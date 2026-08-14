@@ -1,0 +1,9 @@
+[package]
+name = "quarry-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quarry-delimited = { path = "../quarry-delimited" }

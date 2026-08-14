@@ -1,0 +1,19 @@
+[package]
+name = "quarry-cli"
+default-run = "quarry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc = "0.2"
+quarry-core = { path = "../../crates/quarry-core" }
+
+[[bin]]
+name = "quarry"
+path = "src/main.rs"
+
+[[bin]]
+name = "quarry-bench"
+path = "src/bin/quarry-bench.rs"
