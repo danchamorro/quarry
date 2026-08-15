@@ -2,6 +2,18 @@
 
 > A performance-first, open-source macOS application for exploring and transforming massive delimited text files.
 
+## Built with AI, in the open
+
+Quarry is intentionally built 100% with AI coding agents under human product
+direction. That is not a footnote—it is one of the project's defining ideas.
+The goal is to demonstrate that agent-built software can be fast, reliable,
+accessible, maintainable, and developed with engineering rigor.
+
+AI agents implement, benchmark, test, document, and iterate. The human owner
+sets the product vision, evaluates the experience, and accepts the decisions.
+The source, architecture decisions, performance evidence, tests, and commit
+history are public so the process and results can be inspected.
+
 ## Mission
 Quarry exists for a simple reason: a file should not become unusable just because it is larger than RAM.
 
