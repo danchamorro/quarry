@@ -496,6 +496,11 @@ impl Document {
         } else {
             return Err("No structural index is available.".into());
         };
+        let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
+        if loaded_columns > self.total_columns {
+            self.total_columns = loaded_columns;
+            self.headers = headers_for(&self.session, self.total_columns);
+        }
         self.last_viewport_read = Some(began.elapsed());
         self.buffer_start = start;
         self.buffered_rows = rows;
@@ -581,29 +586,20 @@ fn parse_data_row(value: &str, data_start: u64) -> Result<u64, String> {
 fn headers_for(session: &Session, total_columns: usize) -> Vec<String> {
     // ponytail: render 32 columns in this spike; add horizontal column virtualization if egui wins.
     let visible = total_columns.min(MAX_VISIBLE_COLUMNS);
-    if session.dialect.has_header {
-        return session
-            .first_rows
-            .first()
-            .map(|row| {
-                row.fields
-                    .iter()
-                    .take(visible)
-                    .enumerate()
-                    .map(|(index, field)| {
-                        let text = field_text(field);
-                        if text.is_empty() {
-                            format!("Column {}", index + 1)
-                        } else {
-                            text
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-    }
-    (1..=visible)
-        .map(|index| format!("Column {index}"))
+    (0..visible)
+        .map(|index| {
+            if session.dialect.has_header {
+                let text = session
+                    .first_rows
+                    .first()
+                    .and_then(|row| row.fields.get(index))
+                    .map_or_else(String::new, |field| field_text(field));
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            format!("Column {}", index + 1)
+        })
         .collect()
 }
 
@@ -992,6 +988,38 @@ mod tests {
             .unwrap();
         assert_eq!(document.viewport_start, target);
         assert!(document.buffered_rows.len() <= capacity);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn later_wider_rows_expand_visible_columns() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-ragged-{name}.csv"));
+        let mut file = File::create(&path).unwrap();
+        for row in 1..=20 {
+            writeln!(file, "{row},{}", row + 100).unwrap();
+        }
+        writeln!(file, "21,121,visible").unwrap();
+        drop(file);
+
+        let mut document = Document::open(&path).unwrap();
+        assert!(!document.session.dialect.has_header);
+        assert_eq!(document.total_columns, 2);
+
+        let index = document.job.take().unwrap().wait().unwrap();
+        document.index = Some(index);
+        document.navigate(20).unwrap();
+
+        assert_eq!(document.total_columns, 3);
+        assert_eq!(document.headers.len(), 3);
+        assert_eq!(document.headers[2], "Column 3");
+        assert_eq!(
+            document.visible_rows().last().unwrap().fields[2],
+            b"visible"
+        );
         fs::remove_file(path).unwrap();
     }
 
