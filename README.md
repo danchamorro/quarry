@@ -38,6 +38,14 @@ navigation before a production GUI is selected.
 cargo run --release -p quarry-cli -- open huge.csv
 ```
 
+Request a row range with `--jump`; Quarry serves it as soon as background
+indexing reaches that range, then continues indexing:
+
+```bash
+cargo run --release -p quarry-cli -- open huge.csv \
+  --jump 100000000 --jump-count 3
+```
+
 Generate a deterministic local fixture:
 
 ```bash

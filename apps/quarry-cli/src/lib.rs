@@ -6,7 +6,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use quarry_core::{IndexConfig, OpenOptions, Session};
+use quarry_core::{IndexConfig, IndexProgress, OpenOptions, Session, StructuralIndex};
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
 
@@ -38,7 +38,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     let mut path = None;
     let mut rows = 100_usize;
     let mut delimiter = None;
-    let mut jump = None;
+    let mut jump: Option<u64> = None;
     let mut jump_count = 5_usize;
     let mut cache_state = "unknown".to_owned();
     let mut wait_for_index = true;
@@ -132,19 +132,30 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     }
 
     if !wait_for_index {
+        let cancel_started = Instant::now();
         job.cancel();
         let index = job.wait()?;
         println!(
-            "\nIndexing cancelled after {}",
-            human_bytes(index.indexed_bytes())
+            "\nIndexing cancelled after {} in {:.3} ms",
+            human_bytes(index.indexed_bytes()),
+            cancel_started.elapsed().as_secs_f64() * 1000.0
         );
         return Ok(());
     }
 
     println!("\nBackground indexing...");
     let mut last_report = Instant::now();
+    let mut pending_jump = jump;
     loop {
         let progress = job.progress();
+        if let Some(start) = pending_jump {
+            let requested_end = start.saturating_add(jump_count as u64);
+            if !progress.done && progress.rows_scanned >= requested_end {
+                let index = job.snapshot();
+                print_jump(&session, &index, start, jump_count, Some(progress))?;
+                pending_jump = None;
+            }
+        }
         if progress.done {
             break;
         }
@@ -180,30 +191,50 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
         human_bytes(index.memory_bytes() as u64)
     );
 
-    if let Some(start) = jump {
-        let began = Instant::now();
-        let selected = session.read_rows(&index, start, jump_count)?;
-        println!(
-            "Jump to row {start}: {} rows in {:.3} ms",
-            selected.len(),
-            began.elapsed().as_secs_f64() * 1000.0
-        );
-        for (offset, row) in selected.iter().enumerate() {
-            println!(
-                "row {} @{}: {}",
-                start + offset as u64,
-                row.offset,
-                row.fields
-                    .iter()
-                    .map(|field| render_field(field))
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-        }
+    if let Some(start) = pending_jump {
+        print_jump(&session, &index, start, jump_count, None)?;
     }
 
     println!("Current memory: {}", optional_bytes(current_rss_bytes()));
     println!("Peak memory: {}", optional_bytes(peak_rss_bytes()));
+    Ok(())
+}
+
+fn print_jump(
+    session: &Session,
+    index: &StructuralIndex,
+    start: u64,
+    count: usize,
+    live_progress: Option<IndexProgress>,
+) -> CliResult<()> {
+    let began = Instant::now();
+    let selected = session.read_rows(index, start, count)?;
+    let read_ms = began.elapsed().as_secs_f64() * 1000.0;
+    if let Some(progress) = live_progress {
+        println!(
+            "Live jump to row {start} at {:.2}% indexed ({:.3} s): {} rows in {read_ms:.3} ms",
+            progress.bytes_scanned as f64 * 100.0 / progress.file_size.max(1) as f64,
+            progress.elapsed.as_secs_f64(),
+            selected.len()
+        );
+    } else {
+        println!(
+            "Jump to row {start} after indexing: {} rows in {read_ms:.3} ms",
+            selected.len()
+        );
+    }
+    for (offset, row) in selected.iter().enumerate() {
+        println!(
+            "row {} @{}: {}",
+            start + offset as u64,
+            row.offset,
+            row.fields
+                .iter()
+                .map(|field| render_field(field))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
     Ok(())
 }
 

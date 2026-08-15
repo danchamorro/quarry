@@ -485,7 +485,8 @@ fn read_up_to(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<usize> {
 mod tests {
     use std::fs::{self, File};
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{IndexConfig, OpenOptions, QuarryError, Session};
 
@@ -528,6 +529,51 @@ mod tests {
         let rows = session.read_rows(&index, 2, 2).unwrap();
         assert_eq!(rows[0].fields[0], b"multi\nline");
         assert_eq!(rows[1].fields[0], b"c");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_live_index_and_cancels_promptly() {
+        let path = fixture(&b"a,b\n".repeat(250_000));
+        let session = Session::open(&path, OpenOptions::default()).unwrap();
+        let job = session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 1,
+                checkpoint_every: 8,
+                memory_budget_bytes: 64 * 1024,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let progress = loop {
+            let progress = job.progress();
+            if progress.rows_scanned >= 100 || progress.done {
+                break progress;
+            }
+            assert!(Instant::now() < deadline, "index did not make progress");
+            thread::yield_now();
+        };
+        assert!(!progress.done, "test file indexed before the live read");
+
+        let snapshot = job.snapshot();
+        let rows = session.read_rows(&snapshot, 50, 3).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.fields == [b"a", b"b"]));
+
+        let requested = snapshot.indexed_rows() + 1_000;
+        assert!(matches!(
+            session.read_rows(&snapshot, requested, 1),
+            Err(QuarryError::RowNotIndexed {
+                requested: error_row,
+                indexed_rows,
+            }) if error_row == requested && indexed_rows == snapshot.indexed_rows()
+        ));
+
+        let cancel_started = Instant::now();
+        job.cancel();
+        let index = job.wait().unwrap();
+        assert!(cancel_started.elapsed() < Duration::from_secs(1));
+        assert!(index.indexed_bytes() < session.file_size);
         fs::remove_file(path).unwrap();
     }
 

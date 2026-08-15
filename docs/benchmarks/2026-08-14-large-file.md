@@ -40,6 +40,26 @@ This clears the initial targets of under 3 seconds to useful rows and under
 500 MiB RAM. The 16 MiB adaptive checkpoint budget prevents index memory from
 growing without bound on larger files.
 
+### Live navigation and cancellation follow-up
+
+After live-index navigation was connected to the CLI, the same warm 12 GB
+workload produced:
+
+| Metric | Result |
+|---|---:|
+| Time to 100 correctly parsed rows | 9.246 ms |
+| Live jump to row 100,000,000 | 17.894 s after indexing began |
+| Index completion at live jump | 85.76% |
+| Live row-range read (3 rows) | 2.895 ms |
+| Full structural index | 20.862 s |
+| Index throughput | 556.22 MiB/s |
+| Peak RSS | 12.05 MiB |
+| Cancellation after first viewport | 15.160 ms |
+
+The cancellation run stopped after the current 8 MiB chunk. The targeted core
+regression also verifies partial-index reads, the explicit not-indexed-yet
+boundary, and worker cancellation before the test file finishes indexing.
+
 ## EmEditor comparison
 
 EmEditor ran under Windows 11 through Parallels Desktop for Mac Pro 20.1.3.

@@ -2,6 +2,29 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
+## Current progress — 2026-08-14
+
+| Phase | Status | Evidence |
+|---|---|---|
+| Phase 0 — Foundation | Complete | Rust workspace, CI, deterministic generator, ADR, licensing, and the [12 GB benchmark](benchmarks/2026-08-14-large-file.md) |
+| Phase 1 — Prove the core | In progress | Progressive open, correct parsing, bounded structural index, live row navigation, cancellation, and diagnostics are working |
+| Phase 2 — UI bake-off | Not started | Begins only after the remaining Phase 1 cache decision |
+
+### Phase 1 checklist
+
+- [x] Return the first viewport before full-file indexing.
+- [x] Parse quoted delimiters, escaped quotes, CRLF, and embedded newlines.
+- [x] Keep structural-index memory bounded with adaptive checkpoints.
+- [x] Navigate a row range from a completed index.
+- [x] Navigate a row range as soon as the live index reaches it.
+- [x] Cancel and join background indexing promptly.
+- [x] Report first-row time, throughput, progress, memory, and index size.
+- [ ] Measure repeated nearby and random viewport reads, then add a bounded
+  cache only if the measurements justify it.
+
+**Current exit gate:** make and document the cache/no-cache decision. The core
+already opens and navigates the 12 GB reference file with bounded memory.
+
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
 
