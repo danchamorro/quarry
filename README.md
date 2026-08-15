@@ -46,6 +46,13 @@ cargo run --release -p quarry-cli -- open huge.csv \
   --jump 100000000 --jump-count 3
 ```
 
+Measure repeated, sequential, and deterministic random viewport reads:
+
+```bash
+cargo run --release -p quarry-cli --bin quarry-bench -- viewport huge.csv \
+  --iterations 500 --rows 100 --seed 1 --cache-state warm
+```
+
 Generate a deterministic local fixture:
 
 ```bash
@@ -54,7 +61,8 @@ cargo run --release -p quarry-cli --bin quarry -- generate \
   --output fixtures/generated/test-10gb.csv --seed 1
 ```
 
-See the [12 GB benchmark](docs/benchmarks/2026-08-14-large-file.md) and
-[initial engine decision](docs/adr/0001-initial-engine.md).
+See the [12 GB benchmark](docs/benchmarks/2026-08-14-large-file.md),
+[initial engine decision](docs/adr/0001-initial-engine.md), and
+[viewport cache decision](docs/adr/0002-defer-viewport-cache.md).
 
 Quarry is dual-licensed under MIT or Apache-2.0.

@@ -14,6 +14,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
         Some("open") => open_command(args.collect()),
+        Some("viewport") => viewport_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -29,8 +30,164 @@ fn print_help() {
          Usage:\n  \
            quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
          [--jump-count 5] [--cache-state unknown|cold|warm] [--no-wait]\n  \
+           quarry viewport <FILE> [--iterations 500] [--rows 100] \
+         [--seed 1] [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]"
+    );
+}
+
+fn viewport_command(args: Vec<String>) -> CliResult<()> {
+    let mut path = None;
+    let mut iterations = 500_usize;
+    let mut rows = 100_usize;
+    let mut seed = 1_u64;
+    let mut cache_state = "unknown".to_owned();
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--iterations" => iterations = value(&args, &mut cursor, "--iterations")?.parse()?,
+            "--rows" => rows = value(&args, &mut cursor, "--rows")?.parse()?,
+            "--seed" => seed = value(&args, &mut cursor, "--seed")?.parse()?,
+            "--cache-state" => {
+                cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
+                if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
+                    return Err("--cache-state must be unknown, cold, or warm".into());
+                }
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            value if path.is_none() => path = Some(PathBuf::from(value)),
+            value => return Err(format!("unexpected argument {value:?}").into()),
+        }
+        cursor += 1;
+    }
+
+    if iterations == 0 || rows == 0 {
+        return Err("iterations and rows must be non-zero".into());
+    }
+    let path = path.ok_or("viewport requires a file path")?;
+    let session = Session::open(
+        &path,
+        OpenOptions {
+            rows,
+            ..OpenOptions::default()
+        },
+    )?;
+    let index_started = Instant::now();
+    let index = session.start_indexing(IndexConfig::default())?.wait()?;
+    let index_elapsed = index_started.elapsed();
+    if index.indexed_rows() < rows as u64 {
+        return Err(format!(
+            "viewport requires {rows} rows, but the file contains {}",
+            index.indexed_rows()
+        )
+        .into());
+    }
+
+    let max_start = index.indexed_rows() - rows as u64;
+    let repeated_start = max_start / 2;
+    let (repeated, repeated_checksum) =
+        benchmark_viewports(&session, &index, iterations, rows, |_| repeated_start)?;
+
+    let mut sequential_start = repeated_start;
+    let (sequential, sequential_checksum) =
+        benchmark_viewports(&session, &index, iterations, rows, |_| {
+            let start = sequential_start;
+            sequential_start = sequential_start
+                .checked_add(rows as u64)
+                .filter(|next| *next <= max_start)
+                .unwrap_or(0);
+            start
+        })?;
+
+    let mut random = XorShift64::new(seed);
+    let (random_stats, random_checksum) =
+        benchmark_viewports(&session, &index, iterations, rows, |_| {
+            random.next() % max_start.saturating_add(1)
+        })?;
+
+    println!("Quarry viewport benchmark\n");
+    println!("File: {}", session.path().display());
+    println!("File size: {}", human_bytes(session.file_size));
+    println!("Rows indexed: {}", index.indexed_rows());
+    println!("Indexing time: {:.3} s", index_elapsed.as_secs_f64());
+    println!("Cache state: {cache_state}");
+    println!("Iterations: {iterations} per pattern, {rows} rows per viewport");
+    println!("Seed: {seed}\n");
+    println!("Pattern       min ms    p50 ms    p95 ms    max ms   requests/s");
+    print_viewport_stats("repeated", repeated);
+    print_viewport_stats("sequential", sequential);
+    print_viewport_stats("random", random_stats);
+    println!(
+        "Checksum: {}",
+        repeated_checksum ^ sequential_checksum ^ random_checksum
+    );
+    println!("Current memory: {}", optional_bytes(current_rss_bytes()));
+    println!("Peak memory: {}", optional_bytes(peak_rss_bytes()));
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct LatencyStats {
+    min: Duration,
+    p50: Duration,
+    p95: Duration,
+    max: Duration,
+    total: Duration,
+    count: usize,
+}
+
+fn benchmark_viewports(
+    session: &Session,
+    index: &StructuralIndex,
+    iterations: usize,
+    rows: usize,
+    mut start: impl FnMut(usize) -> u64,
+) -> CliResult<(LatencyStats, u64)> {
+    let mut samples = Vec::with_capacity(iterations);
+    let mut checksum = 0_u64;
+    for iteration in 0..iterations {
+        let start = start(iteration);
+        let began = Instant::now();
+        let selected = session.read_rows(index, start, rows)?;
+        samples.push(began.elapsed());
+        checksum = selected.iter().fold(checksum, |checksum, row| {
+            row.fields
+                .iter()
+                .fold(checksum ^ row.offset, |sum, field| sum ^ field.len() as u64)
+        });
+    }
+    Ok((latency_stats(&mut samples), checksum))
+}
+
+fn latency_stats(samples: &mut [Duration]) -> LatencyStats {
+    samples.sort_unstable();
+    let percentile = |value: usize| {
+        let rank = samples.len().saturating_mul(value).div_ceil(100).max(1);
+        samples[rank.min(samples.len()) - 1]
+    };
+    LatencyStats {
+        min: samples[0],
+        p50: percentile(50),
+        p95: percentile(95),
+        max: samples[samples.len() - 1],
+        total: samples.iter().sum(),
+        count: samples.len(),
+    }
+}
+
+fn print_viewport_stats(pattern: &str, stats: LatencyStats) {
+    let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
+    println!(
+        "{pattern:<10} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>12.1}",
+        milliseconds(stats.min),
+        milliseconds(stats.p50),
+        milliseconds(stats.p95),
+        milliseconds(stats.max),
+        stats.count as f64 / stats.total.as_secs_f64()
     );
 }
 
@@ -464,9 +621,24 @@ fn peak_rss_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{generate_file, parse_size};
+    use super::{generate_file, latency_stats, parse_size, viewport_command};
+
+    #[test]
+    fn summarizes_viewport_latency_and_rejects_empty_workloads() {
+        let mut samples = [1, 2, 3, 4, 100].map(Duration::from_millis);
+        let stats = latency_stats(&mut samples);
+        assert_eq!(stats.min, Duration::from_millis(1));
+        assert_eq!(stats.p50, Duration::from_millis(3));
+        assert_eq!(stats.p95, Duration::from_millis(100));
+        assert_eq!(stats.max, Duration::from_millis(100));
+        assert_eq!(stats.total, Duration::from_millis(110));
+        assert_eq!(stats.count, 5);
+
+        let error = viewport_command(vec!["--iterations".into(), "0".into()]).unwrap_err();
+        assert_eq!(error.to_string(), "iterations and rows must be non-zero");
+    }
 
     #[test]
     fn parses_sizes_and_generates_deterministically() {

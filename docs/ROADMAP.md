@@ -7,8 +7,8 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase | Status | Evidence |
 |---|---|---|
 | Phase 0 — Foundation | Complete | Rust workspace, CI, deterministic generator, ADR, licensing, and the [12 GB benchmark](benchmarks/2026-08-14-large-file.md) |
-| Phase 1 — Prove the core | In progress | Progressive open, correct parsing, bounded structural index, live row navigation, cancellation, and diagnostics are working |
-| Phase 2 — UI bake-off | Not started | Begins only after the remaining Phase 1 cache decision |
+| Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
+| Phase 2 — UI bake-off | Next | Build minimal UI prototypes against the same measured engine contract |
 
 ### Phase 1 checklist
 
@@ -19,11 +19,12 @@ The roadmap is ordered by technical risk rather than feature excitement.
 - [x] Navigate a row range as soon as the live index reaches it.
 - [x] Cancel and join background indexing promptly.
 - [x] Report first-row time, throughput, progress, memory, and index size.
-- [ ] Measure repeated nearby and random viewport reads, then add a bounded
+- [x] Measure repeated nearby and random viewport reads, then add a bounded
   cache only if the measurements justify it.
 
-**Current exit gate:** make and document the cache/no-cache decision. The core
-already opens and navigates the 12 GB reference file with bounded memory.
+**Phase 1 exit met:** the 12 GB reference file opens and navigates with bounded
+memory, and warm random 100-row reads complete in 1.843 ms at p95 without an
+application cache. Phase 2 is now the active milestone.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -31,7 +32,7 @@ Rust workspace, CI, lint/test policy, deterministic large-file generator, benchm
 **Exit:** reproducible benchmark results on a known machine.
 
 ## Phase 1 — Prove the core
-Open/map huge files, sample format, parse first viewport, background structural indexing, bounded cache, row-range navigation, cancellation, and diagnostics.
+Open/map huge files, sample format, parse first viewport, background structural indexing, measured cache decision, row-range navigation, cancellation, and diagnostics.
 
 **Exit:** a 10 GB CSV can be opened and navigated through the engine with bounded memory.
 

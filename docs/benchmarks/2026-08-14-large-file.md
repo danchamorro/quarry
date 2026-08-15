@@ -60,6 +60,30 @@ The cancellation run stopped after the current 8 MiB chunk. The targeted core
 regression also verifies partial-index reads, the explicit not-indexed-yet
 boundary, and worker cancellation before the test file finishes indexing.
 
+### Post-index viewport latency
+
+Command:
+
+```bash
+target/release/quarry-bench viewport LARGE_FILE.csv \
+  --iterations 500 --rows 100 --seed 1 --cache-state warm
+```
+
+The release benchmark completed structural indexing in 20.703 s, then measured
+500 reads for each access pattern. Each request materialized 100 rows through
+the same `Session::read_rows` path available to a future UI.
+
+| Pattern | Minimum | p50 | p95 | Maximum | Requests/s |
+|---|---:|---:|---:|---:|---:|
+| Repeated viewport | 1.589 ms | 1.686 ms | 1.824 ms | 1.976 ms | 590.0 |
+| Sequential viewports | 1.591 ms | 1.690 ms | 1.808 ms | 2.073 ms | 589.8 |
+| Seeded random viewports | 1.605 ms | 1.699 ms | 1.843 ms | 1.959 ms | 584.6 |
+
+Peak RSS was 14.64 MiB. All p95 results clear the 8 ms engine budget, so
+[ADR 0002](../adr/0002-defer-viewport-cache.md) defers an application cache.
+The run was warm: full indexing had just scanned the file, and the machine has
+enough RAM to retain the dataset in the operating system's file cache.
+
 ## EmEditor comparison
 
 EmEditor ran under Windows 11 through Parallels Desktop for Mac Pro 20.1.3.
