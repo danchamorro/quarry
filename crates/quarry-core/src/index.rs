@@ -10,7 +10,7 @@ use quarry_delimited::RecordScanner;
 
 use crate::QuarryError;
 
-const DEFAULT_INDEX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_INDEX_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_CHECKPOINT_EVERY: u64 = 4096;
 const DEFAULT_INDEX_MEMORY_BUDGET: usize = 16 * 1024 * 1024;
 
@@ -140,6 +140,18 @@ struct SharedState {
     file_size: u64,
 }
 
+struct WorkerCompletion<'a>(&'a SharedState);
+
+impl Drop for WorkerCompletion<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.0.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.0
+            .finished_nanos
+            .store(elapsed.max(1), Ordering::Release);
+        self.0.done.store(true, Ordering::Release);
+    }
+}
+
 pub struct IndexJob {
     shared: Arc<SharedState>,
     handle: Option<JoinHandle<Result<(), QuarryError>>>,
@@ -169,19 +181,11 @@ impl IndexJob {
         let handle = thread::Builder::new()
             .name("quarry-index".into())
             .spawn(move || {
+                let _completion = WorkerCompletion(&worker_state);
                 let result = run_indexer(file, delimiter, config, &worker_state);
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
                 }
-                let elapsed = worker_state
-                    .started
-                    .elapsed()
-                    .as_nanos()
-                    .min(u64::MAX as u128) as u64;
-                worker_state
-                    .finished_nanos
-                    .store(elapsed.max(1), Ordering::Release);
-                worker_state.done.store(true, Ordering::Release);
                 result
             })?;
         Ok(Self {
@@ -288,12 +292,13 @@ fn run_indexer(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use super::{IndexConfig, IndexJob, StructuralIndex};
+    use super::{IndexConfig, IndexJob, SharedState, StructuralIndex, WorkerCompletion};
 
     #[test]
     fn compacts_checkpoints_to_stay_under_budget() {
@@ -313,6 +318,30 @@ mod tests {
             index.nearest_checkpoint(100).row % index.checkpoint_every,
             0
         );
+    }
+
+    #[test]
+    fn worker_completion_marks_panicked_workers_done() {
+        let shared = SharedState {
+            index: RwLock::new(StructuralIndex::new(IndexConfig::default()).unwrap()),
+            bytes_scanned: AtomicU64::new(0),
+            rows_scanned: AtomicU64::new(0),
+            finished_nanos: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            error: Mutex::new(None),
+            started: Instant::now(),
+            file_size: 0,
+        };
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _completion = WorkerCompletion(&shared);
+            panic!("simulated worker panic");
+        }));
+
+        assert!(result.is_err());
+        assert!(shared.done.load(Ordering::Acquire));
+        assert!(shared.finished_nanos.load(Ordering::Acquire) > 0);
     }
 
     #[test]

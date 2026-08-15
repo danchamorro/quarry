@@ -63,16 +63,19 @@ pacing becomes measurable with the viewer-alpha grid.
   reopen.
 - [x] Start a replacement indexer successfully, then cancel and join the prior
   worker before installing it as the current document.
-- [ ] Benchmark live-index snapshot latency and indexing throughput together
-  before tuning the structural-index lock window.
+- [x] Benchmark live-index snapshot latency and indexing throughput together,
+  then reduce the default chunk from 8 MiB to 1 MiB based on the measured
+  [live-index latency result](benchmarks/2026-08-15-live-index-latency.md).
 - [ ] Complete viewer-alpha grid controls, copying, and streaming search.
 
 **Phase 3 in progress:** the viewer now provides bounded file-level continuous
 scrolling plus native opening and explicit format controls. The
 [12 GB scroll run](benchmarks/2026-08-15-continuous-scroll.md) and
 [file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md) record
-the current evidence. Grid controls, copying, and streaming search remain;
-filtering, editing, export, and cosmetic redesign stay outside this slice.
+the current UI evidence; the [live-index benchmark](benchmarks/2026-08-15-live-index-latency.md)
+records the lock-window tuning decision. Grid controls, copying, and streaming
+search remain; filtering, editing, export, and cosmetic redesign stay outside
+this slice.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.

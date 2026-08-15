@@ -6,9 +6,11 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use quarry_core::{IndexConfig, IndexProgress, OpenOptions, Session, StructuralIndex};
+use quarry_core::{IndexConfig, IndexJob, IndexProgress, OpenOptions, Session, StructuralIndex};
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
+
+const MAX_LIVE_BENCHMARK_MILLIS: u128 = 60_000;
 
 pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let mut args = args.into_iter();
@@ -31,7 +33,8 @@ fn print_help() {
            quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
          [--jump-count 5] [--cache-state unknown|cold|warm] [--no-wait]\n  \
            quarry viewport <FILE> [--iterations 500] [--rows 100] \
-         [--seed 1] [--cache-state unknown|cold|warm]\n  \
+         [--seed 1] [--cache-state unknown|cold|warm] [--live] \
+         [--interval-ms 16] [--chunk-bytes 1048576]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]"
     );
@@ -43,6 +46,9 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     let mut rows = 100_usize;
     let mut seed = 1_u64;
     let mut cache_state = "unknown".to_owned();
+    let mut live = false;
+    let mut interval_ms = 16_u64;
+    let mut chunk_bytes = IndexConfig::default().chunk_bytes;
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -50,6 +56,9 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
             "--iterations" => iterations = value(&args, &mut cursor, "--iterations")?.parse()?,
             "--rows" => rows = value(&args, &mut cursor, "--rows")?.parse()?,
             "--seed" => seed = value(&args, &mut cursor, "--seed")?.parse()?,
+            "--live" => live = true,
+            "--interval-ms" => interval_ms = value(&args, &mut cursor, "--interval-ms")?.parse()?,
+            "--chunk-bytes" => chunk_bytes = value(&args, &mut cursor, "--chunk-bytes")?.parse()?,
             "--cache-state" => {
                 cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
                 if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
@@ -68,6 +77,12 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     if iterations == 0 || rows == 0 {
         return Err("iterations and rows must be non-zero".into());
     }
+    if interval_ms == 0 || chunk_bytes == 0 {
+        return Err("interval and chunk bytes must be non-zero".into());
+    }
+    if live && interval_ms as u128 * iterations as u128 > MAX_LIVE_BENCHMARK_MILLIS {
+        return Err("live viewport schedule must not exceed 60 seconds".into());
+    }
     let path = path.ok_or("viewport requires a file path")?;
     let session = Session::open(
         &path,
@@ -77,7 +92,22 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
         },
     )?;
     let index_started = Instant::now();
-    let index = session.start_indexing(IndexConfig::default())?.wait()?;
+    let job = session.start_indexing(IndexConfig {
+        chunk_bytes,
+        ..IndexConfig::default()
+    })?;
+    if live {
+        return benchmark_live_viewports(
+            &session,
+            job,
+            iterations,
+            rows,
+            Duration::from_millis(interval_ms),
+            chunk_bytes,
+            &cache_state,
+        );
+    }
+    let index = job.wait()?;
     let index_elapsed = index_started.elapsed();
     if index.indexed_rows() < rows as u64 {
         return Err(format!(
@@ -161,6 +191,136 @@ fn benchmark_viewports(
         });
     }
     Ok((latency_stats(&mut samples), checksum))
+}
+
+fn benchmark_live_viewports(
+    session: &Session,
+    job: IndexJob,
+    iterations: usize,
+    rows: usize,
+    interval: Duration,
+    chunk_bytes: usize,
+    cache_state: &str,
+) -> CliResult<()> {
+    let required_rows = (iterations as u64)
+        .checked_mul(rows as u64)
+        .ok_or("live viewport workload is too large")?;
+    let ready = loop {
+        let progress = job.progress();
+        if progress.done {
+            return live_finished_early(
+                job,
+                "indexing finished before the live viewport workload was ready",
+            );
+        }
+        if progress.rows_scanned >= required_rows {
+            break progress;
+        }
+        thread::sleep(Duration::from_millis(1));
+    };
+
+    let mut snapshot_samples = Vec::with_capacity(iterations);
+    let mut read_samples = Vec::with_capacity(iterations);
+    let mut combined_samples = Vec::with_capacity(iterations);
+    let mut missed_deadlines = 0_usize;
+    let mut over_budget = 0_usize;
+    let mut checksum = 0_u64;
+    let mut deadline = Instant::now();
+
+    for _ in 0..iterations {
+        deadline = deadline
+            .checked_add(interval)
+            .ok_or("live viewport deadline overflowed")?;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            missed_deadlines += 1;
+            continue;
+        };
+        thread::sleep(remaining);
+        if job.progress().done {
+            return live_finished_early(
+                job,
+                "indexing finished before the live viewport workload completed",
+            );
+        }
+
+        let combined_started = Instant::now();
+        let snapshot_started = Instant::now();
+        let index = job.snapshot();
+        let snapshot_elapsed = snapshot_started.elapsed();
+        let start = combined_samples.len() as u64 * rows as u64;
+        let read_started = Instant::now();
+        let selected = session.read_rows(&index, start, rows)?;
+        let read_elapsed = read_started.elapsed();
+        let combined_elapsed = combined_started.elapsed();
+        if job.progress().done {
+            return live_finished_early(job, "indexing finished during the live viewport workload");
+        }
+
+        snapshot_samples.push(snapshot_elapsed);
+        read_samples.push(read_elapsed);
+        combined_samples.push(combined_elapsed);
+        over_budget += usize::from(combined_elapsed > interval);
+        checksum = selected.iter().fold(checksum, |checksum, row| {
+            row.fields
+                .iter()
+                .fold(checksum ^ row.offset, |sum, field| sum ^ field.len() as u64)
+        });
+    }
+    if combined_samples.is_empty() {
+        return Err("every live viewport request deadline was missed".into());
+    }
+
+    let sampled = job.progress();
+    while !job.progress().done {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let finished = job.progress();
+    let index = job.wait()?;
+
+    println!("Quarry live viewport benchmark\n");
+    println!("File: {}", session.path().display());
+    println!("File size: {}", human_bytes(session.file_size));
+    println!("Cache state: {cache_state}");
+    println!("Index chunk: {}", human_bytes(chunk_bytes as u64));
+    println!("Scheduled requests: {iterations}, {rows} rows per viewport");
+    println!("Completed requests: {}", combined_samples.len());
+    println!(
+        "Request interval: {:.3} ms",
+        interval.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Sampling window: {:.2}% to {:.2}% indexed\n",
+        ready.bytes_scanned as f64 * 100.0 / ready.file_size.max(1) as f64,
+        sampled.bytes_scanned as f64 * 100.0 / sampled.file_size.max(1) as f64
+    );
+    println!("Pattern       min ms    p50 ms    p95 ms    max ms    service/s");
+    print_viewport_stats("snapshot", latency_stats(&mut snapshot_samples));
+    print_viewport_stats("row read", latency_stats(&mut read_samples));
+    print_viewport_stats("combined", latency_stats(&mut combined_samples));
+    println!("Missed request deadlines: {missed_deadlines} / {iterations}");
+    println!(
+        "Combined reads over {:.3} ms: {over_budget} / {}",
+        interval.as_secs_f64() * 1000.0,
+        combined_samples.len()
+    );
+    println!("Checksum: {checksum}");
+    println!("Rows indexed: {}", index.indexed_rows());
+    println!("Indexing time: {:.3} s", finished.elapsed.as_secs_f64());
+    println!(
+        "Indexing throughput: {}/s",
+        human_bytes(rate(finished.bytes_scanned, finished.elapsed))
+    );
+    println!("Index memory: {}", human_bytes(index.memory_bytes() as u64));
+    println!("Current memory: {}", optional_bytes(current_rss_bytes()));
+    println!("Peak memory: {}", optional_bytes(peak_rss_bytes()));
+    Ok(())
+}
+
+fn live_finished_early(job: IndexJob, message: &'static str) -> CliResult<()> {
+    match job.wait() {
+        Ok(_) => Err(message.into()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn latency_stats(samples: &mut [Duration]) -> LatencyStats {
@@ -638,6 +798,32 @@ mod tests {
 
         let error = viewport_command(vec!["--iterations".into(), "0".into()]).unwrap_err();
         assert_eq!(error.to_string(), "iterations and rows must be non-zero");
+
+        let error = viewport_command(vec!["--live".into(), "--interval-ms".into(), "0".into()])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "interval and chunk bytes must be non-zero"
+        );
+
+        let error = viewport_command(vec!["--chunk-bytes".into(), "0".into()]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "interval and chunk bytes must be non-zero"
+        );
+
+        let error = viewport_command(vec![
+            "--live".into(),
+            "--iterations".into(),
+            "1000".into(),
+            "--interval-ms".into(),
+            "1000".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "live viewport schedule must not exceed 60 seconds"
+        );
     }
 
     #[test]
