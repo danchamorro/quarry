@@ -16,7 +16,8 @@ Initial capabilities: CSV/TSV/pipe-delimited files, progressive opening, virtual
 The initial reference workload is a **10 GB delimited file**. Quarry should show useful first rows within seconds, keep memory bounded, remain interactive during scans, and avoid full-file copies for read-only work.
 
 ## Architecture
-The data engine will be written in **Rust**. The UI technology is intentionally undecided and will be selected through benchmarked prototypes rather than convention.
+The data engine is written in **Rust**. A measured egui/AppKit bake-off selected
+**egui** for the production UI while keeping the engine framework-independent.
 
 ## First milestone
 > Open a 10 GB CSV, display its first rows quickly, and scroll through it smoothly without memory usage scaling with file size.
@@ -32,10 +33,23 @@ The data engine will be written in **Rust**. The UI technology is intentionally 
 
 The Rust engine and CLI prove progressive opening, correct delimited parsing,
 bounded structural indexing, deterministic fixture generation, and row-range
-navigation before a production GUI is selected.
+navigation. Phase 2 selected egui; Phase 3 will turn that candidate into the
+viewer alpha.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
+```
+
+Launch the selected egui prototype (it is not the viewer alpha yet):
+
+```bash
+cargo run --release -p quarry-egui -- huge.csv
+```
+
+The measured native comparator remains runnable for bake-off reproduction:
+
+```bash
+cargo run --release -p quarry-appkit -- huge.csv
 ```
 
 Request a row range with `--jump`; Quarry serves it as soon as background
@@ -61,8 +75,11 @@ cargo run --release -p quarry-cli --bin quarry -- generate \
   --output fixtures/generated/test-10gb.csv --seed 1
 ```
 
-See the [12 GB benchmark](docs/benchmarks/2026-08-14-large-file.md),
-[initial engine decision](docs/adr/0001-initial-engine.md), and
-[viewport cache decision](docs/adr/0002-defer-viewport-cache.md).
+See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
+[egui spike results](docs/benchmarks/2026-08-14-egui-spike.md),
+[AppKit spike results](docs/benchmarks/2026-08-14-appkit-spike.md),
+[initial engine decision](docs/adr/0001-initial-engine.md),
+[viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
+[UI decision](docs/adr/0003-select-egui-ui.md).
 
 Quarry is dual-licensed under MIT or Apache-2.0.

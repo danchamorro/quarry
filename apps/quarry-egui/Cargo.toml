@@ -1,0 +1,11 @@
+[package]
+name = "quarry-egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui_extras.workspace = true
+quarry-core = { path = "../../crates/quarry-core" }

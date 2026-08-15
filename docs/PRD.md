@@ -77,7 +77,9 @@ A 10 GB CSV is repeatedly practical to open and navigate on supported Macs while
 Another editor's trademark should not be Quarry's official tagline.
 
 ## Open questions
-UI framework; minimum macOS version; encoding breadth; whether sorting lands in 0.1; persistent index format/invalidation.
+Minimum macOS version; encoding breadth; whether sorting lands in 0.1;
+persistent index format/invalidation. [ADR 0003](adr/0003-select-egui-ui.md)
+selects the UI framework.
 
 The initial engine ships with a benchmark-oriented CLI and is dual-licensed
 under MIT or Apache-2.0.

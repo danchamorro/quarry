@@ -89,6 +89,9 @@ Do not select a framework because it is fashionable, native, or Rust-based. Prot
 
 Measure scrolling/frame time, allocation behavior, text rendering, keyboard behavior, VoiceOver, native integration, FFI complexity, packaging, and developer velocity.
 
+[ADR 0003](adr/0003-select-egui-ui.md) records the measured egui/AppKit
+bake-off and selects egui while keeping this boundary replaceable.
+
 ## Benchmarking
 Generate deterministic 1 GB, 10 GB, 25 GB, and 50 GB datasets locally, including multiline quoted fields, wide tables, long fields, and malformed records.
 

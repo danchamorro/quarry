@@ -8,7 +8,8 @@ The roadmap is ordered by technical risk rather than feature excitement.
 |---|---|---|
 | Phase 0 — Foundation | Complete | Rust workspace, CI, deterministic generator, ADR, licensing, and the [12 GB benchmark](benchmarks/2026-08-14-large-file.md) |
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
-| Phase 2 — UI bake-off | Next | Build minimal UI prototypes against the same measured engine contract |
+| Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
+| Phase 3 — Viewer alpha | Next | Extend the selected egui candidate into a useful file viewer |
 
 ### Phase 1 checklist
 
@@ -24,7 +25,22 @@ The roadmap is ordered by technical risk rather than feature excitement.
 
 **Phase 1 exit met:** the 12 GB reference file opens and navigates with bounded
 memory, and warm random 100-row reads complete in 1.843 ms at p95 without an
-application cache. Phase 2 is now the active milestone.
+application cache.
+
+### Phase 2 checklist
+
+- [x] Build an egui spike on the existing engine.
+- [x] Keep each UI request bounded to 100 rows.
+- [x] Wire open, previous/next, jump, progress, cancellation, and keyboard paging.
+- [x] Expose controls, headers, and visible cells through macOS accessibility.
+- [x] Collect repeatable bounded-navigation and sustained-scroll measurements.
+- [x] Build the native AppKit comparator.
+- [x] Document the production UI decision in an ADR.
+
+**Phase 2 exit met:** both candidates open the 12 GB reference file within the
+memory target and remain responsive under bounded navigation and viewport
+scrolling. egui is selected for Phase 3; continuous file-level scroll frame
+pacing becomes measurable with the viewer-alpha grid.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.

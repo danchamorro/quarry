@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "apps/quarry-appkit",
     "apps/quarry-cli",
+    "apps/quarry-egui",
     "crates/quarry-core",
     "crates/quarry-delimited",
 ]
@@ -13,7 +15,12 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+egui_extras = { version = "0.33.3", default-features = false }
 memchr = "2.7"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "AppKitDefines", "NSAppearance", "NSApplication", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSProgressIndicator", "NSResponder", "NSRunningApplication", "NSScrollView", "NSText", "NSTextContainer", "NSTextField", "NSTextView", "NSView", "NSWindow", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDate", "NSNotification", "NSObject", "NSString", "NSTimer"] }
 
 [profile.release]
 codegen-units = 1
