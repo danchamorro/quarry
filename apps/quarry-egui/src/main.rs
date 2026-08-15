@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
 use quarry_core::{
-    IndexConfig, IndexJob, IndexProgress, OpenOptions, Row, Session, StructuralIndex,
+    HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, Row, Session, StructuralIndex,
 };
 
 const INITIAL_VISIBLE_ROWS: usize = 15;
@@ -30,7 +30,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Quarry — egui prototype",
+        "Quarry — Viewer Alpha",
         options,
         Box::new(move |creation| {
             configure_style(&creation.egui_ctx);
@@ -42,6 +42,8 @@ fn main() -> eframe::Result<()> {
 struct QuarryApp {
     path_input: String,
     jump_input: String,
+    delimiter_mode: DelimiterMode,
+    header_mode: HeaderMode,
     document: Option<Document>,
     notice: Option<String>,
     started: Instant,
@@ -57,42 +59,111 @@ impl QuarryApp {
         let mut app = Self {
             path_input,
             jump_input: "1".into(),
+            delimiter_mode: DelimiterMode::Auto,
+            header_mode: HeaderMode::Auto,
             document: None,
             notice: None,
             started,
             logged_first_update: false,
         };
-        if initial_path.is_some() {
-            app.open_document();
+        if let Some(path) = initial_path {
+            app.open_path_and_report(path);
         }
         app
     }
 
-    fn open_document(&mut self) {
+    fn open_options(&self) -> OpenOptions {
+        OpenOptions {
+            delimiter: self.delimiter_mode.delimiter(),
+            header_mode: self.header_mode,
+            ..OpenOptions::default()
+        }
+    }
+
+    fn open_typed_path(&mut self) {
         if self.path_input.trim().is_empty() {
             self.notice = Some("Enter a file path to open.".into());
             return;
         }
-        match Document::open(Path::new(self.path_input.trim())) {
-            Ok(document) => {
-                self.jump_input = "1".into();
-                self.document = Some(document);
-                self.notice = None;
-            }
-            Err(error) => self.notice = Some(error),
+        self.open_path_and_report(PathBuf::from(self.path_input.trim()));
+    }
+
+    fn open_path(&mut self, path: PathBuf) -> Result<(), String> {
+        let mut document = Document::prepare(&path, self.open_options())?;
+        document.start_indexing()?;
+        if let Some(current) = self.document.as_mut() {
+            current.shutdown();
+        }
+        self.path_input = path.to_string_lossy().into_owned();
+        self.jump_input = "1".into();
+        self.document = Some(document);
+        Ok(())
+    }
+
+    fn open_path_and_report(&mut self, path: PathBuf) {
+        let result = self.open_path(path);
+        self.notice = result.err();
+    }
+
+    fn open_picker_result(&mut self, path: Option<PathBuf>) {
+        if let Some(path) = path {
+            self.open_path_and_report(path);
         }
     }
 
-    fn apply(&mut self, action: Action) {
-        if action == Action::Open {
-            self.open_document();
+    fn choose_file(&mut self) {
+        let path = rfd::FileDialog::new()
+            .set_title("Open a delimited file")
+            .pick_file();
+        self.open_picker_result(path);
+    }
+
+    fn reopen_document(&mut self) {
+        let Some(path) = self
+            .document
+            .as_ref()
+            .map(|document| document.session.path().to_path_buf())
+        else {
+            self.notice = Some("Open a file first.".into());
             return;
+        };
+        self.open_path_and_report(path);
+    }
+
+    fn handle_dropped_paths(&mut self, dropped: Vec<Option<PathBuf>>) {
+        let count = dropped.len();
+        let Some(path) = dropped.into_iter().flatten().next() else {
+            self.notice = Some(format!(
+                "Ignored {count} dropped item(s); Quarry can only open a local file."
+            ));
+            return;
+        };
+        let ignored = count.saturating_sub(1);
+        let result = self.open_path(path);
+        self.notice = match (result, ignored) {
+            (Ok(()), 0) => None,
+            (Ok(()), ignored) => Some(format!(
+                "Opened one file and ignored {ignored} additional dropped item(s)."
+            )),
+            (Err(error), 0) => Some(error),
+            (Err(error), ignored) => Some(format!(
+                "{error} Ignored {ignored} additional dropped item(s)."
+            )),
+        };
+    }
+
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::Open => return self.open_typed_path(),
+            Action::Choose => return self.choose_file(),
+            Action::Reopen => return self.reopen_document(),
+            _ => {}
         }
         let Some(document) = self.document.as_mut() else {
             return;
         };
         let result = match action {
-            Action::Open => unreachable!(),
+            Action::Open | Action::Choose | Action::Reopen => unreachable!(),
             Action::PageUp => document.page(-1),
             Action::PageDown => document.page(1),
             Action::Jump => parse_data_row(&self.jump_input, document.data_start)
@@ -116,13 +187,22 @@ impl eframe::App for QuarryApp {
             self.logged_first_update = true;
         }
 
-        if let Some(document) = &mut self.document {
-            if let Err(error) = document.poll() {
-                self.notice = Some(error);
-            }
-            if document.is_indexing() {
-                ctx.request_repaint_after(POLL_INTERVAL);
-            }
+        let dropped_paths = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>()
+        });
+        if !dropped_paths.is_empty() {
+            self.handle_dropped_paths(dropped_paths);
+        }
+
+        if let Some(document) = &mut self.document
+            && let Err(error) = document.poll()
+        {
+            self.notice = Some(error);
         }
 
         let mut action = None;
@@ -138,7 +218,7 @@ impl eframe::App for QuarryApp {
                             .color(Color32::from_rgb(24, 35, 42)),
                     );
                     ui.label(
-                        RichText::new("EGUI BAKE-OFF")
+                        RichText::new("VIEWER ALPHA")
                             .monospace()
                             .size(10.0)
                             .color(Color32::from_rgb(49, 85, 217)),
@@ -150,7 +230,7 @@ impl eframe::App for QuarryApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let label = ui.label("File");
-                    let width = (ui.available_width() - 78.0).max(200.0);
+                    let width = (ui.available_width() - 168.0).max(200.0);
                     let response = ui
                         .add_sized(
                             [width, 28.0],
@@ -158,6 +238,9 @@ impl eframe::App for QuarryApp {
                                 .hint_text("/path/to/file.csv"),
                         )
                         .labelled_by(label.id);
+                    if ui.button("Choose…").clicked() {
+                        action = Some(Action::Choose);
+                    }
                     if ui.button("Open").clicked()
                         || (response.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter)))
@@ -165,18 +248,49 @@ impl eframe::App for QuarryApp {
                         action = Some(Action::Open);
                     }
                 });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let delimiter_label = ui.label("Delimiter");
+                    let _ = egui::ComboBox::from_id_salt("quarry-delimiter-mode")
+                        .selected_text(self.delimiter_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in DelimiterMode::ALL {
+                                ui.selectable_value(&mut self.delimiter_mode, mode, mode.label());
+                            }
+                        })
+                        .response
+                        .labelled_by(delimiter_label.id);
+
+                    let header_label = ui.label("Header");
+                    let _ = egui::ComboBox::from_id_salt("quarry-header-mode")
+                        .selected_text(header_mode_label(self.header_mode))
+                        .show_ui(ui, |ui| {
+                            for mode in
+                                [HeaderMode::Auto, HeaderMode::FirstRow, HeaderMode::NoHeader]
+                            {
+                                ui.selectable_value(
+                                    &mut self.header_mode,
+                                    mode,
+                                    header_mode_label(mode),
+                                );
+                            }
+                        })
+                        .response
+                        .labelled_by(header_label.id);
+
+                    if ui
+                        .add_enabled(self.document.is_some(), egui::Button::new("Apply / Reopen"))
+                        .clicked()
+                    {
+                        action = Some(Action::Reopen);
+                    }
+                });
 
                 if let Some(document) = &self.document {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let progress = document.indexed_fraction();
-                        let status = if document.progress.cancelled {
-                            "Index cancelled"
-                        } else if document.is_indexing() {
-                            "Indexing"
-                        } else {
-                            "Index complete"
-                        };
+                        let status = document.index_status();
                         ui.add(
                             egui::ProgressBar::new(progress)
                                 .desired_width((ui.available_width() - 104.0).max(160.0))
@@ -225,6 +339,17 @@ impl eframe::App for QuarryApp {
                         ui.label(format_bytes(document.session.file_size));
                         ui.separator();
                         ui.label(format!("{} columns", document.total_columns));
+                        ui.separator();
+                        ui.label(format!(
+                            "{} delimiter",
+                            display_delimiter(document.session.dialect.delimiter)
+                        ));
+                        ui.separator();
+                        ui.label(if document.session.dialect.has_header {
+                            "header row"
+                        } else {
+                            "no header"
+                        });
                         ui.separator();
                         ui.label(format!(
                             "{} data rows indexed",
@@ -280,12 +405,68 @@ impl eframe::App for QuarryApp {
         if grid_error.is_some() {
             self.notice = grid_error;
         }
+        if self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.job.is_some())
+        {
+            ctx.request_repaint_after(POLL_INTERVAL);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DelimiterMode {
+    Auto,
+    Comma,
+    Tab,
+    Pipe,
+    Semicolon,
+}
+
+impl DelimiterMode {
+    const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Comma,
+        Self::Tab,
+        Self::Pipe,
+        Self::Semicolon,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Comma => "Comma",
+            Self::Tab => "Tab",
+            Self::Pipe => "Pipe",
+            Self::Semicolon => "Semicolon",
+        }
+    }
+
+    fn delimiter(self) -> Option<u8> {
+        match self {
+            Self::Auto => None,
+            Self::Comma => Some(b','),
+            Self::Tab => Some(b'\t'),
+            Self::Pipe => Some(b'|'),
+            Self::Semicolon => Some(b';'),
+        }
+    }
+}
+
+fn header_mode_label(mode: HeaderMode) -> &'static str {
+    match mode {
+        HeaderMode::Auto => "Auto",
+        HeaderMode::FirstRow => "First row is header",
+        HeaderMode::NoHeader => "No header",
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     Open,
+    Choose,
+    Reopen,
     PageUp,
     PageDown,
     Jump,
@@ -310,13 +491,20 @@ struct Document {
 }
 
 impl Document {
-    fn open(path: &Path) -> Result<Self, String> {
+    #[cfg(test)]
+    fn open(path: &Path, options: OpenOptions) -> Result<Self, String> {
+        let mut document = Self::prepare(path, options)?;
+        document.start_indexing()?;
+        Ok(document)
+    }
+
+    fn prepare(path: &Path, options: OpenOptions) -> Result<Self, String> {
         let buffer_rows = INITIAL_VISIBLE_ROWS + 2 * OVERSCAN_ROWS;
         let session = Session::open(
             path,
             OpenOptions {
                 rows: buffer_rows + 1,
-                ..OpenOptions::default()
+                ..options
             },
         )
         .map_err(|error| error.to_string())?;
@@ -335,14 +523,18 @@ impl Document {
             .take(buffer_rows)
             .cloned()
             .collect();
-        let job = session
-            .start_indexing(IndexConfig::default())
-            .map_err(|error| error.to_string())?;
-        let progress = job.progress();
+        let progress = IndexProgress {
+            bytes_scanned: 0,
+            rows_scanned: 0,
+            file_size: session.file_size,
+            elapsed: Duration::ZERO,
+            done: false,
+            cancelled: false,
+        };
 
         Ok(Self {
             session,
-            job: Some(job),
+            job: None,
             index: None,
             progress,
             headers,
@@ -354,19 +546,31 @@ impl Document {
             visible_rows: INITIAL_VISIBLE_ROWS,
             scroll_points: 0.0,
             last_viewport_read: None,
-            last_poll: Instant::now(),
+            last_poll: Instant::now() - POLL_INTERVAL,
         })
     }
 
+    fn start_indexing(&mut self) -> Result<(), String> {
+        let job = self
+            .session
+            .start_indexing(IndexConfig::default())
+            .map_err(|error| error.to_string())?;
+        self.progress = job.progress();
+        self.job = Some(job);
+        self.last_poll = Instant::now() - POLL_INTERVAL;
+        Ok(())
+    }
+
     fn poll(&mut self) -> Result<(), String> {
-        if self.last_poll.elapsed() < POLL_INTERVAL {
-            return Ok(());
-        }
-        self.last_poll = Instant::now();
         let Some(job) = &self.job else {
             return Ok(());
         };
-        self.progress = job.progress();
+        let progress = job.progress();
+        if self.last_poll.elapsed() < POLL_INTERVAL && !progress.done {
+            return Ok(());
+        }
+        self.last_poll = Instant::now();
+        self.progress = progress;
         if self.progress.done {
             let job = self.job.take().expect("index job is present");
             self.index = Some(job.wait().map_err(|error| error.to_string())?);
@@ -376,6 +580,24 @@ impl Document {
 
     fn is_indexing(&self) -> bool {
         self.job.is_some() && !self.progress.done
+    }
+
+    fn index_status(&self) -> &'static str {
+        if self.job.is_none() && self.index.is_none() {
+            "Index failed"
+        } else if self.progress.cancelled {
+            "Index cancelled"
+        } else if self.job.is_some() {
+            "Indexing"
+        } else {
+            "Index complete"
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(job) = self.job.take() {
+            drop(job);
+        }
     }
 
     fn cancel(&self) {
@@ -397,7 +619,11 @@ impl Document {
     }
 
     fn indexed_fraction(&self) -> f32 {
-        self.progress.bytes_scanned as f32 / self.session.file_size.max(1) as f32
+        if self.session.file_size == 0 && (self.progress.done || self.index.is_some()) {
+            1.0
+        } else {
+            self.progress.bytes_scanned as f32 / self.session.file_size.max(1) as f32
+        }
     }
 
     fn set_visible_rows(&mut self, visible_rows: usize) -> Result<(), String> {
@@ -840,6 +1066,16 @@ fn field_text(field: &[u8]) -> String {
     }
 }
 
+fn display_delimiter(delimiter: u8) -> &'static str {
+    match delimiter {
+        b',' => "comma",
+        b'\t' => "tab",
+        b'|' => "pipe",
+        b';' => "semicolon",
+        _ => "custom",
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -855,11 +1091,12 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use std::fs::{self, File};
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        Document, logical_viewport_start, max_viewport_start, parse_data_row,
-        row_for_scroll_fraction, scroll_fraction_for_row,
+        DelimiterMode, Document, HeaderMode, IndexConfig, OpenOptions, QuarryApp,
+        logical_viewport_start, max_viewport_start, parse_data_row, row_for_scroll_fraction,
+        scroll_fraction_for_row,
     };
 
     #[test]
@@ -941,7 +1178,7 @@ mod tests {
         }
         drop(file);
 
-        let mut document = Document::open(&path).unwrap();
+        let mut document = Document::open(&path, OpenOptions::default()).unwrap();
         let index = document.job.take().unwrap().wait().unwrap();
 
         document.progress.rows_scanned = document.session.first_rows.len() as u64;
@@ -1005,7 +1242,7 @@ mod tests {
         writeln!(file, "21,121,visible").unwrap();
         drop(file);
 
-        let mut document = Document::open(&path).unwrap();
+        let mut document = Document::open(&path, OpenOptions::default()).unwrap();
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.total_columns, 2);
 
@@ -1024,6 +1261,38 @@ mod tests {
     }
 
     #[test]
+    fn late_index_error_is_reported_as_failed() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-malformed-{name}.csv"));
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "name,value").unwrap();
+        for _ in 0..300_000 {
+            file.write_all(b"a,1\n").unwrap();
+        }
+        file.write_all(b"\"unterminated").unwrap();
+        drop(file);
+
+        let mut document = Document::open(&path, OpenOptions::default()).unwrap();
+        document.last_poll = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !document.job.as_ref().unwrap().progress().done {
+            assert!(Instant::now() < deadline, "malformed indexing timed out");
+            std::thread::yield_now();
+        }
+        document.cancel();
+        let error = document.poll().unwrap_err();
+
+        assert!(error.contains("unterminated quoted field"));
+        assert!(document.job.is_none());
+        assert!(document.index.is_none());
+        assert_eq!(document.index_status(), "Index failed");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn empty_file_has_no_active_row() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1032,15 +1301,163 @@ mod tests {
         let path = std::env::temp_dir().join(format!("quarry-empty-{name}.csv"));
         File::create(&path).unwrap();
 
-        let mut document = Document::open(&path).unwrap();
-        let index = document.job.take().unwrap().wait().unwrap();
-        document.index = Some(index);
+        let mut document = Document::prepare(&path, OpenOptions::default()).unwrap();
+        assert!(document.job.is_none());
+        document.start_indexing().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !document.job.as_ref().unwrap().progress().done {
+            assert!(Instant::now() < deadline, "empty file indexing timed out");
+            std::thread::yield_now();
+        }
+        document.poll().unwrap();
         document.set_visible_rows(25).unwrap();
 
+        assert!(document.job.is_none());
+        assert!(document.index.is_some());
+        assert_eq!(document.index_status(), "Index complete");
+        assert_eq!(document.indexed_fraction(), 1.0);
         assert_eq!(document.available_data_rows(), 0);
         assert!(document.visible_rows().is_empty());
         assert_eq!(document.display_start(), 0);
         assert_eq!(document.display_end(), 0);
+        document.index = None;
+        assert_eq!(document.index_status(), "Index failed");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn replaces_a_document_while_its_indexer_is_active() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first = std::env::temp_dir().join(format!("quarry-active-{name}-first.csv"));
+        let second = std::env::temp_dir().join(format!("quarry-active-{name}-second.csv"));
+        fs::write(&first, b"a,b\n".repeat(250_000)).unwrap();
+        fs::write(&second, b"name,value\nsecond,2\n").unwrap();
+
+        let mut current = Document::prepare(&first, OpenOptions::default()).unwrap();
+        let job = current
+            .session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 1,
+                checkpoint_every: 8,
+                memory_budget_bytes: 64 * 1024,
+            })
+            .unwrap();
+        current.progress = job.progress();
+        current.job = Some(job);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let progress = loop {
+            let progress = current.job.as_ref().unwrap().progress();
+            if progress.rows_scanned >= 100 || progress.done {
+                break progress;
+            }
+            assert!(Instant::now() < deadline, "index did not make progress");
+            std::thread::yield_now();
+        };
+        assert!(!progress.done, "test file indexed before replacement");
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.document = Some(current);
+        app.open_path(second.clone()).unwrap();
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), second);
+        assert_eq!(document.buffered_rows[0].fields[0], b"second");
+
+        app.document.as_mut().unwrap().shutdown();
+        drop(app);
+        for path in [first, second] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_and_cancelled_opens_preserve_the_document_and_drops_open_one_file() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first = std::env::temp_dir().join(format!("quarry-open-{name}-first.csv"));
+        let second = std::env::temp_dir().join(format!("quarry-open-{name}-second.csv"));
+        let malformed = std::env::temp_dir().join(format!("quarry-open-{name}-bad.csv"));
+        fs::write(&first, b"name,value\nfirst,1\n").unwrap();
+        fs::write(&second, b"name,value\nsecond,2\n").unwrap();
+        fs::write(&malformed, b"\"unterminated").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.path_input = format!("  {}\n", first.display());
+        app.open_typed_path();
+        assert!(app.notice.is_none());
+        app.open_picker_result(None);
+        assert_eq!(app.document.as_ref().unwrap().session.path(), first);
+
+        app.open_path_and_report(malformed.clone());
+        assert_eq!(app.document.as_ref().unwrap().session.path(), first);
+        assert!(app.notice.as_deref().unwrap().contains("unterminated"));
+
+        app.handle_dropped_paths(vec![Some(second.clone()), Some(first.clone())]);
+        assert_eq!(app.document.as_ref().unwrap().session.path(), second);
+        assert!(app.notice.as_deref().unwrap().contains("ignored 1"));
+
+        app.handle_dropped_paths(vec![None]);
+        assert_eq!(app.document.as_ref().unwrap().session.path(), second);
+        assert!(app.notice.as_deref().unwrap().contains("local file"));
+
+        app.document.as_mut().unwrap().shutdown();
+        drop(app);
+        for path in [first, second, malformed] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn format_changes_wait_for_reopen() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-format-{name}.csv"));
+        fs::write(&path, b"name,value\nfirst,1\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path(path.clone()).unwrap();
+        assert_eq!(
+            app.document.as_ref().unwrap().session.dialect.delimiter,
+            b','
+        );
+        assert!(app.document.as_ref().unwrap().session.dialect.has_header);
+
+        app.delimiter_mode = DelimiterMode::Tab;
+        app.header_mode = HeaderMode::NoHeader;
+        assert_eq!(
+            app.document.as_ref().unwrap().session.dialect.delimiter,
+            b','
+        );
+        assert!(app.document.as_ref().unwrap().session.dialect.has_header);
+
+        app.reopen_document();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), path);
+        assert_eq!(document.session.dialect.delimiter, b'\t');
+        assert!(!document.session.dialect.has_header);
+        assert_eq!(document.headers, ["Column 1"]);
+        assert_eq!(document.buffered_rows[0].fields[0], b"name,value");
+
+        app.delimiter_mode = DelimiterMode::Comma;
+        app.header_mode = HeaderMode::FirstRow;
+        app.reopen_document();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.headers, ["name", "value"]);
+        assert_eq!(document.buffered_rows[0].fields[0], b"first");
+        assert_eq!(document.buffered_rows[0].fields[1], b"1");
+        assert_eq!(DelimiterMode::Pipe.delimiter(), Some(b'|'));
+        assert_eq!(DelimiterMode::Semicolon.delimiter(), Some(b';'));
+
+        app.document.as_mut().unwrap().shutdown();
+        drop(app);
         fs::remove_file(path).unwrap();
     }
 

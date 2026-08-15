@@ -153,6 +153,7 @@ impl IndexJob {
         config: IndexConfig,
     ) -> Result<Self, QuarryError> {
         let index = StructuralIndex::new(config)?;
+        let file = File::open(path)?;
         let shared = Arc::new(SharedState {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
@@ -168,7 +169,7 @@ impl IndexJob {
         let handle = thread::Builder::new()
             .name("quarry-index".into())
             .spawn(move || {
-                let result = run_indexer(path, delimiter, config, &worker_state);
+                let result = run_indexer(file, delimiter, config, &worker_state);
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
                 }
@@ -240,12 +241,11 @@ impl Drop for IndexJob {
 }
 
 fn run_indexer(
-    path: PathBuf,
+    mut file: File,
     delimiter: u8,
     config: IndexConfig,
     shared: &SharedState,
 ) -> Result<(), QuarryError> {
-    let mut file = File::open(path)?;
     let mut scanner = RecordScanner::new(delimiter)?;
     let mut chunk = vec![0; config.chunk_bytes];
     let mut absolute_start = 0;
@@ -287,7 +287,13 @@ fn run_indexer(
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexConfig, StructuralIndex};
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use super::{IndexConfig, IndexJob, StructuralIndex};
 
     #[test]
     fn compacts_checkpoints_to_stay_under_budget() {
@@ -307,5 +313,47 @@ mod tests {
             index.nearest_checkpoint(100).row % index.checkpoint_every,
             0
         );
+    }
+
+    #[test]
+    fn dropping_an_active_job_cancels_and_joins_its_worker() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-drop-{name}.csv"));
+        let contents = b"a,b\n".repeat(250_000);
+        let file_size = contents.len() as u64;
+        fs::write(&path, contents).unwrap();
+
+        let job = IndexJob::start(
+            path.clone(),
+            file_size,
+            b',',
+            IndexConfig {
+                chunk_bytes: 1,
+                checkpoint_every: 8,
+                memory_budget_bytes: 64 * 1024,
+            },
+        )
+        .unwrap();
+        let shared = Arc::clone(&job.shared);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let progress = loop {
+            let progress = job.progress();
+            if progress.rows_scanned >= 100 || progress.done {
+                break progress;
+            }
+            assert!(Instant::now() < deadline, "index did not make progress");
+            thread::yield_now();
+        };
+        assert!(!progress.done, "test file indexed before drop");
+
+        drop(job);
+
+        assert!(shared.cancelled.load(Ordering::Acquire));
+        assert!(shared.done.load(Ordering::Acquire));
+        assert!(shared.finished_nanos.load(Ordering::Acquire) > 0);
+        fs::remove_file(path).unwrap();
     }
 }

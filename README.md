@@ -45,18 +45,24 @@ The data engine is written in **Rust**. A measured egui/AppKit bake-off selected
 
 The Rust engine and CLI prove progressive opening, correct delimited parsing,
 bounded structural indexing, deterministic fixture generation, and row-range
-navigation. Phase 2 selected egui; Phase 3 will turn that candidate into the
-viewer alpha.
+navigation. The Phase 3 egui viewer alpha now has continuous scrolling, native
+file opening, drag and drop, and delimiter/header controls.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
 ```
 
-Launch the selected egui prototype (it is not the viewer alpha yet):
+Launch the egui viewer alpha with or without a CLI path:
 
 ```bash
+cargo run --release -p quarry-egui
 cargo run --release -p quarry-egui -- huge.csv
 ```
+
+Use **Choose…** for the native macOS picker, drop one local file onto the
+window, or type a path and select **Open**. Current delimiter and header
+selections apply to newly opened files; changes to the open document wait for
+**Apply / Reopen**.
 
 The measured native comparator remains runnable for bake-off reproduction:
 

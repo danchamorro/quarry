@@ -9,3 +9,4 @@ rust-version.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
 quarry-core = { path = "../../crates/quarry-core" }
+rfd = { version = "0.17.2", default-features = false }

@@ -9,7 +9,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 0 — Foundation | Complete | Rust workspace, CI, deterministic generator, ADR, licensing, and the [12 GB benchmark](benchmarks/2026-08-14-large-file.md) |
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
-| Phase 3 — Viewer alpha | In progress | Continuous, bounded-memory logical scrolling is implemented and measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md) |
+| Phase 3 — Viewer alpha | In progress | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md) |
 
 ### Phase 1 checklist
 
@@ -55,13 +55,24 @@ pacing becomes measurable with the viewer-alpha grid.
   with regression tests.
 - [x] Record 12 GB continuous-scroll latency, memory, frame-pacing, and final-row
   correctness evidence.
-- [ ] Complete the remaining viewer-alpha grid and file controls.
+- [x] Open local files through a native picker, typed or CLI paths, and one-file
+  drag and drop without replacing a valid document on picker cancellation or an
+  open or index-start failure.
+- [x] Apply Auto, comma, tab, pipe, and semicolon delimiter modes plus Auto,
+  first-row, and no-header modes to the current file only through an explicit
+  reopen.
+- [x] Start a replacement indexer successfully, then cancel and join the prior
+  worker before installing it as the current document.
+- [ ] Benchmark live-index snapshot latency and indexing throughput together
+  before tuning the structural-index lock window.
+- [ ] Complete viewer-alpha grid controls, copying, and streaming search.
 
-**Phase 3 in progress:** this vertical slice provides file-level continuous
-scrolling while indexing expands the available range without changing the
-current row. The [12 GB run](benchmarks/2026-08-15-continuous-scroll.md) records
-no animation hitches and stays below the memory ceiling. Search, filtering,
-editing, and cosmetic redesign remain outside this slice.
+**Phase 3 in progress:** the viewer now provides bounded file-level continuous
+scrolling plus native opening and explicit format controls. The
+[12 GB scroll run](benchmarks/2026-08-15-continuous-scroll.md) and
+[file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md) record
+the current evidence. Grid controls, copying, and streaming search remain;
+filtering, editing, export, and cosmetic redesign stay outside this slice.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
