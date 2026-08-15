@@ -270,7 +270,7 @@ fn materialize_rows(bytes: &[u8], ends: &[u64], delimiter: u8) -> Result<Vec<Row
 
 fn detect_delimiter(sample: &[u8]) -> u8 {
     let mut best = (0_usize, 0_usize, b',');
-    for delimiter in [b',', b'\t', b'|', b';'] {
+    for delimiter in *b",\t|;" {
         let Ok(mut scanner) = RecordScanner::new(delimiter) else {
             continue;
         };
