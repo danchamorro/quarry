@@ -2,14 +2,14 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress — 2026-08-14
+## Current progress — 2026-08-15
 
 | Phase | Status | Evidence |
 |---|---|---|
 | Phase 0 — Foundation | Complete | Rust workspace, CI, deterministic generator, ADR, licensing, and the [12 GB benchmark](benchmarks/2026-08-14-large-file.md) |
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
-| Phase 3 — Viewer alpha | Next | Extend the selected egui candidate into a useful file viewer |
+| Phase 3 — Viewer alpha | In progress | Continuous, bounded-memory logical scrolling is implemented and measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md) |
 
 ### Phase 1 checklist
 
@@ -41,6 +41,27 @@ application cache.
 memory target and remain responsive under bounded navigation and viewport
 scrolling. egui is selected for Phase 3; continuous file-level scroll frame
 pacing becomes measurable with the viewer-alpha grid.
+
+### Phase 3 checklist
+
+- [x] Replace visible previous/next paging with continuous row scrolling.
+- [x] Map one scrollbar over the indexed row range without file-sized pixel
+  content.
+- [x] Keep the header visible and retain horizontal scrolling, row jump, and
+  Page Up/Page Down navigation.
+- [x] Materialize only the visible rows plus a two-row overscan on each side.
+- [x] Cover progressive refill, wheel and page movement, empty files, first,
+  midpoint, final, 117-million-row, overflow, and exact-final-record behavior
+  with regression tests.
+- [x] Record 12 GB continuous-scroll latency, memory, frame-pacing, and final-row
+  correctness evidence.
+- [ ] Complete the remaining viewer-alpha grid and file controls.
+
+**Phase 3 in progress:** this vertical slice provides file-level continuous
+scrolling while indexing expands the available range without changing the
+current row. The [12 GB run](benchmarks/2026-08-15-continuous-scroll.md) records
+no animation hitches and stays below the memory ceiling. Search, filtering,
+editing, and cosmetic redesign remain outside this slice.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
