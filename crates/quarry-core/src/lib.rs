@@ -74,10 +74,19 @@ impl From<ParseError> for QuarryError {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderMode {
+    #[default]
+    Auto,
+    FirstRow,
+    NoHeader,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
     pub rows: usize,
     pub delimiter: Option<u8>,
+    pub header_mode: HeaderMode,
     pub sample_bytes: usize,
     pub bootstrap_limit: usize,
 }
@@ -87,6 +96,7 @@ impl Default for OpenOptions {
         Self {
             rows: 100,
             delimiter: None,
+            header_mode: HeaderMode::Auto,
             sample_bytes: DEFAULT_SAMPLE_BYTES,
             bootstrap_limit: DEFAULT_BOOTSTRAP_LIMIT,
         }
@@ -162,7 +172,11 @@ impl Session {
         )?;
         let first_rows =
             materialize_rows(&bootstrap, &ends[..ends.len().min(options.rows)], delimiter)?;
-        let has_header = detect_header(&first_rows);
+        let has_header = match options.header_mode {
+            HeaderMode::Auto => detect_header(&first_rows),
+            HeaderMode::FirstRow => true,
+            HeaderMode::NoHeader => false,
+        };
 
         Ok(Self {
             path: path.as_ref().to_path_buf(),
@@ -485,17 +499,17 @@ fn read_up_to(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<usize> {
 mod tests {
     use std::fs::{self, File};
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
 
-    use super::{IndexConfig, OpenOptions, QuarryError, Session};
+    use super::{HeaderMode, IndexConfig, OpenOptions, QuarryError, Session};
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn fixture(bytes: &[u8]) -> std::path::PathBuf {
-        let name = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("quarry-{name}.csv"));
+        let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("quarry-{}-{id}.csv", std::process::id()));
         let mut file = File::create(&path).unwrap();
         file.write_all(bytes).unwrap();
         path
@@ -530,6 +544,18 @@ mod tests {
         assert_eq!(rows[0].fields[0], b"multi\nline");
         assert_eq!(rows[1].fields[0], b"c");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn starting_indexing_reports_a_missing_file_synchronously() {
+        let path = fixture(b"name,value\na,1\n");
+        let session = Session::open(&path, OpenOptions::default()).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(matches!(
+            session.start_indexing(IndexConfig::default()),
+            Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
@@ -578,6 +604,56 @@ mod tests {
     }
 
     #[test]
+    fn applies_delimiter_and_header_overrides() {
+        let path = fixture(b"1\t2\n3\t4\n");
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                delimiter: Some(b'\t'),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(session.dialect.delimiter, b'\t');
+        assert!(session.dialect.has_header);
+        fs::remove_file(path).unwrap();
+
+        let path = fixture(b"name;value\na;1\n");
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                delimiter: Some(b';'),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(session.dialect.delimiter, b';');
+        assert!(!session.dialect.has_header);
+        assert_eq!(
+            session.first_rows[0].fields,
+            [b"name".to_vec(), b"value".to_vec()]
+        );
+        fs::remove_file(path).unwrap();
+
+        let path = fixture(b"name|value\na|1\n");
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                delimiter: Some(b'|'),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(session.dialect.delimiter, b'|');
+        assert_eq!(session.first_rows[1].fields[0], b"a");
+        assert_eq!(session.first_rows[1].fields[1], b"1");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn detects_tab_delimiter_and_bounds_bootstrap() {
         let path = fixture(b"a\tb\n1\t2\n");
         let session = Session::open(&path, OpenOptions::default()).unwrap();
@@ -592,6 +668,7 @@ mod tests {
                 sample_bytes: 32,
                 bootstrap_limit: 64,
                 delimiter: Some(b','),
+                header_mode: HeaderMode::Auto,
             },
         )
         .unwrap_err();
