@@ -816,7 +816,7 @@ fn configure_style(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::light();
     visuals.override_text_color = Some(Color32::from_rgb(24, 35, 42));
     visuals.selection.bg_fill = Color32::from_rgb(49, 85, 217);
-    visuals.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.inactive.bg_fill = Color32::from_rgb(238, 242, 244);
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(220, 228, 233);
     visuals.widgets.active.bg_fill = Color32::from_rgb(204, 218, 227);
@@ -830,7 +830,7 @@ fn panel_frame(fill: Color32) -> egui::Frame {
     egui::Frame::new()
         .fill(fill)
         .inner_margin(egui::Margin::symmetric(14, 10))
-        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(200, 209, 213)))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 209, 213)))
 }
 
 fn field_text(field: &[u8]) -> String {
