@@ -105,13 +105,15 @@ than claiming equal throughput across datasets.
 
 ## Cancellation
 
-| Dataset | Requested | Final bytes | Search elapsed | Cancel-and-join latency | Outcome | Peak RSS |
+| Dataset | Requested | Final bytes | Search elapsed | Poll-inclusive cancellation latency | Outcome | Peak RSS |
 |---|---:|---:|---:|---:|---|---:|
 | Deterministic 1 GB | 64 MiB | 65 MiB | 0.117 s | 1.266 ms | Cancelled | 4.02 MiB |
 | 12 GB reference | 64 MiB | 65 MiB | 0.251 s | 2.534 ms | Cancelled | 3.95 MiB |
 
 The one-chunk overshoot is expected because the coordinator observes progress
-between worker publications. Both workers stopped far before EOF.
+between worker publications. The coordinator polls every 1 ms, so each latency
+also includes the final polling and scheduler observation delay. Both workers
+stopped far before EOF.
 
 ## Acceptance
 
@@ -120,7 +122,8 @@ The implementation passes the predeclared gates:
 - decoded quoted and multiline probes match the exact data row and column;
 - both row-1 probes complete below 100 ms after the index prepass;
 - absent scans report Not found only after exact EOF byte and record counts;
-- both cancellation runs join below 100 ms and stop before EOF;
+- both poll-inclusive cancellation measurements remain below 100 ms, and both
+  runs stop before EOF;
 - both peak RSS measurements remain below 500 MiB;
 - 12 GB peak RSS does not exceed 1 GB peak RSS by more than 32 MiB.
 

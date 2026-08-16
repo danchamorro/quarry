@@ -73,8 +73,8 @@ pacing becomes measurable with the viewer-alpha grid.
 - [x] Add literal, case-sensitive Find Next over decoded cells with background
   progress, cancellation, same-query resume, and direct row-and-column reveal.
 - [x] Record quoted/multiline correctness on a deterministic fixture, plus
-  complete-scan throughput, cancellation, and file-size-independent memory on
-  deterministic and 12 GB datasets in the
+  complete-scan throughput, cancellation, and measured peak RSS on the
+  deterministic 1 GB and 12 GB datasets in the
   [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md).
 - [ ] Add bounded copying for selected cells and rows.
 - [ ] Complete the remaining viewer-alpha column controls.

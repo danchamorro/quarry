@@ -171,7 +171,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
             requested_at
         );
         println!(
-            "Cancellation latency: {:.3} ms",
+            "Poll-inclusive cancellation latency: {:.3} ms",
             latency.as_secs_f64() * 1000.0
         );
     }
