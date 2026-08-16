@@ -6,4 +6,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+memchr.workspace = true
 quarry-delimited = { path = "../quarry-delimited" }

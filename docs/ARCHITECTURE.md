@@ -76,7 +76,17 @@ File chunks, row boundaries, decoded visible cells, search results, and filter m
 Rust workers handle indexing, search, filters, sorting, export, and prefetching. Evaluate `rayon` for suitable CPU-parallel work, but use explicit coordination where cancellation/lifecycle control requires it. Every long operation must be cancellable.
 
 ## Search and filters
-Search begins as a high-throughput sequential scan that streams matches incrementally. Filters can use streaming predicates and compact row/chunk selection metadata instead of copying matching rows.
+Literal Find Next uses a cancellable core worker after structural indexing. It
+starts at the nearest row checkpoint, scans fixed 1 MiB chunks with the shared
+delimited-record scanner, parses one bounded record at a time, and retains only
+the first decoded-cell match. The job publishes byte/row progress and joins its
+worker on wait or drop. Memory therefore depends on the query, the fixed chunk,
+the 64 MiB maximum record and its decoded fields, one match, and the bounded
+structural index—not on file size or match count.
+
+The first slice is case-sensitive and does not wrap or collect results. Filters
+can later use streaming predicates and compact row/chunk selection metadata
+instead of copying matching rows.
 
 ## Sorting
 Use a disk-aware external merge sort: bounded runs, sort in memory, spill to temporary storage, then merge into a stable row-order abstraction. Sorting must not delay the first performance milestone.

@@ -254,9 +254,8 @@ pub fn parse_record(record: &[u8], delimiter: u8) -> Result<Vec<Cow<'_, [u8]>>, 
                 let quote = cursor + relative;
 
                 if record.get(quote + 1) == Some(&b'"') {
-                    let output = unescaped.get_or_insert_with(|| {
-                        Vec::with_capacity(record.len().saturating_sub(content_start))
-                    });
+                    let output = unescaped
+                        .get_or_insert_with(|| Vec::with_capacity(quote - content_start + 1));
                     output.extend_from_slice(&record[segment_start..quote]);
                     output.push(b'"');
                     cursor = quote + 2;
@@ -391,6 +390,30 @@ mod tests {
         let parsed = parse_record(&record, b',').unwrap();
         assert_eq!(parsed[0].as_ref(), field);
         assert_eq!(parsed[1].as_ref(), b"tail");
+    }
+
+    #[test]
+    fn escaped_fields_allocate_in_proportion_to_the_record() {
+        let mut record = Vec::new();
+        for field in 0..128 {
+            if field > 0 {
+                record.push(b',');
+            }
+            record.extend_from_slice(b"\"a\"\"b\"");
+        }
+
+        let parsed = parse_record(&record, b',').unwrap();
+        let total_capacity = parsed
+            .iter()
+            .map(|field| match field {
+                Cow::Borrowed(_) => 0,
+                Cow::Owned(bytes) => bytes.capacity(),
+            })
+            .sum::<usize>();
+
+        assert_eq!(parsed.len(), 128);
+        assert!(parsed.iter().all(|field| field.as_ref() == b"a\"b"));
+        assert!(total_capacity <= record.len() * 4);
     }
 
     #[test]

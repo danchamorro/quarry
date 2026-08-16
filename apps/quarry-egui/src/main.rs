@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
 use quarry_core::{
-    HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, Row, Session, StructuralIndex,
+    HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, Row, SearchJob, SearchMatch,
+    SearchOutcome, SearchPosition, SearchProgress, Session, StructuralIndex,
 };
 
 const INITIAL_VISIBLE_ROWS: usize = 15;
@@ -42,6 +43,7 @@ fn main() -> eframe::Result<()> {
 struct QuarryApp {
     path_input: String,
     jump_input: String,
+    find_input: String,
     delimiter_mode: DelimiterMode,
     header_mode: HeaderMode,
     document: Option<Document>,
@@ -59,6 +61,7 @@ impl QuarryApp {
         let mut app = Self {
             path_input,
             jump_input: "1".into(),
+            find_input: String::new(),
             delimiter_mode: DelimiterMode::Auto,
             header_mode: HeaderMode::Auto,
             document: None,
@@ -166,8 +169,17 @@ impl QuarryApp {
             Action::Open | Action::Choose | Action::Reopen => unreachable!(),
             Action::PageUp => document.page(-1),
             Action::PageDown => document.page(1),
+            Action::FirstColumns => {
+                document.show_first_columns();
+                Ok(())
+            }
             Action::Jump => parse_data_row(&self.jump_input, document.data_start)
                 .and_then(|start| document.navigate(start)),
+            Action::FindNext => document.start_find_next(self.find_input.as_bytes()),
+            Action::CancelSearch => {
+                document.cancel_search();
+                Ok(())
+            }
             Action::Cancel => {
                 document.cancel();
                 Ok(())
@@ -201,6 +213,11 @@ impl eframe::App for QuarryApp {
 
         if let Some(document) = &mut self.document
             && let Err(error) = document.poll()
+        {
+            self.notice = Some(error);
+        }
+        if let Some(document) = &mut self.document
+            && let Err(error) = document.poll_search()
         {
             self.notice = Some(error);
         }
@@ -319,7 +336,27 @@ impl eframe::App for QuarryApp {
                         if let Some(page_action) = page_controls(ui) {
                             action = Some(page_action);
                         }
+                        if let Some(column_action) =
+                            column_window_controls(ui, document.column_start)
+                        {
+                            action = Some(column_action);
+                        }
                     });
+                    ui.add_space(6.0);
+                    let search_progress = document.search_progress();
+                    let search_status = document.search_status.as_deref().or_else(|| {
+                        (!document.is_search_ready())
+                            .then_some("Search is available after indexing completes.")
+                    });
+                    if let Some(search_action) = search_controls(
+                        ui,
+                        &mut self.find_input,
+                        document.is_search_ready(),
+                        search_progress.as_ref(),
+                        search_status,
+                    ) {
+                        action = Some(search_action);
+                    }
                 }
 
                 if let Some(notice) = &self.notice {
@@ -405,7 +442,7 @@ impl eframe::App for QuarryApp {
         if self
             .document
             .as_ref()
-            .is_some_and(|document| document.job.is_some())
+            .is_some_and(|document| document.job.is_some() || document.search_job.is_some())
         {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
@@ -466,7 +503,10 @@ enum Action {
     Reopen,
     PageUp,
     PageDown,
+    FirstColumns,
     Jump,
+    FindNext,
+    CancelSearch,
     Cancel,
 }
 
@@ -482,13 +522,83 @@ fn page_controls(ui: &mut egui::Ui) -> Option<Action> {
     }
 }
 
+fn column_window_controls(ui: &mut egui::Ui, column_start: usize) -> Option<Action> {
+    (column_start > 0 && ui.button("First columns").clicked()).then_some(Action::FirstColumns)
+}
+
+fn search_controls(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    index_ready: bool,
+    progress: Option<&SearchProgress>,
+    status: Option<&str>,
+) -> Option<Action> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        let searching = progress.is_some();
+        let label = ui.label("Find (literal, case-sensitive)");
+        let input = ui
+            .add_enabled(
+                !searching,
+                egui::TextEdit::singleline(query).hint_text("Text to find"),
+            )
+            .labelled_by(label.id);
+        let can_find = index_ready && !searching && !query.is_empty();
+        if ui
+            .add_enabled(can_find, egui::Button::new("Find Next"))
+            .clicked()
+            || (can_find
+                && input.lost_focus()
+                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+        {
+            action = Some(Action::FindNext);
+        }
+
+        if let Some(progress) = progress {
+            let fraction = if progress.total_bytes == 0 {
+                if progress.done { 1.0 } else { 0.0 }
+            } else {
+                (progress.bytes_scanned as f32 / progress.total_bytes as f32).clamp(0.0, 1.0)
+            };
+            let text = if progress.cancelled {
+                format!("Cancelling search · {:.1}%", fraction * 100.0)
+            } else {
+                format!("Searching · {:.1}%", fraction * 100.0)
+            };
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_width(180.0)
+                    .text(text),
+            );
+            if ui
+                .add_enabled(!progress.cancelled, egui::Button::new("Cancel Search"))
+                .clicked()
+            {
+                action = Some(Action::CancelSearch);
+            }
+        } else if let Some(status) = status {
+            let response = ui.label(status);
+            let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_live(egui::accesskit::Live::Polite);
+            });
+        }
+    });
+    action
+}
+
 struct Document {
     session: Session,
     job: Option<IndexJob>,
     index: Option<StructuralIndex>,
     progress: IndexProgress,
+    search_job: Option<SearchJob>,
+    search_query: Vec<u8>,
+    last_match: Option<SearchMatch>,
+    search_status: Option<String>,
+    reveal_cell: Option<(u64, usize)>,
     headers: Vec<String>,
     total_columns: usize,
+    column_start: usize,
     data_start: u64,
     viewport_start: u64,
     buffer_start: u64,
@@ -524,7 +634,7 @@ impl Document {
             .map(|row| row.fields.len())
             .max()
             .unwrap_or(0);
-        let headers = headers_for(&session, total_columns);
+        let headers = headers_for(&session, total_columns, 0);
         let buffered_rows = session
             .first_rows
             .iter()
@@ -546,8 +656,14 @@ impl Document {
             job: None,
             index: None,
             progress,
+            search_job: None,
+            search_query: Vec::new(),
+            last_match: None,
+            search_status: None,
+            reveal_cell: None,
             headers,
             total_columns,
+            column_start: 0,
             data_start,
             viewport_start: data_start,
             buffer_start: data_start,
@@ -587,6 +703,101 @@ impl Document {
         Ok(())
     }
 
+    fn start_find_next(&mut self, query: &[u8]) -> Result<(), String> {
+        if query.is_empty() {
+            return Err("Enter text to find.".into());
+        }
+        if self.search_job.is_some() {
+            return Err("A search is already running.".into());
+        }
+        if !self.is_search_ready() {
+            return Err("Search is available after indexing completes.".into());
+        }
+        if self.search_query != query {
+            self.search_query.clear();
+            self.search_query.extend_from_slice(query);
+            self.last_match = None;
+        }
+        let position = self.last_match.as_ref().map_or(
+            SearchPosition {
+                row: self.viewport_start,
+                column: 0,
+            },
+            |found| SearchPosition {
+                row: found.row,
+                column: found.column.saturating_add(1),
+            },
+        );
+        let index = self.index.as_ref().expect("index was checked above");
+        self.search_job = Some(
+            self.session
+                .start_search(index, query.to_vec(), position)
+                .map_err(|error| error.to_string())?,
+        );
+        self.search_status = None;
+        self.reveal_cell = None;
+        Ok(())
+    }
+
+    fn poll_search(&mut self) -> Result<(), String> {
+        let Some(job) = &self.search_job else {
+            return Ok(());
+        };
+        if !job.progress().done {
+            return Ok(());
+        }
+        let job = self.search_job.take().expect("search job is present");
+        match job.wait().map_err(|error| error.to_string())? {
+            SearchOutcome::Match(found) => {
+                let row = found.row;
+                let column = found.column;
+                self.navigate(row)?;
+                self.center_column(column);
+                self.reveal_cell = Some((row, column));
+                self.search_status = Some(format!(
+                    "Found row {}, column {}.",
+                    row.saturating_sub(self.data_start).saturating_add(1),
+                    column.saturating_add(1)
+                ));
+                self.last_match = Some(found);
+            }
+            SearchOutcome::NotFound => {
+                self.search_status = Some("No further matches.".into());
+            }
+            SearchOutcome::Cancelled => {
+                self.search_status = Some("Search cancelled.".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn search_progress(&self) -> Option<SearchProgress> {
+        self.search_job.as_ref().map(SearchJob::progress)
+    }
+
+    fn is_search_ready(&self) -> bool {
+        self.index.is_some() && self.progress.done && !self.progress.cancelled
+    }
+
+    fn cancel_search(&self) {
+        if let Some(job) = &self.search_job {
+            job.cancel();
+        }
+    }
+
+    fn center_column(&mut self, column: usize) {
+        self.total_columns = self.total_columns.max(column.saturating_add(1));
+        let maximum = self.total_columns.saturating_sub(MAX_VISIBLE_COLUMNS);
+        self.column_start = column.saturating_sub(MAX_VISIBLE_COLUMNS / 2).min(maximum);
+        self.headers = headers_for(&self.session, self.total_columns, self.column_start);
+    }
+
+    fn show_first_columns(&mut self) {
+        self.column_start = 0;
+        self.headers = headers_for(&self.session, self.total_columns, 0);
+        self.reveal_cell = Some((self.viewport_start, 0));
+    }
+
     fn is_indexing(&self) -> bool {
         self.job.is_some() && !self.progress.done
     }
@@ -604,6 +815,10 @@ impl Document {
     }
 
     fn shutdown(&mut self) {
+        if let Some(job) = self.search_job.take() {
+            job.cancel();
+            drop(job);
+        }
         if let Some(job) = self.job.take() {
             drop(job);
         }
@@ -640,7 +855,8 @@ impl Document {
         if self.available_data_rows() == 0 {
             return Ok(());
         }
-        self.navigate(self.viewport_start)
+        let target = self.reveal_cell.map_or(self.viewport_start, |(row, _)| row);
+        self.navigate(target)
     }
 
     fn page(&mut self, direction: i64) -> Result<(), String> {
@@ -734,7 +950,7 @@ impl Document {
         let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
         if loaded_columns > self.total_columns {
             self.total_columns = loaded_columns;
-            self.headers = headers_for(&self.session, self.total_columns);
+            self.headers = headers_for(&self.session, self.total_columns, self.column_start);
         }
         self.last_viewport_read = Some(began.elapsed());
         self.buffer_start = start;
@@ -818,10 +1034,11 @@ fn parse_data_row(value: &str, data_start: u64) -> Result<u64, String> {
     Ok(data_start.saturating_add(row - 1))
 }
 
-fn headers_for(session: &Session, total_columns: usize) -> Vec<String> {
-    // ponytail: render 32 columns in this spike; add horizontal column virtualization if egui wins.
-    let visible = total_columns.min(MAX_VISIBLE_COLUMNS);
-    (0..visible)
+fn headers_for(session: &Session, total_columns: usize, column_start: usize) -> Vec<String> {
+    let end = column_start
+        .saturating_add(MAX_VISIBLE_COLUMNS)
+        .min(total_columns);
+    (column_start..end)
         .map(|index| {
             if session.dialect.has_header {
                 let text = session
@@ -919,16 +1136,17 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
             }
         }
 
+        let reveal_cell = document.reveal_cell.take();
         ui.separator();
         ui.allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::Min), |ui| {
-            show_table(ui, document)
+            show_table(ui, document, reveal_cell)
         });
         Ok(())
     })
     .inner
 }
 
-fn show_table(ui: &mut egui::Ui, document: &Document) {
+fn show_table(ui: &mut egui::Ui, document: &Document, reveal_cell: Option<(u64, usize)>) {
     let rows = document.visible_rows();
     ui.horizontal(|ui| {
         if rows.is_empty() {
@@ -940,9 +1158,11 @@ fn show_table(ui: &mut egui::Ui, document: &Document) {
                 document.display_end()
             ));
         }
-        if document.total_columns > MAX_VISIBLE_COLUMNS {
+        if document.total_columns > document.headers.len() {
             ui.label(format!(
-                "Showing first {MAX_VISIBLE_COLUMNS} of {} columns",
+                "Showing columns {}–{} of {}",
+                document.column_start.saturating_add(1),
+                document.column_start.saturating_add(document.headers.len()),
                 document.total_columns
             ));
         }
@@ -1006,13 +1226,19 @@ fn show_table(ui: &mut egui::Ui, document: &Document) {
                                     .color(Color32::from_rgb(49, 85, 217)),
                             );
                         });
-                        for column in 0..document.headers.len() {
+                        for visible_column in 0..document.headers.len() {
+                            let column = document.column_start.saturating_add(visible_column);
                             table_row.col(|ui| {
                                 let text = row
                                     .fields
                                     .get(column)
                                     .map_or_else(String::new, |field| field_text(field));
-                                ui.label(RichText::new(text).monospace());
+                                let response = ui.label(RichText::new(text).monospace());
+                                let record_row =
+                                    document.viewport_start.saturating_add(row_index as u64);
+                                if reveal_cell == Some((record_row, column)) {
+                                    response.scroll_to_me(Some(Align::Center));
+                                }
                             });
                         }
                     });
@@ -1106,17 +1332,21 @@ mod tests {
 
     use super::{
         Action, DelimiterMode, Document, HeaderMode, IndexConfig, OpenOptions, QuarryApp,
-        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
-        row_for_scroll_fraction, scroll_fraction_for_row,
+        SearchProgress, column_window_controls, logical_viewport_start, max_viewport_start,
+        page_controls, parse_data_row, row_for_scroll_fraction, scroll_fraction_for_row,
+        search_controls, show_grid,
     };
 
-    fn click_page_control(label: &str) -> Option<Action> {
+    fn click_accessible_button(
+        label: &str,
+        mut render: impl FnMut(&mut egui::Ui) -> Option<Action>,
+    ) -> Option<Action> {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut action = None;
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                action = page_controls(ui);
+                action = render(ui);
             });
         });
         let target = output
@@ -1146,11 +1376,37 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    action = page_controls(ui);
+                    action = render(ui);
                 });
             },
         );
         action
+    }
+
+    fn click_page_control(label: &str) -> Option<Action> {
+        click_accessible_button(label, page_controls)
+    }
+
+    fn finish_index(document: &mut Document) {
+        let job = document.job.take().expect("index job should be active");
+        document.index = Some(job.wait().unwrap());
+        document.progress.done = true;
+        document.progress.bytes_scanned = document.session.file_size;
+    }
+
+    fn finish_search(document: &mut Document) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !document
+            .search_job
+            .as_ref()
+            .expect("search job should be active")
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline, "search timed out");
+            std::thread::yield_now();
+        }
+        document.poll_search().unwrap();
     }
 
     #[test]
@@ -1163,6 +1419,204 @@ mod tests {
             click_page_control("Page Down"),
             Some(Action::PageDown)
         ));
+        assert!(matches!(
+            click_accessible_button("First columns", |ui| column_window_controls(ui, 8)),
+            Some(Action::FirstColumns)
+        ));
+    }
+
+    #[test]
+    fn search_controls_are_accessible_and_clickable() {
+        let mut query = "needle".to_owned();
+        let find = click_accessible_button("Find Next", |ui| {
+            search_controls(ui, &mut query, true, None, None)
+        });
+        assert!(matches!(find, Some(Action::FindNext)));
+
+        let progress = SearchProgress {
+            bytes_scanned: 50,
+            total_bytes: 100,
+            rows_scanned: 4,
+            elapsed: Duration::from_millis(1),
+            done: false,
+            cancelled: false,
+        };
+        let cancel = click_accessible_button("Cancel Search", |ui| {
+            search_controls(ui, &mut query, true, Some(&progress), None)
+        });
+        assert!(matches!(cancel, Some(Action::CancelSearch)));
+    }
+
+    #[test]
+    fn find_next_navigates_resumes_resets_and_reports_no_match() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-find-{name}.csv"));
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "one,two,three,four").unwrap();
+        for row in 1..=50 {
+            match row {
+                25 => writeln!(file, "row25,x,needle,x").unwrap(),
+                30 => writeln!(file, "fresh,needle,x,x").unwrap(),
+                _ => writeln!(file, "row{row},x,x,x").unwrap(),
+            }
+        }
+        drop(file);
+
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.set_visible_rows(5).unwrap();
+
+        document.start_find_next(b"needle").unwrap();
+        finish_search(&mut document);
+        let first = document.last_match.as_ref().unwrap();
+        assert_eq!((first.row, first.column), (25, 2));
+        assert_eq!(document.viewport_start, 25);
+        assert_eq!(document.reveal_cell, Some((25, 2)));
+        assert_eq!(
+            document.search_status.as_deref(),
+            Some("Found row 25, column 3.")
+        );
+
+        document.start_find_next(b"needle").unwrap();
+        finish_search(&mut document);
+        let second = document.last_match.as_ref().unwrap();
+        assert_eq!((second.row, second.column), (30, 1));
+        assert_eq!(document.viewport_start, 30);
+
+        document.start_find_next(b"fresh").unwrap();
+        finish_search(&mut document);
+        let reset = document.last_match.as_ref().unwrap();
+        assert_eq!((reset.row, reset.column), (30, 0));
+
+        document.set_visible_rows(25).unwrap();
+        document.start_find_next(b"row50").unwrap();
+        finish_search(&mut document);
+        assert_eq!(document.viewport_start, 26);
+        document.set_visible_rows(10).unwrap();
+        assert_eq!(document.viewport_start, 41);
+        assert_eq!(document.reveal_cell, Some((50, 0)));
+
+        let before = document.viewport_start;
+        document.start_find_next(b"missing").unwrap();
+        finish_search(&mut document);
+        assert_eq!(document.viewport_start, before);
+        assert!(document.last_match.is_none());
+        assert_eq!(
+            document.search_status.as_deref(),
+            Some("No further matches.")
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cancel_search_action_sets_state_and_shutdown_clears_the_job() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "quarry-search-cancel-{}-{name}.csv",
+            std::process::id()
+        ));
+        fs::write(&path, b"name\nvalue\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.find_input = "missing".into();
+        app.document = Some(document);
+        app.apply(Action::FindNext);
+        app.apply(Action::CancelSearch);
+        assert!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .search_progress()
+                .unwrap()
+                .cancelled
+        );
+
+        app.document.as_mut().unwrap().shutdown();
+        assert!(app.document.as_ref().unwrap().search_job.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn search_reveals_a_match_beyond_the_first_column_window() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-find-wide-{name}.csv"));
+        let headers = (1..=40)
+            .map(|column| format!("c{column}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut values = vec!["x"; 40];
+        values[39] = "needle";
+        fs::write(&path, format!("{headers}\n{}\n", values.join(","))).unwrap();
+
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.start_find_next(b"needle").unwrap();
+        finish_search(&mut document);
+
+        let found = document.last_match.as_ref().unwrap();
+        assert_eq!((found.row, found.column), (1, 39));
+        assert_eq!(document.column_start, 8);
+        assert_eq!(document.headers.first().map(String::as_str), Some("c9"));
+        assert_eq!(document.headers.last().map(String::as_str), Some("c40"));
+        assert_eq!(document.reveal_cell, Some((1, 39)));
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 780.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert!(document.reveal_cell.is_none());
+
+        document.show_first_columns();
+        assert_eq!(document.column_start, 0);
+        assert_eq!(document.headers.first().map(String::as_str), Some("c1"));
+        assert_eq!(document.headers.last().map(String::as_str), Some("c32"));
+        assert_eq!(document.reveal_cell, Some((1, 0)));
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

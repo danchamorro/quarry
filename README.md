@@ -46,7 +46,8 @@ The data engine is written in **Rust**. A measured egui/AppKit bake-off selected
 The Rust engine and CLI prove progressive opening, correct delimited parsing,
 bounded structural indexing, deterministic fixture generation, and row-range
 navigation. The Phase 3 egui viewer alpha now has continuous scrolling, native
-file opening, drag and drop, and delimiter/header controls.
+file opening, drag and drop, delimiter/header controls, and bounded literal
+Find Next with progress and cancellation.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -62,7 +63,9 @@ cargo run --release -p quarry-egui -- huge.csv
 Use **Choose…** for the native macOS picker, drop one local file onto the
 window, or type a path and select **Open**. Current delimiter and header
 selections apply to newly opened files; changes to the open document wait for
-**Apply / Reopen**.
+**Apply / Reopen**. After indexing completes, **Find Next** searches decoded
+cells from the first visible data row and jumps directly to the matching row
+and column.
 
 The measured native comparator remains runnable for bake-off reproduction:
 
@@ -85,6 +88,13 @@ cargo run --release -p quarry-cli --bin quarry-bench -- viewport huge.csv \
   --iterations 500 --rows 100 --seed 1 --cache-state warm
 ```
 
+Measure a complete bounded literal search without retaining a results list:
+
+```bash
+cargo run --release -p quarry-cli --bin quarry-bench -- search huge.csv \
+  --query QUARRY_NO_MATCH_9F7B2C --cache-state unknown
+```
+
 Generate a deterministic local fixture:
 
 ```bash
@@ -96,6 +106,7 @@ cargo run --release -p quarry-cli --bin quarry -- generate \
 See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [egui spike results](docs/benchmarks/2026-08-14-egui-spike.md),
 [AppKit spike results](docs/benchmarks/2026-08-14-appkit-spike.md),
+[streaming-search results](docs/benchmarks/2026-08-15-streaming-search.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).
