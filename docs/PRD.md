@@ -32,14 +32,21 @@ Data operations professionals, data engineers, ETL developers, analysts, databas
 10. Fail explicitly rather than silently corrupt data.
 
 ## Version 0.1 — read-only exploration
-Required: local file opening; delimiter detection/override; header selection; virtualized grid; navigation; jump-to-row; column resize/hide/show/reorder; streaming search; background structural indexing; progress/cancellation; parsing metadata; diagnostics and benchmarks.
+Required: local file opening; delimiter detection/override; header selection;
+virtualized grid; navigation; jump-to-row; view-only column
+resize/hide/show/reorder; streaming search; bounded copy of one cell or row;
+background structural indexing; progress/cancellation; parsing metadata;
+diagnostics and benchmarks.
 
-Strong candidates: simple filters, copy cells/rows, filtered export, and disk-aware sorting if it does not delay the core milestone.
+Strong candidates: simple filters, filtered export, and disk-aware sorting if it
+does not delay the core milestone.
 
 Not required: general text editing, formulas, charts, database connectivity, plugins, cloud sync, collaboration, full in-place editing, or EmEditor feature parity.
 
 ## Version 0.2 — transformations
-Split columns, join columns, rename/reorder/drop columns, find/replace transforms, filtered export, and safe streaming full-file output. Transformations should be non-destructive until explicitly written.
+Split columns, join columns, rename/reorder/drop columns in saved output,
+find/replace transforms, filtered export, and safe streaming full-file output.
+Transformations should be non-destructive until explicitly written.
 
 ## Progressive opening
 1. Open the file and sample a bounded region.
@@ -66,7 +73,8 @@ Every benchmark must identify hardware, OS, dataset, build mode, and cache state
 Early releases default to read-only. Writing should initially target a new file, stream output, use safe temporary-file patterns where appropriate, expose malformed records, and never silently corrupt source data.
 
 ## Accessibility
-UI candidates must be evaluated for keyboard navigation, VoiceOver, focus behavior, native text behavior, and high-DPI rendering.
+The selected UI must preserve keyboard navigation, VoiceOver, focus behavior,
+native text behavior, and high-DPI rendering as features are added.
 
 ## Alpha success criterion
 A 10 GB CSV is repeatedly practical to open and navigate on supported Macs while memory stays bounded and the UI remains responsive.
@@ -77,9 +85,8 @@ A 10 GB CSV is repeatedly practical to open and navigate on supported Macs while
 Another editor's trademark should not be Quarry's official tagline.
 
 ## Open questions
-Minimum macOS version; encoding breadth; whether sorting lands in 0.1;
-persistent index format/invalidation. [ADR 0003](adr/0003-select-egui-ui.md)
-selects the UI framework.
+Minimum macOS version; encoding breadth; persistent index format/invalidation.
+[ADR 0003](adr/0003-select-egui-ui.md) selects the UI framework.
 
 The initial engine ships with a benchmark-oriented CLI and is dual-licensed
 under MIT or Apache-2.0.
