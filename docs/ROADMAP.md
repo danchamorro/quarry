@@ -2,14 +2,14 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress — 2026-08-15
+## Current progress: 2026-08-16
 
 | Phase | Status | Evidence |
 |---|---|---|
 | Phase 0 — Foundation | Complete | Rust workspace, CI, deterministic generator, ADR, licensing, and the [12 GB benchmark](benchmarks/2026-08-14-large-file.md) |
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
-| Phase 3 — Viewer alpha | In progress | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md) |
+| Phase 3 — Viewer alpha | In progress | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md) |
 
 ### Phase 1 checklist
 
@@ -76,7 +76,14 @@ pacing becomes measurable with the viewer-alpha grid.
   complete-scan throughput, cancellation, and measured peak RSS on the
   deterministic 1 GB and 12 GB datasets in the
   [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md).
-- [ ] Add bounded copying for selected cells and rows.
+- [x] Copy one selected visible cell or full parsed row through a visible action
+  and Command+C, preserving cell text or serializing a row as UTF-8 TSV within
+  a 64 MiB limit.
+- [x] Cover multiline and quoted fields, tabs, invalid UTF-8, the output limit,
+  text-input shortcut focus, viewport selection lifecycle, and stable
+  accessibility identity with regressions, then validate the macOS clipboard
+  at data row 100,000,000 on the
+  [12 GB reference file](benchmarks/2026-08-16-bounded-copy.md).
 - [ ] Complete the remaining viewer-alpha column controls.
 
 **Phase 3 in progress:** the viewer now provides bounded file-level continuous
@@ -86,9 +93,11 @@ scrolling plus native opening and explicit format controls. The
 the current UI evidence; the [live-index benchmark](benchmarks/2026-08-15-live-index-latency.md)
 records the lock-window tuning decision, and the
 [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md) records
-the bounded Find Next result. Copying, the remaining column controls, and
-increased default row density remain; filtering, editing, export, and cosmetic
-redesign stay outside this slice.
+the bounded Find Next result. The
+[bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md) records exact
+cell and row clipboard output plus the deep-row check. The remaining column
+controls and increased default row density remain; filtering, editing, export,
+and cosmetic redesign stay outside this slice.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.

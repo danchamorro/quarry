@@ -16,7 +16,11 @@ const GRID_TITLE_HEIGHT: f32 = 36.0;
 const SCROLLBAR_WIDTH: f32 = 18.0;
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 const MAX_VISIBLE_COLUMNS: usize = 32;
+const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PATH_INPUT_ID: &str = "quarry-path-input";
+const JUMP_INPUT_ID: &str = "quarry-jump-input";
+const FIND_INPUT_ID: &str = "quarry-find-input";
 
 fn main() -> eframe::Result<()> {
     let started = Instant::now();
@@ -155,18 +159,21 @@ impl QuarryApp {
         };
     }
 
-    fn apply(&mut self, action: Action) {
+    fn apply(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::Open => return self.open_typed_path(),
             Action::Choose => return self.choose_file(),
             Action::Reopen => return self.reopen_document(),
+            Action::CopySelection => return self.copy_selection(ctx),
             _ => {}
         }
         let Some(document) = self.document.as_mut() else {
             return;
         };
         let result = match action {
-            Action::Open | Action::Choose | Action::Reopen => unreachable!(),
+            Action::Open | Action::Choose | Action::Reopen | Action::CopySelection => {
+                unreachable!()
+            }
             Action::PageUp => document.page(-1),
             Action::PageDown => document.page(1),
             Action::FirstColumns => {
@@ -186,6 +193,21 @@ impl QuarryApp {
             }
         };
         self.notice = result.err();
+    }
+
+    fn copy_selection(&mut self, ctx: &egui::Context) {
+        let result = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "Open a file before copying.".to_owned())
+            .and_then(Document::copy_selection_text);
+        match result {
+            Ok(text) => {
+                ctx.copy_text(text);
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error),
+        }
     }
 }
 
@@ -252,6 +274,7 @@ impl eframe::App for QuarryApp {
                         .add_sized(
                             [width, 28.0],
                             egui::TextEdit::singleline(&mut self.path_input)
+                                .id(egui::Id::new(PATH_INPUT_ID))
                                 .hint_text("/path/to/file.csv"),
                         )
                         .labelled_by(label.id);
@@ -324,6 +347,7 @@ impl eframe::App for QuarryApp {
                             .add_sized(
                                 [120.0, 26.0],
                                 egui::TextEdit::singleline(&mut self.jump_input)
+                                    .id(egui::Id::new(JUMP_INPUT_ID))
                                     .horizontal_align(Align::RIGHT),
                             )
                             .labelled_by(label.id);
@@ -340,6 +364,9 @@ impl eframe::App for QuarryApp {
                             column_window_controls(ui, document.column_start)
                         {
                             action = Some(column_action);
+                        }
+                        if let Some(copy_action) = copy_control(ui, document.selection.is_some()) {
+                            action = Some(copy_action);
                         }
                     });
                     ui.add_space(6.0);
@@ -416,7 +443,7 @@ impl eframe::App for QuarryApp {
             });
         }
         if let Some(action) = action {
-            self.apply(action);
+            self.apply(ctx, action);
         }
 
         let mut grid_error = None;
@@ -436,6 +463,14 @@ impl eframe::App for QuarryApp {
                     });
                 }
             });
+        let copy_event_targets_selection = self
+            .document
+            .as_ref()
+            .and_then(|document| document.selection.as_ref())
+            .is_some_and(|_| selection_copy_requested(ctx));
+        if copy_event_targets_selection {
+            self.copy_selection(ctx);
+        }
         if grid_error.is_some() {
             self.notice = grid_error;
         }
@@ -507,6 +542,7 @@ enum Action {
     Jump,
     FindNext,
     CancelSearch,
+    CopySelection,
     Cancel,
 }
 
@@ -520,6 +556,30 @@ fn page_controls(ui: &mut egui::Ui) -> Option<Action> {
     } else {
         None
     }
+}
+
+fn copy_control(ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
+    ui.add_enabled(enabled, egui::Button::new("Copy"))
+        .on_hover_text("Copy the selected cell or row (⌘C)")
+        .clicked()
+        .then_some(Action::CopySelection)
+}
+
+fn selection_copy_requested(ctx: &egui::Context) -> bool {
+    let copy_event = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Copy))
+    });
+    let text_input_focused = ctx.memory(|memory| {
+        memory.focused().is_some_and(|focused| {
+            [PATH_INPUT_ID, JUMP_INPUT_ID, FIND_INPUT_ID]
+                .into_iter()
+                .any(|id| focused == egui::Id::new(id))
+        })
+    });
+    copy_event && !text_input_focused
 }
 
 fn column_window_controls(ui: &mut egui::Ui, column_start: usize) -> Option<Action> {
@@ -540,7 +600,9 @@ fn search_controls(
         let input = ui
             .add_enabled(
                 !searching,
-                egui::TextEdit::singleline(query).hint_text("Text to find"),
+                egui::TextEdit::singleline(query)
+                    .id(egui::Id::new(FIND_INPUT_ID))
+                    .hint_text("Text to find"),
             )
             .labelled_by(label.id);
         let can_find = index_ready && !searching && !query.is_empty();
@@ -586,6 +648,36 @@ fn search_controls(
     action
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridSelection {
+    Cell { row: u64, column: usize },
+    Row { row: u64 },
+}
+
+impl GridSelection {
+    fn row(self) -> u64 {
+        match self {
+            Self::Cell { row, .. } | Self::Row { row, .. } => row,
+        }
+    }
+
+    fn selects_row(self, row: u64) -> bool {
+        matches!(self, Self::Row { row: selected, .. } if selected == row)
+    }
+
+    fn selects_cell(self, row: u64, column: usize) -> bool {
+        self.selects_row(row)
+            || matches!(
+                self,
+                Self::Cell {
+                    row: selected_row,
+                    column: selected_column,
+                    ..
+                } if selected_row == row && selected_column == column
+            )
+    }
+}
+
 struct Document {
     session: Session,
     job: Option<IndexJob>,
@@ -596,6 +688,7 @@ struct Document {
     last_match: Option<SearchMatch>,
     search_status: Option<String>,
     reveal_cell: Option<(u64, usize)>,
+    selection: Option<GridSelection>,
     headers: Vec<String>,
     total_columns: usize,
     column_start: usize,
@@ -661,6 +754,7 @@ impl Document {
             last_match: None,
             search_status: None,
             reveal_cell: None,
+            selection: None,
             headers,
             total_columns,
             column_start: 0,
@@ -790,12 +884,14 @@ impl Document {
         let maximum = self.total_columns.saturating_sub(MAX_VISIBLE_COLUMNS);
         self.column_start = column.saturating_sub(MAX_VISIBLE_COLUMNS / 2).min(maximum);
         self.headers = headers_for(&self.session, self.total_columns, self.column_start);
+        self.clear_hidden_selection();
     }
 
     fn show_first_columns(&mut self) {
         self.column_start = 0;
         self.headers = headers_for(&self.session, self.total_columns, 0);
         self.reveal_cell = Some((self.viewport_start, 0));
+        self.clear_hidden_selection();
     }
 
     fn is_indexing(&self) -> bool {
@@ -908,6 +1004,7 @@ impl Document {
         );
         self.load_buffer(start)?;
         self.viewport_start = start;
+        self.clear_hidden_selection();
         Ok(())
     }
 
@@ -966,6 +1063,43 @@ impl Document {
             .saturating_add(self.visible_rows)
             .min(self.buffered_rows.len());
         &self.buffered_rows[offset..end]
+    }
+
+    fn clear_hidden_selection(&mut self) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let row_end = self
+            .viewport_start
+            .saturating_add(self.visible_rows().len() as u64);
+        let row_visible = (self.viewport_start..row_end).contains(&selection.row());
+        let column_visible = match selection {
+            GridSelection::Row { .. } => true,
+            GridSelection::Cell { column, .. } => {
+                let column_end = self.column_start.saturating_add(self.headers.len());
+                (self.column_start..column_end).contains(&column)
+            }
+        };
+        if !row_visible || !column_visible {
+            self.selection = None;
+        }
+    }
+
+    fn copy_selection_text(&self) -> Result<String, String> {
+        let selection = self
+            .selection
+            .ok_or_else(|| "Select a cell or row before copying.".to_owned())?;
+        let relative = selection
+            .row()
+            .checked_sub(self.buffer_start)
+            .ok_or_else(|| "The selected row is no longer visible. Select it again.".to_owned())?;
+        let offset = usize::try_from(relative)
+            .map_err(|_| "The selected row is no longer visible. Select it again.".to_owned())?;
+        let row = self
+            .buffered_rows
+            .get(offset)
+            .ok_or_else(|| "The selected row is no longer visible. Select it again.".to_owned())?;
+        selection_text(row, selection, MAX_COPY_BYTES)
     }
 
     fn display_start(&self) -> u64 {
@@ -1138,16 +1272,26 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
 
         let reveal_cell = document.reveal_cell.take();
         ui.separator();
-        ui.allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::Min), |ui| {
-            show_table(ui, document, reveal_cell)
-        });
+        let selection = ui
+            .allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::Min), |ui| {
+                show_table(ui, document, reveal_cell)
+            })
+            .inner;
+        if let Some(selection) = selection {
+            document.selection = Some(selection);
+        }
         Ok(())
     })
     .inner
 }
 
-fn show_table(ui: &mut egui::Ui, document: &Document, reveal_cell: Option<(u64, usize)>) {
+fn show_table(
+    ui: &mut egui::Ui,
+    document: &Document,
+    reveal_cell: Option<(u64, usize)>,
+) -> Option<GridSelection> {
     let rows = document.visible_rows();
+    let mut clicked_selection = None;
     ui.horizontal(|ui| {
         if rows.is_empty() {
             ui.heading("No data rows");
@@ -1219,31 +1363,99 @@ fn show_table(ui: &mut egui::Ui, document: &Document, reveal_cell: Option<(u64, 
                     body.rows(ROW_HEIGHT, rows.len(), |mut table_row| {
                         let row_index = table_row.index();
                         let row = &rows[row_index];
+                        let record_row =
+                            document.viewport_start.saturating_add(row_index as u64);
+                        let display_row = start.saturating_add(row_index as u64);
                         table_row.col(|ui| {
-                            ui.label(
-                                RichText::new((start + row_index as u64).to_string())
-                                    .monospace()
-                                    .color(Color32::from_rgb(49, 85, 217)),
+                            ui.scope_builder(
+                                egui::UiBuilder::new().id(("row-selection", record_row)),
+                                |ui| {
+                                let selected = document
+                                    .selection
+                                    .is_some_and(|selection| selection.selects_row(record_row));
+                                let color = if selected {
+                                    ui.visuals().selection.stroke.color
+                                } else {
+                                    Color32::from_rgb(49, 85, 217)
+                                };
+                                let response = ui.add_sized(
+                                    [ui.available_width(), ROW_HEIGHT],
+                                    egui::Button::selectable(
+                                        selected,
+                                        RichText::new(display_row.to_string())
+                                            .monospace()
+                                            .color(color),
+                                    ),
+                                );
+                                let enabled = ui.is_enabled();
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::selected(
+                                        egui::WidgetType::SelectableLabel,
+                                        enabled,
+                                        selected,
+                                        format!("Select row {display_row}"),
+                                    )
+                                });
+                                if response.clicked() {
+                                    response.request_focus();
+                                    clicked_selection =
+                                        Some(GridSelection::Row { row: record_row });
+                                }
+                                },
                             );
                         });
                         for visible_column in 0..document.headers.len() {
                             let column = document.column_start.saturating_add(visible_column);
                             table_row.col(|ui| {
-                                let text = row
-                                    .fields
-                                    .get(column)
-                                    .map_or_else(String::new, |field| field_text(field));
-                                let response = ui.label(RichText::new(text).monospace());
-                                let record_row =
-                                    document.viewport_start.saturating_add(row_index as u64);
-                                if reveal_cell == Some((record_row, column)) {
-                                    response.scroll_to_me(Some(Align::Center));
-                                }
+                                ui.scope_builder(
+                                    egui::UiBuilder::new()
+                                        .id(("cell-selection", record_row, column)),
+                                    |ui| {
+                                    let text = row
+                                        .fields
+                                        .get(column)
+                                        .map_or_else(String::new, |field| field_text(field));
+                                    let selected = document.selection.is_some_and(|selection| {
+                                        selection.selects_cell(record_row, column)
+                                    });
+                                    let response = ui.add_sized(
+                                        [ui.available_width(), ROW_HEIGHT],
+                                        egui::Button::selectable(
+                                            selected,
+                                            RichText::new(&text).monospace(),
+                                        ),
+                                    );
+                                    let enabled = ui.is_enabled();
+                                    let header = &document.headers[visible_column];
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::selected(
+                                            egui::WidgetType::SelectableLabel,
+                                            enabled,
+                                            selected,
+                                            format!(
+                                                "Select row {display_row}, column {} ({header}): {text}",
+                                                column.saturating_add(1)
+                                            ),
+                                        )
+                                    });
+                                    if response.clicked() {
+                                        response.request_focus();
+                                        clicked_selection = Some(GridSelection::Cell {
+                                            row: record_row,
+                                            column,
+                                        });
+                                    }
+                                    if reveal_cell == Some((record_row, column)) {
+                                        response.scroll_to_me(Some(Align::Center));
+                                    }
+                                    },
+                                );
                             });
                         }
                     });
                 });
         });
+    clicked_selection
 }
 
 fn scrollbar_thumb_height(track_height: f32, total_rows: u64, visible_rows: usize) -> f32 {
@@ -1301,6 +1513,77 @@ fn field_text(field: &[u8]) -> String {
     }
 }
 
+fn selection_text(row: &Row, selection: GridSelection, max_bytes: usize) -> Result<String, String> {
+    match selection {
+        GridSelection::Cell { column, .. } => {
+            let mut output = String::new();
+            append_clipboard_field(
+                &mut output,
+                row.fields.get(column).map_or(&[], Vec::as_slice),
+                false,
+                max_bytes,
+            )?;
+            Ok(output)
+        }
+        GridSelection::Row { .. } => {
+            let mut output = String::new();
+            for (index, field) in row.fields.iter().enumerate() {
+                if index > 0 {
+                    ensure_copy_capacity(&output, 1, max_bytes)?;
+                    output.push('\t');
+                }
+                append_clipboard_field(&mut output, field, true, max_bytes)?;
+            }
+            Ok(output)
+        }
+    }
+}
+
+fn append_clipboard_field(
+    output: &mut String,
+    field: &[u8],
+    quote_for_tsv: bool,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let text = std::str::from_utf8(field)
+        .map_err(|_| "The selected data is not valid UTF-8 and cannot be copied yet.".to_owned())?;
+    let needs_quotes = quote_for_tsv
+        && text
+            .bytes()
+            .any(|byte| matches!(byte, b'\t' | b'\r' | b'\n' | b'"'));
+    let added = text.len().saturating_add(if needs_quotes {
+        2 + text.bytes().filter(|byte| *byte == b'"').count()
+    } else {
+        0
+    });
+    ensure_copy_capacity(output, added, max_bytes)?;
+
+    if needs_quotes {
+        output.push('"');
+        for character in text.chars() {
+            if character == '"' {
+                output.push('"');
+            }
+            output.push(character);
+        }
+        output.push('"');
+    } else {
+        output.push_str(text);
+    }
+    Ok(())
+}
+
+fn ensure_copy_capacity(output: &str, added: usize, max_bytes: usize) -> Result<(), String> {
+    if output.len().saturating_add(added) > max_bytes {
+        Err(format!(
+            "Copy exceeds the {} clipboard limit.",
+            format_bytes(max_bytes as u64)
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn display_delimiter(delimiter: u8) -> &'static str {
     match delimiter {
         b',' => "comma",
@@ -1331,10 +1614,11 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        Action, DelimiterMode, Document, HeaderMode, IndexConfig, OpenOptions, QuarryApp,
-        SearchProgress, column_window_controls, logical_viewport_start, max_viewport_start,
-        page_controls, parse_data_row, row_for_scroll_fraction, scroll_fraction_for_row,
-        search_controls, show_grid,
+        Action, DelimiterMode, Document, FIND_INPUT_ID, GridSelection, HeaderMode, IndexConfig,
+        OpenOptions, QuarryApp, Row, SearchProgress, column_window_controls, copy_control,
+        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
+        row_for_scroll_fraction, scroll_fraction_for_row, search_controls,
+        selection_copy_requested, selection_text, show_grid,
     };
 
     fn click_accessible_button(
@@ -1387,6 +1671,69 @@ mod tests {
         click_accessible_button(label, page_controls)
     }
 
+    fn grid_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 780.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn grid_control_id(
+        ctx: &egui::Context,
+        label: &str,
+        document: &mut Document,
+    ) -> egui::accesskit::NodeId {
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, document).unwrap();
+            });
+        });
+        output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present")
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some(label)
+                    && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .unwrap_or_else(|| panic!("{label} is not an accessible button"))
+    }
+
+    fn click_grid_control(
+        label: &str,
+        document: &mut Document,
+    ) -> (egui::Context, egui::accesskit::NodeId) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let target = grid_control_id(&ctx, label, document);
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, document).unwrap();
+                });
+            },
+        );
+        (ctx, target)
+    }
+
     fn finish_index(document: &mut Document) {
         let job = document.job.take().expect("index job should be active");
         document.index = Some(job.wait().unwrap());
@@ -1423,6 +1770,152 @@ mod tests {
             click_accessible_button("First columns", |ui| column_window_controls(ui, 8)),
             Some(Action::FirstColumns)
         ));
+        assert!(matches!(
+            click_accessible_button("Copy", |ui| copy_control(ui, true)),
+            Some(Action::CopySelection)
+        ));
+    }
+
+    #[test]
+    fn selected_cells_and_rows_copy_full_bounded_text() {
+        let row = Row {
+            offset: 0,
+            fields: vec![
+                vec![b'x'; 200],
+                b"has\ttab".to_vec(),
+                b"say \"hi\"".to_vec(),
+                Vec::new(),
+            ],
+        };
+        let cell = GridSelection::Cell { row: 0, column: 0 };
+        assert_eq!(selection_text(&row, cell, 200).unwrap(), "x".repeat(200));
+        assert!(selection_text(&row, cell, 199).is_err());
+
+        let selected_row = GridSelection::Row { row: 0 };
+        assert_eq!(
+            selection_text(&row, selected_row, 1024).unwrap(),
+            format!("{}\t\"has\ttab\"\t\"say \"\"hi\"\"\"\t", "x".repeat(200))
+        );
+
+        let invalid = Row {
+            offset: 0,
+            fields: vec![vec![0xff]],
+        };
+        assert!(selection_text(&invalid, cell, 1024).is_err());
+    }
+
+    #[test]
+    fn grid_selection_is_clickable_and_command_c_copies_decoded_data() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-copy-{name}.csv"));
+        fs::write(
+            &path,
+            b"name,notes\nalpha,\"line one\nline two\"\nbeta,other\ngamma,third\ndelta,fourth\n",
+        )
+        .unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        let (ctx, _) = click_grid_control(
+            "Select row 1, column 2 (notes): line one\\nline two",
+            &mut document,
+        );
+        let selection = document.selection.unwrap();
+        assert!(matches!(
+            selection,
+            GridSelection::Cell {
+                row: 1,
+                column: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            document.copy_selection_text().unwrap(),
+            "line one\nline two"
+        );
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 780.0),
+                )),
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ctx| {
+                if selection_copy_requested(ctx) {
+                    ctx.copy_text(document.copy_selection_text().unwrap());
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "line one\nline two")
+        }));
+
+        let mut find = String::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut find).id(egui::Id::new(FIND_INPUT_ID)))
+                    .request_focus();
+            });
+        });
+        let output = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ctx| {
+                if selection_copy_requested(ctx) {
+                    ctx.copy_text(document.copy_selection_text().unwrap());
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut find).id(egui::Id::new(FIND_INPUT_ID)));
+                });
+            },
+        );
+        assert!(
+            !output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+        );
+
+        let _ = click_grid_control("Select row 1", &mut document);
+        assert!(matches!(
+            document.selection,
+            Some(GridSelection::Row { row: 1, .. })
+        ));
+        assert_eq!(
+            document.copy_selection_text().unwrap(),
+            "alpha\t\"line one\nline two\""
+        );
+
+        document.set_visible_rows(3).unwrap();
+        let (ctx, row_id) = click_grid_control("Select row 3", &mut document);
+        document.navigate(2).unwrap();
+        assert_eq!(grid_control_id(&ctx, "Select row 3", &mut document), row_id);
+        assert!(matches!(
+            document.selection,
+            Some(GridSelection::Row { row: 3 })
+        ));
+        document.set_visible_rows(1).unwrap();
+        assert!(document.selection.is_none());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1543,8 +2036,9 @@ mod tests {
         let mut app = QuarryApp::new(None, Instant::now());
         app.find_input = "missing".into();
         app.document = Some(document);
-        app.apply(Action::FindNext);
-        app.apply(Action::CancelSearch);
+        let ctx = egui::Context::default();
+        app.apply(&ctx, Action::FindNext);
+        app.apply(&ctx, Action::CancelSearch);
         assert!(
             app.document
                 .as_ref()

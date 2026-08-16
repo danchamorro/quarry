@@ -67,6 +67,11 @@ selections apply to newly opened files; changes to the open document wait for
 cells from the first visible data row and jumps directly to the matching row
 and column.
 
+Click a cell or its row number, then use **Copy** or **Command+C**. Cell copy
+preserves the complete decoded value. Row copy emits every actual field as
+UTF-8 TSV, excluding the header and synthetic row number, with a 64 MiB
+clipboard limit.
+
 The measured native comparator remains runnable for bake-off reproduction:
 
 ```bash
@@ -107,6 +112,7 @@ See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [egui spike results](docs/benchmarks/2026-08-14-egui-spike.md),
 [AppKit spike results](docs/benchmarks/2026-08-14-appkit-spike.md),
 [streaming-search results](docs/benchmarks/2026-08-15-streaming-search.md),
+[bounded-copy validation](docs/benchmarks/2026-08-16-bounded-copy.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).
