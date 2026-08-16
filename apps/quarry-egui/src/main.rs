@@ -4,8 +4,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
 use quarry_core::{
-    HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, Row, SearchJob, SearchMatch,
-    SearchOutcome, SearchPosition, SearchProgress, Session, StructuralIndex,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterProgress, FilterQuery,
+    FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress,
+    OpenOptions, Row, SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress,
+    Session, StructuralIndex,
 };
 
 const BOOTSTRAP_ROWS: usize = 40;
@@ -23,6 +25,8 @@ const JUMP_INPUT_ID: &str = "quarry-jump-input";
 const FIND_INPUT_ID: &str = "quarry-find-input";
 const COLUMN_INPUT_ID: &str = "quarry-column-input";
 const COLUMN_POSITION_INPUT_ID: &str = "quarry-column-position-input";
+const FILTER_COLUMN_INPUT_ID: &str = "quarry-filter-column-input";
+const FILTER_VALUE_INPUT_ID: &str = "quarry-filter-value-input";
 
 fn main() -> eframe::Result<()> {
     let started = Instant::now();
@@ -53,6 +57,10 @@ struct QuarryApp {
     column_input: String,
     column_position_input: String,
     columns_open: bool,
+    filter_column_input: String,
+    filter_value_input: String,
+    filter_operator: FilterOperator,
+    filters_open: bool,
     delimiter_mode: DelimiterMode,
     header_mode: HeaderMode,
     document: Option<Document>,
@@ -74,6 +82,10 @@ impl QuarryApp {
             column_input: "1".into(),
             column_position_input: "1".into(),
             columns_open: false,
+            filter_column_input: "1".into(),
+            filter_value_input: String::new(),
+            filter_operator: FilterOperator::Contains,
+            filters_open: false,
             delimiter_mode: DelimiterMode::Auto,
             header_mode: HeaderMode::Auto,
             document: None,
@@ -114,6 +126,10 @@ impl QuarryApp {
         self.column_input = "1".into();
         self.column_position_input = "1".into();
         self.columns_open = false;
+        self.filter_column_input = "1".into();
+        self.filter_value_input.clear();
+        self.filter_operator = FilterOperator::Contains;
+        self.filters_open = false;
         self.document = Some(document);
         Ok(())
     }
@@ -180,6 +196,10 @@ impl QuarryApp {
                 self.columns_open = true;
                 return;
             }
+            Action::OpenFilters => {
+                self.filters_open = true;
+                return;
+            }
             _ => {}
         }
         let Some(document) = self.document.as_mut() else {
@@ -190,7 +210,8 @@ impl QuarryApp {
             | Action::Choose
             | Action::Reopen
             | Action::CopySelection
-            | Action::OpenColumns => {
+            | Action::OpenColumns
+            | Action::OpenFilters => {
                 unreachable!()
             }
             Action::PageUp => document.page(-1),
@@ -206,6 +227,22 @@ impl QuarryApp {
                 document.cancel_search();
                 Ok(())
             }
+            Action::ApplyFilter => {
+                parse_file_column(&self.filter_column_input, document.total_columns).and_then(
+                    |column| {
+                        document.start_filter(FilterQuery {
+                            column,
+                            operator: self.filter_operator,
+                            value: self.filter_value_input.as_bytes().to_vec(),
+                        })
+                    },
+                )
+            }
+            Action::CancelFilter => {
+                document.cancel_filter();
+                Ok(())
+            }
+            Action::ClearFilter => document.clear_filter(),
             Action::Cancel => {
                 document.cancel();
                 Ok(())
@@ -289,6 +326,11 @@ impl eframe::App for QuarryApp {
         }
         if let Some(document) = &mut self.document
             && let Err(error) = document.poll_search()
+        {
+            self.notice = Some(error);
+        }
+        if let Some(document) = &mut self.document
+            && let Err(error) = document.poll_filter()
         {
             self.notice = Some(error);
         }
@@ -391,17 +433,22 @@ impl eframe::App for QuarryApp {
                     });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
+                        let filter_active = document.filter_active();
                         let label = ui.label("Data row");
                         let jump = ui
-                            .add_sized(
-                                [120.0, 26.0],
+                            .add_enabled(
+                                !filter_active,
                                 egui::TextEdit::singleline(&mut self.jump_input)
                                     .id(egui::Id::new(JUMP_INPUT_ID))
-                                    .horizontal_align(Align::RIGHT),
+                                    .horizontal_align(Align::RIGHT)
+                                    .desired_width(120.0),
                             )
                             .labelled_by(label.id);
-                        if ui.button("Jump").clicked()
-                            || (jump.lost_focus()
+                        if ui
+                            .add_enabled(!filter_active, egui::Button::new("Jump"))
+                            .clicked()
+                            || (!filter_active
+                                && jump.lost_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter)))
                         {
                             action = Some(Action::Jump);
@@ -414,20 +461,32 @@ impl eframe::App for QuarryApp {
                         {
                             action = Some(column_action);
                         }
+                        let filter_label = if filter_active {
+                            "Filters active…"
+                        } else {
+                            "Filters…"
+                        };
+                        if ui.button(filter_label).clicked() {
+                            action = Some(Action::OpenFilters);
+                        }
                         if let Some(copy_action) = copy_control(ui, document.selection.is_some()) {
                             action = Some(copy_action);
                         }
                     });
                     ui.add_space(6.0);
                     let search_progress = document.search_progress();
-                    let search_status = document.search_status.as_deref().or_else(|| {
-                        (!document.is_search_ready())
-                            .then_some("Search is available after indexing completes.")
-                    });
+                    let search_status = if document.filter_active() {
+                        Some("Clear the filter to use Find Next.")
+                    } else {
+                        document.search_status.as_deref().or_else(|| {
+                            (!document.is_search_ready())
+                                .then_some("Search is available after indexing completes.")
+                        })
+                    };
                     if let Some(search_action) = search_controls(
                         ui,
                         &mut self.find_input,
-                        document.is_search_ready(),
+                        document.is_search_ready() && !document.filter_active(),
                         search_progress.as_ref(),
                         search_status,
                     ) {
@@ -465,6 +524,13 @@ impl eframe::App for QuarryApp {
                             "{} data rows indexed",
                             document.available_data_rows()
                         ));
+                        if document.filter_active() {
+                            ui.separator();
+                            ui.label(format!(
+                                "{} filter matches",
+                                document.available_filter_rows()
+                            ));
+                        }
                         ui.separator();
                         ui.label(format!(
                             "first rows {:.3} ms",
@@ -508,6 +574,20 @@ impl eframe::App for QuarryApp {
             self.apply_column_command(command);
         }
 
+        let filter_action = self.document.as_ref().and_then(|document| {
+            show_filter_manager(
+                ctx,
+                &mut self.filters_open,
+                &mut self.filter_column_input,
+                &mut self.filter_operator,
+                &mut self.filter_value_input,
+                document,
+            )
+        });
+        if let Some(action) = filter_action {
+            self.apply(ctx, action);
+        }
+
         let mut grid_error = None;
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
@@ -536,11 +616,12 @@ impl eframe::App for QuarryApp {
         if grid_error.is_some() {
             self.notice = grid_error;
         }
-        if self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.job.is_some() || document.search_job.is_some())
-        {
+        if self.document.as_ref().is_some_and(|document| {
+            document.job.is_some()
+                || document.search_job.is_some()
+                || document.filter_job.is_some()
+                || document.filter_rows_loading()
+        }) {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
     }
@@ -602,9 +683,13 @@ enum Action {
     PageDown,
     FirstColumns,
     OpenColumns,
+    OpenFilters,
     Jump,
     FindNext,
     CancelSearch,
+    ApplyFilter,
+    CancelFilter,
+    ClearFilter,
     CopySelection,
     Cancel,
 }
@@ -643,6 +728,8 @@ fn selection_copy_requested(ctx: &egui::Context) -> bool {
                 FIND_INPUT_ID,
                 COLUMN_INPUT_ID,
                 COLUMN_POSITION_INPUT_ID,
+                FILTER_COLUMN_INPUT_ID,
+                FILTER_VALUE_INPUT_ID,
             ]
             .into_iter()
             .any(|id| focused == egui::Id::new(id))
@@ -852,6 +939,160 @@ fn show_column_manager(
                 });
         });
     command
+}
+
+fn show_filter_manager(
+    ctx: &egui::Context,
+    open: &mut bool,
+    column_input: &mut String,
+    operator: &mut FilterOperator,
+    value_input: &mut String,
+    document: &Document,
+) -> Option<Action> {
+    let mut action = None;
+    egui::Window::new("Filters")
+        .id(egui::Id::new("quarry-filter-manager"))
+        .open(open)
+        .default_width(460.0)
+        .min_width(380.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label("Show only rows that match one file column.");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let label = ui.label("File column");
+                let _ = ui
+                    .add_sized(
+                        [96.0, 26.0],
+                        egui::TextEdit::singleline(column_input)
+                            .id(egui::Id::new(FILTER_COLUMN_INPUT_ID))
+                            .horizontal_align(Align::RIGHT),
+                    )
+                    .labelled_by(label.id);
+                if let Ok(column) = parse_file_column(column_input, document.total_columns) {
+                    ui.label(column_name(&document.session, column));
+                }
+            });
+            ui.horizontal(|ui| {
+                let label = ui.label("Match");
+                let _ = egui::ComboBox::from_id_salt("quarry-filter-operator")
+                    .selected_text(filter_operator_label(*operator))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(operator, FilterOperator::Contains, "Contains");
+                        ui.selectable_value(operator, FilterOperator::Equals, "Equals");
+                    })
+                    .response
+                    .labelled_by(label.id);
+            });
+            ui.horizontal(|ui| {
+                let label = ui.label("Value");
+                let width = (ui.available_width() - 112.0).max(120.0);
+                let _ = ui
+                    .add_sized(
+                        [width, 48.0],
+                        egui::TextEdit::multiline(value_input)
+                            .desired_rows(2)
+                            .id(egui::Id::new(FILTER_VALUE_INPUT_ID))
+                            .hint_text("Literal, case-sensitive text"),
+                    )
+                    .labelled_by(label.id);
+                let valid_column = parse_file_column(column_input, document.total_columns).is_ok();
+                let valid_value = *operator == FilterOperator::Equals || !value_input.is_empty();
+                let can_apply = document.is_filter_ready()
+                    && document.search_job.is_none()
+                    && document.filter_job.is_none()
+                    && valid_column
+                    && valid_value;
+                if ui
+                    .add_enabled(can_apply, egui::Button::new("Apply filter"))
+                    .clicked()
+                {
+                    action = Some(Action::ApplyFilter);
+                }
+            });
+            ui.small("Contains requires a value. Equals can match an empty cell.");
+
+            if let Some(progress) = document.filter_progress() {
+                ui.add_space(8.0);
+                let fraction = if progress.file_size == 0 {
+                    if progress.done { 1.0 } else { 0.0 }
+                } else {
+                    (progress.bytes_scanned as f32 / progress.file_size as f32).clamp(0.0, 1.0)
+                };
+                let text = if progress.cancelled && !progress.done {
+                    format!(
+                        "Cancelling · {:.1}% · {} matches",
+                        fraction * 100.0,
+                        progress.matches_found
+                    )
+                } else if !progress.done {
+                    format!(
+                        "Filtering · {:.1}% · {} matches",
+                        fraction * 100.0,
+                        progress.matches_found
+                    )
+                } else {
+                    format!("{} matches", progress.matches_found)
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(ui.available_width())
+                        .text(text),
+                );
+            }
+
+            if let Some(query) = document.filter_query.as_ref() {
+                ui.add_space(6.0);
+                let value = field_text(&query.value);
+                ui.label(format!(
+                    "Active: file column {} ({}) {} {:?}",
+                    query.column.saturating_add(1),
+                    column_name(&document.session, query.column),
+                    filter_operator_label(query.operator).to_lowercase(),
+                    value
+                ));
+            }
+            if let Some(status) = document.filter_status.as_deref() {
+                let response = ui.label(status);
+                let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                    node.set_live(egui::accesskit::Live::Polite);
+                });
+            } else if document.search_job.is_some() {
+                ui.label("Cancel the active search before filtering.");
+            } else if !document.is_filter_ready() {
+                ui.label("Open a file with at least one column to filter rows.");
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        document.filter_job.is_some()
+                            && document
+                                .filter_progress()
+                                .is_some_and(|progress| !progress.done && !progress.cancelled),
+                        egui::Button::new("Cancel filter"),
+                    )
+                    .clicked()
+                {
+                    action = Some(Action::CancelFilter);
+                }
+                if ui
+                    .add_enabled(document.filter_active(), egui::Button::new("Clear filter"))
+                    .clicked()
+                {
+                    action = Some(Action::ClearFilter);
+                }
+            });
+        });
+    action
+}
+
+fn filter_operator_label(operator: FilterOperator) -> &'static str {
+    match operator {
+        FilterOperator::Contains => "Contains",
+        FilterOperator::Equals => "Equals",
+    }
 }
 
 fn column_drop_position(source_position: usize, insertion: usize, total_columns: usize) -> usize {
@@ -1100,6 +1341,16 @@ struct Document {
     search_query: Vec<u8>,
     last_match: Option<SearchMatch>,
     search_status: Option<String>,
+    filter_job: Option<FilterJob>,
+    filter_index: Option<FilterIndex>,
+    filter_query: Option<FilterQuery>,
+    filter_progress: Option<FilterProgress>,
+    filter_status: Option<String>,
+    filter_viewport_start: u64,
+    filter_buffer_start: u64,
+    filtered_rows: Vec<FilterMatch>,
+    filter_read: Option<ActiveFilterRead>,
+    pending_filter_read: Option<FilterReadWindow>,
     reveal_cell: Option<(u64, usize)>,
     selection: Option<GridSelection>,
     headers: Vec<String>,
@@ -1113,6 +1364,19 @@ struct Document {
     scroll_points: f32,
     last_viewport_read: Option<Duration>,
     last_poll: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FilterReadWindow {
+    start_match: u64,
+    count: usize,
+}
+
+struct ActiveFilterRead {
+    window: FilterReadWindow,
+    job: FilterReadJob,
+    started: Instant,
+    cancel_requested: bool,
 }
 
 impl Document {
@@ -1167,6 +1431,16 @@ impl Document {
             search_query: Vec::new(),
             last_match: None,
             search_status: None,
+            filter_job: None,
+            filter_index: None,
+            filter_query: None,
+            filter_progress: None,
+            filter_status: None,
+            filter_viewport_start: 0,
+            filter_buffer_start: 0,
+            filtered_rows: Vec::new(),
+            filter_read: None,
+            pending_filter_read: None,
             reveal_cell: None,
             selection: None,
             headers,
@@ -1214,6 +1488,9 @@ impl Document {
     fn start_find_next(&mut self, query: &[u8]) -> Result<(), String> {
         if query.is_empty() {
             return Err("Enter text to find.".into());
+        }
+        if self.filter_active() {
+            return Err("Clear the filter before using Find Next.".into());
         }
         if self.search_job.is_some() {
             return Err("A search is already running.".into());
@@ -1283,6 +1560,219 @@ impl Document {
         self.search_job.as_ref().map(SearchJob::progress)
     }
 
+    fn start_filter(&mut self, query: FilterQuery) -> Result<(), String> {
+        if self.filter_job.is_some() {
+            return Err("A filter is already running.".into());
+        }
+        if self.search_job.is_some() {
+            return Err("Cancel the active search before filtering.".into());
+        }
+        if !self.is_filter_ready() {
+            return Err("Open a file with at least one column before filtering.".into());
+        }
+        self.validate_column(query.column)?;
+        if query.operator == FilterOperator::Contains && query.value.is_empty() {
+            return Err("Enter text for a Contains filter.".into());
+        }
+
+        let job = self
+            .session
+            .start_filter(query.clone())
+            .map_err(|error| error.to_string())?;
+        self.stop_filter_read();
+        self.filter_progress = Some(job.progress());
+        self.filter_index = Some(job.snapshot());
+        self.filter_job = Some(job);
+        self.filter_query = Some(query);
+        self.filter_status = Some("Filtering rows…".into());
+        self.filter_viewport_start = 0;
+        self.filter_buffer_start = 0;
+        self.filtered_rows.clear();
+        self.selection = None;
+        self.reveal_cell = None;
+        self.scroll_points = 0.0;
+        Ok(())
+    }
+
+    fn poll_filter(&mut self) -> Result<(), String> {
+        self.poll_filter_scan()?;
+        self.poll_filter_read()
+    }
+
+    fn poll_filter_scan(&mut self) -> Result<(), String> {
+        let Some(job) = self.filter_job.as_ref() else {
+            return Ok(());
+        };
+        let progress = job.progress();
+        self.filter_progress = Some(progress);
+
+        if progress.matches_found > 0 {
+            let required = self
+                .filter_viewport_start
+                .saturating_add(self.visible_rows as u64)
+                .min(progress.matches_found);
+            self.refresh_filter_snapshot_for(required);
+            self.navigate_filter(self.filter_viewport_start)?;
+        } else {
+            self.filtered_rows.clear();
+            self.filter_buffer_start = 0;
+            self.filter_viewport_start = 0;
+        }
+        if !progress.done {
+            return Ok(());
+        }
+
+        let job = self.filter_job.take().expect("filter job is present");
+        match job.wait() {
+            Ok(index) => {
+                let matches = index.matches_found();
+                self.filter_index = Some(index);
+                self.filter_status = Some(if progress.cancelled {
+                    format!("Filter cancelled after {matches} matches.")
+                } else if matches == 0 {
+                    "Filter complete. No matching rows.".into()
+                } else {
+                    format!("Filter complete. {matches} matches.")
+                });
+                if matches > 0 {
+                    self.navigate_filter(self.filter_viewport_start)?;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.stop_filter_read();
+                self.filter_index = None;
+                self.filter_query = None;
+                self.filter_progress = None;
+                self.filter_status = None;
+                self.filtered_rows.clear();
+                self.filter_viewport_start = 0;
+                self.filter_buffer_start = 0;
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn poll_filter_read(&mut self) -> Result<(), String> {
+        let done = self
+            .filter_read
+            .as_ref()
+            .is_some_and(|active| active.job.progress().done);
+        if !done {
+            return Ok(());
+        }
+
+        let active = self
+            .filter_read
+            .take()
+            .expect("completed filter read should be active");
+        let desired = self.filter_read_window(self.filter_viewport_start);
+        match active.job.wait() {
+            Ok(FilterReadOutcome::Complete(rows)) if desired == Some(active.window) => {
+                let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
+                if loaded_columns > self.total_columns {
+                    self.ensure_column_count(loaded_columns);
+                    self.refresh_column_headers();
+                }
+                self.last_viewport_read = Some(active.started.elapsed());
+                self.filter_buffer_start = active.window.start_match;
+                self.filtered_rows = rows;
+            }
+            Ok(FilterReadOutcome::Complete(_) | FilterReadOutcome::Cancelled) => {}
+            Err(error) => {
+                self.pending_filter_read = None;
+                return Err(error.to_string());
+            }
+        }
+
+        self.schedule_filter_buffer(self.filter_viewport_start)
+    }
+
+    fn cancel_filter(&self) {
+        if let Some(job) = &self.filter_job {
+            job.cancel();
+        }
+    }
+
+    fn clear_filter(&mut self) -> Result<(), String> {
+        self.stop_filter_read();
+        if let Some(job) = self.filter_job.take() {
+            job.cancel();
+            drop(job);
+        }
+        self.filter_index = None;
+        self.filter_query = None;
+        self.filter_progress = None;
+        self.filter_status = None;
+        self.filter_viewport_start = 0;
+        self.filter_buffer_start = 0;
+        self.filtered_rows.clear();
+        self.selection = None;
+        self.reveal_cell = None;
+        self.scroll_points = 0.0;
+        if self.available_data_rows() > 0 {
+            self.navigate(self.viewport_start)?;
+        }
+        Ok(())
+    }
+
+    fn filter_active(&self) -> bool {
+        self.filter_query.is_some()
+    }
+
+    fn is_filter_ready(&self) -> bool {
+        self.total_columns > 0
+    }
+
+    fn filter_progress(&self) -> Option<FilterProgress> {
+        self.filter_job
+            .as_ref()
+            .map(FilterJob::progress)
+            .or(self.filter_progress)
+    }
+
+    fn filter_rows_loading(&self) -> bool {
+        self.filter_read.is_some() || self.pending_filter_read.is_some()
+    }
+
+    fn filter_empty_message(&self, row_count: usize) -> Option<&'static str> {
+        if !self.filter_active() || row_count != 0 {
+            None
+        } else if self.available_filter_rows() == 0 && self.filter_job.is_some() {
+            Some("Finding matching rows…")
+        } else if self.filter_rows_loading() {
+            Some("Loading matching rows…")
+        } else {
+            Some("No matching rows")
+        }
+    }
+
+    fn available_filter_rows(&self) -> u64 {
+        self.filter_progress
+            .map(|progress| progress.matches_found)
+            .unwrap_or(0)
+            .max(
+                self.filter_index
+                    .as_ref()
+                    .map(FilterIndex::matches_found)
+                    .unwrap_or(0),
+            )
+    }
+
+    fn refresh_filter_snapshot_for(&mut self, required_matches: u64) {
+        let indexed = self
+            .filter_index
+            .as_ref()
+            .map(FilterIndex::matches_found)
+            .unwrap_or(0);
+        if indexed >= required_matches {
+            return;
+        }
+        if let Some(job) = &self.filter_job {
+            self.filter_index = Some(job.snapshot());
+        }
+    }
+
     fn is_search_ready(&self) -> bool {
         self.index.is_some() && self.progress.done && !self.progress.cancelled
     }
@@ -1304,7 +1794,7 @@ impl Document {
         self.validate_column(column)?;
         self.columns.view(column);
         self.refresh_column_headers();
-        self.reveal_cell = Some((self.viewport_start, column));
+        self.reveal_cell = Some((self.current_source_row(), column));
         self.clear_hidden_selection();
         Ok(())
     }
@@ -1346,7 +1836,7 @@ impl Document {
             .visible
             .first()
             .copied()
-            .map(|column| (self.viewport_start, column));
+            .map(|column| (self.current_source_row(), column));
         self.clear_hidden_selection();
     }
 
@@ -1358,7 +1848,7 @@ impl Document {
             .visible
             .first()
             .copied()
-            .map(|column| (self.viewport_start, column));
+            .map(|column| (self.current_source_row(), column));
         self.clear_hidden_selection();
     }
 
@@ -1403,12 +1893,24 @@ impl Document {
     }
 
     fn shutdown(&mut self) {
+        self.stop_filter_read();
+        if let Some(job) = self.filter_job.take() {
+            job.cancel();
+            drop(job);
+        }
         if let Some(job) = self.search_job.take() {
             job.cancel();
             drop(job);
         }
         if let Some(job) = self.job.take() {
             drop(job);
+        }
+    }
+
+    fn stop_filter_read(&mut self) {
+        self.pending_filter_read = None;
+        if let Some(active) = self.filter_read.take() {
+            active.job.cancel_without_waiting();
         }
     }
 
@@ -1440,6 +1942,9 @@ impl Document {
 
     fn set_visible_rows(&mut self, visible_rows: usize) -> Result<(), String> {
         self.visible_rows = visible_rows.max(1);
+        if self.filter_active() {
+            return self.navigate_filter(self.filter_viewport_start);
+        }
         if self.available_data_rows() == 0 {
             return Ok(());
         }
@@ -1464,6 +1969,21 @@ impl Document {
     }
 
     fn scroll_rows(&mut self, rows: i64) -> Result<(), String> {
+        if self.filter_active() {
+            let available = self.available_filter_rows();
+            let maximum = max_viewport_start(available, self.visible_rows);
+            let current = self.filter_viewport_start;
+            let target = if rows.is_negative() {
+                current.saturating_sub(rows.unsigned_abs())
+            } else {
+                current.saturating_add(rows as u64).min(maximum)
+            };
+            if target == current {
+                self.scroll_points = 0.0;
+                return Ok(());
+            }
+            return self.navigate_filter(target);
+        }
         let available = self.available_data_rows();
         let maximum = max_viewport_start(available, self.visible_rows);
         let current = self.viewport_start.saturating_sub(self.data_start);
@@ -1477,6 +1997,23 @@ impl Document {
             return Ok(());
         }
         self.navigate(self.data_start.saturating_add(target))
+    }
+
+    fn navigate_filter(&mut self, requested: u64) -> Result<(), String> {
+        let available = self.available_filter_rows();
+        if available == 0 {
+            self.cancel_filter_read_for_navigation();
+            self.filter_viewport_start = 0;
+            self.filter_buffer_start = 0;
+            self.filtered_rows.clear();
+            self.clear_hidden_selection();
+            return Ok(());
+        }
+        let start = requested.min(max_viewport_start(available, self.visible_rows));
+        self.schedule_filter_buffer(start)?;
+        self.filter_viewport_start = start;
+        self.clear_hidden_selection();
+        Ok(())
     }
 
     fn navigate(&mut self, requested: u64) -> Result<(), String> {
@@ -1547,6 +2084,107 @@ impl Document {
         Ok(())
     }
 
+    fn filter_read_window(&self, viewport_start: u64) -> Option<FilterReadWindow> {
+        let available = self.available_filter_rows();
+        if available == 0 {
+            return None;
+        }
+        let capacity = self.visible_rows.saturating_add(2 * OVERSCAN_ROWS) as u64;
+        let last_start = available.saturating_sub(capacity);
+        let start_match = viewport_start
+            .saturating_sub(OVERSCAN_ROWS as u64)
+            .min(last_start);
+        let count = (available - start_match).min(capacity) as usize;
+        Some(FilterReadWindow { start_match, count })
+    }
+
+    fn filter_buffer_covers(&self, viewport_start: u64) -> bool {
+        let available = self.available_filter_rows();
+        if available == 0 {
+            return false;
+        }
+        let visible_end = viewport_start
+            .saturating_add((available - viewport_start).min(self.visible_rows as u64));
+        let loaded_end = self
+            .filter_buffer_start
+            .saturating_add(self.filtered_rows.len() as u64);
+        let capacity = self.visible_rows.saturating_add(2 * OVERSCAN_ROWS) as u64;
+        self.filter_buffer_start <= viewport_start
+            && loaded_end >= visible_end
+            && self.filtered_rows.len() as u64 <= capacity
+    }
+
+    fn schedule_filter_buffer(&mut self, viewport_start: u64) -> Result<(), String> {
+        let Some(window) = self.filter_read_window(viewport_start) else {
+            self.cancel_filter_read_for_navigation();
+            self.filter_buffer_start = 0;
+            self.filtered_rows.clear();
+            return Ok(());
+        };
+
+        if self.filtered_rows.len() > window.count && window.start_match >= self.filter_buffer_start
+        {
+            let offset =
+                usize::try_from(window.start_match.saturating_sub(self.filter_buffer_start))
+                    .unwrap_or(self.filtered_rows.len());
+            if offset.saturating_add(window.count) <= self.filtered_rows.len() {
+                self.filtered_rows.drain(..offset);
+                self.filtered_rows.truncate(window.count);
+                self.filter_buffer_start = window.start_match;
+            }
+        }
+
+        if self.filter_buffer_covers(viewport_start) {
+            self.cancel_filter_read_for_navigation();
+            return Ok(());
+        }
+
+        self.refresh_filter_snapshot_for(window.start_match.saturating_add(window.count as u64));
+        if let Some(active) = self.filter_read.as_mut() {
+            if active.window == window && !active.cancel_requested {
+                self.pending_filter_read = None;
+            } else {
+                if !active.cancel_requested {
+                    active.job.cancel();
+                    active.cancel_requested = true;
+                }
+                self.pending_filter_read = Some(window);
+            }
+            return Ok(());
+        }
+
+        self.start_filter_read(window)
+    }
+
+    fn start_filter_read(&mut self, window: FilterReadWindow) -> Result<(), String> {
+        self.pending_filter_read = None;
+        let index = self
+            .filter_index
+            .as_ref()
+            .ok_or_else(|| "No filter index is available.".to_owned())?;
+        let job = self
+            .session
+            .start_filtered_read(index, window.start_match, window.count)
+            .map_err(|error| error.to_string())?;
+        self.filter_read = Some(ActiveFilterRead {
+            window,
+            job,
+            started: Instant::now(),
+            cancel_requested: false,
+        });
+        Ok(())
+    }
+
+    fn cancel_filter_read_for_navigation(&mut self) {
+        self.pending_filter_read = None;
+        if let Some(active) = self.filter_read.as_mut()
+            && !active.cancel_requested
+        {
+            active.job.cancel();
+            active.cancel_requested = true;
+        }
+    }
+
     fn visible_rows(&self) -> &[Row] {
         let offset = usize::try_from(self.viewport_start.saturating_sub(self.buffer_start))
             .unwrap_or(self.buffered_rows.len())
@@ -1557,14 +2195,62 @@ impl Document {
         &self.buffered_rows[offset..end]
     }
 
+    fn visible_filter_rows(&self) -> &[FilterMatch] {
+        let offset = usize::try_from(
+            self.filter_viewport_start
+                .saturating_sub(self.filter_buffer_start),
+        )
+        .unwrap_or(self.filtered_rows.len())
+        .min(self.filtered_rows.len());
+        let end = offset
+            .saturating_add(self.visible_rows)
+            .min(self.filtered_rows.len());
+        &self.filtered_rows[offset..end]
+    }
+
+    fn visible_row_count(&self) -> usize {
+        if self.filter_active() {
+            self.visible_filter_rows().len()
+        } else {
+            self.visible_rows().len()
+        }
+    }
+
+    fn visible_row(&self, index: usize) -> Option<(u64, &[Vec<u8>])> {
+        if self.filter_active() {
+            self.visible_filter_rows()
+                .get(index)
+                .map(|row| (row.row, row.fields.as_slice()))
+        } else {
+            self.visible_rows().get(index).map(|row| {
+                (
+                    self.viewport_start.saturating_add(index as u64),
+                    row.fields.as_slice(),
+                )
+            })
+        }
+    }
+
+    fn current_source_row(&self) -> u64 {
+        self.visible_row(0)
+            .map(|(row, _)| row)
+            .unwrap_or(self.viewport_start)
+    }
+
     fn clear_hidden_selection(&mut self) {
         let Some(selection) = self.selection else {
             return;
         };
-        let row_end = self
-            .viewport_start
-            .saturating_add(self.visible_rows().len() as u64);
-        let row_visible = (self.viewport_start..row_end).contains(&selection.row());
+        let row_visible = if self.filter_active() {
+            self.visible_filter_rows()
+                .iter()
+                .any(|row| row.row == selection.row())
+        } else {
+            let row_end = self
+                .viewport_start
+                .saturating_add(self.visible_rows().len() as u64);
+            (self.viewport_start..row_end).contains(&selection.row())
+        };
         let column_visible = match selection {
             GridSelection::Row { .. } => true,
             GridSelection::Cell { column, .. } => self.columns.visible.contains(&column),
@@ -1578,17 +2264,54 @@ impl Document {
         let selection = self
             .selection
             .ok_or_else(|| "Select a cell or row before copying.".to_owned())?;
-        let relative = selection
-            .row()
-            .checked_sub(self.buffer_start)
-            .ok_or_else(|| "The selected row is no longer visible. Select it again.".to_owned())?;
-        let offset = usize::try_from(relative)
-            .map_err(|_| "The selected row is no longer visible. Select it again.".to_owned())?;
-        let row = self
-            .buffered_rows
-            .get(offset)
-            .ok_or_else(|| "The selected row is no longer visible. Select it again.".to_owned())?;
-        selection_text(row, selection, MAX_COPY_BYTES)
+        if self.filter_active() {
+            let row = self
+                .visible_filter_rows()
+                .iter()
+                .find(|row| row.row == selection.row())
+                .ok_or_else(|| {
+                    "The selected row is no longer visible. Select it again.".to_owned()
+                })?;
+            selection_fields_text(&row.fields, selection, MAX_COPY_BYTES)
+        } else {
+            let relative = selection
+                .row()
+                .checked_sub(self.buffer_start)
+                .ok_or_else(|| {
+                    "The selected row is no longer visible. Select it again.".to_owned()
+                })?;
+            let offset = usize::try_from(relative).map_err(|_| {
+                "The selected row is no longer visible. Select it again.".to_owned()
+            })?;
+            let row = self.buffered_rows.get(offset).ok_or_else(|| {
+                "The selected row is no longer visible. Select it again.".to_owned()
+            })?;
+            selection_text(row, selection, MAX_COPY_BYTES)
+        }
+    }
+
+    fn grid_total_rows(&self) -> u64 {
+        if self.filter_active() {
+            self.available_filter_rows()
+        } else {
+            self.available_data_rows()
+        }
+    }
+
+    fn grid_position(&self) -> u64 {
+        if self.filter_active() {
+            self.filter_viewport_start
+        } else {
+            self.viewport_start.saturating_sub(self.data_start)
+        }
+    }
+
+    fn navigate_grid_position(&mut self, position: u64) -> Result<(), String> {
+        if self.filter_active() {
+            self.navigate_filter(position)
+        } else {
+            self.navigate(self.data_start.saturating_add(position))
+        }
     }
 
     fn display_start(&self) -> u64 {
@@ -1722,7 +2445,7 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
     let row_stride = ROW_HEIGHT;
     let visible_rows = (body_height / row_stride).floor().max(1.0) as usize;
     document.set_visible_rows(visible_rows)?;
-    let total_rows = document.available_data_rows();
+    let total_rows = document.grid_total_rows();
 
     let grid_rect = ui.available_rect_before_wrap();
     if total_rows > 0 && ui.rect_contains_pointer(grid_rect) {
@@ -1737,17 +2460,18 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
     }
 
     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-        let fraction = scroll_fraction_for_row(
-            document.viewport_start,
-            document.data_start,
-            total_rows,
-            document.visible_rows,
-        );
+        let position = document.grid_position();
+        let fraction = scroll_fraction_for_row(position, 0, total_rows, document.visible_rows);
         let mut slider_position = 1.0 - fraction;
         let thumb_height = scrollbar_thumb_height(grid_height, total_rows, document.visible_rows);
         let handle_radius = SCROLLBAR_WIDTH / 2.5;
         let scroll_enabled = total_rows > 0;
-        let label = if scroll_enabled {
+        let label = if scroll_enabled && document.filter_active() {
+            format!(
+                "Vertical scroll, filter match {} of {total_rows}",
+                position.saturating_add(1)
+            )
+        } else if scroll_enabled {
             format!(
                 "Vertical scroll, row {} of {total_rows}",
                 document.display_start()
@@ -1755,7 +2479,12 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
         } else {
             "Vertical scroll, no data rows".into()
         };
-        let hover_text = if scroll_enabled {
+        let hover_text = if scroll_enabled && document.filter_active() {
+            format!(
+                "Filter match {} of {total_rows}",
+                position.saturating_add(1)
+            )
+        } else if scroll_enabled {
             format!("Row {} of {total_rows}", document.display_start())
         } else {
             "No data rows".into()
@@ -1786,12 +2515,12 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
         if scroll_enabled && response.changed() {
             let target = row_for_scroll_fraction(
                 1.0 - slider_position,
-                document.data_start,
+                0,
                 total_rows,
                 document.visible_rows,
             );
-            if target != document.viewport_start {
-                document.navigate(target)?;
+            if target != position {
+                document.navigate_grid_position(target)?;
             }
         }
 
@@ -1815,10 +2544,21 @@ fn show_table(
     document: &Document,
     reveal_cell: Option<(u64, usize)>,
 ) -> Option<GridSelection> {
-    let rows = document.visible_rows();
+    let row_count = document.visible_row_count();
     let mut clicked_selection = None;
     ui.horizontal(|ui| {
-        if rows.is_empty() {
+        if let Some(message) = document.filter_empty_message(row_count) {
+            ui.heading(message);
+        } else if document.filter_active() {
+            ui.heading(format!(
+                "Matches {}–{} of {}",
+                document.filter_viewport_start.saturating_add(1),
+                document
+                    .filter_viewport_start
+                    .saturating_add(row_count as u64),
+                document.available_filter_rows()
+            ));
+        } else if row_count == 0 {
             ui.heading("No data rows");
         } else {
             ui.heading(format!(
@@ -1851,7 +2591,6 @@ fn show_table(
         ((viewport_width - 82.0) / document.headers.len().max(1) as f32).clamp(80.0, 160.0);
     let content_width =
         74.0 + document.headers.len() as f32 * (column_width + ui.spacing().item_spacing.x);
-    let start = document.display_start();
     let body_height =
         (grid_height - HEADER_HEIGHT - ui.spacing().scroll.allocated_width()).max(ROW_HEIGHT);
 
@@ -1893,12 +2632,14 @@ fn show_table(
                     }
                 })
                 .body(|body| {
-                    body.rows(ROW_HEIGHT, rows.len(), |mut table_row| {
+                    body.rows(ROW_HEIGHT, row_count, |mut table_row| {
                         let row_index = table_row.index();
-                        let row = &rows[row_index];
-                        let record_row =
-                            document.viewport_start.saturating_add(row_index as u64);
-                        let display_row = start.saturating_add(row_index as u64);
+                        let (record_row, fields) = document
+                            .visible_row(row_index)
+                            .expect("the table row is visible");
+                        let display_row = record_row
+                            .saturating_sub(document.data_start)
+                            .saturating_add(1);
                         table_row.col(|ui| {
                             ui.scope_builder(
                                 egui::UiBuilder::new().id(("row-selection", record_row)),
@@ -1946,8 +2687,7 @@ fn show_table(
                                     egui::UiBuilder::new()
                                         .id(("cell-selection", record_row, column)),
                                     |ui| {
-                                    let text = row
-                                        .fields
+                                    let text = fields
                                         .get(column)
                                         .map_or_else(String::new, |field| field_text(field));
                                     let selected = document.selection.is_some_and(|selection| {
@@ -2050,12 +2790,20 @@ fn field_text(field: &[u8]) -> String {
 }
 
 fn selection_text(row: &Row, selection: GridSelection, max_bytes: usize) -> Result<String, String> {
+    selection_fields_text(&row.fields, selection, max_bytes)
+}
+
+fn selection_fields_text(
+    fields: &[Vec<u8>],
+    selection: GridSelection,
+    max_bytes: usize,
+) -> Result<String, String> {
     match selection {
         GridSelection::Cell { column, .. } => {
             let mut output = String::new();
             append_clipboard_field(
                 &mut output,
-                row.fields.get(column).map_or(&[], Vec::as_slice),
+                fields.get(column).map_or(&[], Vec::as_slice),
                 false,
                 max_bytes,
             )?;
@@ -2063,7 +2811,7 @@ fn selection_text(row: &Row, selection: GridSelection, max_bytes: usize) -> Resu
         }
         GridSelection::Row { .. } => {
             let mut output = String::new();
-            for (index, field) in row.fields.iter().enumerate() {
+            for (index, field) in fields.iter().enumerate() {
                 if index > 0 {
                     ensure_copy_capacity(&output, 1, max_bytes)?;
                     output.push('\t');
@@ -2151,11 +2899,12 @@ mod tests {
 
     use super::{
         Action, COLUMN_INPUT_ID, COLUMN_POSITION_INPUT_ID, ColumnCommand, ColumnView,
-        DelimiterMode, Document, FIND_INPUT_ID, GridSelection, HeaderMode, IndexConfig,
-        OpenOptions, QuarryApp, Row, SearchProgress, column_drop_position, column_window_controls,
-        copy_control, logical_viewport_start, max_viewport_start, page_controls,
-        parse_column_position, parse_data_row, parse_file_column, row_for_scroll_fraction,
-        scroll_fraction_for_row, search_controls, selection_text, show_column_manager, show_grid,
+        DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterQuery, GridSelection,
+        HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SearchProgress, Session,
+        column_drop_position, column_window_controls, copy_control, logical_viewport_start,
+        max_viewport_start, page_controls, parse_column_position, parse_data_row,
+        parse_file_column, row_for_scroll_fraction, scroll_fraction_for_row, search_controls,
+        selection_text, show_column_manager, show_filter_manager, show_grid,
     };
 
     fn click_accessible_button(
@@ -2394,6 +3143,27 @@ mod tests {
         document.poll_search().unwrap();
     }
 
+    fn finish_filter(document: &mut Document) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            document.poll_filter().unwrap();
+            if document.filter_job.is_none() && !document.filter_rows_loading() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "filter timed out");
+            std::thread::yield_now();
+        }
+    }
+
+    fn finish_filter_read(document: &mut Document) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while document.filter_rows_loading() {
+            document.poll_filter().unwrap();
+            assert!(Instant::now() < deadline, "filter read timed out");
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn page_navigation_controls_are_clickable() {
         assert!(matches!(
@@ -2416,6 +3186,463 @@ mod tests {
             click_accessible_button("Copy", |ui| copy_control(ui, true)),
             Some(Action::CopySelection)
         ));
+    }
+
+    #[test]
+    fn filter_manager_applies_a_labelled_multiline_equals_value_by_button() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-filter-a11y-{name}.csv"));
+        fs::write(
+            &path,
+            b"name,note\nfirst,\"line one\nline two\"\nsecond,single line\n",
+        )
+        .unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(path.clone()).unwrap();
+        app.filters_open = true;
+        app.filter_column_input = "2".to_owned();
+        app.filter_operator = FilterOperator::Equals;
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut action = None;
+        let output = ctx.run(grid_input(), |ctx| {
+            action = show_filter_manager(
+                ctx,
+                &mut app.filters_open,
+                &mut app.filter_column_input,
+                &mut app.filter_operator,
+                &mut app.filter_value_input,
+                app.document.as_ref().unwrap(),
+            );
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present");
+        assert_eq!(
+            tree.nodes
+                .iter()
+                .filter(|(_, node)| {
+                    matches!(
+                        node.role(),
+                        egui::accesskit::Role::TextInput
+                            | egui::accesskit::Role::MultilineTextInput
+                    ) && !node.labelled_by().is_empty()
+                })
+                .count(),
+            2
+        );
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::MultilineTextInput
+                && !node.labelled_by().is_empty()
+        }));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::ComboBox && !node.labelled_by().is_empty()
+        }));
+        let target = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Apply filter")
+                    && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .expect("Apply filter should be accessible");
+
+        ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new(super::FILTER_VALUE_INPUT_ID));
+        });
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Text("line one".to_owned()),
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Text("line two".to_owned()),
+                ],
+                ..grid_input()
+            },
+            |ctx| {
+                action = show_filter_manager(
+                    ctx,
+                    &mut app.filters_open,
+                    &mut app.filter_column_input,
+                    &mut app.filter_operator,
+                    &mut app.filter_value_input,
+                    app.document.as_ref().unwrap(),
+                );
+            },
+        );
+        assert!(action.is_none(), "Enter should insert data, not apply");
+        assert_eq!(app.filter_value_input, "line one\nline two");
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                action = show_filter_manager(
+                    ctx,
+                    &mut app.filters_open,
+                    &mut app.filter_column_input,
+                    &mut app.filter_operator,
+                    &mut app.filter_value_input,
+                    app.document.as_ref().unwrap(),
+                );
+            },
+        );
+        assert!(matches!(action, Some(Action::ApplyFilter)));
+
+        app.apply(&ctx, action.unwrap());
+        let document = app.document.as_mut().unwrap();
+        finish_filter(document);
+        assert_eq!(document.available_filter_rows(), 1);
+        assert_eq!(document.visible_filter_rows()[0].fields[0], b"first");
+        assert_eq!(
+            document.visible_filter_rows()[0].fields[1],
+            b"line one\nline two"
+        );
+        document.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filtered_grid_is_match_only_bounded_and_keeps_source_column_identity() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-filter-grid-{name}.csv"));
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "id,status,note").unwrap();
+        for row in 1..=200 {
+            let status = if row % 3 == 0 { "keep" } else { "skip" };
+            writeln!(file, "{row},{status},note{row}").unwrap();
+        }
+        drop(file);
+
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.move_column(1, 0).unwrap();
+        document.set_column_shown(1, false).unwrap();
+        let order = document.columns.order.clone();
+        let hidden = document.columns.hidden.clone();
+
+        document
+            .start_filter(FilterQuery {
+                column: 1,
+                operator: FilterOperator::Equals,
+                value: b"keep".to_vec(),
+            })
+            .unwrap();
+        finish_filter(&mut document);
+        document.set_visible_rows(7).unwrap();
+
+        assert_eq!(document.available_filter_rows(), 66);
+        assert_eq!(document.filter_viewport_start, 0);
+        assert_eq!(document.visible_row_count(), 7);
+        assert!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .all(|row| { row.fields.get(1).map(Vec::as_slice) == Some(b"keep".as_slice()) })
+        );
+        assert_eq!(document.visible_filter_rows()[0].match_ordinal, 0);
+        assert_eq!(document.visible_filter_rows()[0].row, 3);
+        assert_eq!(document.columns.order, order);
+        assert_eq!(document.columns.hidden, hidden);
+
+        let first_row = document.visible_filter_rows()[0].row;
+        document.selection = Some(GridSelection::Cell {
+            row: first_row,
+            column: 2,
+        });
+        assert_eq!(document.copy_selection_text().unwrap(), "note3");
+        document.selection = Some(GridSelection::Row { row: first_row });
+        assert_eq!(document.copy_selection_text().unwrap(), "3\tkeep\tnote3");
+
+        document.page(1).unwrap();
+        assert_eq!(document.filter_viewport_start, 7);
+        assert_eq!(document.visible_filter_rows()[0].match_ordinal, 7);
+        assert_eq!(document.visible_filter_rows()[0].row, 24);
+        assert!(document.filtered_rows.len() <= document.visible_rows + 2 * super::OVERSCAN_ROWS);
+
+        let final_start =
+            max_viewport_start(document.available_filter_rows(), document.visible_rows);
+        document.navigate_filter(final_start).unwrap();
+        assert!(document.filter_rows_loading());
+        finish_filter_read(&mut document);
+        assert_eq!(document.visible_filter_rows().last().unwrap().row, 198);
+        assert!(document.filtered_rows.len() <= document.visible_rows + 2 * super::OVERSCAN_ROWS);
+        document.page(-1).unwrap();
+        assert_eq!(
+            document.filter_viewport_start,
+            final_start.saturating_sub(document.visible_rows as u64)
+        );
+
+        document.clear_filter().unwrap();
+        assert!(!document.filter_active());
+        assert!(document.filtered_rows.is_empty());
+        assert_eq!(document.columns.order, order);
+        assert_eq!(document.columns.hidden, hidden);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn active_filter_navigation_refreshes_a_stale_snapshot_before_reading() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-filter-stale-{name}.csv"));
+        let prefix_path =
+            std::env::temp_dir().join(format!("quarry-filter-stale-prefix-{name}.csv"));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"name,status\n").unwrap();
+        file.write_all(&b"row,keep\n".repeat(2_000)).unwrap();
+        drop(file);
+        let mut prefix = File::create(&prefix_path).unwrap();
+        prefix.write_all(b"name,status\n").unwrap();
+        prefix.write_all(&b"row,keep\n".repeat(1_000)).unwrap();
+        drop(prefix);
+
+        let mut document = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        document.visible_rows = 5;
+        let query = FilterQuery {
+            column: 1,
+            operator: FilterOperator::Equals,
+            value: b"keep".to_vec(),
+        };
+        let stale_session = Session::open(
+            &prefix_path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let stale_job = stale_session.start_filter(query.clone()).unwrap();
+        let stale_index = stale_job.wait().unwrap();
+        let stale_matches = stale_index.matches_found();
+        assert_eq!(stale_matches, 1_000);
+
+        document.start_filter(query).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let progress = loop {
+            let progress = document.filter_job.as_ref().unwrap().progress();
+            if progress.done {
+                break progress;
+            }
+            assert!(Instant::now() < deadline, "filter did not complete");
+            std::thread::yield_now();
+        };
+        assert_eq!(progress.matches_found, 2_000);
+        document.filter_progress = Some(progress);
+        document.filter_index = Some(stale_index);
+        let target = max_viewport_start(progress.matches_found, document.visible_rows);
+        let required = target
+            .saturating_add(document.visible_rows as u64)
+            .min(progress.matches_found);
+        assert!(stale_matches < required);
+
+        document.navigate_filter(target).unwrap();
+        assert!(document.filter_rows_loading());
+        finish_filter_read(&mut document);
+
+        assert!(document.filter_index.as_ref().unwrap().matches_found() >= required);
+        assert_eq!(document.visible_filter_rows()[0].match_ordinal, target);
+        assert!(document.filtered_rows.len() <= document.visible_rows + 2 * super::OVERSCAN_ROWS);
+        document.shutdown();
+        for path in [path, prefix_path] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn filter_navigation_is_async_and_latest_request_wins() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-filter-latest-{name}.csv"));
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "id,status").unwrap();
+        for row in 0..25_000 {
+            let status = if row % 20 == 0 { "keep" } else { "skip" };
+            writeln!(file, "{row},{status}").unwrap();
+        }
+        drop(file);
+
+        let mut document = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        document.visible_rows = 5;
+        document
+            .start_filter(FilterQuery {
+                column: 1,
+                operator: FilterOperator::Equals,
+                value: b"keep".to_vec(),
+            })
+            .unwrap();
+        finish_filter(&mut document);
+
+        document.navigate_filter(100).unwrap();
+        assert!(document.filter_read.is_some());
+        assert!(document.visible_filter_rows().is_empty());
+        assert_eq!(
+            document.filter_empty_message(document.visible_row_count()),
+            Some("Loading matching rows…")
+        );
+
+        document.navigate_filter(500).unwrap();
+        assert!(document.filter_read.as_ref().unwrap().cancel_requested);
+        document.navigate_filter(900).unwrap();
+        assert_eq!(
+            document.pending_filter_read,
+            document.filter_read_window(900)
+        );
+        assert_eq!(document.filter_viewport_start, 900);
+
+        finish_filter_read(&mut document);
+        assert_eq!(document.visible_filter_rows()[0].match_ordinal, 900);
+        assert_eq!(document.visible_filter_rows()[0].fields[0], b"18000");
+        assert!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .all(|row| row.fields[1] == b"keep")
+        );
+        assert!(document.filtered_rows.len() <= document.visible_rows + 2 * super::OVERSCAN_ROWS);
+        assert!(document.filter_read.is_none());
+        assert!(document.pending_filter_read.is_none());
+
+        document.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filter_cancel_clear_and_reopen_reset_the_filter_lifecycle() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first = std::env::temp_dir().join(format!("quarry-filter-life-{name}-first.csv"));
+        let second = std::env::temp_dir().join(format!("quarry-filter-life-{name}-second.csv"));
+        let mut file = File::create(&first).unwrap();
+        writeln!(file, "name,status").unwrap();
+        for row in 0..50_000 {
+            writeln!(file, "row{row},keep").unwrap();
+        }
+        drop(file);
+        fs::write(&second, b"name,status\nsecond,keep\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(first.clone()).unwrap();
+        let document = app.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery {
+                column: 1,
+                operator: FilterOperator::Contains,
+                value: b"keep".to_vec(),
+            })
+            .unwrap();
+        document.cancel_filter();
+        finish_filter(document);
+        assert!(document.filter_active());
+        let status = document.filter_status.as_deref().unwrap();
+        assert!(
+            status.starts_with("Filter cancelled after") || status.starts_with("Filter complete.")
+        );
+
+        document.clear_filter().unwrap();
+        assert!(!document.filter_active());
+        assert!(document.filter_job.is_none());
+        assert!(document.filter_index.is_none());
+
+        let query = FilterQuery {
+            column: 1,
+            operator: FilterOperator::Equals,
+            value: b"keep".to_vec(),
+        };
+        document.start_filter(query.clone()).unwrap();
+        finish_filter(document);
+        document.navigate_filter(100).unwrap();
+        document.navigate_filter(200).unwrap();
+        assert!(document.filter_read.is_some());
+        assert!(document.pending_filter_read.is_some());
+
+        document.start_filter(query.clone()).unwrap();
+        assert!(document.filter_read.is_none());
+        assert!(document.pending_filter_read.is_none());
+        finish_filter(document);
+        document.navigate_filter(100).unwrap();
+        document.navigate_filter(200).unwrap();
+        assert!(document.filter_read.is_some());
+        assert!(document.pending_filter_read.is_some());
+        document.clear_filter().unwrap();
+        assert!(document.filter_read.is_none());
+        assert!(document.pending_filter_read.is_none());
+
+        document.start_filter(query).unwrap();
+        finish_filter(document);
+        document.navigate_filter(100).unwrap();
+        document.navigate_filter(200).unwrap();
+        assert!(document.filter_read.is_some());
+        assert!(document.pending_filter_read.is_some());
+        app.filters_open = true;
+        app.filter_column_input = "2".into();
+        app.filter_value_input = "keep".into();
+        app.open_path(second.clone()).unwrap();
+        assert!(!app.filters_open);
+        assert_eq!(app.filter_column_input, "1");
+        assert!(app.filter_value_input.is_empty());
+        assert!(!app.document.as_ref().unwrap().filter_active());
+        assert!(app.document.as_ref().unwrap().filter_read.is_none());
+        assert!(app.document.as_ref().unwrap().pending_filter_read.is_none());
+
+        app.document.as_mut().unwrap().shutdown();
+        for path in [first, second] {
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -2871,8 +4098,7 @@ mod tests {
         let reference_rows = document.visible_rows;
         assert!(
             reference_rows >= 40,
-            "maximized reference window fits only {} rows",
-            reference_rows
+            "maximized reference window fits only {reference_rows} rows"
         );
         assert!(document.display_end() >= 40);
         assert!(

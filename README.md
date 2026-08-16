@@ -25,8 +25,9 @@ The first objective is deliberately narrow: make a 10 GB CSV practical to open a
 Current alpha capabilities include CSV, TSV, pipe, and semicolon-delimited
 files; progressive opening; continuous virtualized rows; resizable columns in a
 bounded 32-column display window; direct access to every known column;
-view-only hide/show/reorder controls; literal search; and bounded cell or row
-copy. Filtering, transformations, and streaming export remain planned.
+view-only hide/show/reorder controls; literal search; bounded cell or row copy;
+and single-column contains/equality filtering. Multiple filters,
+transformations, and streaming export remain planned.
 
 ## Performance direction
 The initial reference workload is a **10 GB delimited file**. Quarry should show useful first rows within seconds, keep memory bounded, remain interactive during scans, and avoid full-file copies for read-only work.
@@ -56,6 +57,11 @@ It also provides direct access to every known column plus view-only
 hide/show/reorder controls. The compact default grid dynamically fits rows to
 the available height and showed 42 data rows in the maximized reference window,
 completing the Phase 3 viewer alpha.
+
+Phase 4 is in progress. Its first slice scans one selected source column with a
+literal contains or equality predicate, builds a bounded adaptive match index,
+and serves bounded filtered row ranges through cancellable background reads
+without retaining every matching row.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -116,6 +122,14 @@ cargo run --release -p quarry-cli --bin quarry-bench -- search huge.csv \
   --query QUARRY_NO_MATCH_9F7B2C --cache-state unknown
 ```
 
+Measure a complete single-column filter scan and bounded filtered-row reads:
+
+```bash
+cargo run --release -p quarry-cli --bin quarry-bench -- filter huge.csv \
+  --column 1 --operator contains --value QUARRY_NO_MATCH_9F7B2C \
+  --cache-state unknown
+```
+
 Generate a deterministic local fixture:
 
 ```bash
@@ -134,6 +148,7 @@ See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [bounded-copy validation](docs/benchmarks/2026-08-16-bounded-copy.md),
 [column-controls validation](docs/benchmarks/2026-08-16-column-controls.md),
 [row-density validation](docs/benchmarks/2026-08-16-row-density.md),
+[streaming-filter validation](docs/benchmarks/2026-08-16-streaming-filter.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).

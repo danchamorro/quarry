@@ -12,6 +12,7 @@ quarry-core
    +-- Structural index worker
    +-- Bounded viewport reads
    +-- Literal search worker
+   +-- Bounded filter-index worker
    |
 quarry-delimited
    +-- Record scanner
@@ -38,8 +39,9 @@ quarry/
 ```
 
 `quarry-cli` provides the `quarry` and `quarry-bench` binaries. File access,
-structural indexing, bounded viewport reads, and literal search remain modules
-in core until their APIs or dependencies justify separate crates. See
+structural indexing, bounded viewport reads, literal search, and filtering
+remain modules in core until their APIs or dependencies justify separate
+crates. See
 [ADR 0001](adr/0001-initial-engine.md).
 
 ## File access
@@ -95,18 +97,22 @@ prevents clipboard serialization from growing without bound.
 
 ## Bounded memory
 Core defaults to 1 MiB read chunks, with a 64 MiB bootstrap and record limit and
-a 16 MiB adaptive structural-index budget. The UI retains the bounded bootstrap
-rows, one active viewport window, compact metadata per known column, one search
+fixed budgets for the adaptive structural and filter indexes. The UI retains
+the bounded bootstrap rows, one source viewport buffer, one filtered viewport
+buffer when filtering is active, compact metadata per known column, one search
 match, and at most a 64 MiB clipboard payload.
 [ADR 0002](adr/0002-defer-viewport-cache.md) records why an application viewport
 cache remains deferred.
 
 ## Concurrency
-Rust workers currently handle indexing and literal search. Both publish
-progress, support cancellation, and join before their job is dropped. Future
-long-running filters, sorting, and export must follow the same lifecycle rule.
+Rust workers currently handle indexing, literal search, filtering, and
+filtered viewport reads. Each publishes progress and supports cancellation.
+Jobs normally join before they are dropped. The viewer cancels and detaches
+obsolete read-only viewport workers so the render thread never waits for them;
+each worker owns its resources and exits at its next cancellation check. Future
+sorting and export workers must keep cleanup off the render thread.
 
-## Search and planned filters
+## Search and filtering
 Literal Find Next uses a cancellable core worker after structural indexing. It
 starts at the nearest row checkpoint, scans fixed 1 MiB chunks with the shared
 delimited-record scanner, parses one bounded record at a time, and retains only
@@ -115,9 +121,20 @@ worker on wait or drop. Memory therefore depends on the query, the fixed chunk,
 the 64 MiB maximum record and its decoded fields, one match, and the bounded
 structural index, not on file size or match count.
 
-The first slice is case-sensitive and does not wrap or collect results. Filters
-can later use streaming predicates and compact row/chunk selection metadata
-instead of copying matching rows.
+The first filter slice evaluates a case-sensitive contains or equality
+predicate against one decoded source column. A sequential worker counts every
+match while retaining only adaptive match checkpoints under a fixed budget.
+When the budget fills, the checkpoint interval grows and existing checkpoints
+compact; the exact match count is preserved.
+
+Filtered navigation asks for a bounded match range. Core starts a cancellable
+background read from the nearest retained match checkpoint, resumes the same
+predicate scan, and materializes only the requested rows. Rapid navigation
+cancels obsolete work and keeps only the newest requested window. The filter
+index owns its predicate so a caller cannot accidentally read its checkpoints
+with different filter semantics. Memory therefore depends on the fixed chunk
+and index budgets, the 64 MiB maximum record and its decoded fields, and the
+requested row count, not on file size or match count.
 
 ## Planned sorting
 Use a disk-aware external merge sort: bounded runs, sort in memory, spill to temporary storage, then merge into a stable row-order abstraction. Sorting must not delay the first performance milestone.
