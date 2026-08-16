@@ -84,5 +84,6 @@ denied, formatting, a release build, and diff checks.
 This slice does not persist layouts, auto-scroll a drag across manager rows that
 are not currently visible, freeze columns, or scan an entire headerless ragged
 file solely to discover its maximum width. The position field provides direct
-long-distance moves. Default row density remains unchanged and is the next
-Phase 3 task.
+long-distance moves. The later
+[row-density validation](2026-08-16-row-density.md) records the compact grid
+that completes Phase 3.

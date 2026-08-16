@@ -9,7 +9,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 0 — Foundation | Complete | Rust workspace, CI, deterministic generator, ADR, licensing, and the [12 GB benchmark](benchmarks/2026-08-14-large-file.md) |
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
-| Phase 3 — Viewer alpha | In progress | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md) |
+| Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 
 ### Phase 1 checklist
 
@@ -88,24 +88,17 @@ pacing becomes measurable with the viewer-alpha grid.
   behavior, and accessibility.
 - [x] Cover the column controls with deterministic wide-file regressions and a
   [12 GB viewer check](benchmarks/2026-08-16-column-controls.md).
-- [ ] **Next:** increase the default grid density so the same maximized reference
-  window shows at least 40 data rows (currently 23), using EmEditor only as a
-  density reference while preserving legibility, accessibility, and bounded
-  virtualization.
+- [x] Make the default grid dynamically fit compact rows to the available
+  height. The maximized reference window shows 42 data rows instead of 23,
+  using EmEditor only as a density reference while preserving legibility,
+  accessibility, and bounded virtualization in the
+  [row-density validation](benchmarks/2026-08-16-row-density.md).
 
-**Phase 3 in progress:** the viewer now provides bounded file-level continuous
-scrolling plus native opening and explicit format controls. The
-[12 GB scroll run](benchmarks/2026-08-15-continuous-scroll.md) and
-[file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md) record
-the current UI evidence; the [live-index benchmark](benchmarks/2026-08-15-live-index-latency.md)
-records the lock-window tuning decision, and the
-[streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md) records
-the bounded Find Next result. The
-[bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md) records exact
-cell and row clipboard output plus the deep-row check, and the
-[column-controls validation](benchmarks/2026-08-16-column-controls.md) records
-the bounded wide-file and 12 GB results. Increased default row density is next.
-Filtering, editing, export, and cosmetic redesign stay outside this slice.
+**Phase 3 exit met:** the viewer combines bounded continuous navigation, native
+opening, format controls, literal search, copy, column controls, diagnostics,
+and an adaptive grid measured at 42 rows in the maximized reference window.
+Phase 4 filters and streaming export are next. Editing and cosmetic redesign
+remain outside the current scope.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.

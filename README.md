@@ -53,8 +53,9 @@ navigation. The Phase 3 egui viewer alpha now has continuous scrolling, native
 file opening, drag and drop, delimiter/header controls, and bounded literal
 Find Next with progress and cancellation, plus bounded cell and row copying.
 It also provides direct access to every known column plus view-only
-hide/show/reorder controls. A denser default grid remains before Phase 3 is
-complete.
+hide/show/reorder controls. The compact default grid dynamically fits rows to
+the available height and showed 42 data rows in the maximized reference window,
+completing the Phase 3 viewer alpha.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -132,6 +133,7 @@ See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [streaming-search results](docs/benchmarks/2026-08-15-streaming-search.md),
 [bounded-copy validation](docs/benchmarks/2026-08-16-bounded-copy.md),
 [column-controls validation](docs/benchmarks/2026-08-16-column-controls.md),
+[row-density validation](docs/benchmarks/2026-08-16-row-density.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).
