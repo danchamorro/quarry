@@ -826,7 +826,7 @@ fn show_column_manager(
                                 ui.painter().hline(
                                     row.response.rect.x_range(),
                                     line_y,
-                                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                                    egui::Stroke::new(2.0_f32, ui.visuals().selection.stroke.color),
                                 );
                                 if ui.input(|input| input.pointer.any_released())
                                     && let Some(dropped) =
