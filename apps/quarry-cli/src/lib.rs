@@ -287,14 +287,18 @@ fn sample_filtered_rows(session: &Session, index: &FilterIndex) -> CliResult<Fil
     starts.sort_unstable();
     let started = Instant::now();
     let mut samples = FilterSamples::default();
-    for (position, start) in starts.into_iter().enumerate() {
-        if position > 0 && start == starts[position - 1] {
+    let mut sampled_until = 0_u64;
+    for start in starts {
+        let start = start.max(sampled_until);
+        if start >= matches {
             continue;
         }
-        let count = usize::try_from((matches - start).min(FILTER_SAMPLE_ROWS as u64))?;
+        let end = start.saturating_add(FILTER_SAMPLE_ROWS as u64).min(matches);
+        let count = usize::try_from(end - start)?;
         for found in session.read_filtered_rows(index, start, count)? {
             record_filter_sample(&mut samples, &found);
         }
+        sampled_until = end;
     }
     samples.elapsed = started.elapsed();
     Ok(samples)
@@ -1266,9 +1270,11 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        data_search_position, filter_command, generate_file, latency_stats, parse_size,
-        physical_to_data_row, search_command, viewport_command,
+        FilterSamples, data_search_position, filter_command, generate_file, latency_stats,
+        parse_size, physical_to_data_row, record_filter_sample, sample_filtered_rows,
+        search_command, viewport_command,
     };
+    use quarry_core::{FilterOperator, FilterQuery, HeaderMode, OpenOptions, Session};
 
     #[test]
     fn summarizes_viewport_latency_and_rejects_empty_workloads() {
@@ -1417,6 +1423,14 @@ mod tests {
 
         for (args, expected) in [
             (
+                vec!["missing.csv", "--column", "1"],
+                "filter requires --operator",
+            ),
+            (
+                vec!["missing.csv", "--column", "1", "--operator", "equals"],
+                "filter requires --value",
+            ),
+            (
                 vec![
                     "missing.csv",
                     "--column",
@@ -1515,6 +1529,32 @@ mod tests {
             ])
             .unwrap();
         }
+
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let index = session
+            .start_filter(FilterQuery {
+                column: 1,
+                operator: FilterOperator::Equals,
+                value: b"needle".to_vec(),
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let samples = sample_filtered_rows(&session, &index).unwrap();
+        let mut expected = FilterSamples::default();
+        for found in session.read_filtered_rows(&index, 0, 2).unwrap() {
+            record_filter_sample(&mut expected, &found);
+        }
+        assert_eq!(index.matches_found(), 2);
+        assert_eq!(samples.rows_read, 2);
+        assert_eq!(samples.checksum, expected.checksum);
 
         let error = filter_command(vec![
             path.to_string_lossy().into_owned(),

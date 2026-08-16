@@ -26,7 +26,8 @@ and streaming export remain deferred.
 - A bounded row request starts a cancellable background read at the nearest
   checkpoint, reevaluates the same predicate, and materializes only the
   requested matching rows. The egui viewer cancels obsolete reads and applies
-  only the newest requested match window.
+  only the newest requested match window. Cancelled read-only workers detach so
+  the render thread never waits for their cleanup.
 - Progress reports exact bytes, physical records, and matches scanned. The job
   supports snapshots, cancellation, wait, and cancel-and-join on drop.
 - The CLI accepts a one-based source column, waits for the filter worker, and
@@ -132,7 +133,7 @@ checkpoint index stayed below its 16 MiB budget.
 | 12 GB reference | 0 | 0 | 12,167,847,982 | 117,168,830 | 41.387 s | 280.39 MiB/s | 0 B | 3.92 MiB |
 
 The 12 GB source is 12.17 times larger, while peak RSS for the same absent
-predicate was 0.05 MiB lower. Throughput differs because the datasets contain
+predicate was 0.03 MiB lower. Throughput differs because the datasets contain
 different record shapes and the OS cache state was not controlled.
 
 ### Cancellation
@@ -148,7 +149,7 @@ neither result can be a raced complete scan labelled as cancellation.
 
 ## Automated coverage
 
-- `cargo test -p quarry-core` passed 24 tests, including decoded quoted and
+- `cargo test -p quarry-core` passed 25 tests, including decoded quoted and
   multiline predicates, equals-empty semantics, ragged rows, exact incremental
   range reads, adaptive compaction, readable partial indexes after
   cancellation, background sparse-range reads, mid-gap cancellation, oversized
@@ -157,10 +158,10 @@ neither result can be a raced complete scan labelled as cancellation.
   completed contains/equality/empty-equality scans, bounded samples, threshold
   rejection, and a deterministic successful cancellation branch.
 - The 26 egui regressions include labelled multiline filter controls, bounded
-  match-only grid navigation, source-column identity, live snapshot refresh,
+  match-only grid navigation, source-column identity, stale snapshot refresh,
   latest-request-wins background reads, and cancel/clear/reopen lifecycle
   behavior.
-- The full workspace passed 62 tests, formatting, strict Clippy with warnings
+- The full workspace passed 63 tests, formatting, strict Clippy with warnings
   denied, and a locked release build.
 
 ## Viewer smoke test

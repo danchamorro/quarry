@@ -106,9 +106,11 @@ cache remains deferred.
 
 ## Concurrency
 Rust workers currently handle indexing, literal search, filtering, and
-filtered viewport reads. Each publishes progress, supports cancellation, and
-joins before its job is dropped. Future sorting and export workers must follow
-the same lifecycle rule.
+filtered viewport reads. Each publishes progress and supports cancellation.
+Jobs normally join before they are dropped. The viewer cancels and detaches
+obsolete read-only viewport workers so the render thread never waits for them;
+each worker owns its resources and exits at its next cancellation check. Future
+sorting and export workers must keep cleanup off the render thread.
 
 ## Search and filtering
 Literal Find Next uses a cancellable core worker after structural indexing. It

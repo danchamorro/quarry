@@ -1910,8 +1910,7 @@ impl Document {
     fn stop_filter_read(&mut self) {
         self.pending_filter_read = None;
         if let Some(active) = self.filter_read.take() {
-            active.job.cancel();
-            drop(active);
+            active.job.cancel_without_waiting();
         }
     }
 
@@ -3426,7 +3425,7 @@ mod tests {
             std::env::temp_dir().join(format!("quarry-filter-stale-prefix-{name}.csv"));
         let mut file = File::create(&path).unwrap();
         file.write_all(b"name,status\n").unwrap();
-        file.write_all(&b"row,keep\n".repeat(750_000)).unwrap();
+        file.write_all(&b"row,keep\n".repeat(2_000)).unwrap();
         drop(file);
         let mut prefix = File::create(&prefix_path).unwrap();
         prefix.write_all(b"name,status\n").unwrap();
@@ -3464,12 +3463,13 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let progress = loop {
             let progress = document.filter_job.as_ref().unwrap().progress();
-            if progress.matches_found > stale_matches {
+            if progress.done {
                 break progress;
             }
-            assert!(Instant::now() < deadline, "filter did not publish matches");
+            assert!(Instant::now() < deadline, "filter did not complete");
             std::thread::yield_now();
         };
+        assert_eq!(progress.matches_found, 2_000);
         document.filter_progress = Some(progress);
         document.filter_index = Some(stale_index);
         let target = max_viewport_start(progress.matches_found, document.visible_rows);

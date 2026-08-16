@@ -431,6 +431,11 @@ impl FilterReadJob {
         }
     }
 
+    pub fn cancel_without_waiting(mut self) {
+        self.cancel();
+        drop(self.handle.take());
+    }
+
     pub fn wait(mut self) -> Result<FilterReadOutcome, QuarryError> {
         self.handle
             .take()
@@ -1057,7 +1062,9 @@ mod tests {
             .unwrap();
         let job = session.start_filtered_read(&index, 1, 2).unwrap();
 
+        let deadline = Instant::now() + Duration::from_secs(2);
         while !job.progress().done {
+            assert!(Instant::now() < deadline, "filtered read did not complete");
             thread::yield_now();
         }
         let progress = job.progress();
@@ -1120,7 +1127,12 @@ mod tests {
         )
         .unwrap();
 
+        let deadline = Instant::now() + Duration::from_secs(2);
         while job.progress().rows_scanned <= rows_before_gap + 10 {
+            assert!(
+                Instant::now() < deadline,
+                "filtered read did not reach the gap"
+            );
             thread::yield_now();
         }
         assert_eq!(job.progress().matches_read, 0);
@@ -1207,7 +1219,9 @@ mod tests {
             },
         )
         .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
         while !job.progress().done {
+            assert!(Instant::now() < deadline, "filter did not report its error");
             thread::yield_now();
         }
         assert!(job.error().unwrap().contains("8-byte limit"));
@@ -1230,7 +1244,9 @@ mod tests {
             })
             .unwrap();
 
+        let deadline = Instant::now() + Duration::from_secs(2);
         while !job.progress().done {
+            assert!(Instant::now() < deadline, "filter did not complete");
             thread::yield_now();
         }
         assert!(!job.progress().cancelled);
@@ -1260,7 +1276,9 @@ mod tests {
         let worker_exited = Arc::clone(&exited);
         let handle = thread::spawn(move || {
             let _completion = WorkerCompletion(&worker_state);
+            let deadline = Instant::now() + Duration::from_secs(2);
             while !worker_state.cancel_requested.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "filter was not cancelled");
                 thread::yield_now();
             }
             worker_state.cancelled.store(true, Ordering::Release);
@@ -1288,7 +1306,9 @@ mod tests {
         let worker_exited = Arc::clone(&exited);
         let handle = thread::spawn(move || {
             let _completion = FilterReadCompletion(&worker_state);
+            let deadline = Instant::now() + Duration::from_secs(2);
             while !worker_state.cancel_requested.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "filtered read was not cancelled");
                 thread::yield_now();
             }
             worker_state.cancelled.store(true, Ordering::Release);
@@ -1306,5 +1326,46 @@ mod tests {
         assert!(shared.cancelled.load(Ordering::Acquire));
         assert!(shared.done.load(Ordering::Acquire));
         assert!(exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelling_a_filtered_read_without_waiting_does_not_wait_for_exit() {
+        let shared = Arc::new(FilterReadSharedState::new(100));
+        let worker_state = Arc::clone(&shared);
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_release = Arc::clone(&release);
+        let handle = thread::spawn(move || {
+            let _completion = FilterReadCompletion(&worker_state);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !worker_state.cancel_requested.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "filtered read was not cancelled");
+                thread::yield_now();
+            }
+            while !worker_release.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "filtered read was not released");
+                thread::yield_now();
+            }
+            worker_state.cancelled.store(true, Ordering::Release);
+            Ok(FilterReadOutcome::Cancelled)
+        });
+        let job = FilterReadJob {
+            shared: Arc::clone(&shared),
+            handle: Some(handle),
+        };
+
+        job.cancel_without_waiting();
+
+        assert!(shared.cancel_requested.load(Ordering::Acquire));
+        assert!(!shared.done.load(Ordering::Acquire));
+        release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !shared.done.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "detached filtered read did not finish"
+            );
+            thread::yield_now();
+        }
+        assert!(shared.cancelled.load(Ordering::Acquire));
     }
 }
