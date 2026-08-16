@@ -1,11 +1,11 @@
 # Quarry
 
-> A performance-first, open-source macOS application for exploring and transforming massive delimited text files.
+> A performance-first, open-source macOS application being built to explore and transform massive delimited text files.
 
 ## Built with AI, in the open
 
 Quarry is intentionally built 100% with AI coding agents under human product
-direction. That is not a footnote—it is one of the project's defining ideas.
+direction. That is not a footnote. It is one of the project's defining ideas.
 The goal is to demonstrate that agent-built software can be fast, reliable,
 accessible, maintainable, and developed with engineering rigor.
 
@@ -22,7 +22,11 @@ The first objective is deliberately narrow: make a 10 GB CSV practical to open a
 ## Core promise
 **Open huge delimited files quickly, keep the interface responsive, and make common data operations practical.**
 
-Initial capabilities: CSV/TSV/pipe-delimited files, progressive opening, virtualized rows/columns, search, filtering, column operations, split/join transformations, and safe streaming export.
+Current alpha capabilities include CSV, TSV, pipe, and semicolon-delimited
+files; progressive opening; continuous virtualized rows; resizable columns in a
+bounded 32-column display window; literal search; and bounded cell or row copy.
+Direct manual access to every column, view-only hide/show/reorder controls,
+filtering, transformations, and streaming export remain planned.
 
 ## Performance direction
 The initial reference workload is a **10 GB delimited file**. Quarry should show useful first rows within seconds, keep memory bounded, remain interactive during scans, and avoid full-file copies for read-only work.
@@ -47,7 +51,9 @@ The Rust engine and CLI prove progressive opening, correct delimited parsing,
 bounded structural indexing, deterministic fixture generation, and row-range
 navigation. The Phase 3 egui viewer alpha now has continuous scrolling, native
 file opening, drag and drop, delimiter/header controls, and bounded literal
-Find Next with progress and cancellation.
+Find Next with progress and cancellation, plus bounded cell and row copying.
+Direct access to all columns, view-only hide/show/reorder controls, and a denser
+default grid remain before Phase 3 is complete.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -111,6 +117,9 @@ cargo run --release -p quarry-cli --bin quarry -- generate \
 See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [egui spike results](docs/benchmarks/2026-08-14-egui-spike.md),
 [AppKit spike results](docs/benchmarks/2026-08-14-appkit-spike.md),
+[continuous-scroll results](docs/benchmarks/2026-08-15-continuous-scroll.md),
+[viewer file-controls validation](docs/benchmarks/2026-08-15-viewer-file-controls.md),
+[live-index latency results](docs/benchmarks/2026-08-15-live-index-latency.md),
 [streaming-search results](docs/benchmarks/2026-08-15-streaming-search.md),
 [bounded-copy validation](docs/benchmarks/2026-08-16-bounded-copy.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),

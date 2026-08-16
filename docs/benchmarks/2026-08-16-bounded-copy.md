@@ -3,17 +3,22 @@
 ## Decision
 
 Ship one selected cell or one selected row for the viewer alpha. A cell copies
-its complete decoded UTF-8 value. A row copies every actual field as quoted TSV,
-excluding the header and synthetic row number. The serialized payload is capped
-at 64 MiB, so clipboard memory does not scale with file size.
+its complete decoded UTF-8 value. A row copies every actual field as UTF-8 TSV,
+quoting fields with tabs, line breaks, or quotes and excluding the header and
+synthetic row number. The serialized payload is capped at 64 MiB, so clipboard
+memory does not scale with file size.
 
 Multi-cell ranges, multi-row ranges, and drag selection remain outside this
 slice.
 
-## Build and datasets
+## Environment and datasets
 
 - Date: 2026-08-16
+- Hardware: Apple M3 Max MacBook Pro, 16 CPU cores, 128 GB RAM
+- OS: macOS 26.6.1 (25G76), arm64
+- Rust: 1.88.0
 - Build: `cargo build -p quarry-egui --release --locked`
+- Cache state: unknown; the clipboard exercise did not control the OS file cache
 - Small fixture: 64 bytes, SHA-256
   `32e23fbff1d56a861384b866d89488c310453d75eae50fe9920c4984d61d2caa`
 - Reference file: `LARGE_FILE.csv`, 12,167,847,982 bytes (11.33 GiB), modified

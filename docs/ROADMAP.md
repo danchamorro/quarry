@@ -66,10 +66,8 @@ pacing becomes measurable with the viewer-alpha grid.
 - [x] Benchmark live-index snapshot latency and indexing throughput together,
   then reduce the default chunk from 8 MiB to 1 MiB based on the measured
   [live-index latency result](benchmarks/2026-08-15-live-index-latency.md).
-- [ ] Increase the default grid density so the same maximized reference window
-  shows at least 40 data rows (currently 23), using EmEditor only as a density
-  reference while preserving legibility, accessibility, and bounded
-  virtualization.
+- [x] Expose file size, column count, delimiter/header mode, indexed rows,
+  first-row time, and viewport latency in the viewer status area.
 - [x] Add literal, case-sensitive Find Next over decoded cells with background
   progress, cancellation, same-query resume, and direct row-and-column reveal.
 - [x] Record quoted/multiline correctness on a deterministic fixture, plus
@@ -84,7 +82,15 @@ pacing becomes measurable with the viewer-alpha grid.
   accessibility identity with regressions, then validate the macOS clipboard
   at data row 100,000,000 on the
   [12 GB reference file](benchmarks/2026-08-16-bounded-copy.md).
-- [ ] Complete the remaining viewer-alpha column controls.
+- [ ] **Next:** add direct manual access to every column plus view-only
+  hide/show/reorder controls, while preserving existing resizing, bounded
+  32-column rendering, search reveal, reset behavior, and accessibility.
+- [ ] Cover the column controls with deterministic wide-file regressions and a
+  12 GB viewer check.
+- [ ] Then increase the default grid density so the same maximized reference
+  window shows at least 40 data rows (currently 23), using EmEditor only as a
+  density reference while preserving legibility, accessibility, and bounded
+  virtualization.
 
 **Phase 3 in progress:** the viewer now provides bounded file-level continuous
 scrolling plus native opening and explicit format controls. The
@@ -96,8 +102,8 @@ records the lock-window tuning decision, and the
 the bounded Find Next result. The
 [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md) records exact
 cell and row clipboard output plus the deep-row check. The remaining column
-controls and increased default row density remain; filtering, editing, export,
-and cosmetic redesign stay outside this slice.
+controls are next, followed by increased default row density. Filtering,
+editing, export, and cosmetic redesign stay outside this slice.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -115,7 +121,8 @@ Build minimal UI prototypes against the same Rust engine. Compare frame time, CP
 **Exit:** documented UI architecture decision.
 
 ## Phase 3 — Viewer alpha
-Virtualized grid, drag/drop/open, delimiter/header controls, column operations, jump-to-row, streaming search, copy, status, diagnostics.
+Virtualized grid, drag/drop/open, delimiter/header controls, view-only column
+controls, jump-to-row, streaming search, copy, status, diagnostics.
 
 **Exit:** Quarry is genuinely useful for inspecting huge files.
 
@@ -123,13 +130,16 @@ Virtualized grid, drag/drop/open, delimiter/header controls, column operations, 
 Contains/equality filters, multiple predicates, incremental results, filtered navigation, streaming export, progress/cancellation.
 
 ## Phase 5 — Column transformations
-Split, join, rename, reorder/drop, find/replace, preview, reusable transformation pipeline.
+Split, join, rename, reorder/drop in saved output, find/replace, preview,
+reusable transformation pipeline.
 
 ## Phase 6 — Sorting
 Type semantics, external run generation, spill management, merge, stable row-order abstraction, disk-space estimation.
 
 ## Phase 7 — Hardening
-Persistent indexes, invalidation, malformed-data UX, encoding strategy, packaging/signing/notarization, accessibility audit, benchmark dashboard.
+Persistent indexes, invalidation, malformed-data UX, encoding strategy,
+packaging/signing/notarization, accessibility audit, controlled cold-cache
+performance runs, benchmark dashboard.
 
 ## Later possibilities
 Cross-platform front ends, plugin/API surface, schema inference, SQL-like querying, compressed files, CLI recipes, multi-file operations.

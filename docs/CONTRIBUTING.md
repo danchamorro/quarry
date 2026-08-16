@@ -1,6 +1,7 @@
 # Contributing to Quarry
 
-Quarry is intended to be an open-source, performance-first project. Contributions are welcome once the repository and license are finalized.
+Quarry is an open-source, performance-first project. Contributions are welcome
+under the dual MIT or Apache-2.0 license.
 
 ## Priorities
 In the early project, contributions should favor:
@@ -35,7 +36,10 @@ Add regression fixtures/tests for parsing bugs. Important cases include quoted d
 Material architectural changes should use an ADR under `docs/adr/` describing context, options considered, decision, consequences, and benchmark evidence when performance-related.
 
 ## UI contributions
-Until the UI bake-off is complete, do not assume the final framework. UI prototypes must use the same engine contract so comparisons are meaningful.
+The measured UI bake-off selected egui for the production viewer. UI changes
+must keep the engine contract independent, preserve accessibility, and include
+focused interaction regressions. [ADR 0003](adr/0003-select-egui-ui.md) records
+the decision.
 
 ## Scope discipline
 Quarry is not trying to become a generic IDE or spreadsheet. Feature proposals should explain how they help the core massive-delimited-file workflow and how they scale beyond RAM.
@@ -45,10 +49,10 @@ Quarry is not trying to become a generic IDE or spreadsheet. Feature proposals s
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo bench
+cargo build --workspace --release
 ```
 
-Exact commands will evolve as the repository is scaffolded.
+These commands match the required CI checks and release-build validation.
 
 ## Pull requests
 Keep changes focused. Explain the problem, design, tradeoffs, tests, and performance impact. Screenshots are useful for UI work; benchmark tables are useful for engine work.
