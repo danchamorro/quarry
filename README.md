@@ -24,9 +24,9 @@ The first objective is deliberately narrow: make a 10 GB CSV practical to open a
 
 Current alpha capabilities include CSV, TSV, pipe, and semicolon-delimited
 files; progressive opening; continuous virtualized rows; resizable columns in a
-bounded 32-column display window; literal search; and bounded cell or row copy.
-Direct manual access to every column, view-only hide/show/reorder controls,
-filtering, transformations, and streaming export remain planned.
+bounded 32-column display window; direct access to every known column;
+view-only hide/show/reorder controls; literal search; and bounded cell or row
+copy. Filtering, transformations, and streaming export remain planned.
 
 ## Performance direction
 The initial reference workload is a **10 GB delimited file**. Quarry should show useful first rows within seconds, keep memory bounded, remain interactive during scans, and avoid full-file copies for read-only work.
@@ -52,8 +52,9 @@ bounded structural indexing, deterministic fixture generation, and row-range
 navigation. The Phase 3 egui viewer alpha now has continuous scrolling, native
 file opening, drag and drop, delimiter/header controls, and bounded literal
 Find Next with progress and cancellation, plus bounded cell and row copying.
-Direct access to all columns, view-only hide/show/reorder controls, and a denser
-default grid remain before Phase 3 is complete.
+It also provides direct access to every known column plus view-only
+hide/show/reorder controls. A denser default grid remains before Phase 3 is
+complete.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -72,6 +73,14 @@ selections apply to newly opened files; changes to the open document wait for
 **Apply / Reopen**. After indexing completes, **Find Next** searches decoded
 cells from the first visible data row and jumps directly to the matching row
 and column.
+
+Use **Columns…** to view or hide a one-based file column, move it to any display
+position, drag it by its handle inside the Columns window, or reset the layout.
+Hidden columns remain part of that display order. The main grid headers stay
+resize-only, which prevents accidental reordering while browsing. Quarry
+renders at most 32 data columns at once while keeping source column identity
+stable for search and copy. Header columns are known immediately; extra fields
+in later ragged rows are appended when Quarry encounters them.
 
 Click a cell or its row number, then use **Copy** or **Command+C**. Cell copy
 preserves the complete decoded value. Row copy emits every actual field as
@@ -122,6 +131,7 @@ See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [live-index latency results](docs/benchmarks/2026-08-15-live-index-latency.md),
 [streaming-search results](docs/benchmarks/2026-08-15-streaming-search.md),
 [bounded-copy validation](docs/benchmarks/2026-08-16-bounded-copy.md),
+[column-controls validation](docs/benchmarks/2026-08-16-column-controls.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).
