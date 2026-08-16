@@ -2824,7 +2824,7 @@ mod tests {
     }
 
     #[test]
-    fn maximized_reference_window_shows_at_least_40_rows() {
+    fn reference_window_is_dense_and_visible_rows_adapt_to_height() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2853,22 +2853,26 @@ mod tests {
         let mut app = QuarryApp::new(None, Instant::now());
         app.document = Some(document);
         let mut frame = eframe::Frame::_new_kittest();
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1728.0, 1052.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
-        );
+        let render = |height: f32, app: &mut QuarryApp, frame: &mut eframe::Frame| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1728.0, height),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| eframe::App::update(app, ctx, frame),
+            )
+        };
+        let output = render(1052.0, &mut app, &mut frame);
 
         let document = app.document.as_ref().unwrap();
+        let reference_rows = document.visible_rows;
         assert!(
-            document.visible_rows >= 40,
+            reference_rows >= 40,
             "maximized reference window fits only {} rows",
-            document.visible_rows
+            reference_rows
         );
         assert!(document.display_end() >= 40);
         assert!(
@@ -2890,6 +2894,19 @@ mod tests {
                     .label()
                     .is_some_and(|label| label.starts_with("Select row 40, column 1"))
         }));
+
+        let _ = render(852.0, &mut app, &mut frame);
+        let smaller_rows = app.document.as_ref().unwrap().visible_rows;
+        let _ = render(1252.0, &mut app, &mut frame);
+        let larger_rows = app.document.as_ref().unwrap().visible_rows;
+        assert!(
+            smaller_rows < reference_rows,
+            "smaller window kept {smaller_rows} rows from the {reference_rows}-row reference"
+        );
+        assert!(
+            larger_rows > reference_rows,
+            "larger window kept {larger_rows} rows from the {reference_rows}-row reference"
+        );
 
         app.document.as_mut().unwrap().shutdown();
         drop(app);
