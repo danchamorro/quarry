@@ -789,15 +789,15 @@ fn run_filtered_read(
                         limit: config.max_record_bytes,
                     });
                 }
-                if let Some(fields) = matching_fields(&record, delimiter, &plan.query, &finder)? {
-                    if match_ordinal >= plan.start_match {
-                        rows.push(FilterMatch {
-                            match_ordinal,
-                            row: row_number,
-                            record_offset: record_start,
-                            fields: fields.into_iter().map(Cow::into_owned).collect(),
-                        });
-                    }
+                if let Some(fields) = matching_fields(&record, delimiter, &plan.query, &finder)?
+                    && match_ordinal >= plan.start_match
+                {
+                    rows.push(FilterMatch {
+                        match_ordinal,
+                        row: row_number,
+                        record_offset: record_start,
+                        fields: fields.into_iter().map(Cow::into_owned).collect(),
+                    });
                 }
             }
             publish_filtered_read_progress(shared, plan, absolute_start, rows_scanned, rows.len());
