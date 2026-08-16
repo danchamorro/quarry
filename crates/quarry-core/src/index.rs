@@ -195,6 +195,7 @@ impl IndexJob {
     }
 
     pub fn progress(&self) -> IndexProgress {
+        let done = self.shared.done.load(Ordering::Acquire);
         let finished_nanos = self.shared.finished_nanos.load(Ordering::Acquire);
         IndexProgress {
             bytes_scanned: self.shared.bytes_scanned.load(Ordering::Acquire),
@@ -205,7 +206,7 @@ impl IndexJob {
             } else {
                 Duration::from_nanos(finished_nanos)
             },
-            done: self.shared.done.load(Ordering::Acquire),
+            done,
             cancelled: self.shared.cancelled.load(Ordering::Acquire),
         }
     }

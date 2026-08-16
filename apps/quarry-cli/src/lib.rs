@@ -233,6 +233,12 @@ fn benchmark_live_viewports(
             .ok_or("live viewport deadline overflowed")?;
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             missed_deadlines += 1;
+            if job.progress().done {
+                return live_finished_early(
+                    job,
+                    "indexing finished before the live viewport workload completed",
+                );
+            }
             continue;
         };
         thread::sleep(remaining);
