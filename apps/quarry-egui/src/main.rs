@@ -8,9 +8,9 @@ use quarry_core::{
     SearchOutcome, SearchPosition, SearchProgress, Session, StructuralIndex,
 };
 
-const INITIAL_VISIBLE_ROWS: usize = 15;
+const BOOTSTRAP_ROWS: usize = 40;
 const OVERSCAN_ROWS: usize = 2;
-const ROW_HEIGHT: f32 = 25.0;
+const ROW_HEIGHT: f32 = 17.0;
 const HEADER_HEIGHT: f32 = 30.0;
 const GRID_TITLE_HEIGHT: f32 = 36.0;
 const SCROLLBAR_WIDTH: f32 = 18.0;
@@ -1124,7 +1124,7 @@ impl Document {
     }
 
     fn prepare(path: &Path, options: OpenOptions) -> Result<Self, String> {
-        let buffer_rows = INITIAL_VISIBLE_ROWS + 2 * OVERSCAN_ROWS;
+        let buffer_rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS;
         let session = Session::open(
             path,
             OpenOptions {
@@ -1176,7 +1176,7 @@ impl Document {
             viewport_start: data_start,
             buffer_start: data_start,
             buffered_rows,
-            visible_rows: INITIAL_VISIBLE_ROWS,
+            visible_rows: BOOTSTRAP_ROWS,
             scroll_points: 0.0,
             last_viewport_read: None,
             last_poll: Instant::now() - POLL_INTERVAL,
@@ -1719,7 +1719,7 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
     let horizontal_scrollbar = ui.spacing().scroll.allocated_width();
     let body_height =
         (grid_height - GRID_TITLE_HEIGHT - HEADER_HEIGHT - horizontal_scrollbar).max(ROW_HEIGHT);
-    let row_stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
+    let row_stride = ROW_HEIGHT;
     let visible_rows = (body_height / row_stride).floor().max(1.0) as usize;
     document.set_visible_rows(visible_rows)?;
     let total_rows = document.available_data_rows();
@@ -1861,6 +1861,7 @@ fn show_table(
         .max_height(grid_height)
         .show(ui, |ui| {
             ui.set_min_width(content_width.max(viewport_width));
+            ui.spacing_mut().item_spacing.y = 0.0;
             let mut table = TableBuilder::new(ui)
                 .id_salt("quarry-grid")
                 .striped(true)
@@ -1917,7 +1918,8 @@ fn show_table(
                                         RichText::new(display_row.to_string())
                                             .monospace()
                                             .color(color),
-                                    ),
+                                    )
+                                    .small(),
                                 );
                                 let enabled = ui.is_enabled();
                                 response.widget_info(|| {
@@ -1956,7 +1958,8 @@ fn show_table(
                                         egui::Button::selectable(
                                             selected,
                                             RichText::new(&text).monospace(),
-                                        ),
+                                        )
+                                        .small(),
                                     );
                                     let enabled = ui.is_enabled();
                                     let header = &document.headers[visible_column];
@@ -2821,6 +2824,96 @@ mod tests {
     }
 
     #[test]
+    fn reference_window_is_dense_and_visible_rows_adapt_to_height() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-density-{name}.csv"));
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "name,value").unwrap();
+        for row in 1..=120 {
+            writeln!(file, "row{row},{row}").unwrap();
+        }
+        drop(file);
+
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        super::configure_style(&ctx);
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.document = Some(document);
+        let mut frame = eframe::Frame::_new_kittest();
+        let render = |height: f32, app: &mut QuarryApp, frame: &mut eframe::Frame| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1728.0, height),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| eframe::App::update(app, ctx, frame),
+            )
+        };
+        let output = render(1052.0, &mut app, &mut frame);
+
+        let document = app.document.as_ref().unwrap();
+        let reference_rows = document.visible_rows;
+        assert!(
+            reference_rows >= 40,
+            "maximized reference window fits only {} rows",
+            reference_rows
+        );
+        assert!(document.display_end() >= 40);
+        assert!(
+            document.buffered_rows.len()
+                <= document
+                    .visible_rows
+                    .saturating_add(2 * super::OVERSCAN_ROWS)
+        );
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.label() == Some("Select row 40")
+        }));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node
+                    .label()
+                    .is_some_and(|label| label.starts_with("Select row 40, column 1"))
+        }));
+
+        let _ = render(852.0, &mut app, &mut frame);
+        let smaller_rows = app.document.as_ref().unwrap().visible_rows;
+        let _ = render(1252.0, &mut app, &mut frame);
+        let larger_rows = app.document.as_ref().unwrap().visible_rows;
+        assert!(
+            smaller_rows < reference_rows,
+            "smaller window kept {smaller_rows} rows from the {reference_rows}-row reference"
+        );
+        assert!(
+            larger_rows > reference_rows,
+            "larger window kept {larger_rows} rows from the {reference_rows}-row reference"
+        );
+
+        app.document.as_mut().unwrap().shutdown();
+        drop(app);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn search_controls_are_accessible_and_clickable() {
         let mut query = "needle".to_owned();
         let find = click_accessible_button("Find Next", |ui| {
@@ -3191,8 +3284,13 @@ mod tests {
         let index = document.job.take().unwrap().wait().unwrap();
 
         document.progress.rows_scanned = document.session.first_rows.len() as u64;
-        document.set_visible_rows(25).unwrap();
-        assert_eq!(document.visible_rows().len(), 19);
+        let bootstrap_data_rows = document
+            .session
+            .first_rows
+            .len()
+            .saturating_sub(document.data_start as usize);
+        document.set_visible_rows(bootstrap_data_rows + 1).unwrap();
+        assert_eq!(document.visible_rows().len(), bootstrap_data_rows);
 
         document.index = Some(index);
         document.set_visible_rows(25).unwrap();
@@ -3202,7 +3300,7 @@ mod tests {
         assert!(document.buffered_rows.len() <= capacity);
 
         let first = document.data_start;
-        let row_stride = super::ROW_HEIGHT + 6.0;
+        let row_stride = super::ROW_HEIGHT;
         document
             .scroll_by_points(-(row_stride - 1.0), row_stride)
             .unwrap();
@@ -3245,10 +3343,11 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("quarry-ragged-{name}.csv"));
         let mut file = File::create(&path).unwrap();
-        for row in 1..=20 {
+        let narrow_rows = super::BOOTSTRAP_ROWS + 2 * super::OVERSCAN_ROWS + 1;
+        for row in 1..=narrow_rows {
             writeln!(file, "{row},{}", row + 100).unwrap();
         }
-        writeln!(file, "21,121,visible").unwrap();
+        writeln!(file, "{},121,visible", narrow_rows + 1).unwrap();
         drop(file);
 
         let mut document = Document::open(&path, OpenOptions::default()).unwrap();
@@ -3259,7 +3358,7 @@ mod tests {
 
         let index = document.job.take().unwrap().wait().unwrap();
         document.index = Some(index);
-        document.navigate(20).unwrap();
+        document.navigate(narrow_rows as u64).unwrap();
 
         assert_eq!(document.total_columns, 3);
         assert_eq!(document.columns.order, [1, 0, 2]);
