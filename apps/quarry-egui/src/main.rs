@@ -1617,8 +1617,8 @@ mod tests {
         Action, DelimiterMode, Document, FIND_INPUT_ID, GridSelection, HeaderMode, IndexConfig,
         OpenOptions, QuarryApp, Row, SearchProgress, column_window_controls, copy_control,
         logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
-        row_for_scroll_fraction, scroll_fraction_for_row, search_controls,
-        selection_copy_requested, selection_text, show_grid,
+        row_for_scroll_fraction, scroll_fraction_for_row, search_controls, selection_text,
+        show_grid,
     };
 
     fn click_accessible_button(
@@ -1826,11 +1826,43 @@ mod tests {
         .unwrap();
         finish_index(&mut document);
 
-        let (ctx, _) = click_grid_control(
-            "Select row 1, column 2 (notes): line one\\nline two",
-            &mut document,
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.document = Some(document);
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let target = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present")
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Select row 1, column 2 (notes): line one\\nline two")
+            })
+            .map(|(id, _)| *id)
+            .expect("cell selection should be accessible");
+        let output = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    }),
+                    egui::Event::Copy,
+                ],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
         );
-        let selection = document.selection.unwrap();
+        let selection = app.document.as_ref().unwrap().selection.unwrap();
         assert!(matches!(
             selection,
             GridSelection::Cell {
@@ -1840,60 +1872,34 @@ mod tests {
             }
         ));
         assert_eq!(
-            document.copy_selection_text().unwrap(),
+            app.document
+                .as_ref()
+                .unwrap()
+                .copy_selection_text()
+                .unwrap(),
             "line one\nline two"
-        );
-
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1280.0, 780.0),
-                )),
-                events: vec![egui::Event::Copy],
-                ..Default::default()
-            },
-            |ctx| {
-                if selection_copy_requested(ctx) {
-                    ctx.copy_text(document.copy_selection_text().unwrap());
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    show_grid(ui, &mut document).unwrap();
-                });
-            },
         );
         assert!(output.platform_output.commands.iter().any(|command| {
             matches!(command, egui::OutputCommand::CopyText(text) if text == "line one\nline two")
         }));
 
-        let mut find = String::new();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut find).id(egui::Id::new(FIND_INPUT_ID)))
-                    .request_focus();
-            });
+        ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new(FIND_INPUT_ID));
         });
         let output = ctx.run(
             egui::RawInput {
                 events: vec![egui::Event::Copy],
-                ..Default::default()
+                ..grid_input()
             },
             |ctx| {
-                if selection_copy_requested(ctx) {
-                    ctx.copy_text(document.copy_selection_text().unwrap());
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut find).id(egui::Id::new(FIND_INPUT_ID)));
-                });
+                eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(
-            !output
-                .platform_output
-                .commands
-                .iter()
-                .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
-        );
+        assert!(!output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "line one\nline two")
+        }));
+
+        let mut document = app.document.take().unwrap();
 
         let _ = click_grid_control("Select row 1", &mut document);
         assert!(matches!(
