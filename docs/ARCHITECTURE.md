@@ -69,6 +69,21 @@ rows plus two rows of overscan on each side and renders at most 32 columns at a
 time. Column windowing limits UI work; it does not project fields out of the
 parsed rows.
 
+## Column views
+The viewer keeps source column indexes as the canonical identity for search,
+selection, and copy. A UI-only column view stores display order, hidden state,
+the first shown position, and a visible list capped at 32 source columns.
+View, hide/show, arbitrary move-to-position, manager-only drag, first-columns,
+and reset actions update this metadata without changing parsed rows or output
+order. Drag handles exist only in the Columns manager; main-grid headers remain
+resize-only. A search match automatically shows and centers its source column,
+while row copy continues to serialize every source field in file order.
+
+Header columns are known immediately. If a later ragged row contains more
+fields, the viewer appends those newly known source columns without resetting
+the existing layout. Discovering the maximum width of an entire headerless
+ragged file would require a separate full scan and remains deferred.
+
 ## Clipboard copying
 The viewer retains a selected cell only while its row and column remain visible,
 and a selected row only while that row remains visible. Cell copy uses the
@@ -81,9 +96,10 @@ prevents clipboard serialization from growing without bound.
 ## Bounded memory
 Core defaults to 1 MiB read chunks, with a 64 MiB bootstrap and record limit and
 a 16 MiB adaptive structural-index budget. The UI retains the bounded bootstrap
-rows, one active viewport window, one search match, and at most a 64 MiB
-clipboard payload. [ADR 0002](adr/0002-defer-viewport-cache.md) records why an
-application viewport cache remains deferred.
+rows, one active viewport window, compact metadata per known column, one search
+match, and at most a 64 MiB clipboard payload.
+[ADR 0002](adr/0002-defer-viewport-cache.md) records why an application viewport
+cache remains deferred.
 
 ## Concurrency
 Rust workers currently handle indexing and literal search. Both publish
@@ -107,7 +123,10 @@ instead of copying matching rows.
 Use a disk-aware external merge sort: bounded runs, sort in memory, spill to temporary storage, then merge into a stable row-order abstraction. Sorting must not delay the first performance milestone.
 
 ## Planned transformations
-Model split/join/reorder/drop operations as a non-destructive pipeline ending in streaming export.
+Model split/join/reorder/drop operations as a non-destructive pipeline ending in
+streaming export. Save As can later write either an unchanged source-order copy
+or transformed output using the arranged column order. Hiding a view column
+alone does not remove it from output.
 
 ## UI selection
 [ADR 0003](adr/0003-select-egui-ui.md) records the measured egui and AppKit

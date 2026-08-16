@@ -9,7 +9,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 0 — Foundation | Complete | Rust workspace, CI, deterministic generator, ADR, licensing, and the [12 GB benchmark](benchmarks/2026-08-14-large-file.md) |
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
-| Phase 3 — Viewer alpha | In progress | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md) |
+| Phase 3 — Viewer alpha | In progress | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md) |
 
 ### Phase 1 checklist
 
@@ -82,12 +82,13 @@ pacing becomes measurable with the viewer-alpha grid.
   accessibility identity with regressions, then validate the macOS clipboard
   at data row 100,000,000 on the
   [12 GB reference file](benchmarks/2026-08-16-bounded-copy.md).
-- [ ] **Next:** add direct manual access to every column plus view-only
-  hide/show/reorder controls, while preserving existing resizing, bounded
-  32-column rendering, search reveal, reset behavior, and accessibility.
-- [ ] Cover the column controls with deterministic wide-file regressions and a
-  12 GB viewer check.
-- [ ] Then increase the default grid density so the same maximized reference
+- [x] Add direct manual access to every known column plus view-only hide/show
+  and arbitrary reorder controls inside the Columns manager, while preserving
+  resize-only grid headers, bounded 32-column rendering, search reveal, reset
+  behavior, and accessibility.
+- [x] Cover the column controls with deterministic wide-file regressions and a
+  [12 GB viewer check](benchmarks/2026-08-16-column-controls.md).
+- [ ] **Next:** increase the default grid density so the same maximized reference
   window shows at least 40 data rows (currently 23), using EmEditor only as a
   density reference while preserving legibility, accessibility, and bounded
   virtualization.
@@ -101,9 +102,10 @@ records the lock-window tuning decision, and the
 [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md) records
 the bounded Find Next result. The
 [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md) records exact
-cell and row clipboard output plus the deep-row check. The remaining column
-controls are next, followed by increased default row density. Filtering,
-editing, export, and cosmetic redesign stay outside this slice.
+cell and row clipboard output plus the deep-row check, and the
+[column-controls validation](benchmarks/2026-08-16-column-controls.md) records
+the bounded wide-file and 12 GB results. Increased default row density is next.
+Filtering, editing, export, and cosmetic redesign stay outside this slice.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -132,6 +134,11 @@ Contains/equality filters, multiple predicates, incremental results, filtered na
 ## Phase 5 — Column transformations
 Split, join, rename, reorder/drop in saved output, find/replace, preview,
 reusable transformation pipeline.
+
+Add **Save As** modes for an unchanged source-order copy and a transformed
+copy. A transformed copy writes columns in the current arranged order. Hiding
+a column does not remove it from saved output unless the user explicitly
+chooses to exclude it; the source file remains unchanged.
 
 ## Phase 6 — Sorting
 Type semantics, external run generation, spill management, merge, stable row-order abstraction, disk-space estimation.

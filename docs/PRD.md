@@ -38,6 +38,10 @@ resize/hide/show/reorder; streaming search; bounded copy of one cell or row;
 background structural indexing; progress/cancellation; parsing metadata;
 diagnostics and benchmarks.
 
+Column controls operate on stable source-column identities. Header columns are
+available immediately, while extra fields in ragged rows become available when
+the viewer encounters them.
+
 Strong candidates: simple filters, filtered export, and disk-aware sorting if it
 does not delay the core milestone.
 
