@@ -1,3 +1,4 @@
+mod filter;
 mod index;
 mod search;
 
@@ -9,6 +10,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub use filter::{
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterProgress, FilterQuery,
+    FilterReadJob, FilterReadOutcome, FilterReadProgress,
+};
 pub use index::{Checkpoint, IndexConfig, IndexJob, IndexProgress, StructuralIndex};
 use quarry_delimited::{ParseError, RecordScanner, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
@@ -22,9 +27,21 @@ const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 pub enum QuarryError {
     Io(io::Error),
     Parse(ParseError),
-    BootstrapLimitExceeded { limit: usize, rows_found: usize },
-    RecordTooLarge { limit: usize },
-    RowNotIndexed { requested: u64, indexed_rows: u64 },
+    BootstrapLimitExceeded {
+        limit: usize,
+        rows_found: usize,
+    },
+    RecordTooLarge {
+        limit: usize,
+    },
+    RowNotIndexed {
+        requested: u64,
+        indexed_rows: u64,
+    },
+    MatchNotIndexed {
+        requested: u64,
+        indexed_matches: u64,
+    },
     InvalidOption(&'static str),
     WorkerPanicked,
 }
@@ -47,6 +64,13 @@ impl fmt::Display for QuarryError {
             } => write!(
                 f,
                 "row {requested} is not indexed yet ({indexed_rows} rows available)"
+            ),
+            Self::MatchNotIndexed {
+                requested,
+                indexed_matches,
+            } => write!(
+                f,
+                "match {requested} is not indexed yet ({indexed_matches} matches available)"
             ),
             Self::InvalidOption(option) => write!(f, "invalid option: {option}"),
             Self::WorkerPanicked => write!(f, "background worker panicked"),

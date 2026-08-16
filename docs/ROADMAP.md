@@ -10,6 +10,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
+| Phase 4: Filters and export | In progress | The first bounded single-column filter slice is tracked in the [streaming-filter validation](benchmarks/2026-08-16-streaming-filter.md) |
 
 ### Phase 1 checklist
 
@@ -97,8 +98,9 @@ pacing becomes measurable with the viewer-alpha grid.
 **Phase 3 exit met:** the viewer combines bounded continuous navigation, native
 opening, format controls, literal search, copy, column controls, diagnostics,
 and an adaptive grid measured at 42 rows in the maximized reference window.
-Phase 4 filters and streaming export are next. Editing and cosmetic redesign
-remain outside the current scope.
+The first Phase 4 single-column filter slice is complete. Multiple predicates
+and streaming export are next. Editing and cosmetic redesign remain outside
+the current scope.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -123,6 +125,26 @@ controls, jump-to-row, streaming search, copy, status, diagnostics.
 
 ## Phase 4 — Filters and export
 Contains/equality filters, multiple predicates, incremental results, filtered navigation, streaming export, progress/cancellation.
+
+### Phase 4 checklist
+
+- [x] Add literal, case-sensitive contains and equality predicates over one
+  selected source column.
+- [x] Build an adaptive match index with a fixed memory budget, background
+  progress, prompt cancellation, and joined worker lifecycle.
+- [x] Serve bounded filtered row ranges from the nearest match checkpoint in a
+  cancellable background worker and navigate them through the egui viewer.
+- [x] Cover selected-column isolation, decoded quotes, multiline fields, exact
+  match counts, adaptive compaction, range reads, and cancellation with
+  deterministic regressions.
+- [x] Record complete-scan throughput, cancellation, bounded index memory, and
+  peak RSS on the deterministic 1 GB and 12 GB datasets.
+- [ ] Add multiple predicates without materializing matching rows in memory.
+- [ ] Stream filtered rows to a new output file with progress, cancellation,
+  and source-file safety.
+
+**Phase 4 exit:** multiple predicates and filtered export remain practical on
+the 12 GB reference file while memory stays bounded.
 
 ## Phase 5 — Column transformations
 Split, join, rename, reorder/drop in saved output, find/replace, preview,
