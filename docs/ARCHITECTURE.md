@@ -69,6 +69,14 @@ Optimize common paths without compromising quoted fields, escaped quotes, embedd
 ## Viewport
 The UI requests a bounded window such as rows 8,250,000–8,250,150 and columns 4–18. The engine resolves and parses only the required region plus modest overscan.
 
+## Clipboard copying
+The viewer retains a selected cell only while its row and column remain visible,
+and a selected row only while that row remains visible. Cell copy uses the
+complete decoded field from the bounded row buffer. Row copy serializes every
+actual field as quoted UTF-8 TSV, excluding the header and synthetic row number.
+Invalid UTF-8 is reported instead of replaced, and a 64 MiB output limit
+prevents clipboard serialization from growing without bound.
+
 ## Bounded caching
 File chunks, row boundaries, decoded visible cells, search results, and filter metadata all receive explicit memory budgets. No cache grows indefinitely with file size.
 
