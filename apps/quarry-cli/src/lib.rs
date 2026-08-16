@@ -6,9 +6,13 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use quarry_core::{IndexConfig, IndexJob, IndexProgress, OpenOptions, Session, StructuralIndex};
+use quarry_core::{
+    IndexConfig, IndexJob, IndexProgress, OpenOptions, SearchJob, SearchOutcome, SearchPosition,
+    SearchProgress, Session, StructuralIndex,
+};
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
+type SearchRun = (SearchOutcome, SearchProgress, Option<(u64, Duration)>);
 
 const MAX_LIVE_BENCHMARK_MILLIS: u128 = 60_000;
 
@@ -17,6 +21,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     match args.next().as_deref() {
         Some("open") => open_command(args.collect()),
         Some("viewport") => viewport_command(args.collect()),
+        Some("search") => search_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -35,9 +40,206 @@ fn print_help() {
            quarry viewport <FILE> [--iterations 500] [--rows 100] \
          [--seed 1] [--cache-state unknown|cold|warm] [--live] \
          [--interval-ms 16] [--chunk-bytes 1048576]\n  \
+           quarry search <FILE> --query LITERAL [--start-row 1] \
+         [--start-column 1] [--cancel-after-bytes N] \
+         [--cache-state unknown|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]"
     );
+}
+
+fn search_command(args: Vec<String>) -> CliResult<()> {
+    let mut path = None;
+    let mut query = None;
+    let mut start_row = 1_u64;
+    let mut start_column = 1_usize;
+    let mut cancel_after_bytes = None;
+    let mut cache_state = "unknown".to_owned();
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--query" => query = Some(value(&args, &mut cursor, "--query")?.as_bytes().to_vec()),
+            "--start-row" => start_row = value(&args, &mut cursor, "--start-row")?.parse()?,
+            "--start-column" => {
+                start_column = value(&args, &mut cursor, "--start-column")?.parse()?
+            }
+            "--cancel-after-bytes" => {
+                cancel_after_bytes =
+                    Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
+            }
+            "--cache-state" => {
+                cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
+                if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
+                    return Err("--cache-state must be unknown, cold, or warm".into());
+                }
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            value if path.is_none() => path = Some(PathBuf::from(value)),
+            value => return Err(format!("unexpected argument {value:?}").into()),
+        }
+        cursor += 1;
+    }
+
+    let path = path.ok_or("search requires a file path")?;
+    let query = query.ok_or("search requires --query")?;
+    if query.is_empty() {
+        return Err("query must not be empty".into());
+    }
+    if start_row == 0 || start_column == 0 {
+        return Err("start row and column must be at least 1".into());
+    }
+    if cancel_after_bytes == Some(0) {
+        return Err("cancel-after-bytes must be non-zero".into());
+    }
+    if cache_state == "cold" {
+        return Err("search cannot be cold because indexing reads the file first".into());
+    }
+
+    let session = Session::open(&path, OpenOptions::default())?;
+    let start = data_search_position(start_row, start_column, session.dialect.has_header)?;
+    let index_started = Instant::now();
+    let index = session.start_indexing(IndexConfig::default())?.wait()?;
+    let index_elapsed = index_started.elapsed();
+    let search_bytes = session
+        .file_size
+        .saturating_sub(index.nearest_checkpoint(start.row).offset);
+    if cancel_after_bytes.is_some_and(|bytes| bytes >= search_bytes) {
+        return Err("cancel-after-bytes must be less than the searchable byte span".into());
+    }
+    let job = session.start_search(&index, query.clone(), start)?;
+    let (outcome, progress, cancellation) =
+        wait_for_search(job, cancel_after_bytes, Duration::from_millis(1))?;
+
+    println!("Quarry search benchmark\n");
+    println!("File: {}", session.path().display());
+    println!(
+        "File size: {} ({} bytes)",
+        human_bytes(session.file_size),
+        session.file_size
+    );
+    println!(
+        "Build: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!("Search cache state: {cache_state} after indexing prepass");
+    println!("Query: {}", render_field(&query));
+    println!("Start: data row {start_row}, column {start_column}");
+    println!("Rows indexed: {}", index.indexed_rows());
+    println!("Indexing time: {:.3} s", index_elapsed.as_secs_f64());
+    let time_label = if matches!(&outcome, SearchOutcome::Match(_)) {
+        "Time to first match"
+    } else {
+        "Search time"
+    };
+    match outcome {
+        SearchOutcome::Match(found) => {
+            let data_row = physical_to_data_row(found.row, session.dialect.has_header);
+            println!("Outcome: match");
+            println!(
+                "Match: data row {data_row}, column {}, record offset {}",
+                found.column + 1,
+                found.record_offset
+            );
+        }
+        SearchOutcome::NotFound => println!("Outcome: not found"),
+        SearchOutcome::Cancelled => println!("Outcome: cancelled"),
+    }
+    println!(
+        "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
+        human_bytes(progress.bytes_scanned),
+        progress.bytes_scanned,
+        human_bytes(progress.total_bytes),
+        progress.total_bytes
+    );
+    println!("Rows scanned: {}", progress.rows_scanned);
+    println!("{time_label}: {:.3} s", progress.elapsed.as_secs_f64());
+    println!(
+        "Search throughput: {}/s",
+        human_bytes(rate(progress.bytes_scanned, progress.elapsed))
+    );
+    if let Some((requested_at, latency)) = cancellation {
+        println!(
+            "Cancellation requested after: {} ({} bytes)",
+            human_bytes(requested_at),
+            requested_at
+        );
+        println!(
+            "Cancellation latency: {:.3} ms",
+            latency.as_secs_f64() * 1000.0
+        );
+    }
+    println!(
+        "Current process memory: {}",
+        optional_bytes(current_rss_bytes())
+    );
+    println!(
+        "Peak process memory (index + search): {}",
+        optional_bytes(peak_rss_bytes())
+    );
+    Ok(())
+}
+
+fn data_search_position(
+    data_row: u64,
+    column: usize,
+    has_header: bool,
+) -> CliResult<SearchPosition> {
+    let row = data_row
+        .checked_sub(1)
+        .and_then(|row| row.checked_add(u64::from(has_header)))
+        .ok_or("search position is out of range")?;
+    let column = column
+        .checked_sub(1)
+        .ok_or("search position is out of range")?;
+    Ok(SearchPosition { row, column })
+}
+
+fn physical_to_data_row(row: u64, has_header: bool) -> u64 {
+    if has_header {
+        row
+    } else {
+        row.saturating_add(1)
+    }
+}
+
+fn wait_for_search(
+    job: SearchJob,
+    cancel_after_bytes: Option<u64>,
+    poll_interval: Duration,
+) -> CliResult<SearchRun> {
+    let mut cancellation = None;
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if cancellation.is_none()
+            && cancel_after_bytes.is_some_and(|threshold| progress.bytes_scanned >= threshold)
+        {
+            let started = Instant::now();
+            job.cancel();
+            cancellation = Some((progress.bytes_scanned, started));
+        }
+        thread::sleep(poll_interval);
+    }
+
+    let progress = job.progress();
+    let outcome = job.wait()?;
+    let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
+    if cancel_after_bytes.is_some() && cancellation.is_none() {
+        return Err("search finished before cancellation threshold".into());
+    }
+    if cancel_after_bytes.is_some() && !matches!(outcome, SearchOutcome::Cancelled) {
+        return Err("search completed before cancellation took effect".into());
+    }
+    Ok((outcome, progress, cancellation))
 }
 
 fn viewport_command(args: Vec<String>) -> CliResult<()> {
@@ -789,7 +991,10 @@ mod tests {
     use std::fs;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{generate_file, latency_stats, parse_size, viewport_command};
+    use super::{
+        data_search_position, generate_file, latency_stats, parse_size, physical_to_data_row,
+        search_command, viewport_command,
+    };
 
     #[test]
     fn summarizes_viewport_latency_and_rejects_empty_workloads() {
@@ -830,6 +1035,102 @@ mod tests {
             error.to_string(),
             "live viewport schedule must not exceed 60 seconds"
         );
+    }
+
+    #[test]
+    fn validates_search_arguments_and_converts_data_coordinates() {
+        let error = search_command(Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), "search requires a file path");
+
+        let error = search_command(vec!["missing.csv".into()]).unwrap_err();
+        assert_eq!(error.to_string(), "search requires --query");
+
+        for (option, expected) in [
+            ("--start-row", "start row and column must be at least 1"),
+            ("--start-column", "start row and column must be at least 1"),
+            (
+                "--cancel-after-bytes",
+                "cancel-after-bytes must be non-zero",
+            ),
+        ] {
+            let error = search_command(vec![
+                "missing.csv".into(),
+                "--query".into(),
+                "needle".into(),
+                option.into(),
+                "0".into(),
+            ])
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+
+        let error = search_command(vec!["missing.csv".into(), "--query".into(), String::new()])
+            .unwrap_err();
+        assert_eq!(error.to_string(), "query must not be empty");
+
+        let error = search_command(vec![
+            "missing.csv".into(),
+            "--query".into(),
+            "needle".into(),
+            "--cache-state".into(),
+            "hot".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--cache-state must be unknown, cold, or warm"
+        );
+
+        let error = search_command(vec![
+            "missing.csv".into(),
+            "--query".into(),
+            "needle".into(),
+            "--cache-state".into(),
+            "cold".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "search cannot be cold because indexing reads the file first"
+        );
+
+        let with_header = data_search_position(1, 1, true).unwrap();
+        assert_eq!((with_header.row, with_header.column), (1, 0));
+        assert_eq!(physical_to_data_row(with_header.row, true), 1);
+
+        let without_header = data_search_position(42, 3, false).unwrap();
+        assert_eq!((without_header.row, without_header.column), (41, 2));
+        assert_eq!(physical_to_data_row(without_header.row, false), 42);
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "quarry-search-command-{}-{suffix}.csv",
+            std::process::id()
+        ));
+        fs::write(&path, b"name,value\none,needle\n").unwrap();
+        search_command(vec![
+            path.to_string_lossy().into_owned(),
+            "--query".into(),
+            "needle".into(),
+        ])
+        .unwrap();
+
+        let error = search_command(vec![
+            path.to_string_lossy().into_owned(),
+            "--query".into(),
+            "missing".into(),
+            "--cancel-after-bytes".into(),
+            fs::metadata(&path).unwrap().len().to_string(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cancel-after-bytes must be less than the searchable byte span"
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

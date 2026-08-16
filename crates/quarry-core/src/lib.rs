@@ -1,4 +1,5 @@
 mod index;
+mod search;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub use index::{Checkpoint, IndexConfig, IndexJob, IndexProgress, StructuralIndex};
 use quarry_delimited::{ParseError, RecordScanner, parse_record};
+pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
 const DEFAULT_BOOTSTRAP_LIMIT: usize = 64 * 1024 * 1024;
@@ -47,7 +49,7 @@ impl fmt::Display for QuarryError {
                 "row {requested} is not indexed yet ({indexed_rows} rows available)"
             ),
             Self::InvalidOption(option) => write!(f, "invalid option: {option}"),
-            Self::WorkerPanicked => write!(f, "index worker panicked"),
+            Self::WorkerPanicked => write!(f, "background worker panicked"),
         }
     }
 }
