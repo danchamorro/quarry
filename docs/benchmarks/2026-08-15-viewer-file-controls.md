@@ -121,9 +121,10 @@ Two Page Down reads while the background indexer was active measured 10.565 ms
 and 12.809 ms; the same keyboard path measured 6.408 ms after indexing, and Page
 Up measured 2.882 ms. The accepted 8 ms engine target is explicitly post-index,
 so this does not invalidate the cache decision. It does expose live contention:
-the indexer holds the structural-index write lock while scanning each 8 MiB
-chunk, and the UI's snapshot waits for that lock. Measure live snapshot p95 and
-index throughput together before changing the chunk size.
+the indexer held the structural-index write lock while scanning each 8 MiB
+chunk, and the UI's snapshot waits for that lock. The follow-up
+[live-index benchmark](2026-08-15-live-index-latency.md) measured snapshot
+latency and index throughput together, then reduced the default chunk to 1 MiB.
 
 An earlier, pre-review Computer Use session with repeated picker, reopen,
 accessibility, and indexing operations reached 182.0 MiB sampled RSS and a
