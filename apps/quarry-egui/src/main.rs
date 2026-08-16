@@ -316,12 +316,9 @@ impl eframe::App for QuarryApp {
                         {
                             action = Some(Action::Jump);
                         }
-                        ui.label(
-                            RichText::new("Page Up / Page Down")
-                                .monospace()
-                                .size(10.0)
-                                .color(Color32::from_rgb(89, 103, 111)),
-                        );
+                        if let Some(page_action) = page_controls(ui) {
+                            action = Some(page_action);
+                        }
                     });
                 }
 
@@ -471,6 +468,18 @@ enum Action {
     PageDown,
     Jump,
     Cancel,
+}
+
+fn page_controls(ui: &mut egui::Ui) -> Option<Action> {
+    let page_up = ui.button("Page Up").clicked();
+    let page_down = ui.button("Page Down").clicked();
+    if page_up {
+        Some(Action::PageUp)
+    } else if page_down {
+        Some(Action::PageDown)
+    } else {
+        None
+    }
 }
 
 struct Document {
@@ -1093,11 +1102,68 @@ mod tests {
     use std::io::Write;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use eframe::egui;
+
     use super::{
-        DelimiterMode, Document, HeaderMode, IndexConfig, OpenOptions, QuarryApp,
-        logical_viewport_start, max_viewport_start, parse_data_row, row_for_scroll_fraction,
-        scroll_fraction_for_row,
+        Action, DelimiterMode, Document, HeaderMode, IndexConfig, OpenOptions, QuarryApp,
+        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
+        row_for_scroll_fraction, scroll_fraction_for_row,
     };
+
+    fn click_page_control(label: &str) -> Option<Action> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut action = None;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = page_controls(ui);
+            });
+        });
+        let target = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present")
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some(label)
+                    && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .unwrap_or_else(|| panic!("{label} is not an accessible button"));
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = page_controls(ui);
+                });
+            },
+        );
+        action
+    }
+
+    #[test]
+    fn page_navigation_controls_are_clickable() {
+        assert!(matches!(
+            click_page_control("Page Up"),
+            Some(Action::PageUp)
+        ));
+        assert!(matches!(
+            click_page_control("Page Down"),
+            Some(Action::PageDown)
+        ));
+    }
 
     #[test]
     fn logical_scrollbar_maps_the_full_row_range() {

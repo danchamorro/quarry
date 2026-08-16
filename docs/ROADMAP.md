@@ -66,6 +66,10 @@ pacing becomes measurable with the viewer-alpha grid.
 - [x] Benchmark live-index snapshot latency and indexing throughput together,
   then reduce the default chunk from 8 MiB to 1 MiB based on the measured
   [live-index latency result](benchmarks/2026-08-15-live-index-latency.md).
+- [ ] Increase the default grid density so the same maximized reference window
+  shows at least 40 data rows (currently 23), using EmEditor only as a density
+  reference while preserving legibility, accessibility, and bounded
+  virtualization.
 - [ ] Complete viewer-alpha grid controls, copying, and streaming search.
 
 **Phase 3 in progress:** the viewer now provides bounded file-level continuous
@@ -74,8 +78,8 @@ scrolling plus native opening and explicit format controls. The
 [file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md) record
 the current UI evidence; the [live-index benchmark](benchmarks/2026-08-15-live-index-latency.md)
 records the lock-window tuning decision. Grid controls, copying, and streaming
-search remain; filtering, editing, export, and cosmetic redesign stay outside
-this slice.
+search remain, along with increasing the default row density; filtering,
+editing, export, and cosmetic redesign stay outside this slice.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
