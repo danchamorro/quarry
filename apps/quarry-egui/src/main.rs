@@ -3305,13 +3305,13 @@ mod tests {
 
     use super::{
         Action, COLUMN_INPUT_ID, COLUMN_POSITION_INPUT_ID, ColumnCommand, ColumnView,
-        DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterQuery, GridSelection,
-        HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SearchProgress, Session,
-        column_drop_position, column_window_controls, copy_control, filtered_export_controls,
-        filtered_export_file_name, logical_viewport_start, max_viewport_start, page_controls,
-        parse_column_position, parse_data_row, parse_file_column, row_for_scroll_fraction,
-        scroll_fraction_for_row, search_controls, selection_text, show_column_manager,
-        show_filter_manager, show_grid,
+        DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterProgress, FilterQuery,
+        GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SearchProgress,
+        Session, column_drop_position, column_window_controls, copy_control,
+        filtered_export_controls, filtered_export_file_name, logical_viewport_start,
+        max_viewport_start, page_controls, parse_column_position, parse_data_row,
+        parse_file_column, row_for_scroll_fraction, scroll_fraction_for_row, search_controls,
+        selection_text, show_column_manager, show_filter_manager, show_grid,
     };
 
     fn click_accessible_button(
@@ -4078,14 +4078,21 @@ mod tests {
         app.header_mode = HeaderMode::FirstRow;
         app.open_path(first.clone()).unwrap();
         let document = app.document.as_mut().unwrap();
-        document
-            .start_filter(FilterQuery::single(
-                1,
-                FilterOperator::Equals,
-                b"keep".to_vec(),
-            ))
-            .unwrap();
-        finish_filter(document);
+        let file_size = document.session.file_size;
+        document.filter_query = Some(FilterQuery::single(
+            1,
+            FilterOperator::Equals,
+            b"keep".to_vec(),
+        ));
+        document.filter_progress = Some(FilterProgress {
+            bytes_scanned: file_size,
+            rows_scanned: 1_000_001,
+            matches_found: 1_000_000,
+            file_size,
+            elapsed: Duration::from_millis(1),
+            done: true,
+            cancelled: false,
+        });
 
         app.notice = Some("unchanged".into());
         app.export_picker_result(None);
