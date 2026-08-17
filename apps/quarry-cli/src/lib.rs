@@ -7,9 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterProgress, FilterQuery, IndexConfig,
-    IndexJob, IndexProgress, OpenOptions, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
-    Session, StructuralIndex,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
+    FilterQuery, IndexConfig, IndexJob, IndexProgress, OpenOptions, SearchJob, SearchOutcome,
+    SearchPosition, SearchProgress, Session, StructuralIndex,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -48,11 +48,20 @@ fn print_help() {
          [--start-column 1] [--cancel-after-bytes N] \
          [--cache-state unknown|warm]\n  \
            quarry filter <FILE> --column N --operator contains|equals \
-         --value LITERAL [--cancel-after-bytes N] \
+         --value LITERAL [--and N contains|equals LITERAL]... \
+         [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]"
     );
+}
+
+fn parse_filter_operator(value: &str, option: &str) -> CliResult<FilterOperator> {
+    match value {
+        "contains" => Ok(FilterOperator::Contains),
+        "equals" => Ok(FilterOperator::Equals),
+        _ => Err(format!("{option} must be contains or equals").into()),
+    }
 }
 
 fn filter_command(args: Vec<String>) -> CliResult<()> {
@@ -60,6 +69,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     let mut column = None;
     let mut operator = None;
     let mut filter_value = None;
+    let mut and_predicates = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
     let mut cursor = 0;
@@ -68,14 +78,33 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
         match args[cursor].as_str() {
             "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
             "--operator" => {
-                operator = Some(match value(&args, &mut cursor, "--operator")? {
-                    "contains" => FilterOperator::Contains,
-                    "equals" => FilterOperator::Equals,
-                    _ => return Err("--operator must be contains or equals".into()),
-                })
+                operator = Some(parse_filter_operator(
+                    value(&args, &mut cursor, "--operator")?,
+                    "--operator",
+                )?)
             }
             "--value" => {
                 filter_value = Some(value(&args, &mut cursor, "--value")?.as_bytes().to_vec())
+            }
+            "--and" => {
+                let operands = args
+                    .get(cursor + 1..cursor + 4)
+                    .ok_or("--and requires COLUMN contains|equals VALUE")?;
+                let column = operands[0].parse::<usize>()?;
+                let operator = parse_filter_operator(&operands[1], "--and operator")?;
+                let value = operands[2].as_bytes().to_vec();
+                if column == 0 {
+                    return Err("AND filter column must be at least 1".into());
+                }
+                if operator == FilterOperator::Contains && value.is_empty() {
+                    return Err("AND contains filter value must not be empty".into());
+                }
+                and_predicates.push(FilterPredicate {
+                    column: column - 1,
+                    operator,
+                    value,
+                });
+                cursor += 3;
             }
             "--cancel-after-bytes" => {
                 cancel_after_bytes =
@@ -114,11 +143,8 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
-    let query = FilterQuery {
-        column: column - 1,
-        operator,
-        value: filter_value,
-    };
+    let mut query = FilterQuery::single(column - 1, operator, filter_value);
+    query.predicates.extend(and_predicates);
     let job = session.start_filter(query)?;
     let (index, progress, cancellation) =
         wait_for_filter(job, cancel_after_bytes, Duration::from_millis(1))?;
@@ -140,15 +166,19 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Filter cache state: {cache_state}");
-    println!("Column: {column}");
-    println!(
-        "Operator: {}",
-        match operator {
-            FilterOperator::Contains => "contains",
-            FilterOperator::Equals => "equals",
-        }
-    );
-    println!("Value: {}", render_field(&index.query().value));
+    println!("Predicate count: {}", index.query().predicates.len());
+    for (position, predicate) in index.query().predicates.iter().enumerate() {
+        println!(
+            "Predicate {}: column {}, operator {}, value {}",
+            position + 1,
+            predicate.column + 1,
+            match predicate.operator {
+                FilterOperator::Contains => "contains",
+                FilterOperator::Equals => "equals",
+            },
+            render_field(&predicate.value)
+        );
+    }
     println!(
         "Outcome: {}",
         if progress.cancelled {
@@ -1494,6 +1524,69 @@ mod tests {
                 ],
                 "--cache-state must be unknown, cold, or warm",
             ),
+            (
+                vec![
+                    "missing.csv",
+                    "--column",
+                    "1",
+                    "--operator",
+                    "equals",
+                    "--value",
+                    "x",
+                    "--and",
+                    "2",
+                    "equals",
+                ],
+                "--and requires COLUMN contains|equals VALUE",
+            ),
+            (
+                vec![
+                    "missing.csv",
+                    "--column",
+                    "1",
+                    "--operator",
+                    "equals",
+                    "--value",
+                    "x",
+                    "--and",
+                    "0",
+                    "equals",
+                    "x",
+                ],
+                "AND filter column must be at least 1",
+            ),
+            (
+                vec![
+                    "missing.csv",
+                    "--column",
+                    "1",
+                    "--operator",
+                    "equals",
+                    "--value",
+                    "x",
+                    "--and",
+                    "2",
+                    "contains",
+                    "",
+                ],
+                "AND contains filter value must not be empty",
+            ),
+            (
+                vec![
+                    "missing.csv",
+                    "--column",
+                    "1",
+                    "--operator",
+                    "equals",
+                    "--value",
+                    "x",
+                    "--and",
+                    "2",
+                    "regex",
+                    "x",
+                ],
+                "--and operator must be contains or equals",
+            ),
         ] {
             let error = filter_command(args.into_iter().map(str::to_owned).collect()).unwrap_err();
             assert_eq!(error.to_string(), expected);
@@ -1539,11 +1632,11 @@ mod tests {
         )
         .unwrap();
         let index = session
-            .start_filter(FilterQuery {
-                column: 1,
-                operator: FilterOperator::Equals,
-                value: b"needle".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"needle".to_vec(),
+            ))
             .unwrap()
             .wait()
             .unwrap();
@@ -1572,6 +1665,46 @@ mod tests {
             error.to_string(),
             "cancel-after-bytes must be less than file size"
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filter_command_accepts_repeatable_and_predicates() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "quarry-filter-and-command-{}-{suffix}.csv",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            b"name,state,status,kind\none,TX,active,gold\ntwo,TX,active,silver\nthree,TX,inactive,gold\nfour,CA,active,gold\nfive,TX,active,gold\n",
+        )
+        .unwrap();
+
+        let mut and_args = vec![
+            path.to_string_lossy().into_owned(),
+            "--column".into(),
+            "2".into(),
+            "--operator".into(),
+            "equals".into(),
+            "--value".into(),
+            "TX".into(),
+        ];
+        and_args.extend([
+            "--and".into(),
+            "3".into(),
+            "equals".into(),
+            "active".into(),
+            "--and".into(),
+            "4".into(),
+            "equals".into(),
+            "gold".into(),
+        ]);
+        filter_command(and_args).unwrap();
+
         fs::remove_file(path).unwrap();
     }
 

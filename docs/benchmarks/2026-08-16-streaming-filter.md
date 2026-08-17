@@ -13,8 +13,13 @@ used 8.97 MiB. It completed in 42.779 seconds at 271.26 MiB/s with 25.62 MiB
 peak process RSS. The absent 12 GB scan completed in 41.387 seconds at
 280.39 MiB/s with 3.92 MiB peak RSS.
 
-Multiple predicates, case-insensitive matching, regex, a full results panel,
-and streaming export remain deferred.
+At the time of this original slice, multiple predicates, case-insensitive
+matching, regex, a full results panel, and streaming export remained deferred.
+
+This report preserves the original single-predicate measurements. Quarry now
+routes that command through the compatible `FilterQuery::single` path. See the
+[multiple-predicate filter validation](2026-08-16-multiple-predicate-filter.md)
+for the later AND-combined implementation and measurements.
 
 ## Implementation
 
@@ -23,13 +28,15 @@ and streaming export remain deferred.
 - The filter index owns its source column, operator, and literal value. It keeps
   the exact match count while compacting sparse match checkpoints whenever its
   16 MiB budget fills.
-- A bounded row request starts a cancellable background read at the nearest
-  checkpoint, reevaluates the same predicate, and materializes only the
-  requested matching rows. The egui viewer cancels obsolete reads and applies
-  only the newest requested match window. Cancelled read-only workers detach so
-  the render thread never waits for their cleanup.
-- Progress reports exact bytes, physical records, and matches scanned. The job
-  supports snapshots, cancellation, wait, and cancel-and-join on drop.
+- Core can serve bounded filtered rows synchronously. An egui row request starts
+  a cancellable background read at the nearest checkpoint, reevaluates the same
+  predicate, and materializes only the requested matching rows. Rapid
+  navigation cancels obsolete reads, keeps only the newest pending match window,
+  and joins a cancelled read after it finishes. Lifecycle resets cancel and
+  detach an active read-only worker so the render thread never waits for
+  cleanup.
+- The filter-index job reports exact bytes, physical records, and matches found.
+  It supports snapshots, cancellation, wait, and cancel-and-join on drop.
 - The CLI accepts a one-based source column, waits for the filter worker, and
   reads at most three 100-row samples for first, middle, final, and checksum
   evidence. It does not retain a full match list.

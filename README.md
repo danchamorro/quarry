@@ -26,8 +26,8 @@ Current alpha capabilities include CSV, TSV, pipe, and semicolon-delimited
 files; progressive opening; continuous virtualized rows; resizable columns in a
 bounded 32-column display window; direct access to every known column;
 view-only hide/show/reorder controls; literal search; bounded cell or row copy;
-and single-column contains/equality filtering. Multiple filters,
-transformations, and streaming export remain planned.
+and one or more AND-combined contains/equality filter predicates.
+Transformations and streaming export remain planned.
 
 ## Performance direction
 The initial reference workload is a **10 GB delimited file**. Quarry should show useful first rows within seconds, keep memory bounded, remain interactive during scans, and avoid full-file copies for read-only work.
@@ -55,13 +55,14 @@ file opening, drag and drop, delimiter/header controls, and bounded literal
 Find Next with progress and cancellation, plus bounded cell and row copying.
 It also provides direct access to every known column plus view-only
 hide/show/reorder controls. The compact default grid dynamically fits rows to
-the available height and showed 42 data rows in the maximized reference window,
-completing the Phase 3 viewer alpha.
+the available height and keeps at least 40 data rows visible in the maximized
+reference window, completing the Phase 3 viewer alpha.
 
-Phase 4 is in progress. Its first slice scans one selected source column with a
-literal contains or equality predicate, builds a bounded adaptive match index,
-and serves bounded filtered row ranges through cancellable background reads
-without retaining every matching row.
+Phase 4 is in progress. Filtering now combines one or more literal contains or
+equality predicates with AND semantics. A background worker parses each row
+once, builds a bounded adaptive match index, and serves bounded filtered row
+ranges through cancellable reads without retaining every matching row.
+Streaming filtered export is next.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -81,10 +82,19 @@ selections apply to newly opened files; changes to the open document wait for
 cells from the first visible data row and jumps directly to the matching row
 and column.
 
+Use **Filters…** to choose a one-based file column and a literal, case-sensitive
+**Contains** or **Equals** predicate. Select **Add AND rule** to combine more
+rules; a row appears only when every rule matches. The grid shows matching rows
+while the background scan progresses. Page Up/Page Down, wheel, and scrollbar
+navigation operate on those matches. **Cancel filter** stops the scan, and
+**Clear filter** returns to the full file. Value editors accept literal newlines
+for matching multiline fields.
+
 Use **Columns…** to view or hide a one-based file column, move it to any display
 position, drag it by its handle inside the Columns window, or reset the layout.
 Hidden columns remain part of that display order. The main grid headers stay
-resize-only, which prevents accidental reordering while browsing. Quarry
+resize-only, which prevents accidental reordering while browsing. Each header
+shows its stable, one-based file-column number above the column name. Quarry
 renders at most 32 data columns at once while keeping source column identity
 stable for search and copy. Header columns are known immediately; extra fields
 in later ragged rows are appended when Quarry encounters them.
@@ -122,11 +132,12 @@ cargo run --release -p quarry-cli --bin quarry-bench -- search huge.csv \
   --query QUARRY_NO_MATCH_9F7B2C --cache-state unknown
 ```
 
-Measure a complete single-column filter scan and bounded filtered-row reads:
+Measure a complete two-predicate AND scan and bounded filtered-row reads:
 
 ```bash
 cargo run --release -p quarry-cli --bin quarry-bench -- filter huge.csv \
-  --column 1 --operator contains --value QUARRY_NO_MATCH_9F7B2C \
+  --column 1 --operator contains --value 'with "quotes"' \
+  --and 2 equals $'line one\nline two' \
   --cache-state unknown
 ```
 
@@ -149,6 +160,7 @@ See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [column-controls validation](docs/benchmarks/2026-08-16-column-controls.md),
 [row-density validation](docs/benchmarks/2026-08-16-row-density.md),
 [streaming-filter validation](docs/benchmarks/2026-08-16-streaming-filter.md),
+[multiple-predicate filter validation](docs/benchmarks/2026-08-16-multiple-predicate-filter.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).

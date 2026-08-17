@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
 use quarry_core::{
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterProgress, FilterQuery,
-    FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress,
-    OpenOptions, Row, SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress,
-    Session, StructuralIndex,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
+    FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob,
+    IndexProgress, OpenOptions, Row, SearchJob, SearchMatch, SearchOutcome, SearchPosition,
+    SearchProgress, Session, StructuralIndex,
 };
 
 const BOOTSTRAP_ROWS: usize = 40;
@@ -57,9 +57,7 @@ struct QuarryApp {
     column_input: String,
     column_position_input: String,
     columns_open: bool,
-    filter_column_input: String,
-    filter_value_input: String,
-    filter_operator: FilterOperator,
+    filter_rules: Vec<FilterRuleDraft>,
     filters_open: bool,
     delimiter_mode: DelimiterMode,
     header_mode: HeaderMode,
@@ -67,6 +65,23 @@ struct QuarryApp {
     notice: Option<String>,
     started: Instant,
     logged_first_update: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilterRuleDraft {
+    column_input: String,
+    operator: FilterOperator,
+    value_input: String,
+}
+
+impl Default for FilterRuleDraft {
+    fn default() -> Self {
+        Self {
+            column_input: "1".into(),
+            operator: FilterOperator::Contains,
+            value_input: String::new(),
+        }
+    }
 }
 
 impl QuarryApp {
@@ -82,9 +97,7 @@ impl QuarryApp {
             column_input: "1".into(),
             column_position_input: "1".into(),
             columns_open: false,
-            filter_column_input: "1".into(),
-            filter_value_input: String::new(),
-            filter_operator: FilterOperator::Contains,
+            filter_rules: vec![FilterRuleDraft::default()],
             filters_open: false,
             delimiter_mode: DelimiterMode::Auto,
             header_mode: HeaderMode::Auto,
@@ -126,9 +139,7 @@ impl QuarryApp {
         self.column_input = "1".into();
         self.column_position_input = "1".into();
         self.columns_open = false;
-        self.filter_column_input = "1".into();
-        self.filter_value_input.clear();
-        self.filter_operator = FilterOperator::Contains;
+        self.filter_rules = vec![FilterRuleDraft::default()];
         self.filters_open = false;
         self.document = Some(document);
         Ok(())
@@ -228,15 +239,21 @@ impl QuarryApp {
                 Ok(())
             }
             Action::ApplyFilter => {
-                parse_file_column(&self.filter_column_input, document.total_columns).and_then(
-                    |column| {
-                        document.start_filter(FilterQuery {
-                            column,
-                            operator: self.filter_operator,
-                            value: self.filter_value_input.as_bytes().to_vec(),
-                        })
-                    },
-                )
+                let predicates = self
+                    .filter_rules
+                    .iter()
+                    .enumerate()
+                    .map(|(index, rule)| {
+                        parse_file_column(&rule.column_input, document.total_columns)
+                            .map_err(|error| format!("Rule {}: {error}", index + 1))
+                            .map(|column| FilterPredicate {
+                                column,
+                                operator: rule.operator,
+                                value: rule.value_input.as_bytes().to_vec(),
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                predicates.and_then(|predicates| document.start_filter(FilterQuery { predicates }))
             }
             Action::CancelFilter => {
                 document.cancel_filter();
@@ -578,9 +595,7 @@ impl eframe::App for QuarryApp {
             show_filter_manager(
                 ctx,
                 &mut self.filters_open,
-                &mut self.filter_column_input,
-                &mut self.filter_operator,
-                &mut self.filter_value_input,
+                &mut self.filter_rules,
                 document,
             )
         });
@@ -609,7 +624,7 @@ impl eframe::App for QuarryApp {
             .document
             .as_ref()
             .and_then(|document| document.selection.as_ref())
-            .is_some_and(|_| selection_copy_requested(ctx));
+            .is_some_and(|_| selection_copy_requested(ctx, self.filter_rules.len()));
         if copy_event_targets_selection {
             self.copy_selection(ctx);
         }
@@ -713,7 +728,30 @@ fn copy_control(ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
         .then_some(Action::CopySelection)
 }
 
-fn selection_copy_requested(ctx: &egui::Context) -> bool {
+fn filter_column_input_id(rule_index: usize) -> egui::Id {
+    egui::Id::new((FILTER_COLUMN_INPUT_ID, rule_index))
+}
+
+fn filter_value_input_id(rule_index: usize) -> egui::Id {
+    egui::Id::new((FILTER_VALUE_INPUT_ID, rule_index))
+}
+
+fn is_filter_text_input(focused: egui::Id, filter_rule_count: usize) -> bool {
+    (0..filter_rule_count).any(|index| {
+        focused == filter_column_input_id(index) || focused == filter_value_input_id(index)
+    })
+}
+
+fn surrender_filter_text_focus(ctx: &egui::Context, filter_rule_count: usize) {
+    let focused = ctx.memory(|memory| memory.focused());
+    if let Some(focused) =
+        focused.filter(|focused| is_filter_text_input(*focused, filter_rule_count))
+    {
+        ctx.memory_mut(|memory| memory.surrender_focus(focused));
+    }
+}
+
+fn selection_copy_requested(ctx: &egui::Context, filter_rule_count: usize) -> bool {
     let copy_event = ctx.input(|input| {
         input
             .events
@@ -728,11 +766,10 @@ fn selection_copy_requested(ctx: &egui::Context) -> bool {
                 FIND_INPUT_ID,
                 COLUMN_INPUT_ID,
                 COLUMN_POSITION_INPUT_ID,
-                FILTER_COLUMN_INPUT_ID,
-                FILTER_VALUE_INPUT_ID,
             ]
             .into_iter()
             .any(|id| focused == egui::Id::new(id))
+                || is_filter_text_input(focused, filter_rule_count)
         })
     });
     copy_event && !text_input_focused
@@ -944,73 +981,113 @@ fn show_column_manager(
 fn show_filter_manager(
     ctx: &egui::Context,
     open: &mut bool,
-    column_input: &mut String,
-    operator: &mut FilterOperator,
-    value_input: &mut String,
+    rules: &mut Vec<FilterRuleDraft>,
     document: &Document,
 ) -> Option<Action> {
     let mut action = None;
     egui::Window::new("Filters")
         .id(egui::Id::new("quarry-filter-manager"))
         .open(open)
-        .default_width(460.0)
-        .min_width(380.0)
+        .default_width(520.0)
+        .min_width(420.0)
+        .vscroll(true)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.label("Show only rows that match one file column.");
+            ui.label("Show only rows where all rules match (AND).");
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let label = ui.label("File column");
-                let _ = ui
-                    .add_sized(
-                        [96.0, 26.0],
-                        egui::TextEdit::singleline(column_input)
-                            .id(egui::Id::new(FILTER_COLUMN_INPUT_ID))
-                            .horizontal_align(Align::RIGHT),
-                    )
-                    .labelled_by(label.id);
-                if let Ok(column) = parse_file_column(column_input, document.total_columns) {
-                    ui.label(column_name(&document.session, column));
-                }
-            });
-            ui.horizontal(|ui| {
-                let label = ui.label("Match");
-                let _ = egui::ComboBox::from_id_salt("quarry-filter-operator")
-                    .selected_text(filter_operator_label(*operator))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(operator, FilterOperator::Contains, "Contains");
-                        ui.selectable_value(operator, FilterOperator::Equals, "Equals");
-                    })
-                    .response
-                    .labelled_by(label.id);
-            });
-            ui.horizontal(|ui| {
-                let label = ui.label("Value");
-                let width = (ui.available_width() - 112.0).max(120.0);
-                let _ = ui
-                    .add_sized(
-                        [width, 48.0],
-                        egui::TextEdit::multiline(value_input)
-                            .desired_rows(2)
-                            .id(egui::Id::new(FILTER_VALUE_INPUT_ID))
-                            .hint_text("Literal, case-sensitive text"),
-                    )
-                    .labelled_by(label.id);
-                let valid_column = parse_file_column(column_input, document.total_columns).is_ok();
-                let valid_value = *operator == FilterOperator::Equals || !value_input.is_empty();
-                let can_apply = document.is_filter_ready()
-                    && document.search_job.is_none()
-                    && document.filter_job.is_none()
-                    && valid_column
-                    && valid_value;
-                if ui
-                    .add_enabled(can_apply, egui::Button::new("Apply filter"))
-                    .clicked()
-                {
-                    action = Some(Action::ApplyFilter);
-                }
-            });
-            ui.small("Contains requires a value. Equals can match an empty cell.");
+            let rule_count = rules.len();
+            let sole_rule = rule_count == 1;
+            let mut remove_index = None;
+            for (index, rule) in rules.iter_mut().enumerate() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("Rule {}", index + 1));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let response =
+                                ui.add_enabled(!sole_rule, egui::Button::new("Remove"));
+                            let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                node.set_label(format!("Remove rule {}", index + 1));
+                            });
+                            if response.clicked() {
+                                surrender_filter_text_focus(ui.ctx(), rule_count);
+                                remove_index = Some(index);
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        let label = ui.label(format!("Rule {} file column (1-based)", index + 1));
+                        let _ = ui
+                            .add_sized(
+                                [96.0, 26.0],
+                                egui::TextEdit::singleline(&mut rule.column_input)
+                                    .id(filter_column_input_id(index))
+                                    .horizontal_align(Align::RIGHT),
+                            )
+                            .labelled_by(label.id);
+                        if let Ok(column) =
+                            parse_file_column(&rule.column_input, document.total_columns)
+                        {
+                            ui.label(column_name(&document.session, column));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let label = ui.label(format!("Rule {} match", index + 1));
+                        let _ = egui::ComboBox::from_id_salt((
+                            "quarry-filter-operator",
+                            index,
+                        ))
+                        .selected_text(filter_operator_label(rule.operator))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut rule.operator,
+                                FilterOperator::Contains,
+                                "Contains",
+                            );
+                            ui.selectable_value(
+                                &mut rule.operator,
+                                FilterOperator::Equals,
+                                "Equals",
+                            );
+                        })
+                        .response
+                        .labelled_by(label.id);
+                    });
+                    let label = ui.label(format!("Rule {} value", index + 1));
+                    let _ = ui
+                        .add_sized(
+                            [ui.available_width(), 48.0],
+                            egui::TextEdit::multiline(&mut rule.value_input)
+                                .desired_rows(2)
+                                .id(filter_value_input_id(index))
+                                .hint_text("Literal, case-sensitive text"),
+                        )
+                        .labelled_by(label.id);
+                });
+                ui.add_space(4.0);
+            }
+            if let Some(index) = remove_index {
+                rules.remove(index);
+            }
+            if ui.button("Add AND rule").clicked() {
+                surrender_filter_text_focus(ui.ctx(), rules.len());
+                rules.push(FilterRuleDraft::default());
+            }
+
+            let can_apply = document.is_filter_ready()
+                && document.search_job.is_none()
+                && document.filter_job.is_none()
+                && !rules.is_empty()
+                && rules.iter().all(|rule| {
+                    parse_file_column(&rule.column_input, document.total_columns).is_ok()
+                        && (rule.operator == FilterOperator::Equals || !rule.value_input.is_empty())
+                });
+            if ui
+                .add_enabled(can_apply, egui::Button::new("Apply filters"))
+                .clicked()
+            {
+                action = Some(Action::ApplyFilter);
+            }
+            ui.small("Contains requires a value. Equals can match an empty cell. Values are literal and case-sensitive.");
 
             if let Some(progress) = document.filter_progress() {
                 ui.add_space(8.0);
@@ -1043,14 +1120,22 @@ fn show_filter_manager(
 
             if let Some(query) = document.filter_query.as_ref() {
                 ui.add_space(6.0);
-                let value = field_text(&query.value);
                 ui.label(format!(
-                    "Active: file column {} ({}) {} {:?}",
-                    query.column.saturating_add(1),
-                    column_name(&document.session, query.column),
-                    filter_operator_label(query.operator).to_lowercase(),
-                    value
+                    "Active: {} rule{} (all must match)",
+                    query.predicates.len(),
+                    if query.predicates.len() == 1 { "" } else { "s" }
                 ));
+                for (index, predicate) in query.predicates.iter().enumerate() {
+                    let value = field_text(&predicate.value);
+                    ui.label(format!(
+                        "{}. file column {} ({}) {} {:?}",
+                        index + 1,
+                        predicate.column.saturating_add(1),
+                        column_name(&document.session, predicate.column),
+                        filter_operator_label(predicate.operator).to_lowercase(),
+                        value
+                    ));
+                }
             }
             if let Some(status) = document.filter_status.as_deref() {
                 let response = ui.label(status);
@@ -1570,9 +1655,18 @@ impl Document {
         if !self.is_filter_ready() {
             return Err("Open a file with at least one column before filtering.".into());
         }
-        self.validate_column(query.column)?;
-        if query.operator == FilterOperator::Contains && query.value.is_empty() {
-            return Err("Enter text for a Contains filter.".into());
+        if query.predicates.is_empty() {
+            return Err("Add at least one filter rule.".into());
+        }
+        for (index, predicate) in query.predicates.iter().enumerate() {
+            self.validate_column(predicate.column)
+                .map_err(|error| format!("Rule {}: {error}", index + 1))?;
+            if predicate.operator == FilterOperator::Contains && predicate.value.is_empty() {
+                return Err(format!(
+                    "Rule {}: enter text for a Contains filter.",
+                    index + 1
+                ));
+            }
         }
 
         let job = self
@@ -2623,11 +2717,35 @@ fn show_table(
             table
                 .header(HEADER_HEIGHT, |mut header| {
                     header.col(|ui| {
-                        ui.label(RichText::new("ROW").monospace().strong());
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.add_space(13.0);
+                            ui.add(
+                                egui::Label::new(RichText::new("ROW").monospace().strong())
+                                    .truncate(),
+                            );
+                        });
                     });
-                    for name in &document.headers {
+                    for (column, name) in document.columns.visible.iter().zip(&document.headers) {
                         header.col(|ui| {
-                            ui.label(RichText::new(name).strong());
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                let width = ui.available_width();
+                                ui.add_sized(
+                                    [width, 13.0],
+                                    egui::Label::new(
+                                        RichText::new(column.saturating_add(1).to_string())
+                                            .monospace()
+                                            .size(11.0),
+                                    )
+                                    .halign(Align::Center)
+                                    .truncate(),
+                                );
+                                ui.add_sized(
+                                    [width, 17.0],
+                                    egui::Label::new(RichText::new(name).strong()).truncate(),
+                                );
+                            });
                         });
                     }
                 })
@@ -3205,8 +3323,8 @@ mod tests {
         app.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
         app.filters_open = true;
-        app.filter_column_input = "2".to_owned();
-        app.filter_operator = FilterOperator::Equals;
+        app.filter_rules[0].column_input = "2".to_owned();
+        app.filter_rules[0].operator = FilterOperator::Equals;
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -3215,9 +3333,7 @@ mod tests {
             action = show_filter_manager(
                 ctx,
                 &mut app.filters_open,
-                &mut app.filter_column_input,
-                &mut app.filter_operator,
-                &mut app.filter_value_input,
+                &mut app.filter_rules,
                 app.document.as_ref().unwrap(),
             );
         });
@@ -3250,14 +3366,14 @@ mod tests {
             .iter()
             .find(|(_, node)| {
                 node.role() == egui::accesskit::Role::Button
-                    && node.label() == Some("Apply filter")
+                    && node.label() == Some("Apply filters")
                     && node.supports_action(egui::accesskit::Action::Click)
             })
             .map(|(id, _)| *id)
-            .expect("Apply filter should be accessible");
+            .expect("Apply filters should be accessible");
 
         ctx.memory_mut(|memory| {
-            memory.request_focus(egui::Id::new(super::FILTER_VALUE_INPUT_ID));
+            memory.request_focus(super::filter_value_input_id(0));
         });
         let _ = ctx.run(
             egui::RawInput {
@@ -3278,15 +3394,13 @@ mod tests {
                 action = show_filter_manager(
                     ctx,
                     &mut app.filters_open,
-                    &mut app.filter_column_input,
-                    &mut app.filter_operator,
-                    &mut app.filter_value_input,
+                    &mut app.filter_rules,
                     app.document.as_ref().unwrap(),
                 );
             },
         );
         assert!(action.is_none(), "Enter should insert data, not apply");
-        assert_eq!(app.filter_value_input, "line one\nline two");
+        assert_eq!(app.filter_rules[0].value_input, "line one\nline two");
 
         let _ = ctx.run(
             egui::RawInput {
@@ -3303,9 +3417,7 @@ mod tests {
                 action = show_filter_manager(
                     ctx,
                     &mut app.filters_open,
-                    &mut app.filter_column_input,
-                    &mut app.filter_operator,
-                    &mut app.filter_value_input,
+                    &mut app.filter_rules,
                     app.document.as_ref().unwrap(),
                 );
             },
@@ -3321,6 +3433,212 @@ mod tests {
             document.visible_filter_rows()[0].fields[1],
             b"line one\nline two"
         );
+        document.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filter_manager_adds_and_removes_accessible_rules_and_suppresses_copy() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-filter-rules-a11y-{name}.csv"));
+        fs::write(&path, b"name,status\nfirst,keep\n").unwrap();
+        let mut document = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut open = true;
+        let mut rules = vec![super::FilterRuleDraft::default()];
+
+        let output = ctx.run(grid_input(), |ctx| {
+            let _ = show_filter_manager(ctx, &mut open, &mut rules, &document);
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.label() == Some("Remove rule 1")
+                && node.is_disabled()
+        }));
+        let add_target = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Add AND rule")
+                    && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .expect("Add AND rule should be accessible");
+
+        ctx.memory_mut(|memory| memory.request_focus(super::filter_value_input_id(0)));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: add_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                let _ = show_filter_manager(ctx, &mut open, &mut rules, &document);
+            },
+        );
+        assert_eq!(rules.len(), 2);
+        assert!(!ctx.memory(|memory| {
+            memory
+                .focused()
+                .is_some_and(|focused| super::is_filter_text_input(focused, rules.len()))
+        }));
+        rules[0].value_input = "first".into();
+        rules[1].value_input = "second".into();
+
+        let output = ctx.run(grid_input(), |ctx| {
+            let _ = show_filter_manager(ctx, &mut open, &mut rules, &document);
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present");
+        assert_eq!(
+            tree.nodes
+                .iter()
+                .filter(|(_, node)| {
+                    matches!(
+                        node.role(),
+                        egui::accesskit::Role::TextInput
+                            | egui::accesskit::Role::MultilineTextInput
+                    ) && !node.labelled_by().is_empty()
+                })
+                .count(),
+            4
+        );
+        assert_eq!(
+            tree.nodes
+                .iter()
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::ComboBox && !node.labelled_by().is_empty()
+                })
+                .count(),
+            2
+        );
+        let remove_target = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Remove rule 2")
+                    && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .expect("Remove rule 2 should be enabled with two rules");
+
+        for focused in [
+            super::filter_column_input_id(1),
+            super::filter_value_input_id(1),
+        ] {
+            ctx.memory_mut(|memory| memory.request_focus(focused));
+            let mut selection_copy = true;
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Copy],
+                    ..grid_input()
+                },
+                |ctx| {
+                    selection_copy = super::selection_copy_requested(ctx, rules.len());
+                },
+            );
+            assert!(!selection_copy);
+        }
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: remove_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                let _ = show_filter_manager(ctx, &mut open, &mut rules, &document);
+            },
+        );
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].value_input, "first");
+        assert!(!ctx.memory(|memory| {
+            memory
+                .focused()
+                .is_some_and(|focused| super::is_filter_text_input(focused, 2))
+        }));
+
+        document.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn applying_two_filter_rules_shows_only_rows_matching_both() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-filter-and-{name}.csv"));
+        fs::write(
+            &path,
+            b"id,status,region\n1,keep,east\n2,keep,west\n3,skip,east\n4,keep,east\n",
+        )
+        .unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(path.clone()).unwrap();
+        app.filter_rules = vec![
+            super::FilterRuleDraft {
+                column_input: "2".into(),
+                operator: FilterOperator::Equals,
+                value_input: "keep".into(),
+            },
+            super::FilterRuleDraft {
+                column_input: "3".into(),
+                operator: FilterOperator::Equals,
+                value_input: "east".into(),
+            },
+        ];
+        let ctx = egui::Context::default();
+        app.apply(&ctx, Action::ApplyFilter);
+        assert!(app.notice.is_none());
+
+        let document = app.document.as_mut().unwrap();
+        finish_filter(document);
+        assert_eq!(document.filter_query.as_ref().unwrap().predicates.len(), 2);
+        assert_eq!(document.available_filter_rows(), 2);
+        assert_eq!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .map(|row| row.fields[0].as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"1".as_slice(), b"4".as_slice()]
+        );
+        assert!(document.visible_filter_rows().iter().all(|row| {
+            row.fields[1].as_slice() == b"keep" && row.fields[2].as_slice() == b"east"
+        }));
+
         document.shutdown();
         fs::remove_file(path).unwrap();
     }
@@ -3355,11 +3673,11 @@ mod tests {
         let hidden = document.columns.hidden.clone();
 
         document
-            .start_filter(FilterQuery {
-                column: 1,
-                operator: FilterOperator::Equals,
-                value: b"keep".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
             .unwrap();
         finish_filter(&mut document);
         document.set_visible_rows(7).unwrap();
@@ -3441,11 +3759,7 @@ mod tests {
         )
         .unwrap();
         document.visible_rows = 5;
-        let query = FilterQuery {
-            column: 1,
-            operator: FilterOperator::Equals,
-            value: b"keep".to_vec(),
-        };
+        let query = FilterQuery::single(1, FilterOperator::Equals, b"keep".to_vec());
         let stale_session = Session::open(
             &prefix_path,
             OpenOptions {
@@ -3516,11 +3830,11 @@ mod tests {
         .unwrap();
         document.visible_rows = 5;
         document
-            .start_filter(FilterQuery {
-                column: 1,
-                operator: FilterOperator::Equals,
-                value: b"keep".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
             .unwrap();
         finish_filter(&mut document);
 
@@ -3579,11 +3893,11 @@ mod tests {
         app.open_path(first.clone()).unwrap();
         let document = app.document.as_mut().unwrap();
         document
-            .start_filter(FilterQuery {
-                column: 1,
-                operator: FilterOperator::Contains,
-                value: b"keep".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Contains,
+                b"keep".to_vec(),
+            ))
             .unwrap();
         document.cancel_filter();
         finish_filter(document);
@@ -3598,11 +3912,7 @@ mod tests {
         assert!(document.filter_job.is_none());
         assert!(document.filter_index.is_none());
 
-        let query = FilterQuery {
-            column: 1,
-            operator: FilterOperator::Equals,
-            value: b"keep".to_vec(),
-        };
+        let query = FilterQuery::single(1, FilterOperator::Equals, b"keep".to_vec());
         document.start_filter(query.clone()).unwrap();
         finish_filter(document);
         document.navigate_filter(100).unwrap();
@@ -3629,12 +3939,12 @@ mod tests {
         assert!(document.filter_read.is_some());
         assert!(document.pending_filter_read.is_some());
         app.filters_open = true;
-        app.filter_column_input = "2".into();
-        app.filter_value_input = "keep".into();
+        app.filter_rules[0].column_input = "2".into();
+        app.filter_rules[0].value_input = "keep".into();
+        app.filter_rules.push(super::FilterRuleDraft::default());
         app.open_path(second.clone()).unwrap();
         assert!(!app.filters_open);
-        assert_eq!(app.filter_column_input, "1");
-        assert!(app.filter_value_input.is_empty());
+        assert_eq!(app.filter_rules, vec![super::FilterRuleDraft::default()]);
         assert!(!app.document.as_ref().unwrap().filter_active());
         assert!(app.document.as_ref().unwrap().filter_read.is_none());
         assert!(app.document.as_ref().unwrap().pending_filter_read.is_none());
@@ -4380,6 +4690,24 @@ mod tests {
         assert_eq!(document.headers[22], "c40");
         assert_eq!(document.headers[23], "c31");
         assert_eq!(document.copy_selection_text().unwrap(), "v40");
+
+        document.move_column(39, 8).unwrap();
+        let header_ctx = egui::Context::default();
+        let output = header_ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
+        let rendered_text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered_text.windows(2).any(|texts| texts == ["40", "c40"]));
+        assert!(!rendered_text.windows(2).any(|texts| texts == ["9", "c40"]));
 
         document.selection = Some(GridSelection::Row { row: 1 });
         assert_eq!(document.copy_selection_text().unwrap(), values.join("\t"));

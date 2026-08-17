@@ -30,8 +30,9 @@ remains a visual density reference, not a performance gate.
 
 Only the data grid became denser. Rows use a 17-point height with no vertical
 gap inside the table, and selectable cells use compact button padding. The
-13-point monospace data font, 30-point header height, toolbar, status area, and
-global spacing remain unchanged. The bounded bootstrap target increased to 40
+13-point monospace data font, toolbar, status area, and global spacing remain
+unchanged. The 30-point header uses two compact lines so each stable one-based
+file-column number appears above its name. The bounded bootstrap target is 40
 rows; each rendered frame still calculates its visible count from the available
 grid height. The active buffer retains only visible rows plus two overscan rows
 on each side.
@@ -43,6 +44,7 @@ on each side.
 | Quarry before | 23 visible data rows in the supplied maximized screenshot. |
 | EmEditor reference | 45 visible data rows, rows 2 through 46. |
 | Quarry after | 42 visible data rows, rows 1 through 42. |
+| Numbered-header follow-up | 40 visible data rows, with file-column numbers above names. |
 | Legibility | No clipped or overlapping text was visible; headers and striped rows remained distinct. |
 | Selection | A selected cell remained clearly visible in the compact grid. |
 | Page Down | Rows 1 through 42 advanced to rows 43 through 84. |
@@ -58,7 +60,7 @@ layout without fixing the production row count.
 
 ## Validation
 
-The final source passed:
+The original density slice passed:
 
 ```bash
 cargo fmt --all -- --check
@@ -68,7 +70,10 @@ cargo +1.97.1 build --workspace --release
 git diff --check
 ```
 
-The workspace run passed 45 tests, including 21 `quarry-egui` tests.
+The original workspace run passed 45 tests, including 21 `quarry-egui` tests.
+The numbered-header follow-up passed 67 workspace tests, including 28
+`quarry-egui` tests, plus formatting, strict Clippy, the locked release build,
+and `git diff --check`.
 
 ## Limits
 
