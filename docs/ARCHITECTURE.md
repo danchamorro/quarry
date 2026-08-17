@@ -14,6 +14,7 @@ quarry-core
    +-- Literal search worker
    +-- Bounded filter-index worker
    +-- Bounded filtered-row read worker
+   +-- Streaming filtered-export worker
    |
 quarry-delimited
    +-- Record scanner
@@ -106,14 +107,16 @@ match, and at most a 64 MiB clipboard payload.
 cache remains deferred.
 
 ## Concurrency
-Rust workers currently handle indexing, literal search, filtering, and
-filtered viewport reads. Each publishes progress and supports cancellation.
+Rust workers currently handle indexing, literal search, filtering, filtered
+viewport reads, and filtered export. Each publishes progress and supports
+cancellation.
 Jobs normally join before they are dropped. Rapid filtered navigation cancels
 obsolete reads, keeps only the newest pending window, and joins a cancelled read
 after it finishes. Filter resets and document lifecycle changes detach an active
 read-only viewport worker so the render thread never waits for cleanup; each
-worker owns its resources and exits at its next cancellation check. Future
-sorting and export workers must keep cleanup off the render thread.
+worker owns its resources and exits at its next cancellation check. An active
+export blocks document replacement until cancellation finishes. App shutdown
+joins the export worker so temporary-output cleanup is guaranteed.
 
 ## Search and filtering
 Literal Find Next uses a cancellable core worker after structural indexing. It
@@ -144,6 +147,19 @@ index owns its query so a caller cannot accidentally read its checkpoints with
 different filter semantics. Memory therefore depends on the predicate values,
 fixed chunk and index budgets, the 64 MiB maximum record and its decoded fields,
 and the requested row count, not on file size or match count.
+
+## Filtered export
+Filtered export scans the source once with the same decoded-cell predicate
+semantics as filtered navigation, but copies each matching raw record to a
+buffered temporary file. This preserves the source header, delimiter, quoting,
+line endings, and multiline records byte for byte without retaining matching
+rows. The worker publishes scanned bytes, parsed records, written rows, written
+bytes, elapsed time, and cancellation state.
+
+The temporary file is created beside the destination. A successful worker
+flushes and syncs it before publishing the destination without overwriting an
+existing path. Cancellation or failure removes the temporary file and never
+publishes the destination. The source path itself is rejected as a destination.
 
 ## Planned sorting
 Use a disk-aware external merge sort: bounded runs, sort in memory, spill to temporary storage, then merge into a stable row-order abstraction. Sorting must not delay the first performance milestone.

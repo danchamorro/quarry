@@ -10,7 +10,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
-| Phase 4: Filters and export | In progress | Bounded single and multiple AND-predicate filtering is complete and tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; streaming filtered export is next |
+| Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
 
 ### Phase 1 checklist
 
@@ -99,9 +99,8 @@ pacing becomes measurable with the viewer-alpha grid.
 opening, format controls, literal search, copy, column controls, diagnostics,
 and an adaptive grid that keeps at least 40 rows visible in the maximized
 reference window.
-The first Phase 4 filtering slices are complete, including multiple AND
-predicates. Streaming filtered export is next. Editing and cosmetic redesign
-remain outside the current scope.
+Phase 4 filtering and streaming filtered export are complete. Phase 5 column
+transformations are next. Cosmetic redesign remains outside the current scope.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -144,13 +143,17 @@ Contains/equality filters, multiple AND predicates, incremental results, filtere
   the adaptive index bounded, preserve single-predicate compatibility, and
   record 1 GB and 12 GB evidence in the
   [multiple-predicate filter validation](benchmarks/2026-08-16-multiple-predicate-filter.md).
-- [ ] Stream filtered rows to a new output file with progress, cancellation,
-  and source-file safety.
+- [x] Stream filtered rows to a new output file with progress, cancellation,
+  source-file safety, exact output validation, and bounded 1 GB and 12 GB RSS
+  evidence in the
+  [filtered-export validation](benchmarks/2026-08-16-filtered-export.md).
 
-**Next:** stream filtered rows to a new output file without changing the source.
+**Next:** begin Phase 5 with a bounded transformation preview before adding
+saved transformed output.
 
-**Phase 4 exit:** multiple predicates and filtered export remain practical on
-the 12 GB reference file while memory stays bounded.
+**Phase 4 exit met:** multiple predicates and filtered export remain practical
+on the 12 GB reference file while memory stays bounded and the source stays
+unchanged.
 
 ## Phase 5 — Column transformations
 Split, join, rename, reorder/drop in saved output, find/replace, preview,

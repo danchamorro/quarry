@@ -10,8 +10,10 @@ memory budget. Single-predicate commands remain compatible through
 
 The deterministic 1 GB intersection returned the exact 251 matches with a
 5.88 KiB filter index and 5.16 MiB peak process RSS. The 12 GB scan reached the
-exact end of the file with 3.92 MiB peak RSS. Streaming filtered export is the
-next Phase 4 slice. OR, regex, and case-insensitive matching remain deferred.
+exact end of the file with 3.92 MiB peak RSS. At the time of this measurement,
+streaming filtered export was the next Phase 4 slice. It is now complete and
+documented in the [filtered-export validation](2026-08-16-filtered-export.md).
+OR, regex, and case-insensitive matching remain deferred.
 
 ## Implementation
 

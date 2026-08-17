@@ -7,14 +7,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
-    FilterQuery, IndexConfig, IndexJob, IndexProgress, OpenOptions, SearchJob, SearchOutcome,
-    SearchPosition, SearchProgress, Session, StructuralIndex,
+    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
+    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, IndexConfig,
+    IndexJob, IndexProgress, OpenOptions, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
+    Session, StructuralIndex,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
 type SearchRun = (SearchOutcome, SearchProgress, Option<(u64, Duration)>);
 type FilterRun = (FilterIndex, FilterProgress, Option<(u64, Duration)>);
+type FilterExportRun = (
+    FilterExportOutcome,
+    FilterExportProgress,
+    Option<(u64, Duration)>,
+);
 
 const MAX_LIVE_BENCHMARK_MILLIS: u128 = 60_000;
 const FILTER_SAMPLE_ROWS: usize = 100;
@@ -26,6 +32,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("viewport") => viewport_command(args.collect()),
         Some("search") => search_command(args.collect()),
         Some("filter") => filter_command(args.collect()),
+        Some("export") => export_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -50,6 +57,10 @@ fn print_help() {
            quarry filter <FILE> --column N --operator contains|equals \
          --value LITERAL [--and N contains|equals LITERAL]... \
          [--cancel-after-bytes N] \
+         [--cache-state unknown|cold|warm]\n  \
+           quarry export <FILE> --output FILE --column N \
+         --operator contains|equals --value LITERAL \
+         [--and N contains|equals LITERAL]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]"
@@ -285,6 +296,243 @@ fn wait_for_filter(
         return Err("filter reached end of file before cancellation took effect".into());
     }
     Ok((index, progress, cancellation))
+}
+
+fn export_command(args: Vec<String>) -> CliResult<()> {
+    let mut path = None;
+    let mut destination = None;
+    let mut column = None;
+    let mut operator = None;
+    let mut filter_value = None;
+    let mut and_predicates = Vec::new();
+    let mut cancel_after_bytes = None;
+    let mut cache_state = "unknown".to_owned();
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
+            "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
+            "--operator" => {
+                operator = Some(parse_filter_operator(
+                    value(&args, &mut cursor, "--operator")?,
+                    "--operator",
+                )?)
+            }
+            "--value" => {
+                filter_value = Some(value(&args, &mut cursor, "--value")?.as_bytes().to_vec())
+            }
+            "--and" => {
+                let operands = args
+                    .get(cursor + 1..cursor + 4)
+                    .ok_or("--and requires COLUMN contains|equals VALUE")?;
+                let column = operands[0].parse::<usize>()?;
+                let operator = parse_filter_operator(&operands[1], "--and operator")?;
+                let value = operands[2].as_bytes().to_vec();
+                if column == 0 {
+                    return Err("AND filter column must be at least 1".into());
+                }
+                if operator == FilterOperator::Contains && value.is_empty() {
+                    return Err("AND contains filter value must not be empty".into());
+                }
+                and_predicates.push(FilterPredicate {
+                    column: column - 1,
+                    operator,
+                    value,
+                });
+                cursor += 3;
+            }
+            "--cancel-after-bytes" => {
+                cancel_after_bytes =
+                    Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
+            }
+            "--cache-state" => {
+                cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
+                if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
+                    return Err("--cache-state must be unknown, cold, or warm".into());
+                }
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            value if path.is_none() => path = Some(PathBuf::from(value)),
+            value => return Err(format!("unexpected argument {value:?}").into()),
+        }
+        cursor += 1;
+    }
+
+    let path = path.ok_or("export requires a file path")?;
+    let destination = destination.ok_or("export requires --output")?;
+    let column = column.ok_or("export requires --column")?;
+    let operator = operator.ok_or("export requires --operator")?;
+    let filter_value = filter_value.ok_or("export requires --value")?;
+    if column == 0 {
+        return Err("export column must be at least 1".into());
+    }
+    if operator == FilterOperator::Contains && filter_value.is_empty() {
+        return Err("contains filter value must not be empty".into());
+    }
+    if cancel_after_bytes == Some(0) {
+        return Err("cancel-after-bytes must be non-zero".into());
+    }
+
+    let session = Session::open(&path, OpenOptions::default())?;
+    if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
+        return Err("cancel-after-bytes must be less than file size".into());
+    }
+    let mut query = FilterQuery::single(column - 1, operator, filter_value);
+    query.predicates.extend(and_predicates);
+    let source_size_before = session.file_size;
+    let job = session.start_filtered_export(query.clone(), &destination)?;
+    let (outcome, progress, cancellation) =
+        wait_for_export(job, cancel_after_bytes, Duration::from_millis(1))?;
+    let source_size_after = std::fs::metadata(session.path())?.len();
+    if source_size_after != source_size_before {
+        return Err("source file size changed during export".into());
+    }
+
+    let (outcome_label, published_rows, published_bytes) = match &outcome {
+        FilterExportOutcome::Complete(summary) => {
+            let output_size = std::fs::metadata(&summary.destination)?.len();
+            if summary.rows_written != progress.rows_written
+                || summary.bytes_written != progress.bytes_written
+                || output_size != summary.bytes_written
+            {
+                return Err("published output does not match export progress".into());
+            }
+            ("complete", Some(summary.rows_written), Some(output_size))
+        }
+        FilterExportOutcome::Cancelled => {
+            if destination.exists() {
+                return Err("cancelled export published a destination file".into());
+            }
+            ("cancelled", None, None)
+        }
+    };
+
+    println!("Quarry filtered export benchmark\n");
+    println!("Source: {}", session.path().display());
+    println!(
+        "Source size: {} ({} bytes)",
+        human_bytes(source_size_before),
+        source_size_before
+    );
+    println!("Destination: {}", destination.display());
+    println!(
+        "Build: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!("Export cache state: {cache_state}");
+    println!("Predicate count: {}", query.predicates.len());
+    for (position, predicate) in query.predicates.iter().enumerate() {
+        println!(
+            "Predicate {}: column {}, operator {}, value {}",
+            position + 1,
+            predicate.column + 1,
+            match predicate.operator {
+                FilterOperator::Contains => "contains",
+                FilterOperator::Equals => "equals",
+            },
+            render_field(&predicate.value)
+        );
+    }
+    println!("Outcome: {outcome_label}");
+    println!(
+        "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
+        human_bytes(progress.bytes_scanned),
+        progress.bytes_scanned,
+        human_bytes(progress.total_bytes),
+        progress.total_bytes
+    );
+    println!("Physical records scanned: {}", progress.rows_scanned);
+    println!("Matching rows written: {}", progress.rows_written);
+    println!(
+        "Output bytes written: {} ({} bytes)",
+        human_bytes(progress.bytes_written),
+        progress.bytes_written
+    );
+    println!("Export time: {:.3} s", progress.elapsed.as_secs_f64());
+    println!(
+        "Scan throughput: {}/s",
+        human_bytes(rate(progress.bytes_scanned, progress.elapsed))
+    );
+    println!(
+        "Output throughput: {}/s",
+        human_bytes(rate(progress.bytes_written, progress.elapsed))
+    );
+    println!("Source size unchanged: yes ({source_size_after} bytes)");
+    println!(
+        "Destination published: {}",
+        if published_bytes.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if let (Some(rows), Some(bytes)) = (published_rows, published_bytes) {
+        println!("Published rows: {rows}");
+        println!("Published size: {} ({bytes} bytes)", human_bytes(bytes));
+    }
+    if let Some((requested_at, latency)) = cancellation {
+        println!(
+            "Cancellation requested after: {} ({} bytes)",
+            human_bytes(requested_at),
+            requested_at
+        );
+        println!(
+            "Poll-inclusive cancellation latency: {:.3} ms",
+            latency.as_secs_f64() * 1000.0
+        );
+    }
+    println!(
+        "Current process memory: {}",
+        optional_bytes(current_rss_bytes())
+    );
+    println!(
+        "Peak process memory (export): {}",
+        optional_bytes(peak_rss_bytes())
+    );
+    Ok(())
+}
+
+fn wait_for_export(
+    job: FilterExportJob,
+    cancel_after_bytes: Option<u64>,
+    poll_interval: Duration,
+) -> CliResult<FilterExportRun> {
+    let mut cancellation = None;
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if cancellation.is_none()
+            && cancel_after_bytes.is_some_and(|threshold| progress.bytes_scanned >= threshold)
+        {
+            let started = Instant::now();
+            job.cancel();
+            cancellation = Some((progress.bytes_scanned, started));
+        }
+        thread::sleep(poll_interval);
+    }
+
+    let progress = job.progress();
+    let outcome = job.wait()?;
+    let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
+    if cancel_after_bytes.is_some() && cancellation.is_none() {
+        return Err("export finished before cancellation threshold".into());
+    }
+    if cancel_after_bytes.is_some() && !matches!(&outcome, FilterExportOutcome::Cancelled) {
+        return Err("export completed before cancellation took effect".into());
+    }
+    if cancel_after_bytes.is_some() && progress.bytes_scanned >= progress.total_bytes {
+        return Err("export reached end of file before cancellation took effect".into());
+    }
+    Ok((outcome, progress, cancellation))
 }
 
 #[derive(Clone, Copy)]
@@ -1300,9 +1548,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        FilterSamples, data_search_position, filter_command, generate_file, latency_stats,
-        parse_size, physical_to_data_row, record_filter_sample, sample_filtered_rows,
-        search_command, viewport_command,
+        FilterSamples, data_search_position, export_command, filter_command, generate_file,
+        latency_stats, parse_size, physical_to_data_row, record_filter_sample,
+        sample_filtered_rows, search_command, viewport_command,
     };
     use quarry_core::{FilterOperator, FilterQuery, HeaderMode, OpenOptions, Session};
 
@@ -1732,6 +1980,81 @@ mod tests {
         ])
         .unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn export_command_preserves_raw_records_and_source() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-export-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("filtered.csv");
+        let source_bytes = b"name,note,state\r\none,\"line, \"\"one\"\"\r\nline two\",TX\r\ntwo,plain,CA\r\nthree,\"other\",TX\r\n";
+        let expected = b"name,note,state\r\none,\"line, \"\"one\"\"\r\nline two\",TX\r\nthree,\"other\",TX\r\n";
+        fs::write(&source, source_bytes).unwrap();
+
+        export_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+            "--column".into(),
+            "3".into(),
+            "--operator".into(),
+            "equals".into(),
+            "--value".into(),
+            "TX".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn export_command_cancellation_leaves_no_output_or_temporary_file() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-export-cancellation-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("filtered.csv");
+        generate_file(&source, 64 * 1024 * 1024, 11, b',', 7).unwrap();
+
+        export_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+            "--column".into(),
+            "1".into(),
+            "--operator".into(),
+            "contains".into(),
+            "--value".into(),
+            "QUARRY_NO_MATCH_9F7B2C".into(),
+            "--cancel-after-bytes".into(),
+            "1".into(),
+        ])
+        .unwrap();
+
+        assert!(!destination.exists());
+        let names = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], source.file_name().unwrap());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

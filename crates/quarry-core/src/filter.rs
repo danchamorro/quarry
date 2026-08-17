@@ -516,7 +516,7 @@ impl Session {
     }
 }
 
-fn validate_query(query: &FilterQuery) -> Result<(), QuarryError> {
+pub(crate) fn validate_query(query: &FilterQuery) -> Result<(), QuarryError> {
     if query.predicates.is_empty() {
         return Err(QuarryError::InvalidOption(
             "filter query must contain at least one predicate",
@@ -532,7 +532,7 @@ fn validate_query(query: &FilterQuery) -> Result<(), QuarryError> {
     Ok(())
 }
 
-fn matching_fields<'a>(
+pub(crate) fn matching_fields<'a>(
     record: &'a [u8],
     delimiter: u8,
     query: &FilterQuery,
