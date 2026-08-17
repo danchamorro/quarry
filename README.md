@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/quarry-wordmark.png" alt="Quarry" width="640">
+</p>
+
 # Quarry
 
 > A performance-first, open-source macOS application being built to explore and transform massive delimited text files.
