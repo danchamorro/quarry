@@ -26,8 +26,8 @@ Current alpha capabilities include CSV, TSV, pipe, and semicolon-delimited
 files; progressive opening; continuous virtualized rows; resizable columns in a
 bounded 32-column display window; direct access to every known column;
 view-only hide/show/reorder controls; literal search; bounded cell or row copy;
-and one or more AND-combined contains/equality filter predicates.
-Transformations and streaming export remain planned.
+one or more AND-combined contains/equality filter predicates; and cancellable,
+streaming filtered export to a new file. Transformations remain planned.
 
 ## Performance direction
 The initial reference workload is a **10 GB delimited file**. Quarry should show useful first rows within seconds, keep memory bounded, remain interactive during scans, and avoid full-file copies for read-only work.
@@ -58,11 +58,12 @@ hide/show/reorder controls. The compact default grid dynamically fits rows to
 the available height and keeps at least 40 data rows visible in the maximized
 reference window, completing the Phase 3 viewer alpha.
 
-Phase 4 is in progress. Filtering now combines one or more literal contains or
+Phase 4 is complete. Filtering combines one or more literal contains or
 equality predicates with AND semantics. A background worker parses each row
 once, builds a bounded adaptive match index, and serves bounded filtered row
-ranges through cancellable reads without retaining every matching row.
-Streaming filtered export is next.
+ranges through cancellable reads without retaining every matching row. Safe,
+cancellable streaming export passed the 1 GB and 12 GB validation. Phase 5
+column transformations are next.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -89,6 +90,20 @@ while the background scan progresses. Page Up/Page Down, wheel, and scrollbar
 navigation operate on those matches. **Cancel filter** stops the scan, and
 **Clear filter** returns to the full file. Value editors accept literal newlines
 for matching multiline fields.
+
+After filtering completes, use **Export Filtered Rows…** to choose a new output
+file. Quarry copies the original header and matching records without changing
+the source, reports progress, and supports cancellation without publishing a
+partial destination.
+
+Reproduce a filtered export from the CLI without loading the entire source or
+retaining all matches in memory:
+
+```bash
+cargo run --release -p quarry-cli --bin quarry-bench -- export huge.csv \
+  --output filtered.csv --column 1 --operator equals --value example \
+  --cache-state unknown
+```
 
 Use **Columns…** to view or hide a one-based file column, move it to any display
 position, drag it by its handle inside the Columns window, or reset the layout.
@@ -161,6 +176,7 @@ See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [row-density validation](docs/benchmarks/2026-08-16-row-density.md),
 [streaming-filter validation](docs/benchmarks/2026-08-16-streaming-filter.md),
 [multiple-predicate filter validation](docs/benchmarks/2026-08-16-multiple-predicate-filter.md),
+[filtered-export validation](docs/benchmarks/2026-08-16-filtered-export.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).

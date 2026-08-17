@@ -1,3 +1,4 @@
+mod export;
 mod filter;
 mod index;
 mod search;
@@ -10,6 +11,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub use export::{FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterExportSummary};
 pub use filter::{
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
     FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
@@ -43,6 +45,8 @@ pub enum QuarryError {
         indexed_matches: u64,
     },
     InvalidOption(&'static str),
+    ExportDestinationIsSource,
+    ExportDestinationExists,
     WorkerPanicked,
 }
 
@@ -73,6 +77,10 @@ impl fmt::Display for QuarryError {
                 "match {requested} is not indexed yet ({indexed_matches} matches available)"
             ),
             Self::InvalidOption(option) => write!(f, "invalid option: {option}"),
+            Self::ExportDestinationIsSource => {
+                write!(f, "export destination must differ from the source file")
+            }
+            Self::ExportDestinationExists => write!(f, "export destination already exists"),
             Self::WorkerPanicked => write!(f, "background worker panicked"),
         }
     }

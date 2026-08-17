@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
 use quarry_core::{
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
-    FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob,
-    IndexProgress, OpenOptions, Row, SearchJob, SearchMatch, SearchOutcome, SearchPosition,
-    SearchProgress, Session, StructuralIndex,
+    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
+    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, FilterReadJob,
+    FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, Row,
+    SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress, Session,
+    StructuralIndex,
 };
 
 const BOOTSTRAP_ROWS: usize = 40;
@@ -129,6 +130,16 @@ impl QuarryApp {
     }
 
     fn open_path(&mut self, path: PathBuf) -> Result<(), String> {
+        if self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.export_job.is_some())
+        {
+            return Err(
+                "Cancel the active export and wait for it to finish before opening another file."
+                    .into(),
+            );
+        }
         let mut document = Document::prepare(&path, self.open_options())?;
         document.start_indexing()?;
         if let Some(current) = self.document.as_mut() {
@@ -161,6 +172,36 @@ impl QuarryApp {
             .set_title("Open a delimited file")
             .pick_file();
         self.open_picker_result(path);
+    }
+
+    fn choose_filtered_export(&mut self) {
+        let Some(source) = self
+            .document
+            .as_ref()
+            .map(|document| document.session.path().to_path_buf())
+        else {
+            self.notice = Some("Open and filter a file before exporting.".into());
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export filtered rows")
+            .set_file_name(filtered_export_file_name(&source));
+        if let Some(parent) = source.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        self.export_picker_result(dialog.save_file());
+    }
+
+    fn export_picker_result(&mut self, destination: Option<PathBuf>) {
+        let Some(destination) = destination else {
+            return;
+        };
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "Open and filter a file before exporting.".to_owned())
+            .and_then(|document| document.start_filtered_export(destination));
+        self.notice = result.err();
     }
 
     fn reopen_document(&mut self) {
@@ -202,6 +243,7 @@ impl QuarryApp {
             Action::Open => return self.open_typed_path(),
             Action::Choose => return self.choose_file(),
             Action::Reopen => return self.reopen_document(),
+            Action::ChooseFilteredExport => return self.choose_filtered_export(),
             Action::CopySelection => return self.copy_selection(ctx),
             Action::OpenColumns => {
                 self.columns_open = true;
@@ -220,6 +262,7 @@ impl QuarryApp {
             Action::Open
             | Action::Choose
             | Action::Reopen
+            | Action::ChooseFilteredExport
             | Action::CopySelection
             | Action::OpenColumns
             | Action::OpenFilters => {
@@ -260,6 +303,10 @@ impl QuarryApp {
                 Ok(())
             }
             Action::ClearFilter => document.clear_filter(),
+            Action::CancelExport => {
+                document.cancel_filtered_export();
+                Ok(())
+            }
             Action::Cancel => {
                 document.cancel();
                 Ok(())
@@ -351,6 +398,11 @@ impl eframe::App for QuarryApp {
         {
             self.notice = Some(error);
         }
+        if let Some(document) = &mut self.document
+            && let Err(error) = document.poll_filtered_export()
+        {
+            self.notice = Some(error);
+        }
 
         let mut action = None;
         egui::TopBottomPanel::top("quarry-toolbar")
@@ -376,6 +428,10 @@ impl eframe::App for QuarryApp {
                 });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
+                    let export_active = self
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| document.export_job.is_some());
                     let label = ui.label("File");
                     let width = (ui.available_width() - 168.0).max(200.0);
                     let response = ui
@@ -386,11 +442,23 @@ impl eframe::App for QuarryApp {
                                 .hint_text("/path/to/file.csv"),
                         )
                         .labelled_by(label.id);
-                    if ui.button("Choose…").clicked() {
+                    if ui
+                        .add_enabled(!export_active, egui::Button::new("Choose…"))
+                        .on_disabled_hover_text(
+                            "Cancel the active export and wait for it to finish first.",
+                        )
+                        .clicked()
+                    {
                         action = Some(Action::Choose);
                     }
-                    if ui.button("Open").clicked()
-                        || (response.lost_focus()
+                    if ui
+                        .add_enabled(!export_active, egui::Button::new("Open"))
+                        .on_disabled_hover_text(
+                            "Cancel the active export and wait for it to finish first.",
+                        )
+                        .clicked()
+                        || (!export_active
+                            && response.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter)))
                     {
                         action = Some(Action::Open);
@@ -427,7 +495,17 @@ impl eframe::App for QuarryApp {
                         .labelled_by(header_label.id);
 
                     if ui
-                        .add_enabled(self.document.is_some(), egui::Button::new("Apply / Reopen"))
+                        .add_enabled(
+                            self.document.is_some()
+                                && self
+                                    .document
+                                    .as_ref()
+                                    .is_none_or(|document| document.export_job.is_none()),
+                            egui::Button::new("Apply / Reopen"),
+                        )
+                        .on_disabled_hover_text(
+                            "Cancel the active export and wait for it to finish first.",
+                        )
                         .clicked()
                     {
                         action = Some(Action::Reopen);
@@ -491,23 +569,25 @@ impl eframe::App for QuarryApp {
                         }
                     });
                     ui.add_space(6.0);
-                    let search_progress = document.search_progress();
-                    let search_status = if document.filter_active() {
-                        Some("Clear the filter to use Find Next.")
+                    if document.filter_active() {
+                        if let Some(export_action) = filtered_export_controls(ui, document) {
+                            action = Some(export_action);
+                        }
                     } else {
-                        document.search_status.as_deref().or_else(|| {
+                        let search_progress = document.search_progress();
+                        let search_status = document.search_status.as_deref().or_else(|| {
                             (!document.is_search_ready())
                                 .then_some("Search is available after indexing completes.")
-                        })
-                    };
-                    if let Some(search_action) = search_controls(
-                        ui,
-                        &mut self.find_input,
-                        document.is_search_ready() && !document.filter_active(),
-                        search_progress.as_ref(),
-                        search_status,
-                    ) {
-                        action = Some(search_action);
+                        });
+                        if let Some(search_action) = search_controls(
+                            ui,
+                            &mut self.find_input,
+                            document.is_search_ready(),
+                            search_progress.as_ref(),
+                            search_status,
+                        ) {
+                            action = Some(search_action);
+                        }
                     }
                 }
 
@@ -636,6 +716,7 @@ impl eframe::App for QuarryApp {
                 || document.search_job.is_some()
                 || document.filter_job.is_some()
                 || document.filter_rows_loading()
+                || document.export_job.is_some()
         }) {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
@@ -699,12 +780,14 @@ enum Action {
     FirstColumns,
     OpenColumns,
     OpenFilters,
+    ChooseFilteredExport,
     Jump,
     FindNext,
     CancelSearch,
     ApplyFilter,
     CancelFilter,
     ClearFilter,
+    CancelExport,
     CopySelection,
     Cancel,
 }
@@ -1076,6 +1159,7 @@ fn show_filter_manager(
             let can_apply = document.is_filter_ready()
                 && document.search_job.is_none()
                 && document.filter_job.is_none()
+                && document.export_job.is_none()
                 && !rules.is_empty()
                 && rules.iter().all(|rule| {
                     parse_file_column(&rule.column_input, document.total_columns).is_ok()
@@ -1163,7 +1247,10 @@ fn show_filter_manager(
                     action = Some(Action::CancelFilter);
                 }
                 if ui
-                    .add_enabled(document.filter_active(), egui::Button::new("Clear filter"))
+                    .add_enabled(
+                        document.filter_active() && document.export_job.is_none(),
+                        egui::Button::new("Clear filter"),
+                    )
                     .clicked()
                 {
                     action = Some(Action::ClearFilter);
@@ -1265,6 +1352,86 @@ fn search_controls(
         }
     });
     action
+}
+
+fn filtered_export_controls(ui: &mut egui::Ui, document: &Document) -> Option<Action> {
+    if !document.filter_active() {
+        return None;
+    }
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                document.is_filtered_export_ready(),
+                egui::Button::new("Export Filtered Rows…"),
+            )
+            .on_hover_text("Export all matching rows to a new file")
+            .clicked()
+        {
+            action = Some(Action::ChooseFilteredExport);
+        }
+
+        if let Some(progress) = document.filtered_export_progress() {
+            let fraction = if progress.total_bytes == 0 {
+                if progress.done { 1.0 } else { 0.0 }
+            } else {
+                (progress.bytes_scanned as f32 / progress.total_bytes as f32).clamp(0.0, 1.0)
+            };
+            let verb = if document.export_cancel_requested {
+                "Cancelling export"
+            } else if progress.cancelled {
+                "Export cancelled"
+            } else if document
+                .export_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Export failed"))
+            {
+                "Export failed"
+            } else if progress.done {
+                "Export finished"
+            } else {
+                "Exporting"
+            };
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_width(220.0)
+                    .text(format!(
+                        "{verb} · {:.1}% · {} rows",
+                        fraction * 100.0,
+                        progress.rows_written
+                    )),
+            );
+        }
+        if document.export_job.is_some()
+            && ui
+                .add_enabled(
+                    !document.export_cancel_requested,
+                    egui::Button::new("Cancel Export"),
+                )
+                .clicked()
+        {
+            action = Some(Action::CancelExport);
+        }
+    });
+    if let Some(status) = document.export_status.as_deref() {
+        let response = ui.label(status);
+        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_live(egui::accesskit::Live::Polite);
+        });
+    }
+    action
+}
+
+fn filtered_export_file_name(source: &Path) -> String {
+    let stem = source
+        .file_stem()
+        .or_else(|| source.file_name())
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "export".into());
+    match source.extension() {
+        Some(extension) => format!("{stem}-filtered.{}", extension.to_string_lossy()),
+        None => format!("{stem}-filtered"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1431,6 +1598,10 @@ struct Document {
     filter_query: Option<FilterQuery>,
     filter_progress: Option<FilterProgress>,
     filter_status: Option<String>,
+    export_job: Option<FilterExportJob>,
+    export_progress: Option<FilterExportProgress>,
+    export_status: Option<String>,
+    export_cancel_requested: bool,
     filter_viewport_start: u64,
     filter_buffer_start: u64,
     filtered_rows: Vec<FilterMatch>,
@@ -1521,6 +1692,10 @@ impl Document {
             filter_query: None,
             filter_progress: None,
             filter_status: None,
+            export_job: None,
+            export_progress: None,
+            export_status: None,
+            export_cancel_requested: false,
             filter_viewport_start: 0,
             filter_buffer_start: 0,
             filtered_rows: Vec::new(),
@@ -1646,6 +1821,9 @@ impl Document {
     }
 
     fn start_filter(&mut self, query: FilterQuery) -> Result<(), String> {
+        if self.export_job.is_some() {
+            return Err("Cancel the active export before changing filters.".into());
+        }
         if self.filter_job.is_some() {
             return Err("A filter is already running.".into());
         }
@@ -1679,6 +1857,9 @@ impl Document {
         self.filter_job = Some(job);
         self.filter_query = Some(query);
         self.filter_status = Some("Filtering rows…".into());
+        self.export_progress = None;
+        self.export_status = None;
+        self.export_cancel_requested = false;
         self.filter_viewport_start = 0;
         self.filter_buffer_start = 0;
         self.filtered_rows.clear();
@@ -1782,6 +1963,101 @@ impl Document {
         self.schedule_filter_buffer(self.filter_viewport_start)
     }
 
+    fn start_filtered_export(&mut self, destination: PathBuf) -> Result<(), String> {
+        if self.export_job.is_some() {
+            return Err("A filtered export is already running.".into());
+        }
+        let query = self
+            .filter_query
+            .clone()
+            .ok_or_else(|| "Apply a filter before exporting rows.".to_owned())?;
+        let progress = self
+            .filter_progress()
+            .ok_or_else(|| "Wait for filtering to complete before exporting.".to_owned())?;
+        if self.filter_job.is_some() || !progress.done {
+            return Err("Wait for filtering to complete before exporting.".into());
+        }
+        if progress.cancelled {
+            return Err("Run the filter to completion before exporting.".into());
+        }
+
+        let job = self
+            .session
+            .start_filtered_export(query, destination)
+            .map_err(|error| error.to_string())?;
+        self.export_progress = Some(job.progress());
+        self.export_job = Some(job);
+        self.export_status = Some(
+            "Export in progress. To open or reapply a file, cancel this export and wait for it to finish."
+                .into(),
+        );
+        self.export_cancel_requested = false;
+        Ok(())
+    }
+
+    fn poll_filtered_export(&mut self) -> Result<(), String> {
+        let Some(job) = self.export_job.as_ref() else {
+            return Ok(());
+        };
+        let progress = job.progress();
+        self.export_progress = Some(progress);
+        if !progress.done {
+            return Ok(());
+        }
+
+        let job = self
+            .export_job
+            .take()
+            .expect("filter export job is present");
+        self.export_cancel_requested = false;
+        match job.wait() {
+            Ok(FilterExportOutcome::Complete(summary)) => {
+                self.export_status = Some(format!(
+                    "Export complete: {} rows ({}) saved to {}.",
+                    summary.rows_written,
+                    format_bytes(summary.bytes_written),
+                    summary.destination.display()
+                ));
+                Ok(())
+            }
+            Ok(FilterExportOutcome::Cancelled) => {
+                self.export_status = Some("Export cancelled. No output file was created.".into());
+                Ok(())
+            }
+            Err(error) => {
+                self.export_status = Some("Export failed. No output file was created.".into());
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn cancel_filtered_export(&mut self) {
+        if let Some(job) = &self.export_job {
+            job.cancel();
+            self.export_cancel_requested = true;
+            self.export_status = Some(
+                "Cancelling export… Wait for it to finish before opening or reapplying the file."
+                    .into(),
+            );
+        }
+    }
+
+    fn filtered_export_progress(&self) -> Option<FilterExportProgress> {
+        self.export_job
+            .as_ref()
+            .map(FilterExportJob::progress)
+            .or(self.export_progress)
+    }
+
+    fn is_filtered_export_ready(&self) -> bool {
+        self.filter_query.is_some()
+            && self.filter_job.is_none()
+            && self.export_job.is_none()
+            && self
+                .filter_progress
+                .is_some_and(|progress| progress.done && !progress.cancelled)
+    }
+
     fn cancel_filter(&self) {
         if let Some(job) = &self.filter_job {
             job.cancel();
@@ -1789,6 +2065,9 @@ impl Document {
     }
 
     fn clear_filter(&mut self) -> Result<(), String> {
+        if self.export_job.is_some() {
+            return Err("Cancel the active export before clearing filters.".into());
+        }
         self.stop_filter_read();
         if let Some(job) = self.filter_job.take() {
             job.cancel();
@@ -1798,6 +2077,9 @@ impl Document {
         self.filter_query = None;
         self.filter_progress = None;
         self.filter_status = None;
+        self.export_progress = None;
+        self.export_status = None;
+        self.export_cancel_requested = false;
         self.filter_viewport_start = 0;
         self.filter_buffer_start = 0;
         self.filtered_rows.clear();
@@ -1988,6 +2270,11 @@ impl Document {
 
     fn shutdown(&mut self) {
         self.stop_filter_read();
+        if let Some(job) = self.export_job.take() {
+            job.cancel();
+            drop(job);
+        }
+        self.export_cancel_requested = false;
         if let Some(job) = self.filter_job.take() {
             job.cancel();
             drop(job);
@@ -3011,6 +3298,7 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use std::fs::{self, File};
     use std::io::Write;
+    use std::path::Path;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use eframe::egui;
@@ -3019,10 +3307,11 @@ mod tests {
         Action, COLUMN_INPUT_ID, COLUMN_POSITION_INPUT_ID, ColumnCommand, ColumnView,
         DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterQuery, GridSelection,
         HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SearchProgress, Session,
-        column_drop_position, column_window_controls, copy_control, logical_viewport_start,
-        max_viewport_start, page_controls, parse_column_position, parse_data_row,
-        parse_file_column, row_for_scroll_fraction, scroll_fraction_for_row, search_controls,
-        selection_text, show_column_manager, show_filter_manager, show_grid,
+        column_drop_position, column_window_controls, copy_control, filtered_export_controls,
+        filtered_export_file_name, logical_viewport_start, max_viewport_start, page_controls,
+        parse_column_position, parse_data_row, parse_file_column, row_for_scroll_fraction,
+        scroll_fraction_for_row, search_controls, selection_text, show_column_manager,
+        show_filter_manager, show_grid,
     };
 
     fn click_accessible_button(
@@ -3278,6 +3567,15 @@ mod tests {
         while document.filter_rows_loading() {
             document.poll_filter().unwrap();
             assert!(Instant::now() < deadline, "filter read timed out");
+            std::thread::yield_now();
+        }
+    }
+
+    fn finish_filtered_export(document: &mut Document) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while document.export_job.is_some() {
+            document.poll_filtered_export().unwrap();
+            assert!(Instant::now() < deadline, "filtered export timed out");
             std::thread::yield_now();
         }
     }
@@ -3641,6 +3939,209 @@ mod tests {
 
         document.shutdown();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filtered_export_control_is_accessible_only_for_a_completed_active_filter() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-export-control-{name}.csv"));
+        fs::write(&path, b"name,status\nfirst,keep\nsecond,skip\n").unwrap();
+        let mut document = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(filtered_export_controls(ui, &document).is_none());
+            });
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present");
+        assert!(!tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.label() == Some("Export Filtered Rows…")
+        }));
+
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(&mut document);
+        assert!(document.is_filtered_export_ready());
+        assert!(matches!(
+            click_accessible_button("Export Filtered Rows…", |ui| {
+                filtered_export_controls(ui, &document)
+            }),
+            Some(Action::ChooseFilteredExport)
+        ));
+
+        document.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filtered_export_reports_success_and_never_overwrites() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-export-success-{name}.csv"));
+        let destination =
+            std::env::temp_dir().join(format!("quarry-export-success-{name}-filtered.csv"));
+        let source = b"id,note,status\n1,\"line one\nline two\",keep\n2,skip,skip\n3,\"quote \"\"yes\"\"\",keep\n";
+        let expected =
+            b"id,note,status\n1,\"line one\nline two\",keep\n3,\"quote \"\"yes\"\"\",keep\n";
+        fs::write(&path, source).unwrap();
+        let mut document = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let query = FilterQuery::single(2, FilterOperator::Equals, b"keep".to_vec());
+        document.start_filter(query.clone()).unwrap();
+        finish_filter(&mut document);
+
+        document.start_filtered_export(destination.clone()).unwrap();
+        assert_eq!(
+            document.clear_filter().unwrap_err(),
+            "Cancel the active export before clearing filters."
+        );
+        assert_eq!(
+            document.start_filter(query.clone()).unwrap_err(),
+            "Cancel the active export before changing filters."
+        );
+        finish_filtered_export(&mut document);
+
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        let status = document.export_status.as_deref().unwrap();
+        assert!(status.contains("2 rows"));
+        assert!(status.contains(&destination.display().to_string()));
+        assert_eq!(
+            document
+                .start_filtered_export(destination.clone())
+                .unwrap_err(),
+            "export destination already exists"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        assert_eq!(
+            document.start_filtered_export(path.clone()).unwrap_err(),
+            "export destination must differ from the source file"
+        );
+        assert_eq!(fs::read(&path).unwrap(), source);
+
+        document.start_filter(query).unwrap();
+        assert!(document.export_progress.is_none());
+        assert!(document.export_status.is_none());
+        finish_filter(&mut document);
+        document.shutdown();
+        for path in [path, destination] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn filtered_export_cancel_reopen_and_picker_cancel_are_safe() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first = std::env::temp_dir().join(format!("quarry-export-life-{name}-first.csv"));
+        let second = std::env::temp_dir().join(format!("quarry-export-life-{name}-second.csv"));
+        let cancelled =
+            std::env::temp_dir().join(format!("quarry-export-life-{name}-cancelled.csv"));
+        let reopened = std::env::temp_dir().join(format!("quarry-export-life-{name}-reopened.csv"));
+        let mut file = File::create(&first).unwrap();
+        file.write_all(b"name,status\n").unwrap();
+        file.write_all(&b"row,keep\n".repeat(1_000_000)).unwrap();
+        drop(file);
+        fs::write(&second, b"name,status\nsecond,keep\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(first.clone()).unwrap();
+        let document = app.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+
+        app.notice = Some("unchanged".into());
+        app.export_picker_result(None);
+        assert_eq!(app.notice.as_deref(), Some("unchanged"));
+        app.export_picker_result(Some(first.clone()));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("export destination must differ from the source file")
+        );
+        app.export_picker_result(Some(cancelled.clone()));
+        let document = app.document.as_mut().unwrap();
+        document.cancel_filtered_export();
+        assert!(document.export_cancel_requested);
+        assert_eq!(
+            document.export_status.as_deref(),
+            Some("Cancelling export… Wait for it to finish before opening or reapplying the file.")
+        );
+        finish_filtered_export(document);
+        assert_eq!(
+            document.export_status.as_deref(),
+            Some("Export cancelled. No output file was created.")
+        );
+        assert!(!cancelled.exists());
+
+        document.start_filtered_export(reopened.clone()).unwrap();
+        let error = app.open_path(second.clone()).unwrap_err();
+        assert_eq!(
+            error,
+            "Cancel the active export and wait for it to finish before opening another file."
+        );
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(document.session.path(), first);
+        assert!(document.export_job.is_some());
+
+        document.cancel_filtered_export();
+        finish_filtered_export(document);
+        app.open_path(second.clone()).unwrap();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), second);
+        assert!(document.export_job.is_none());
+        assert!(document.export_status.is_none());
+        assert_eq!(
+            filtered_export_file_name(Path::new("report.csv")),
+            "report-filtered.csv"
+        );
+        assert_eq!(
+            filtered_export_file_name(Path::new("report")),
+            "report-filtered"
+        );
+
+        app.document.as_mut().unwrap().shutdown();
+        for path in [first, second, reopened] {
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+            }
+        }
     }
 
     #[test]
