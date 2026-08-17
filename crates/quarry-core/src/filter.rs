@@ -46,10 +46,27 @@ pub enum FilterOperator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilterQuery {
+pub struct FilterPredicate {
     pub column: usize,
     pub operator: FilterOperator,
     pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterQuery {
+    pub predicates: Vec<FilterPredicate>,
+}
+
+impl FilterQuery {
+    pub fn single(column: usize, operator: FilterOperator, value: Vec<u8>) -> Self {
+        Self {
+            predicates: vec![FilterPredicate {
+                column,
+                operator,
+                value,
+            }],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,7 +517,14 @@ impl Session {
 }
 
 fn validate_query(query: &FilterQuery) -> Result<(), QuarryError> {
-    if query.operator == FilterOperator::Contains && query.value.is_empty() {
+    if query.predicates.is_empty() {
+        return Err(QuarryError::InvalidOption(
+            "filter query must contain at least one predicate",
+        ));
+    }
+    if query.predicates.iter().any(|predicate| {
+        predicate.operator == FilterOperator::Contains && predicate.value.is_empty()
+    }) {
         return Err(QuarryError::InvalidOption(
             "contains filter value must not be empty",
         ));
@@ -512,16 +536,23 @@ fn matching_fields<'a>(
     record: &'a [u8],
     delimiter: u8,
     query: &FilterQuery,
-    finder: &Finder<'_>,
+    finders: &[Finder<'_>],
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
     let fields = parse_record(record, delimiter)?;
-    let Some(field) = fields.get(query.column) else {
-        return Ok(None);
-    };
-    let matches = match query.operator {
-        FilterOperator::Contains => finder.find(field.as_ref()).is_some(),
-        FilterOperator::Equals => field.as_ref() == query.value.as_slice(),
-    };
+    debug_assert_eq!(query.predicates.len(), finders.len());
+    let matches = query
+        .predicates
+        .iter()
+        .zip(finders)
+        .all(|(predicate, finder)| {
+            let Some(field) = fields.get(predicate.column) else {
+                return false;
+            };
+            match predicate.operator {
+                FilterOperator::Contains => finder.find(field.as_ref()).is_some(),
+                FilterOperator::Equals => field.as_ref() == predicate.value.as_slice(),
+            }
+        });
     Ok(matches.then_some(fields))
 }
 
@@ -549,7 +580,11 @@ fn run_filter(
     max_record_bytes: usize,
     shared: &SharedState,
 ) -> Result<(), QuarryError> {
-    let finder = Finder::new(&query.value);
+    let finders: Vec<_> = query
+        .predicates
+        .iter()
+        .map(|predicate| Finder::new(&predicate.value))
+        .collect();
     let mut scanner = RecordScanner::new(delimiter)?;
     let mut chunk = vec![0; chunk_bytes];
     let mut absolute_start = 0_u64;
@@ -578,7 +613,7 @@ fn run_filter(
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, query, &finder) {
+                        match matching_fields(&record, delimiter, query, &finders) {
                             Ok(Some(_)) => pending_matches.push((row_number, record_start)),
                             Ok(None) => {}
                             Err(error) => deferred_error = Some(error),
@@ -623,7 +658,7 @@ fn run_filter(
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, query, &finder) {
+                        match matching_fields(&record, delimiter, query, &finders) {
                             Ok(Some(_)) => {
                                 pending_matches.push((row_number, record_start));
                                 if pending_matches.len() == MATCH_PUBLISH_BATCH {
@@ -766,7 +801,12 @@ fn run_filtered_read(
     config: FilterReadConfig,
     shared: Option<&FilterReadSharedState>,
 ) -> Result<FilterReadOutcome, QuarryError> {
-    let finder = Finder::new(&plan.query.value);
+    let finders: Vec<_> = plan
+        .query
+        .predicates
+        .iter()
+        .map(|predicate| Finder::new(&predicate.value))
+        .collect();
     let mut scanner = RecordScanner::at_offset(delimiter, plan.checkpoint.offset)?;
     let mut chunk = vec![0; config.chunk_bytes];
     let mut absolute_start = plan.checkpoint.offset;
@@ -794,7 +834,7 @@ fn run_filtered_read(
                         limit: config.max_record_bytes,
                     });
                 }
-                if let Some(fields) = matching_fields(&record, delimiter, &plan.query, &finder)?
+                if let Some(fields) = matching_fields(&record, delimiter, &plan.query, &finders)?
                     && match_ordinal >= plan.start_match
                 {
                     rows.push(FilterMatch {
@@ -828,7 +868,7 @@ fn run_filtered_read(
                             limit: config.max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, &plan.query, &finder) {
+                        match matching_fields(&record, delimiter, &plan.query, &finders) {
                             Ok(Some(fields)) => {
                                 if match_ordinal >= plan.start_match {
                                     rows.push(FilterMatch {
@@ -886,8 +926,8 @@ mod tests {
 
     use super::{
         DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES, FilterIndex, FilterJob, FilterOperator,
-        FilterQuery, FilterReadCompletion, FilterReadConfig, FilterReadJob, FilterReadOutcome,
-        FilterReadSharedState, FilterScanConfig, SharedState, WorkerCompletion,
+        FilterPredicate, FilterQuery, FilterReadCompletion, FilterReadConfig, FilterReadJob,
+        FilterReadOutcome, FilterReadSharedState, FilterScanConfig, SharedState, WorkerCompletion,
         prepare_filtered_read,
     };
     use crate::{HeaderMode, OpenOptions, QuarryError, Session};
@@ -916,11 +956,7 @@ mod tests {
 
     #[test]
     fn compacts_match_checkpoints_and_retains_match_zero() {
-        let query = FilterQuery {
-            column: 0,
-            operator: FilterOperator::Equals,
-            value: b"hit".to_vec(),
-        };
+        let query = FilterQuery::single(0, FilterOperator::Equals, b"hit".to_vec());
         let checkpoint_bytes = std::mem::size_of::<super::FilterCheckpoint>();
         let memory_budget = checkpoint_bytes * 2;
         let mut index = FilterIndex::new(query.clone(), memory_budget).unwrap();
@@ -951,11 +987,11 @@ mod tests {
         let session = session(&path, HeaderMode::FirstRow);
 
         let contains = session
-            .start_filter(FilterQuery {
-                column: 1,
-                operator: FilterOperator::Contains,
-                value: b"\ntarget \"quoted\"".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Contains,
+                b"\ntarget \"quoted\"".to_vec(),
+            ))
             .unwrap()
             .wait()
             .unwrap();
@@ -967,22 +1003,18 @@ mod tests {
         assert!(rows[0].fields[1].ends_with(b"\ntarget \"quoted\""));
 
         let equals = session
-            .start_filter(FilterQuery {
-                column: 1,
-                operator: FilterOperator::Equals,
-                value: b"target".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"target".to_vec(),
+            ))
             .unwrap()
             .wait()
             .unwrap();
         assert_eq!(session.read_filtered_rows(&equals, 0, 1).unwrap()[0].row, 2);
 
         let empty = session
-            .start_filter(FilterQuery {
-                column: 1,
-                operator: FilterOperator::Equals,
-                value: Vec::new(),
-            })
+            .start_filter(FilterQuery::single(1, FilterOperator::Equals, Vec::new()))
             .unwrap()
             .wait()
             .unwrap();
@@ -994,12 +1026,65 @@ mod tests {
 
         assert!(matches!(
             session.start_filter(FilterQuery {
-                column: 0,
-                operator: FilterOperator::Contains,
-                value: Vec::new(),
+                predicates: vec![
+                    FilterPredicate {
+                        column: 0,
+                        operator: FilterOperator::Equals,
+                        value: b"1".to_vec(),
+                    },
+                    FilterPredicate {
+                        column: 1,
+                        operator: FilterOperator::Contains,
+                        value: Vec::new(),
+                    },
+                ],
             }),
             Err(QuarryError::InvalidOption(_))
         ));
+        assert!(matches!(
+            session.start_filter(FilterQuery {
+                predicates: Vec::new(),
+            }),
+            Err(QuarryError::InvalidOption(_))
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn and_predicates_narrow_multiline_rows_and_range_reads_reuse_query() {
+        let path = fixture(
+            b"id,status,note\n1,keep,\"line one\nline two\"\n2,keep,other\n3,skip,\"line one\nline two\"\n4,keep,\"line one\nline two\"\n5,keep\n",
+        );
+        let session = session(&path, HeaderMode::FirstRow);
+        let query = FilterQuery {
+            predicates: vec![
+                FilterPredicate {
+                    column: 1,
+                    operator: FilterOperator::Equals,
+                    value: b"keep".to_vec(),
+                },
+                FilterPredicate {
+                    column: 2,
+                    operator: FilterOperator::Equals,
+                    value: b"line one\nline two".to_vec(),
+                },
+            ],
+        };
+
+        let index = session.start_filter(query.clone()).unwrap().wait().unwrap();
+        assert_eq!(index.query(), &query);
+        assert_eq!(index.matches_found(), 2);
+
+        let rows = session.read_filtered_rows(&index, 0, 2).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.row, row.fields[0].as_slice(), row.fields[2].as_slice()))
+                .collect::<Vec<_>>(),
+            [
+                (1, b"1".as_slice(), b"line one\nline two".as_slice()),
+                (4, b"4".as_slice(), b"line one\nline two".as_slice()),
+            ]
+        );
         fs::remove_file(path).unwrap();
     }
 
@@ -1008,11 +1093,11 @@ mod tests {
         let path = fixture(b"value\nmiss\nhit\nmiss\nhit\nhit\nmiss\nhit");
         let session = session(&path, HeaderMode::FirstRow);
         let index = session
-            .start_filter(FilterQuery {
-                column: 0,
-                operator: FilterOperator::Equals,
-                value: b"hit".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"hit".to_vec(),
+            ))
             .unwrap()
             .wait()
             .unwrap();
@@ -1052,11 +1137,11 @@ mod tests {
         let path = fixture(b"value\nmiss\nhit\nmiss\nhit\nhit\nmiss\nhit");
         let session = session(&path, HeaderMode::FirstRow);
         let index = session
-            .start_filter(FilterQuery {
-                column: 0,
-                operator: FilterOperator::Equals,
-                value: b"hit".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"hit".to_vec(),
+            ))
             .unwrap()
             .wait()
             .unwrap();
@@ -1097,11 +1182,7 @@ mod tests {
             session.file_size,
             session.dialect.delimiter,
             0,
-            FilterQuery {
-                column: 0,
-                operator: FilterOperator::Equals,
-                value: b"hit".to_vec(),
-            },
+            FilterQuery::single(0, FilterOperator::Equals, b"hit".to_vec()),
             FilterScanConfig {
                 chunk_bytes: crate::DEFAULT_READ_CHUNK,
                 memory_budget_bytes: checkpoint_bytes * 2,
@@ -1155,11 +1236,7 @@ mod tests {
             session.file_size,
             session.dialect.delimiter,
             0,
-            FilterQuery {
-                column: 0,
-                operator: FilterOperator::Equals,
-                value: b"hit".to_vec(),
-            },
+            FilterQuery::single(0, FilterOperator::Equals, b"hit".to_vec()),
             FilterScanConfig {
                 chunk_bytes: 1,
                 memory_budget_bytes: DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES,
@@ -1207,11 +1284,7 @@ mod tests {
             session.file_size,
             session.dialect.delimiter,
             0,
-            FilterQuery {
-                column: 0,
-                operator: FilterOperator::Equals,
-                value: b"missing".to_vec(),
-            },
+            FilterQuery::single(0, FilterOperator::Equals, b"missing".to_vec()),
             FilterScanConfig {
                 chunk_bytes: crate::DEFAULT_READ_CHUNK,
                 memory_budget_bytes: DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES,
@@ -1237,11 +1310,11 @@ mod tests {
         let path = fixture(b"value\nhit\nmiss\n");
         let session = session(&path, HeaderMode::FirstRow);
         let job = session
-            .start_filter(FilterQuery {
-                column: 0,
-                operator: FilterOperator::Equals,
-                value: b"hit".to_vec(),
-            })
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"hit".to_vec(),
+            ))
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1262,11 +1335,7 @@ mod tests {
     #[test]
     fn dropping_an_active_filter_cancels_and_joins_its_worker() {
         let index = FilterIndex::new(
-            FilterQuery {
-                column: 0,
-                operator: FilterOperator::Equals,
-                value: b"hit".to_vec(),
-            },
+            FilterQuery::single(0, FilterOperator::Equals, b"hit".to_vec()),
             DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES,
         )
         .unwrap();

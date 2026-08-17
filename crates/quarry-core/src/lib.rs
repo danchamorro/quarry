@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use filter::{
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterProgress, FilterQuery,
-    FilterReadJob, FilterReadOutcome, FilterReadProgress,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
+    FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
 };
 pub use index::{Checkpoint, IndexConfig, IndexJob, IndexProgress, StructuralIndex};
 use quarry_delimited::{ParseError, RecordScanner, parse_record};

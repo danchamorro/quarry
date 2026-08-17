@@ -13,6 +13,7 @@ quarry-core
    +-- Bounded viewport reads
    +-- Literal search worker
    +-- Bounded filter-index worker
+   +-- Bounded filtered-row read worker
    |
 quarry-delimited
    +-- Record scanner
@@ -21,8 +22,8 @@ quarry-delimited
 
 The egui app is the selected production UI. The CLI exposes the engine and
 benchmark commands, while AppKit remains a measured comparator. The Rust engine
-stays UI-independent so future filters, transformations, sorting, and export can
-reuse the same boundaries.
+stays UI-independent so new filter operators, transformations, sorting, and
+export can reuse the same boundaries.
 
 ## Current workspace
 ```text
@@ -107,9 +108,11 @@ cache remains deferred.
 ## Concurrency
 Rust workers currently handle indexing, literal search, filtering, and
 filtered viewport reads. Each publishes progress and supports cancellation.
-Jobs normally join before they are dropped. The viewer cancels and detaches
-obsolete read-only viewport workers so the render thread never waits for them;
-each worker owns its resources and exits at its next cancellation check. Future
+Jobs normally join before they are dropped. Rapid filtered navigation cancels
+obsolete reads, keeps only the newest pending window, and joins a cancelled read
+after it finishes. Filter resets and document lifecycle changes detach an active
+read-only viewport worker so the render thread never waits for cleanup; each
+worker owns its resources and exits at its next cancellation check. Future
 sorting and export workers must keep cleanup off the render thread.
 
 ## Search and filtering
@@ -121,20 +124,26 @@ worker on wait or drop. Memory therefore depends on the query, the fixed chunk,
 the 64 MiB maximum record and its decoded fields, one match, and the bounded
 structural index, not on file size or match count.
 
-The first filter slice evaluates a case-sensitive contains or equality
-predicate against one decoded source column. A sequential worker counts every
-match while retaining only adaptive match checkpoints under a fixed budget.
-When the budget fills, the checkpoint interval grows and existing checkpoints
-compact; the exact match count is preserved.
+A `FilterQuery` owns one or more `FilterPredicate` values. Each predicate stores
+a source column, a case-sensitive contains or equality operator, and its literal
+value. All predicates use AND semantics. The scanner parses each bounded record
+once, then evaluates every predicate against the decoded fields. A missing
+column or any failed predicate rejects that row. `FilterQuery::single` keeps
+single-predicate callers compatible with the same path.
+
+The sequential worker counts every matching row while retaining only adaptive
+match checkpoints under a fixed budget. When the budget fills, the checkpoint
+interval grows and existing checkpoints compact; the exact match count is
+preserved.
 
 Filtered navigation asks for a bounded match range. Core starts a cancellable
 background read from the nearest retained match checkpoint, resumes the same
-predicate scan, and materializes only the requested rows. Rapid navigation
+query, and materializes only the requested rows. Rapid navigation
 cancels obsolete work and keeps only the newest requested window. The filter
-index owns its predicate so a caller cannot accidentally read its checkpoints
-with different filter semantics. Memory therefore depends on the fixed chunk
-and index budgets, the 64 MiB maximum record and its decoded fields, and the
-requested row count, not on file size or match count.
+index owns its query so a caller cannot accidentally read its checkpoints with
+different filter semantics. Memory therefore depends on the predicate values,
+fixed chunk and index budgets, the 64 MiB maximum record and its decoded fields,
+and the requested row count, not on file size or match count.
 
 ## Planned sorting
 Use a disk-aware external merge sort: bounded runs, sort in memory, spill to temporary storage, then merge into a stable row-order abstraction. Sorting must not delay the first performance milestone.
@@ -155,7 +164,7 @@ Generate deterministic 1 GB, 10 GB, 25 GB, and 50 GB datasets locally,
 including multiline quoted fields, wide tables, and long fields. Use separate
 malformed-record fixtures for parser correctness.
 
-Track time-to-first-rows, memory, index/search/export throughput, scroll frame time, cache behavior, and cancellation latency.
+Track time-to-first-rows, memory, index/search/filter/export throughput, scroll frame time, cache behavior, and cancellation latency.
 
 ## Architecture rule
 **If a feature only works because the entire file fits in RAM, it is not a finished Quarry feature.**

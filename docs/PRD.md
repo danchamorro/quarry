@@ -35,15 +35,15 @@ Data operations professionals, data engineers, ETL developers, analysts, databas
 Required: local file opening; delimiter detection/override; header selection;
 virtualized grid; navigation; jump-to-row; view-only column
 resize/hide/show/reorder; streaming search; bounded copy of one cell or row;
-background structural indexing; progress/cancellation; parsing metadata;
-diagnostics and benchmarks.
+one or more AND-combined literal filter predicates; background structural
+indexing; progress/cancellation; parsing metadata; diagnostics and benchmarks.
 
 Column controls operate on stable source-column identities. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
 
-Strong candidates: simple filters, filtered export, and disk-aware sorting if it
-does not delay the core milestone.
+Next: safe streaming filtered export. Disk-aware sorting remains a candidate if
+it does not delay the core milestone.
 
 Not required: general text editing, formulas, charts, database connectivity, plugins, cloud sync, collaboration, full in-place editing, or EmEditor feature parity.
 
@@ -58,7 +58,8 @@ Transformations should be non-destructive until explicitly written.
 3. Parse enough records for the first viewport.
 4. Display them immediately.
 5. Continue structural indexing in background workers.
-6. Improve navigation/search as indexes become available.
+6. Enable index-dependent navigation and search as structural indexes become available.
+7. Start filtering directly from the source file as an independent, cancellable scan.
 
 ## Performance requirements
 Reference benchmark: representative **10 GB CSV** on modern Apple Silicon with SSD storage.
@@ -67,7 +68,7 @@ Initial targets:
 - First useful rows: under 3 seconds target.
 - Initial viewing memory: under 500 MB target.
 - No RAM growth proportional to file size during read-only viewing.
-- Responsive UI during indexing/search.
+- Responsive UI during indexing, search, filtering, and filtered navigation.
 - Long operations cancellable.
 - Smooth interactive scrolling.
 
