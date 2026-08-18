@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -6,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use memchr::memmem::Finder;
-use quarry_delimited::RecordScanner;
+use memchr::{memchr, memmem::Finder};
+use quarry_delimited::{RecordScanner, parse_record};
 
 use crate::filter::{FilterQuery, matching_fields, validate_query};
 use crate::{DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session};
@@ -15,12 +16,12 @@ use crate::{DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session};
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
-struct FilterExportConfig {
+struct ExportConfig {
     chunk_bytes: usize,
     max_record_bytes: usize,
 }
 
-const DEFAULT_FILTER_EXPORT_CONFIG: FilterExportConfig = FilterExportConfig {
+const DEFAULT_EXPORT_CONFIG: ExportConfig = ExportConfig {
     chunk_bytes: DEFAULT_READ_CHUNK,
     max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
 };
@@ -43,6 +44,28 @@ pub struct FilterExportProgress {
     pub bytes_scanned: u64,
     pub rows_scanned: u64,
     pub rows_written: u64,
+    pub bytes_written: u64,
+    pub total_bytes: u64,
+    pub elapsed: Duration,
+    pub done: bool,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveAsSummary {
+    pub destination: PathBuf,
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveAsOutcome {
+    Complete(SaveAsSummary),
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SaveAsProgress {
+    pub bytes_scanned: u64,
     pub bytes_written: u64,
     pub total_bytes: u64,
     pub elapsed: Duration,
@@ -107,7 +130,7 @@ impl FilterExportJob {
         has_header: bool,
         query: FilterQuery,
         destination: PathBuf,
-        config: FilterExportConfig,
+        config: ExportConfig,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
@@ -196,6 +219,107 @@ impl Drop for FilterExportJob {
     }
 }
 
+pub struct SaveAsJob {
+    shared: Arc<SharedState>,
+    handle: Option<JoinHandle<Result<SaveAsOutcome, QuarryError>>>,
+}
+
+impl SaveAsJob {
+    fn start(
+        source_path: PathBuf,
+        file_size: u64,
+        delimiter: u8,
+        has_header: bool,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        destination: PathBuf,
+        config: ExportConfig,
+    ) -> Result<Self, QuarryError> {
+        if config.chunk_bytes == 0 {
+            return Err(QuarryError::InvalidOption("save-as chunk must be non-zero"));
+        }
+        if !has_header {
+            return Err(QuarryError::InvalidOption(
+                "header renames require a header row",
+            ));
+        }
+        let source = File::open(&source_path)?;
+        let output = ExportTarget::new(&source_path, destination)?;
+        let shared = Arc::new(SharedState::new(file_size));
+        let worker_state = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("quarry-save-as".into())
+            .spawn(move || {
+                let _completion = WorkerCompletion(&worker_state);
+                let result = run_save_as(
+                    source,
+                    output,
+                    delimiter,
+                    &header_renames,
+                    config,
+                    &worker_state,
+                );
+                match &result {
+                    Ok(SaveAsOutcome::Cancelled) => {
+                        worker_state.cancelled.store(true, Ordering::Release);
+                    }
+                    Err(error) => {
+                        *worker_state.error.lock().unwrap() = Some(error.to_string());
+                    }
+                    Ok(SaveAsOutcome::Complete(_)) => {}
+                }
+                result
+            })?;
+        Ok(Self {
+            shared,
+            handle: Some(handle),
+        })
+    }
+
+    pub fn progress(&self) -> SaveAsProgress {
+        let done = self.shared.done.load(Ordering::Acquire);
+        let finished_nanos = self.shared.finished_nanos.load(Ordering::Acquire);
+        SaveAsProgress {
+            bytes_scanned: self.shared.bytes_scanned.load(Ordering::Acquire),
+            bytes_written: self.shared.bytes_written.load(Ordering::Acquire),
+            total_bytes: self.shared.total_bytes,
+            elapsed: if finished_nanos == 0 {
+                self.shared.started.elapsed()
+            } else {
+                Duration::from_nanos(finished_nanos)
+            },
+            done,
+            cancelled: self.shared.cancelled.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.shared.error.lock().unwrap().clone()
+    }
+
+    pub fn cancel(&self) {
+        if !self.shared.done.load(Ordering::Acquire) {
+            self.shared.cancel_requested.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn wait(mut self) -> Result<SaveAsOutcome, QuarryError> {
+        self.handle
+            .take()
+            .expect("save-as handle is present")
+            .join()
+            .map_err(|_| QuarryError::WorkerPanicked)?
+    }
+}
+
+impl Drop for SaveAsJob {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel();
+            let _ = handle.join();
+        }
+    }
+}
+
 impl Session {
     pub fn start_filtered_export(
         &self,
@@ -209,7 +333,23 @@ impl Session {
             self.dialect.has_header,
             query,
             destination.as_ref().to_path_buf(),
-            DEFAULT_FILTER_EXPORT_CONFIG,
+            DEFAULT_EXPORT_CONFIG,
+        )
+    }
+
+    pub fn start_save_as_with_header_renames(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        destination: impl AsRef<Path>,
+    ) -> Result<SaveAsJob, QuarryError> {
+        SaveAsJob::start(
+            self.path.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.dialect.has_header,
+            header_renames,
+            destination.as_ref().to_path_buf(),
+            DEFAULT_EXPORT_CONFIG,
         )
     }
 }
@@ -417,7 +557,7 @@ fn run_export(
     delimiter: u8,
     data_start: u64,
     query: &FilterQuery,
-    config: FilterExportConfig,
+    config: ExportConfig,
     shared: &SharedState,
 ) -> Result<FilterExportOutcome, QuarryError> {
     match scan_export(
@@ -444,13 +584,249 @@ fn run_export(
     }
 }
 
+fn run_save_as(
+    mut source: File,
+    mut output: ExportTarget,
+    delimiter: u8,
+    header_renames: &BTreeMap<usize, Vec<u8>>,
+    config: ExportConfig,
+    shared: &SharedState,
+) -> Result<SaveAsOutcome, QuarryError> {
+    match copy_with_rewritten_header(
+        &mut source,
+        &mut output,
+        delimiter,
+        header_renames,
+        config,
+        shared,
+    ) {
+        Ok(Some(bytes_written)) => {
+            match output.publish(0, bytes_written, &shared.cancel_requested)? {
+                FilterExportOutcome::Complete(summary) => {
+                    Ok(SaveAsOutcome::Complete(SaveAsSummary {
+                        destination: summary.destination,
+                        bytes_written: summary.bytes_written,
+                    }))
+                }
+                FilterExportOutcome::Cancelled => Ok(SaveAsOutcome::Cancelled),
+            }
+        }
+        Ok(None) => {
+            output.discard()?;
+            Ok(SaveAsOutcome::Cancelled)
+        }
+        Err(error) => {
+            output.discard()?;
+            Err(error)
+        }
+    }
+}
+
+fn copy_with_rewritten_header(
+    source: &mut File,
+    output: &mut ExportTarget,
+    delimiter: u8,
+    header_renames: &BTreeMap<usize, Vec<u8>>,
+    config: ExportConfig,
+    shared: &SharedState,
+) -> Result<Option<u64>, QuarryError> {
+    let mut scanner = RecordScanner::new(delimiter)?;
+    let mut chunk = vec![0; config.chunk_bytes];
+    let mut header = Vec::new();
+    let mut absolute_start = 0_u64;
+    let mut bytes_written = 0_u64;
+    let mut header_written = false;
+
+    loop {
+        if shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let read = source.read(&mut chunk)?;
+        if read == 0 {
+            if !header_written {
+                let mut found_header = false;
+                scanner.finish(absolute_start, |_| found_header = true)?;
+                if !found_header {
+                    return Err(QuarryError::InvalidOption(
+                        "source does not contain a header row",
+                    ));
+                }
+                bytes_written = write_rewritten_header(
+                    output,
+                    &header,
+                    delimiter,
+                    header_renames,
+                    config.max_record_bytes,
+                )?;
+                shared.bytes_written.store(bytes_written, Ordering::Release);
+            }
+            return Ok(Some(bytes_written));
+        }
+
+        absolute_start = absolute_start.saturating_add(read as u64);
+        shared
+            .bytes_scanned
+            .store(absolute_start, Ordering::Release);
+
+        if header_written {
+            output.write_all(&chunk[..read])?;
+            bytes_written = bytes_written.saturating_add(read as u64);
+            shared.bytes_written.store(bytes_written, Ordering::Release);
+            continue;
+        }
+
+        let chunk_start = absolute_start - read as u64;
+        let mut segment_start = 0_usize;
+        while segment_start < read {
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let segment_end = memchr(b'\n', &chunk[segment_start..read])
+                .map_or(read, |relative| segment_start + relative + 1);
+            let mut found_header = false;
+            scanner.scan_chunk(
+                &chunk[segment_start..segment_end],
+                chunk_start + segment_start as u64,
+                |_| found_header = true,
+            )?;
+            header.extend_from_slice(&chunk[segment_start..segment_end]);
+            if header.len() > config.max_record_bytes {
+                return Err(QuarryError::RecordTooLarge {
+                    limit: config.max_record_bytes,
+                });
+            }
+            segment_start = segment_end;
+
+            if found_header {
+                bytes_written = write_rewritten_header(
+                    output,
+                    &header,
+                    delimiter,
+                    header_renames,
+                    config.max_record_bytes,
+                )?;
+                if segment_start < read {
+                    output.write_all(&chunk[segment_start..read])?;
+                    bytes_written = bytes_written.saturating_add((read - segment_start) as u64);
+                }
+                shared.bytes_written.store(bytes_written, Ordering::Release);
+                header_written = true;
+                break;
+            }
+        }
+    }
+}
+
+fn write_rewritten_header(
+    output: &mut ExportTarget,
+    record: &[u8],
+    delimiter: u8,
+    header_renames: &BTreeMap<usize, Vec<u8>>,
+    max_record_bytes: usize,
+) -> Result<u64, QuarryError> {
+    const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+    let (prefix, record) = record
+        .strip_prefix(UTF8_BOM)
+        .map_or((&[][..], record), |record| (UTF8_BOM, record));
+    let fields = parse_record(record, delimiter)?;
+    if header_renames
+        .last_key_value()
+        .is_some_and(|(column, _)| *column >= fields.len())
+    {
+        return Err(QuarryError::InvalidOption(
+            "header rename column is out of range",
+        ));
+    }
+
+    let ending = if record.ends_with(b"\r\n") {
+        b"\r\n".as_slice()
+    } else if record.ends_with(b"\n") {
+        b"\n".as_slice()
+    } else {
+        b"".as_slice()
+    };
+    let mut serialized_len = prefix
+        .len()
+        .saturating_add(ending.len())
+        .saturating_add(fields.len().saturating_sub(1));
+    for (column, field) in fields.iter().enumerate() {
+        let field = header_renames
+            .get(&column)
+            .map_or(field.as_ref(), Vec::as_slice);
+        serialized_len = serialized_len.saturating_add(delimited_field_len(field, delimiter));
+    }
+    if serialized_len > max_record_bytes {
+        return Err(QuarryError::RecordTooLarge {
+            limit: max_record_bytes,
+        });
+    }
+
+    output.write_all(prefix)?;
+    let mut bytes_written = prefix.len() as u64;
+    for (column, field) in fields.iter().enumerate() {
+        if column > 0 {
+            output.write_all(&[delimiter])?;
+            bytes_written += 1;
+        }
+        let field = header_renames
+            .get(&column)
+            .map_or(field.as_ref(), Vec::as_slice);
+        bytes_written =
+            bytes_written.saturating_add(write_delimited_field(output, field, delimiter)?);
+    }
+
+    output.write_all(ending)?;
+    Ok(bytes_written.saturating_add(ending.len() as u64))
+}
+
+fn delimited_field_len(field: &[u8], delimiter: u8) -> usize {
+    let quotes = field.iter().filter(|byte| **byte == b'"').count();
+    if quotes > 0
+        || field
+            .iter()
+            .any(|byte| matches!(*byte, b'\r' | b'\n') || *byte == delimiter)
+    {
+        field.len().saturating_add(quotes).saturating_add(2)
+    } else {
+        field.len()
+    }
+}
+
+fn write_delimited_field(
+    output: &mut ExportTarget,
+    field: &[u8],
+    delimiter: u8,
+) -> Result<u64, QuarryError> {
+    let needs_quotes = field
+        .iter()
+        .any(|byte| matches!(*byte, b'"' | b'\r' | b'\n') || *byte == delimiter);
+    if !needs_quotes {
+        output.write_all(field)?;
+        return Ok(field.len() as u64);
+    }
+
+    output.write_all(b"\"")?;
+    let mut start = 0_usize;
+    let mut bytes_written = 2_u64;
+    while let Some(relative) = memchr(b'"', &field[start..]) {
+        let quote = start + relative;
+        output.write_all(&field[start..quote])?;
+        output.write_all(b"\"\"")?;
+        bytes_written = bytes_written.saturating_add((quote - start + 2) as u64);
+        start = quote + 1;
+    }
+    output.write_all(&field[start..])?;
+    output.write_all(b"\"")?;
+    Ok(bytes_written.saturating_add((field.len() - start) as u64))
+}
+
 fn scan_export(
     source: &mut File,
     output: &mut ExportTarget,
     delimiter: u8,
     data_start: u64,
     query: &FilterQuery,
-    config: FilterExportConfig,
+    config: ExportConfig,
     shared: &SharedState,
 ) -> Result<ScanOutcome, QuarryError> {
     let finders: Vec<_> = query
@@ -613,6 +989,7 @@ fn publish_progress(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs::{self, File};
     use std::io::Write;
     use std::sync::Arc;
@@ -621,8 +998,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ExportTarget, FilterExportConfig, FilterExportJob, FilterExportOutcome, SharedState,
-        WorkerCompletion,
+        ExportConfig, ExportTarget, FilterExportJob, FilterExportOutcome, SaveAsJob, SaveAsOutcome,
+        SharedState, WorkerCompletion,
     };
     use crate::{FilterOperator, FilterQuery, HeaderMode, OpenOptions, QuarryError, Session};
 
@@ -686,6 +1063,194 @@ mod tests {
             assert!(Instant::now() < deadline, "export did not finish promptly");
             thread::yield_now();
         }
+    }
+
+    fn wait_until_save_done(job: &SaveAsJob) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !job.progress().done {
+            assert!(Instant::now() < deadline, "save-as did not finish promptly");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn save_as_rewrites_only_the_header_and_preserves_source_and_data_bytes() {
+        let source_bytes =
+            b"\xEF\xBB\xBFdup;dup;\"old\nname\";empty\r\n1;\"raw\nrecord\";x;y\r\n2;\"\";a;b";
+        let expected = b"\xEF\xBB\xBF\"renamed; \"\"quoted\"\"\nline\";dup;;dup\r\n1;\"raw\nrecord\";x;y\r\n2;\"\";a;b";
+        let source = fixture(source_bytes);
+        let destination = destination(&source, "renamed.csv");
+        let session = session(&source, b';', HeaderMode::FirstRow);
+        let renames = BTreeMap::from([
+            (0, b"renamed; \"quoted\"\nline".to_vec()),
+            (2, Vec::new()),
+            (3, b"dup".to_vec()),
+        ]);
+        let job = SaveAsJob::start(
+            source.clone(),
+            session.file_size,
+            b';',
+            true,
+            renames,
+            destination.clone(),
+            ExportConfig {
+                chunk_bytes: 3,
+                max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        let progress = job.progress();
+        assert_eq!(progress.bytes_scanned, source_bytes.len() as u64);
+        assert_eq!(progress.bytes_written, expected.len() as u64);
+        assert_eq!(progress.total_bytes, source_bytes.len() as u64);
+        assert!(!progress.cancelled);
+        assert!(job.error().is_none());
+
+        let SaveAsOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("save-as unexpectedly cancelled");
+        };
+        assert_eq!(summary.destination, destination);
+        assert_eq!(summary.bytes_written, expected.len() as u64);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        assert!(temporary_exports(&destination).is_empty());
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(destination).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn save_as_rejects_unsafe_destinations_and_headerless_sources() {
+        let source = fixture(b"id,name\n1,Ada\n");
+        let existing = destination(&source, "existing.csv");
+        fs::write(&existing, b"existing").unwrap();
+        let with_header = session(&source, b',', HeaderMode::FirstRow);
+        let without_header = session(&source, b',', HeaderMode::NoHeader);
+        let renames = BTreeMap::from([(0, b"ID".to_vec())]);
+
+        assert!(matches!(
+            with_header.start_save_as_with_header_renames(renames.clone(), &source),
+            Err(QuarryError::ExportDestinationIsSource)
+        ));
+        assert!(matches!(
+            with_header.start_save_as_with_header_renames(renames.clone(), &existing),
+            Err(QuarryError::ExportDestinationExists)
+        ));
+        assert!(matches!(
+            without_header
+                .start_save_as_with_header_renames(renames, destination(&source, "no-header.csv")),
+            Err(QuarryError::InvalidOption(
+                "header renames require a header row"
+            ))
+        ));
+        assert_eq!(fs::read(&source).unwrap(), b"id,name\n1,Ada\n");
+        assert_eq!(fs::read(&existing).unwrap(), b"existing");
+        assert!(temporary_exports(&existing).is_empty());
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(existing).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn invalid_header_rename_cleans_up_without_publishing() {
+        let source = fixture(b"id,name\n1,Ada\n");
+        let destination = destination(&source, "invalid.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = session
+            .start_save_as_with_header_renames(
+                BTreeMap::from([(2, b"missing".to_vec())]),
+                &destination,
+            )
+            .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(job.error().unwrap().contains("out of range"));
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::InvalidOption(
+                "header rename column is out of range"
+            ))
+        ));
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn serialized_header_limit_counts_the_renamed_value() {
+        let source_bytes = b"id,name\n1,Ada\n";
+        let source = fixture(source_bytes);
+        let destination = destination(&source, "oversized-header.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = SaveAsJob::start(
+            source.clone(),
+            session.file_size,
+            b',',
+            true,
+            BTreeMap::from([(0, b"a renamed header".to_vec())]),
+            destination.clone(),
+            ExportConfig {
+                chunk_bytes: 4,
+                max_record_bytes: 8,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::RecordTooLarge { limit: 8 })
+        ));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn cancelling_save_as_removes_partial_output() {
+        let mut source_bytes = b"id,name\n".to_vec();
+        source_bytes.extend_from_slice(&b"1,Ada\n".repeat(500_000));
+        let source = fixture(&source_bytes);
+        let destination = destination(&source, "cancelled-save.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = SaveAsJob::start(
+            source.clone(),
+            session.file_size,
+            b',',
+            true,
+            BTreeMap::from([(0, b"ID".to_vec())]),
+            destination.clone(),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while job.progress().bytes_scanned < 100 {
+            assert!(
+                !job.progress().done,
+                "save-as completed before cancellation"
+            );
+            assert!(Instant::now() < deadline, "save-as did not make progress");
+            thread::yield_now();
+        }
+        assert_eq!(temporary_exports(&destination).len(), 1);
+
+        job.cancel();
+        wait_until_save_done(&job);
+        assert!(job.progress().cancelled);
+        assert_eq!(job.wait().unwrap(), SaveAsOutcome::Cancelled);
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
     }
 
     #[test]
@@ -825,7 +1390,7 @@ mod tests {
             false,
             query(),
             destination.clone(),
-            FilterExportConfig {
+            ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
             },
@@ -861,7 +1426,7 @@ mod tests {
             false,
             query(),
             destination.clone(),
-            FilterExportConfig {
+            ExportConfig {
                 chunk_bytes: 4,
                 max_record_bytes: 8,
             },

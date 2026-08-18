@@ -11,7 +11,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub use export::{FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterExportSummary};
+pub use export::{
+    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterExportSummary, SaveAsJob,
+    SaveAsOutcome, SaveAsProgress, SaveAsSummary,
+};
 pub use filter::{
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
     FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,

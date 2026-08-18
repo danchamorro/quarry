@@ -2,7 +2,7 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress: 2026-08-16
+## Current progress: 2026-08-17
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -11,6 +11,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 | Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
+| Phase 5: Direct editing and transformations | In progress | Inline header rename, unsaved-change protection, and safe Save As are implemented; Save and direct cell editing remain |
 
 ### Phase 1 checklist
 
@@ -99,8 +100,9 @@ pacing becomes measurable with the viewer-alpha grid.
 opening, format controls, literal search, copy, column controls, diagnostics,
 and an adaptive grid that keeps at least 40 rows visible in the maximized
 reference window.
-Phase 4 filtering and streaming filtered export are complete. Phase 5 column
-transformations are next. Cosmetic redesign remains outside the current scope.
+Phase 4 filtering and streaming filtered export are complete. Phase 5 begins
+with direct in-grid header rename and unsaved document state. Cosmetic redesign
+remains outside the current scope.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -148,21 +150,44 @@ Contains/equality filters, multiple AND predicates, incremental results, filtere
   evidence in the
   [filtered-export validation](benchmarks/2026-08-16-filtered-export.md).
 
-**Next:** begin Phase 5 with a bounded transformation preview before adding
-saved transformed output.
+**Next:** add Save back to the current file, then extend the same editing model
+from headers to cells.
 
 **Phase 4 exit met:** multiple predicates and filtered export remain practical
 on the 12 GB reference file while memory stays bounded and the source stays
 unchanged.
 
-## Phase 5 — Column transformations
-Split, join, rename, reorder/drop in saved output, find/replace, preview,
-reusable transformation pipeline.
+## Phase 5: Direct editing and transformations
 
-Add **Save As** modes for an unchanged source-order copy and a transformed
-copy. A transformed copy writes columns in the current arranged order. Hiding
-a column does not remove it from saved output unless the user explicitly
-chooses to exclude it; the source file remains unchanged.
+Edit values where they appear in the grid. Keep committed edits as sparse
+unsaved document state until an explicit Save or Save As. Begin with inline
+header rename, then extend the same model to cells and column transformations.
+
+### Phase 5 checklist
+
+- [x] Rename an existing header directly in the grid while preserving its
+  stable source-column identity.
+- [x] Track effective edits as unsaved document state and prevent open, reopen,
+  or close from silently discarding them.
+- [x] Add Save As: stream the current document to a selected path, publish only
+  after a complete flush and sync, leave the original unchanged, and make the
+  new path current only after success.
+- [ ] Add Save: stream through a same-directory temporary file and atomically
+  replace the current file only after success.
+- [x] Reopen a successful Save As destination, rebuild offset-dependent
+  indexes, and clear the unsaved state only after the new document is ready.
+- [x] Preserve existing files and remove Save As temporary output after
+  cancellation or failure, with memory bounded independently of file size.
+- [ ] Extend direct editing to cells, split/join, explicit reorder/drop, and
+  find/replace.
+
+The Columns manager remains view-only and does not mark the document changed.
+A transformed Save As may explicitly use its arranged order. Hidden columns
+remain in output unless the user explicitly excludes them.
+
+**Phase 5 exit:** direct edits remain responsive on the 12 GB reference file,
+unsaved changes cannot be lost silently, and Save and Save As never expose a
+partial or corrupted file.
 
 ## Phase 6 — Sorting
 Type semantics, external run generation, spill management, merge, stable row-order abstraction, disk-space estimation.

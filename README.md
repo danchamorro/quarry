@@ -67,7 +67,9 @@ equality predicates with AND semantics. A background worker parses each row
 once, builds a bounded adaptive match index, and serves bounded filtered row
 ranges through cancellable reads without retaining every matching row. Safe,
 cancellable streaming export passed the 1 GB and 12 GB validation. Phase 5
-column transformations are next.
+is in progress. Existing headers can now be renamed directly in the grid, with
+safe Save As to a new file. The original source remains unchanged. Save back
+to the current file and direct cell editing are next.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
