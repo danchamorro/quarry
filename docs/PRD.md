@@ -43,16 +43,27 @@ Column controls operate on stable source-column identities. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
 
-Next: bounded transformation previews and saved transformed output. Disk-aware
-sorting remains a candidate if it does not delay the core milestone.
+Phase 5 has delivered direct in-grid header rename, unsaved document state, and
+Save As to a new file. Next: Save back to the current file, then direct cell
+editing. Disk-aware sorting remains a candidate if it does not delay the core
+milestone.
 
-Not required: general text editing, formulas, charts, database connectivity, plugins, cloud sync, collaboration, full in-place editing, or EmEditor feature parity.
+Not required: general-purpose text-editor behavior, formulas, charts, database
+connectivity, plugins, cloud sync, collaboration, direct in-place byte
+mutation, or EmEditor feature parity.
 
-## Version 0.2 — transformations
-Split columns, join columns, rename/reorder/drop columns in saved output,
-find/replace transforms, transformed filtered output, and safe streaming
-full-file output.
-Transformations should be non-destructive until explicitly written.
+## Version 0.2: direct editing and transformations
+
+Edit headers and cells directly in the grid. The first slice renames an
+existing header and records the change as sparse unsaved document state keyed
+by stable source-column identity, with Save As to a new file. Later slices add
+Save to the current file, direct cell editing, split/join, rename/reorder/drop,
+find/replace, transformed filtered output, and safe streaming full-file output.
+
+Save As writes a selected destination, leaves the previous source unchanged,
+and makes the new file current only after success. The planned Save operation
+will write the current document back to its active path. Neither operation
+writes records in place.
 
 ## Progressive opening
 1. Open the file and sample a bounded region.
@@ -78,7 +89,13 @@ Initial targets:
 Every benchmark must identify hardware, OS, dataset, build mode, and cache state. Cold-cache performance must not be hidden behind warm-cache numbers.
 
 ## Reliability and safety
-Early releases default to read-only. Writing should initially target a new file, stream output, use safe temporary-file patterns where appropriate, expose malformed records, and never silently corrupt source data.
+
+Opening and editing never modify source bytes. Committed edits remain unsaved
+document state until Save As succeeds or the planned Save operation is added.
+Save As streams through temporary output, flushes and syncs before publication,
+and preserves existing files after cancellation or failure. Save must provide
+the same guarantees. Opening, reopening, or closing a changed document requires
+an explicit save or discard decision.
 
 ## Accessibility
 The selected UI must preserve keyboard navigation, VoiceOver, focus behavior,

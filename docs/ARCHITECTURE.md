@@ -15,6 +15,7 @@ quarry-core
    +-- Bounded filter-index worker
    +-- Bounded filtered-row read worker
    +-- Streaming filtered-export worker
+   +-- Streaming edited Save As worker
    |
 quarry-delimited
    +-- Record scanner
@@ -83,6 +84,9 @@ order. Drag handles exist only in the Columns manager; main-grid headers remain
 resize-only. A search match automatically shows and centers its source column,
 while row copy continues to serialize every source field in file order.
 
+View order and hidden state remain non-dirty UI metadata. They affect saved
+output only through an explicit transformed-output choice.
+
 Header columns are known immediately. If a later ragged row contains more
 fields, the viewer appends those newly known source columns without resetting
 the existing layout. Discovering the maximum width of an entire headerless
@@ -106,17 +110,22 @@ match, and at most a 64 MiB clipboard payload.
 [ADR 0002](adr/0002-defer-viewport-cache.md) records why an application viewport
 cache remains deferred.
 
+Unsaved edits use a sparse overlay whose memory grows with the number and size
+of user edits, not with source-file size. Save As enforces the existing maximum
+record size against the fully serialized edited header before publication.
+
 ## Concurrency
 Rust workers currently handle indexing, literal search, filtering, filtered
-viewport reads, and filtered export. Each publishes progress and supports
-cancellation.
+viewport reads, filtered export, and edited Save As. Each publishes progress
+and supports cancellation.
 Jobs normally join before they are dropped. Rapid filtered navigation cancels
 obsolete reads, keeps only the newest pending window, and joins a cancelled read
 after it finishes. Filter resets and document lifecycle changes detach an active
 read-only viewport worker so the render thread never waits for cleanup; each
 worker owns its resources and exits at its next cancellation check. An active
-export blocks document replacement until cancellation finishes. App shutdown
-joins the export worker so temporary-output cleanup is guaranteed.
+filtered export or Save As blocks document replacement until cancellation
+finishes. App shutdown joins active output workers so temporary-output cleanup
+is guaranteed.
 
 ## Search and filtering
 Literal Find Next uses a cancellable core worker after structural indexing. It
@@ -164,11 +173,30 @@ publishes the destination. The source path itself is rejected as a destination.
 ## Planned sorting
 Use a disk-aware external merge sort: bounded runs, sort in memory, spill to temporary storage, then merge into a stable row-order abstraction. Sorting must not delay the first performance milestone.
 
-## Planned transformations
-Model split/join/reorder/drop operations as a non-destructive pipeline ending in
-streaming export. Save As can later write either an unchanged source-order copy
-or transformed output using the arranged column order. Hiding a view column
-alone does not remove it from output.
+## Document editing and persistence
+
+Editing occurs directly in the grid. The source file remains immutable while
+the document is open. A sparse overlay stores committed edits by stable source
+identity; the first slice stores renamed header values by source column.
+Viewport rendering reads the overlay before falling back to decoded source
+values. Cancelling an inline edit does not change document state.
+
+A document is dirty while effective edits exist. Open, reopen, format changes,
+and application close must not silently discard dirty state. Every write path
+must consume the current document overlay or remain unavailable while the
+document is dirty.
+
+Save As uses a streaming rewrite rather than in-place record mutation. It
+publishes a selected destination and leaves the previous source unchanged.
+Cancellation or failure removes temporary output and preserves existing files.
+The planned Save path will write beside the active file and atomically replace
+it only after the temporary output is flushed and synced.
+
+After a successful Save As publication, Quarry opens the destination as the
+current source and rebuilds offset-dependent indexes before clearing dirty
+state. This is required because even a header rename can shift every later byte
+offset. Unchanged records remain byte-preserving where possible; edited records
+are serialized with the document dialect.
 
 ## UI selection
 [ADR 0003](adr/0003-select-egui-ui.md) records the measured egui and AppKit

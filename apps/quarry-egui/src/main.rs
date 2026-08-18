@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -7,8 +8,8 @@ use quarry_core::{
     FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
     FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, FilterReadJob,
     FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, Row,
-    SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress, Session,
-    StructuralIndex,
+    SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch, SearchOutcome, SearchPosition,
+    SearchProgress, Session, StructuralIndex,
 };
 
 const BOOTSTRAP_ROWS: usize = 40;
@@ -64,6 +65,8 @@ struct QuarryApp {
     header_mode: HeaderMode,
     document: Option<Document>,
     notice: Option<String>,
+    close_confirmation_open: bool,
+    close_after_save: bool,
     started: Instant,
     logged_first_update: bool,
 }
@@ -104,6 +107,8 @@ impl QuarryApp {
             header_mode: HeaderMode::Auto,
             document: None,
             notice: None,
+            close_confirmation_open: false,
+            close_after_save: false,
             started,
             logged_first_update: false,
         };
@@ -130,6 +135,15 @@ impl QuarryApp {
     }
 
     fn open_path(&mut self, path: PathBuf) -> Result<(), String> {
+        if let Some(document) = self.document.as_mut() {
+            if document.save_as_job.is_some() {
+                return Err("Cancel the active Save As before opening another file.".into());
+            }
+            document.commit_header_edit();
+            if document.is_dirty() {
+                return Err("Discard or save your changes before opening another file.".into());
+            }
+        }
         if self
             .document
             .as_ref()
@@ -140,7 +154,19 @@ impl QuarryApp {
                     .into(),
             );
         }
-        let mut document = Document::prepare(&path, self.open_options())?;
+        self.replace_document(path)
+    }
+
+    fn replace_document(&mut self, path: PathBuf) -> Result<(), String> {
+        self.replace_document_with_options(path, self.open_options())
+    }
+
+    fn replace_document_with_options(
+        &mut self,
+        path: PathBuf,
+        options: OpenOptions,
+    ) -> Result<(), String> {
+        let mut document = Document::prepare(&path, options)?;
         document.start_indexing()?;
         if let Some(current) = self.document.as_mut() {
             current.shutdown();
@@ -168,6 +194,18 @@ impl QuarryApp {
     }
 
     fn choose_file(&mut self) {
+        if let Some(document) = self.document.as_mut() {
+            if document.save_as_job.is_some() {
+                self.notice = Some("Cancel the active Save As before opening another file.".into());
+                return;
+            }
+            document.commit_header_edit();
+            if document.is_dirty() {
+                self.notice =
+                    Some("Discard or save your changes before opening another file.".into());
+                return;
+            }
+        }
         let path = rfd::FileDialog::new()
             .set_title("Open a delimited file")
             .pick_file();
@@ -175,6 +213,19 @@ impl QuarryApp {
     }
 
     fn choose_filtered_export(&mut self) {
+        if let Some(document) = self.document.as_mut() {
+            if document.save_as_job.is_some() {
+                self.notice =
+                    Some("Cancel the active Save As before exporting filtered rows.".into());
+                return;
+            }
+            document.commit_header_edit();
+            if document.is_dirty() {
+                self.notice =
+                    Some("Save or discard your changes before exporting filtered rows.".into());
+                return;
+            }
+        }
         let Some(source) = self
             .document
             .as_ref()
@@ -190,6 +241,45 @@ impl QuarryApp {
             dialog = dialog.set_directory(parent);
         }
         self.export_picker_result(dialog.save_file());
+    }
+
+    fn choose_save_as(&mut self) -> bool {
+        let Some(document) = self.document.as_mut() else {
+            self.notice = Some("Open a file before using Save As.".into());
+            return false;
+        };
+        document.commit_header_edit();
+        if !document.is_save_as_ready() {
+            self.notice = Some(if document.save_as_job.is_some() {
+                "A Save As operation is already running.".into()
+            } else if document.export_job.is_some() {
+                "Cancel the active export before using Save As.".into()
+            } else {
+                "Rename a header before using Save As.".into()
+            });
+            return false;
+        }
+        let source = document.session.path().to_path_buf();
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save edited file as")
+            .set_file_name(save_as_file_name(&source));
+        if let Some(parent) = source.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        self.save_as_picker_result(dialog.save_file())
+    }
+
+    fn save_as_picker_result(&mut self, destination: Option<PathBuf>) -> bool {
+        let Some(destination) = destination else {
+            return false;
+        };
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "Open a file before using Save As.".to_owned())
+            .and_then(|document| document.start_save_as(destination));
+        self.notice = result.err();
+        self.notice.is_none()
     }
 
     fn export_picker_result(&mut self, destination: Option<PathBuf>) {
@@ -239,11 +329,30 @@ impl QuarryApp {
     }
 
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        if let Some(document) = self.document.as_mut() {
+            document.commit_header_edit();
+        }
         match action {
             Action::Open => return self.open_typed_path(),
             Action::Choose => return self.choose_file(),
             Action::Reopen => return self.reopen_document(),
+            Action::ChooseSaveAs => {
+                self.choose_save_as();
+                return;
+            }
             Action::ChooseFilteredExport => return self.choose_filtered_export(),
+            Action::DiscardChanges => {
+                if let Some(document) = self.document.as_mut() {
+                    if document.save_as_job.is_some() {
+                        self.notice =
+                            Some("Wait for Save As to finish before discarding changes.".into());
+                        return;
+                    }
+                    document.discard_header_edits();
+                }
+                self.notice = None;
+                return;
+            }
             Action::CopySelection => return self.copy_selection(ctx),
             Action::OpenColumns => {
                 self.columns_open = true;
@@ -262,7 +371,9 @@ impl QuarryApp {
             Action::Open
             | Action::Choose
             | Action::Reopen
+            | Action::ChooseSaveAs
             | Action::ChooseFilteredExport
+            | Action::DiscardChanges
             | Action::CopySelection
             | Action::OpenColumns
             | Action::OpenFilters => {
@@ -305,6 +416,10 @@ impl QuarryApp {
             Action::ClearFilter => document.clear_filter(),
             Action::CancelExport => {
                 document.cancel_filtered_export();
+                Ok(())
+            }
+            Action::CancelSaveAs => {
+                document.cancel_save_as();
                 Ok(())
             }
             Action::Cancel => {
@@ -359,6 +474,30 @@ impl QuarryApp {
             Err(error) => self.notice = Some(error),
         }
     }
+
+    fn intercept_dirty_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if let Some(document) = self.document.as_mut() {
+            if document.save_as_job.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_confirmation_open = false;
+                self.close_after_save = true;
+                return;
+            }
+            document.commit_header_edit();
+            if document.is_dirty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_confirmation_open = true;
+            }
+        }
+    }
+
+    fn keep_editing(&mut self) {
+        self.close_confirmation_open = false;
+        self.close_after_save = false;
+    }
 }
 
 impl eframe::App for QuarryApp {
@@ -370,6 +509,8 @@ impl eframe::App for QuarryApp {
             );
             self.logged_first_update = true;
         }
+
+        self.intercept_dirty_close(ctx);
 
         let dropped_paths = ctx.input(|input| {
             input
@@ -403,6 +544,66 @@ impl eframe::App for QuarryApp {
         {
             self.notice = Some(error);
         }
+        let save_as_result = self
+            .document
+            .as_mut()
+            .map_or(Ok(None), Document::poll_save_as);
+        match save_as_result {
+            Ok(Some(destination)) => {
+                let delimiter = self
+                    .document
+                    .as_ref()
+                    .expect("saved document is still open")
+                    .session
+                    .dialect
+                    .delimiter;
+                let options = OpenOptions {
+                    delimiter: Some(delimiter),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                };
+                match self.replace_document_with_options(destination.clone(), options) {
+                    Ok(()) => {
+                        self.notice = Some(format!("Saved as {}.", destination.display()));
+                        if self.close_after_save {
+                            self.close_after_save = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(document) = self.document.as_mut() {
+                            document.save_as_status = None;
+                        }
+                        self.notice = Some(format!(
+                            "Saved {} but could not open it: {error}",
+                            destination.display()
+                        ));
+                        if self.close_after_save {
+                            self.close_after_save = false;
+                            self.close_confirmation_open = true;
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                if self.close_after_save
+                    && self
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| document.save_as_job.is_none())
+                {
+                    self.close_after_save = false;
+                    self.close_confirmation_open = true;
+                }
+            }
+            Err(error) => {
+                self.notice = Some(error);
+                if self.close_after_save {
+                    self.close_after_save = false;
+                    self.close_confirmation_open = true;
+                }
+            }
+        }
 
         let mut action = None;
         egui::TopBottomPanel::top("quarry-toolbar")
@@ -423,15 +624,20 @@ impl eframe::App for QuarryApp {
                             .color(Color32::from_rgb(49, 85, 217)),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("READ ONLY").monospace().size(10.0));
+                        let state = if self.document.as_ref().is_some_and(Document::is_dirty) {
+                            "MODIFIED"
+                        } else {
+                            "EDITABLE"
+                        };
+                        ui.label(RichText::new(state).monospace().size(10.0));
                     });
                 });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let export_active = self
-                        .document
-                        .as_ref()
-                        .is_some_and(|document| document.export_job.is_some());
+                    let export_active = self.document.as_ref().is_some_and(|document| {
+                        document.export_job.is_some() || document.save_as_job.is_some()
+                    });
+                    let dirty = self.document.as_ref().is_some_and(Document::is_dirty);
                     let label = ui.label("File");
                     let width = (ui.available_width() - 168.0).max(200.0);
                     let response = ui
@@ -443,21 +649,26 @@ impl eframe::App for QuarryApp {
                         )
                         .labelled_by(label.id);
                     if ui
-                        .add_enabled(!export_active, egui::Button::new("Choose…"))
-                        .on_disabled_hover_text(
-                            "Cancel the active export and wait for it to finish first.",
-                        )
+                        .add_enabled(!export_active && !dirty, egui::Button::new("Choose…"))
+                        .on_disabled_hover_text(if dirty {
+                            "Discard or save your changes before opening another file."
+                        } else {
+                            "Cancel the active export and wait for it to finish first."
+                        })
                         .clicked()
                     {
                         action = Some(Action::Choose);
                     }
                     if ui
-                        .add_enabled(!export_active, egui::Button::new("Open"))
-                        .on_disabled_hover_text(
-                            "Cancel the active export and wait for it to finish first.",
-                        )
+                        .add_enabled(!export_active && !dirty, egui::Button::new("Open"))
+                        .on_disabled_hover_text(if dirty {
+                            "Discard or save your changes before opening another file."
+                        } else {
+                            "Cancel the active export and wait for it to finish first."
+                        })
                         .clicked()
                         || (!export_active
+                            && !dirty
                             && response.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter)))
                     {
@@ -497,6 +708,7 @@ impl eframe::App for QuarryApp {
                     if ui
                         .add_enabled(
                             self.document.is_some()
+                                && !self.document.as_ref().is_some_and(Document::is_dirty)
                                 && self
                                     .document
                                     .as_ref()
@@ -504,11 +716,38 @@ impl eframe::App for QuarryApp {
                             egui::Button::new("Apply / Reopen"),
                         )
                         .on_disabled_hover_text(
-                            "Cancel the active export and wait for it to finish first.",
+                            if self.document.as_ref().is_some_and(Document::is_dirty) {
+                                "Discard or save your changes before reopening the file."
+                            } else {
+                                "Cancel the active export and wait for it to finish first."
+                            },
                         )
                         .clicked()
                     {
                         action = Some(Action::Reopen);
+                    }
+                    if let Some(document) = self
+                        .document
+                        .as_ref()
+                        .filter(|document| document.is_dirty())
+                    {
+                        if ui
+                            .add_enabled(document.is_save_as_ready(), egui::Button::new("Save As…"))
+                            .on_disabled_hover_text("Wait for the active file operation to finish.")
+                            .clicked()
+                        {
+                            action = Some(Action::ChooseSaveAs);
+                        }
+                        if ui
+                            .add_enabled(
+                                document.save_as_job.is_none(),
+                                egui::Button::new("Discard Changes"),
+                            )
+                            .on_disabled_hover_text("Wait for Save As to finish.")
+                            .clicked()
+                        {
+                            action = Some(Action::DiscardChanges);
+                        }
                     }
                 });
 
@@ -589,6 +828,45 @@ impl eframe::App for QuarryApp {
                             action = Some(search_action);
                         }
                     }
+                    if let Some(progress) = document.save_as_job.as_ref().map(SaveAsJob::progress) {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let fraction = if progress.total_bytes == 0 {
+                                if progress.done { 1.0 } else { 0.0 }
+                            } else {
+                                (progress.bytes_scanned as f32 / progress.total_bytes as f32)
+                                    .clamp(0.0, 1.0)
+                            };
+                            let status = if document.save_as_cancel_requested {
+                                "Cancelling Save As"
+                            } else if progress.done {
+                                "Save As finished"
+                            } else {
+                                "Saving edited file"
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .desired_width(260.0)
+                                    .text(format!("{status} · {:.1}%", fraction * 100.0)),
+                            );
+                            if document.save_as_job.is_some()
+                                && ui
+                                    .add_enabled(
+                                        !document.save_as_cancel_requested,
+                                        egui::Button::new("Cancel Save As"),
+                                    )
+                                    .clicked()
+                            {
+                                action = Some(Action::CancelSaveAs);
+                            }
+                        });
+                    }
+                    if let Some(status) = document.save_as_status.as_deref() {
+                        let response = ui.label(status);
+                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                            node.set_live(egui::accesskit::Live::Polite);
+                        });
+                    }
                 }
 
                 if let Some(notice) = &self.notice {
@@ -610,6 +888,13 @@ impl eframe::App for QuarryApp {
                             "{} delimiter",
                             display_delimiter(document.session.dialect.delimiter)
                         ));
+                        if document.is_dirty() {
+                            ui.separator();
+                            ui.colored_label(
+                                Color32::from_rgb(171, 65, 53),
+                                "Modified (not saved)",
+                            );
+                        }
                         ui.separator();
                         ui.label(if document.session.dialect.has_header {
                             "header row"
@@ -700,16 +985,76 @@ impl eframe::App for QuarryApp {
                     });
                 }
             });
-        let copy_event_targets_selection = self
-            .document
-            .as_ref()
-            .and_then(|document| document.selection.as_ref())
-            .is_some_and(|_| selection_copy_requested(ctx, self.filter_rules.len()));
+        let copy_event_targets_selection = self.document.as_ref().is_some_and(|document| {
+            document.selection.is_some()
+                && selection_copy_requested(
+                    ctx,
+                    self.filter_rules.len(),
+                    document.header_edit.as_ref().map(|edit| edit.column),
+                )
+        });
         if copy_event_targets_selection {
             self.copy_selection(ctx);
         }
         if grid_error.is_some() {
             self.notice = grid_error;
+        }
+
+        if self.close_confirmation_open {
+            let mut discard_and_close = false;
+            let mut keep_editing = false;
+            let mut save_and_close = false;
+            let modal =
+                egui::Modal::new(egui::Id::new("quarry-close-confirmation")).show(ctx, |ui| {
+                    ui.heading("Unsaved changes");
+                    ui.label("This file has unsaved header changes.");
+                    ui.label("Save them to a new file, keep editing, or discard them.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Keep Editing").clicked() {
+                            keep_editing = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.document
+                                    .as_ref()
+                                    .is_some_and(Document::is_save_as_ready),
+                                egui::Button::new("Save As and Close…"),
+                            )
+                            .clicked()
+                        {
+                            save_and_close = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.document
+                                    .as_ref()
+                                    .is_none_or(|document| document.save_as_job.is_none()),
+                                egui::Button::new("Discard Changes and Close"),
+                            )
+                            .clicked()
+                        {
+                            discard_and_close = true;
+                        }
+                    });
+                });
+            keep_editing |= modal.should_close();
+            if keep_editing {
+                self.keep_editing();
+            } else if save_and_close {
+                self.close_confirmation_open = false;
+                self.close_after_save = true;
+                if !self.choose_save_as() {
+                    self.close_after_save = false;
+                    self.close_confirmation_open = true;
+                }
+            } else if discard_and_close {
+                if let Some(document) = self.document.as_mut() {
+                    document.discard_header_edits();
+                }
+                self.close_confirmation_open = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
         if self.document.as_ref().is_some_and(|document| {
             document.job.is_some()
@@ -717,6 +1062,7 @@ impl eframe::App for QuarryApp {
                 || document.filter_job.is_some()
                 || document.filter_rows_loading()
                 || document.export_job.is_some()
+                || document.save_as_job.is_some()
         }) {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
@@ -780,7 +1126,10 @@ enum Action {
     FirstColumns,
     OpenColumns,
     OpenFilters,
+    ChooseSaveAs,
+    CancelSaveAs,
     ChooseFilteredExport,
+    DiscardChanges,
     Jump,
     FindNext,
     CancelSearch,
@@ -834,7 +1183,11 @@ fn surrender_filter_text_focus(ctx: &egui::Context, filter_rule_count: usize) {
     }
 }
 
-fn selection_copy_requested(ctx: &egui::Context, filter_rule_count: usize) -> bool {
+fn selection_copy_requested(
+    ctx: &egui::Context,
+    filter_rule_count: usize,
+    edited_header: Option<usize>,
+) -> bool {
     let copy_event = ctx.input(|input| {
         input
             .events
@@ -853,9 +1206,14 @@ fn selection_copy_requested(ctx: &egui::Context, filter_rule_count: usize) -> bo
             .into_iter()
             .any(|id| focused == egui::Id::new(id))
                 || is_filter_text_input(focused, filter_rule_count)
+                || edited_header.is_some_and(|column| focused == header_edit_id(column))
         })
     });
     copy_event && !text_input_focused
+}
+
+fn header_edit_id(column: usize) -> egui::Id {
+    egui::Id::new(("quarry-header-edit", column))
 }
 
 fn column_window_controls(ui: &mut egui::Ui, column_start: usize) -> Option<Action> {
@@ -990,7 +1348,7 @@ fn show_column_manager(
                                     "Drag file column {} to reorder",
                                     column.saturating_add(1)
                                 ));
-                                let name = column_name(&document.session, column);
+                                let name = document.column_name(column);
                                 let mut shown = !document.columns.hidden[column];
                                 let checkbox_width = (ui.available_width() - 72.0).max(120.0);
                                 if ui
@@ -1110,7 +1468,7 @@ fn show_filter_manager(
                         if let Ok(column) =
                             parse_file_column(&rule.column_input, document.total_columns)
                         {
-                            ui.label(column_name(&document.session, column));
+                            ui.label(document.column_name(column));
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1215,7 +1573,7 @@ fn show_filter_manager(
                         "{}. file column {} ({}) {} {:?}",
                         index + 1,
                         predicate.column.saturating_add(1),
-                        column_name(&document.session, predicate.column),
+                        document.column_name(predicate.column),
                         filter_operator_label(predicate.operator).to_lowercase(),
                         value
                     ));
@@ -1362,10 +1720,14 @@ fn filtered_export_controls(ui: &mut egui::Ui, document: &Document) -> Option<Ac
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
-                document.is_filtered_export_ready(),
+                document.is_filtered_export_ready() && !document.is_dirty(),
                 egui::Button::new("Export Filtered Rows…"),
             )
-            .on_hover_text("Export all matching rows to a new file")
+            .on_hover_text(if document.is_dirty() {
+                "Save or discard your changes before exporting filtered rows."
+            } else {
+                "Export all matching rows to a new file"
+            })
             .clicked()
         {
             action = Some(Action::ChooseFilteredExport);
@@ -1431,6 +1793,18 @@ fn filtered_export_file_name(source: &Path) -> String {
     match source.extension() {
         Some(extension) => format!("{stem}-filtered.{}", extension.to_string_lossy()),
         None => format!("{stem}-filtered"),
+    }
+}
+
+fn save_as_file_name(source: &Path) -> String {
+    let stem = source
+        .file_stem()
+        .or_else(|| source.file_name())
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "edited".into());
+    match source.extension() {
+        Some(extension) => format!("{stem}-edited.{}", extension.to_string_lossy()),
+        None => format!("{stem}-edited"),
     }
 }
 
@@ -1602,6 +1976,9 @@ struct Document {
     export_progress: Option<FilterExportProgress>,
     export_status: Option<String>,
     export_cancel_requested: bool,
+    save_as_job: Option<SaveAsJob>,
+    save_as_status: Option<String>,
+    save_as_cancel_requested: bool,
     filter_viewport_start: u64,
     filter_buffer_start: u64,
     filtered_rows: Vec<FilterMatch>,
@@ -1610,6 +1987,8 @@ struct Document {
     reveal_cell: Option<(u64, usize)>,
     selection: Option<GridSelection>,
     headers: Vec<String>,
+    header_renames: BTreeMap<usize, String>,
+    header_edit: Option<HeaderEdit>,
     total_columns: usize,
     columns: ColumnView,
     data_start: u64,
@@ -1620,6 +1999,13 @@ struct Document {
     scroll_points: f32,
     last_viewport_read: Option<Duration>,
     last_poll: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeaderEdit {
+    column: usize,
+    draft: String,
+    focus_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1696,6 +2082,9 @@ impl Document {
             export_progress: None,
             export_status: None,
             export_cancel_requested: false,
+            save_as_job: None,
+            save_as_status: None,
+            save_as_cancel_requested: false,
             filter_viewport_start: 0,
             filter_buffer_start: 0,
             filtered_rows: Vec::new(),
@@ -1704,6 +2093,8 @@ impl Document {
             reveal_cell: None,
             selection: None,
             headers,
+            header_renames: BTreeMap::new(),
+            header_edit: None,
             total_columns,
             columns,
             data_start,
@@ -1758,6 +2149,7 @@ impl Document {
         if !self.is_search_ready() {
             return Err("Search is available after indexing completes.".into());
         }
+        self.commit_header_edit();
         if self.search_query != query {
             self.search_query.clear();
             self.search_query.extend_from_slice(query);
@@ -1964,6 +2356,13 @@ impl Document {
     }
 
     fn start_filtered_export(&mut self, destination: PathBuf) -> Result<(), String> {
+        if self.save_as_job.is_some() {
+            return Err("Cancel the active Save As before exporting filtered rows.".into());
+        }
+        self.commit_header_edit();
+        if self.is_dirty() {
+            return Err("Save or discard your changes before exporting filtered rows.".into());
+        }
         if self.export_job.is_some() {
             return Err("A filtered export is already running.".into());
         }
@@ -2053,9 +2452,72 @@ impl Document {
         self.filter_query.is_some()
             && self.filter_job.is_none()
             && self.export_job.is_none()
+            && self.save_as_job.is_none()
             && self
                 .filter_progress
                 .is_some_and(|progress| progress.done && !progress.cancelled)
+    }
+
+    fn is_save_as_ready(&self) -> bool {
+        self.is_dirty() && self.save_as_job.is_none() && self.export_job.is_none()
+    }
+
+    fn start_save_as(&mut self, destination: PathBuf) -> Result<(), String> {
+        if self.save_as_job.is_some() {
+            return Err("A Save As operation is already running.".into());
+        }
+        if self.export_job.is_some() {
+            return Err("Cancel the active export before using Save As.".into());
+        }
+        self.commit_header_edit();
+        if !self.is_dirty() {
+            return Err("Rename a header before using Save As.".into());
+        }
+        let renames = self
+            .header_renames
+            .iter()
+            .map(|(column, name)| (*column, name.as_bytes().to_vec()))
+            .collect();
+        let job = self
+            .session
+            .start_save_as_with_header_renames(renames, destination)
+            .map_err(|error| error.to_string())?;
+        self.save_as_job = Some(job);
+        self.save_as_status = Some("Saving edited file…".into());
+        self.save_as_cancel_requested = false;
+        Ok(())
+    }
+
+    fn poll_save_as(&mut self) -> Result<Option<PathBuf>, String> {
+        let Some(job) = self.save_as_job.as_ref() else {
+            return Ok(None);
+        };
+        let progress = job.progress();
+        if !progress.done {
+            return Ok(None);
+        }
+
+        let job = self.save_as_job.take().expect("Save As job is present");
+        self.save_as_cancel_requested = false;
+        match job.wait() {
+            Ok(SaveAsOutcome::Complete(summary)) => Ok(Some(summary.destination)),
+            Ok(SaveAsOutcome::Cancelled) => {
+                self.save_as_status = Some("Save As cancelled. No output file was created.".into());
+                Ok(None)
+            }
+            Err(error) => {
+                self.save_as_status = Some("Save As failed. No output file was created.".into());
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn cancel_save_as(&mut self) {
+        if let Some(job) = &self.save_as_job {
+            job.cancel();
+            self.save_as_cancel_requested = true;
+            self.save_as_status = Some("Cancelling Save As…".into());
+        }
     }
 
     fn cancel_filter(&self) {
@@ -2160,6 +2622,7 @@ impl Document {
     }
 
     fn center_column(&mut self, column: usize) {
+        self.commit_header_edit();
         self.ensure_column_count(column.saturating_add(1));
         self.columns.view(column);
         self.refresh_column_headers();
@@ -2167,6 +2630,7 @@ impl Document {
     }
 
     fn view_column(&mut self, column: usize) -> Result<(), String> {
+        self.commit_header_edit();
         self.validate_column(column)?;
         self.columns.view(column);
         self.refresh_column_headers();
@@ -2176,6 +2640,7 @@ impl Document {
     }
 
     fn set_column_shown(&mut self, column: usize, shown: bool) -> Result<(), String> {
+        self.commit_header_edit();
         self.validate_column(column)?;
         self.columns.set_shown(column, shown);
         self.refresh_column_headers();
@@ -2191,6 +2656,7 @@ impl Document {
     }
 
     fn move_column(&mut self, column: usize, position: usize) -> Result<(), String> {
+        self.commit_header_edit();
         self.validate_column(column)?;
         if position >= self.total_columns {
             return Err(format!(
@@ -2205,6 +2671,7 @@ impl Document {
     }
 
     fn show_first_columns(&mut self) {
+        self.commit_header_edit();
         self.columns.first();
         self.refresh_column_headers();
         self.reveal_cell = self
@@ -2217,6 +2684,7 @@ impl Document {
     }
 
     fn reset_columns(&mut self) {
+        self.commit_header_edit();
         self.columns.reset();
         self.refresh_column_headers();
         self.reveal_cell = self
@@ -2236,7 +2704,107 @@ impl Document {
     }
 
     fn refresh_column_headers(&mut self) {
-        self.headers = headers_for(&self.session, &self.columns.visible);
+        self.headers = self
+            .columns
+            .visible
+            .iter()
+            .map(|column| self.column_name(*column))
+            .collect();
+    }
+
+    fn column_name(&self, column: usize) -> String {
+        self.header_renames
+            .get(&column)
+            .map(|name| field_text(name.as_bytes()))
+            .unwrap_or_else(|| column_name(&self.session, column))
+    }
+
+    fn header_is_editable(&self, column: usize) -> bool {
+        self.save_as_job.is_none()
+            && self.export_job.is_none()
+            && self.search_job.is_none()
+            && self.source_header_name(column).is_some()
+    }
+
+    fn source_header_name(&self, column: usize) -> Option<&str> {
+        if !self.session.dialect.has_header {
+            return None;
+        }
+        let field = self.session.first_rows.first()?.fields.get(column)?;
+        let name = std::str::from_utf8(field).ok()?;
+        Some(if column == 0 {
+            name.strip_prefix('\u{feff}').unwrap_or(name)
+        } else {
+            name
+        })
+    }
+
+    fn begin_header_edit(&mut self, column: usize) {
+        if !self.header_is_editable(column) {
+            return;
+        }
+        if let Some(source_name) = self.source_header_name(column) {
+            let draft = self
+                .header_renames
+                .get(&column)
+                .cloned()
+                .unwrap_or_else(|| source_name.to_owned());
+            self.commit_header_edit();
+            self.header_edit = Some(HeaderEdit {
+                column,
+                draft,
+                focus_requested: true,
+            });
+        }
+    }
+
+    fn rename_header(&mut self, column: usize, name: String) -> Result<(), String> {
+        if self.save_as_job.is_some() {
+            return Err("Wait for Save As to finish before editing headers.".into());
+        }
+        if self.export_job.is_some() {
+            return Err("Wait for the filtered export to finish before editing headers.".into());
+        }
+        if self.search_job.is_some() {
+            return Err("Wait for the search to finish before editing headers.".into());
+        }
+        if !self.header_is_editable(column) {
+            return Err("Only columns in the source header row can be renamed.".into());
+        }
+        if name.as_bytes()
+            == self
+                .source_header_name(column)
+                .expect("editable header has source text")
+                .as_bytes()
+        {
+            self.header_renames.remove(&column);
+        } else {
+            self.header_renames.insert(column, name);
+        }
+        self.refresh_column_headers();
+        Ok(())
+    }
+
+    fn commit_header_edit(&mut self) {
+        if self.save_as_job.is_some() {
+            return;
+        }
+        if let Some(edit) = self.header_edit.take() {
+            let _ = self.rename_header(edit.column, edit.draft);
+        }
+    }
+
+    fn discard_header_edits(&mut self) {
+        if self.save_as_job.is_some() {
+            return;
+        }
+        self.header_edit = None;
+        self.header_renames.clear();
+        self.refresh_column_headers();
+    }
+
+    fn is_dirty(&self) -> bool {
+        !self.header_renames.is_empty()
     }
 
     fn validate_column(&self, column: usize) -> Result<(), String> {
@@ -2270,6 +2838,11 @@ impl Document {
 
     fn shutdown(&mut self) {
         self.stop_filter_read();
+        if let Some(job) = self.save_as_job.take() {
+            job.cancel();
+            drop(job);
+        }
+        self.save_as_cancel_requested = false;
         if let Some(job) = self.export_job.take() {
             job.cancel();
             drop(job);
@@ -2922,11 +3495,15 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
 
 fn show_table(
     ui: &mut egui::Ui,
-    document: &Document,
+    document: &mut Document,
     reveal_cell: Option<(u64, usize)>,
 ) -> Option<GridSelection> {
     let row_count = document.visible_row_count();
     let mut clicked_selection = None;
+    let mut active_header_edit = document.header_edit.take();
+    let mut begin_header_edit = None;
+    let mut commit_header_edit = false;
+    let mut cancel_header_edit = false;
     ui.horizontal(|ui| {
         if let Some(message) = document.filter_empty_message(row_count) {
             ui.heading(message);
@@ -3013,7 +3590,13 @@ fn show_table(
                             );
                         });
                     });
-                    for (column, name) in document.columns.visible.iter().zip(&document.headers) {
+                    for (column, name) in document
+                        .columns
+                        .visible
+                        .iter()
+                        .copied()
+                        .zip(document.headers.iter())
+                    {
                         header.col(|ui| {
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
@@ -3028,10 +3611,68 @@ fn show_table(
                                     .halign(Align::Center)
                                     .truncate(),
                                 );
-                                ui.add_sized(
-                                    [width, 17.0],
-                                    egui::Label::new(RichText::new(name).strong()).truncate(),
-                                );
+                                if let Some(edit) = active_header_edit
+                                    .as_mut()
+                                    .filter(|edit| edit.column == column)
+                                {
+                                    let response = ui.add_sized(
+                                        [width, 17.0],
+                                        egui::TextEdit::singleline(&mut edit.draft)
+                                            .id(header_edit_id(column))
+                                            .margin(egui::Margin::ZERO),
+                                    );
+                                    let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                        node.set_label(format!(
+                                            "New name for file column {}",
+                                            column.saturating_add(1)
+                                        ));
+                                    });
+                                    if edit.focus_requested {
+                                        response.request_focus();
+                                        edit.focus_requested = false;
+                                    }
+                                    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                                        cancel_header_edit = true;
+                                    } else if (response.has_focus()
+                                        && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                                        || response.lost_focus()
+                                    {
+                                        commit_header_edit = true;
+                                    }
+                                } else {
+                                    let editable = document.header_is_editable(column);
+                                    let response = ui.add_sized(
+                                        [width, 17.0],
+                                        egui::Label::new(RichText::new(name).strong())
+                                            .truncate()
+                                            .sense(if editable {
+                                                egui::Sense::click()
+                                            } else {
+                                                egui::Sense::hover()
+                                            }),
+                                    );
+                                    if editable {
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::Button,
+                                                ui.is_enabled(),
+                                                format!(
+                                                    "Rename file column {} ({name})",
+                                                    column.saturating_add(1)
+                                                ),
+                                            )
+                                        });
+                                        let activate = response.clicked()
+                                            || (response.has_focus()
+                                                && ui.input(|input| {
+                                                    input.key_pressed(egui::Key::Enter)
+                                                }));
+                                        response.on_hover_text("Click to rename");
+                                        if activate {
+                                            begin_header_edit = Some(column);
+                                        }
+                                    }
+                                }
                             });
                         });
                     }
@@ -3136,6 +3777,20 @@ fn show_table(
                     });
                 });
         });
+
+    if cancel_header_edit {
+        active_header_edit = None;
+    } else if commit_header_edit && let Some(edit) = active_header_edit.take() {
+        let _ = document.rename_header(edit.column, edit.draft);
+    }
+    if let Some(column) = begin_header_edit {
+        if let Some(edit) = active_header_edit.take() {
+            let _ = document.rename_header(edit.column, edit.draft);
+        }
+        document.begin_header_edit(column);
+    } else {
+        document.header_edit = active_header_edit;
+    }
     clicked_selection
 }
 
@@ -3310,8 +3965,8 @@ mod tests {
         Session, column_drop_position, column_window_controls, copy_control,
         filtered_export_controls, filtered_export_file_name, logical_viewport_start,
         max_viewport_start, page_controls, parse_column_position, parse_data_row,
-        parse_file_column, row_for_scroll_fraction, scroll_fraction_for_row, search_controls,
-        selection_text, show_column_manager, show_filter_manager, show_grid,
+        parse_file_column, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
+        search_controls, selection_text, show_column_manager, show_filter_manager, show_grid,
     };
 
     fn click_accessible_button(
@@ -3856,7 +4511,7 @@ mod tests {
                     ..grid_input()
                 },
                 |ctx| {
-                    selection_copy = super::selection_copy_requested(ctx, rules.len());
+                    selection_copy = super::selection_copy_requested(ctx, rules.len(), None);
                 },
             );
             assert!(!selection_copy);
@@ -3995,6 +4650,354 @@ mod tests {
     }
 
     #[test]
+    fn header_renames_keep_lossless_source_identity_and_clear_when_restored() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-header-rename-{name}.csv"));
+        let long_header = "x".repeat(140);
+        let source = format!("\"line\nname\",,{long_header}\nfirst,second,third\n");
+        fs::write(&path, source.as_bytes()).unwrap();
+        let mut document = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(document.source_header_name(0), Some("line\nname"));
+        assert_eq!(document.source_header_name(1), Some(""));
+        assert_eq!(document.source_header_name(2), Some(long_header.as_str()));
+        assert!(document.column_name(2).ends_with("..."));
+
+        document.begin_header_edit(0);
+        assert_eq!(
+            document
+                .header_edit
+                .as_ref()
+                .map(|edit| edit.draft.as_str()),
+            Some("line\nname")
+        );
+        document.header_edit.as_mut().unwrap().draft = "renamed".into();
+        document.move_column(0, 2).unwrap();
+        assert!(document.is_dirty());
+        assert_eq!(document.column_name(0), "renamed");
+
+        document.set_column_shown(0, false).unwrap();
+        document.set_column_shown(0, true).unwrap();
+        assert_eq!(document.column_name(0), "renamed");
+        assert_eq!(
+            document.header_renames.get(&0).map(String::as_str),
+            Some("renamed")
+        );
+
+        document.rename_header(0, "line\nname".into()).unwrap();
+        assert!(!document.is_dirty());
+        document.rename_header(1, "Column 2".into()).unwrap();
+        assert!(document.is_dirty());
+        document.rename_header(1, String::new()).unwrap();
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read(&path).unwrap(), source.as_bytes());
+
+        document.shutdown();
+        let mut no_header = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(!no_header.header_is_editable(0));
+        no_header.begin_header_edit(0);
+        assert!(no_header.header_edit.is_none());
+        assert_eq!(
+            no_header.rename_header(0, "renamed".into()).unwrap_err(),
+            "Only columns in the source header row can be renamed."
+        );
+        no_header.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accessible_header_editor_commits_cancels_and_keeps_copy_in_the_editor() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-header-editor-{name}.csv"));
+        fs::write(&path, b"name,value\nfirst,1\n").unwrap();
+        let mut document = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        document.selection = Some(GridSelection::Cell { row: 1, column: 0 });
+
+        let (ctx, _) = click_grid_control("Rename file column 1 (name)", &mut document);
+        assert_eq!(document.header_edit.as_ref().unwrap().column, 0);
+        document.header_edit.as_mut().unwrap().draft = "renamed".into();
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::TextInput
+                && node.label() == Some("New name for file column 1")
+        }));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert!(document.header_edit.is_none());
+        assert_eq!(document.column_name(0), "renamed");
+
+        let _ = click_grid_control("Rename file column 1 (renamed)", &mut document);
+        document.header_edit.as_mut().unwrap().draft = "cancelled".into();
+        let _ = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert!(document.header_edit.is_none());
+        assert_eq!(document.column_name(0), "renamed");
+
+        document.begin_header_edit(0);
+        let mut selection_copy = true;
+        let _ = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+                selection_copy = super::selection_copy_requested(ctx, 0, Some(0));
+            },
+        );
+        assert!(!selection_copy);
+
+        document.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dirty_lifecycle_blocks_loss_and_save_as_reopens_the_edited_copy() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source = std::env::temp_dir().join(format!("quarry-save-as-ui-{name}.csv"));
+        let other = std::env::temp_dir().join(format!("quarry-save-as-ui-{name}-other.csv"));
+        let unopenable = std::env::temp_dir().join(format!("quarry-save-as-ui-{name}-removed.csv"));
+        let destination = std::env::temp_dir().join(format!("quarry-save-as-ui-{name}-edited.csv"));
+        let source_bytes = b"name,value\nfirst,1\n";
+        fs::write(&source, source_bytes).unwrap();
+        fs::write(&other, b"other,value\nsecond,2\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(source.clone()).unwrap();
+        let document = app.document.as_mut().unwrap();
+        document.rename_header(0, "renamed".into()).unwrap();
+        let ctx = egui::Context::default();
+        let mut close_input = grid_input();
+        close_input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let close_output = ctx.run(close_input, |ctx| app.intercept_dirty_close(ctx));
+        assert!(app.close_confirmation_open);
+        assert!(
+            close_output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .unwrap()
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
+        );
+        app.close_after_save = true;
+        app.keep_editing();
+        assert!(!app.close_confirmation_open);
+        assert!(!app.close_after_save);
+        assert_eq!(
+            app.open_path(other.clone()).unwrap_err(),
+            "Discard or save your changes before opening another file."
+        );
+        app.handle_dropped_paths(vec![Some(other.clone())]);
+        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
+        assert_eq!(
+            app.document
+                .as_mut()
+                .unwrap()
+                .start_filtered_export(destination.clone())
+                .unwrap_err(),
+            "Save or discard your changes before exporting filtered rows."
+        );
+
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_save_as(unopenable.clone())
+            .unwrap();
+        let mut saving_close_input = grid_input();
+        saving_close_input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let saving_close_output = ctx.run(saving_close_input, |ctx| app.intercept_dirty_close(ctx));
+        assert!(app.close_after_save);
+        assert!(!app.close_confirmation_open);
+        assert!(
+            saving_close_output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .unwrap()
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
+        );
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(
+            document.rename_header(1, "amount".into()).unwrap_err(),
+            "Wait for Save As to finish before editing headers."
+        );
+        document.discard_header_edits();
+        assert!(document.is_dirty());
+        assert_eq!(
+            app.open_path(other.clone()).unwrap_err(),
+            "Cancel the active Save As before opening another file."
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .document
+            .as_ref()
+            .unwrap()
+            .save_as_job
+            .as_ref()
+            .unwrap()
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline, "Save As timed out");
+            std::thread::yield_now();
+        }
+        fs::remove_file(&unopenable).unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert!(app.close_confirmation_open);
+        assert!(!app.close_after_save);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), source);
+        assert!(document.is_dirty());
+        assert!(document.save_as_status.is_none());
+
+        app.close_confirmation_open = false;
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_save_as(destination.clone())
+            .unwrap();
+        app.close_after_save = true;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .document
+            .as_ref()
+            .unwrap()
+            .save_as_job
+            .as_ref()
+            .unwrap()
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline, "Save As timed out");
+            std::thread::yield_now();
+        }
+        let saved_output = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert!(
+            saved_output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .unwrap()
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Close))
+        );
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), destination);
+        assert_eq!(document.column_name(0), "renamed");
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&destination).unwrap(), b"renamed,value\nfirst,1\n");
+        assert_eq!(
+            save_as_file_name(Path::new("report.csv")),
+            "report-edited.csv"
+        );
+
+        app.document.as_mut().unwrap().shutdown();
+        for path in [source, other, destination] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn filtered_export_reports_success_and_never_overwrites() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4020,6 +5023,10 @@ mod tests {
         finish_filter(&mut document);
 
         document.start_filtered_export(destination.clone()).unwrap();
+        assert_eq!(
+            document.rename_header(0, "renamed".into()).unwrap_err(),
+            "Wait for the filtered export to finish before editing headers."
+        );
         assert_eq!(
             document.clear_filter().unwrap_err(),
             "Cancel the active export before clearing filters."
@@ -5009,6 +6016,11 @@ mod tests {
         document.set_visible_rows(5).unwrap();
 
         document.start_find_next(b"needle").unwrap();
+        assert!(!document.header_is_editable(0));
+        assert_eq!(
+            document.rename_header(0, "renamed".into()).unwrap_err(),
+            "Wait for the search to finish before editing headers."
+        );
         finish_search(&mut document);
         let first = document.last_match.as_ref().unwrap();
         assert_eq!((first.row, first.column), (25, 2));
