@@ -378,6 +378,12 @@ impl Session {
             SaveTarget::Source(self.source_stamp.clone()),
             DEFAULT_EXPORT_CONFIG,
         )
+        .map_err(|error| match error {
+            QuarryError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+                QuarryError::SourceChanged
+            }
+            error => error,
+        })
     }
 }
 

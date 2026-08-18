@@ -199,6 +199,11 @@ rejected with guidance to use Save As. Cancellation observed before publication
 or a write failure removes temporary output without Quarry replacing the source
 or clobbering an existing destination.
 
+Rename-based Save preserves standard permission bits but does not explicitly
+preserve ownership, ACLs, extended attributes or resource forks, or hard-link
+identity; other hard links retain the old contents. The final source-stamp check
+narrows, but does not eliminate, the race before replacement.
+
 After a successful Save or Save As publication, Quarry opens the published file
 as the current source and rebuilds offset-dependent indexes before clearing
 dirty state. If an in-place Save succeeds but reloading fails, Quarry removes

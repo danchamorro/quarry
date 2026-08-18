@@ -763,17 +763,16 @@ impl eframe::App for QuarryApp {
                     {
                         action = Some(Action::Reopen);
                     }
-                    if let Some(document) = self.document.as_ref() {
-                        if ui
+                    if let Some(document) = self.document.as_ref()
+                        && ui
                             .add_enabled(document.is_save_ready(), egui::Button::new("Save"))
                             .on_hover_text("Save changes to this file (⌘S)")
                             .on_disabled_hover_text(
                                 "Make a change, or wait for the active file operation to finish.",
                             )
                             .clicked()
-                        {
-                            action = Some(Action::Save);
-                        }
+                    {
+                        action = Some(Action::Save);
                     }
                     if let Some(document) = self
                         .document
@@ -5221,6 +5220,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("quarry-save-conflict-{name}.csv"));
+        let moved = path.with_extension("moved.csv");
         fs::write(&path, b"name,value\nfirst,1\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
@@ -5231,7 +5231,7 @@ mod tests {
             .unwrap()
             .rename_header(0, "renamed".into())
             .unwrap();
-        fs::write(&path, b"name,value\nexternal,2\n").unwrap();
+        fs::rename(&path, &moved).unwrap();
 
         assert!(!app.save_current());
         let document = app.document.as_ref().unwrap();
@@ -5251,11 +5251,12 @@ mod tests {
         );
 
         app.apply(&ctx, Action::DiscardChanges);
+        fs::rename(&moved, &path).unwrap();
         app.reopen_document();
         let document = app.document.as_ref().unwrap();
         assert!(!document.source_changed);
         assert!(!document.is_dirty());
-        assert_eq!(document.session.first_rows[1].fields[0], b"external");
+        assert_eq!(document.session.first_rows[1].fields[0], b"first");
 
         app.document.as_mut().unwrap().shutdown();
         fs::remove_file(path).unwrap();

@@ -150,8 +150,6 @@ Contains/equality filters, multiple AND predicates, incremental results, filtere
   evidence in the
   [filtered-export validation](benchmarks/2026-08-16-filtered-export.md).
 
-**Next:** extend the same editing model from headers to cells.
-
 **Phase 4 exit met:** multiple predicates and filtered export remain practical
 on the 12 GB reference file while memory stays bounded and the source stays
 unchanged.
@@ -161,6 +159,8 @@ unchanged.
 Edit values where they appear in the grid. Keep committed edits as sparse
 unsaved document state until an explicit Save or Save As. Begin with inline
 header rename, then extend the same model to cells and column transformations.
+
+**Next:** extend the same editing model from headers to cells.
 
 ### Phase 5 checklist
 
