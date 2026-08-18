@@ -111,8 +111,8 @@ match, and at most a 64 MiB clipboard payload.
 cache remains deferred.
 
 Unsaved edits use a sparse overlay whose memory grows with the number and size
-of user edits, not with source-file size. The first header-rename slice is
-bounded by the known columns and the existing record-size limit.
+of user edits, not with source-file size. Save As enforces the existing maximum
+record size against the fully serialized edited header before publication.
 
 ## Concurrency
 Rust workers currently handle indexing, literal search, filtering, filtered
