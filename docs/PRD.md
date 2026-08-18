@@ -43,8 +43,9 @@ Column controls operate on stable source-column identities. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
 
-Phase 5 has delivered direct in-grid header rename, unsaved document state, and
-safe Save and Save As. Direct cell editing is next. Disk-aware sorting remains
+Phase 5 has delivered direct in-grid header rename, unsaved document state,
+atomic Save with metadata-based conflict detection, and no-clobber Save As.
+Direct cell editing is next. Disk-aware sorting remains
 a candidate if it does not delay the core milestone.
 
 Not required: general-purpose text-editor behavior, formulas, charts, database
