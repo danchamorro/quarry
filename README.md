@@ -68,8 +68,10 @@ once, builds a bounded adaptive match index, and serves bounded filtered row
 ranges through cancellable reads without retaining every matching row. Safe,
 cancellable streaming export passed the 1 GB and 12 GB validation. Phase 5
 is in progress. Existing headers can now be renamed directly in the grid, with
-safe Save As to a new file. The original source remains unchanged. Save back
-to the current file and direct cell editing are next.
+atomic Save plus metadata-based conflict detection and no-clobber Save As. Save
+replaces the current regular file only after a same-directory temporary file is
+flushed and synced; Save As leaves the previous source unchanged. Direct cell
+editing is next.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv

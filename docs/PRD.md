@@ -43,10 +43,10 @@ Column controls operate on stable source-column identities. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
 
-Phase 5 has delivered direct in-grid header rename, unsaved document state, and
-Save As to a new file. Next: Save back to the current file, then direct cell
-editing. Disk-aware sorting remains a candidate if it does not delay the core
-milestone.
+Phase 5 has delivered direct in-grid header rename, unsaved document state,
+atomic Save with metadata-based conflict detection, and no-clobber Save As.
+Direct cell editing is next. Disk-aware sorting remains
+a candidate if it does not delay the core milestone.
 
 Not required: general-purpose text-editor behavior, formulas, charts, database
 connectivity, plugins, cloud sync, collaboration, direct in-place byte
@@ -56,14 +56,17 @@ mutation, or EmEditor feature parity.
 
 Edit headers and cells directly in the grid. The first slice renames an
 existing header and records the change as sparse unsaved document state keyed
-by stable source-column identity, with Save As to a new file. Later slices add
-Save to the current file, direct cell editing, split/join, rename/reorder/drop,
-find/replace, transformed filtered output, and safe streaming full-file output.
+by stable source-column identity, with Save and Save As. Later slices add direct
+cell editing, split/join, rename/reorder/drop, find/replace, transformed
+filtered output, and safe streaming full-file output.
 
 Save As writes a selected destination, leaves the previous source unchanged,
-and makes the new file current only after success. The planned Save operation
-will write the current document back to its active path. Neither operation
-writes records in place.
+and makes the new file current only after success. Save writes through a
+same-directory temporary file, preserves standard file permissions, rejects
+the Save when a metadata-visible source change is found at startup or
+immediately before replacement, flushes and syncs, then atomically replaces the
+current regular file. Final-path symbolic links require Save As. Neither
+operation mutates records in place.
 
 ## Progressive opening
 1. Open the file and sample a bounded region.
@@ -91,11 +94,12 @@ Every benchmark must identify hardware, OS, dataset, build mode, and cache state
 ## Reliability and safety
 
 Opening and editing never modify source bytes. Committed edits remain unsaved
-document state until Save As succeeds or the planned Save operation is added.
-Save As streams through temporary output, flushes and syncs before publication,
-and preserves existing files after cancellation or failure. Save must provide
-the same guarantees. Opening, reopening, or closing a changed document requires
-an explicit save or discard decision.
+document state until Save or Save As succeeds. Both operations stream through
+temporary output and flush and sync it before publication. Cancellation or
+failure before publication removes Quarry's temporary output without Quarry
+replacing the current file or clobbering an existing destination. Opening,
+reopening, or closing a changed document requires an explicit save or discard
+decision.
 
 ## Accessibility
 The selected UI must preserve keyboard navigation, VoiceOver, focus behavior,

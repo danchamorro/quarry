@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,7 +13,7 @@ use memchr::{memchr, memmem::Finder};
 use quarry_delimited::{RecordScanner, parse_record};
 
 use crate::filter::{FilterQuery, matching_fields, validate_query};
-use crate::{DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session};
+use crate::{DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session, SourceStamp};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -224,6 +226,11 @@ pub struct SaveAsJob {
     handle: Option<JoinHandle<Result<SaveAsOutcome, QuarryError>>>,
 }
 
+enum SaveTarget {
+    New(PathBuf),
+    Source(SourceStamp),
+}
+
 impl SaveAsJob {
     fn start(
         source_path: PathBuf,
@@ -231,7 +238,7 @@ impl SaveAsJob {
         delimiter: u8,
         has_header: bool,
         header_renames: BTreeMap<usize, Vec<u8>>,
-        destination: PathBuf,
+        target: SaveTarget,
         config: ExportConfig,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
@@ -243,7 +250,12 @@ impl SaveAsJob {
             ));
         }
         let source = File::open(&source_path)?;
-        let output = ExportTarget::new(&source_path, destination)?;
+        let output = match target {
+            SaveTarget::New(destination) => ExportTarget::new(&source_path, destination)?,
+            SaveTarget::Source(expected) => {
+                ExportTarget::replace_source(&source_path, source.metadata()?, expected)?
+            }
+        };
         let shared = Arc::new(SharedState::new(file_size));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -348,21 +360,79 @@ impl Session {
             self.dialect.delimiter,
             self.dialect.has_header,
             header_renames,
-            destination.as_ref().to_path_buf(),
+            SaveTarget::New(destination.as_ref().to_path_buf()),
             DEFAULT_EXPORT_CONFIG,
         )
     }
+
+    pub fn start_save_with_header_renames(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+    ) -> Result<SaveAsJob, QuarryError> {
+        SaveAsJob::start(
+            self.path.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.dialect.has_header,
+            header_renames,
+            SaveTarget::Source(self.source_stamp.clone()),
+            DEFAULT_EXPORT_CONFIG,
+        )
+        .map_err(|error| match error {
+            QuarryError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+                QuarryError::SourceChanged
+            }
+            error => error,
+        })
+    }
+}
+
+enum Publication {
+    CreateNew,
+    ReplaceSource {
+        permissions: fs::Permissions,
+        source_stamp: SourceStamp,
+    },
 }
 
 struct ExportTarget {
     writer: Option<BufWriter<File>>,
     temporary: PathBuf,
     destination: PathBuf,
+    publication: Publication,
 }
 
 impl ExportTarget {
     fn new(source: &Path, destination: PathBuf) -> Result<Self, QuarryError> {
         validate_destination(source, &destination)?;
+        Self::create(destination, Publication::CreateNew)
+    }
+
+    fn replace_source(
+        source: &Path,
+        metadata: fs::Metadata,
+        expected: SourceStamp,
+    ) -> Result<Self, QuarryError> {
+        let path_metadata = fs::symlink_metadata(source)?;
+        if path_metadata.file_type().is_symlink() {
+            return Err(QuarryError::InvalidOption(
+                "saving through a symbolic link is not supported; use Save As instead",
+            ));
+        }
+        let source_stamp = SourceStamp::from_metadata(&metadata);
+        if SourceStamp::from_metadata(&path_metadata) != expected || source_stamp != expected {
+            return Err(QuarryError::SourceChanged);
+        }
+        Self::create(
+            source.to_path_buf(),
+            Publication::ReplaceSource {
+                permissions: metadata.permissions(),
+                source_stamp,
+            },
+        )
+    }
+
+    fn create(destination: PathBuf, publication: Publication) -> Result<Self, QuarryError> {
         let parent = destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -370,19 +440,29 @@ impl ExportTarget {
         destination.file_name().ok_or(QuarryError::InvalidOption(
             "export destination must name a file",
         ))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Publication::ReplaceSource { permissions, .. } = &publication {
+            options.mode(permissions.mode());
+        }
         for _ in 0..100 {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let temporary = parent.join(format!(".quarry-export-{}-{id}.tmp", std::process::id()));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-            {
+            match options.open(&temporary) {
                 Ok(file) => {
+                    if let Publication::ReplaceSource { permissions, .. } = &publication
+                        && let Err(error) = file.set_permissions(permissions.clone())
+                    {
+                        drop(file);
+                        let _ = fs::remove_file(&temporary);
+                        return Err(error.into());
+                    }
                     return Ok(Self {
                         writer: Some(BufWriter::new(file)),
                         temporary,
                         destination,
+                        publication,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -413,12 +493,34 @@ impl ExportTarget {
         let mut writer = self.writer.take().expect("export writer is present");
         writer.flush()?;
         let file = writer.into_inner().map_err(|error| error.into_error())?;
+        if let Publication::ReplaceSource { permissions, .. } = &self.publication {
+            file.set_permissions(permissions.clone())?;
+        }
         file.sync_all()?;
+        drop(file);
         if cancel_requested.load(Ordering::Acquire) {
             self.remove_temporary()?;
             return Ok(FilterExportOutcome::Cancelled);
         }
-        if let Err(error) = publish_no_replace(&self.temporary, &self.destination) {
+        let publish_result = match &self.publication {
+            Publication::CreateNew => publish_no_replace(&self.temporary, &self.destination),
+            Publication::ReplaceSource { source_stamp, .. } => {
+                let unchanged = fs::symlink_metadata(&self.destination)
+                    .ok()
+                    .filter(|metadata| !metadata.file_type().is_symlink())
+                    .is_some_and(|metadata| SourceStamp::from_metadata(&metadata) == *source_stamp);
+                if !unchanged {
+                    self.remove_temporary()?;
+                    return Err(QuarryError::SourceChanged);
+                }
+                if cancel_requested.load(Ordering::Acquire) {
+                    self.remove_temporary()?;
+                    return Ok(FilterExportOutcome::Cancelled);
+                }
+                fs::rename(&self.temporary, &self.destination)
+            }
+        };
+        if let Err(error) = publish_result {
             self.remove_temporary()?;
             return Err(if error.kind() == io::ErrorKind::AlreadyExists {
                 QuarryError::ExportDestinationExists
@@ -992,6 +1094,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs::{self, File};
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
@@ -999,7 +1103,7 @@ mod tests {
 
     use super::{
         ExportConfig, ExportTarget, FilterExportJob, FilterExportOutcome, SaveAsJob, SaveAsOutcome,
-        SharedState, WorkerCompletion,
+        SaveTarget, SharedState, WorkerCompletion,
     };
     use crate::{FilterOperator, FilterQuery, HeaderMode, OpenOptions, QuarryError, Session};
 
@@ -1092,7 +1196,7 @@ mod tests {
             b';',
             true,
             renames,
-            destination.clone(),
+            SaveTarget::New(destination.clone()),
             ExportConfig {
                 chunk_bytes: 3,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
@@ -1118,6 +1222,144 @@ mod tests {
         assert!(temporary_exports(&destination).is_empty());
         fs::remove_file(&source).unwrap();
         fs::remove_file(destination).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn save_replaces_the_source_and_preserves_permissions() {
+        let source = fixture(b"id,name\n1,Ada\n");
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+            let metadata = File::open(&source).unwrap().metadata().unwrap();
+            let stamp = crate::SourceStamp::from_metadata(&metadata);
+            let output = ExportTarget::replace_source(&source, metadata, stamp).unwrap();
+            assert_eq!(
+                fs::metadata(&output.temporary)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+            output.discard().unwrap();
+        }
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = session
+            .start_save_with_header_renames(BTreeMap::from([(1, b"person".to_vec())]))
+            .unwrap();
+
+        wait_until_save_done(&job);
+        let SaveAsOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("save unexpectedly cancelled");
+        };
+        assert_eq!(summary.destination, source);
+        assert_eq!(fs::read(&source).unwrap(), b"id,person\n1,Ada\n");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(temporary_exports(&source).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn failed_save_preserves_the_source_and_removes_its_temporary_file() {
+        let source_bytes = b"id,name\n1,Ada\n";
+        let source = fixture(source_bytes);
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = session
+            .start_save_with_header_renames(BTreeMap::from([(2, b"missing".to_vec())]))
+            .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::InvalidOption(
+                "header rename column is out of range"
+            ))
+        ));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(temporary_exports(&source).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn cancelled_save_before_publication_preserves_the_source() {
+        let source = fixture(b"original");
+        let metadata = File::open(&source).unwrap().metadata().unwrap();
+        let stamp = crate::SourceStamp::from_metadata(&metadata);
+        let mut output = ExportTarget::replace_source(&source, metadata, stamp).unwrap();
+        assert_eq!(output.temporary.parent(), source.parent());
+        output.write_all(b"replacement").unwrap();
+
+        assert_eq!(
+            output.publish(0, 11, &AtomicBool::new(true)).unwrap(),
+            FilterExportOutcome::Cancelled
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"original");
+        assert!(temporary_exports(&source).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn save_does_not_overwrite_an_external_source_change() {
+        let source = fixture(b"original");
+        let metadata = File::open(&source).unwrap().metadata().unwrap();
+        let stamp = crate::SourceStamp::from_metadata(&metadata);
+        let mut output = ExportTarget::replace_source(&source, metadata, stamp).unwrap();
+        output.write_all(b"quarry replacement").unwrap();
+        fs::write(&source, b"external replacement").unwrap();
+
+        assert!(matches!(
+            output.publish(0, 18, &AtomicBool::new(false)),
+            Err(QuarryError::SourceChanged)
+        ));
+        assert_eq!(fs::read(&source).unwrap(), b"external replacement");
+        assert!(temporary_exports(&source).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn save_rejects_a_source_changed_since_the_session_opened() {
+        let source = fixture(b"id,name\n1,Ada\n");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        fs::write(&source, b"id,name\n1,Grace\n").unwrap();
+
+        assert!(matches!(
+            session.start_save_with_header_renames(BTreeMap::from([(0, b"ID".to_vec())])),
+            Err(QuarryError::SourceChanged)
+        ));
+        assert_eq!(fs::read(&source).unwrap(), b"id,name\n1,Grace\n");
+        assert!(temporary_exports(&source).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_a_symbolic_link_without_changing_it_or_its_target() {
+        let source = fixture(b"id,name\n1,Ada\n");
+        let link = destination(&source, "linked.csv");
+        symlink(&source, &link).unwrap();
+        let session = session(&link, b',', HeaderMode::FirstRow);
+
+        assert!(matches!(
+            session.start_save_with_header_renames(BTreeMap::from([(0, b"ID".to_vec())])),
+            Err(QuarryError::InvalidOption(
+                "saving through a symbolic link is not supported; use Save As instead"
+            ))
+        ));
+        assert_eq!(fs::read(&source).unwrap(), b"id,name\n1,Ada\n");
+        assert_eq!(fs::read_link(&link).unwrap(), source);
+        assert!(temporary_exports(&link).is_empty());
+        fs::remove_file(link).unwrap();
+        fs::remove_file(&source).unwrap();
         remove_case(&source);
     }
 
@@ -1191,7 +1433,7 @@ mod tests {
             b',',
             true,
             BTreeMap::from([(0, b"a renamed header".to_vec())]),
-            destination.clone(),
+            SaveTarget::New(destination.clone()),
             ExportConfig {
                 chunk_bytes: 4,
                 max_record_bytes: 8,
@@ -1224,7 +1466,7 @@ mod tests {
             b',',
             true,
             BTreeMap::from([(0, b"ID".to_vec())]),
-            destination.clone(),
+            SaveTarget::New(destination.clone()),
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
