@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -7,10 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
-    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, IndexConfig,
-    IndexJob, IndexProgress, OpenOptions, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
-    Session, StructuralIndex,
+    Dialect, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
+    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, HeaderMode,
+    IndexConfig, IndexJob, IndexProgress, OpenOptions, SaveAsJob, SaveAsOutcome, SaveAsProgress,
+    SearchJob, SearchOutcome, SearchPosition, SearchProgress, Session, StructuralIndex,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -21,6 +22,7 @@ type FilterExportRun = (
     FilterExportProgress,
     Option<(u64, Duration)>,
 );
+type SaveAsRun = (SaveAsOutcome, SaveAsProgress, Option<(u64, Duration)>);
 
 const MAX_LIVE_BENCHMARK_MILLIS: u128 = 60_000;
 const FILTER_SAMPLE_ROWS: usize = 100;
@@ -33,6 +35,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("search") => search_command(args.collect()),
         Some("filter") => filter_command(args.collect()),
         Some("export") => export_command(args.collect()),
+        Some("edit-save-as") => edit_save_as_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -62,6 +65,9 @@ fn print_help() {
          --operator contains|equals --value LITERAL \
          [--and N contains|equals LITERAL]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
+           quarry edit-save-as <FILE> --output FILE \
+         --edit DATA_ROW COLUMN VALUE [--edit DATA_ROW COLUMN VALUE]... \
+         [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]"
     );
@@ -533,6 +539,294 @@ fn wait_for_export(
         return Err("export reached end of file before cancellation took effect".into());
     }
     Ok((outcome, progress, cancellation))
+}
+
+#[derive(Debug, Clone)]
+struct RequestedCellEdit {
+    data_row: u64,
+    column: usize,
+    value: Vec<u8>,
+}
+
+fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
+    let mut path = None;
+    let mut destination = None;
+    let mut requested_edits = Vec::new();
+    let mut cancel_after_bytes = None;
+    let mut cache_state = "unknown".to_owned();
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
+            "--edit" => {
+                let operands = args
+                    .get(cursor + 1..cursor + 4)
+                    .ok_or("--edit requires DATA_ROW COLUMN VALUE")?;
+                let data_row = operands[0].parse::<u64>()?;
+                let column = operands[1].parse::<usize>()?;
+                if data_row == 0 || column == 0 {
+                    return Err("edit data row and column must be at least 1".into());
+                }
+                requested_edits.push(RequestedCellEdit {
+                    data_row,
+                    column,
+                    value: operands[2].as_bytes().to_vec(),
+                });
+                cursor += 3;
+            }
+            "--cancel-after-bytes" => {
+                cancel_after_bytes =
+                    Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
+            }
+            "--cache-state" => {
+                cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
+                if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
+                    return Err("--cache-state must be unknown, cold, or warm".into());
+                }
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            argument if path.is_none() => path = Some(PathBuf::from(argument)),
+            argument => return Err(format!("unexpected argument {argument:?}").into()),
+        }
+        cursor += 1;
+    }
+
+    let path = path.ok_or("edit-save-as requires a file path")?;
+    let destination = destination.ok_or("edit-save-as requires --output")?;
+    if requested_edits.is_empty() {
+        return Err("edit-save-as requires at least one --edit".into());
+    }
+    if cancel_after_bytes == Some(0) {
+        return Err("cancel-after-bytes must be non-zero".into());
+    }
+
+    let session = Session::open(&path, OpenOptions::default())?;
+    if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
+        return Err("cancel-after-bytes must be less than file size".into());
+    }
+    let source_size_before = session.file_size;
+    let mut cell_edits = BTreeMap::new();
+    for requested in &requested_edits {
+        let row = requested
+            .data_row
+            .checked_sub(1)
+            .and_then(|row| row.checked_add(u64::from(session.dialect.has_header)))
+            .ok_or("edit position is out of range")?;
+        let column = requested.column - 1;
+        if cell_edits
+            .insert((row, column), requested.value.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate edit for data row {}, column {}",
+                requested.data_row, requested.column
+            )
+            .into());
+        }
+    }
+
+    let job =
+        session.start_save_as_with_edits(BTreeMap::new(), cell_edits.clone(), &destination)?;
+    let (outcome, progress, cancellation) =
+        wait_for_save_as(job, cancel_after_bytes, Duration::from_millis(1))?;
+    let source_size_after = std::fs::metadata(session.path())?.len();
+    if source_size_after != source_size_before {
+        return Err("source file size changed during Save As".into());
+    }
+    let save_peak_rss = peak_rss_bytes();
+    let save_current_rss = current_rss_bytes();
+
+    let (outcome_label, published_bytes, validated_edits, validation_elapsed) = match &outcome {
+        SaveAsOutcome::Complete(summary) => {
+            let output_size = std::fs::metadata(&summary.destination)?.len();
+            if summary.bytes_written != progress.bytes_written
+                || output_size != summary.bytes_written
+            {
+                return Err("published output does not match Save As progress".into());
+            }
+            let validation_elapsed =
+                validate_saved_edits(&summary.destination, &cell_edits, session.dialect)?;
+            (
+                "complete",
+                Some(output_size),
+                Some(cell_edits.len()),
+                Some(validation_elapsed),
+            )
+        }
+        SaveAsOutcome::Cancelled => {
+            if destination.exists() {
+                return Err("cancelled Save As published a destination file".into());
+            }
+            ("cancelled", None, None, None)
+        }
+    };
+
+    println!("Quarry direct cell Save As benchmark\n");
+    println!("Source: {}", session.path().display());
+    println!(
+        "Source size: {} ({} bytes)",
+        human_bytes(source_size_before),
+        source_size_before
+    );
+    println!("Destination: {}", destination.display());
+    println!(
+        "Build: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!("Save As cache state: {cache_state}");
+    println!("Sparse cell edits: {}", requested_edits.len());
+    for (position, edit) in requested_edits.iter().enumerate() {
+        println!(
+            "Edit {}: data row {}, column {}, value {}",
+            position + 1,
+            edit.data_row,
+            edit.column,
+            render_field(&edit.value)
+        );
+    }
+    println!("Outcome: {outcome_label}");
+    println!(
+        "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
+        human_bytes(progress.bytes_scanned),
+        progress.bytes_scanned,
+        human_bytes(progress.total_bytes),
+        progress.total_bytes
+    );
+    println!(
+        "Output bytes written: {} ({} bytes)",
+        human_bytes(progress.bytes_written),
+        progress.bytes_written
+    );
+    println!("Save As time: {:.3} s", progress.elapsed.as_secs_f64());
+    println!(
+        "Scan throughput: {}/s",
+        human_bytes(rate(progress.bytes_scanned, progress.elapsed))
+    );
+    println!(
+        "Output throughput: {}/s",
+        human_bytes(rate(progress.bytes_written, progress.elapsed))
+    );
+    println!("Source size unchanged: yes ({source_size_after} bytes)");
+    println!(
+        "Destination published: {}",
+        if published_bytes.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if let Some(bytes) = published_bytes {
+        println!("Published size: {} ({bytes} bytes)", human_bytes(bytes));
+    }
+    if let (Some(edits), Some(elapsed)) = (validated_edits, validation_elapsed) {
+        println!("Validated edited cells: {edits}");
+        println!("Validation index and reads: {:.3} s", elapsed.as_secs_f64());
+    }
+    if let Some((requested_at, latency)) = cancellation {
+        println!(
+            "Cancellation requested after: {} ({} bytes)",
+            human_bytes(requested_at),
+            requested_at
+        );
+        println!(
+            "Poll-inclusive cancellation latency: {:.3} ms",
+            latency.as_secs_f64() * 1000.0
+        );
+    }
+    println!(
+        "Current process memory after Save As: {}",
+        optional_bytes(save_current_rss)
+    );
+    println!(
+        "Peak process memory through Save As: {}",
+        optional_bytes(save_peak_rss)
+    );
+    Ok(())
+}
+
+fn wait_for_save_as(
+    job: SaveAsJob,
+    cancel_after_bytes: Option<u64>,
+    poll_interval: Duration,
+) -> CliResult<SaveAsRun> {
+    let mut cancellation = None;
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if cancellation.is_none()
+            && cancel_after_bytes.is_some_and(|threshold| progress.bytes_scanned >= threshold)
+        {
+            let started = Instant::now();
+            job.cancel();
+            cancellation = Some((progress.bytes_scanned, started));
+        }
+        thread::sleep(poll_interval);
+    }
+
+    let progress = job.progress();
+    let outcome = job.wait()?;
+    let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
+    if cancel_after_bytes.is_some() && cancellation.is_none() {
+        return Err("Save As finished before cancellation threshold".into());
+    }
+    if cancel_after_bytes.is_some() && !matches!(&outcome, SaveAsOutcome::Cancelled) {
+        return Err("Save As completed before cancellation took effect".into());
+    }
+    if cancel_after_bytes.is_some() && progress.bytes_scanned >= progress.total_bytes {
+        return Err("Save As reached end of file before cancellation took effect".into());
+    }
+    Ok((outcome, progress, cancellation))
+}
+
+fn validate_saved_edits(
+    destination: &Path,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    dialect: Dialect,
+) -> CliResult<Duration> {
+    let started = Instant::now();
+    let session = Session::open(
+        destination,
+        OpenOptions {
+            delimiter: Some(dialect.delimiter),
+            header_mode: if dialect.has_header {
+                HeaderMode::FirstRow
+            } else {
+                HeaderMode::NoHeader
+            },
+            ..OpenOptions::default()
+        },
+    )?;
+    let index = session.start_indexing(IndexConfig::default())?.wait()?;
+    let mut current_row = None;
+    let mut row = None;
+    for (&(record_row, column), expected) in cell_edits {
+        if current_row != Some(record_row) {
+            row = session.read_rows(&index, record_row, 1)?.into_iter().next();
+            current_row = Some(record_row);
+        }
+        let actual = row
+            .as_ref()
+            .and_then(|row| row.fields.get(column))
+            .ok_or("saved edit position is out of range")?;
+        if actual != expected {
+            return Err(format!(
+                "saved data row {}, column {} does not contain the requested value",
+                physical_to_data_row(record_row, session.dialect.has_header),
+                column + 1
+            )
+            .into());
+        }
+    }
+    Ok(started.elapsed())
 }
 
 #[derive(Clone, Copy)]
@@ -1548,8 +1842,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        FilterSamples, data_search_position, export_command, filter_command, generate_file,
-        latency_stats, parse_size, physical_to_data_row, record_filter_sample,
+        FilterSamples, data_search_position, edit_save_as_command, export_command, filter_command,
+        generate_file, latency_stats, parse_size, physical_to_data_row, record_filter_sample,
         sample_filtered_rows, search_command, viewport_command,
     };
     use quarry_core::{FilterOperator, FilterQuery, HeaderMode, OpenOptions, Session};
@@ -2047,6 +2341,185 @@ mod tests {
         ])
         .unwrap();
 
+        assert!(!destination.exists());
+        let names = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], source.file_name().unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn edit_save_as_command_validates_sparse_cells_and_preserves_source() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-edit-save-as-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("edited.csv");
+        let source_bytes = b"name,note,state\r\none,\"line, \"\"one\"\"\r\nline two\",TX\r\ntwo,plain,CA\r\nthree,other,WA";
+        let expected = b"name,note,state\r\none,\"changed, \"\"quoted\"\"\nnext\",TX\r\ntwo,plain,CA\r\nthree,other,TX";
+        fs::write(&source, source_bytes).unwrap();
+
+        edit_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+            "--edit".into(),
+            "1".into(),
+            "2".into(),
+            "changed, \"quoted\"\nnext".into(),
+            "--edit".into(),
+            "3".into(),
+            "3".into(),
+            "TX".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn edit_save_as_command_reuses_the_resolved_source_dialect_for_validation() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-edit-save-as-dialect-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.tsv");
+        let destination = directory.join("edited.tsv");
+        fs::write(&source, b"1\t2\n3\t4\n").unwrap();
+
+        edit_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+            "--edit".into(),
+            "1".into(),
+            "2".into(),
+            "a,b,c".into(),
+            "--edit".into(),
+            "2".into(),
+            "2".into(),
+            "d,e,f".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), b"1\t2\n3\t4\n");
+        assert_eq!(fs::read(&destination).unwrap(), b"1\ta,b,c\n3\td,e,f\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn edit_save_as_command_rejects_invalid_and_duplicate_edits() {
+        let error = edit_save_as_command(Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), "edit-save-as requires a file path");
+
+        let error = edit_save_as_command(vec!["missing.csv".into()]).unwrap_err();
+        assert_eq!(error.to_string(), "edit-save-as requires --output");
+
+        let error = edit_save_as_command(vec![
+            "missing.csv".into(),
+            "--output".into(),
+            "output.csv".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "edit-save-as requires at least one --edit"
+        );
+
+        for (row, column) in [("0", "1"), ("1", "0")] {
+            let error = edit_save_as_command(vec![
+                "missing.csv".into(),
+                "--output".into(),
+                "output.csv".into(),
+                "--edit".into(),
+                row.into(),
+                column.into(),
+                "value".into(),
+            ])
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "edit data row and column must be at least 1"
+            );
+        }
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-edit-save-as-duplicate-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("edited.csv");
+        fs::write(&source, b"name,value\none,1\n").unwrap();
+        let error = edit_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+            "--edit".into(),
+            "1".into(),
+            "2".into(),
+            "first".into(),
+            "--edit".into(),
+            "1".into(),
+            "2".into(),
+            "second".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(error.to_string(), "duplicate edit for data row 1, column 2");
+        assert!(!destination.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn edit_save_as_command_cancellation_preserves_source_and_cleans_output() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-edit-save-as-cancellation-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("edited.csv");
+        generate_file(&source, 64 * 1024 * 1024, 11, b',', 7).unwrap();
+        let source_size = fs::metadata(&source).unwrap().len();
+
+        edit_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+            "--edit".into(),
+            "1".into(),
+            "1".into(),
+            "cancelled".into(),
+            "--cancel-after-bytes".into(),
+            "1".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::metadata(&source).unwrap().len(), source_size);
         assert!(!destination.exists());
         let names = fs::read_dir(&directory)
             .unwrap()

@@ -94,12 +94,13 @@ ragged file would require a separate full scan and remains deferred.
 
 ## Clipboard copying
 The viewer retains a selected cell only while its row and column remain visible,
-and a selected row only while that row remains visible. Cell copy uses the
-complete decoded field from the bounded row buffer. Row copy serializes every
-actual field as UTF-8 TSV, quoting fields with tabs, line breaks, or quotes and
-doubling embedded quotes. It excludes the header and synthetic row number.
-Invalid UTF-8 is reported instead of replaced, and a 64 MiB output limit
-prevents clipboard serialization from growing without bound.
+and a selected row only while that row remains visible. Cell and row copy read
+the sparse edit overlay before falling back to the bounded source row. Row copy
+serializes every actual field as UTF-8 TSV in source-column order, quoting
+fields with tabs, line breaks, or quotes and doubling embedded quotes. It
+excludes the header and synthetic row number. Invalid UTF-8 is reported instead
+of replaced, and a 64 MiB output limit prevents clipboard serialization from
+growing without bound.
 
 ## Bounded memory
 Core defaults to 1 MiB read chunks, with a 64 MiB bootstrap and record limit and
@@ -112,8 +113,9 @@ cache remains deferred.
 
 Unsaved edits use a sparse overlay whose memory grows with the number and size
 of user edits, not with source-file size. Save and Save As enforce the existing
-maximum record size against the fully serialized edited header before
-publication.
+maximum record size against every fully serialized edited record before
+publication. For a fixed sparse edit set, the streaming worker retains a fixed
+read chunk, at most one bounded record and its decoded fields, and the overlay.
 
 ## Concurrency
 Rust workers currently handle indexing, literal search, filtering, filtered
@@ -136,6 +138,12 @@ the first decoded-cell match. The job publishes byte/row progress and joins its
 worker on wait or drop. Memory therefore depends on the query, the fixed chunk,
 the 64 MiB maximum record and its decoded fields, one match, and the bounded
 structural index, not on file size or match count.
+
+Search and filter workers intentionally scan the immutable source rather than
+the unsaved overlay. The viewer therefore disables new searches and filters
+while data-cell edits exist and requires an active filter to be cleared before
+cell editing. This keeps displayed results from silently disagreeing with the
+unsaved document. Overlay-aware search and filtering remain a later slice.
 
 A `FilterQuery` owns one or more `FilterPredicate` values. Each predicate stores
 a source column, a case-sensitive contains or equality operator, and its literal
@@ -178,9 +186,16 @@ Use a disk-aware external merge sort: bounded runs, sort in memory, spill to tem
 
 Editing occurs directly in the grid. The source file remains immutable while
 the document is open. A sparse overlay stores committed edits by stable source
-identity; the first slice stores renamed header values by source column.
-Viewport rendering reads the overlay before falling back to decoded source
-values. Cancelling an inline edit does not change document state.
+identity. Header renames use the original source column. Data-cell edits use the
+physical record row and original source column, independent of the current
+column display order. Viewport rendering and copy read the overlay before
+falling back to decoded source values. Cancelling an inline edit does not change
+document state, and restoring the original bytes removes that overlay entry.
+
+The first data-cell slice edits only existing valid UTF-8 fields. It accepts
+multiline input, but does not create a missing field in a ragged row or replace
+invalid UTF-8 with lossy text. Row insertion, deletion, split/join, and output
+column transformations remain separate features.
 
 A document is dirty while effective edits exist. Open, reopen, format changes,
 and application close must not silently discard dirty state. Every write path
@@ -198,6 +213,14 @@ the unsaved edits plus reopening the source. Final-path symbolic links are
 rejected with guidance to use Save As. Cancellation observed before publication
 or a write failure removes temporary output without Quarry replacing the source
 or clobbering an existing destination.
+
+The rewrite scans records once with the same quote-aware scanner used by the
+other streaming workers. It copies every unedited record byte for byte. For an
+edited record, it parses the bounded record, replaces the selected decoded
+fields, and serializes all fields with the document delimiter plus that
+record's original CRLF, LF, or absent final line ending. An edit targeting a
+missing row or column, a parse failure in an edited record, or serialized output
+above the limit fails before publication.
 
 Rename-based Save preserves standard permission bits but does not explicitly
 preserve ownership, ACLs, extended attributes or resource forks, or hard-link
@@ -222,7 +245,9 @@ Generate deterministic 1 GB, 10 GB, 25 GB, and 50 GB datasets locally,
 including multiline quoted fields, wide tables, and long fields. Use separate
 malformed-record fixtures for parser correctness.
 
-Track time-to-first-rows, memory, index/search/filter/export throughput, scroll frame time, cache behavior, and cancellation latency.
+Track time-to-first-rows, memory, index/search/filter/export/save throughput,
+scroll frame time, cache behavior, cancellation latency, and exact edited-output
+validation.
 
 ## Architecture rule
 **If a feature only works because the entire file fits in RAM, it is not a finished Quarry feature.**

@@ -141,7 +141,7 @@ impl QuarryApp {
             if document.save_job.is_some() {
                 return Err("Cancel the active save before opening another file.".into());
             }
-            document.commit_header_edit();
+            document.commit_edits();
             if document.is_dirty() {
                 return Err("Discard or save your changes before opening another file.".into());
             }
@@ -201,7 +201,7 @@ impl QuarryApp {
                 self.notice = Some("Cancel the active save before opening another file.".into());
                 return;
             }
-            document.commit_header_edit();
+            document.commit_edits();
             if document.is_dirty() {
                 self.notice =
                     Some("Discard or save your changes before opening another file.".into());
@@ -220,7 +220,7 @@ impl QuarryApp {
                 self.notice = Some("Cancel the active save before exporting filtered rows.".into());
                 return;
             }
-            document.commit_header_edit();
+            document.commit_edits();
             if document.is_dirty() {
                 self.notice =
                     Some("Save or discard your changes before exporting filtered rows.".into());
@@ -249,7 +249,7 @@ impl QuarryApp {
             self.notice = Some("Open a file before using Save As.".into());
             return false;
         };
-        document.commit_header_edit();
+        document.commit_edits();
         if !document.is_save_ready() {
             self.notice = Some(if document.save_job.is_some() {
                 "A save operation is already running.".into()
@@ -258,7 +258,7 @@ impl QuarryApp {
             } else if document.source_changed {
                 SOURCE_CHANGED_NOTICE.into()
             } else {
-                "Rename a header before using Save As.".into()
+                "Make a header or cell change before using Save As.".into()
             });
             return false;
         }
@@ -343,7 +343,7 @@ impl QuarryApp {
 
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
         if let Some(document) = self.document.as_mut() {
-            document.commit_header_edit();
+            document.commit_edits();
         }
         match action {
             Action::Open => return self.open_typed_path(),
@@ -365,7 +365,7 @@ impl QuarryApp {
                             Some("Wait for the save to finish before discarding changes.".into());
                         return;
                     }
-                    document.discard_header_edits();
+                    document.discard_edits();
                 }
                 self.notice = None;
                 return;
@@ -508,7 +508,7 @@ impl QuarryApp {
                 self.close_after_save = true;
                 return;
             }
-            document.commit_header_edit();
+            document.commit_edits();
             if document.is_dirty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.close_confirmation_open = true;
@@ -569,16 +569,19 @@ impl eframe::App for QuarryApp {
         let save_result = self.document.as_mut().map_or(Ok(None), Document::poll_save);
         match save_result {
             Ok(Some((destination, in_place))) => {
-                let delimiter = self
+                let dialect = self
                     .document
                     .as_ref()
                     .expect("saved document is still open")
                     .session
-                    .dialect
-                    .delimiter;
+                    .dialect;
                 let options = OpenOptions {
-                    delimiter: Some(delimiter),
-                    header_mode: HeaderMode::FirstRow,
+                    delimiter: Some(dialect.delimiter),
+                    header_mode: if dialect.has_header {
+                        HeaderMode::FirstRow
+                    } else {
+                        HeaderMode::NoHeader
+                    },
                     ..OpenOptions::default()
                 };
                 match self.replace_document_with_options(destination.clone(), options) {
@@ -863,8 +866,12 @@ impl eframe::App for QuarryApp {
                     } else {
                         let search_progress = document.search_progress();
                         let search_status = document.search_status.as_deref().or_else(|| {
-                            (!document.is_search_ready())
-                                .then_some("Search is available after indexing completes.")
+                            if document.has_cell_edits() {
+                                Some("Save or discard cell edits before searching the source file.")
+                            } else {
+                                (!document.is_search_ready())
+                                    .then_some("Search is available after indexing completes.")
+                            }
                         });
                         if let Some(search_action) = search_controls(
                             ui,
@@ -1051,6 +1058,10 @@ impl eframe::App for QuarryApp {
                     ctx,
                     self.filter_rules.len(),
                     document.header_edit.as_ref().map(|edit| edit.column),
+                    document
+                        .cell_edit
+                        .as_ref()
+                        .map(|edit| (edit.row, edit.column)),
                 )
         });
         if copy_event_targets_selection {
@@ -1068,7 +1079,7 @@ impl eframe::App for QuarryApp {
             let modal =
                 egui::Modal::new(egui::Id::new("quarry-close-confirmation")).show(ctx, |ui| {
                     ui.heading("Unsaved changes");
-                    ui.label("This file has unsaved header changes.");
+                    ui.label("This file has unsaved changes.");
                     ui.label("Save them, save a new copy, keep editing, or discard them.");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -1125,7 +1136,7 @@ impl eframe::App for QuarryApp {
                 }
             } else if discard_and_close {
                 if let Some(document) = self.document.as_mut() {
-                    document.discard_header_edits();
+                    document.discard_edits();
                 }
                 self.close_confirmation_open = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1263,6 +1274,7 @@ fn selection_copy_requested(
     ctx: &egui::Context,
     filter_rule_count: usize,
     edited_header: Option<usize>,
+    edited_cell: Option<(u64, usize)>,
 ) -> bool {
     let copy_event = ctx.input(|input| {
         input
@@ -1283,6 +1295,7 @@ fn selection_copy_requested(
             .any(|id| focused == egui::Id::new(id))
                 || is_filter_text_input(focused, filter_rule_count)
                 || edited_header.is_some_and(|column| focused == header_edit_id(column))
+                || edited_cell.is_some_and(|(row, column)| focused == cell_edit_id(row, column))
         })
     });
     copy_event && !text_input_focused
@@ -1290,6 +1303,10 @@ fn selection_copy_requested(
 
 fn header_edit_id(column: usize) -> egui::Id {
     egui::Id::new(("quarry-header-edit", column))
+}
+
+fn cell_edit_id(row: u64, column: usize) -> egui::Id {
+    egui::Id::new(("quarry-cell-edit", row, column))
 }
 
 fn column_window_controls(ui: &mut egui::Ui, column_start: usize) -> Option<Action> {
@@ -1591,6 +1608,7 @@ fn show_filter_manager(
             }
 
             let can_apply = document.is_filter_ready()
+                && !document.has_cell_edits()
                 && document.search_job.is_none()
                 && document.filter_job.is_none()
                 && document.export_job.is_none()
@@ -1606,6 +1624,9 @@ fn show_filter_manager(
                 action = Some(Action::ApplyFilter);
             }
             ui.small("Contains requires a value. Equals can match an empty cell. Values are literal and case-sensitive.");
+            if document.has_cell_edits() {
+                ui.small("Save or discard cell edits before filtering the source file.");
+            }
 
             if let Some(progress) = document.filter_progress() {
                 ui.add_space(8.0);
@@ -2067,6 +2088,9 @@ struct Document {
     headers: Vec<String>,
     header_renames: BTreeMap<usize, String>,
     header_edit: Option<HeaderEdit>,
+    cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+    cell_edit: Option<CellEdit>,
+    cell_focus_requested: Option<(u64, usize)>,
     total_columns: usize,
     columns: ColumnView,
     data_start: u64,
@@ -2082,6 +2106,15 @@ struct Document {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HeaderEdit {
     column: usize,
+    draft: String,
+    focus_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CellEdit {
+    row: u64,
+    column: usize,
+    source: Vec<u8>,
     draft: String,
     focus_requested: bool,
 }
@@ -2175,6 +2208,9 @@ impl Document {
             headers,
             header_renames: BTreeMap::new(),
             header_edit: None,
+            cell_edits: BTreeMap::new(),
+            cell_edit: None,
+            cell_focus_requested: None,
             total_columns,
             columns,
             data_start,
@@ -2226,10 +2262,13 @@ impl Document {
         if self.search_job.is_some() {
             return Err("A search is already running.".into());
         }
+        if self.has_cell_edits() {
+            return Err("Save or discard cell edits before searching the source file.".into());
+        }
         if !self.is_search_ready() {
             return Err("Search is available after indexing completes.".into());
         }
-        self.commit_header_edit();
+        self.commit_edits();
         if self.search_query != query {
             self.search_query.clear();
             self.search_query.extend_from_slice(query);
@@ -2302,6 +2341,9 @@ impl Document {
         if self.search_job.is_some() {
             return Err("Cancel the active search before filtering.".into());
         }
+        if self.has_cell_edits() {
+            return Err("Save or discard cell edits before filtering the source file.".into());
+        }
         if !self.is_filter_ready() {
             return Err("Open a file with at least one column before filtering.".into());
         }
@@ -2319,6 +2361,7 @@ impl Document {
             }
         }
 
+        self.commit_edits();
         let job = self
             .session
             .start_filter(query.clone())
@@ -2439,7 +2482,7 @@ impl Document {
         if self.save_job.is_some() {
             return Err("Cancel the active save before exporting filtered rows.".into());
         }
-        self.commit_header_edit();
+        self.commit_edits();
         if self.is_dirty() {
             return Err("Save or discard your changes before exporting filtered rows.".into());
         }
@@ -2530,6 +2573,7 @@ impl Document {
 
     fn is_filtered_export_ready(&self) -> bool {
         self.filter_query.is_some()
+            && !self.has_cell_edits()
             && self.filter_job.is_none()
             && self.export_job.is_none()
             && self.save_job.is_none()
@@ -2563,9 +2607,9 @@ impl Document {
         if self.export_job.is_some() {
             return Err("Cancel the active export before saving.".into());
         }
-        self.commit_header_edit();
+        self.commit_edits();
         if !self.is_dirty() {
-            return Err("Rename a header before saving.".into());
+            return Err("Make a header or cell change before saving.".into());
         }
         let renames = self
             .header_renames
@@ -2574,10 +2618,13 @@ impl Document {
             .collect();
         let saving_in_place = destination.is_none();
         let result = match destination {
-            Some(destination) => self
+            Some(destination) => {
+                self.session
+                    .start_save_as_with_edits(renames, self.cell_edits.clone(), destination)
+            }
+            None => self
                 .session
-                .start_save_as_with_header_renames(renames, destination),
-            None => self.session.start_save_with_header_renames(renames),
+                .start_save_with_edits(renames, self.cell_edits.clone()),
         };
         let job = match result {
             Ok(job) => job,
@@ -2750,7 +2797,10 @@ impl Document {
     }
 
     fn is_search_ready(&self) -> bool {
-        self.index.is_some() && self.progress.done && !self.progress.cancelled
+        self.index.is_some()
+            && self.progress.done
+            && !self.progress.cancelled
+            && !self.has_cell_edits()
     }
 
     fn cancel_search(&self) {
@@ -2760,7 +2810,7 @@ impl Document {
     }
 
     fn center_column(&mut self, column: usize) {
-        self.commit_header_edit();
+        self.commit_edits();
         self.ensure_column_count(column.saturating_add(1));
         self.columns.view(column);
         self.refresh_column_headers();
@@ -2768,7 +2818,7 @@ impl Document {
     }
 
     fn view_column(&mut self, column: usize) -> Result<(), String> {
-        self.commit_header_edit();
+        self.commit_edits();
         self.validate_column(column)?;
         self.columns.view(column);
         self.refresh_column_headers();
@@ -2778,7 +2828,7 @@ impl Document {
     }
 
     fn set_column_shown(&mut self, column: usize, shown: bool) -> Result<(), String> {
-        self.commit_header_edit();
+        self.commit_edits();
         self.validate_column(column)?;
         self.columns.set_shown(column, shown);
         self.refresh_column_headers();
@@ -2794,7 +2844,7 @@ impl Document {
     }
 
     fn move_column(&mut self, column: usize, position: usize) -> Result<(), String> {
-        self.commit_header_edit();
+        self.commit_edits();
         self.validate_column(column)?;
         if position >= self.total_columns {
             return Err(format!(
@@ -2809,7 +2859,7 @@ impl Document {
     }
 
     fn show_first_columns(&mut self) {
-        self.commit_header_edit();
+        self.commit_edits();
         self.columns.first();
         self.refresh_column_headers();
         self.reveal_cell = self
@@ -2822,7 +2872,7 @@ impl Document {
     }
 
     fn reset_columns(&mut self) {
-        self.commit_header_edit();
+        self.commit_edits();
         self.columns.reset();
         self.refresh_column_headers();
         self.reveal_cell = self
@@ -2887,6 +2937,7 @@ impl Document {
                 .get(&column)
                 .cloned()
                 .unwrap_or_else(|| source_name.to_owned());
+            self.commit_cell_edit();
             self.commit_header_edit();
             self.header_edit = Some(HeaderEdit {
                 column,
@@ -2932,6 +2983,81 @@ impl Document {
         }
     }
 
+    fn cell_is_editable(&self, source: Option<&[u8]>) -> bool {
+        self.cell_edit_disabled_reason(source).is_none()
+    }
+
+    fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
+        if self.source_changed {
+            Some("Reopen the changed source before editing data cells.")
+        } else if self.filter_active() {
+            Some("Clear the filter before editing data cells.")
+        } else if self.save_job.is_some()
+            || self.export_job.is_some()
+            || self.search_job.is_some()
+            || self.filter_job.is_some()
+        {
+            Some("Wait for the active file operation before editing data cells.")
+        } else if source.is_none() {
+            Some("This row has no cell in this file column.")
+        } else if source.is_some_and(|source| std::str::from_utf8(source).is_err()) {
+            Some("This cell is not valid UTF-8 and cannot be edited.")
+        } else {
+            None
+        }
+    }
+
+    fn begin_cell_edit(&mut self, row: u64, column: usize, source: Vec<u8>) -> Result<(), String> {
+        if self.filter_active() {
+            return Err("Clear the filter before editing data cells.".into());
+        }
+        if let Some(reason) = self.cell_edit_disabled_reason(Some(&source)) {
+            return Err(reason.into());
+        }
+        self.commit_header_edit();
+        self.commit_cell_edit();
+        let draft = self
+            .cell_edits
+            .get(&(row, column))
+            .map_or(source.as_slice(), Vec::as_slice);
+        let draft = std::str::from_utf8(draft)
+            .expect("editable cell text was checked as UTF-8")
+            .to_owned();
+        self.selection = Some(GridSelection::Cell { row, column });
+        self.cell_edit = Some(CellEdit {
+            row,
+            column,
+            source,
+            draft,
+            focus_requested: true,
+        });
+        Ok(())
+    }
+
+    fn commit_cell_edit(&mut self) {
+        if self.save_job.is_some() {
+            return;
+        }
+        let Some(edit) = self.cell_edit.take() else {
+            return;
+        };
+        let key = (edit.row, edit.column);
+        if edit.draft.as_bytes() == edit.source {
+            self.cell_edits.remove(&key);
+        } else {
+            self.cell_edits.insert(key, edit.draft.into_bytes());
+            self.search_query.clear();
+            self.last_match = None;
+            self.search_status = None;
+            self.reveal_cell = None;
+        }
+    }
+
+    fn commit_edits(&mut self) {
+        self.commit_header_edit();
+        self.commit_cell_edit();
+    }
+
     fn discard_header_edits(&mut self) {
         if self.save_job.is_some() {
             return;
@@ -2941,18 +3067,38 @@ impl Document {
         self.refresh_column_headers();
     }
 
+    fn discard_edits(&mut self) {
+        if self.save_job.is_some() {
+            return;
+        }
+        self.discard_header_edits();
+        self.cell_edit = None;
+        self.cell_edits.clear();
+    }
+
+    fn has_cell_edits(&self) -> bool {
+        !self.cell_edits.is_empty()
+            || self
+                .cell_edit
+                .as_ref()
+                .is_some_and(|edit| edit.draft.as_bytes() != edit.source.as_slice())
+    }
+
     fn is_dirty(&self) -> bool {
-        let Some(edit) = self.header_edit.as_ref() else {
-            return !self.header_renames.is_empty();
-        };
-        self.header_renames
-            .keys()
-            .any(|column| *column != edit.column)
-            || edit.draft.as_bytes()
-                != self
-                    .source_header_name(edit.column)
-                    .expect("active header edit has source text")
-                    .as_bytes()
+        let header_dirty = self.header_edit.as_ref().map_or_else(
+            || !self.header_renames.is_empty(),
+            |edit| {
+                self.header_renames
+                    .keys()
+                    .any(|column| *column != edit.column)
+                    || edit.draft.as_bytes()
+                        != self
+                            .source_header_name(edit.column)
+                            .expect("active header edit has source text")
+                            .as_bytes()
+            },
+        );
+        header_dirty || self.has_cell_edits()
     }
 
     fn validate_column(&self, column: usize) -> Result<(), String> {
@@ -3046,7 +3192,12 @@ impl Document {
     }
 
     fn set_visible_rows(&mut self, visible_rows: usize) -> Result<(), String> {
-        self.visible_rows = visible_rows.max(1);
+        let visible_rows = visible_rows.max(1);
+        if visible_rows == self.visible_rows {
+            return Ok(());
+        }
+        self.commit_edits();
+        self.visible_rows = visible_rows;
         if self.filter_active() {
             return self.navigate_filter(self.filter_viewport_start);
         }
@@ -3122,6 +3273,7 @@ impl Document {
     }
 
     fn navigate(&mut self, requested: u64) -> Result<(), String> {
+        self.commit_edits();
         let available = self.available_rows();
         if requested.max(self.data_start) >= available {
             return Err(format!(
@@ -3336,6 +3488,20 @@ impl Document {
         }
     }
 
+    fn cell_value<'a>(&'a self, row: u64, column: usize, source: &'a [u8]) -> &'a [u8] {
+        self.cell_edits
+            .get(&(row, column))
+            .map_or(source, Vec::as_slice)
+    }
+
+    fn row_with_edits(&self, row: u64, fields: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        fields
+            .iter()
+            .enumerate()
+            .map(|(column, source)| self.cell_value(row, column, source).to_vec())
+            .collect()
+    }
+
     fn current_source_row(&self) -> u64 {
         self.visible_row(0)
             .map(|(row, _)| row)
@@ -3377,7 +3543,11 @@ impl Document {
                 .ok_or_else(|| {
                     "The selected row is no longer visible. Select it again.".to_owned()
                 })?;
-            selection_fields_text(&row.fields, selection, MAX_COPY_BYTES)
+            selection_fields_text(
+                &self.row_with_edits(row.row, &row.fields),
+                selection,
+                MAX_COPY_BYTES,
+            )
         } else {
             let relative = selection
                 .row()
@@ -3391,7 +3561,11 @@ impl Document {
             let row = self.buffered_rows.get(offset).ok_or_else(|| {
                 "The selected row is no longer visible. Select it again.".to_owned()
             })?;
-            selection_text(row, selection, MAX_COPY_BYTES)
+            selection_fields_text(
+                &self.row_with_edits(selection.row(), &row.fields),
+                selection,
+                MAX_COPY_BYTES,
+            )
         }
     }
 
@@ -3412,6 +3586,7 @@ impl Document {
     }
 
     fn navigate_grid_position(&mut self, position: u64) -> Result<(), String> {
+        self.commit_edits();
         if self.filter_active() {
             self.navigate_filter(position)
         } else {
@@ -3661,6 +3836,12 @@ fn show_table(
     let mut begin_header_edit = None;
     let mut commit_header_edit = false;
     let mut cancel_header_edit = false;
+    let mut active_cell_edit = document.cell_edit.take();
+    let cell_focus_requested = document.cell_focus_requested.take();
+    let mut begin_cell_edit = None;
+    let mut commit_cell_edit = false;
+    let mut cancel_cell_edit = false;
+    let mut restore_cell_focus = None;
     ui.horizontal(|ui| {
         if let Some(message) = document.filter_empty_message(row_count) {
             ui.heading(message);
@@ -3890,42 +4071,116 @@ fn show_table(
                                     egui::UiBuilder::new()
                                         .id(("cell-selection", record_row, column)),
                                     |ui| {
-                                    let text = fields
-                                        .get(column)
-                                        .map_or_else(String::new, |field| field_text(field));
-                                    let selected = document.selection.is_some_and(|selection| {
-                                        selection.selects_cell(record_row, column)
-                                    });
-                                    let response = ui.add_sized(
-                                        [ui.available_width(), ROW_HEIGHT],
-                                        egui::Button::selectable(
-                                            selected,
-                                            RichText::new(&text).monospace(),
-                                        )
-                                        .small(),
-                                    );
-                                    let enabled = ui.is_enabled();
+                                    let source = fields.get(column).map(Vec::as_slice);
                                     let header = &document.headers[visible_column];
-                                    response.widget_info(|| {
-                                        egui::WidgetInfo::selected(
-                                            egui::WidgetType::SelectableLabel,
-                                            enabled,
-                                            selected,
-                                            format!(
-                                                "Select row {display_row}, column {} ({header}): {text}",
+                                    if let Some(edit) = active_cell_edit.as_mut().filter(|edit| {
+                                        edit.row == record_row && edit.column == column
+                                    }) {
+                                        let response = ui.add_sized(
+                                            [ui.available_width(), ROW_HEIGHT],
+                                            egui::TextEdit::multiline(&mut edit.draft)
+                                                .id(cell_edit_id(record_row, column))
+                                                .font(TextStyle::Monospace)
+                                                .desired_rows(1)
+                                                .return_key(egui::KeyboardShortcut::new(
+                                                    egui::Modifiers::SHIFT,
+                                                    egui::Key::Enter,
+                                                ))
+                                                .margin(egui::Margin::ZERO),
+                                        );
+                                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                            node.set_label(format!(
+                                                "Edit data row {display_row}, file column {} ({header})",
                                                 column.saturating_add(1)
-                                            ),
-                                        )
-                                    });
-                                    if response.clicked() {
-                                        response.request_focus();
-                                        clicked_selection = Some(GridSelection::Cell {
-                                            row: record_row,
-                                            column,
+                                            ));
                                         });
-                                    }
-                                    if reveal_cell == Some((record_row, column)) {
-                                        response.scroll_to_me(Some(Align::Center));
+                                        if edit.focus_requested {
+                                            response.request_focus();
+                                            edit.focus_requested = false;
+                                        }
+                                        let escape = ui.input(|input| {
+                                            input.key_pressed(egui::Key::Escape)
+                                        });
+                                        let enter = response.has_focus()
+                                            && ui.input(|input| {
+                                                input.key_pressed(egui::Key::Enter)
+                                                    && !input.modifiers.shift
+                                            });
+                                        if escape {
+                                            cancel_cell_edit = true;
+                                            restore_cell_focus = Some((record_row, column));
+                                        } else if enter {
+                                            commit_cell_edit = true;
+                                            restore_cell_focus = Some((record_row, column));
+                                        } else if response.lost_focus() {
+                                            commit_cell_edit = true;
+                                        }
+                                        if reveal_cell == Some((record_row, column)) {
+                                            response.scroll_to_me(Some(Align::Center));
+                                        }
+                                    } else {
+                                        let value = source.map(|source| {
+                                            document.cell_value(record_row, column, source)
+                                        });
+                                        let text = value.map_or_else(String::new, field_text);
+                                        let selected = document.selection.is_some_and(|selection| {
+                                            selection.selects_cell(record_row, column)
+                                        });
+                                        let response = ui.add_sized(
+                                            [ui.available_width(), ROW_HEIGHT],
+                                            egui::Button::selectable(
+                                                selected,
+                                                RichText::new(&text).monospace(),
+                                            )
+                                            .small(),
+                                        );
+                                        let enabled = ui.is_enabled();
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::selected(
+                                                egui::WidgetType::SelectableLabel,
+                                                enabled,
+                                                selected,
+                                                format!(
+                                                    "Select row {display_row}, column {} ({header}): {text}",
+                                                    column.saturating_add(1)
+                                                ),
+                                            )
+                                        });
+                                        if response.clicked() {
+                                            response.request_focus();
+                                            clicked_selection = Some(GridSelection::Cell {
+                                                row: record_row,
+                                                column,
+                                            });
+                                        }
+                                        if cell_focus_requested == Some((record_row, column)) {
+                                            response.request_focus();
+                                        }
+                                        let keyboard_activate = selected
+                                            && response.has_focus()
+                                            && ui.input(|input| {
+                                                input.key_pressed(egui::Key::Enter)
+                                                    || input.key_pressed(egui::Key::F2)
+                                            });
+                                        if document.cell_is_editable(source)
+                                            && (response.double_clicked() || keyboard_activate)
+                                        {
+                                            begin_cell_edit = source.map(|source| {
+                                                (record_row, column, source.to_vec())
+                                            });
+                                        }
+                                        if reveal_cell == Some((record_row, column)) {
+                                            response.scroll_to_me(Some(Align::Center));
+                                        }
+                                        if let Some(reason) =
+                                            document.cell_edit_disabled_reason(source)
+                                        {
+                                            response.on_hover_text(reason);
+                                        } else {
+                                            response.on_hover_text(
+                                                "Double-click or press Enter/F2 to edit",
+                                            );
+                                        }
                                     }
                                     },
                                 );
@@ -3940,14 +4195,35 @@ fn show_table(
     } else if commit_header_edit && let Some(edit) = active_header_edit.take() {
         let _ = document.rename_header(edit.column, edit.draft);
     }
+    if cancel_cell_edit {
+        active_cell_edit = None;
+    } else if commit_cell_edit && let Some(edit) = active_cell_edit.take() {
+        document.cell_edit = Some(edit);
+        document.commit_cell_edit();
+    }
     if let Some(column) = begin_header_edit {
+        if let Some(edit) = active_cell_edit.take() {
+            document.cell_edit = Some(edit);
+            document.commit_cell_edit();
+        }
         if let Some(edit) = active_header_edit.take() {
             let _ = document.rename_header(edit.column, edit.draft);
         }
         document.begin_header_edit(column);
+    } else if let Some((row, column, source)) = begin_cell_edit {
+        if let Some(edit) = active_header_edit.take() {
+            let _ = document.rename_header(edit.column, edit.draft);
+        }
+        if let Some(edit) = active_cell_edit.take() {
+            document.cell_edit = Some(edit);
+            document.commit_cell_edit();
+        }
+        let _ = document.begin_cell_edit(row, column, source);
     } else {
         document.header_edit = active_header_edit;
+        document.cell_edit = active_cell_edit;
     }
+    document.cell_focus_requested = restore_cell_focus;
     clicked_selection
 }
 
@@ -4006,6 +4282,7 @@ fn field_text(field: &[u8]) -> String {
     }
 }
 
+#[cfg(test)]
 fn selection_text(row: &Row, selection: GridSelection, max_bytes: usize) -> Result<String, String> {
     selection_fields_text(&row.fields, selection, max_bytes)
 }
@@ -4119,8 +4396,8 @@ mod tests {
         Action, COLUMN_INPUT_ID, COLUMN_POSITION_INPUT_ID, ColumnCommand, ColumnView,
         DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterProgress, FilterQuery,
         GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SOURCE_CHANGED_NOTICE,
-        SearchProgress, Session, column_drop_position, column_window_controls, copy_control,
-        filtered_export_controls, filtered_export_file_name, logical_viewport_start,
+        SearchMatch, SearchProgress, Session, column_drop_position, column_window_controls,
+        copy_control, filtered_export_controls, filtered_export_file_name, logical_viewport_start,
         max_viewport_start, page_controls, parse_column_position, parse_data_row,
         parse_file_column, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
         search_controls, selection_text, show_column_manager, show_filter_manager, show_grid,
@@ -4237,6 +4514,40 @@ mod tests {
             },
         );
         (ctx, target)
+    }
+
+    fn render_grid(ctx: &egui::Context, document: &mut Document) -> egui::FullOutput {
+        ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, document).unwrap();
+            });
+        })
+    }
+
+    fn press_grid_key(
+        ctx: &egui::Context,
+        document: &mut Document,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, document).unwrap();
+                });
+            },
+        );
     }
 
     fn click_column_manager_control(
@@ -4690,7 +5001,7 @@ mod tests {
                     ..grid_input()
                 },
                 |ctx| {
-                    selection_copy = super::selection_copy_requested(ctx, rules.len(), None);
+                    selection_copy = super::selection_copy_requested(ctx, rules.len(), None, None);
                 },
             );
             assert!(!selection_copy);
@@ -4957,11 +5268,7 @@ mod tests {
 
         let _ = click_grid_control("Rename file column 1 (renamed)", &mut document);
         document.header_edit.as_mut().unwrap().draft = "cancelled".into();
-        let _ = ctx.run(grid_input(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                show_grid(ui, &mut document).unwrap();
-            });
-        });
+        let _ = render_grid(&ctx, &mut document);
         let _ = ctx.run(
             egui::RawInput {
                 events: vec![egui::Event::Key {
@@ -4998,10 +5305,227 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     show_grid(ui, &mut document).unwrap();
                 });
-                selection_copy = super::selection_copy_requested(ctx, 0, Some(0));
+                selection_copy = super::selection_copy_requested(ctx, 0, Some(0), None);
             },
         );
         assert!(!selection_copy);
+
+        document.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn inline_cell_editor_is_accessible_sparse_and_lossless() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-cell-editor-{name}.csv"));
+        fs::write(&path, b"name,value\nfirst,1\nsecond,2\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        let (ctx, cell_control) =
+            click_grid_control("Select row 1, column 2 (value): 1", &mut document);
+        press_grid_key(&ctx, &mut document, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(
+            document
+                .cell_edit
+                .as_ref()
+                .map(|edit| (edit.row, edit.column, edit.draft.as_str())),
+            Some((1, 1, "1"))
+        );
+
+        let output = render_grid(&ctx, &mut document);
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::MultilineTextInput
+                && node.label() == Some("Edit data row 1, file column 2 (value)")
+        }));
+
+        press_grid_key(
+            &ctx,
+            &mut document,
+            egui::Key::Enter,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(document.cell_edit.as_ref().unwrap().draft, "1\n");
+        document.cell_edit.as_mut().unwrap().draft = "changed\r\nvalue".into();
+        document.search_query = b"stale".to_vec();
+        document.last_match = Some(SearchMatch {
+            row: 1,
+            column: 1,
+            record_offset: 0,
+        });
+        document.search_status = Some("Stale search result".into());
+        document.reveal_cell = Some((1, 1));
+
+        let mut selection_copy = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+                selection_copy = super::selection_copy_requested(ctx, 0, None, Some((1, 1)));
+            },
+        );
+        assert!(!selection_copy);
+
+        press_grid_key(&ctx, &mut document, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(document.cell_edit.is_none());
+        let output = render_grid(&ctx, &mut document);
+        assert_eq!(
+            output
+                .platform_output
+                .accesskit_update
+                .expect("accessibility tree should be present")
+                .focus,
+            cell_control
+        );
+        assert_eq!(
+            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            Some(b"changed\r\nvalue".as_slice())
+        );
+        assert!(document.search_query.is_empty());
+        assert!(document.last_match.is_none());
+        assert!(document.search_status.is_none());
+        assert!(document.reveal_cell.is_none());
+        assert!(document.is_dirty());
+        assert_eq!(document.copy_selection_text().unwrap(), "changed\r\nvalue");
+        assert_eq!(
+            document.start_find_next(b"first").unwrap_err(),
+            "Save or discard cell edits before searching the source file."
+        );
+        assert_eq!(
+            document
+                .start_filter(FilterQuery::single(
+                    0,
+                    FilterOperator::Contains,
+                    b"first".to_vec(),
+                ))
+                .unwrap_err(),
+            "Save or discard cell edits before filtering the source file."
+        );
+
+        document.set_column_shown(1, false).unwrap();
+        document.set_column_shown(1, true).unwrap();
+        document.move_column(1, 0).unwrap();
+        document.set_visible_rows(1).unwrap();
+        document.navigate(2).unwrap();
+        document.navigate(1).unwrap();
+        assert_eq!(
+            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            Some(b"changed\r\nvalue".as_slice())
+        );
+        let _ = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
+
+        let cell_control = grid_control_id(
+            &ctx,
+            "Select row 1, column 2 (value): changed\\r\\nvalue",
+            &mut document,
+        );
+        document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+        assert_eq!(
+            document.cell_edit.as_ref().unwrap().draft,
+            "changed\r\nvalue"
+        );
+        document.cell_edit.as_mut().unwrap().draft = "cancelled".into();
+        let _ = render_grid(&ctx, &mut document);
+        press_grid_key(
+            &ctx,
+            &mut document,
+            egui::Key::Escape,
+            egui::Modifiers::NONE,
+        );
+        assert!(document.cell_edit.is_none());
+        let output = render_grid(&ctx, &mut document);
+        assert_eq!(
+            output
+                .platform_output
+                .accesskit_update
+                .expect("accessibility tree should be present")
+                .focus,
+            cell_control
+        );
+        assert_eq!(
+            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            Some(b"changed\r\nvalue".as_slice())
+        );
+
+        document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "focus loss".into();
+        let _ = render_grid(&ctx, &mut document);
+        let mut other_text = String::new();
+        let _ = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut other_text)
+                        .id(egui::Id::new("cell-focus-loss-target")),
+                )
+                .request_focus();
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
+        let _ = render_grid(&ctx, &mut document);
+        assert!(document.cell_edit.is_none());
+        assert_eq!(
+            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            Some(b"focus loss".as_slice())
+        );
+
+        document.set_visible_rows(1).unwrap();
+        document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "wheel navigation".into();
+        document.scroll_rows(1).unwrap();
+        assert!(document.cell_edit.is_none());
+        assert_eq!(
+            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            Some(b"wheel navigation".as_slice())
+        );
+        document.navigate(1).unwrap();
+
+        document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "1".into();
+        document.commit_cell_edit();
+        assert!(!document.is_dirty());
+        assert!(document.cell_edits.is_empty());
+        assert_eq!(
+            document.cell_edit_disabled_reason(None),
+            Some("This row has no cell in this file column.")
+        );
+        assert_eq!(
+            document.cell_edit_disabled_reason(Some(&[0xff])),
+            Some("This cell is not valid UTF-8 and cannot be edited.")
+        );
+        document
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Contains,
+                b"first".to_vec(),
+            ))
+            .unwrap();
+        assert_eq!(
+            document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap_err(),
+            "Clear the filter before editing data cells."
+        );
 
         document.shutdown();
         fs::remove_file(path).unwrap();
@@ -5019,11 +5543,10 @@ mod tests {
         let mut app = QuarryApp::new(None, Instant::now());
         app.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
-        app.document
-            .as_mut()
-            .unwrap()
-            .rename_header(0, "button_name".into())
-            .unwrap();
+        let document = app.document.as_mut().unwrap();
+        document.rename_header(0, "button_name".into()).unwrap();
+        document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "line one\nline two".into();
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -5087,7 +5610,10 @@ mod tests {
         assert_eq!(document.session.path(), path);
         assert_eq!(document.column_name(0), "button_name");
         assert!(!document.is_dirty());
-        assert_eq!(fs::read(&path).unwrap(), b"button_name,value\nfirst,1\n");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"button_name,value\nfirst,\"line one\nline two\"\n"
+        );
 
         let document = app.document.as_mut().unwrap();
         document.begin_header_edit(0);
@@ -5114,7 +5640,10 @@ mod tests {
         assert_eq!(document.session.path(), path);
         assert_eq!(document.column_name(0), "shortcut_name");
         assert!(!document.is_dirty());
-        assert_eq!(fs::read(&path).unwrap(), b"shortcut_name,value\nfirst,1\n");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"shortcut_name,value\nfirst,\"line one\nline two\"\n"
+        );
 
         app.document
             .as_mut()
@@ -5168,10 +5697,65 @@ mod tests {
         let document = app.document.as_ref().unwrap();
         assert_eq!(document.column_name(0), "close_name");
         assert!(!document.is_dirty());
-        assert_eq!(fs::read(&path).unwrap(), b"close_name,value\nfirst,1\n");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"close_name,value\nfirst,\"line one\nline two\"\n"
+        );
 
         app.document.as_mut().unwrap().shutdown();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn headerless_cell_edits_stay_headerless_after_save_and_save_as() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source = std::env::temp_dir().join(format!("quarry-headerless-save-{name}.csv"));
+        let destination =
+            std::env::temp_dir().join(format!("quarry-headerless-save-{name}-copy.csv"));
+        fs::write(&source, b"first,1\nsecond,2\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::NoHeader;
+        app.open_path(source.clone()).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        document.begin_cell_edit(0, 1, b"1".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "saved".into();
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        assert!(app.save_current());
+        let _ = finish_app_save(&mut app, &ctx, &mut frame);
+        let document = app.document.as_ref().unwrap();
+        assert!(!document.session.dialect.has_header);
+        assert_eq!(document.data_start, 0);
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), b"first,saved\nsecond,2\n");
+
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        document.begin_cell_edit(1, 1, b"2".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "saved as".into();
+        assert!(app.save_as_picker_result(Some(destination.clone())));
+        let _ = finish_app_save(&mut app, &ctx, &mut frame);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), destination);
+        assert!(!document.session.dialect.has_header);
+        assert_eq!(document.data_start, 0);
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), b"first,saved\nsecond,2\n");
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"first,saved\nsecond,saved as\n"
+        );
+
+        app.document.as_mut().unwrap().shutdown();
+        for path in [source, destination] {
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -5221,6 +5805,7 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("quarry-save-conflict-{name}.csv"));
         let moved = path.with_extension("moved.csv");
+        let destination = path.with_extension("saved-as.csv");
         fs::write(&path, b"name,value\nfirst,1\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
@@ -5258,6 +5843,29 @@ mod tests {
         assert!(!document.is_dirty());
         assert_eq!(document.session.first_rows[1].fields[0], b"first");
 
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "save_as_name".into())
+            .unwrap();
+        fs::rename(&path, &moved).unwrap();
+        assert!(!app.save_as_picker_result(Some(destination.clone())));
+        let document = app.document.as_ref().unwrap();
+        assert!(document.source_changed);
+        assert!(document.is_dirty());
+        assert!(document.index.is_none());
+        assert!(document.buffered_rows.is_empty());
+        let viewport_start = document.viewport_start;
+        app.apply(&ctx, Action::PageDown);
+        assert_eq!(app.notice.as_deref(), Some(SOURCE_CHANGED_NOTICE));
+        assert_eq!(
+            app.document.as_ref().unwrap().viewport_start,
+            viewport_start
+        );
+        assert!(!destination.exists());
+
+        app.apply(&ctx, Action::DiscardChanges);
+        fs::rename(&moved, &path).unwrap();
         app.document.as_mut().unwrap().shutdown();
         fs::remove_file(path).unwrap();
     }
@@ -5281,6 +5889,8 @@ mod tests {
         app.open_path(source.clone()).unwrap();
         let document = app.document.as_mut().unwrap();
         document.rename_header(0, "renamed".into()).unwrap();
+        document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "edited".into();
         let ctx = egui::Context::default();
         let mut close_input = grid_input();
         close_input
@@ -5348,6 +5958,10 @@ mod tests {
             document.rename_header(1, "amount".into()).unwrap_err(),
             "Wait for the save to finish before editing headers."
         );
+        assert_eq!(
+            document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap_err(),
+            "Wait for the active file operation before editing data cells."
+        );
         document.discard_header_edits();
         assert!(document.is_dirty());
         assert_eq!(
@@ -5379,6 +5993,10 @@ mod tests {
         let document = app.document.as_ref().unwrap();
         assert_eq!(document.session.path(), source);
         assert!(document.is_dirty());
+        assert_eq!(
+            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            Some(b"edited".as_slice())
+        );
         assert!(document.save_status.is_none());
 
         app.close_confirmation_open = false;
@@ -5419,7 +6037,10 @@ mod tests {
         assert_eq!(document.column_name(0), "renamed");
         assert!(!document.is_dirty());
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
-        assert_eq!(fs::read(&destination).unwrap(), b"renamed,value\nfirst,1\n");
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"renamed,value\nfirst,edited\n"
+        );
         assert_eq!(
             save_as_file_name(Path::new("report.csv")),
             "report-edited.csv"

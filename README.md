@@ -31,7 +31,10 @@ files; progressive opening; continuous virtualized rows; resizable columns in a
 bounded 32-column display window; direct access to every known column;
 view-only hide/show/reorder controls; literal search; bounded cell or row copy;
 one or more AND-combined contains/equality filter predicates; and cancellable,
-streaming filtered export to a new file. Transformations remain planned.
+streaming filtered export to a new file. Existing UTF-8 headers and data cells
+can be edited directly in the grid, then written through atomic Save with
+metadata-based conflict detection or no-clobber Save As.
+Structural transformations remain planned.
 
 ## Performance direction
 The initial reference workload is a **10 GB delimited file**. Quarry should show useful first rows within seconds, keep memory bounded, remain interactive during scans, and avoid full-file copies for read-only work.
@@ -66,12 +69,13 @@ Phase 4 is complete. Filtering combines one or more literal contains or
 equality predicates with AND semantics. A background worker parses each row
 once, builds a bounded adaptive match index, and serves bounded filtered row
 ranges through cancellable reads without retaining every matching row. Safe,
-cancellable streaming export passed the 1 GB and 12 GB validation. Phase 5
-is in progress. Existing headers can now be renamed directly in the grid, with
-atomic Save plus metadata-based conflict detection and no-clobber Save As. Save
-replaces the current regular file only after a same-directory temporary file is
-flushed and synced; Save As leaves the previous source unchanged. Direct cell
-editing is next.
+cancellable streaming export passed the 1 GB and 12 GB validation. Phase 5 is
+in progress. Existing headers and UTF-8 data cells can now be edited directly
+in the grid. Atomic Save uses metadata-based conflict detection, and no-clobber
+Save As leaves the previous source unchanged. Both stream the sparse edit
+overlay without loading the file into memory. The direct-cell Save As path is
+measured on deterministic 1 GB and 12 GB files; structural transformations are
+next.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -104,12 +108,32 @@ file. Quarry copies the original header and matching records without changing
 the source, reports progress, and supports cancellation without publishing a
 partial destination.
 
+Double-click an existing data cell, or select it and press **Enter** or **F2**,
+to edit it in the grid. Press **Shift+Enter** to insert a newline, **Enter** to
+commit the in-memory change, or **Escape** to cancel the active edit. Quarry
+does not modify the file until **Save** or **Save As…** succeeds. Missing cells
+in ragged rows and invalid UTF-8 cells remain non-editable. Clear an active
+filter before editing; save or discard data-cell edits before starting a new
+search or filter because those background workers scan the unchanged source.
+
 Reproduce a filtered export from the CLI without loading the entire source or
 retaining all matches in memory:
 
 ```bash
 cargo run --release -p quarry-cli --bin quarry-bench -- export huge.csv \
   --output filtered.csv --column 1 --operator equals --value example \
+  --cache-state unknown
+```
+
+Measure streaming Save As with deterministic sparse cell edits and automatic
+read-back validation:
+
+```bash
+cargo run --release -p quarry-cli --bin quarry-bench -- edit-save-as huge.csv \
+  --output edited.csv \
+  --edit 1 1 first-value \
+  --edit 1000000 6 middle-value \
+  --edit 5000000 11 deep-value \
   --cache-state unknown
 ```
 
@@ -185,6 +209,7 @@ See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [streaming-filter validation](docs/benchmarks/2026-08-16-streaming-filter.md),
 [multiple-predicate filter validation](docs/benchmarks/2026-08-16-multiple-predicate-filter.md),
 [filtered-export validation](docs/benchmarks/2026-08-16-filtered-export.md),
+[direct-cell editing validation](docs/benchmarks/2026-08-18-direct-cell-editing.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).
