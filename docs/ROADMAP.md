@@ -2,7 +2,7 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress: 2026-08-17
+## Current progress: 2026-08-18
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -11,7 +11,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 | Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
-| Phase 5: Direct editing and transformations | In progress | Inline header rename, unsaved-change protection, and safe Save As are implemented; Save and direct cell editing remain |
+| Phase 5: Direct editing and transformations | In progress | Inline header rename, unsaved-change protection, and safe Save and Save As are implemented; direct cell editing remains |
 
 ### Phase 1 checklist
 
@@ -150,8 +150,7 @@ Contains/equality filters, multiple AND predicates, incremental results, filtere
   evidence in the
   [filtered-export validation](benchmarks/2026-08-16-filtered-export.md).
 
-**Next:** add Save back to the current file, then extend the same editing model
-from headers to cells.
+**Next:** extend the same editing model from headers to cells.
 
 **Phase 4 exit met:** multiple predicates and filtered export remain practical
 on the 12 GB reference file while memory stays bounded and the source stays
@@ -172,12 +171,17 @@ header rename, then extend the same model to cells and column transformations.
 - [x] Add Save As: stream the current document to a selected path, publish only
   after a complete flush and sync, leave the original unchanged, and make the
   new path current only after success.
-- [ ] Add Save: stream through a same-directory temporary file and atomically
-  replace the current file only after success.
-- [x] Reopen a successful Save As destination, rebuild offset-dependent
+- [x] Add Save: stream through a same-directory temporary file, preserve
+  standard file permissions, check for metadata-visible source changes when
+  Save starts and immediately before replacement, and atomically replace the
+  current regular file only after success. Final-path symbolic links require
+  Save As.
+- [x] Reopen a successful Save or Save As destination, rebuild offset-dependent
   indexes, and clear the unsaved state only after the new document is ready.
-- [x] Preserve existing files and remove Save As temporary output after
-  cancellation or failure, with memory bounded independently of file size.
+- [x] Remove Save and Save As temporary output after cancellation observed
+  before publication or a write failure, without Quarry replacing the current
+  file or clobbering an existing destination. Keep memory bounded independently
+  of file size.
 - [ ] Extend direct editing to cells, split/join, explicit reorder/drop, and
   find/replace.
 

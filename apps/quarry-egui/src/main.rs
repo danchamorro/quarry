@@ -7,8 +7,8 @@ use egui_extras::{Column, TableBuilder};
 use quarry_core::{
     FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
     FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, FilterReadJob,
-    FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, Row,
-    SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch, SearchOutcome, SearchPosition,
+    FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, QuarryError,
+    Row, SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch, SearchOutcome, SearchPosition,
     SearchProgress, Session, StructuralIndex,
 };
 
@@ -29,6 +29,8 @@ const COLUMN_INPUT_ID: &str = "quarry-column-input";
 const COLUMN_POSITION_INPUT_ID: &str = "quarry-column-position-input";
 const FILTER_COLUMN_INPUT_ID: &str = "quarry-filter-column-input";
 const FILTER_VALUE_INPUT_ID: &str = "quarry-filter-value-input";
+const SOURCE_CHANGED_NOTICE: &str =
+    "The source file changed outside Quarry. Discard changes and reopen it.";
 
 fn main() -> eframe::Result<()> {
     let started = Instant::now();
@@ -136,8 +138,8 @@ impl QuarryApp {
 
     fn open_path(&mut self, path: PathBuf) -> Result<(), String> {
         if let Some(document) = self.document.as_mut() {
-            if document.save_as_job.is_some() {
-                return Err("Cancel the active Save As before opening another file.".into());
+            if document.save_job.is_some() {
+                return Err("Cancel the active save before opening another file.".into());
             }
             document.commit_header_edit();
             if document.is_dirty() {
@@ -195,8 +197,8 @@ impl QuarryApp {
 
     fn choose_file(&mut self) {
         if let Some(document) = self.document.as_mut() {
-            if document.save_as_job.is_some() {
-                self.notice = Some("Cancel the active Save As before opening another file.".into());
+            if document.save_job.is_some() {
+                self.notice = Some("Cancel the active save before opening another file.".into());
                 return;
             }
             document.commit_header_edit();
@@ -214,9 +216,8 @@ impl QuarryApp {
 
     fn choose_filtered_export(&mut self) {
         if let Some(document) = self.document.as_mut() {
-            if document.save_as_job.is_some() {
-                self.notice =
-                    Some("Cancel the active Save As before exporting filtered rows.".into());
+            if document.save_job.is_some() {
+                self.notice = Some("Cancel the active save before exporting filtered rows.".into());
                 return;
             }
             document.commit_header_edit();
@@ -249,11 +250,13 @@ impl QuarryApp {
             return false;
         };
         document.commit_header_edit();
-        if !document.is_save_as_ready() {
-            self.notice = Some(if document.save_as_job.is_some() {
-                "A Save As operation is already running.".into()
+        if !document.is_save_ready() {
+            self.notice = Some(if document.save_job.is_some() {
+                "A save operation is already running.".into()
             } else if document.export_job.is_some() {
                 "Cancel the active export before using Save As.".into()
+            } else if document.source_changed {
+                SOURCE_CHANGED_NOTICE.into()
             } else {
                 "Rename a header before using Save As.".into()
             });
@@ -267,6 +270,16 @@ impl QuarryApp {
             dialog = dialog.set_directory(parent);
         }
         self.save_as_picker_result(dialog.save_file())
+    }
+
+    fn save_current(&mut self) -> bool {
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "Open a file before saving.".to_owned())
+            .and_then(Document::start_save);
+        self.notice = result.err();
+        self.notice.is_none()
     }
 
     fn save_as_picker_result(&mut self, destination: Option<PathBuf>) -> bool {
@@ -340,12 +353,16 @@ impl QuarryApp {
                 self.choose_save_as();
                 return;
             }
+            Action::Save => {
+                self.save_current();
+                return;
+            }
             Action::ChooseFilteredExport => return self.choose_filtered_export(),
             Action::DiscardChanges => {
                 if let Some(document) = self.document.as_mut() {
-                    if document.save_as_job.is_some() {
+                    if document.save_job.is_some() {
                         self.notice =
-                            Some("Wait for Save As to finish before discarding changes.".into());
+                            Some("Wait for the save to finish before discarding changes.".into());
                         return;
                     }
                     document.discard_header_edits();
@@ -367,10 +384,15 @@ impl QuarryApp {
         let Some(document) = self.document.as_mut() else {
             return;
         };
+        if document.source_changed {
+            self.notice = Some(SOURCE_CHANGED_NOTICE.into());
+            return;
+        }
         let result = match action {
             Action::Open
             | Action::Choose
             | Action::Reopen
+            | Action::Save
             | Action::ChooseSaveAs
             | Action::ChooseFilteredExport
             | Action::DiscardChanges
@@ -418,8 +440,8 @@ impl QuarryApp {
                 document.cancel_filtered_export();
                 Ok(())
             }
-            Action::CancelSaveAs => {
-                document.cancel_save_as();
+            Action::CancelSave => {
+                document.cancel_save();
                 Ok(())
             }
             Action::Cancel => {
@@ -480,7 +502,7 @@ impl QuarryApp {
             return;
         }
         if let Some(document) = self.document.as_mut() {
-            if document.save_as_job.is_some() {
+            if document.save_job.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.close_confirmation_open = false;
                 self.close_after_save = true;
@@ -544,12 +566,9 @@ impl eframe::App for QuarryApp {
         {
             self.notice = Some(error);
         }
-        let save_as_result = self
-            .document
-            .as_mut()
-            .map_or(Ok(None), Document::poll_save_as);
-        match save_as_result {
-            Ok(Some(destination)) => {
+        let save_result = self.document.as_mut().map_or(Ok(None), Document::poll_save);
+        match save_result {
+            Ok(Some((destination, in_place))) => {
                 let delimiter = self
                     .document
                     .as_ref()
@@ -564,7 +583,25 @@ impl eframe::App for QuarryApp {
                 };
                 match self.replace_document_with_options(destination.clone(), options) {
                     Ok(()) => {
-                        self.notice = Some(format!("Saved as {}.", destination.display()));
+                        self.notice = Some(if in_place {
+                            format!("Saved {}.", destination.display())
+                        } else {
+                            format!("Saved as {}.", destination.display())
+                        });
+                        if self.close_after_save {
+                            self.close_after_save = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    Err(error) if in_place => {
+                        if let Some(mut document) = self.document.take() {
+                            document.shutdown();
+                        }
+                        self.path_input = destination.to_string_lossy().into_owned();
+                        self.notice = Some(format!(
+                            "Saved {} but could not reload it: {error}. Reopen the file to continue.",
+                            destination.display()
+                        ));
                         if self.close_after_save {
                             self.close_after_save = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -572,7 +609,7 @@ impl eframe::App for QuarryApp {
                     }
                     Err(error) => {
                         if let Some(document) = self.document.as_mut() {
-                            document.save_as_status = None;
+                            document.save_status = None;
                         }
                         self.notice = Some(format!(
                             "Saved {} but could not open it: {error}",
@@ -590,7 +627,7 @@ impl eframe::App for QuarryApp {
                     && self
                         .document
                         .as_ref()
-                        .is_some_and(|document| document.save_as_job.is_none())
+                        .is_some_and(|document| document.save_job.is_none())
                 {
                     self.close_after_save = false;
                     self.close_confirmation_open = true;
@@ -635,7 +672,7 @@ impl eframe::App for QuarryApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let export_active = self.document.as_ref().is_some_and(|document| {
-                        document.export_job.is_some() || document.save_as_job.is_some()
+                        document.export_job.is_some() || document.save_job.is_some()
                     });
                     let dirty = self.document.as_ref().is_some_and(Document::is_dirty);
                     let label = ui.label("File");
@@ -726,13 +763,25 @@ impl eframe::App for QuarryApp {
                     {
                         action = Some(Action::Reopen);
                     }
+                    if let Some(document) = self.document.as_ref() {
+                        if ui
+                            .add_enabled(document.is_save_ready(), egui::Button::new("Save"))
+                            .on_hover_text("Save changes to this file (⌘S)")
+                            .on_disabled_hover_text(
+                                "Make a change, or wait for the active file operation to finish.",
+                            )
+                            .clicked()
+                        {
+                            action = Some(Action::Save);
+                        }
+                    }
                     if let Some(document) = self
                         .document
                         .as_ref()
                         .filter(|document| document.is_dirty())
                     {
                         if ui
-                            .add_enabled(document.is_save_as_ready(), egui::Button::new("Save As…"))
+                            .add_enabled(document.is_save_ready(), egui::Button::new("Save As…"))
                             .on_disabled_hover_text("Wait for the active file operation to finish.")
                             .clicked()
                         {
@@ -740,10 +789,10 @@ impl eframe::App for QuarryApp {
                         }
                         if ui
                             .add_enabled(
-                                document.save_as_job.is_none(),
+                                document.save_job.is_none(),
                                 egui::Button::new("Discard Changes"),
                             )
-                            .on_disabled_hover_text("Wait for Save As to finish.")
+                            .on_disabled_hover_text("Wait for the save to finish.")
                             .clicked()
                         {
                             action = Some(Action::DiscardChanges);
@@ -828,7 +877,7 @@ impl eframe::App for QuarryApp {
                             action = Some(search_action);
                         }
                     }
-                    if let Some(progress) = document.save_as_job.as_ref().map(SaveAsJob::progress) {
+                    if let Some(progress) = document.save_job.as_ref().map(SaveAsJob::progress) {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             let fraction = if progress.total_bytes == 0 {
@@ -837,31 +886,36 @@ impl eframe::App for QuarryApp {
                                 (progress.bytes_scanned as f32 / progress.total_bytes as f32)
                                     .clamp(0.0, 1.0)
                             };
-                            let status = if document.save_as_cancel_requested {
-                                "Cancelling Save As"
-                            } else if progress.done {
-                                "Save As finished"
+                            let operation = if document.saving_in_place {
+                                "Save"
                             } else {
-                                "Saving edited file"
+                                "Save As"
+                            };
+                            let status = if document.save_cancel_requested {
+                                format!("Cancelling {operation}")
+                            } else if progress.done {
+                                format!("{operation} finished")
+                            } else {
+                                "Saving edited file".into()
                             };
                             ui.add(
                                 egui::ProgressBar::new(fraction)
                                     .desired_width(260.0)
                                     .text(format!("{status} · {:.1}%", fraction * 100.0)),
                             );
-                            if document.save_as_job.is_some()
+                            if document.save_job.is_some()
                                 && ui
                                     .add_enabled(
-                                        !document.save_as_cancel_requested,
-                                        egui::Button::new("Cancel Save As"),
+                                        !document.save_cancel_requested,
+                                        egui::Button::new(format!("Cancel {operation}")),
                                     )
                                     .clicked()
                             {
-                                action = Some(Action::CancelSaveAs);
+                                action = Some(Action::CancelSave);
                             }
                         });
                     }
-                    if let Some(status) = document.save_as_status.as_deref() {
+                    if let Some(status) = document.save_status.as_deref() {
                         let response = ui.label(status);
                         let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
                             node.set_live(egui::accesskit::Live::Polite);
@@ -928,6 +982,13 @@ impl eframe::App for QuarryApp {
                 }
             });
 
+        if action.is_none()
+            && !self.close_confirmation_open
+            && self.document.as_ref().is_some_and(Document::is_save_ready)
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
+        {
+            action = Some(Action::Save);
+        }
         if action.is_none() && self.document.is_some() {
             action = ctx.input(|input| {
                 if input.key_pressed(egui::Key::PageDown) {
@@ -1004,11 +1065,12 @@ impl eframe::App for QuarryApp {
             let mut discard_and_close = false;
             let mut keep_editing = false;
             let mut save_and_close = false;
+            let mut save_as_and_close = false;
             let modal =
                 egui::Modal::new(egui::Id::new("quarry-close-confirmation")).show(ctx, |ui| {
                     ui.heading("Unsaved changes");
                     ui.label("This file has unsaved header changes.");
-                    ui.label("Save them to a new file, keep editing, or discard them.");
+                    ui.label("Save them, save a new copy, keep editing, or discard them.");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Keep Editing").clicked() {
@@ -1016,10 +1078,8 @@ impl eframe::App for QuarryApp {
                         }
                         if ui
                             .add_enabled(
-                                self.document
-                                    .as_ref()
-                                    .is_some_and(Document::is_save_as_ready),
-                                egui::Button::new("Save As and Close…"),
+                                self.document.as_ref().is_some_and(Document::is_save_ready),
+                                egui::Button::new("Save and Close"),
                             )
                             .clicked()
                         {
@@ -1027,9 +1087,18 @@ impl eframe::App for QuarryApp {
                         }
                         if ui
                             .add_enabled(
+                                self.document.as_ref().is_some_and(Document::is_save_ready),
+                                egui::Button::new("Save As and Close…"),
+                            )
+                            .clicked()
+                        {
+                            save_as_and_close = true;
+                        }
+                        if ui
+                            .add_enabled(
                                 self.document
                                     .as_ref()
-                                    .is_none_or(|document| document.save_as_job.is_none()),
+                                    .is_none_or(|document| document.save_job.is_none()),
                                 egui::Button::new("Discard Changes and Close"),
                             )
                             .clicked()
@@ -1042,6 +1111,13 @@ impl eframe::App for QuarryApp {
             if keep_editing {
                 self.keep_editing();
             } else if save_and_close {
+                self.close_confirmation_open = false;
+                self.close_after_save = true;
+                if !self.save_current() {
+                    self.close_after_save = false;
+                    self.close_confirmation_open = true;
+                }
+            } else if save_as_and_close {
                 self.close_confirmation_open = false;
                 self.close_after_save = true;
                 if !self.choose_save_as() {
@@ -1062,7 +1138,7 @@ impl eframe::App for QuarryApp {
                 || document.filter_job.is_some()
                 || document.filter_rows_loading()
                 || document.export_job.is_some()
-                || document.save_as_job.is_some()
+                || document.save_job.is_some()
         }) {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
@@ -1121,13 +1197,14 @@ enum Action {
     Open,
     Choose,
     Reopen,
+    Save,
     PageUp,
     PageDown,
     FirstColumns,
     OpenColumns,
     OpenFilters,
     ChooseSaveAs,
-    CancelSaveAs,
+    CancelSave,
     ChooseFilteredExport,
     DiscardChanges,
     Jump,
@@ -1976,9 +2053,11 @@ struct Document {
     export_progress: Option<FilterExportProgress>,
     export_status: Option<String>,
     export_cancel_requested: bool,
-    save_as_job: Option<SaveAsJob>,
-    save_as_status: Option<String>,
-    save_as_cancel_requested: bool,
+    save_job: Option<SaveAsJob>,
+    save_status: Option<String>,
+    save_cancel_requested: bool,
+    saving_in_place: bool,
+    source_changed: bool,
     filter_viewport_start: u64,
     filter_buffer_start: u64,
     filtered_rows: Vec<FilterMatch>,
@@ -2082,9 +2161,11 @@ impl Document {
             export_progress: None,
             export_status: None,
             export_cancel_requested: false,
-            save_as_job: None,
-            save_as_status: None,
-            save_as_cancel_requested: false,
+            save_job: None,
+            save_status: None,
+            save_cancel_requested: false,
+            saving_in_place: false,
+            source_changed: false,
             filter_viewport_start: 0,
             filter_buffer_start: 0,
             filtered_rows: Vec::new(),
@@ -2356,8 +2437,8 @@ impl Document {
     }
 
     fn start_filtered_export(&mut self, destination: PathBuf) -> Result<(), String> {
-        if self.save_as_job.is_some() {
-            return Err("Cancel the active Save As before exporting filtered rows.".into());
+        if self.save_job.is_some() {
+            return Err("Cancel the active save before exporting filtered rows.".into());
         }
         self.commit_header_edit();
         if self.is_dirty() {
@@ -2452,44 +2533,70 @@ impl Document {
         self.filter_query.is_some()
             && self.filter_job.is_none()
             && self.export_job.is_none()
-            && self.save_as_job.is_none()
+            && self.save_job.is_none()
             && self
                 .filter_progress
                 .is_some_and(|progress| progress.done && !progress.cancelled)
     }
 
-    fn is_save_as_ready(&self) -> bool {
-        self.is_dirty() && self.save_as_job.is_none() && self.export_job.is_none()
+    fn is_save_ready(&self) -> bool {
+        !self.source_changed
+            && self.is_dirty()
+            && self.save_job.is_none()
+            && self.export_job.is_none()
+    }
+
+    fn start_save(&mut self) -> Result<(), String> {
+        self.start_save_operation(None)
     }
 
     fn start_save_as(&mut self, destination: PathBuf) -> Result<(), String> {
-        if self.save_as_job.is_some() {
-            return Err("A Save As operation is already running.".into());
+        self.start_save_operation(Some(destination))
+    }
+
+    fn start_save_operation(&mut self, destination: Option<PathBuf>) -> Result<(), String> {
+        if self.source_changed {
+            return Err(SOURCE_CHANGED_NOTICE.into());
+        }
+        if self.save_job.is_some() {
+            return Err("A save operation is already running.".into());
         }
         if self.export_job.is_some() {
-            return Err("Cancel the active export before using Save As.".into());
+            return Err("Cancel the active export before saving.".into());
         }
         self.commit_header_edit();
         if !self.is_dirty() {
-            return Err("Rename a header before using Save As.".into());
+            return Err("Rename a header before saving.".into());
         }
         let renames = self
             .header_renames
             .iter()
             .map(|(column, name)| (*column, name.as_bytes().to_vec()))
             .collect();
-        let job = self
-            .session
-            .start_save_as_with_header_renames(renames, destination)
-            .map_err(|error| error.to_string())?;
-        self.save_as_job = Some(job);
-        self.save_as_status = Some("Saving edited file…".into());
-        self.save_as_cancel_requested = false;
+        let saving_in_place = destination.is_none();
+        let result = match destination {
+            Some(destination) => self
+                .session
+                .start_save_as_with_header_renames(renames, destination),
+            None => self.session.start_save_with_header_renames(renames),
+        };
+        let job = match result {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        self.save_job = Some(job);
+        self.save_status = Some("Saving edited file…".into());
+        self.save_cancel_requested = false;
+        self.saving_in_place = saving_in_place;
         Ok(())
     }
 
-    fn poll_save_as(&mut self) -> Result<Option<PathBuf>, String> {
-        let Some(job) = self.save_as_job.as_ref() else {
+    fn poll_save(&mut self) -> Result<Option<(PathBuf, bool)>, String> {
+        let Some(job) = self.save_job.as_ref() else {
             return Ok(None);
         };
         let progress = job.progress();
@@ -2497,26 +2604,58 @@ impl Document {
             return Ok(None);
         }
 
-        let job = self.save_as_job.take().expect("Save As job is present");
-        self.save_as_cancel_requested = false;
+        let job = self.save_job.take().expect("save job is present");
+        let in_place = self.saving_in_place;
+        self.save_cancel_requested = false;
+        self.saving_in_place = false;
         match job.wait() {
-            Ok(SaveAsOutcome::Complete(summary)) => Ok(Some(summary.destination)),
+            Ok(SaveAsOutcome::Complete(summary)) => Ok(Some((summary.destination, in_place))),
             Ok(SaveAsOutcome::Cancelled) => {
-                self.save_as_status = Some("Save As cancelled. No output file was created.".into());
+                self.save_status = Some(if in_place {
+                    "Save cancelled. Quarry did not replace the current file.".into()
+                } else {
+                    "Save As cancelled. No output file was created.".into()
+                });
                 Ok(None)
             }
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                Err(SOURCE_CHANGED_NOTICE.into())
+            }
             Err(error) => {
-                self.save_as_status = Some("Save As failed. No output file was created.".into());
+                self.save_status = Some(if in_place {
+                    "Save failed. Quarry did not replace the current file.".into()
+                } else {
+                    "Save As failed. No output file was created.".into()
+                });
                 Err(error.to_string())
             }
         }
     }
 
-    fn cancel_save_as(&mut self) {
-        if let Some(job) = &self.save_as_job {
+    fn invalidate_changed_source(&mut self) {
+        self.shutdown();
+        self.source_changed = true;
+        self.index = None;
+        self.filter_index = None;
+        self.filter_query = None;
+        self.filter_progress = None;
+        self.buffered_rows.clear();
+        self.filtered_rows.clear();
+        self.selection = None;
+        self.reveal_cell = None;
+        self.save_status = Some(SOURCE_CHANGED_NOTICE.into());
+    }
+
+    fn cancel_save(&mut self) {
+        if let Some(job) = &self.save_job {
             job.cancel();
-            self.save_as_cancel_requested = true;
-            self.save_as_status = Some("Cancelling Save As…".into());
+            self.save_cancel_requested = true;
+            self.save_status = Some(if self.saving_in_place {
+                "Cancelling Save…".into()
+            } else {
+                "Cancelling Save As…".into()
+            });
         }
     }
 
@@ -2720,7 +2859,7 @@ impl Document {
     }
 
     fn header_is_editable(&self, column: usize) -> bool {
-        self.save_as_job.is_none()
+        self.save_job.is_none()
             && self.export_job.is_none()
             && self.search_job.is_none()
             && self.source_header_name(column).is_some()
@@ -2759,8 +2898,8 @@ impl Document {
     }
 
     fn rename_header(&mut self, column: usize, name: String) -> Result<(), String> {
-        if self.save_as_job.is_some() {
-            return Err("Wait for Save As to finish before editing headers.".into());
+        if self.save_job.is_some() {
+            return Err("Wait for the save to finish before editing headers.".into());
         }
         if self.export_job.is_some() {
             return Err("Wait for the filtered export to finish before editing headers.".into());
@@ -2786,7 +2925,7 @@ impl Document {
     }
 
     fn commit_header_edit(&mut self) {
-        if self.save_as_job.is_some() {
+        if self.save_job.is_some() {
             return;
         }
         if let Some(edit) = self.header_edit.take() {
@@ -2795,7 +2934,7 @@ impl Document {
     }
 
     fn discard_header_edits(&mut self) {
-        if self.save_as_job.is_some() {
+        if self.save_job.is_some() {
             return;
         }
         self.header_edit = None;
@@ -2804,7 +2943,17 @@ impl Document {
     }
 
     fn is_dirty(&self) -> bool {
-        !self.header_renames.is_empty()
+        let Some(edit) = self.header_edit.as_ref() else {
+            return !self.header_renames.is_empty();
+        };
+        self.header_renames
+            .keys()
+            .any(|column| *column != edit.column)
+            || edit.draft.as_bytes()
+                != self
+                    .source_header_name(edit.column)
+                    .expect("active header edit has source text")
+                    .as_bytes()
     }
 
     fn validate_column(&self, column: usize) -> Result<(), String> {
@@ -2825,7 +2974,9 @@ impl Document {
     }
 
     fn index_status(&self) -> &'static str {
-        if self.job.is_none() && self.index.is_none() {
+        if self.source_changed {
+            "Source changed"
+        } else if self.job.is_none() && self.index.is_none() {
             "Index failed"
         } else if self.progress.cancelled {
             "Index cancelled"
@@ -2838,11 +2989,12 @@ impl Document {
 
     fn shutdown(&mut self) {
         self.stop_filter_read();
-        if let Some(job) = self.save_as_job.take() {
+        if let Some(job) = self.save_job.take() {
             job.cancel();
             drop(job);
         }
-        self.save_as_cancel_requested = false;
+        self.save_cancel_requested = false;
+        self.saving_in_place = false;
         if let Some(job) = self.export_job.take() {
             job.cancel();
             drop(job);
@@ -3392,6 +3544,12 @@ fn column_name(session: &Session, column: usize) -> String {
 }
 
 fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
+    if document.source_changed {
+        ui.centered_and_justified(|ui| {
+            ui.label(SOURCE_CHANGED_NOTICE);
+        });
+        return Ok(());
+    }
     let grid_height = ui.available_height();
     let horizontal_scrollbar = ui.spacing().scroll.allocated_width();
     let body_height =
@@ -3961,8 +4119,8 @@ mod tests {
     use super::{
         Action, COLUMN_INPUT_ID, COLUMN_POSITION_INPUT_ID, ColumnCommand, ColumnView,
         DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterProgress, FilterQuery,
-        GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SearchProgress,
-        Session, column_drop_position, column_window_controls, copy_control,
+        GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SOURCE_CHANGED_NOTICE,
+        SearchProgress, Session, column_drop_position, column_window_controls, copy_control,
         filtered_export_controls, filtered_export_file_name, logical_viewport_start,
         max_viewport_start, page_controls, parse_column_position, parse_data_row,
         parse_file_column, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
@@ -4233,6 +4391,28 @@ mod tests {
             assert!(Instant::now() < deadline, "filtered export timed out");
             std::thread::yield_now();
         }
+    }
+
+    fn finish_app_save(
+        app: &mut QuarryApp,
+        ctx: &egui::Context,
+        frame: &mut eframe::Frame,
+    ) -> egui::FullOutput {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .document
+            .as_ref()
+            .and_then(|document| document.save_job.as_ref())
+            .expect("save job should be active")
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline, "save timed out");
+            std::thread::yield_now();
+        }
+        ctx.run(grid_input(), |ctx| {
+            eframe::App::update(app, ctx, frame);
+        })
     }
 
     #[test]
@@ -4829,6 +5009,259 @@ mod tests {
     }
 
     #[test]
+    fn save_button_and_command_s_replace_the_current_file_and_reopen_it_clean() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-save-ui-{name}.csv"));
+        fs::write(&path, b"name,value\nfirst,1\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(path.clone()).unwrap();
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "button_name".into())
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        app.close_confirmation_open = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: egui::Modifiers::COMMAND,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::S,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(app.close_confirmation_open);
+        assert!(app.document.as_ref().unwrap().save_job.is_none());
+        assert!(app.document.as_ref().unwrap().is_dirty());
+        app.keep_editing();
+
+        let output = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let save_button = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present")
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Save")
+                    && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .expect("Save should be an accessible button");
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: save_button,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(app.document.as_ref().unwrap().save_job.is_some());
+        let _ = finish_app_save(&mut app, &ctx, &mut frame);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), path);
+        assert_eq!(document.column_name(0), "button_name");
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read(&path).unwrap(), b"button_name,value\nfirst,1\n");
+
+        let document = app.document.as_mut().unwrap();
+        document.begin_header_edit(0);
+        document.header_edit.as_mut().unwrap().draft = "shortcut_name".into();
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: egui::Modifiers::COMMAND,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::S,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(app.document.as_ref().unwrap().save_job.is_some());
+        let _ = finish_app_save(&mut app, &ctx, &mut frame);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), path);
+        assert_eq!(document.column_name(0), "shortcut_name");
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read(&path).unwrap(), b"shortcut_name,value\nfirst,1\n");
+
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "close_name".into())
+            .unwrap();
+        app.close_confirmation_open = true;
+        let output = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let save_and_close = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present")
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Save and Close")
+                    && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .expect("Save and Close should be an accessible button");
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: save_and_close,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(app.close_after_save);
+        assert!(app.document.as_ref().unwrap().save_job.is_some());
+        let close_output = finish_app_save(&mut app, &ctx, &mut frame);
+        assert!(
+            close_output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .unwrap()
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Close))
+        );
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.column_name(0), "close_name");
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read(&path).unwrap(), b"close_name,value\nfirst,1\n");
+
+        app.document.as_mut().unwrap().shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn successful_save_with_failed_reload_drops_the_stale_document() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-save-reload-{name}.csv"));
+        let moved = std::env::temp_dir().join(format!("quarry-save-reload-{name}-moved.csv"));
+        fs::write(&path, b"name,value\nfirst,1\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(path.clone()).unwrap();
+        let document = app.document.as_mut().unwrap();
+        document.rename_header(0, "renamed".into()).unwrap();
+        document.start_save().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !document.save_job.as_ref().unwrap().progress().done {
+            assert!(Instant::now() < deadline, "save timed out");
+            std::thread::yield_now();
+        }
+        fs::rename(&path, &moved).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert!(app.document.is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("could not reload it"))
+        );
+        assert_eq!(fs::read(&moved).unwrap(), b"renamed,value\nfirst,1\n");
+
+        fs::remove_file(moved).unwrap();
+    }
+
+    #[test]
+    fn source_change_conflict_freezes_stale_navigation_until_reopen() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-save-conflict-{name}.csv"));
+        fs::write(&path, b"name,value\nfirst,1\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(path.clone()).unwrap();
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "renamed".into())
+            .unwrap();
+        fs::write(&path, b"name,value\nexternal,2\n").unwrap();
+
+        assert!(!app.save_current());
+        let document = app.document.as_ref().unwrap();
+        assert!(document.source_changed);
+        assert!(document.is_dirty());
+        assert_eq!(document.index_status(), "Source changed");
+        assert!(document.index.is_none());
+        assert!(document.buffered_rows.is_empty());
+        let viewport_start = document.viewport_start;
+
+        let ctx = egui::Context::default();
+        app.apply(&ctx, Action::PageDown);
+        assert_eq!(app.notice.as_deref(), Some(SOURCE_CHANGED_NOTICE));
+        assert_eq!(
+            app.document.as_ref().unwrap().viewport_start,
+            viewport_start
+        );
+
+        app.apply(&ctx, Action::DiscardChanges);
+        app.reopen_document();
+        let document = app.document.as_ref().unwrap();
+        assert!(!document.source_changed);
+        assert!(!document.is_dirty());
+        assert_eq!(document.session.first_rows[1].fields[0], b"external");
+
+        app.document.as_mut().unwrap().shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn dirty_lifecycle_blocks_loss_and_save_as_reopens_the_edited_copy() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4912,13 +5345,13 @@ mod tests {
         let document = app.document.as_mut().unwrap();
         assert_eq!(
             document.rename_header(1, "amount".into()).unwrap_err(),
-            "Wait for Save As to finish before editing headers."
+            "Wait for the save to finish before editing headers."
         );
         document.discard_header_edits();
         assert!(document.is_dirty());
         assert_eq!(
             app.open_path(other.clone()).unwrap_err(),
-            "Cancel the active Save As before opening another file."
+            "Cancel the active save before opening another file."
         );
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4926,7 +5359,7 @@ mod tests {
             .document
             .as_ref()
             .unwrap()
-            .save_as_job
+            .save_job
             .as_ref()
             .unwrap()
             .progress()
@@ -4945,7 +5378,7 @@ mod tests {
         let document = app.document.as_ref().unwrap();
         assert_eq!(document.session.path(), source);
         assert!(document.is_dirty());
-        assert!(document.save_as_status.is_none());
+        assert!(document.save_status.is_none());
 
         app.close_confirmation_open = false;
         app.document
@@ -4959,7 +5392,7 @@ mod tests {
             .document
             .as_ref()
             .unwrap()
-            .save_as_job
+            .save_job
             .as_ref()
             .unwrap()
             .progress()

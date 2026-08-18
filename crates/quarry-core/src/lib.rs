@@ -8,8 +8,10 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub use export::{
     FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterExportSummary, SaveAsJob,
@@ -50,6 +52,7 @@ pub enum QuarryError {
     InvalidOption(&'static str),
     ExportDestinationIsSource,
     ExportDestinationExists,
+    SourceChanged,
     WorkerPanicked,
 }
 
@@ -84,6 +87,7 @@ impl fmt::Display for QuarryError {
                 write!(f, "export destination must differ from the source file")
             }
             Self::ExportDestinationExists => write!(f, "export destination already exists"),
+            Self::SourceChanged => write!(f, "source file changed since it was opened"),
             Self::WorkerPanicked => write!(f, "background worker panicked"),
         }
     }
@@ -162,10 +166,44 @@ pub struct Row {
 #[derive(Debug)]
 pub struct Session {
     path: PathBuf,
+    source_stamp: SourceStamp,
     pub file_size: u64,
     pub dialect: Dialect,
     pub first_rows: Vec<Row>,
     pub metrics: OpenMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    readonly: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanos: i64,
+}
+
+impl SourceStamp {
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            readonly: metadata.permissions().readonly(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanos: metadata.ctime_nsec(),
+        }
+    }
 }
 
 impl Session {
@@ -185,7 +223,9 @@ impl Session {
         let open_started = Instant::now();
         let mut file = File::open(path.as_ref())?;
         let file_open = open_started.elapsed();
-        let file_size = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        let file_size = metadata.len();
+        let source_stamp = SourceStamp::from_metadata(&metadata);
 
         let mut sample = vec![0; options.sample_bytes.min(file_size as usize)];
         let sample_len = read_up_to(&mut file, &mut sample)?;
@@ -217,6 +257,7 @@ impl Session {
 
         Ok(Self {
             path: path.as_ref().to_path_buf(),
+            source_stamp,
             file_size,
             dialect: Dialect {
                 delimiter,

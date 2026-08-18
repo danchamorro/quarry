@@ -15,7 +15,7 @@ quarry-core
    +-- Bounded filter-index worker
    +-- Bounded filtered-row read worker
    +-- Streaming filtered-export worker
-   +-- Streaming edited Save As worker
+   +-- Streaming edited Save and Save As worker
    |
 quarry-delimited
    +-- Record scanner
@@ -111,19 +111,20 @@ match, and at most a 64 MiB clipboard payload.
 cache remains deferred.
 
 Unsaved edits use a sparse overlay whose memory grows with the number and size
-of user edits, not with source-file size. Save As enforces the existing maximum
-record size against the fully serialized edited header before publication.
+of user edits, not with source-file size. Save and Save As enforce the existing
+maximum record size against the fully serialized edited header before
+publication.
 
 ## Concurrency
 Rust workers currently handle indexing, literal search, filtering, filtered
-viewport reads, filtered export, and edited Save As. Each publishes progress
+viewport reads, filtered export, and edited Save and Save As. Each publishes progress
 and supports cancellation.
 Jobs normally join before they are dropped. Rapid filtered navigation cancels
 obsolete reads, keeps only the newest pending window, and joins a cancelled read
 after it finishes. Filter resets and document lifecycle changes detach an active
 read-only viewport worker so the render thread never waits for cleanup; each
 worker owns its resources and exits at its next cancellation check. An active
-filtered export or Save As blocks document replacement until cancellation
+filtered export, Save, or Save As blocks document replacement until cancellation
 finishes. App shutdown joins active output workers so temporary-output cleanup
 is guaranteed.
 
@@ -186,17 +187,25 @@ and application close must not silently discard dirty state. Every write path
 must consume the current document overlay or remain unavailable while the
 document is dirty.
 
-Save As uses a streaming rewrite rather than in-place record mutation. It
-publishes a selected destination and leaves the previous source unchanged.
-Cancellation or failure removes temporary output and preserves existing files.
-The planned Save path will write beside the active file and atomically replace
-it only after the temporary output is flushed and synced.
+Save and Save As use a streaming rewrite rather than in-place record mutation.
+Save As publishes a selected destination and leaves the previous source
+unchanged. Save creates temporary output beside the current regular file,
+preserves its standard permissions, flushes and syncs the temporary file,
+checks for metadata-visible source changes when Save starts and immediately
+before replacement, then atomically replaces the source. If a change is
+detected, Quarry invalidates offset-backed navigation and requires discarding
+the unsaved edits plus reopening the source. Final-path symbolic links are
+rejected with guidance to use Save As. Cancellation observed before publication
+or a write failure removes temporary output without Quarry replacing the source
+or clobbering an existing destination.
 
-After a successful Save As publication, Quarry opens the destination as the
-current source and rebuilds offset-dependent indexes before clearing dirty
-state. This is required because even a header rename can shift every later byte
-offset. Unchanged records remain byte-preserving where possible; edited records
-are serialized with the document dialect.
+After a successful Save or Save As publication, Quarry opens the published file
+as the current source and rebuilds offset-dependent indexes before clearing
+dirty state. If an in-place Save succeeds but reloading fails, Quarry removes
+the stale document from use and asks the user to reopen it. This is required
+because even a header rename can shift every later byte offset. Unchanged
+records remain byte-preserving where possible; edited records are serialized
+with the document dialect.
 
 ## UI selection
 [ADR 0003](adr/0003-select-egui-ui.md) records the measured egui and AppKit
