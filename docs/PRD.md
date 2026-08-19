@@ -43,10 +43,10 @@ Column controls operate on stable source-column identities. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
 
-Phase 5 has delivered direct in-grid header rename, unsaved document state,
-atomic Save with metadata-based conflict detection, and no-clobber Save As.
-Direct cell editing is next. Disk-aware sorting remains
-a candidate if it does not delay the core milestone.
+Phase 5 has delivered direct in-grid header and existing data-cell editing,
+sparse unsaved document state, atomic Save with metadata-based conflict
+detection, and no-clobber Save As. Structural transformations are next.
+Disk-aware sorting remains a candidate if it does not delay the core milestone.
 
 Not required: general-purpose text-editor behavior, formulas, charts, database
 connectivity, plugins, cloud sync, collaboration, direct in-place byte
@@ -54,11 +54,14 @@ mutation, or EmEditor feature parity.
 
 ## Version 0.2: direct editing and transformations
 
-Edit headers and cells directly in the grid. The first slice renames an
-existing header and records the change as sparse unsaved document state keyed
-by stable source-column identity, with Save and Save As. Later slices add direct
-cell editing, split/join, rename/reorder/drop, find/replace, transformed
-filtered output, and safe streaming full-file output.
+Edit headers and cells directly in the grid. Existing UTF-8 data cells support
+multiline input and use sparse unsaved document state keyed by stable physical
+record row and source-column identity. Missing fields in ragged rows and
+invalid UTF-8 cells fail explicitly rather than creating or corrupting data.
+Search and filters continue to scan the unchanged source, so they remain
+unavailable while data-cell edits are unsaved. Later slices add split/join,
+explicit rename/reorder/drop transformations, overlay-aware find/replace, and
+transformed filtered output.
 
 Save As writes a selected destination, leaves the previous source unchanged,
 and makes the new file current only after success. Save writes through a
@@ -67,6 +70,12 @@ the Save when a metadata-visible source change is found at startup or
 immediately before replacement, flushes and syncs, then atomically replaces the
 current regular file. Final-path symbolic links require Save As. Neither
 operation mutates records in place.
+
+Save and Save As copy unedited records byte for byte and serialize only edited
+records with the document delimiter and original line ending. For a fixed edit
+set, memory depends on the bounded scanner record and sparse overlay rather
+than source-file size. Overlay memory may grow with the number and size of
+edits.
 
 ## Progressive opening
 1. Open the file and sample a bounded region.
@@ -84,8 +93,10 @@ Initial targets:
 - First useful rows: under 3 seconds target.
 - Initial viewing memory: under 500 MB target.
 - No RAM growth proportional to file size during read-only viewing.
-- Responsive UI during indexing, search, filtering, filtered navigation, and
-  export.
+- Responsive UI during indexing, search, filtering, filtered navigation,
+  export, and editing.
+- Streaming Save and Save As with memory bounded by scanner limits and the
+  sparse edit set rather than source-file size.
 - Long operations cancellable.
 - Smooth interactive scrolling.
 

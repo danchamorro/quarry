@@ -11,7 +11,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 | Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
-| Phase 5: Direct editing and transformations | In progress | Inline header rename, unsaved-change protection, atomic Save with metadata-based conflict detection, and no-clobber Save As are implemented; direct cell editing remains |
+| Phase 5: Direct editing and transformations | In progress | Inline header and data-cell editing, unsaved-change protection, atomic Save with metadata-based conflict detection, no-clobber Save As, and deterministic [1 GB and 12 GB direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md) are implemented; structural transformations remain |
 
 ### Phase 1 checklist
 
@@ -100,9 +100,9 @@ pacing becomes measurable with the viewer-alpha grid.
 opening, format controls, literal search, copy, column controls, diagnostics,
 and an adaptive grid that keeps at least 40 rows visible in the maximized
 reference window.
-Phase 4 filtering and streaming filtered export are complete. Phase 5 begins
-with direct in-grid header rename and unsaved document state. Cosmetic redesign
-remains outside the current scope.
+Phase 4 filtering and streaming filtered export are complete. Phase 5 now has
+direct in-grid header and data-cell editing plus sparse streaming persistence.
+Cosmetic redesign remains outside the current scope.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -157,10 +157,12 @@ unchanged.
 ## Phase 5: Direct editing and transformations
 
 Edit values where they appear in the grid. Keep committed edits as sparse
-unsaved document state until an explicit Save or Save As. Begin with inline
-header rename, then extend the same model to cells and column transformations.
+unsaved document state until an explicit Save or Save As. Header rename and
+editing existing data cells use stable source identities. Later slices add
+structural row and column transformations.
 
-**Next:** extend the same editing model from headers to cells.
+**Next:** define and implement the first explicit structural transformation,
+starting with split/join while preserving the same publication guarantees.
 
 ### Phase 5 checklist
 
@@ -180,10 +182,24 @@ header rename, then extend the same model to cells and column transformations.
   indexes, and clear the unsaved state only after the new document is ready.
 - [x] Remove Save and Save As temporary output after cancellation observed
   before publication or a write failure, without Quarry replacing the current
-  file or clobbering an existing destination. Keep memory bounded independently
-  of file size.
-- [ ] Extend direct editing to cells, split/join, explicit reorder/drop, and
-  find/replace.
+  file or clobbering an existing destination. For a fixed sparse edit set, keep
+  memory bounded with respect to source-file size.
+- [x] Edit an existing UTF-8 data cell directly in the grid by stable physical
+  record row and source column. Preserve multiline input, cancel an active edit
+  with Escape, reject missing ragged fields and invalid UTF-8 explicitly, and
+  keep search/filter results from silently ignoring unsaved cell values.
+- [x] Stream header and cell overlays through Save and Save As. Copy unedited
+  records byte for byte, serialize only edited records with the document
+  dialect and original line ending, and reject invalid row or column targets
+  before publication.
+- [x] Record exact output, source preservation, cancellation, throughput, and
+  peak RSS on deterministic 1 GB and 12 GB datasets in the
+  [direct-cell editing validation](benchmarks/2026-08-18-direct-cell-editing.md).
+- [ ] Add split/join transformations without building a file-sized in-memory
+  document model.
+- [ ] Add explicit output reorder/drop choices while keeping the Columns
+  manager view-only.
+- [ ] Add overlay-aware find/replace with bounded progress and cancellation.
 
 The Columns manager remains view-only and does not mark the document changed.
 A transformed Save As may explicitly use its arranged order. Hidden columns

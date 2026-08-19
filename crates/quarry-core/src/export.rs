@@ -227,31 +227,54 @@ pub struct SaveAsJob {
 }
 
 enum SaveTarget {
-    New(PathBuf),
+    New(PathBuf, SourceStamp),
     Source(SourceStamp),
 }
 
+struct SaveEdits {
+    headers: BTreeMap<usize, Vec<u8>>,
+    cells: BTreeMap<(u64, usize), Vec<u8>>,
+}
+
 impl SaveAsJob {
-    fn start(
+    fn start_with_edits(
         source_path: PathBuf,
         file_size: u64,
         delimiter: u8,
         has_header: bool,
-        header_renames: BTreeMap<usize, Vec<u8>>,
+        edits: SaveEdits,
         target: SaveTarget,
         config: ExportConfig,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption("save-as chunk must be non-zero"));
         }
-        if !has_header {
+        if !has_header && !edits.headers.is_empty() {
             return Err(QuarryError::InvalidOption(
                 "header renames require a header row",
             ));
         }
-        let source = File::open(&source_path)?;
+        let data_start = u64::from(has_header);
+        if edits
+            .cells
+            .first_key_value()
+            .is_some_and(|((row, _), _)| *row < data_start)
+        {
+            return Err(QuarryError::InvalidOption(
+                "cell edits must target data rows",
+            ));
+        }
+        let source = File::open(&source_path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                QuarryError::SourceChanged
+            } else {
+                error.into()
+            }
+        })?;
         let output = match target {
-            SaveTarget::New(destination) => ExportTarget::new(&source_path, destination)?,
+            SaveTarget::New(destination, expected) => {
+                ExportTarget::new_guarded(&source_path, destination, &source, expected)?
+            }
             SaveTarget::Source(expected) => {
                 ExportTarget::replace_source(&source_path, source.metadata()?, expected)?
             }
@@ -266,7 +289,8 @@ impl SaveAsJob {
                     source,
                     output,
                     delimiter,
-                    &header_renames,
+                    has_header,
+                    &edits,
                     config,
                     &worker_state,
                 );
@@ -354,13 +378,28 @@ impl Session {
         header_renames: BTreeMap<usize, Vec<u8>>,
         destination: impl AsRef<Path>,
     ) -> Result<SaveAsJob, QuarryError> {
-        SaveAsJob::start(
+        self.start_save_as_with_edits(header_renames, BTreeMap::new(), destination)
+    }
+
+    pub fn start_save_as_with_edits(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        destination: impl AsRef<Path>,
+    ) -> Result<SaveAsJob, QuarryError> {
+        SaveAsJob::start_with_edits(
             self.path.clone(),
             self.file_size,
             self.dialect.delimiter,
             self.dialect.has_header,
-            header_renames,
-            SaveTarget::New(destination.as_ref().to_path_buf()),
+            SaveEdits {
+                headers: header_renames,
+                cells: cell_edits,
+            },
+            SaveTarget::New(
+                destination.as_ref().to_path_buf(),
+                self.source_stamp.clone(),
+            ),
             DEFAULT_EXPORT_CONFIG,
         )
     }
@@ -369,12 +408,23 @@ impl Session {
         &self,
         header_renames: BTreeMap<usize, Vec<u8>>,
     ) -> Result<SaveAsJob, QuarryError> {
-        SaveAsJob::start(
+        self.start_save_with_edits(header_renames, BTreeMap::new())
+    }
+
+    pub fn start_save_with_edits(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+    ) -> Result<SaveAsJob, QuarryError> {
+        SaveAsJob::start_with_edits(
             self.path.clone(),
             self.file_size,
             self.dialect.delimiter,
             self.dialect.has_header,
-            header_renames,
+            SaveEdits {
+                headers: header_renames,
+                cells: cell_edits,
+            },
             SaveTarget::Source(self.source_stamp.clone()),
             DEFAULT_EXPORT_CONFIG,
         )
@@ -389,6 +439,11 @@ impl Session {
 
 enum Publication {
     CreateNew,
+    GuardedCreateNew {
+        source_path: PathBuf,
+        source: File,
+        source_stamp: SourceStamp,
+    },
     ReplaceSource {
         permissions: fs::Permissions,
         source_stamp: SourceStamp,
@@ -406,6 +461,26 @@ impl ExportTarget {
     fn new(source: &Path, destination: PathBuf) -> Result<Self, QuarryError> {
         validate_destination(source, &destination)?;
         Self::create(destination, Publication::CreateNew)
+    }
+
+    fn new_guarded(
+        source_path: &Path,
+        destination: PathBuf,
+        source: &File,
+        source_stamp: SourceStamp,
+    ) -> Result<Self, QuarryError> {
+        validate_destination(source_path, &destination)?;
+        if !source_matches_stamp(source, source_path, &source_stamp)? {
+            return Err(QuarryError::SourceChanged);
+        }
+        Self::create(
+            destination,
+            Publication::GuardedCreateNew {
+                source_path: source_path.to_path_buf(),
+                source: source.try_clone()?,
+                source_stamp,
+            },
+        )
     }
 
     fn replace_source(
@@ -504,6 +579,17 @@ impl ExportTarget {
         }
         let publish_result = match &self.publication {
             Publication::CreateNew => publish_no_replace(&self.temporary, &self.destination),
+            Publication::GuardedCreateNew {
+                source_path,
+                source,
+                source_stamp,
+            } => {
+                if !source_matches_stamp(source, source_path, source_stamp)? {
+                    self.remove_temporary()?;
+                    return Err(QuarryError::SourceChanged);
+                }
+                publish_no_replace(&self.temporary, &self.destination)
+            }
             Publication::ReplaceSource { source_stamp, .. } => {
                 let unchanged = fs::symlink_metadata(&self.destination)
                     .ok()
@@ -555,6 +641,22 @@ impl Drop for ExportTarget {
         drop(self.writer.take());
         let _ = fs::remove_file(&self.temporary);
     }
+}
+
+fn source_matches_stamp(
+    source: &File,
+    source_path: &Path,
+    expected: &SourceStamp,
+) -> Result<bool, QuarryError> {
+    if SourceStamp::from_metadata(&source.metadata()?) != *expected {
+        return Ok(false);
+    }
+    let path_metadata = match fs::metadata(source_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(SourceStamp::from_metadata(&path_metadata) == *expected)
 }
 
 fn validate_destination(source: &Path, destination: &Path) -> Result<(), QuarryError> {
@@ -690,18 +792,24 @@ fn run_save_as(
     mut source: File,
     mut output: ExportTarget,
     delimiter: u8,
-    header_renames: &BTreeMap<usize, Vec<u8>>,
+    has_header: bool,
+    edits: &SaveEdits,
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<SaveAsOutcome, QuarryError> {
-    match copy_with_rewritten_header(
-        &mut source,
-        &mut output,
-        delimiter,
-        header_renames,
-        config,
-        shared,
-    ) {
+    let copied = if edits.cells.is_empty() && has_header {
+        copy_with_rewritten_header(
+            &mut source,
+            &mut output,
+            delimiter,
+            &edits.headers,
+            config,
+            shared,
+        )
+    } else {
+        copy_with_rewritten_records(&mut source, &mut output, delimiter, edits, config, shared)
+    };
+    match copied {
         Ok(Some(bytes_written)) => {
             match output.publish(0, bytes_written, &shared.cancel_requested)? {
                 FilterExportOutcome::Complete(summary) => {
@@ -722,6 +830,182 @@ fn run_save_as(
             Err(error)
         }
     }
+}
+
+fn copy_with_rewritten_records(
+    source: &mut File,
+    output: &mut ExportTarget,
+    delimiter: u8,
+    edits: &SaveEdits,
+    config: ExportConfig,
+    shared: &SharedState,
+) -> Result<Option<u64>, QuarryError> {
+    let mut scanner = RecordScanner::new(delimiter)?;
+    let mut chunk = vec![0; config.chunk_bytes];
+    let mut record = Vec::new();
+    let mut absolute_start = 0_u64;
+    let mut row_number = 0_u64;
+    let mut bytes_written = 0_u64;
+    let mut next_cell_edit_row = edits.cells.first_key_value().map(|((row, _), _)| *row);
+
+    loop {
+        if shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let read = source.read(&mut chunk)?;
+        if read == 0 {
+            let mut deferred_error = None;
+            let mut cancelled = false;
+            let finish_result = scanner.finish(absolute_start, |_| {
+                if shared.cancel_requested.load(Ordering::Acquire) {
+                    cancelled = true;
+                } else if row_number == 0 && !edits.headers.is_empty()
+                    || next_cell_edit_row == Some(row_number)
+                {
+                    let has_cell_edits = next_cell_edit_row == Some(row_number);
+                    match write_saved_record(
+                        output,
+                        &record,
+                        row_number,
+                        delimiter,
+                        has_cell_edits,
+                        edits,
+                        config.max_record_bytes,
+                    ) {
+                        Ok(written) => bytes_written = bytes_written.saturating_add(written),
+                        Err(error) => deferred_error = Some(error),
+                    }
+                    if has_cell_edits {
+                        next_cell_edit_row = row_number.checked_add(1).and_then(|next_row| {
+                            edits
+                                .cells
+                                .range((next_row, 0)..)
+                                .next()
+                                .map(|((row, _), _)| *row)
+                        });
+                    }
+                }
+                row_number += 1;
+            });
+            shared.bytes_written.store(bytes_written, Ordering::Release);
+            if cancelled {
+                return Ok(None);
+            }
+            if let Some(error) = deferred_error {
+                return Err(error);
+            }
+            finish_result?;
+            if next_cell_edit_row.is_some() {
+                return Err(QuarryError::InvalidOption("cell edit row is out of range"));
+            }
+            return Ok(Some(bytes_written));
+        }
+
+        let mut segment_start = 0_usize;
+        let mut deferred_error = None;
+        let mut cancelled = false;
+        let scan_result = scanner.scan_chunk(&chunk[..read], absolute_start, |absolute_end| {
+            let local_end = (absolute_end - absolute_start) as usize;
+            if deferred_error.is_none() && !cancelled {
+                if shared.cancel_requested.load(Ordering::Acquire) {
+                    cancelled = true;
+                } else {
+                    let has_cell_edits = next_cell_edit_row == Some(row_number);
+                    if row_number == 0 && !edits.headers.is_empty() || has_cell_edits {
+                        record.extend_from_slice(&chunk[segment_start..local_end]);
+                        match write_saved_record(
+                            output,
+                            &record,
+                            row_number,
+                            delimiter,
+                            has_cell_edits,
+                            edits,
+                            config.max_record_bytes,
+                        ) {
+                            Ok(written) => bytes_written = bytes_written.saturating_add(written),
+                            Err(error) => deferred_error = Some(error),
+                        }
+                    } else {
+                        let raw = &chunk[segment_start..local_end];
+                        match output.write_all(raw) {
+                            Ok(()) => {
+                                bytes_written = bytes_written.saturating_add(raw.len() as u64)
+                            }
+                            Err(error) => deferred_error = Some(error),
+                        }
+                    }
+                    if has_cell_edits {
+                        next_cell_edit_row = row_number.checked_add(1).and_then(|next_row| {
+                            edits
+                                .cells
+                                .range((next_row, 0)..)
+                                .next()
+                                .map(|((row, _), _)| *row)
+                        });
+                    }
+                }
+            }
+            record.clear();
+            row_number += 1;
+            segment_start = local_end;
+        });
+
+        absolute_start = absolute_start.saturating_add(read as u64);
+        shared
+            .bytes_scanned
+            .store(absolute_start, Ordering::Release);
+        if cancelled || shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
+        scan_result?;
+        let trailing = &chunk[segment_start..read];
+        if row_number == 0 && !edits.headers.is_empty() || next_cell_edit_row == Some(row_number) {
+            record.extend_from_slice(trailing);
+            if record.len() > config.max_record_bytes {
+                return Err(QuarryError::RecordTooLarge {
+                    limit: config.max_record_bytes,
+                });
+            }
+        } else {
+            output.write_all(trailing)?;
+            bytes_written = bytes_written.saturating_add(trailing.len() as u64);
+        }
+        shared.bytes_written.store(bytes_written, Ordering::Release);
+    }
+}
+
+fn write_saved_record(
+    output: &mut ExportTarget,
+    record: &[u8],
+    row_number: u64,
+    delimiter: u8,
+    has_cell_edits: bool,
+    edits: &SaveEdits,
+    max_record_bytes: usize,
+) -> Result<u64, QuarryError> {
+    if record.len() > max_record_bytes {
+        return Err(QuarryError::RecordTooLarge {
+            limit: max_record_bytes,
+        });
+    }
+    if row_number == 0 && !edits.headers.is_empty() {
+        return write_rewritten_header(output, record, delimiter, &edits.headers, max_record_bytes);
+    }
+    if has_cell_edits {
+        return write_rewritten_data_record(
+            output,
+            record,
+            row_number,
+            delimiter,
+            &edits.cells,
+            max_record_bytes,
+        );
+    }
+    output.write_all(record)?;
+    Ok(record.len() as u64)
 }
 
 fn copy_with_rewritten_header(
@@ -826,18 +1110,64 @@ fn write_rewritten_header(
     header_renames: &BTreeMap<usize, Vec<u8>>,
     max_record_bytes: usize,
 ) -> Result<u64, QuarryError> {
+    write_rewritten_record(
+        output,
+        record,
+        delimiter,
+        header_renames.last_key_value().map(|(column, _)| *column),
+        |column| header_renames.get(&column).map(Vec::as_slice),
+        None,
+        max_record_bytes,
+    )
+}
+
+fn write_rewritten_data_record(
+    output: &mut ExportTarget,
+    record: &[u8],
+    row_number: u64,
+    delimiter: u8,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    max_record_bytes: usize,
+) -> Result<u64, QuarryError> {
+    let last_column = cell_edits
+        .range((row_number, 0)..=(row_number, usize::MAX))
+        .next_back()
+        .map(|((_, column), _)| *column);
+    write_rewritten_record(
+        output,
+        record,
+        delimiter,
+        last_column,
+        |column| cell_edits.get(&(row_number, column)).map(Vec::as_slice),
+        Some(row_number),
+        max_record_bytes,
+    )
+}
+
+fn write_rewritten_record<'a>(
+    output: &mut ExportTarget,
+    record: &[u8],
+    delimiter: u8,
+    last_replacement_column: Option<usize>,
+    replacement: impl Fn(usize) -> Option<&'a [u8]>,
+    data_row: Option<u64>,
+    max_record_bytes: usize,
+) -> Result<u64, QuarryError> {
     const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
-    let (prefix, record) = record
-        .strip_prefix(UTF8_BOM)
-        .map_or((&[][..], record), |record| (UTF8_BOM, record));
+    let (prefix, record) = if data_row.is_none_or(|row| row == 0) {
+        record
+            .strip_prefix(UTF8_BOM)
+            .map_or((&[][..], record), |record| (UTF8_BOM, record))
+    } else {
+        (&[][..], record)
+    };
     let fields = parse_record(record, delimiter)?;
-    if header_renames
-        .last_key_value()
-        .is_some_and(|(column, _)| *column >= fields.len())
-    {
-        return Err(QuarryError::InvalidOption(
-            "header rename column is out of range",
-        ));
+    if last_replacement_column.is_some_and(|column| column >= fields.len()) {
+        return Err(QuarryError::InvalidOption(if data_row.is_some() {
+            "cell edit column is out of range"
+        } else {
+            "header rename column is out of range"
+        }));
     }
 
     let ending = if record.ends_with(b"\r\n") {
@@ -852,9 +1182,7 @@ fn write_rewritten_header(
         .saturating_add(ending.len())
         .saturating_add(fields.len().saturating_sub(1));
     for (column, field) in fields.iter().enumerate() {
-        let field = header_renames
-            .get(&column)
-            .map_or(field.as_ref(), Vec::as_slice);
+        let field = replacement(column).unwrap_or_else(|| field.as_ref());
         serialized_len = serialized_len.saturating_add(delimited_field_len(field, delimiter));
     }
     if serialized_len > max_record_bytes {
@@ -870,9 +1198,7 @@ fn write_rewritten_header(
             output.write_all(&[delimiter])?;
             bytes_written += 1;
         }
-        let field = header_renames
-            .get(&column)
-            .map_or(field.as_ref(), Vec::as_slice);
+        let field = replacement(column).unwrap_or_else(|| field.as_ref());
         bytes_written =
             bytes_written.saturating_add(write_delimited_field(output, field, delimiter)?);
     }
@@ -1103,7 +1429,7 @@ mod tests {
 
     use super::{
         ExportConfig, ExportTarget, FilterExportJob, FilterExportOutcome, SaveAsJob, SaveAsOutcome,
-        SaveTarget, SharedState, WorkerCompletion,
+        SaveEdits, SaveTarget, SharedState, WorkerCompletion,
     };
     use crate::{FilterOperator, FilterQuery, HeaderMode, OpenOptions, QuarryError, Session};
 
@@ -1190,13 +1516,16 @@ mod tests {
             (2, Vec::new()),
             (3, b"dup".to_vec()),
         ]);
-        let job = SaveAsJob::start(
+        let job = SaveAsJob::start_with_edits(
             source.clone(),
             session.file_size,
             b';',
             true,
-            renames,
-            SaveTarget::New(destination.clone()),
+            SaveEdits {
+                headers: renames,
+                cells: BTreeMap::new(),
+            },
+            SaveTarget::New(destination.clone(), session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 3,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
@@ -1226,7 +1555,184 @@ mod tests {
     }
 
     #[test]
-    fn save_replaces_the_source_and_preserves_permissions() {
+    fn save_as_streams_sparse_cell_edits_with_header_and_csv_fidelity() {
+        let source_bytes = b"\xEF\xBB\xBFid;note;empty\r\n1;\"old\nline\";x\r\n2;\"say \"\"hi\"\"\";keep\n3;remove;tail";
+        let expected = b"\xEF\xBB\xBFid;memo;empty\r\n\"1;changed\";\"new\nline\";\r\n2;\"say \"\"bye\"\"\";keep\n3;;tail";
+        let source = fixture(source_bytes);
+        let destination = destination(&source, "edited.csv");
+        let session = session(&source, b';', HeaderMode::FirstRow);
+        let job = SaveAsJob::start_with_edits(
+            source.clone(),
+            session.file_size,
+            b';',
+            true,
+            SaveEdits {
+                headers: BTreeMap::from([(1, b"memo".to_vec())]),
+                cells: BTreeMap::from([
+                    ((1, 0), b"1;changed".to_vec()),
+                    ((1, 1), b"new\nline".to_vec()),
+                    ((1, 2), Vec::new()),
+                    ((2, 1), b"say \"bye\"".to_vec()),
+                    ((3, 1), Vec::new()),
+                ]),
+            },
+            SaveTarget::New(destination.clone(), session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 2,
+                max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        let SaveAsOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("save-as unexpectedly cancelled");
+        };
+        assert_eq!(summary.bytes_written, expected.len() as u64);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        assert!(temporary_exports(&destination).is_empty());
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(destination).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn save_as_edits_the_first_headerless_bom_record() {
+        let source_bytes = b"\xEF\xBB\xBF1,old\r\n2,last";
+        let expected = b"\xEF\xBB\xBF1,\"new\nline\"\r\n2,last";
+        let source = fixture(source_bytes);
+        let destination = destination(&source, "headerless.csv");
+        let session = session(&source, b',', HeaderMode::NoHeader);
+        let job = session
+            .start_save_as_with_edits(
+                BTreeMap::new(),
+                BTreeMap::from([((0, 1), b"new\nline".to_vec())]),
+                &destination,
+            )
+            .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(destination).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn invalid_cell_coordinates_do_not_publish() {
+        let source_bytes = b"id,name\n1,Ada\n";
+        let source = fixture(source_bytes);
+        let destination = destination(&source, "invalid-cell.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = session
+            .start_save_as_with_edits(
+                BTreeMap::new(),
+                BTreeMap::from([((1, 2), b"extra".to_vec())]),
+                &destination,
+            )
+            .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait(), Err(QuarryError::InvalidOption(_))));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        let job = session
+            .start_save_as_with_edits(
+                BTreeMap::new(),
+                BTreeMap::from([((9, 0), b"missing".to_vec())]),
+                &destination,
+            )
+            .unwrap();
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait(), Err(QuarryError::InvalidOption(_))));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        assert!(matches!(
+            session.start_save_with_edits(
+                BTreeMap::new(),
+                BTreeMap::from([((0, 0), b"header".to_vec())]),
+            ),
+            Err(QuarryError::InvalidOption(_))
+        ));
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn serialized_record_limit_counts_the_edited_cell() {
+        let source_bytes = b"id,name\n1,A\n";
+        let source = fixture(source_bytes);
+        let destination = destination(&source, "oversized-cell.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = SaveAsJob::start_with_edits(
+            source.clone(),
+            session.file_size,
+            b',',
+            true,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::from([((1, 1), b"too long".to_vec())]),
+            },
+            SaveTarget::New(destination.clone(), session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 3,
+                max_record_bytes: 8,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::RecordTooLarge { limit: 8 })
+        ));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn cell_save_streams_unedited_records_larger_than_the_edit_buffer() {
+        let source_bytes = b"id,name\n1,an untouched long value\n2,A\n";
+        let expected = b"id,name\n1,an untouched long value\n2,B\n";
+        let source = fixture(source_bytes);
+        let destination = destination(&source, "bounded-cell.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = SaveAsJob::start_with_edits(
+            source.clone(),
+            session.file_size,
+            b',',
+            true,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::from([((2, 1), b"B".to_vec())]),
+            },
+            SaveTarget::New(destination.clone(), session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 3,
+                max_record_bytes: 8,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(destination).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn save_replaces_the_source_with_edits_and_preserves_permissions() {
         let source = fixture(b"id,name\n1,Ada\n");
         #[cfg(unix)]
         {
@@ -1246,7 +1752,10 @@ mod tests {
         }
         let session = session(&source, b',', HeaderMode::FirstRow);
         let job = session
-            .start_save_with_header_renames(BTreeMap::from([(1, b"person".to_vec())]))
+            .start_save_with_edits(
+                BTreeMap::from([(1, b"person".to_vec())]),
+                BTreeMap::from([((1, 1), b"Grace".to_vec())]),
+            )
             .unwrap();
 
         wait_until_save_done(&job);
@@ -1254,7 +1763,7 @@ mod tests {
             panic!("save unexpectedly cancelled");
         };
         assert_eq!(summary.destination, source);
-        assert_eq!(fs::read(&source).unwrap(), b"id,person\n1,Ada\n");
+        assert_eq!(fs::read(&source).unwrap(), b"id,person\n1,Grace\n");
         #[cfg(unix)]
         assert_eq!(
             fs::metadata(&source).unwrap().permissions().mode() & 0o777,
@@ -1328,6 +1837,7 @@ mod tests {
     #[test]
     fn save_rejects_a_source_changed_since_the_session_opened() {
         let source = fixture(b"id,name\n1,Ada\n");
+        let destination = destination(&source, "stale-save-as.csv");
         let session = session(&source, b',', HeaderMode::FirstRow);
         fs::write(&source, b"id,name\n1,Grace\n").unwrap();
 
@@ -1335,9 +1845,41 @@ mod tests {
             session.start_save_with_header_renames(BTreeMap::from([(0, b"ID".to_vec())])),
             Err(QuarryError::SourceChanged)
         ));
+        assert!(matches!(
+            session.start_save_as_with_header_renames(
+                BTreeMap::from([(0, b"ID".to_vec())]),
+                &destination,
+            ),
+            Err(QuarryError::SourceChanged)
+        ));
         assert_eq!(fs::read(&source).unwrap(), b"id,name\n1,Grace\n");
+        assert!(!destination.exists());
         assert!(temporary_exports(&source).is_empty());
+        assert!(temporary_exports(&destination).is_empty());
         fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn save_as_reports_source_changed_when_the_opened_source_was_renamed() {
+        let source_bytes = b"id,name\n1,Ada\n";
+        let source = fixture(source_bytes);
+        let moved_source = destination(&source, "moved-source.csv");
+        let destination = destination(&source, "renamed-source-save.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        fs::rename(&source, &moved_source).unwrap();
+
+        assert!(matches!(
+            session.start_save_as_with_header_renames(
+                BTreeMap::from([(0, b"ID".to_vec())]),
+                &destination,
+            ),
+            Err(QuarryError::SourceChanged)
+        ));
+        assert_eq!(fs::read(&moved_source).unwrap(), source_bytes);
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        fs::remove_file(&moved_source).unwrap();
         remove_case(&source);
     }
 
@@ -1427,13 +1969,16 @@ mod tests {
         let source = fixture(source_bytes);
         let destination = destination(&source, "oversized-header.csv");
         let session = session(&source, b',', HeaderMode::FirstRow);
-        let job = SaveAsJob::start(
+        let job = SaveAsJob::start_with_edits(
             source.clone(),
             session.file_size,
             b',',
             true,
-            BTreeMap::from([(0, b"a renamed header".to_vec())]),
-            SaveTarget::New(destination.clone()),
+            SaveEdits {
+                headers: BTreeMap::from([(0, b"a renamed header".to_vec())]),
+                cells: BTreeMap::new(),
+            },
+            SaveTarget::New(destination.clone(), session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 4,
                 max_record_bytes: 8,
@@ -1460,13 +2005,16 @@ mod tests {
         let source = fixture(&source_bytes);
         let destination = destination(&source, "cancelled-save.csv");
         let session = session(&source, b',', HeaderMode::FirstRow);
-        let job = SaveAsJob::start(
+        let job = SaveAsJob::start_with_edits(
             source.clone(),
             session.file_size,
             b',',
             true,
-            BTreeMap::from([(0, b"ID".to_vec())]),
-            SaveTarget::New(destination.clone()),
+            SaveEdits {
+                headers: BTreeMap::from([(0, b"ID".to_vec())]),
+                cells: BTreeMap::new(),
+            },
+            SaveTarget::New(destination.clone(), session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
@@ -1491,6 +2039,50 @@ mod tests {
         assert!(!destination.exists());
         assert!(temporary_exports(&destination).is_empty());
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn save_as_does_not_publish_when_source_changes_during_copy() {
+        let mut source_bytes = b"id,name\n".to_vec();
+        source_bytes.extend_from_slice(&b"1,Ada\n".repeat(500_000));
+        let source = fixture(&source_bytes);
+        let destination = destination(&source, "source-changed-save.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let job = SaveAsJob::start_with_edits(
+            source.clone(),
+            session.file_size,
+            b',',
+            true,
+            SaveEdits {
+                headers: BTreeMap::from([(0, b"ID".to_vec())]),
+                cells: BTreeMap::new(),
+            },
+            SaveTarget::New(destination.clone(), session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while job.progress().bytes_scanned < 100 {
+            assert!(
+                !job.progress().done,
+                "save-as completed before source change"
+            );
+            assert!(Instant::now() < deadline, "save-as did not make progress");
+            thread::yield_now();
+        }
+
+        let external = b"id,name\nexternal,change\n";
+        fs::write(&source, external).unwrap();
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait(), Err(QuarryError::SourceChanged)));
+        assert_eq!(fs::read(&source).unwrap(), external);
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
         fs::remove_file(&source).unwrap();
         remove_case(&source);
     }
