@@ -61,6 +61,7 @@ The data engine is written in **Rust**. A measured egui/AppKit bake-off selected
 - [Roadmap](docs/ROADMAP.md)
 - [Engineering Principles](docs/ENGINEERING_PRINCIPLES.md)
 - [Contributing](docs/CONTRIBUTING.md)
+- [macOS Packaging and Installation](docs/MACOS_PACKAGING.md)
 
 ## Current milestone
 
@@ -97,14 +98,38 @@ complete order and preservation scans with peak RSS below 20 MiB, measured
 temporary disk below the conservative estimate, unchanged source hashes, and
 prompt cancellation without leftover files. The worker now also verifies the
 effective record multiset and exact stable tie order before publication. Phase
-7 hardening begins with reproducible packaging and one canonical installed
-desktop application.
+7A desktop packaging is complete. The full installed-app interaction journey
+passes, and clean committed build 31 installs as the canonical
+`/Applications/Quarry.app`, reports matching source metadata, and enforces the
+application/installer exclusion lock. Phase 7B next focuses on polishing current
+workflows before the missing-feature inventory.
+
+## Install Quarry
+
+Quit any running Quarry copy, then build, install, and verify the canonical
+local alpha application:
+
+```bash
+./scripts/macos-app.sh install
+./scripts/macos-app.sh verify
+open /Applications/Quarry.app
+```
+
+The installer preserves any valid prior Quarry app as a rollback archive,
+verifies the new bundle before and after replacement, removes any legacy
+prototype, and leaves only `/Applications/Quarry.app` active. See the
+[macOS packaging guide](docs/MACOS_PACKAGING.md) for package-only, update,
+verification, rollback, and signing details.
+
+## Development launch
+
+Run the benchmark-oriented CLI from source:
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
 ```
 
-Launch the egui viewer alpha with or without a CLI path:
+Launch the egui viewer alpha directly from Cargo with or without a path:
 
 ```bash
 cargo run --release -p quarry-egui

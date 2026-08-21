@@ -2093,6 +2093,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui_extras",
+ "libc",
  "quarry-core",
  "rfd",
  "tempfile",

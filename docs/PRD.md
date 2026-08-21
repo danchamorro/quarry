@@ -1,6 +1,6 @@
 # Quarry Product Requirements Document
 
-**Version:** 0.1 Draft
+**Version:** 0.4 Draft
 **Platform:** macOS first
 **Core engine:** Rust
 **Model:** Open source
@@ -165,6 +165,28 @@ stable-tie source-ordinal checks, unchanged source hashes, and prompt
 cancellation without leftovers. Numeric, date, locale-aware, case-insensitive,
 and multi-column sorting remain later slices.
 
+## Version 0.4: desktop packaging and installation
+
+Phase 7A packages the selected egui application as the customer-facing
+`/Applications/Quarry.app`. Its stable bundle identifier is
+`io.github.danchamorro.quarry`, and the bundle executable is `Quarry`.
+The checked-in icon, Cargo version, numeric build version, full Git commit,
+source-tree status, architecture, and declared minimum macOS version are
+recorded in the bundle metadata. The initial plist declares macOS 11.0 or later.
+Current acceptance validates Apple Silicon on the documented host; it does not
+claim that the packaged binary was exercised on macOS 11.
+
+One command performs a locked release build, bundle assembly, signing, and
+verification. When a previous app exists, installation verifies it before
+replacement, preserves a rollback archive outside `/Applications`, restores it
+after any replacement failure, verifies the final payload, and removes the
+legacy and staging bundles. Acceptance testing uses only the canonical installed
+application.
+
+The local alpha uses ad-hoc signing until a Developer ID Application identity
+and notarization credentials are available. Ad-hoc verification is not a claim
+of trusted-publisher or Gatekeeper distribution readiness.
+
 ## Progressive opening
 1. Open the file and sample a bounded region.
 2. Detect likely encoding/delimiter/quote settings.
@@ -200,6 +222,11 @@ replacing the current file or clobbering an existing destination. Opening,
 reopening, or closing a changed document requires an explicit save or discard
 decision.
 
+Installing or updating Quarry never replaces the current installed app until a
+new candidate passes bundle verification. When a prior app exists, a failed
+replacement restores it and a successful update retains a verified rollback
+archive outside `/Applications`.
+
 Replace All follows the same rule: it publishes only a complete private working
 copy, leaves the opened or saved source unchanged, and removes unpublished
 output after no match, cancellation, or failure.
@@ -217,7 +244,8 @@ A 10 GB CSV is repeatedly practical to open and navigate on supported Macs while
 Another editor's trademark should not be Quarry's official tagline.
 
 ## Open questions
-Minimum macOS version; encoding breadth; persistent index format/invalidation.
+Validated minimum macOS version; encoding breadth; persistent index
+format/invalidation.
 [ADR 0003](adr/0003-select-egui-ui.md) selects the UI framework.
 
 The initial engine ships with a benchmark-oriented CLI and is dual-licensed

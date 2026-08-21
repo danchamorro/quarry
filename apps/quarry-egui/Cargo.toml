@@ -11,3 +11,6 @@ egui_extras.workspace = true
 quarry-core = { path = "../../crates/quarry-core" }
 rfd = { version = "0.17.2", default-features = false }
 tempfile = "3.27.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
