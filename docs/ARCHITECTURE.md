@@ -16,6 +16,8 @@ quarry-core
    +-- Bounded filtered-row read worker
    +-- Streaming filtered-export worker
    +-- Streaming edited Save and Save As worker
+   +-- Split analysis worker
+   +-- Streaming structural materialization worker
    |
 quarry-delimited
    +-- Record scanner
@@ -111,24 +113,37 @@ match, and at most a 64 MiB clipboard payload.
 [ADR 0002](adr/0002-defer-viewport-cache.md) records why an application viewport
 cache remains deferred.
 
-Unsaved edits use a sparse overlay whose memory grows with the number and size
-of user edits, not with source-file size. Save and Save As enforce the existing
-maximum record size against every fully serialized edited record before
-publication. For a fixed sparse edit set, the streaming worker retains a fixed
-read chunk, at most one bounded record and its decoded fields, and the overlay.
+Before a structural operation, unsaved cell and header values remain a sparse
+overlay on the active indexed CSV. A confirmed Split or Combine does not stay
+as a lazy operation. A bounded worker materializes the operation and sparse
+overlay into a private working CSV, then Quarry reopens that file as the
+ordinary indexed document. Split first makes a cancellable analysis pass that
+retains only the current bounded record and width counters. The materialization
+pass retains a fixed read chunk, one bounded decoded record, and its output
+fields.
+RAM therefore grows with user changes, schema width, and record size rather
+than file size.
+
+The materialized working copy necessarily uses disk proportional to the current
+document. Quarry retains the current private CSV and may retain one adjacent
+private CSV for one-level structural Undo or Redo. Its private directory is
+owner-only, and each materialized CSV is created with owner-only permissions.
+Quarry removes private working files on Discard, successful publication,
+document replacement, and shutdown.
 
 ## Concurrency
 Rust workers currently handle indexing, literal search, filtering, filtered
-viewport reads, filtered export, and edited Save and Save As. Each publishes progress
-and supports cancellation.
+viewport reads, filtered export, Split analysis, structural materialization,
+and edited Save and Save As. Each long operation publishes progress and
+supports cancellation.
 Jobs normally join before they are dropped. Rapid filtered navigation cancels
 obsolete reads, keeps only the newest pending window, and joins a cancelled read
 after it finishes. Filter resets and document lifecycle changes detach an active
 read-only viewport worker so the render thread never waits for cleanup; each
 worker owns its resources and exits at its next cancellation check. An active
-filtered export, Save, or Save As blocks document replacement until cancellation
-finishes. App shutdown joins active output workers so temporary-output cleanup
-is guaranteed.
+filtered export, structural materialization, Save, or Save As blocks document
+replacement until cancellation finishes. App shutdown joins active output
+workers so temporary-output cleanup is guaranteed.
 
 ## Search and filtering
 Literal Find Next uses a cancellable core worker after structural indexing. It
@@ -139,11 +154,13 @@ worker on wait or drop. Memory therefore depends on the query, the fixed chunk,
 the 64 MiB maximum record and its decoded fields, one match, and the bounded
 structural index, not on file size or match count.
 
-Search and filter workers intentionally scan the immutable source rather than
-the unsaved overlay. The viewer therefore disables new searches and filters
-while data-cell edits exist and requires an active filter to be cleared before
-cell editing. This keeps displayed results from silently disagreeing with the
-unsaved document. Overlay-aware search and filtering remain a later slice.
+Search and filter workers scan the active indexed CSV rather than a sparse
+overlay. The viewer therefore disables new searches and filters while sparse
+cell or header edits exist and requires an active filter to be cleared before
+editing. This keeps displayed results from silently disagreeing with the
+unsaved document. Once a Split or Combine has materialized and its private
+working CSV has been indexed, that file is the active searchable document.
+Overlay-aware search and filtering remain a later slice.
 
 A `FilterQuery` owns one or more `FilterPredicate` values. Each predicate stores
 a source column, a case-sensitive contains or equality operator, and its literal
@@ -167,9 +184,10 @@ fixed chunk and index budgets, the 64 MiB maximum record and its decoded fields,
 and the requested row count, not on file size or match count.
 
 ## Filtered export
-Filtered export scans the source once with the same decoded-cell predicate
-semantics as filtered navigation, but copies each matching raw record to a
-buffered temporary file. This preserves the source header, delimiter, quoting,
+Filtered export scans the active indexed CSV once with the same decoded-cell
+predicate semantics as filtered navigation, but copies each matching raw
+record to a buffered temporary file. This preserves the active header,
+delimiter, quoting,
 line endings, and multiline records byte for byte without retaining matching
 rows. The worker publishes scanned bytes, parsed records, written rows, written
 bytes, elapsed time, and cancellation state.
@@ -184,23 +202,29 @@ Use a disk-aware external merge sort: bounded runs, sort in memory, spill to tem
 
 ## Document editing and persistence
 
-Editing occurs directly in the grid. The source file remains immutable while
-the document is open. A sparse overlay stores committed edits by stable source
-identity. Header renames use the original source column. Data-cell edits use the
-physical record row and original source column, independent of the current
-column display order. Viewport rendering and copy read the overlay before
-falling back to decoded source values. Cancelling an inline edit does not change
-document state, and restoring the original bytes removes that overlay entry.
+Editing occurs directly in the grid. The last opened or saved file remains
+immutable until Save. Sparse value changes use stable row and column identities
+within the active indexed CSV. Cancelling an inline edit does not change
+document state, and restoring the current underlying value removes that sparse
+entry. A confirmed structural operation consumes the active CSV plus those
+sparse edits into a new private working CSV. Quarry then reopens the result,
+rebuilds offset-dependent indexes, clears the absorbed sparse overlay, and uses
+the new schema as the ordinary editable document. View-only hide and reorder
+actions do not alter that document schema.
 
 The first data-cell slice edits only existing valid UTF-8 fields. It accepts
 multiline input, but does not create a missing field in a ragged row or replace
-invalid UTF-8 with lossy text. Row insertion, deletion, split/join, and output
-column transformations remain separate features.
+invalid UTF-8 with lossy text. Row insertion, deletion, and general output
+reorder/drop remain separate features.
 
-A document is dirty while effective edits exist. Open, reopen, format changes,
-and application close must not silently discard dirty state. Every write path
-must consume the current document overlay or remain unavailable while the
-document is dirty.
+A document is dirty while effective cell or header edits exist, or while its
+active CSV is a materialized working copy that differs from the last opened or
+saved file. Open, reopen, format changes, and application close must not
+silently discard dirty state. Every write path must consume the complete
+working copy or remain unavailable while the document is dirty. One-level
+structural Undo and Redo move between adjacent indexed CSV versions and reopen
+the chosen version as the current indexed grid. Discard removes all sparse edits
+and private working copies, then restores the last opened or saved file.
 
 Save and Save As use a streaming rewrite rather than in-place record mutation.
 Save As publishes a selected destination and leaves the previous source
@@ -214,13 +238,61 @@ rejected with guidance to use Save As. Cancellation observed before publication
 or a write failure removes temporary output without Quarry replacing the source
 or clobbering an existing destination.
 
-The rewrite scans records once with the same quote-aware scanner used by the
-other streaming workers. It copies every unedited record byte for byte. For an
-edited record, it parses the bounded record, replaces the selected decoded
-fields, and serializes all fields with the document delimiter plus that
-record's original CRLF, LF, or absent final line ending. An edit targeting a
-missing row or column, a parse failure in an edited record, or serialized output
-above the limit fails before publication.
+The rewrite scans the active CSV once with the same quote-aware scanner used by
+the other streaming workers and applies any current sparse value edits. It can
+copy records without sparse edits byte for byte. Edited records are serialized
+with the document delimiter plus that record's original CRLF, LF, or absent
+final line ending. An edit targeting a missing row or column, a parse failure,
+or serialized output above the limit fails before publication. Save targets the
+logical current file only after validating both the original source stamp and
+the active working snapshot stamp. Save As publishes a new file and leaves the
+previous logical source unchanged.
+
+## Column transformations
+
+The desktop calls the multi-column operation **Combine Columns…**, while
+`quarry-core` represents that operation as `ColumnTransformation::Join`. This
+section uses Combine for the user-facing operation and Join only for the engine
+variant.
+
+The numbered grid headers own structural selection. The context menu for one
+selected column offers **Split Columns…**; selecting at least two columns also
+offers **Combine Columns…**. Each command opens a compact modal prefilled from
+the current selection. Split requires a non-empty literal separator, while
+Combine accepts an optional literal separator. The dialog asks only for the
+separator and confirmation. Cancel closes it without changing the document.
+
+Split first scans the current data plus sparse edits to derive the maximum
+number of separated parts, then replaces the selected column using that derived
+schema. The original header stays on the first result, additional headers are
+blank and editable, and following columns move to their new one-based document
+positions. Rows with fewer parts receive empty fields. If no value contains the
+separator, Split reports that nothing can be split and does not materialize a
+new generation. Combine reads the selected columns in document order, combines
+them with the separator, inserts the result at the leftmost selected position,
+and removes the selected originals. The result keeps the leftmost selected
+current header. Missing selected fields in ragged rows are empty, and the
+resulting header remains editable.
+
+OK starts the bounded background operation. Split performs its analysis pass,
+then Split or Combine streams the current document into a newly reserved private
+working CSV. Only that one operation is evaluated during the stream. After the
+worker succeeds, Quarry opens and indexes the result as the normal editable
+grid. The user can edit the result or apply another Split or Combine command,
+which repeats the same process from the current working CSV. The viewport
+displays at most 32 working-document columns at a time, and the desktop uses the
+core 65,536-column structural trust limit.
+
+The grid exposes column selection state and context actions through AccessKit.
+The modal binds a visible label to the separator field, provides named OK and
+Cancel buttons, announces background status changes, and exposes the cancel
+action while a worker is active. Reopening a materialized result preserves the
+affected column selection in the ordinary grid.
+
+Save streams the current working CSV plus any newer sparse edits and atomically
+replaces the logical current regular file. Save As publishes and opens a new
+file without changing the previous source. Discard restores the last opened or
+saved file. Split and Combine cannot start from an active filtered view.
 
 Rename-based Save preserves standard permission bits but does not explicitly
 preserve ownership, ACLs, extended attributes or resource forks, or hard-link

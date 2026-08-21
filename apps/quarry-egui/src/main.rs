@@ -1,21 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
 use quarry_core::{
-    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
-    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, FilterReadJob,
-    FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress, OpenOptions, QuarryError,
-    Row, SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch, SearchOutcome, SearchPosition,
-    SearchProgress, Session, StructuralIndex,
+    ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex,
+    FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery,
+    FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress,
+    MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, Row, SaveAsJob, SaveAsOutcome, SearchJob,
+    SearchMatch, SearchOutcome, SearchPosition, SearchProgress, Session, SplitAnalysisJob,
+    SplitAnalysisOutcome, StructuralIndex,
 };
+use tempfile::TempDir;
 
 const BOOTSTRAP_ROWS: usize = 40;
 const OVERSCAN_ROWS: usize = 2;
 const ROW_HEIGHT: f32 = 17.0;
-const HEADER_HEIGHT: f32 = 30.0;
+const COLUMN_RULER_HEIGHT: f32 = 22.0;
+const HEADER_HEIGHT: f32 = COLUMN_RULER_HEIGHT + ROW_HEIGHT;
 const GRID_TITLE_HEIGHT: f32 = 36.0;
 const SCROLLBAR_WIDTH: f32 = 18.0;
 const MIN_THUMB_HEIGHT: f32 = 24.0;
@@ -29,6 +32,7 @@ const COLUMN_INPUT_ID: &str = "quarry-column-input";
 const COLUMN_POSITION_INPUT_ID: &str = "quarry-column-position-input";
 const FILTER_COLUMN_INPUT_ID: &str = "quarry-filter-column-input";
 const FILTER_VALUE_INPUT_ID: &str = "quarry-filter-value-input";
+const STRUCTURAL_SEPARATOR_INPUT_ID: &str = "quarry-structural-separator-input";
 const SOURCE_CHANGED_NOTICE: &str =
     "The source file changed outside Quarry. Discard changes and reopen it.";
 
@@ -61,6 +65,7 @@ struct QuarryApp {
     column_input: String,
     column_position_input: String,
     columns_open: bool,
+    structural_dialog: Option<StructuralDialog>,
     filter_rules: Vec<FilterRuleDraft>,
     filters_open: bool,
     delimiter_mode: DelimiterMode,
@@ -78,6 +83,37 @@ struct FilterRuleDraft {
     column_input: String,
     operator: FilterOperator,
     value_input: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StructuralRequest {
+    Split,
+    Combine,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuralDialog {
+    request: StructuralRequest,
+    columns: Vec<usize>,
+    separator: String,
+}
+
+impl StructuralDialog {
+    fn split(column: usize) -> Self {
+        Self {
+            request: StructuralRequest::Split,
+            columns: vec![column],
+            separator: String::new(),
+        }
+    }
+
+    fn combine(columns: Vec<usize>) -> Self {
+        Self {
+            request: StructuralRequest::Combine,
+            columns,
+            separator: String::new(),
+        }
+    }
 }
 
 impl Default for FilterRuleDraft {
@@ -103,6 +139,7 @@ impl QuarryApp {
             column_input: "1".into(),
             column_position_input: "1".into(),
             columns_open: false,
+            structural_dialog: None,
             filter_rules: vec![FilterRuleDraft::default()],
             filters_open: false,
             delimiter_mode: DelimiterMode::Auto,
@@ -141,6 +178,9 @@ impl QuarryApp {
             if document.save_job.is_some() {
                 return Err("Cancel the active save before opening another file.".into());
             }
+            if document.structural_job.is_some() {
+                return Err("Cancel the active column edit before opening another file.".into());
+            }
             document.commit_edits();
             if document.is_dirty() {
                 return Err("Discard or save your changes before opening another file.".into());
@@ -178,6 +218,7 @@ impl QuarryApp {
         self.column_input = "1".into();
         self.column_position_input = "1".into();
         self.columns_open = false;
+        self.structural_dialog = None;
         self.filter_rules = vec![FilterRuleDraft::default()];
         self.filters_open = false;
         self.document = Some(document);
@@ -230,7 +271,7 @@ impl QuarryApp {
         let Some(source) = self
             .document
             .as_ref()
-            .map(|document| document.session.path().to_path_buf())
+            .map(|document| document.logical_path.clone())
         else {
             self.notice = Some("Open and filter a file before exporting.".into());
             return;
@@ -258,11 +299,11 @@ impl QuarryApp {
             } else if document.source_changed {
                 SOURCE_CHANGED_NOTICE.into()
             } else {
-                "Make a header or cell change before using Save As.".into()
+                "Make a change before using Save As.".into()
             });
             return false;
         }
-        let source = document.session.path().to_path_buf();
+        let source = document.logical_path.clone();
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save edited file as")
             .set_file_name(save_as_file_name(&source));
@@ -311,7 +352,7 @@ impl QuarryApp {
         let Some(path) = self
             .document
             .as_ref()
-            .map(|document| document.session.path().to_path_buf())
+            .map(|document| document.logical_path.clone())
         else {
             self.notice = Some("Open a file first.".into());
             return;
@@ -359,6 +400,29 @@ impl QuarryApp {
             }
             Action::ChooseFilteredExport => return self.choose_filtered_export(),
             Action::DiscardChanges => {
+                if self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| document.structural_job.is_some())
+                {
+                    self.notice =
+                        Some("Cancel the active column edit before discarding changes.".into());
+                    return;
+                }
+                let structural = self
+                    .document
+                    .as_ref()
+                    .is_some_and(Document::has_structural_edits);
+                if structural {
+                    let document = self
+                        .document
+                        .as_ref()
+                        .expect("structural changes require an open document");
+                    let path = document.logical_path.clone();
+                    let options = document.current_open_options();
+                    self.notice = self.replace_document_with_options(path, options).err();
+                    return;
+                }
                 if let Some(document) = self.document.as_mut() {
                     if document.save_job.is_some() {
                         self.notice =
@@ -373,6 +437,14 @@ impl QuarryApp {
             Action::CopySelection => return self.copy_selection(ctx),
             Action::OpenColumns => {
                 self.columns_open = true;
+                return;
+            }
+            Action::UndoStructuralEdit => {
+                self.notice = self.swap_structural_history(false).err();
+                return;
+            }
+            Action::RedoStructuralEdit => {
+                self.notice = self.swap_structural_history(true).err();
                 return;
             }
             Action::OpenFilters => {
@@ -398,6 +470,8 @@ impl QuarryApp {
             | Action::DiscardChanges
             | Action::CopySelection
             | Action::OpenColumns
+            | Action::UndoStructuralEdit
+            | Action::RedoStructuralEdit
             | Action::OpenFilters => {
                 unreachable!()
             }
@@ -444,6 +518,10 @@ impl QuarryApp {
                 document.cancel_save();
                 Ok(())
             }
+            Action::CancelStructuralEdit => {
+                document.cancel_structural_edit();
+                Ok(())
+            }
             Action::Cancel => {
                 document.cancel();
                 Ok(())
@@ -480,6 +558,184 @@ impl QuarryApp {
             }
         };
         self.notice = result.err();
+    }
+
+    fn open_structural_dialog(&mut self, dialog: StructuralDialog) {
+        let result = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "Open a file before editing columns.".to_owned())
+            .and_then(|document| {
+                document
+                    .structural_edit_disabled_reason()
+                    .map_or(Ok(()), |reason| Err(reason.to_owned()))
+            });
+        match result {
+            Ok(()) => {
+                self.structural_dialog = Some(dialog);
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    fn apply_structural_dialog_action(&mut self, action: StructuralDialogAction) {
+        if action == StructuralDialogAction::Cancel {
+            self.structural_dialog = None;
+            return;
+        }
+        let Some(dialog) = self.structural_dialog.clone() else {
+            return;
+        };
+        let result =
+            self.document
+                .as_mut()
+                .ok_or_else(|| "Open a file before editing columns.".to_owned())
+                .and_then(|document| match dialog.request {
+                    StructuralRequest::Split => document
+                        .start_split(dialog.columns[0], dialog.separator.as_bytes().to_vec()),
+                    StructuralRequest::Combine => {
+                        document.start_combine(dialog.columns, dialog.separator.as_bytes().to_vec())
+                    }
+                });
+        match result {
+            Ok(()) => {
+                self.structural_dialog = None;
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    fn install_materialized_working_copy(
+        &mut self,
+        ready: MaterializedWorkingCopy,
+    ) -> Result<(), String> {
+        let Some(current) = self.document.as_ref() else {
+            return Err("The document closed before the column edit finished.".into());
+        };
+        let options = current.current_open_options();
+        let logical_path = current.logical_path.clone();
+        let mut replacement = Document::prepare(&ready.path, options)?;
+        replacement.start_indexing()?;
+
+        let current = self
+            .document
+            .as_mut()
+            .expect("the materialized document is still open");
+        replacement.logical_path = logical_path.clone();
+        replacement.original_session = current.original_session.take();
+        replacement.working_copy = current.working_copy.take();
+        replacement.selected_columns = ready.selected_columns;
+        let first_selected = replacement.selected_columns.iter().next().copied();
+        replacement.column_selection_anchor = first_selected;
+        replacement.column_focus_requested = first_selected;
+        if let Some(first_selected) = first_selected
+            && replacement.columns.view(first_selected)
+        {
+            replacement.refresh_column_headers();
+        }
+        current.shutdown();
+        self.document = Some(replacement);
+        self.path_input = logical_path.to_string_lossy().into_owned();
+        self.columns_open = false;
+        self.structural_dialog = None;
+        self.notice = Some("Column edit applied. Save to keep it, or discard changes.".into());
+        Ok(())
+    }
+
+    fn swap_structural_history(&mut self, redo: bool) -> Result<(), String> {
+        let Some(current) = self.document.as_mut() else {
+            return Err("Open a file before undoing a column edit.".into());
+        };
+        current.commit_edits();
+        if !redo && (!current.header_renames.is_empty() || current.has_cell_edits()) {
+            return Err(
+                "Save or discard later header and cell edits before undoing the column edit."
+                    .into(),
+            );
+        }
+        if current.save_job.is_some()
+            || current.export_job.is_some()
+            || current.structural_job.is_some()
+        {
+            return Err("Wait for the active file operation to finish.".into());
+        }
+        let state = current
+            .working_copy
+            .as_ref()
+            .ok_or_else(|| "There is no column edit to undo or redo.".to_owned())?;
+        let target = if redo {
+            state.redo.clone()
+        } else {
+            state.undo.clone()
+        }
+        .ok_or_else(|| {
+            if redo {
+                "There is no column edit to redo.".to_owned()
+            } else {
+                "There is no column edit to undo.".to_owned()
+            }
+        })?;
+        if !redo && target.path == current.logical_path {
+            let original = current
+                .original_session
+                .as_ref()
+                .expect("a first structural undo retains the original source guard");
+            match original.ensure_source_unchanged() {
+                Ok(()) => {}
+                Err(QuarryError::SourceChanged) => {
+                    current.invalidate_changed_source();
+                    return Err(SOURCE_CHANGED_NOTICE.into());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        let options = current.current_open_options();
+        let logical_path = current.logical_path.clone();
+        let current_snapshot = WorkingCopySnapshot {
+            path: current.session.path().to_path_buf(),
+            overlay: StructuralOverlay {
+                header_renames: current.header_renames.clone(),
+                cell_edits: current.cell_edits.clone(),
+            },
+        };
+        let mut replacement = Document::prepare(&target.path, options)?;
+        replacement.header_renames = target.overlay.header_renames.clone();
+        replacement.cell_edits = target.overlay.cell_edits.clone();
+        replacement.refresh_column_headers();
+        replacement.start_indexing()?;
+
+        let current = self
+            .document
+            .as_mut()
+            .expect("the document remains open while history is swapped");
+        let mut state = current
+            .working_copy
+            .take()
+            .expect("the history target came from working-copy state");
+        if redo {
+            state.redo = None;
+            state.undo = Some(current_snapshot);
+        } else {
+            state.undo = None;
+            state.redo = Some(current_snapshot);
+        }
+        replacement.logical_path = logical_path.clone();
+        replacement.original_session = current.original_session.take();
+        replacement.working_copy = Some(state);
+        current.shutdown();
+        self.document = Some(replacement);
+        self.path_input = logical_path.to_string_lossy().into_owned();
+        self.structural_dialog = None;
+        self.columns_open = false;
+        self.notice = Some(if redo {
+            "Column edit restored.".into()
+        } else {
+            "Column edit undone.".into()
+        });
+        Ok(())
     }
 
     fn copy_selection(&mut self, ctx: &egui::Context) {
@@ -565,6 +821,19 @@ impl eframe::App for QuarryApp {
             && let Err(error) = document.poll_filtered_export()
         {
             self.notice = Some(error);
+        }
+        let structural_result = self
+            .document
+            .as_mut()
+            .map_or(Ok(None), Document::poll_structural_edit);
+        match structural_result {
+            Ok(Some(ready)) => {
+                if let Err(error) = self.install_materialized_working_copy(ready) {
+                    self.notice = Some(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self.notice = Some(error),
         }
         let save_result = self.document.as_mut().map_or(Ok(None), Document::poll_save);
         match save_result {
@@ -675,7 +944,9 @@ impl eframe::App for QuarryApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let export_active = self.document.as_ref().is_some_and(|document| {
-                        document.export_job.is_some() || document.save_job.is_some()
+                        document.export_job.is_some()
+                            || document.save_job.is_some()
+                            || document.structural_job.is_some()
                     });
                     let dirty = self.document.as_ref().is_some_and(Document::is_dirty);
                     let label = ui.label("File");
@@ -752,7 +1023,10 @@ impl eframe::App for QuarryApp {
                                 && self
                                     .document
                                     .as_ref()
-                                    .is_none_or(|document| document.export_job.is_none()),
+                                    .is_none_or(|document| {
+                                        document.export_job.is_none()
+                                            && document.structural_job.is_none()
+                                    }),
                             egui::Button::new("Apply / Reopen"),
                         )
                         .on_disabled_hover_text(
@@ -791,10 +1065,13 @@ impl eframe::App for QuarryApp {
                         }
                         if ui
                             .add_enabled(
-                                document.save_job.is_none(),
+                                document.save_job.is_none()
+                                    && document.structural_job.is_none(),
                                 egui::Button::new("Discard Changes"),
                             )
-                            .on_disabled_hover_text("Wait for the save to finish.")
+                            .on_disabled_hover_text(
+                                "Wait for the active file operation to finish.",
+                            )
                             .clicked()
                         {
                             action = Some(Action::DiscardChanges);
@@ -841,10 +1118,32 @@ impl eframe::App for QuarryApp {
                         if let Some(page_action) = page_controls(ui) {
                             action = Some(page_action);
                         }
-                        if let Some(column_action) =
-                            column_window_controls(ui, document.columns.start)
-                        {
-                            action = Some(column_action);
+                        let column_action = column_window_controls(ui, document.columns.start);
+                        if column_action.is_some() {
+                            action = column_action;
+                        }
+                        if document.working_copy.is_some() {
+                            if ui
+                                .add_enabled(
+                                    document.can_undo_structural(),
+                                    egui::Button::new("Undo Column Edit"),
+                                )
+                                .on_disabled_hover_text(
+                                    "Save or discard later cell and header edits before undoing the column edit.",
+                                )
+                                .clicked()
+                            {
+                                action = Some(Action::UndoStructuralEdit);
+                            }
+                            if ui
+                                .add_enabled(
+                                    document.can_redo_structural(),
+                                    egui::Button::new("Redo Column Edit"),
+                                )
+                                .clicked()
+                            {
+                                action = Some(Action::RedoStructuralEdit);
+                            }
                         }
                         let filter_label = if filter_active {
                             "Filters active…"
@@ -922,6 +1221,31 @@ impl eframe::App for QuarryApp {
                         });
                     }
                     if let Some(status) = document.save_status.as_deref() {
+                        let response = ui.label(status);
+                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                            node.set_live(egui::accesskit::Live::Polite);
+                        });
+                    }
+                    if let Some(progress) = document.structural_progress() {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::ProgressBar::new(progress.fraction)
+                                    .desired_width(260.0)
+                                    .text(progress.label),
+                            );
+                            if ui
+                                .add_enabled(
+                                    !document.structural_cancel_requested,
+                                    egui::Button::new("Cancel Column Edit"),
+                                )
+                                .clicked()
+                            {
+                                action = Some(Action::CancelStructuralEdit);
+                            }
+                        });
+                    }
+                    if let Some(status) = document.structural_status.as_deref() {
                         let response = ui.label(status);
                         let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
                             node.set_live(egui::accesskit::Live::Polite);
@@ -1036,12 +1360,14 @@ impl eframe::App for QuarryApp {
         }
 
         let mut grid_error = None;
+        let mut requested_structural_dialog = None;
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
             .show(ctx, |ui| {
                 if let Some(document) = self.document.as_mut() {
-                    if let Err(error) = show_grid(ui, document) {
-                        grid_error = Some(error);
+                    match show_grid(ui, document) {
+                        Ok(dialog) => requested_structural_dialog = dialog,
+                        Err(error) => grid_error = Some(error),
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -1052,6 +1378,17 @@ impl eframe::App for QuarryApp {
                     });
                 }
             });
+        if let Some(dialog) = requested_structural_dialog {
+            self.open_structural_dialog(dialog);
+        }
+        let structural_dialog_action = self
+            .structural_dialog
+            .as_mut()
+            .zip(self.document.as_ref())
+            .and_then(|(dialog, document)| show_structural_dialog(ctx, dialog, document));
+        if let Some(action) = structural_dialog_action {
+            self.apply_structural_dialog_action(action);
+        }
         let copy_event_targets_selection = self.document.as_ref().is_some_and(|document| {
             document.selection.is_some()
                 && selection_copy_requested(
@@ -1149,6 +1486,7 @@ impl eframe::App for QuarryApp {
                 || document.filter_rows_loading()
                 || document.export_job.is_some()
                 || document.save_job.is_some()
+                || document.structural_job.is_some()
         }) {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
@@ -1212,9 +1550,12 @@ enum Action {
     PageDown,
     FirstColumns,
     OpenColumns,
+    UndoStructuralEdit,
+    RedoStructuralEdit,
     OpenFilters,
     ChooseSaveAs,
     CancelSave,
+    CancelStructuralEdit,
     ChooseFilteredExport,
     DiscardChanges,
     Jump,
@@ -1294,6 +1635,7 @@ fn selection_copy_requested(
             .into_iter()
             .any(|id| focused == egui::Id::new(id))
                 || is_filter_text_input(focused, filter_rule_count)
+                || focused == egui::Id::new(STRUCTURAL_SEPARATOR_INPUT_ID)
                 || edited_header.is_some_and(|column| focused == header_edit_id(column))
                 || edited_cell.is_some_and(|(row, column)| focused == cell_edit_id(row, column))
         })
@@ -1461,8 +1803,9 @@ fn show_column_manager(
                                     "View",
                                     true,
                                     format!(
-                                        "View file column {} ({name})",
-                                        column.saturating_add(1)
+                                        "View file column {} ({})",
+                                        column.saturating_add(1),
+                                        accessible_header_name(&name)
                                     ),
                                 ) {
                                     command = Some(ColumnCommand::View(column));
@@ -1510,6 +1853,84 @@ fn show_column_manager(
                 });
         });
     command
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructuralDialogAction {
+    Apply,
+    Cancel,
+}
+
+fn show_structural_dialog(
+    ctx: &egui::Context,
+    dialog: &mut StructuralDialog,
+    document: &Document,
+) -> Option<StructuralDialogAction> {
+    let mut action = None;
+    let title = match dialog.request {
+        StructuralRequest::Split => "Split Columns",
+        StructuralRequest::Combine => "Combine Columns",
+    };
+    let modal = egui::Modal::new(egui::Id::new("quarry-structural-dialog")).show(ctx, |ui| {
+        ui.set_min_width(360.0);
+        ui.heading(title);
+        let columns = dialog
+            .columns
+            .iter()
+            .map(|column| {
+                let name = document
+                    .current_header_fields()
+                    .get(*column)
+                    .map(|name| field_text(name))
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    (column.saturating_add(1)).to_string()
+                } else {
+                    format!("{}: {name}", column.saturating_add(1))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.label(format!(
+            "Selected column{}: {columns}",
+            if dialog.columns.len() == 1 { "" } else { "s" }
+        ));
+        ui.add_space(6.0);
+        let label = ui.label("Separator");
+        let separator = ui
+            .add_sized(
+                [ui.available_width(), 26.0],
+                egui::TextEdit::singleline(&mut dialog.separator)
+                    .id(egui::Id::new(STRUCTURAL_SEPARATOR_INPUT_ID))
+                    .hint_text("Enter a literal separator"),
+            )
+            .labelled_by(label.id);
+        let valid =
+            !dialog.separator.is_empty() || matches!(dialog.request, StructuralRequest::Combine);
+        if !valid {
+            ui.small("Enter the text that separates each value.");
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                action = Some(StructuralDialogAction::Cancel);
+            }
+            let apply = ui
+                .add_enabled(valid, egui::Button::new("OK"))
+                .on_disabled_hover_text("Enter a non-empty separator before splitting.");
+            if apply.clicked()
+                || (valid
+                    && separator.has_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                action = Some(StructuralDialogAction::Apply);
+            }
+        });
+    });
+    if modal.should_close() {
+        action = Some(StructuralDialogAction::Cancel);
+    }
+    action
 }
 
 fn show_filter_manager(
@@ -1627,7 +2048,6 @@ fn show_filter_manager(
             if document.has_cell_edits() {
                 ui.small("Save or discard cell edits before filtering the source file.");
             }
-
             if let Some(progress) = document.filter_progress() {
                 ui.add_space(8.0);
                 let fraction = if progress.file_size == 0 {
@@ -1683,7 +2103,7 @@ fn show_filter_manager(
                 });
             } else if document.search_job.is_some() {
                 ui.label("Cancel the active search before filtering.");
-            } else if !document.is_filter_ready() {
+            } else if document.total_columns == 0 {
                 ui.label("Open a file with at least one column to filter rows.");
             }
 
@@ -1911,6 +2331,12 @@ enum GridSelection {
     Row { row: u64 },
 }
 
+#[derive(Default)]
+struct GridInteraction {
+    selection: Option<GridSelection>,
+    structural_dialog: Option<StructuralDialog>,
+}
+
 impl GridSelection {
     fn row(self) -> u64 {
         match self {
@@ -1933,6 +2359,72 @@ impl GridSelection {
                 } if selected_row == row && selected_column == column
             )
     }
+}
+
+struct WorkingCopyState {
+    directory: TempDir,
+    next_generation: u64,
+    undo: Option<WorkingCopySnapshot>,
+    redo: Option<WorkingCopySnapshot>,
+}
+
+impl WorkingCopyState {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            directory: tempfile::Builder::new()
+                .prefix("quarry-working-")
+                .tempdir()
+                .map_err(|error| error.to_string())?,
+            next_generation: 1,
+            undo: None,
+            redo: None,
+        })
+    }
+
+    fn next_path(&mut self) -> PathBuf {
+        let path = self
+            .directory
+            .path()
+            .join(format!("generation-{}.csv", self.next_generation));
+        self.next_generation = self.next_generation.saturating_add(1);
+        path
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StructuralOverlay {
+    header_renames: BTreeMap<usize, String>,
+    cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkingCopySnapshot {
+    path: PathBuf,
+    overlay: StructuralOverlay,
+}
+
+enum StructuralJob {
+    AnalyzingSplit {
+        job: SplitAnalysisJob,
+        source_column: usize,
+        separator: Vec<u8>,
+    },
+    Materializing {
+        job: SaveAsJob,
+        destination: PathBuf,
+        selected_columns: BTreeSet<usize>,
+        undo: WorkingCopySnapshot,
+    },
+}
+
+struct MaterializedWorkingCopy {
+    path: PathBuf,
+    selected_columns: BTreeSet<usize>,
+}
+
+struct StructuralProgressDisplay {
+    fraction: f32,
+    label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2057,6 +2549,9 @@ impl ColumnView {
 
 struct Document {
     session: Session,
+    logical_path: PathBuf,
+    original_session: Option<Session>,
+    working_copy: Option<WorkingCopyState>,
     job: Option<IndexJob>,
     index: Option<StructuralIndex>,
     progress: IndexProgress,
@@ -2077,6 +2572,9 @@ struct Document {
     save_status: Option<String>,
     save_cancel_requested: bool,
     saving_in_place: bool,
+    structural_job: Option<StructuralJob>,
+    structural_status: Option<String>,
+    structural_cancel_requested: bool,
     source_changed: bool,
     filter_viewport_start: u64,
     filter_buffer_start: u64,
@@ -2085,12 +2583,15 @@ struct Document {
     pending_filter_read: Option<FilterReadWindow>,
     reveal_cell: Option<(u64, usize)>,
     selection: Option<GridSelection>,
+    selected_columns: BTreeSet<usize>,
+    column_selection_anchor: Option<usize>,
     headers: Vec<String>,
     header_renames: BTreeMap<usize, String>,
     header_edit: Option<HeaderEdit>,
     cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
     cell_edit: Option<CellEdit>,
     cell_focus_requested: Option<(u64, usize)>,
+    column_focus_requested: Option<usize>,
     total_columns: usize,
     columns: ColumnView,
     data_start: u64,
@@ -2177,6 +2678,9 @@ impl Document {
 
         Ok(Self {
             session,
+            logical_path: path.to_path_buf(),
+            original_session: None,
+            working_copy: None,
             job: None,
             index: None,
             progress,
@@ -2197,6 +2701,9 @@ impl Document {
             save_status: None,
             save_cancel_requested: false,
             saving_in_place: false,
+            structural_job: None,
+            structural_status: None,
+            structural_cancel_requested: false,
             source_changed: false,
             filter_viewport_start: 0,
             filter_buffer_start: 0,
@@ -2205,12 +2712,15 @@ impl Document {
             pending_filter_read: None,
             reveal_cell: None,
             selection: None,
+            selected_columns: BTreeSet::new(),
+            column_selection_anchor: None,
             headers,
             header_renames: BTreeMap::new(),
             header_edit: None,
             cell_edits: BTreeMap::new(),
             cell_edit: None,
             cell_focus_requested: None,
+            column_focus_requested: None,
             total_columns,
             columns,
             data_start,
@@ -2221,6 +2731,386 @@ impl Document {
             scroll_points: 0.0,
             last_viewport_read: None,
             last_poll: Instant::now() - POLL_INTERVAL,
+        })
+    }
+
+    fn current_open_options(&self) -> OpenOptions {
+        OpenOptions {
+            delimiter: Some(self.session.dialect.delimiter),
+            header_mode: if self.session.dialect.has_header {
+                HeaderMode::FirstRow
+            } else {
+                HeaderMode::NoHeader
+            },
+            ..OpenOptions::default()
+        }
+    }
+
+    fn structural_edit_disabled_reason(&self) -> Option<&'static str> {
+        if self.source_changed {
+            Some("Reopen the changed source before editing columns.")
+        } else if self.filter_active() {
+            Some("Clear the filter before editing columns.")
+        } else if self.save_job.is_some()
+            || self.export_job.is_some()
+            || self.structural_job.is_some()
+            || self.search_job.is_some()
+            || self.filter_job.is_some()
+        {
+            Some("Wait for the active file operation to finish.")
+        } else {
+            None
+        }
+    }
+
+    fn start_split(&mut self, source_column: usize, separator: Vec<u8>) -> Result<(), String> {
+        if let Some(reason) = self.structural_edit_disabled_reason() {
+            return Err(reason.into());
+        }
+        if source_column >= self.total_columns {
+            return Err(format!(
+                "Column {} is outside this file.",
+                source_column.saturating_add(1)
+            ));
+        }
+        if separator.is_empty() {
+            return Err("Enter a non-empty separator.".into());
+        }
+        self.commit_edits();
+        self.cancel_search();
+        let max_pieces = MAX_TRANSFORMATION_COLUMNS
+            .saturating_sub(self.total_columns)
+            .saturating_add(1)
+            .min(MAX_TRANSFORMATION_COLUMNS);
+        if max_pieces < 2 {
+            return Err(format!(
+                "Splitting would exceed the {MAX_TRANSFORMATION_COLUMNS}-column file limit."
+            ));
+        }
+        let job = match self.session.start_analyze_split(
+            self.cell_edits.clone(),
+            source_column,
+            separator.clone(),
+            max_pieces,
+        ) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        self.structural_job = Some(StructuralJob::AnalyzingSplit {
+            job,
+            source_column,
+            separator,
+        });
+        self.structural_status = Some("Checking split width…".into());
+        self.structural_cancel_requested = false;
+        Ok(())
+    }
+
+    fn start_combine(
+        &mut self,
+        source_columns: Vec<usize>,
+        separator: Vec<u8>,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.structural_edit_disabled_reason() {
+            return Err(reason.into());
+        }
+        if source_columns.len() < 2 {
+            return Err("Select at least two columns to combine.".into());
+        }
+        if source_columns
+            .iter()
+            .any(|column| *column >= self.total_columns)
+        {
+            return Err("A selected column is outside this file.".into());
+        }
+        let mut unique = BTreeSet::new();
+        if source_columns.iter().any(|column| !unique.insert(*column)) {
+            return Err("Select each column only once.".into());
+        }
+        self.commit_edits();
+        self.cancel_search();
+        let output_header = self.session.dialect.has_header.then(|| {
+            self.current_header_fields()
+                .get(source_columns[0])
+                .cloned()
+                .unwrap_or_default()
+        });
+        let insertion = *source_columns
+            .iter()
+            .min()
+            .expect("at least two combine columns were validated");
+        self.begin_materialization(
+            ColumnTransformation::Join {
+                source_columns,
+                separator,
+                output_header,
+            },
+            BTreeSet::from([insertion]),
+        )
+    }
+
+    fn begin_materialization(
+        &mut self,
+        transformation: ColumnTransformation,
+        selected_columns: BTreeSet<usize>,
+    ) -> Result<(), String> {
+        if self.original_session.is_none() {
+            match self.session.ensure_source_unchanged() {
+                Ok(()) => {}
+                Err(QuarryError::SourceChanged) => {
+                    self.invalidate_changed_source();
+                    return Err(SOURCE_CHANGED_NOTICE.into());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            let original = match Session::open(&self.logical_path, self.current_open_options()) {
+                Ok(original) => original,
+                Err(QuarryError::SourceChanged) => {
+                    self.invalidate_changed_source();
+                    return Err(SOURCE_CHANGED_NOTICE.into());
+                }
+                Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.invalidate_changed_source();
+                    return Err(SOURCE_CHANGED_NOTICE.into());
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            self.original_session = Some(original);
+        }
+        if self.working_copy.is_none() {
+            self.working_copy = Some(WorkingCopyState::new()?);
+        }
+        let undo = WorkingCopySnapshot {
+            path: self.session.path().to_path_buf(),
+            overlay: StructuralOverlay {
+                header_renames: self.header_renames.clone(),
+                cell_edits: self.cell_edits.clone(),
+            },
+        };
+        let state = self
+            .working_copy
+            .as_mut()
+            .expect("the working-copy state was created");
+        let destination = state.next_path();
+        let renames = self
+            .header_renames
+            .iter()
+            .map(|(column, name)| (*column, name.as_bytes().to_vec()))
+            .collect();
+        let job = match self.session.start_create_working_copy(
+            renames,
+            self.cell_edits.clone(),
+            transformation,
+            destination.clone(),
+        ) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(error) => {
+                self.cleanup_empty_working_copy();
+                return Err(error.to_string());
+            }
+        };
+        self.structural_job = Some(StructuralJob::Materializing {
+            job,
+            destination,
+            selected_columns,
+            undo,
+        });
+        self.structural_status = Some("Applying column edit…".into());
+        self.structural_cancel_requested = false;
+        Ok(())
+    }
+
+    fn poll_structural_edit(&mut self) -> Result<Option<MaterializedWorkingCopy>, String> {
+        let Some(job) = self.structural_job.as_ref() else {
+            return Ok(None);
+        };
+        let done = match job {
+            StructuralJob::AnalyzingSplit { job, .. } => job.progress().done,
+            StructuralJob::Materializing { job, .. } => job.progress().done,
+        };
+        if !done {
+            return Ok(None);
+        }
+
+        let job = self
+            .structural_job
+            .take()
+            .expect("the completed structural job is present");
+        self.structural_cancel_requested = false;
+        match job {
+            StructuralJob::AnalyzingSplit {
+                job,
+                source_column,
+                separator,
+            } => match job.wait() {
+                Ok(SplitAnalysisOutcome::Complete(summary)) if summary.max_pieces >= 2 => {
+                    let source_header = self.session.dialect.has_header.then(|| {
+                        self.current_header_fields()
+                            .get(source_column)
+                            .cloned()
+                            .unwrap_or_default()
+                    });
+                    let transformation = ColumnTransformation::split_with_blank_headers(
+                        source_column,
+                        separator,
+                        summary.max_pieces,
+                        source_header,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let selected_columns =
+                        (source_column..source_column.saturating_add(summary.max_pieces)).collect();
+                    self.begin_materialization(transformation, selected_columns)?;
+                    Ok(None)
+                }
+                Ok(SplitAnalysisOutcome::Complete(_)) => {
+                    self.structural_status = None;
+                    Err("The separator was not found in the selected column.".into())
+                }
+                Ok(SplitAnalysisOutcome::Cancelled) => {
+                    self.structural_status =
+                        Some("Split cancelled. The document was not changed.".into());
+                    Ok(None)
+                }
+                Err(QuarryError::SourceChanged) => {
+                    self.invalidate_changed_source();
+                    Err(SOURCE_CHANGED_NOTICE.into())
+                }
+                Err(error) => {
+                    self.structural_status =
+                        Some("Split failed. The document was not changed.".into());
+                    Err(error.to_string())
+                }
+            },
+            StructuralJob::Materializing {
+                job,
+                destination,
+                selected_columns,
+                undo,
+            } => match job.wait() {
+                Ok(SaveAsOutcome::Complete(summary)) => {
+                    debug_assert_eq!(summary.destination, destination);
+                    let state = self
+                        .working_copy
+                        .as_mut()
+                        .expect("materialization owns a working-copy directory");
+                    let current_path = self.session.path().to_path_buf();
+                    for obsolete in [state.undo.take(), state.redo.take()].into_iter().flatten() {
+                        if obsolete.path != current_path
+                            && obsolete.path.starts_with(state.directory.path())
+                        {
+                            let _ = std::fs::remove_file(obsolete.path);
+                        }
+                    }
+                    debug_assert_eq!(undo.path, current_path);
+                    state.undo = Some(undo);
+                    state.redo = None;
+                    self.structural_status = None;
+                    Ok(Some(MaterializedWorkingCopy {
+                        path: summary.destination,
+                        selected_columns,
+                    }))
+                }
+                Ok(SaveAsOutcome::Cancelled) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Column edit cancelled. The document was not changed.".into());
+                    Ok(None)
+                }
+                Err(QuarryError::SourceChanged) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.invalidate_changed_source();
+                    Err(SOURCE_CHANGED_NOTICE.into())
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Column edit failed. The document was not changed.".into());
+                    Err(error.to_string())
+                }
+            },
+        }
+    }
+
+    fn cancel_structural_edit(&mut self) {
+        let Some(job) = self.structural_job.as_ref() else {
+            return;
+        };
+        match job {
+            StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
+            StructuralJob::Materializing { job, .. } => job.cancel(),
+        }
+        self.structural_cancel_requested = true;
+        self.structural_status = Some("Cancelling column edit…".into());
+    }
+
+    fn cleanup_empty_working_copy(&mut self) {
+        let empty = self.working_copy.as_ref().is_some_and(|state| {
+            state.undo.is_none() && state.redo.is_none() && self.session.path() == self.logical_path
+        });
+        if empty {
+            self.working_copy = None;
+            self.original_session = None;
+        }
+    }
+
+    fn invalidate_structural_redo(&mut self) {
+        let Some(state) = self.working_copy.as_mut() else {
+            return;
+        };
+        let Some(redo) = state.redo.take() else {
+            return;
+        };
+        if redo.path != self.session.path() && redo.path.starts_with(state.directory.path()) {
+            let _ = std::fs::remove_file(redo.path);
+        }
+    }
+
+    fn structural_progress(&self) -> Option<StructuralProgressDisplay> {
+        let job = self.structural_job.as_ref()?;
+        let (bytes_scanned, total_bytes, done, operation) = match job {
+            StructuralJob::AnalyzingSplit { job, .. } => {
+                let progress = job.progress();
+                (
+                    progress.bytes_scanned,
+                    progress.total_bytes,
+                    progress.done,
+                    "Checking split width",
+                )
+            }
+            StructuralJob::Materializing { job, .. } => {
+                let progress = job.progress();
+                (
+                    progress.bytes_scanned,
+                    progress.total_bytes,
+                    progress.done,
+                    "Applying column edit",
+                )
+            }
+        };
+        let fraction = if total_bytes == 0 {
+            if done { 1.0 } else { 0.0 }
+        } else {
+            (bytes_scanned as f32 / total_bytes as f32).clamp(0.0, 1.0)
+        };
+        Some(StructuralProgressDisplay {
+            fraction,
+            label: format!("{operation} · {:.1}%", fraction * 100.0),
         })
     }
 
@@ -2587,6 +3477,7 @@ impl Document {
             && self.is_dirty()
             && self.save_job.is_none()
             && self.export_job.is_none()
+            && self.structural_job.is_none()
     }
 
     fn start_save(&mut self) -> Result<(), String> {
@@ -2609,7 +3500,7 @@ impl Document {
         }
         self.commit_edits();
         if !self.is_dirty() {
-            return Err("Make a header or cell change before saving.".into());
+            return Err("Make a change before saving.".into());
         }
         let renames = self
             .header_renames
@@ -2622,6 +3513,13 @@ impl Document {
                 self.session
                     .start_save_as_with_edits(renames, self.cell_edits.clone(), destination)
             }
+            None if self.has_structural_edits() => self.session.start_save_to_original(
+                renames,
+                self.cell_edits.clone(),
+                self.original_session
+                    .as_ref()
+                    .expect("a structural working copy retains the original source guard"),
+            ),
             None => self
                 .session
                 .start_save_with_edits(renames, self.cell_edits.clone()),
@@ -2744,7 +3642,7 @@ impl Document {
     }
 
     fn is_filter_ready(&self) -> bool {
-        self.total_columns > 0
+        self.total_columns > 0 && self.structural_job.is_none()
     }
 
     fn filter_progress(&self) -> Option<FilterProgress> {
@@ -2801,6 +3699,7 @@ impl Document {
             && self.progress.done
             && !self.progress.cancelled
             && !self.has_cell_edits()
+            && self.structural_job.is_none()
     }
 
     fn cancel_search(&self) {
@@ -2901,16 +3800,44 @@ impl Document {
     }
 
     fn column_name(&self, column: usize) -> String {
+        if let Some(edit) = self
+            .header_edit
+            .as_ref()
+            .filter(|edit| edit.column == column)
+        {
+            return field_text(edit.draft.as_bytes());
+        }
         self.header_renames
             .get(&column)
             .map(|name| field_text(name.as_bytes()))
             .unwrap_or_else(|| column_name(&self.session, column))
     }
 
+    fn current_header_fields(&self) -> Vec<Vec<u8>> {
+        let mut fields = self
+            .session
+            .first_rows
+            .first()
+            .map(|row| row.fields.clone())
+            .unwrap_or_default();
+        for (column, name) in &self.header_renames {
+            if let Some(field) = fields.get_mut(*column) {
+                *field = name.as_bytes().to_vec();
+            }
+        }
+        if let Some(edit) = &self.header_edit
+            && let Some(field) = fields.get_mut(edit.column)
+        {
+            *field = edit.draft.as_bytes().to_vec();
+        }
+        fields
+    }
+
     fn header_is_editable(&self, column: usize) -> bool {
         self.save_job.is_none()
             && self.export_job.is_none()
             && self.search_job.is_none()
+            && self.structural_job.is_none()
             && self.source_header_name(column).is_some()
     }
 
@@ -2919,12 +3846,7 @@ impl Document {
             return None;
         }
         let field = self.session.first_rows.first()?.fields.get(column)?;
-        let name = std::str::from_utf8(field).ok()?;
-        Some(if column == 0 {
-            name.strip_prefix('\u{feff}').unwrap_or(name)
-        } else {
-            name
-        })
+        std::str::from_utf8(field).ok()
     }
 
     fn begin_header_edit(&mut self, column: usize) {
@@ -2960,17 +3882,22 @@ impl Document {
         if !self.header_is_editable(column) {
             return Err("Only columns in the source header row can be renamed.".into());
         }
-        if name.as_bytes()
-            == self
-                .source_header_name(column)
-                .expect("editable header has source text")
-                .as_bytes()
-        {
-            self.header_renames.remove(&column);
-        } else {
-            self.header_renames.insert(column, name);
+        let source_name = self
+            .source_header_name(column)
+            .expect("editable header has source text");
+        let next = (name.as_bytes() != source_name.as_bytes()).then_some(name);
+        if self.header_renames.get(&column) != next.as_ref() {
+            self.invalidate_structural_redo();
+            match next {
+                Some(name) => {
+                    self.header_renames.insert(column, name);
+                }
+                None => {
+                    self.header_renames.remove(&column);
+                }
+            }
+            self.refresh_column_headers();
         }
-        self.refresh_column_headers();
         Ok(())
     }
 
@@ -2996,6 +3923,7 @@ impl Document {
             || self.export_job.is_some()
             || self.search_job.is_some()
             || self.filter_job.is_some()
+            || self.structural_job.is_some()
         {
             Some("Wait for the active file operation before editing data cells.")
         } else if source.is_none() {
@@ -3042,15 +3970,24 @@ impl Document {
             return;
         };
         let key = (edit.row, edit.column);
-        if edit.draft.as_bytes() == edit.source {
-            self.cell_edits.remove(&key);
-        } else {
-            self.cell_edits.insert(key, edit.draft.into_bytes());
-            self.search_query.clear();
-            self.last_match = None;
-            self.search_status = None;
-            self.reveal_cell = None;
+        let next =
+            (edit.draft.as_bytes() != edit.source.as_slice()).then(|| edit.draft.into_bytes());
+        if self.cell_edits.get(&key) == next.as_ref() {
+            return;
         }
+        self.invalidate_structural_redo();
+        match next {
+            Some(value) => {
+                self.cell_edits.insert(key, value);
+            }
+            None => {
+                self.cell_edits.remove(&key);
+            }
+        }
+        self.search_query.clear();
+        self.last_match = None;
+        self.search_status = None;
+        self.reveal_cell = None;
     }
 
     fn commit_edits(&mut self) {
@@ -3074,6 +4011,14 @@ impl Document {
         self.discard_header_edits();
         self.cell_edit = None;
         self.cell_edits.clear();
+        self.selection = None;
+        self.reveal_cell = None;
+        self.cell_focus_requested = None;
+        self.column_focus_requested = None;
+        if self.session.path() == self.logical_path {
+            self.working_copy = None;
+            self.original_session = None;
+        }
     }
 
     fn has_cell_edits(&self) -> bool {
@@ -3098,7 +4043,35 @@ impl Document {
                             .as_bytes()
             },
         );
-        header_dirty || self.has_cell_edits()
+        header_dirty || self.has_cell_edits() || self.has_structural_edits()
+    }
+
+    fn has_structural_edits(&self) -> bool {
+        self.session.path() != self.logical_path
+    }
+
+    fn can_undo_structural(&self) -> bool {
+        self.working_copy
+            .as_ref()
+            .is_some_and(|state| state.undo.is_some())
+            && self.header_renames.is_empty()
+            && !self.has_cell_edits()
+            && self.header_edit.is_none()
+            && self.cell_edit.is_none()
+            && self.save_job.is_none()
+            && self.export_job.is_none()
+            && self.structural_job.is_none()
+    }
+
+    fn can_redo_structural(&self) -> bool {
+        self.working_copy
+            .as_ref()
+            .is_some_and(|state| state.redo.is_some())
+            && self.header_edit.is_none()
+            && self.cell_edit.is_none()
+            && self.save_job.is_none()
+            && self.export_job.is_none()
+            && self.structural_job.is_none()
     }
 
     fn validate_column(&self, column: usize) -> Result<(), String> {
@@ -3134,6 +4107,13 @@ impl Document {
 
     fn shutdown(&mut self) {
         self.stop_filter_read();
+        if let Some(job) = self.structural_job.take() {
+            match job {
+                StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
+                StructuralJob::Materializing { job, .. } => job.cancel(),
+            }
+        }
+        self.structural_cancel_requested = false;
         if let Some(job) = self.save_job.take() {
             job.cancel();
             drop(job);
@@ -3489,6 +4469,13 @@ impl Document {
     }
 
     fn cell_value<'a>(&'a self, row: u64, column: usize, source: &'a [u8]) -> &'a [u8] {
+        if let Some(edit) = self
+            .cell_edit
+            .as_ref()
+            .filter(|edit| edit.row == row && edit.column == column)
+        {
+            return edit.draft.as_bytes();
+        }
         self.cell_edits
             .get(&(row, column))
             .map_or(source, Vec::as_slice)
@@ -3509,6 +4496,23 @@ impl Document {
     }
 
     fn clear_hidden_selection(&mut self) {
+        self.selected_columns.retain(|column| {
+            self.columns
+                .hidden
+                .get(*column)
+                .is_some_and(|hidden| !hidden)
+        });
+        if !self
+            .column_selection_anchor
+            .is_some_and(|anchor| self.selected_columns.contains(&anchor))
+        {
+            self.column_selection_anchor = self
+                .columns
+                .order
+                .iter()
+                .copied()
+                .find(|column| self.selected_columns.contains(column));
+        }
         let Some(selection) = self.selection else {
             return;
         };
@@ -3535,7 +4539,7 @@ impl Document {
         let selection = self
             .selection
             .ok_or_else(|| "Select a cell or row before copying.".to_owned())?;
-        if self.filter_active() {
+        let fields = if self.filter_active() {
             let row = self
                 .visible_filter_rows()
                 .iter()
@@ -3543,11 +4547,7 @@ impl Document {
                 .ok_or_else(|| {
                     "The selected row is no longer visible. Select it again.".to_owned()
                 })?;
-            selection_fields_text(
-                &self.row_with_edits(row.row, &row.fields),
-                selection,
-                MAX_COPY_BYTES,
-            )
+            self.row_with_edits(row.row, &row.fields)
         } else {
             let relative = selection
                 .row()
@@ -3561,12 +4561,9 @@ impl Document {
             let row = self.buffered_rows.get(offset).ok_or_else(|| {
                 "The selected row is no longer visible. Select it again.".to_owned()
             })?;
-            selection_fields_text(
-                &self.row_with_edits(selection.row(), &row.fields),
-                selection,
-                MAX_COPY_BYTES,
-            )
-        }
+            self.row_with_edits(selection.row(), &row.fields)
+        };
+        selection_fields_text(&fields, selection, MAX_COPY_BYTES)
     }
 
     fn grid_total_rows(&self) -> u64 {
@@ -3696,6 +4693,12 @@ fn parse_column_position(value: &str, total_columns: usize) -> Result<usize, Str
     Ok(position - 1)
 }
 
+impl Drop for Document {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 fn headers_for(session: &Session, columns: &[usize]) -> Vec<String> {
     columns
         .iter()
@@ -3704,25 +4707,105 @@ fn headers_for(session: &Session, columns: &[usize]) -> Vec<String> {
 }
 
 fn column_name(session: &Session, column: usize) -> String {
-    if session.dialect.has_header {
-        let text = session
+    if session.dialect.has_header
+        && let Some(field) = session
             .first_rows
             .first()
             .and_then(|row| row.fields.get(column))
-            .map_or_else(String::new, |field| field_text(field));
-        if !text.is_empty() {
-            return text;
-        }
+    {
+        return field_text(field);
     }
     format!("Column {}", column + 1)
 }
 
-fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
+fn selected_split_column(selected_columns: &BTreeSet<usize>) -> Option<usize> {
+    if selected_columns.len() == 1 {
+        selected_columns.iter().next().copied()
+    } else {
+        None
+    }
+}
+
+fn select_column(
+    columns: &ColumnView,
+    selected_columns: &mut BTreeSet<usize>,
+    anchor: &mut Option<usize>,
+    column: usize,
+    modifiers: egui::Modifiers,
+) {
+    if modifiers.shift {
+        let shown_columns = columns
+            .order
+            .iter()
+            .copied()
+            .filter(|shown| !columns.hidden[*shown])
+            .collect::<Vec<_>>();
+        let anchor_column = (*anchor)
+            .filter(|anchor| shown_columns.contains(anchor))
+            .or_else(|| {
+                shown_columns
+                    .iter()
+                    .copied()
+                    .find(|shown| selected_columns.contains(shown))
+            })
+            .unwrap_or(column);
+        selected_columns.clear();
+        let Some(anchor_position) = shown_columns
+            .iter()
+            .position(|shown| *shown == anchor_column)
+        else {
+            selected_columns.insert(column);
+            *anchor = Some(column);
+            return;
+        };
+        let Some(column_position) = shown_columns.iter().position(|shown| *shown == column) else {
+            selected_columns.insert(column);
+            *anchor = Some(column);
+            return;
+        };
+        let range = anchor_position.min(column_position)..=anchor_position.max(column_position);
+        selected_columns.extend(shown_columns[range].iter().copied());
+        *anchor = Some(anchor_column);
+    } else if modifiers.command {
+        if selected_columns.remove(&column) {
+            if *anchor == Some(column) {
+                *anchor = selected_columns.iter().next().copied();
+            }
+        } else {
+            selected_columns.insert(column);
+            *anchor = Some(column);
+        }
+    } else {
+        selected_columns.clear();
+        selected_columns.insert(column);
+        *anchor = Some(column);
+    }
+}
+
+fn column_selection_fill(visuals: &egui::Visuals) -> Color32 {
+    visuals.selection.bg_fill.gamma_multiply(0.35)
+}
+
+fn column_ruler_divider_stroke(visuals: &egui::Visuals) -> egui::Stroke {
+    visuals.widgets.noninteractive.bg_stroke
+}
+
+fn paint_column_selection(ui: &egui::Ui, selected: bool) {
+    if selected {
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, column_selection_fill(ui.visuals()));
+    }
+}
+
+fn show_grid(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+) -> Result<Option<StructuralDialog>, String> {
     if document.source_changed {
         ui.centered_and_justified(|ui| {
             ui.label(SOURCE_CHANGED_NOTICE);
         });
-        return Ok(());
+        return Ok(None);
     }
     let grid_height = ui.available_height();
     let horizontal_scrollbar = ui.spacing().scroll.allocated_width();
@@ -3812,15 +4895,17 @@ fn show_grid(ui: &mut egui::Ui, document: &mut Document) -> Result<(), String> {
 
         let reveal_cell = document.reveal_cell.take();
         ui.separator();
-        let selection = ui
+        let interaction = ui
             .allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::Min), |ui| {
                 show_table(ui, document, reveal_cell)
             })
             .inner;
-        if let Some(selection) = selection {
+        if let Some(selection) = interaction.selection {
             document.selection = Some(selection);
+            document.selected_columns.clear();
+            document.column_selection_anchor = None;
         }
-        Ok(())
+        Ok(interaction.structural_dialog)
     })
     .inner
 }
@@ -3829,15 +4914,16 @@ fn show_table(
     ui: &mut egui::Ui,
     document: &mut Document,
     reveal_cell: Option<(u64, usize)>,
-) -> Option<GridSelection> {
+) -> GridInteraction {
     let row_count = document.visible_row_count();
-    let mut clicked_selection = None;
+    let mut interaction = GridInteraction::default();
     let mut active_header_edit = document.header_edit.take();
     let mut begin_header_edit = None;
     let mut commit_header_edit = false;
     let mut cancel_header_edit = false;
     let mut active_cell_edit = document.cell_edit.take();
     let cell_focus_requested = document.cell_focus_requested.take();
+    let column_focus_requested = document.column_focus_requested.take();
     let mut begin_cell_edit = None;
     let mut commit_cell_edit = false;
     let mut cancel_cell_edit = false;
@@ -3878,6 +4964,16 @@ fn show_table(
                 document.total_columns
             ));
         }
+        let selection_help = if document.selected_columns.is_empty() {
+            "Click numbers. Shift-click: range. Command/Ctrl-click: add/remove. Right-click: Split/Combine."
+                .to_owned()
+        } else {
+            format!(
+                "{} selected. Shift-click: range. Command/Ctrl-click: add/remove. Right-click: Split/Combine.",
+                document.selected_columns.len()
+            )
+        };
+        ui.label(RichText::new(selection_help).small().weak());
     });
     ui.add_space(6.0);
 
@@ -3889,6 +4985,13 @@ fn show_table(
         74.0 + document.headers.len() as f32 * (column_width + ui.spacing().item_spacing.x);
     let body_height =
         (grid_height - HEADER_HEIGHT - ui.spacing().scroll.allocated_width()).max(ROW_HEIGHT);
+    let visible_headers = document
+        .columns
+        .visible
+        .iter()
+        .copied()
+        .zip(document.headers.iter().cloned())
+        .collect::<Vec<_>>();
 
     egui::ScrollArea::horizontal()
         .id_salt("quarry-grid-horizontal")
@@ -3897,6 +5000,8 @@ fn show_table(
         .show(ui, |ui| {
             ui.set_min_width(content_width.max(viewport_width));
             ui.spacing_mut().item_spacing.y = 0.0;
+            let divider_left = ui.cursor().left();
+            let divider_y = ui.cursor().top() + COLUMN_RULER_HEIGHT;
             let mut table = TableBuilder::new(ui)
                 .id_salt("quarry-grid")
                 .striped(true)
@@ -3921,34 +5026,160 @@ fn show_table(
                     header.col(|ui| {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.add_space(13.0);
+                            ui.add_space(COLUMN_RULER_HEIGHT);
                             ui.add(
                                 egui::Label::new(RichText::new("ROW").monospace().strong())
                                     .truncate(),
                             );
                         });
                     });
-                    for (column, name) in document
-                        .columns
-                        .visible
-                        .iter()
-                        .copied()
-                        .zip(document.headers.iter())
-                    {
+                    for (column, name) in &visible_headers {
+                        let column = *column;
                         header.col(|ui| {
+                            let selected = document.selected_columns.contains(&column);
+                            paint_column_selection(ui, selected);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 let width = ui.available_width();
-                                ui.add_sized(
-                                    [width, 13.0],
-                                    egui::Label::new(
+                                let mut button = egui::Button::selectable(
+                                        selected,
                                         RichText::new(column.saturating_add(1).to_string())
                                             .monospace()
                                             .size(11.0),
                                     )
-                                    .halign(Align::Center)
-                                    .truncate(),
-                                );
+                                    .small();
+                                if selected {
+                                    button = button
+                                        .fill(ui.visuals().selection.bg_fill)
+                                        .stroke(ui.visuals().selection.stroke);
+                                }
+                                let response = ui
+                                    .add_sized([width, COLUMN_RULER_HEIGHT], button)
+                                    .on_hover_text(
+                                        "Click to select. Shift-click a range. Command/Ctrl-click to add or remove. Right-click a selected number for Split/Combine.",
+                                    );
+                                if column_focus_requested == Some(column) {
+                                    response.request_focus();
+                                }
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::selected(
+                                        egui::WidgetType::SelectableLabel,
+                                        ui.is_enabled(),
+                                        selected,
+                                        format!(
+                                            "Select file column {} ({})",
+                                            column.saturating_add(1),
+                                            accessible_header_name(name)
+                                        ),
+                                    )
+                                });
+                                let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                    node.set_selected(selected);
+                                    node.set_description(
+                                        "Activate to add or remove this column from the selection.",
+                                    );
+                                    node.add_action(egui::accesskit::Action::ShowContextMenu);
+                                });
+                                let accesskit_context_menu = ui.input_mut(|input| {
+                                    let mut requested = false;
+                                    input.consume_accesskit_action_requests(
+                                        response.id,
+                                        |request| {
+                                            let matches = request.action
+                                                == egui::accesskit::Action::ShowContextMenu;
+                                            requested |= matches;
+                                            matches
+                                        },
+                                    );
+                                    requested
+                                });
+                                let accesskit_click = ui.input(|input| {
+                                    input.has_accesskit_action_request(
+                                        response.id,
+                                        egui::accesskit::Action::Click,
+                                    )
+                                });
+                                let keyboard_context_menu = response.has_focus()
+                                    && ui.input(|input| {
+                                        input.modifiers.shift
+                                            && input.key_pressed(egui::Key::F10)
+                                    });
+                                let open_context_menu = response.secondary_clicked()
+                                    || keyboard_context_menu
+                                    || accesskit_context_menu;
+                                if open_context_menu && !selected {
+                                    document.selected_columns.clear();
+                                    document.selected_columns.insert(column);
+                                    document.column_selection_anchor = Some(column);
+                                    document.selection = None;
+                                }
+                                if response.clicked() {
+                                    let mut modifiers = ui.input(|input| input.modifiers);
+                                    if accesskit_click {
+                                        modifiers.shift = false;
+                                        modifiers.command = true;
+                                    }
+                                    select_column(
+                                        &document.columns,
+                                        &mut document.selected_columns,
+                                        &mut document.column_selection_anchor,
+                                        column,
+                                        modifiers,
+                                    );
+                                    document.selection = None;
+                                }
+                                let popup_command = if open_context_menu {
+                                    Some(egui::SetOpenCommand::Bool(true))
+                                } else if response.clicked() {
+                                    Some(egui::SetOpenCommand::Bool(false))
+                                } else {
+                                    None
+                                };
+                                egui::Popup::menu(&response)
+                                    .open_memory(popup_command)
+                                    .show(|ui| {
+                                    let split_column = selected_split_column(
+                                        &document.selected_columns,
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            split_column.is_some(),
+                                            egui::Button::new("Split Columns…"),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Select exactly one numbered column first.",
+                                        )
+                                        .clicked()
+                                    {
+                                        interaction.structural_dialog = Some(
+                                            StructuralDialog::split(
+                                                split_column.expect(
+                                                    "enabled split has one selected column",
+                                                ),
+                                            ),
+                                        );
+                                        ui.close();
+                                    }
+                                    let combine_columns = document
+                                        .selected_columns
+                                        .iter()
+                                        .copied()
+                                        .collect::<Vec<_>>();
+                                    if ui
+                                        .add_enabled(
+                                            combine_columns.len() >= 2,
+                                            egui::Button::new("Combine Columns…"),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Select at least two numbered columns first. Shift-click a range, or Command/Ctrl-click separate columns.",
+                                        )
+                                        .clicked()
+                                    {
+                                        interaction.structural_dialog =
+                                            Some(StructuralDialog::combine(combine_columns));
+                                        ui.close();
+                                    }
+                                    });
                                 if let Some(edit) = active_header_edit
                                     .as_mut()
                                     .filter(|edit| edit.column == column)
@@ -3995,8 +5226,9 @@ fn show_table(
                                                 egui::WidgetType::Button,
                                                 ui.is_enabled(),
                                                 format!(
-                                                    "Rename file column {} ({name})",
-                                                    column.saturating_add(1)
+                                                    "Rename file column {} ({})",
+                                                    column.saturating_add(1),
+                                                    accessible_header_name(name)
                                                 ),
                                             )
                                         });
@@ -4057,7 +5289,7 @@ fn show_table(
                                 });
                                 if response.clicked() {
                                     response.request_focus();
-                                    clicked_selection =
+                                    interaction.selection =
                                         Some(GridSelection::Row { row: record_row });
                                 }
                                 },
@@ -4071,8 +5303,13 @@ fn show_table(
                                     egui::UiBuilder::new()
                                         .id(("cell-selection", record_row, column)),
                                     |ui| {
+                                    paint_column_selection(
+                                        ui,
+                                        document.selected_columns.contains(&column),
+                                    );
                                     let source = fields.get(column).map(Vec::as_slice);
                                     let header = &document.headers[visible_column];
+                                    let accessible_header = accessible_header_name(header);
                                     if let Some(edit) = active_cell_edit.as_mut().filter(|edit| {
                                         edit.row == record_row && edit.column == column
                                     }) {
@@ -4090,8 +5327,8 @@ fn show_table(
                                         );
                                         let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
                                             node.set_label(format!(
-                                                "Edit data row {display_row}, file column {} ({header})",
-                                                column.saturating_add(1)
+                                                "Edit data row {display_row}, file column {} ({accessible_header})",
+                                                column.saturating_add(1),
                                             ));
                                         });
                                         if edit.focus_requested {
@@ -4141,14 +5378,14 @@ fn show_table(
                                                 enabled,
                                                 selected,
                                                 format!(
-                                                    "Select row {display_row}, column {} ({header}): {text}",
-                                                    column.saturating_add(1)
+                                                    "Select row {display_row}, column {} ({accessible_header}): {text}",
+                                                    column.saturating_add(1),
                                                 ),
                                             )
                                         });
                                         if response.clicked() {
                                             response.request_focus();
-                                            clicked_selection = Some(GridSelection::Cell {
+                                            interaction.selection = Some(GridSelection::Cell {
                                                 row: record_row,
                                                 column,
                                             });
@@ -4188,6 +5425,13 @@ fn show_table(
                         }
                     });
                 });
+            ui.painter().line_segment(
+                [
+                    egui::pos2(divider_left, divider_y),
+                    egui::pos2(ui.min_rect().right(), divider_y),
+                ],
+                column_ruler_divider_stroke(ui.visuals()),
+            );
         });
 
     if cancel_header_edit {
@@ -4224,7 +5468,7 @@ fn show_table(
         document.cell_edit = active_cell_edit;
     }
     document.cell_focus_requested = restore_cell_focus;
-    clicked_selection
+    interaction
 }
 
 fn scrollbar_thumb_height(track_height: f32, total_rows: u64, visible_rows: usize) -> f32 {
@@ -4279,6 +5523,14 @@ fn field_text(field: &[u8]) -> String {
         rendered
     } else {
         rendered.chars().take(117).collect::<String>() + "..."
+    }
+}
+
+fn accessible_header_name(name: &str) -> &str {
+    if name.is_empty() {
+        "unnamed header"
+    } else {
+        name
     }
 }
 
@@ -4385,6 +5637,7 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::Path;
@@ -4396,11 +5649,14 @@ mod tests {
         Action, COLUMN_INPUT_ID, COLUMN_POSITION_INPUT_ID, ColumnCommand, ColumnView,
         DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterProgress, FilterQuery,
         GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SOURCE_CHANGED_NOTICE,
-        SearchMatch, SearchProgress, Session, column_drop_position, column_window_controls,
-        copy_control, filtered_export_controls, filtered_export_file_name, logical_viewport_start,
-        max_viewport_start, page_controls, parse_column_position, parse_data_row,
-        parse_file_column, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
-        search_controls, selection_text, show_column_manager, show_filter_manager, show_grid,
+        SearchMatch, SearchProgress, Session, StructuralDialog, StructuralDialogAction,
+        column_drop_position, column_ruler_divider_stroke, column_selection_fill,
+        column_window_controls, configure_style, copy_control, filtered_export_controls,
+        filtered_export_file_name, logical_viewport_start, max_viewport_start, page_controls,
+        parse_column_position, parse_data_row, parse_file_column, row_for_scroll_fraction,
+        save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
+        selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
+        show_structural_dialog,
     };
 
     fn click_accessible_button(
@@ -4453,14 +5709,18 @@ mod tests {
         click_accessible_button(label, page_controls)
     }
 
-    fn grid_input() -> egui::RawInput {
+    fn grid_input_with_width(width: f32) -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1280.0, 780.0),
+                egui::vec2(width, 780.0),
             )),
             ..Default::default()
         }
+    }
+
+    fn grid_input() -> egui::RawInput {
+        grid_input_with_width(1280.0)
     }
 
     fn grid_control_id(
@@ -4522,6 +5782,52 @@ mod tests {
                 show_grid(ui, document).unwrap();
             });
         })
+    }
+
+    fn assert_column_ruler_divider(
+        output: &egui::FullOutput,
+        visuals: &egui::Visuals,
+        header_count: usize,
+    ) -> f32 {
+        let divider_stroke = column_ruler_divider_stroke(visuals);
+        let minimum_divider_span = 74.0 + header_count as f32 * 80.0;
+        let divider_shapes = output
+            .shapes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, shape)| match &shape.shape {
+                egui::Shape::LineSegment { points, stroke }
+                    if *stroke == divider_stroke
+                        && points[0].y == points[1].y
+                        && points[1].x - points[0].x >= minimum_divider_span =>
+                {
+                    Some((index, *points))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            divider_shapes.len(),
+            1,
+            "the ruler and header names should have one uninterrupted divider"
+        );
+        let (divider_index, points) = divider_shapes[0];
+        let tint = column_selection_fill(visuals);
+        let last_selection_fill = output
+            .shapes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, shape)| {
+                matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == tint)
+                    .then_some(index)
+            })
+            .max()
+            .expect("selected columns should paint a persistent fill");
+        assert!(
+            divider_index > last_selection_fill,
+            "the divider should be painted above selected column fills"
+        );
+        points[1].x - points[0].x
     }
 
     fn press_grid_key(
@@ -4656,6 +5962,31 @@ mod tests {
         document.index = Some(job.wait().unwrap());
         document.progress.done = true;
         document.progress.bytes_scanned = document.session.file_size;
+    }
+
+    fn finish_structural_edit(app: &mut QuarryApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = app
+                .document
+                .as_mut()
+                .expect("the document remains open")
+                .poll_structural_edit()
+                .unwrap();
+            if let Some(ready) = ready {
+                app.install_materialized_working_copy(ready).unwrap();
+            }
+            if app
+                .document
+                .as_ref()
+                .is_some_and(|document| document.structural_job.is_none())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "column edit timed out");
+            std::thread::yield_now();
+        }
+        finish_index(app.document.as_mut().unwrap());
     }
 
     fn finish_search(document: &mut Document) {
@@ -5147,7 +6478,8 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("quarry-header-rename-{name}.csv"));
         let long_header = "x".repeat(140);
-        let source = format!("\"line\nname\",,{long_header}\nfirst,second,third\n");
+        let original_header = "\u{feff}line\nname";
+        let source = format!("\"{original_header}\",,{long_header}\nfirst,second,third\n");
         fs::write(&path, source.as_bytes()).unwrap();
         let mut document = Document::prepare(
             &path,
@@ -5158,7 +6490,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(document.source_header_name(0), Some("line\nname"));
+        assert_eq!(document.source_header_name(0), Some(original_header));
         assert_eq!(document.source_header_name(1), Some(""));
         assert_eq!(document.source_header_name(2), Some(long_header.as_str()));
         assert!(document.column_name(2).ends_with("..."));
@@ -5169,7 +6501,7 @@ mod tests {
                 .header_edit
                 .as_ref()
                 .map(|edit| edit.draft.as_str()),
-            Some("line\nname")
+            Some(original_header)
         );
         document.header_edit.as_mut().unwrap().draft = "renamed".into();
         document.move_column(0, 2).unwrap();
@@ -5184,7 +6516,7 @@ mod tests {
             Some("renamed")
         );
 
-        document.rename_header(0, "line\nname".into()).unwrap();
+        document.rename_header(0, original_header.into()).unwrap();
         assert!(!document.is_dirty());
         document.rename_header(1, "Column 2".into()).unwrap();
         assert!(document.is_dirty());
@@ -5715,14 +7047,17 @@ mod tests {
         let source = std::env::temp_dir().join(format!("quarry-headerless-save-{name}.csv"));
         let destination =
             std::env::temp_dir().join(format!("quarry-headerless-save-{name}-copy.csv"));
-        fs::write(&source, b"first,1\nsecond,2\n").unwrap();
+        fs::write(&source, b"\xEF\xBB\xBFfirst,1\nsecond,2\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
         app.header_mode = HeaderMode::NoHeader;
         app.open_path(source.clone()).unwrap();
         finish_index(app.document.as_mut().unwrap());
         let document = app.document.as_mut().unwrap();
-        document.begin_cell_edit(0, 1, b"1".to_vec()).unwrap();
+        let source_cell = document.visible_row(0).unwrap().1[0].clone();
+        assert_eq!(source_cell, b"first");
+        document.begin_cell_edit(0, 0, source_cell).unwrap();
+        assert_eq!(document.cell_edit.as_ref().unwrap().draft, "first");
         document.cell_edit.as_mut().unwrap().draft = "saved".into();
 
         let ctx = egui::Context::default();
@@ -5733,7 +7068,10 @@ mod tests {
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.data_start, 0);
         assert!(!document.is_dirty());
-        assert_eq!(fs::read(&source).unwrap(), b"first,saved\nsecond,2\n");
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"\xEF\xBB\xBFsaved,1\nsecond,2\n"
+        );
 
         finish_index(app.document.as_mut().unwrap());
         let document = app.document.as_mut().unwrap();
@@ -5746,10 +7084,13 @@ mod tests {
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.data_start, 0);
         assert!(!document.is_dirty());
-        assert_eq!(fs::read(&source).unwrap(), b"first,saved\nsecond,2\n");
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"\xEF\xBB\xBFsaved,1\nsecond,2\n"
+        );
         assert_eq!(
             fs::read(&destination).unwrap(),
-            b"first,saved\nsecond,saved as\n"
+            b"\xEF\xBB\xBFsaved,1\nsecond,saved as\n"
         );
 
         app.document.as_mut().unwrap().shutdown();
@@ -5990,7 +7331,7 @@ mod tests {
         });
         assert!(app.close_confirmation_open);
         assert!(!app.close_after_save);
-        let document = app.document.as_ref().unwrap();
+        let document = app.document.as_mut().unwrap();
         assert_eq!(document.session.path(), source);
         assert!(document.is_dirty());
         assert_eq!(
@@ -6748,6 +8089,905 @@ mod tests {
         );
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn column_selection_modifiers_match_editor_conventions() {
+        let columns = ColumnView::new(6);
+        let mut selected = BTreeSet::new();
+        let mut anchor = None;
+
+        select_column(
+            &columns,
+            &mut selected,
+            &mut anchor,
+            2,
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(selected, BTreeSet::from([2]));
+        assert_eq!(anchor, Some(2));
+
+        select_column(
+            &columns,
+            &mut selected,
+            &mut anchor,
+            5,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(selected, BTreeSet::from([2, 3, 4, 5]));
+        assert_eq!(anchor, Some(2));
+
+        select_column(
+            &columns,
+            &mut selected,
+            &mut anchor,
+            1,
+            egui::Modifiers::NONE,
+        );
+        select_column(
+            &columns,
+            &mut selected,
+            &mut anchor,
+            4,
+            egui::Modifiers::COMMAND,
+        );
+        assert_eq!(selected, BTreeSet::from([1, 4]));
+        assert_eq!(anchor, Some(4));
+
+        select_column(
+            &columns,
+            &mut selected,
+            &mut anchor,
+            1,
+            egui::Modifiers::COMMAND,
+        );
+        assert_eq!(selected, BTreeSet::from([4]));
+        select_column(
+            &columns,
+            &mut selected,
+            &mut anchor,
+            4,
+            egui::Modifiers::COMMAND,
+        );
+        assert!(selected.is_empty());
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn shift_selection_uses_shown_display_order_and_hiding_prunes_it() {
+        let mut columns = ColumnView::new(6);
+        assert!(columns.move_column(5, 1));
+        assert!(columns.set_shown(1, false));
+        let mut selected = BTreeSet::new();
+        let mut anchor = None;
+
+        select_column(
+            &columns,
+            &mut selected,
+            &mut anchor,
+            5,
+            egui::Modifiers::NONE,
+        );
+        select_column(
+            &columns,
+            &mut selected,
+            &mut anchor,
+            3,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(selected.iter().copied().collect::<Vec<_>>(), vec![2, 3, 5]);
+        assert!(!selected.contains(&1));
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("hidden-column-selection.csv");
+        fs::write(&source, b"a,b,c,d,e,f\n1,2,3,4,5,6\n").unwrap();
+        let mut document = Document::prepare(
+            &source,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        document.move_column(5, 1).unwrap();
+        document.set_column_shown(1, false).unwrap();
+        document.selected_columns = selected;
+        document.column_selection_anchor = anchor;
+
+        document.set_column_shown(5, false).unwrap();
+        assert_eq!(document.selected_columns, BTreeSet::from([2, 3]));
+        assert_eq!(document.column_selection_anchor, Some(2));
+        document.set_column_shown(2, false).unwrap();
+        assert_eq!(document.selected_columns, BTreeSet::from([3]));
+        assert_eq!(document.column_selection_anchor, Some(3));
+        document.set_column_shown(3, false).unwrap();
+        assert!(document.selected_columns.is_empty());
+        assert_eq!(document.column_selection_anchor, None);
+    }
+
+    #[test]
+    fn numbered_columns_are_visibly_and_accessibly_multi_selectable() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("column-selection.csv");
+        fs::write(
+            &source,
+            b"first,middle,last\nAda,King,Lovelace\nGrace,Brewster,Hopper\n",
+        )
+        .unwrap();
+        let mut document = Document::prepare(
+            &source,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        click_grid_control("Select file column 1 (first)", &mut document);
+        click_grid_control("Select file column 3 (last)", &mut document);
+        assert_eq!(document.selected_columns, BTreeSet::from([0, 2]));
+
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        ctx.enable_accesskit();
+        let output = render_grid(&ctx, &mut document);
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("the selected columns should be accessible");
+        for label in [
+            "Select file column 1 (first)",
+            "Select file column 3 (last)",
+        ] {
+            let node = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .map(|(_, node)| node)
+                .unwrap_or_else(|| panic!("missing accessible numbered header {label}"));
+            assert_eq!(node.is_selected(), Some(true));
+        }
+        let middle = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Select file column 2 (middle)"))
+            .map(|(_, node)| node)
+            .expect("the unselected numbered header should be accessible");
+        assert_eq!(middle.is_selected(), Some(false));
+
+        let tint = column_selection_fill(&ctx.style().visuals);
+        let painted_cells = output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == tint))
+            .count();
+        let expected_cells = (document.visible_row_count() + 1) * document.selected_columns.len();
+        assert!(
+            painted_cells >= expected_cells,
+            "each selected header and visible column cell should be tinted"
+        );
+
+        assert_column_ruler_divider(&output, &ctx.style().visuals, document.headers.len());
+
+        let sizing_ctx = egui::Context::default();
+        configure_style(&sizing_ctx);
+        let render_at_width = |width, document: &mut Document| {
+            sizing_ctx.run(grid_input_with_width(width), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, document).unwrap();
+                });
+            })
+        };
+        let narrow = render_at_width(420.0, &mut document);
+        let narrow_span = assert_column_ruler_divider(
+            &narrow,
+            &sizing_ctx.style().visuals,
+            document.headers.len(),
+        );
+        let wide = render_at_width(1680.0, &mut document);
+        let wide_span =
+            assert_column_ruler_divider(&wide, &sizing_ctx.style().visuals, document.headers.len());
+        assert!(
+            wide_span > narrow_span,
+            "the continuous divider should follow the resized table width"
+        );
+
+        let selected_target = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Select file column 3 (last)"))
+            .map(|(id, _)| *id)
+            .unwrap();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::ShowContextMenu,
+                        target: selected_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert_eq!(document.selected_columns, BTreeSet::from([0, 2]));
+        let menu_output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
+        let menu_tree = menu_output
+            .platform_output
+            .accesskit_update
+            .expect("the multi-column menu should be accessible");
+        let combine = menu_tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Combine Columns…"))
+            .map(|(_, node)| node)
+            .expect("Combine Columns should be in the selected-column menu");
+        assert!(!combine.is_disabled());
+
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let unselected_target =
+            grid_control_id(&context, "Select file column 2 (middle)", &mut document);
+        let _ = context.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::ShowContextMenu,
+                        target: unselected_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert_eq!(document.selected_columns, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn combine_from_numbered_headers_becomes_the_normal_editable_grid() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("combine-from-grid.csv");
+        fs::write(
+            &source,
+            b"first,last,age\nAda,Lovelace,36\nGrace,Hopper,85\n",
+        )
+        .unwrap();
+        let original = fs::read(&source).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+
+        click_grid_control(
+            "Select file column 1 (first)",
+            app.document.as_mut().unwrap(),
+        );
+        click_grid_control(
+            "Select file column 2 (last)",
+            app.document.as_mut().unwrap(),
+        );
+        assert_eq!(
+            app.document.as_ref().unwrap().selected_columns,
+            BTreeSet::from([0, 1])
+        );
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let header_target = grid_control_id(
+            &ctx,
+            "Select file column 2 (last)",
+            app.document.as_mut().unwrap(),
+        );
+        let mut opened_dialog = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::ShowContextMenu,
+                        target: header_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    opened_dialog = show_grid(ui, app.document.as_mut().unwrap()).unwrap();
+                });
+            },
+        );
+        let menu_output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                opened_dialog = show_grid(ui, app.document.as_mut().unwrap()).unwrap();
+            });
+        });
+        let combine_target = menu_output
+            .platform_output
+            .accesskit_update
+            .expect("the selected-column menu should be accessible")
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Combine Columns…") && !node.is_disabled())
+            .map(|(id, _)| *id)
+            .expect("Combine Columns should be enabled for two selected headers");
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: combine_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    opened_dialog = show_grid(ui, app.document.as_mut().unwrap()).unwrap();
+                });
+            },
+        );
+        let mut dialog = opened_dialog.expect("Combine Columns should open its dialog");
+        assert_eq!(dialog.columns, vec![0, 1]);
+        dialog.separator = " ".into();
+        app.open_structural_dialog(dialog);
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.total_columns, 2);
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            vec![b"first".to_vec(), b"age".to_vec()]
+        );
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            vec![b"Ada Lovelace".to_vec(), b"36".to_vec()]
+        );
+        assert_eq!(document.selected_columns, BTreeSet::from([0]));
+        assert_eq!(document.column_selection_anchor, Some(0));
+        assert!(document.cell_is_editable(Some(b"Ada Lovelace")));
+        assert!(document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        let focus_ctx = egui::Context::default();
+        focus_ctx.enable_accesskit();
+        let output = render_grid(&focus_ctx, app.document.as_mut().unwrap());
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("the combined grid should be accessible");
+        let focused = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Select file column 1 (first)"))
+            .map(|(id, node)| (*id, node))
+            .expect("the combined result header should be accessible");
+        assert_eq!(focused.1.is_selected(), Some(true));
+        assert_eq!(tree.focus, focused.0);
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Select file column 2 (age)"))
+        );
+    }
+
+    #[test]
+    fn split_from_numbered_ruler_becomes_the_normal_editable_grid_and_discards_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("split-source.csv");
+        fs::write(
+            &source,
+            b"email,city\nalice@example.com,New York\nbob@test.org,Boston\n",
+        )
+        .unwrap();
+        let original = fs::read(&source).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+
+        let document = app.document.as_mut().unwrap();
+        let (_ctx, _target) = click_grid_control("Select file column 1 (email)", document);
+        assert_eq!(
+            document
+                .selected_columns
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        app.open_structural_dialog(StructuralDialog::split(0));
+        let dialog = app.structural_dialog.as_mut().unwrap();
+        assert_eq!(dialog.columns, vec![0]);
+        dialog.separator = "@".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(grid_input(), |ctx| {
+            assert_eq!(
+                show_structural_dialog(ctx, dialog, app.document.as_ref().unwrap()),
+                None
+            );
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("the split dialog should be accessible");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::TextInput
+                && node.value() == Some(dialog.separator.as_str())
+        }));
+        for label in ["OK", "Cancel"] {
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(label)),
+                "missing accessible split control {label}"
+            );
+        }
+
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let working_directory = app
+            .document
+            .as_ref()
+            .unwrap()
+            .working_copy
+            .as_ref()
+            .unwrap()
+            .directory
+            .path()
+            .to_path_buf();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(app.path_input, source.to_string_lossy());
+        assert_ne!(document.session.path(), source);
+        assert_eq!(document.total_columns, 3);
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            vec![b"email".to_vec(), Vec::new(), b"city".to_vec()]
+        );
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            vec![
+                b"alice".to_vec(),
+                b"example.com".to_vec(),
+                b"New York".to_vec()
+            ]
+        );
+        assert_eq!(document.column_name(1), "");
+        assert!(document.cell_is_editable(Some(b"example.com")));
+        assert!(document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = render_grid(&ctx, app.document.as_mut().unwrap());
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("the transformed grid should be accessible");
+        let focused_header = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Select file column 1 (email)"))
+            .map(|(id, _)| *id)
+            .expect("the affected numbered header should be accessible");
+        assert_eq!(tree.focus, focused_header);
+        for label in [
+            "Select file column 2 (unnamed header)",
+            "Rename file column 2 (unnamed header)",
+            "Select row 1, column 2 (unnamed header): example.com",
+        ] {
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(label)),
+                "missing accessible blank-header label {label}"
+            );
+        }
+
+        app.apply(&egui::Context::default(), Action::DiscardChanges);
+        let document = app.document.as_mut().unwrap();
+        finish_index(document);
+        assert_eq!(document.session.path(), source);
+        assert_eq!(document.total_columns, 2);
+        assert!(!document.is_dirty());
+        assert!(!working_directory.exists());
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn numbered_column_menu_opens_from_the_accessibility_context_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("accessible-column-menu.csv");
+        fs::write(&source, b"email,city\na@b,x\n").unwrap();
+        let mut document = Document::prepare(&source, OpenOptions::default()).unwrap();
+        let (ctx, target) = click_grid_control("Select file column 1 (email)", &mut document);
+        let initial = render_grid(&ctx, &mut document);
+        let initial_tree = initial
+            .platform_output
+            .accesskit_update
+            .expect("the numbered grid should be accessible");
+        assert!(initial_tree.nodes.iter().any(|(id, node)| {
+            *id == target && node.supports_action(egui::accesskit::Action::ShowContextMenu)
+        }));
+
+        let output = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::ShowContextMenu,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        let menu_tree = output
+            .platform_output
+            .accesskit_update
+            .expect("the column menu should be accessible");
+        for label in ["Split Columns…", "Combine Columns…"] {
+            assert!(
+                menu_tree
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(label)),
+                "missing accessible column menu item {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_targets_exactly_one_selection_and_keeps_a_wide_result_in_view() {
+        let mut selected = BTreeSet::new();
+        assert_eq!(selected_split_column(&selected), None);
+        selected.insert(39);
+        assert_eq!(selected_split_column(&selected), Some(39));
+        selected.insert(2);
+        assert_eq!(selected_split_column(&selected), None);
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("wide-split.csv");
+        let headers = (1..=40)
+            .map(|column| format!("column-{column}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let values = (1..=40)
+            .map(|column| {
+                if column == 40 {
+                    "left:right".to_owned()
+                } else {
+                    column.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(&source, format!("{headers}\n{values}\n")).unwrap();
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_split(39, b":".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.total_columns, 41);
+        assert_eq!(
+            document
+                .selected_columns
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![39, 40]
+        );
+        assert!(document.columns.visible.contains(&39));
+        assert!(document.columns.visible.contains(&40));
+        assert_eq!(
+            document.session.first_rows[1].fields[39..=40],
+            [b"left".to_vec(), b"right".to_vec()]
+        );
+    }
+
+    #[test]
+    fn split_then_editing_a_derived_cell_saves_as_without_touching_the_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("split-edit-source.csv");
+        let destination = directory.path().join("split-edit-output.csv");
+        fs::write(&source, b"email,city\nalice@example.com,New York\n").unwrap();
+        let original = fs::read(&source).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_split(0, b"@".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+
+        let document = app.document.as_mut().unwrap();
+        let row = document.data_start;
+        document
+            .begin_cell_edit(row, 1, b"example.com".to_vec())
+            .unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "domain.test".into();
+        document.commit_cell_edit();
+        document.start_save_as(destination.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let saved = loop {
+            if let Some(saved) = document.poll_save().unwrap() {
+                break saved;
+            }
+            assert!(Instant::now() < deadline, "Save As timed out");
+            std::thread::yield_now();
+        };
+        assert_eq!(saved, (destination.clone(), false));
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"email,,city\nalice,domain.test,New York\n"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn split_then_save_replaces_the_guarded_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("split-save-source.csv");
+        fs::write(&source, b"email,city\nalice@example.com,New York\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_split(0, b"@".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+
+        let document = app.document.as_mut().unwrap();
+        document.start_save().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let saved = loop {
+            if let Some(saved) = document.poll_save().unwrap() {
+                break saved;
+            }
+            assert!(Instant::now() < deadline, "Save timed out");
+            std::thread::yield_now();
+        };
+        assert_eq!(saved, (source.clone(), true));
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"email,,city\nalice,example.com,New York\n"
+        );
+    }
+
+    #[test]
+    fn combine_is_atomic_and_one_step_undo_redo_restores_each_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("combine-source.csv");
+        fs::write(&source, b"first,last,age\nAda,Lovelace,36\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_combine(vec![0, 1], b" ".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.total_columns, 2);
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            vec![b"first".to_vec(), b"age".to_vec()]
+        );
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            vec![b"Ada Lovelace".to_vec(), b"36".to_vec()]
+        );
+        assert!(document.can_undo_structural());
+        assert!(document.is_dirty());
+
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(document.session.path(), source);
+        assert_eq!(document.total_columns, 3);
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            vec![b"Ada".to_vec(), b"Lovelace".to_vec(), b"36".to_vec()]
+        );
+        assert!(document.can_redo_structural());
+        assert!(!document.is_dirty());
+
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.total_columns, 2);
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            vec![b"Ada Lovelace".to_vec(), b"36".to_vec()]
+        );
+        assert!(document.can_undo_structural());
+        assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn split_accepts_a_column_discovered_beyond_a_short_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("ragged-header.csv");
+        fs::write(&source, b"only\nleft,right:tail\n").unwrap();
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        assert_eq!(app.document.as_ref().unwrap().total_columns, 2);
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_split(1, b":".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.total_columns, 3);
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            vec![b"only".to_vec(), Vec::new(), Vec::new()]
+        );
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            vec![b"left".to_vec(), b"right".to_vec(), b"tail".to_vec()]
+        );
+    }
+
+    #[test]
+    fn structural_undo_restores_prior_sparse_edits_and_later_edits_invalidate_redo() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("undo-overlay.csv");
+        fs::write(&source, b"email,city\na@b,x\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        document.rename_header(1, "town".into()).unwrap();
+        document.begin_cell_edit(1, 0, b"a@b".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "alpha@beta".into();
+        document.commit_cell_edit();
+        document.start_split(0, b"@".to_vec()).unwrap();
+        finish_structural_edit(&mut app);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            vec![b"email".to_vec(), Vec::new(), b"town".to_vec()]
+        );
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            vec![b"alpha".to_vec(), b"beta".to_vec(), b"x".to_vec()]
+        );
+
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(document.session.path(), source);
+        assert_eq!(document.column_name(1), "town");
+        assert_eq!(document.cell_edits.get(&(1, 0)).unwrap(), b"alpha@beta");
+        assert!(document.is_dirty());
+        assert!(document.can_redo_structural());
+
+        document.rename_header(1, "town".into()).unwrap();
+        assert!(document.can_redo_structural());
+        document.begin_cell_edit(1, 0, b"a@b".to_vec()).unwrap();
+        document.commit_cell_edit();
+        assert!(document.can_redo_structural());
+        assert_eq!(
+            document.start_split(0, Vec::new()).unwrap_err(),
+            "Enter a non-empty separator."
+        );
+        assert!(document.can_redo_structural());
+        document.start_split(0, b"|".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            match document.poll_structural_edit() {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("missing-separator split must not materialize"),
+                Err(error) => break error,
+            }
+            assert!(Instant::now() < deadline, "failed split analysis timed out");
+            std::thread::yield_now();
+        };
+        assert_eq!(error, "The separator was not found in the selected column.");
+        assert!(document.can_redo_structural());
+
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        assert!(document.can_redo_structural());
+        document.begin_cell_edit(1, 1, b"x".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "y".into();
+        document.commit_cell_edit();
+        assert!(!document.can_redo_structural());
+    }
+
+    #[test]
+    fn first_structural_undo_freezes_if_the_original_changed_externally() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("undo-source-guard.csv");
+        fs::write(&source, b"email,city\na@b,x\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_split(0, b"@".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+
+        fs::write(&source, b"email,city\nexternal,change\n").unwrap();
+        assert_eq!(
+            app.swap_structural_history(false).unwrap_err(),
+            SOURCE_CHANGED_NOTICE
+        );
+        assert!(app.document.as_ref().unwrap().source_changed);
+    }
+
+    #[test]
+    fn first_combine_freezes_a_missing_source_without_allocating_working_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("combine-source-guard.csv");
+        fs::write(&source, b"first,last\nAda,Lovelace\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        fs::remove_file(source).unwrap();
+
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(
+            document
+                .start_combine(vec![0, 1], b" ".to_vec())
+                .unwrap_err(),
+            SOURCE_CHANGED_NOTICE
+        );
+        assert!(document.source_changed);
+        assert!(document.original_session.is_none());
+        assert!(document.working_copy.is_none());
+    }
+
+    #[test]
+    fn first_split_freezes_a_missing_source_without_allocating_working_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("split-source-guard.csv");
+        fs::write(&source, b"email,city\na@b,x\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        fs::remove_file(source).unwrap();
+
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(
+            document.start_split(0, b"@".to_vec()).unwrap_err(),
+            SOURCE_CHANGED_NOTICE
+        );
+        assert!(document.source_changed);
+        assert!(document.original_session.is_none());
+        assert!(document.working_copy.is_none());
+        assert!(document.structural_job.is_none());
     }
 
     #[test]
