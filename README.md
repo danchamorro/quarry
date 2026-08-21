@@ -93,10 +93,12 @@ values, Replace in Cell changes the current matched cell, and cancellable
 Replace All uses the same bounded private rewrite worker and change history.
 Phase 6A stable single-column text sorting is complete across the core,
 desktop, and validation CLI. Deterministic 1 GB and 12 GB release runs passed
-complete order and preservation scans with peak RSS below 18 MiB, measured
+complete order and preservation scans with peak RSS below 20 MiB, measured
 temporary disk below the conservative estimate, unchanged source hashes, and
-prompt cancellation without leftover files. Phase 7 hardening begins with
-reproducible packaging and one canonical installed desktop application.
+prompt cancellation without leftover files. The worker now also verifies the
+effective record multiset and exact stable tie order before publication. Phase
+7 hardening begins with reproducible packaging and one canonical installed
+desktop application.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv

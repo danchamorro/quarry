@@ -273,8 +273,9 @@ and deterministic 1 GB and 12 GB release evidence pass.
   ragged rows, sparse overlays, forced multi-run merging, cancellation, cleanup,
   accessibility, and change history with exact regressions.
 - [x] Record deterministic 1 GB and 12 GB time, peak RSS, peak temporary disk,
-  merge passes, exact row/header preservation, source hashes, and cancellation
-  latency before marking Phase 6A complete.
+  merge passes, exact row/header preservation, bounded record-multiset evidence,
+  exact stable-tie order, source hashes, and cancellation latency before marking
+  Phase 6A complete.
 
 **Phase 6A exit:** stable text sorting immediately appears in the editable grid,
 memory stays bounded with respect to file size, required temporary disk is
@@ -282,7 +283,7 @@ clear before starting, and cancellation cannot expose a partial result.
 
 **Phase 6A exit met:** the [release validation](benchmarks/2026-08-21-stable-text-sort.md)
 records complete 1 GB and 12 GB success and cancellation runs. Peak RSS stays
-below 18 MiB, measured temporary disk stays below the conservative estimate,
+below 20 MiB, measured temporary disk stays below the conservative estimate,
 source hashes remain unchanged, and cancellation leaves no output or run files.
 
 ## Phase 7 — Hardening

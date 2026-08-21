@@ -1697,6 +1697,7 @@ fn selection_copy_requested(
                 PATH_INPUT_ID,
                 JUMP_INPUT_ID,
                 FIND_INPUT_ID,
+                REPLACE_INPUT_ID,
                 COLUMN_INPUT_ID,
                 COLUMN_POSITION_INPUT_ID,
             ]
@@ -3761,6 +3762,8 @@ impl Document {
     fn can_replace_current(&self, query: &[u8]) -> bool {
         if query.is_empty()
             || self.search_job.is_some()
+            || self.save_job.is_some()
+            || self.structural_job.is_some()
             || self.cell_edit.is_some()
             || self.header_edit.is_some()
             || self.search_query != query
@@ -6431,16 +6434,16 @@ mod tests {
     use super::{
         Action, COLUMN_INPUT_ID, COLUMN_POSITION_INPUT_ID, ColumnCommand, ColumnView,
         DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterProgress, FilterQuery,
-        GridColumnRequest, GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row,
-        SOURCE_CHANGED_NOTICE, SearchMatch, SearchProgress, Session, StructuralDialog,
-        StructuralDialogAction, column_drop_position, column_ruler_divider_stroke,
-        column_selection_fill, column_window_controls, configure_style, copy_control,
-        estimate_sort_temporary_bytes, filtered_export_controls, filtered_export_file_name,
-        logical_viewport_start, max_viewport_start, page_controls, parse_column_position,
-        parse_data_row, parse_file_column, parse_move_position, row_for_scroll_fraction,
-        save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
-        selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
-        show_structural_dialog, sort_merge_progress,
+        GridColumnRequest, GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp,
+        REPLACE_INPUT_ID, Row, SOURCE_CHANGED_NOTICE, SearchMatch, SearchProgress, Session,
+        StructuralDialog, StructuralDialogAction, column_drop_position,
+        column_ruler_divider_stroke, column_selection_fill, column_window_controls,
+        configure_style, copy_control, estimate_sort_temporary_bytes, filtered_export_controls,
+        filtered_export_file_name, logical_viewport_start, max_viewport_start, page_controls,
+        parse_column_position, parse_data_row, parse_file_column, parse_move_position,
+        row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row, search_controls,
+        select_column, selected_split_column, selection_text, show_column_manager,
+        show_filter_manager, show_grid, show_structural_dialog, sort_merge_progress,
     };
 
     fn click_accessible_button(
@@ -10290,6 +10293,66 @@ mod tests {
     }
 
     #[test]
+    fn replacement_input_copy_does_not_overwrite_text_with_the_grid_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replacement-copy.csv");
+        fs::write(&path, b"name\ngrid value\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.selection = Some(GridSelection::Cell { row: 1, column: 0 });
+
+        let ctx = egui::Context::default();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.replace_input = "copy this".into();
+        app.document = Some(document);
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+
+        let replace_id = egui::Id::new(REPLACE_INPUT_ID);
+        ctx.memory_mut(|memory| memory.request_focus(replace_id));
+        let mut state = egui::TextEdit::load_state(&ctx, replace_id)
+            .expect("replacement input should retain text-edit state");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(4),
+            )));
+        state.store(&ctx, replace_id);
+
+        let output = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        let copied = output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(copied, ["copy"]);
+
+        app.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
     fn reference_window_is_dense_and_visible_rows_adapt_to_height() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10574,6 +10637,51 @@ mod tests {
         );
         assert!(!document.can_replace_current(b"aa"));
         assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn replace_current_is_blocked_during_background_rewrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let open_replaceable = |name: &str| {
+            let path = directory.path().join(name);
+            fs::write(&path, b"name,other\nneedle,x\n").unwrap();
+            let mut document = Document::open(
+                &path,
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            finish_index(&mut document);
+            document.start_find_next(b"needle").unwrap();
+            finish_search(&mut document);
+            assert!(document.can_replace_current(b"needle"));
+            document
+        };
+
+        let mut saving = open_replaceable("replace-during-save.csv");
+        saving.rename_header(0, "renamed".into()).unwrap();
+        saving
+            .start_save_as(directory.path().join("saved.csv"))
+            .unwrap();
+        assert!(saving.save_job.is_some());
+        assert!(!saving.can_replace_current(b"needle"));
+        assert!(saving.replace_current_match(b"needle", b"changed").is_err());
+        assert!(saving.cell_edits.is_empty());
+        saving.shutdown();
+
+        let mut materializing = open_replaceable("replace-during-structural.csv");
+        materializing.start_replace_all(b"x", b"y").unwrap();
+        assert!(materializing.structural_job.is_some());
+        assert!(!materializing.can_replace_current(b"needle"));
+        assert!(
+            materializing
+                .replace_current_match(b"needle", b"changed")
+                .is_err()
+        );
+        assert!(materializing.cell_edits.is_empty());
+        materializing.shutdown();
     }
 
     #[test]

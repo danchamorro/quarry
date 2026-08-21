@@ -5,12 +5,13 @@
 Phase 6A is complete. The implementation, deterministic regressions, and
 release measurements on the deterministic 1 GB and 12 GB fixtures all pass.
 
-The 1 GB sort completed in 10.120 seconds with 16.78 MiB peak process RSS and
-2.05 GiB measured peak temporary disk. The 12 GB sort completed in 162.263
-seconds with 17.39 MiB peak process RSS and 24.65 GiB measured peak temporary
+The 1 GB sort completed in 15.439 seconds with 16.86 MiB peak process RSS and
+2.12 GiB measured peak temporary disk. The 12 GB sort completed in 242.216
+seconds with 17.48 MiB peak process RSS and 24.65 GiB measured peak temporary
 disk. Both outputs preserved the exact data-row count and raw header, matched
-the source byte size, passed a complete sorted-order scan, and left the source
-SHA-256 unchanged.
+the source byte size, passed a complete sorted-order scan, verified bounded
+record-multiset preservation and exact stable tie order before publication, and
+left the source SHA-256 unchanged.
 
 ## Implemented behavior
 
@@ -28,8 +29,10 @@ SHA-256 unchanged.
 ## Resource and publication bounds
 
 The worker builds 8 MiB runs and spills owner-only framed files. Merge heap
-entries retain keys and record lengths, while only one selected record body is
-loaded at a time. Effective merge fan-in is capped against a 256 MiB payload
+entries retain keys and record lengths, while only one pending key and one
+selected record body are loaded at a time. Effective merge fan-in reserves
+those two maximum-record payloads before admitting heap keys; the default
+64 MiB record cap therefore uses fan-in two and stays within the 256 MiB payload
 budget. Multipass run files and guarded output use owner-only storage and are
 removed after success, cancellation, or failure.
 
@@ -47,29 +50,32 @@ phase rather than showing 100 percent while merge work remains.
 
 The validation CLI reports the worker's wall time, peak temporary bytes, merge
 passes, exact data/header counts, cancellation latency, peak process RSS, and
-streaming FNV-1a fingerprints. SHA-256 is recorded separately before and after
-the runs using the platform `shasum` tool.
+streaming FNV-1a fingerprints. Completion also requires a bounded dual
+fingerprint of the effective record multiset and exact increasing source
+ordinals for adjacent equal keys. SHA-256 is recorded separately before and
+after the runs using the platform `shasum` tool.
 
 ## Regression evidence
 
-`cargo test --workspace --locked --offline` passed 184 tests:
+`cargo test --workspace --locked --offline` passed 190 tests:
 
 | Package | Tests |
 |---|---:|
 | AppKit | 1 |
-| CLI | 18 |
-| Core | 96 |
+| CLI | 19 |
+| Core | 99 |
 | Delimited parser | 9 |
-| egui desktop | 60 |
+| egui desktop | 62 |
 
 The sort-specific regressions cover stable ascending and descending order,
 quoted multiline keys, ragged rows, sparse overlays, header renames, BOM and
 unterminated-record handling, forced multipass merging, the merge-memory bound,
 the disk formula, source conflicts, output record limits, owner-only files,
-cancellation cleanup, accessibility, visible merge progress, and structural
-Undo and Redo. Focused regressions also verify the measured peak-temporary-disk,
-merge-pass, header-count, frozen-elapsed-time, cancellation-latency, and file
-fingerprint reporting paths.
+cancellation cleanup, record-multiset preservation, exact equal-key ordinal
+order, accessibility, visible merge progress, and structural Undo and Redo.
+Focused regressions also verify the measured peak-temporary-disk, merge-pass,
+header-count, frozen-elapsed-time, cancellation-latency, and file fingerprint
+reporting paths.
 
 Strict workspace linting, formatting, and whitespace checks also pass.
 
@@ -134,12 +140,13 @@ temporary artifact should remain.
 
 | Dataset | Sort time | Throughput | Peak RSS | Estimated temporary disk | Measured peak temporary disk | Runs | Merge passes | Validation scan |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Deterministic 1 GB | 10.120 s | 94.24 MiB/s | 16.78 MiB | 4,286,594,700 bytes (3.99 GiB) | 2,205,891,941 bytes (2.05 GiB) | 216 | 5 | 7.972 s |
-| Deterministic 12 GB | 162.263 s | 70.53 MiB/s | 17.39 MiB | 51,439,139,964 bytes (47.91 GiB) | 26,470,708,694 bytes (24.65 GiB) | 2,591 | 7 | 96.299 s |
+| Deterministic 1 GB | 15.439 s | 61.77 MiB/s | 16.86 MiB | 4,286,594,700 bytes (3.99 GiB) | 2,279,612,666 bytes (2.12 GiB) | 289 | 8 | 8.317 s |
+| Deterministic 12 GB | 242.216 s | 47.25 MiB/s | 17.48 MiB | 51,439,139,964 bytes (47.91 GiB) | 26,470,708,694 bytes (24.65 GiB) | 3,453 | 11 | 99.742 s |
 
 Both outputs had exactly one 101-byte raw header and the exact source data-row
 count. Output byte size equaled source byte size, every row passed the complete
-ascending-order scan, and owner-only permissions were retained.
+ascending-order scan, the bounded record-multiset and exact stable-tie checks
+passed before publication, and owner-only permissions were retained.
 
 | Dataset | Output bytes | Output SHA-256 | Output FNV-1a 64 |
 |---|---:|---|---|
@@ -150,8 +157,8 @@ ascending-order scan, and owner-only permissions were retained.
 
 | Dataset | Requested threshold | Bytes scanned | Rows processed | Temporary bytes | Worker time | Cancellation latency | Peak RSS | Published or leftover artifact |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| Deterministic 1 GB | 64 MiB | 68,157,440 | 344,299 | 75,496,242 | 0.223 s | 2.755 ms | 16.53 MiB | No |
-| Deterministic 12 GB | 64 MiB | 68,157,440 | 343,696 | 75,496,242 | 0.242 s | 2.821 ms | 16.77 MiB | No |
+| Deterministic 1 GB | 64 MiB | 68,157,440 | 343,442 | 75,496,242 | 0.272 s | 2.933 ms | 16.66 MiB | No |
+| Deterministic 12 GB | 64 MiB | 68,157,440 | 343,965 | 75,496,242 | 0.275 s | 2.838 ms | 15.20 MiB | No |
 
 Both cancellation runs stopped before the full source scan, published no
 destination, removed all run and staging files, and retained the original
@@ -162,6 +169,8 @@ source SHA-256 values.
 - [x] Stable ascending text order passes a complete output scan on 1 GB and
   12 GB.
 - [x] Exact data-row count, raw header, and output byte-size preservation pass.
+- [x] Bounded effective-record multiset evidence and exact equal-key source
+  ordinal checks pass before publication.
 - [x] Peak RSS stays bounded and the 12 GB result remains within 32 MiB of the
   1 GB result.
 - [x] Measured peak temporary disk remains below the conservative preflight

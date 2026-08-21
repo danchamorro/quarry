@@ -1,6 +1,8 @@
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File, OpenOptions};
+use std::hash::Hasher;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -62,6 +64,8 @@ pub struct SortSummary {
     pub merge_passes: u64,
     pub header_rows: u64,
     pub elapsed: Duration,
+    pub record_multiset_verified: bool,
+    pub stable_ties_verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,7 +417,7 @@ fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
             "sort merge fan-in must be at least two",
         ));
     }
-    if config.max_record_bytes.saturating_mul(3) > MERGE_MEMORY_BUDGET_BYTES {
+    if config.max_record_bytes.saturating_mul(4) > MERGE_MEMORY_BUDGET_BYTES {
         return Err(QuarryError::InvalidOption(
             "sort record limit exceeds the merge memory budget",
         ));
@@ -422,8 +426,8 @@ fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
 }
 
 fn effective_merge_fan_in(config: SortConfig) -> usize {
-    let key_slots =
-        MERGE_MEMORY_BUDGET_BYTES.saturating_sub(config.max_record_bytes) / config.max_record_bytes;
+    let total_slots = MERGE_MEMORY_BUDGET_BYTES / config.max_record_bytes;
+    let key_slots = total_slots.saturating_sub(2);
     config.merge_fan_in.min(key_slots.max(2))
 }
 
@@ -566,11 +570,106 @@ impl PartialOrd for HeapEntry {
     }
 }
 
+const RECORD_HASH_DOMAIN_A: u64 = 0x7175_6172_7279_2d61;
+const RECORD_HASH_DOMAIN_B: u64 = 0x7175_6172_7279_2d62;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RecordMultisetFingerprint {
+    count: u64,
+    xor_a: u64,
+    sum_a: u64,
+    xor_b: u64,
+    sum_b: u64,
+}
+
+impl RecordMultisetFingerprint {
+    fn observe(&mut self, record: &[u8]) {
+        let hash_a = hash_bytes(record, RECORD_HASH_DOMAIN_A);
+        let hash_b = hash_bytes(record, RECORD_HASH_DOMAIN_B);
+        self.count = self.count.saturating_add(1);
+        self.xor_a ^= hash_a;
+        self.sum_a = self.sum_a.wrapping_add(hash_a);
+        self.xor_b ^= hash_b;
+        self.sum_b = self.sum_b.wrapping_add(hash_b);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SortVerification {
+    record_multiset_verified: bool,
+    stable_ties_verified: bool,
+}
+
+struct OutputVerifier {
+    expected_records: RecordMultisetFingerprint,
+    observed_records: RecordMultisetFingerprint,
+}
+
+impl OutputVerifier {
+    fn new(expected_records: RecordMultisetFingerprint) -> Self {
+        Self {
+            expected_records,
+            observed_records: RecordMultisetFingerprint::default(),
+        }
+    }
+
+    fn observe(&mut self, record: &[u8], inserted_ending: &[u8]) -> Result<(), QuarryError> {
+        if !inserted_ending.is_empty()
+            && (!record_ending(record).is_empty() || !matches!(inserted_ending, b"\n" | b"\r\n"))
+        {
+            return Err(invalid_sort_output(
+                "sorted output inserted an invalid record ending",
+            ));
+        }
+        self.observed_records.observe(record);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<SortVerification, QuarryError> {
+        if self.observed_records != self.expected_records {
+            return Err(invalid_sort_output(
+                "sorted output did not preserve the effective record multiset",
+            ));
+        }
+        Ok(SortVerification {
+            record_multiset_verified: true,
+            stable_ties_verified: true,
+        })
+    }
+}
+
+fn verify_adjacent_tie_order(
+    previous_key: &[u8],
+    previous_ordinal: u64,
+    current_key: &[u8],
+    current_ordinal: u64,
+) -> Result<(), QuarryError> {
+    if previous_key == current_key && current_ordinal <= previous_ordinal {
+        return Err(invalid_sort_output(
+            "sorted output changed equal-key row order",
+        ));
+    }
+    Ok(())
+}
+
+fn hash_bytes(bytes: &[u8], domain: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u64(domain);
+    hasher.write_u64(bytes.len() as u64);
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+fn invalid_sort_output(message: &'static str) -> QuarryError {
+    io::Error::new(io::ErrorKind::InvalidData, message).into()
+}
+
 struct ScanSummary {
     header: Option<Vec<u8>>,
     preferred_ending: Vec<u8>,
     runs: Vec<PathBuf>,
     rows: u64,
+    records: RecordMultisetFingerprint,
 }
 
 struct InitialRunBuilder<'a> {
@@ -590,6 +689,7 @@ struct InitialRunBuilder<'a> {
     entry_bytes: usize,
     runs: Vec<PathBuf>,
     rows: u64,
+    records: RecordMultisetFingerprint,
 }
 
 impl<'a> InitialRunBuilder<'a> {
@@ -622,6 +722,7 @@ impl<'a> InitialRunBuilder<'a> {
             entry_bytes: 0,
             runs: Vec::new(),
             rows: 0,
+            records: RecordMultisetFingerprint::default(),
         }
     }
 
@@ -730,6 +831,7 @@ impl<'a> InitialRunBuilder<'a> {
         {
             self.flush()?;
         }
+        self.records.observe(&effective_record);
         self.entries.push(RunEntry {
             key,
             record: effective_record,
@@ -781,6 +883,7 @@ impl<'a> InitialRunBuilder<'a> {
             preferred_ending: self.preferred_ending,
             runs: self.runs,
             rows: self.rows,
+            records: self.records,
         })
     }
 }
@@ -929,7 +1032,7 @@ fn run_sort(
     let cleanup = workspace.cleanup();
     let built = built?;
     cleanup?;
-    let Some((rows, bytes_written)) = built else {
+    let Some((rows, bytes_written, verification)) = built else {
         return Ok(SortOutcome::Cancelled);
     };
     match output.publish(rows, bytes_written, &shared.cancel_requested)? {
@@ -942,6 +1045,8 @@ fn run_sort(
             merge_passes: shared.merge_passes.load(Ordering::Acquire),
             header_rows: shared.header_rows.load(Ordering::Acquire),
             elapsed: Duration::ZERO,
+            record_multiset_verified: verification.record_multiset_verified,
+            stable_ties_verified: verification.stable_ties_verified,
         })),
         FilterExportOutcome::Cancelled => Ok(SortOutcome::Cancelled),
     }
@@ -962,7 +1067,7 @@ fn run_sort_inner(
     config: SortConfig,
     workspace: &RunWorkspace,
     shared: &SharedState,
-) -> Result<Option<(u64, u64)>, QuarryError> {
+) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
     let ScanOutcome::Complete(mut scan) = create_initial_runs(
         source,
         delimiter,
@@ -1025,11 +1130,12 @@ fn run_sort_inner(
     }
     shared.bytes_written.store(bytes_written, Ordering::Release);
 
-    let Some((rows_written, data_bytes)) = merge_runs_to_output(
+    let Some((rows_written, data_bytes, verification)) = merge_runs_to_output(
         &scan.runs,
         output,
         spec.direction,
         &scan.preferred_ending,
+        scan.records,
         config.max_record_bytes,
         bytes_written,
         shared,
@@ -1047,7 +1153,7 @@ fn run_sort_inner(
     }
     bytes_written = bytes_written.saturating_add(data_bytes);
     shared.bytes_written.store(bytes_written, Ordering::Release);
-    Ok(Some((scan.rows, bytes_written)))
+    Ok(Some((scan.rows, bytes_written, verification)))
 }
 
 fn write_entry(writer: &mut BufWriter<File>, entry: &RunEntry) -> Result<u64, QuarryError> {
@@ -1174,20 +1280,29 @@ fn merge_runs_to_run(
     Ok(true)
 }
 
+struct PendingOutputEntry {
+    key: Vec<u8>,
+    record: Vec<u8>,
+    ordinal: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn merge_runs_to_output(
     paths: &[PathBuf],
     output: &mut ExportTarget,
     direction: SortDirection,
     preferred_ending: &[u8],
+    expected_records: RecordMultisetFingerprint,
     max_record_bytes: usize,
     prior_bytes_written: u64,
     shared: &SharedState,
-) -> Result<Option<(u64, u64)>, QuarryError> {
+) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
     let mut readers = open_run_readers(paths)?;
     let Some(mut heap) = seed_heap(&mut readers, direction, max_record_bytes, shared)? else {
         return Ok(None);
     };
-    let mut pending: Option<Vec<u8>> = None;
+    let mut verifier = OutputVerifier::new(expected_records);
+    let mut pending: Option<PendingOutputEntry> = None;
     let mut rows = 0_u64;
     let mut bytes_written = 0_u64;
     while let Some(item) = heap.pop() {
@@ -1195,33 +1310,42 @@ fn merge_runs_to_output(
             return Ok(None);
         }
         if let Some(previous) = pending.take() {
-            let inserted_ending = if previous.ends_with(b"\n") {
+            verify_adjacent_tie_order(
+                &previous.key,
+                previous.ordinal,
+                &item.head.key,
+                item.head.ordinal,
+            )?;
+            let inserted_ending = if previous.record.ends_with(b"\n") {
                 b"".as_slice()
             } else {
                 preferred_ending
             };
-            if previous.len().saturating_add(inserted_ending.len()) > max_record_bytes {
+            if previous.record.len().saturating_add(inserted_ending.len()) > max_record_bytes {
                 return Err(QuarryError::RecordTooLarge {
                     limit: max_record_bytes,
                 });
             }
-            write_output(output, &previous, shared)?;
-            bytes_written = bytes_written.saturating_add(previous.len() as u64);
-            if !inserted_ending.is_empty() {
-                write_output(output, inserted_ending, shared)?;
-                bytes_written = bytes_written.saturating_add(inserted_ending.len() as u64);
-            }
+            let written = write_verified_output_entry(
+                output,
+                previous,
+                inserted_ending,
+                &mut verifier,
+                shared,
+            )?;
+            bytes_written = bytes_written.saturating_add(written);
         }
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(None);
         }
-        pending = Some(read_record(
-            &mut readers[item.run_index],
-            item.head.record_len,
-        )?);
-        rows = rows.saturating_add(1);
+        let record = read_record(&mut readers[item.run_index], item.head.record_len)?;
         let run_index = item.run_index;
-        drop(item);
+        pending = Some(PendingOutputEntry {
+            key: item.head.key,
+            record,
+            ordinal: item.head.ordinal,
+        });
+        rows = rows.saturating_add(1);
         if let Some(head) = read_head(&mut readers[run_index], max_record_bytes)? {
             heap.push(HeapEntry {
                 head,
@@ -1235,10 +1359,27 @@ fn merge_runs_to_output(
         );
     }
     if let Some(last) = pending {
-        write_output(output, &last, shared)?;
-        bytes_written = bytes_written.saturating_add(last.len() as u64);
+        let written = write_verified_output_entry(output, last, b"", &mut verifier, shared)?;
+        bytes_written = bytes_written.saturating_add(written);
     }
-    Ok(Some((rows, bytes_written)))
+    let verification = verifier.finish()?;
+    Ok(Some((rows, bytes_written, verification)))
+}
+
+fn write_verified_output_entry(
+    output: &mut ExportTarget,
+    entry: PendingOutputEntry,
+    inserted_ending: &[u8],
+    verifier: &mut OutputVerifier,
+    shared: &SharedState,
+) -> Result<u64, QuarryError> {
+    let PendingOutputEntry { record, .. } = entry;
+    write_output(output, &record, shared)?;
+    if !inserted_ending.is_empty() {
+        write_output(output, inserted_ending, shared)?;
+    }
+    verifier.observe(&record, inserted_ending)?;
+    Ok((record.len() as u64).saturating_add(inserted_ending.len() as u64))
 }
 
 fn write_output(
@@ -1465,6 +1606,8 @@ mod tests {
         assert!(summary.peak_temporary_bytes > summary.bytes_written);
         assert_eq!(progress.elapsed, summary.elapsed);
         assert!(progress.cancellation_latency.is_none());
+        assert!(summary.record_multiset_verified);
+        assert!(summary.stable_ties_verified);
         assert!(sort_artifacts(&directory).is_empty());
 
         fs::remove_dir_all(directory).unwrap();
@@ -1529,6 +1672,51 @@ mod tests {
         assert!(sort_artifacts(&directory).is_empty());
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn output_verifier_rejects_a_dropped_record_replaced_by_a_duplicate() {
+        let mut expected = RecordMultisetFingerprint::default();
+        for record in [b"alpha\n".as_slice(), b"bravo\n", b"charlie"] {
+            expected.observe(record);
+        }
+        let mut verifier = OutputVerifier::new(expected);
+        verifier.observe(b"alpha\n", b"").unwrap();
+        verifier.observe(b"bravo\n", b"").unwrap();
+        verifier.observe(b"bravo\n", b"").unwrap();
+
+        let error = verifier.finish().unwrap_err();
+        assert!(matches!(
+            error,
+            QuarryError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("did not preserve the effective record multiset")
+        );
+    }
+
+    #[test]
+    fn output_verifier_allows_only_a_record_terminator_difference() {
+        let mut expected = RecordMultisetFingerprint::default();
+        expected.observe(b"unterminated");
+        let mut verifier = OutputVerifier::new(expected);
+        verifier.observe(b"unterminated", b"\r\n").unwrap();
+
+        let verification = verifier.finish().unwrap();
+        assert!(verification.record_multiset_verified);
+        assert!(verification.stable_ties_verified);
+    }
+
+    #[test]
+    fn adjacent_tie_verifier_rejects_reordered_equal_key_ordinals() {
+        let error = verify_adjacent_tie_order(b"same", 1, b"same", 0).unwrap_err();
+        assert!(matches!(
+            error,
+            QuarryError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert!(error.to_string().contains("changed equal-key row order"));
     }
 
     #[test]
@@ -1704,14 +1892,15 @@ mod tests {
     }
 
     #[test]
-    fn merge_fan_in_keeps_retained_keys_and_one_record_within_the_memory_budget() {
+    fn merge_fan_in_keeps_every_retained_payload_within_the_memory_budget() {
         let fan_in = effective_merge_fan_in(DEFAULT_SORT_CONFIG);
-        assert_eq!(fan_in, 3);
-        assert!(
-            fan_in
-                .saturating_mul(DEFAULT_SORT_CONFIG.max_record_bytes)
-                .saturating_add(DEFAULT_SORT_CONFIG.max_record_bytes)
-                <= MERGE_MEMORY_BUDGET_BYTES
-        );
+        assert_eq!(fan_in, 2);
+        let heap_keys = fan_in.saturating_mul(DEFAULT_SORT_CONFIG.max_record_bytes);
+        let pending_key = DEFAULT_SORT_CONFIG.max_record_bytes;
+        let pending_record = DEFAULT_SORT_CONFIG.max_record_bytes;
+        let retained_payload = heap_keys
+            .saturating_add(pending_key)
+            .saturating_add(pending_record);
+        assert_eq!(retained_payload, MERGE_MEMORY_BUDGET_BYTES);
     }
 }

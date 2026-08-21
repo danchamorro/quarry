@@ -160,10 +160,11 @@ allowance before starting, and publishes only a complete private sorted CSV.
 The desktop immediately reopens that CSV as Modified and reuses Save, Save As,
 Discard, Undo, and Redo. Cancellation, failure, or a source conflict leaves the
 current document unchanged. Exact regressions and deterministic 1 GB and 12 GB
-release runs pass with peak RSS below 18 MiB, measured temporary storage below
-the conservative estimate, unchanged source hashes, and prompt cancellation
-without leftovers. Numeric, date, locale-aware, case-insensitive, and
-multi-column sorting remain later slices.
+release runs pass with peak RSS below 20 MiB, measured temporary storage below
+the conservative estimate, bounded effective-record multiset evidence, exact
+stable-tie source-ordinal checks, unchanged source hashes, and prompt
+cancellation without leftovers. Numeric, date, locale-aware, case-insensitive,
+and multi-column sorting remain later slices.
 
 ## Progressive opening
 1. Open the file and sample a bounded region.

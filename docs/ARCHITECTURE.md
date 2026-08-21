@@ -217,11 +217,15 @@ current row order.
 
 The core worker generates 8 MiB in-memory runs, spills owner-only framed run
 files, and uses multipass merging into a private sorted working CSV. Merge
-fan-in is capped against a 256 MiB payload budget. Heap entries retain keys and
-record lengths; only the selected record body is loaded during each merge step.
+fan-in reserves one pending key and one pending record before admitting heap
+keys against a 256 MiB payload budget. The default 64 MiB record cap therefore
+uses fan-in two. Heap entries retain keys and record lengths; only the selected
+record body is loaded during each merge step.
 The worker applies sparse edits before key comparison and output, keeps a UTF-8
 BOM at the file boundary, preserves the header, and treats an absent ragged key
-as empty.
+as empty. Before publication, a bounded dual fingerprint verifies the effective
+record multiset and exact adjacent-key comparisons verify increasing source
+ordinals for every stable tie.
 
 The desktop waits for structural indexing to finish so the data-row count is
 known. It combines the current file size, a two-byte-per-row fidelity cushion,
@@ -241,11 +245,12 @@ through existing physical-row paths. A separate lazy row-order index remains
 deferred until a later feature proves it is needed.
 
 The deterministic [Phase 6A release validation](benchmarks/2026-08-21-stable-text-sort.md)
-measured 16.78 MiB and 17.39 MiB peak process RSS for the 1 GB and 12 GB sorts.
-Measured peak temporary disk was 2.05 GiB and 24.65 GiB, both below the
+measured 16.86 MiB and 17.48 MiB peak process RSS for the 1 GB and 12 GB sorts.
+Measured peak temporary disk was 2.12 GiB and 24.65 GiB, both below the
 conservative preflight estimate. Complete order and preservation scans passed,
-source hashes remained unchanged, and both cancellation runs finished within
-3 ms without leaving a destination or temporary run.
+the prepublication multiset and stable-tie checks passed, source hashes remained
+unchanged, and both cancellation runs finished within 4 ms without leaving a
+destination or temporary run.
 
 ## Document editing and persistence
 

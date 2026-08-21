@@ -890,6 +890,10 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             {
                 return Err("sort summary does not preserve exact row/header counts".into());
             }
+            validate_sort_completion_evidence(
+                summary.record_multiset_verified,
+                summary.stable_ties_verified,
+            )?;
             (
                 "complete",
                 Some(output_size),
@@ -904,6 +908,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             ("cancelled", None, None, None)
         }
     };
+    let completion_evidence = matches!(&outcome, SortOutcome::Complete(_));
 
     println!("Quarry guarded sort validation artifact\n");
     println!("Source: {}", session.path().display());
@@ -994,6 +999,10 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             validation.elapsed.as_secs_f64()
         );
     }
+    if completion_evidence {
+        println!("Bounded record multiset evidence: verified (dual fingerprint)");
+        println!("Stable equal-key order evidence: verified (source ordinals)");
+    }
     if let Some(requested_at) = cancellation_requested_at {
         println!(
             "Cancellation requested after: {} ({} bytes)",
@@ -1033,6 +1042,19 @@ fn parse_header_mode(value: &str) -> CliResult<HeaderMode> {
         "none" => Ok(HeaderMode::NoHeader),
         _ => Err("--header must be auto, first-row, or none".into()),
     }
+}
+
+fn validate_sort_completion_evidence(
+    record_multiset_verified: bool,
+    stable_ties_verified: bool,
+) -> CliResult<()> {
+    if !record_multiset_verified {
+        return Err("sort did not verify record multiset preservation".into());
+    }
+    if !stable_ties_verified {
+        return Err("sort did not verify stable equal-key ordering".into());
+    }
+    Ok(())
 }
 
 fn wait_for_sort(
@@ -2670,7 +2692,8 @@ mod tests {
         fnv1a64_file, generate_file, latency_stats, parse_header_mode, parse_size,
         parse_sort_direction, physical_to_data_row, record_filter_sample, sample_filtered_rows,
         search_command, sort_save_as_command, transform_save_as_command,
-        validate_saved_transformation, viewport_command, wait_for_save_as,
+        validate_saved_transformation, validate_sort_completion_evidence, viewport_command,
+        wait_for_save_as,
     };
     use quarry_core::{
         ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, OpenOptions, Session,
@@ -3444,6 +3467,23 @@ mod tests {
         fs::write(&path, b"a").unwrap();
         assert_eq!(fnv1a64_file(&path).unwrap(), 0xaf63_dc4c_8601_ec8c);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sort_completion_requires_multiset_and_stable_tie_evidence() {
+        validate_sort_completion_evidence(true, true).unwrap();
+        assert_eq!(
+            validate_sort_completion_evidence(false, true)
+                .unwrap_err()
+                .to_string(),
+            "sort did not verify record multiset preservation"
+        );
+        assert_eq!(
+            validate_sort_completion_evidence(true, false)
+                .unwrap_err()
+                .to_string(),
+            "sort did not verify stable equal-key ordering"
+        );
     }
 
     #[test]
