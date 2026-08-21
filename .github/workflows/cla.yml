@@ -1,0 +1,82 @@
+name: CLA
+
+# Checks that the pull request author has agreed to docs/CLA.md.
+#
+# Security note: pull_request_target runs with write access to this repo, so it
+# must never execute contributor code. The checkout below is safe because under
+# pull_request_target it checks out the BASE branch (trusted main), not the pull
+# request head, and it pulls a single static markdown file.
+#
+# Do NOT add a ref pointing at the pull request head, and do not build, test, or
+# run anything from the contributor's branch in this workflow. CI does that.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  statuses: write
+
+jobs:
+  check:
+    # Ignore comments on plain issues; only pull requests matter.
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch reminder text
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/cla-reminder.md
+          sparse-checkout-cone-mode: false
+
+      - name: Check for CLA agreement
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          # Logins that never need to sign: the maintainer and known bots.
+          ALLOWLIST: danchamorro dependabot[bot] github-actions[bot]
+          PHRASE: "I have read the Quarry CLA (docs/CLA.md) and I agree to its terms."
+        run: |
+          set -euo pipefail
+
+          pr=$(gh pr view "$PR" --repo "$REPO" --json author,headRefOid,comments)
+          author=$(jq -r '.author.login' <<<"$pr")
+          sha=$(jq -r '.headRefOid' <<<"$pr")
+
+          # Exact whole-line match. Do not use grep -w here: bot logins such as
+          # dependabot[bot] contain brackets a regex would read as a char class.
+          if printf '%s\n' $ALLOWLIST | grep -qxF "$author"; then
+            signed=true
+          else
+            # Only the author's own comments count as a signature.
+            signed=$(jq --arg a "$author" --arg p "$PHRASE" \
+              '[.comments[] | select(.author.login == $a) | .body]
+               | any(contains($p))' <<<"$pr")
+          fi
+
+          if [ "$signed" = true ]; then
+            state=success
+            desc="CLA agreed"
+          else
+            state=failure
+            desc="Comment the agreement line from docs/CLA.md to sign"
+          fi
+
+          gh api "repos/$REPO/statuses/$sha" \
+            -f state="$state" \
+            -f context="CLA" \
+            -f description="$desc" \
+            -f target_url="https://github.com/$REPO/blob/main/docs/CLA.md" >/dev/null
+
+          echo "author=$author signed=$signed state=$state"
+
+          # Explain the red check once, so a first-time contributor is not left
+          # guessing. Skipped if we already asked on this pull request.
+          asked=$(jq -r '[.comments[].body] | any(startswith("Thanks for the pull request"))' <<<"$pr")
+          if [ "$signed" != true ] && [ "$asked" != true ]; then
+            gh pr comment "$PR" --repo "$REPO" --body-file .github/cla-reminder.md
+          fi
