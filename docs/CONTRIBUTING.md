@@ -57,6 +57,22 @@ These commands match the required CI checks and release-build validation.
 ## Pull requests
 Keep changes focused. Explain the problem, design, tradeoffs, tests, and performance impact. Screenshots are useful for UI work; benchmark tables are useful for engine work.
 
+## Contributor License Agreement
+Before a first pull request can be merged, contributors must sign the
+[Quarry CLA](CLA.md). It confirms you have the right to contribute the code and
+grants the maintainer the rights needed to license the Project, including any
+future change to the Project's license terms. You keep full ownership of your
+contributions and may use them however you like elsewhere.
+
+To sign, comment on your pull request with:
+
+```
+I have read the Quarry CLA (docs/CLA.md) and I agree to its terms.
+Signed: Full Name <email@example.com>, YYYY-MM-DD
+```
+
+Signing once covers all your future contributions.
+
 ## License
 Quarry is dual-licensed under MIT or Apache-2.0. Contributions are accepted
 under those same terms.
