@@ -4,10 +4,10 @@
 
 The repeatable package workflow, canonical installation, rollback archive,
 strict signature verification, installed-app interaction journey, and clean
-release gate pass. Commit `493b20d521e116be5eb327f8a38bc042608daf11`
+release gate pass. Commit `8878708da7efb6daba62714c839c012dd269f545`
 was packaged and installed with `QuarrySourceStatus=clean` and
 `QuarryGitRevision` equal to commit
-`493b20d521e116be5eb327f8a38bc042608daf11`. This evidence update is
+`8878708da7efb6daba62714c839c012dd269f545`. This evidence update is
 documentation-only and follows the validated implementation commit.
 
 ## Environment
@@ -22,21 +22,21 @@ documentation-only and follows the validated implementation commit.
 | Xcode | 26.6 (17F113) |
 | macOS SDK | 26.5 |
 | App version | 0.1.0 |
-| Build version | 29 |
-| Validation source revision | `493b20d521e116be5eb327f8a38bc042608daf11` |
+| Build version | 31 |
+| Validation source revision | `8878708da7efb6daba62714c839c012dd269f545` |
 | Installed path | `/Applications/Quarry.app` |
 | Bundle identifier | `io.github.danchamorro.quarry` |
 | Signature | Ad hoc, strict verification passed |
 
 ## Package and installation results
 
-Two consecutive package commands from the same checkout, Rust toolchain, macOS
-SDK, and machine produced identical payload hashes:
+Two consecutive package commands from the same checkout, pinned Rust 1.88.0
+toolchain, macOS SDK, and machine produced identical payload hashes:
 
 | Payload | SHA-256 |
 |---|---|
-| `Contents/Info.plist` | `98946407b147e802a824d62581cbd1941ac7b2c653b1aae761e87ca88659e31d` |
-| `Contents/MacOS/Quarry` | `f5c1f259beb3e3f2b539201371748691c5d87feb91dbfda5420b4cdf117a96e1` |
+| `Contents/Info.plist` | `a6242ce9a03eb4bf78cf5d347b7c595ec856611fea6eed0861b434abd0990849` |
+| `Contents/MacOS/Quarry` | `e55c5a24fa8dc213160d0265ff65b9bf3ac1018f840e2af28f664d7ab4a90927` |
 | `Contents/Resources/Quarry.icns` | `b252894d5a3a2c7aa76bf1dc76b5ffe483a55406d7d4032498c190021048aecb` |
 
 The installer verified the candidate before replacement, installed an exact
@@ -49,6 +49,11 @@ prototype archive was also extracted and passed the same checks.
 A separate running-app check refused the update immediately with `Quit Quarry
 before installing an update.` and created no staged app. The same guard rejected
 a process named `quarry-egui`, which is the Cargo development executable.
+Build 31 also held its shared application installation lock for the full live
+process lifetime: a competing exclusive lock returned status 75. With that
+exclusive lock held first, the build exited before opening a window or input
+file. Process-name checks remain as migration coverage for older builds that do
+not participate in the lock.
 
 The rollback self-test replaced a disposable installed marker, invoked the same
 rollback function used by the exit and signal traps, and restored only the
@@ -83,9 +88,11 @@ From `/Applications/Quarry.app`:
 8. Quarry quit, relaunched from the canonical application, reopened the output,
    and showed the same clean values and order.
 
-After the clean release install, build 29 was launched from
-`/Applications/Quarry.app` and reopened the saved output with the same five
-values in the recorded order.
+After the review fix, clean build 31 launched from
+`/Applications/Quarry.app`, held the application installation lock, and quit
+normally. The complete interaction journey above remains the UI evidence; the
+review fix changes only startup installation exclusion, locked CI resolution,
+and toolchain selection.
 
 | File | SHA-256 |
 |---|---|
@@ -97,6 +104,8 @@ values in the recorded order.
 - [x] Repeated package payload hashes match in the recorded environment.
 - [x] Candidate and installed bundle verification pass.
 - [x] A running app blocks update before packaging or replacement begins.
+- [x] The installed app and installer mutually exclude startup and bundle
+  replacement through one persistent application lock.
 - [x] The installer rollback self-test restores the prior disposable app state.
 - [x] A concurrent package command is rejected by the shared operation lock.
 - [x] Only `/Applications/Quarry.app` remains installed.

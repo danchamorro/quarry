@@ -99,10 +99,10 @@ temporary disk below the conservative estimate, unchanged source hashes, and
 prompt cancellation without leftover files. The worker now also verifies the
 effective record multiset and exact stable tie order before publication. Phase
 7A desktop packaging is complete. The full installed-app interaction journey
-passes, and clean committed build 29 installs as the canonical
-`/Applications/Quarry.app`, reports matching source metadata, and reopens the
-validated output. Phase 7B next focuses on polishing current workflows before
-the missing-feature inventory.
+passes, and clean committed build 31 installs as the canonical
+`/Applications/Quarry.app`, reports matching source metadata, and enforces the
+application/installer exclusion lock. Phase 7B next focuses on polishing current
+workflows before the missing-feature inventory.
 
 ## Install Quarry
 
