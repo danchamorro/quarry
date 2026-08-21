@@ -7,10 +7,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use memchr::memmem::Finder;
-use quarry_delimited::{RecordScanner, parse_record};
+use quarry_delimited::RecordScanner;
 
 use crate::{
-    Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session, StructuralIndex,
+    Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
+    StructuralIndex, parse_source_record,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,7 +326,7 @@ fn find_record(
     start: SearchPosition,
 ) -> Result<Option<SearchMatch>, QuarryError> {
     let first_column = if row == start.row { start.column } else { 0 };
-    let fields = parse_record(record, delimiter)?;
+    let fields = parse_source_record(record, delimiter, row)?;
     Ok(fields
         .iter()
         .enumerate()

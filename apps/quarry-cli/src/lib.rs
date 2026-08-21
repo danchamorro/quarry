@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -8,10 +8,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    Dialect, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
-    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, HeaderMode,
-    IndexConfig, IndexJob, IndexProgress, OpenOptions, SaveAsJob, SaveAsOutcome, SaveAsProgress,
-    SearchJob, SearchOutcome, SearchPosition, SearchProgress, Session, StructuralIndex,
+    ColumnTransformation, Dialect, FilterExportJob, FilterExportOutcome, FilterExportProgress,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
+    FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress, MAX_TRANSFORMATION_COLUMNS,
+    OpenOptions, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome,
+    SearchPosition, SearchProgress, Session, StructuralIndex,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -36,6 +37,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("filter") => filter_command(args.collect()),
         Some("export") => export_command(args.collect()),
         Some("edit-save-as") => edit_save_as_command(args.collect()),
+        Some("transform-save-as") => transform_save_as_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -68,6 +70,10 @@ fn print_help() {
            quarry edit-save-as <FILE> --output FILE \
          --edit DATA_ROW COLUMN VALUE [--edit DATA_ROW COLUMN VALUE]... \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
+           quarry transform-save-as <FILE> --output FILE \
+         (--split COLUMN SEPARATOR OUTPUT_COUNT | --join COLUMNS SEPARATOR) \
+         [--output-header NAME]... [--cancel-after-bytes N] \
+         [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]"
     );
@@ -749,6 +755,406 @@ fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
         optional_bytes(save_peak_rss)
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum RequestedColumnTransformation {
+    Split {
+        source_column: usize,
+        separator: Vec<u8>,
+        output_count: usize,
+    },
+    Join {
+        source_columns: Vec<usize>,
+        separator: Vec<u8>,
+    },
+}
+
+fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
+    let mut path = None;
+    let mut destination = None;
+    let mut requested = None;
+    let mut output_headers = Vec::new();
+    let mut cancel_after_bytes = None;
+    let mut cache_state = "unknown".to_owned();
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
+            "--split" => {
+                if requested.is_some() {
+                    return Err("transform-save-as requires exactly one --split or --join".into());
+                }
+                let operands = args
+                    .get(cursor + 1..cursor + 4)
+                    .ok_or("--split requires COLUMN SEPARATOR OUTPUT_COUNT")?;
+                let source_column = operands[0].parse::<usize>()?;
+                let output_count = operands[2].parse::<usize>()?;
+                if source_column == 0 {
+                    return Err("split column must be at least 1".into());
+                }
+                if operands[1].is_empty() {
+                    return Err("split separator must not be empty".into());
+                }
+                if output_count < 2 {
+                    return Err("split output count must be at least 2".into());
+                }
+                if source_column > MAX_TRANSFORMATION_COLUMNS
+                    || output_count > MAX_TRANSFORMATION_COLUMNS
+                {
+                    return Err("split columns exceed the supported limit".into());
+                }
+                requested = Some(RequestedColumnTransformation::Split {
+                    source_column: source_column - 1,
+                    separator: operands[1].as_bytes().to_vec(),
+                    output_count,
+                });
+                cursor += 3;
+            }
+            "--join" => {
+                if requested.is_some() {
+                    return Err("transform-save-as requires exactly one --split or --join".into());
+                }
+                let operands = args
+                    .get(cursor + 1..cursor + 3)
+                    .ok_or("--join requires COLUMNS SEPARATOR")?;
+                requested = Some(RequestedColumnTransformation::Join {
+                    source_columns: parse_join_columns(&operands[0])?,
+                    separator: operands[1].as_bytes().to_vec(),
+                });
+                cursor += 2;
+            }
+            "--output-header" => output_headers.push(
+                value(&args, &mut cursor, "--output-header")?
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            "--cancel-after-bytes" => {
+                cancel_after_bytes =
+                    Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
+            }
+            "--cache-state" => {
+                cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
+                if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
+                    return Err("--cache-state must be unknown, cold, or warm".into());
+                }
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            argument if path.is_none() => path = Some(PathBuf::from(argument)),
+            argument => return Err(format!("unexpected argument {argument:?}").into()),
+        }
+        cursor += 1;
+    }
+
+    let path = path.ok_or("transform-save-as requires a file path")?;
+    let destination = destination.ok_or("transform-save-as requires --output")?;
+    let requested = requested.ok_or("transform-save-as requires exactly one --split or --join")?;
+    if cancel_after_bytes == Some(0) {
+        return Err("cancel-after-bytes must be non-zero".into());
+    }
+
+    let session = Session::open(&path, OpenOptions::default())?;
+    if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
+        return Err("cancel-after-bytes must be less than file size".into());
+    }
+    let transformation =
+        resolve_column_transformation(&requested, output_headers, session.dialect.has_header)?;
+    let source_size_before = session.file_size;
+    let job = session.start_save_as_with_transformation(
+        BTreeMap::new(),
+        BTreeMap::new(),
+        transformation.clone(),
+        &destination,
+    )?;
+    let (outcome, progress, cancellation) =
+        wait_for_save_as(job, cancel_after_bytes, Duration::from_millis(1))?;
+    let source_size_after = std::fs::metadata(session.path())?.len();
+    if source_size_after != source_size_before {
+        return Err("source file size changed during Save As".into());
+    }
+    let save_peak_rss = peak_rss_bytes();
+    let save_current_rss = current_rss_bytes();
+
+    let (outcome_label, published_bytes, validated_rows, validation_elapsed) = match &outcome {
+        SaveAsOutcome::Complete(summary) => {
+            let output_size = std::fs::metadata(&summary.destination)?.len();
+            if summary.bytes_written != progress.bytes_written
+                || output_size != summary.bytes_written
+            {
+                return Err("published output does not match Save As progress".into());
+            }
+            let (sample_rows, total_data_rows, validation_elapsed) =
+                validate_saved_transformation(&session, &summary.destination, &transformation)?;
+            (
+                "complete",
+                Some(output_size),
+                Some((sample_rows, total_data_rows)),
+                Some(validation_elapsed),
+            )
+        }
+        SaveAsOutcome::Cancelled => {
+            if destination.exists() {
+                return Err("cancelled Save As published a destination file".into());
+            }
+            ("cancelled", None, None, None)
+        }
+    };
+
+    println!("Quarry structural transformation Save As benchmark\n");
+    println!("Source: {}", session.path().display());
+    println!(
+        "Source size: {} ({} bytes)",
+        human_bytes(source_size_before),
+        source_size_before
+    );
+    println!("Destination: {}", destination.display());
+    println!(
+        "Build: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!("Save As cache state: {cache_state}");
+    match &requested {
+        RequestedColumnTransformation::Split {
+            source_column,
+            separator,
+            output_count,
+        } => {
+            println!("Transformation: split");
+            println!("Source column: {}", source_column + 1);
+            println!("Separator: {}", render_field(separator));
+            println!("Output columns: {output_count}");
+        }
+        RequestedColumnTransformation::Join {
+            source_columns,
+            separator,
+        } => {
+            println!("Transformation: join");
+            println!(
+                "Source columns: {}",
+                source_columns
+                    .iter()
+                    .map(|column| (column + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            println!("Separator: {}", render_field(separator));
+        }
+    }
+    println!("Outcome: {outcome_label}");
+    println!(
+        "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
+        human_bytes(progress.bytes_scanned),
+        progress.bytes_scanned,
+        human_bytes(progress.total_bytes),
+        progress.total_bytes
+    );
+    println!(
+        "Output bytes written: {} ({} bytes)",
+        human_bytes(progress.bytes_written),
+        progress.bytes_written
+    );
+    println!("Save As time: {:.3} s", progress.elapsed.as_secs_f64());
+    println!(
+        "Scan throughput: {}/s",
+        human_bytes(rate(progress.bytes_scanned, progress.elapsed))
+    );
+    println!(
+        "Output throughput: {}/s",
+        human_bytes(rate(progress.bytes_written, progress.elapsed))
+    );
+    println!("Source size unchanged: yes ({source_size_after} bytes)");
+    println!(
+        "Destination published: {}",
+        if published_bytes.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if let Some(bytes) = published_bytes {
+        println!("Published size: {} ({bytes} bytes)", human_bytes(bytes));
+    }
+    if let (Some((samples, total_rows)), Some(elapsed)) = (validated_rows, validation_elapsed) {
+        println!(
+            "Validated transformed sample rows: {samples} (first, middle, and final of {total_rows} data rows)"
+        );
+        if session.dialect.has_header {
+            println!("Validated transformed header and output column count: yes");
+        } else if total_rows > 0 {
+            println!("Validated sampled output column counts: yes");
+        }
+        println!(
+            "Validation indexes and reads: {:.3} s",
+            elapsed.as_secs_f64()
+        );
+    }
+    if let Some((requested_at, latency)) = cancellation {
+        println!(
+            "Cancellation requested after: {} ({} bytes)",
+            human_bytes(requested_at),
+            requested_at
+        );
+        println!(
+            "Poll-inclusive cancellation latency: {:.3} ms",
+            latency.as_secs_f64() * 1000.0
+        );
+    }
+    println!(
+        "Current process memory after Save As: {}",
+        optional_bytes(save_current_rss)
+    );
+    println!(
+        "Peak process memory through Save As: {}",
+        optional_bytes(save_peak_rss)
+    );
+    Ok(())
+}
+
+fn parse_join_columns(value: &str) -> CliResult<Vec<usize>> {
+    let mut columns = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in value.split(',') {
+        let column = value.parse::<usize>()?;
+        if column == 0 {
+            return Err("join columns must be at least 1".into());
+        }
+        if column > MAX_TRANSFORMATION_COLUMNS || columns.len() == MAX_TRANSFORMATION_COLUMNS {
+            return Err("join columns exceed the supported limit".into());
+        }
+        let column = column - 1;
+        if !seen.insert(column) {
+            return Err("join columns must be unique".into());
+        }
+        columns.push(column);
+    }
+    if columns.len() < 2 {
+        return Err("join requires at least two columns".into());
+    }
+    Ok(columns)
+}
+
+fn resolve_column_transformation(
+    requested: &RequestedColumnTransformation,
+    output_headers: Vec<Vec<u8>>,
+    has_header: bool,
+) -> CliResult<ColumnTransformation> {
+    if !has_header && !output_headers.is_empty() {
+        return Err("output headers require a source header row".into());
+    }
+    match requested {
+        RequestedColumnTransformation::Split {
+            source_column,
+            separator,
+            output_count,
+        } => {
+            if has_header && output_headers.len() != *output_count {
+                return Err(format!(
+                    "split requires exactly {output_count} --output-header values"
+                )
+                .into());
+            }
+            Ok(ColumnTransformation::Split {
+                source_column: *source_column,
+                separator: separator.clone(),
+                output_count: *output_count,
+                output_headers: has_header.then_some(output_headers),
+            })
+        }
+        RequestedColumnTransformation::Join {
+            source_columns,
+            separator,
+        } => {
+            if has_header && output_headers.len() != 1 {
+                return Err("join requires exactly one --output-header value".into());
+            }
+            Ok(ColumnTransformation::Join {
+                source_columns: source_columns.clone(),
+                separator: separator.clone(),
+                output_header: has_header.then(|| output_headers.into_iter().next().unwrap()),
+            })
+        }
+    }
+}
+
+fn validate_saved_transformation(
+    source: &Session,
+    destination: &Path,
+    transformation: &ColumnTransformation,
+) -> CliResult<(usize, u64, Duration)> {
+    let started = Instant::now();
+    let output = Session::open(
+        destination,
+        OpenOptions {
+            rows: 1,
+            delimiter: Some(source.dialect.delimiter),
+            header_mode: if source.dialect.has_header {
+                HeaderMode::FirstRow
+            } else {
+                HeaderMode::NoHeader
+            },
+            ..OpenOptions::default()
+        },
+    )?;
+    let source_index = source.start_indexing(IndexConfig::default())?.wait()?;
+    let output_index = output.start_indexing(IndexConfig::default())?.wait()?;
+    if output_index.indexed_rows() != source_index.indexed_rows() {
+        return Err("transformed output record count changed".into());
+    }
+
+    if source.dialect.has_header {
+        let source_header = source
+            .first_rows
+            .first()
+            .ok_or("source sample is missing its header")?;
+        let output_header = output
+            .first_rows
+            .first()
+            .ok_or("transformed output is missing its header")?;
+        let expected_header = transformation.transform_header_fields(&source_header.fields)?;
+        if output_header.fields != expected_header {
+            return Err("transformed output header failed read-back validation".into());
+        }
+    }
+
+    let data_start = u64::from(source.dialect.has_header);
+    let total_data_rows = source_index.indexed_rows().saturating_sub(data_start);
+    let mut sample_rows = Vec::new();
+    if total_data_rows > 0 {
+        sample_rows.extend([
+            data_start,
+            data_start + (total_data_rows - 1) / 2,
+            data_start + total_data_rows - 1,
+        ]);
+        sample_rows.sort_unstable();
+        sample_rows.dedup();
+    }
+    for &record_row in &sample_rows {
+        let source_row = source
+            .read_rows(&source_index, record_row, 1)?
+            .into_iter()
+            .next()
+            .ok_or("source validation row is missing")?;
+        let output_row = output
+            .read_rows(&output_index, record_row, 1)?
+            .into_iter()
+            .next()
+            .ok_or("transformed output validation row is missing")?;
+        if output_row.fields != transformation.transform_fields(&source_row.fields)? {
+            return Err(format!(
+                "transformed output data row {} failed read-back validation",
+                physical_to_data_row(record_row, source.dialect.has_header)
+            )
+            .into());
+        }
+    }
+    Ok((sample_rows.len(), total_data_rows, started.elapsed()))
 }
 
 fn wait_for_save_as(
@@ -1844,9 +2250,12 @@ mod tests {
     use super::{
         FilterSamples, data_search_position, edit_save_as_command, export_command, filter_command,
         generate_file, latency_stats, parse_size, physical_to_data_row, record_filter_sample,
-        sample_filtered_rows, search_command, viewport_command,
+        sample_filtered_rows, search_command, transform_save_as_command,
+        validate_saved_transformation, viewport_command, wait_for_save_as,
     };
-    use quarry_core::{FilterOperator, FilterQuery, HeaderMode, OpenOptions, Session};
+    use quarry_core::{
+        ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, OpenOptions, Session,
+    };
 
     #[test]
     fn summarizes_viewport_latency_and_rejects_empty_workloads() {
@@ -2527,6 +2936,215 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0], source.file_name().unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transform_save_as_command_validates_split_and_join_outputs() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-transform-save-as-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let split = directory.join("split.csv");
+        let joined = directory.join("joined.csv");
+        let source_bytes = b"name,city,state\nAda::Lovelace,London,UK\nGrace,Arlington,US\n";
+        fs::write(&source, source_bytes).unwrap();
+
+        transform_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            split.to_string_lossy().into_owned(),
+            "--split".into(),
+            "1".into(),
+            "::".into(),
+            "2".into(),
+            "--output-header".into(),
+            "first".into(),
+            "--output-header".into(),
+            "last".into(),
+        ])
+        .unwrap();
+
+        transform_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            joined.to_string_lossy().into_owned(),
+            "--join".into(),
+            "2,3".into(),
+            ", ".into(),
+            "--output-header".into(),
+            "location".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(
+            fs::read(&split).unwrap(),
+            b"first,last,city,state\nAda,Lovelace,London,UK\nGrace,,Arlington,US\n"
+        );
+        assert_eq!(
+            fs::read(&joined).unwrap(),
+            b"name,location\nAda::Lovelace,\"London, UK\"\nGrace,\"Arlington, US\"\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transform_validation_handles_headered_and_headerless_bom() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-transform-save-as-bom-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("split.csv");
+        fs::write(
+            &source,
+            b"\xEF\xBB\xBFname,city\nAda::Lovelace,London\nGrace,Arlington\n",
+        )
+        .unwrap();
+        let session = Session::open(
+            &source,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let transformation = ColumnTransformation::Split {
+            source_column: 0,
+            separator: b"::".to_vec(),
+            output_count: 2,
+            output_headers: Some(vec![b"first".to_vec(), b"last".to_vec()]),
+        };
+        let job = session
+            .start_save_as_with_transformation(
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                transformation.clone(),
+                &destination,
+            )
+            .unwrap();
+        wait_for_save_as(job, None, Duration::from_millis(1)).unwrap();
+
+        let (samples, total_rows, _) =
+            validate_saved_transformation(&session, &destination, &transformation).unwrap();
+        assert_eq!((samples, total_rows), (2, 2));
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"\xEF\xBB\xBFfirst,last,city\nAda,Lovelace,London\nGrace,,Arlington\n"
+        );
+
+        let headerless_source = directory.join("headerless.csv");
+        let headerless_destination = directory.join("joined.csv");
+        fs::write(&headerless_source, b"\xEF\xBB\xBFone,two\nthree,four\n").unwrap();
+        let headerless_session = Session::open(
+            &headerless_source,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let join = ColumnTransformation::Join {
+            source_columns: vec![1, 0],
+            separator: b",\n".to_vec(),
+            output_header: None,
+        };
+        let job = headerless_session
+            .start_save_as_with_transformation(
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                join.clone(),
+                &headerless_destination,
+            )
+            .unwrap();
+        wait_for_save_as(job, None, Duration::from_millis(1)).unwrap();
+        validate_saved_transformation(&headerless_session, &headerless_destination, &join).unwrap();
+        assert_eq!(
+            fs::read(&headerless_destination).unwrap(),
+            b"\xEF\xBB\xBF\"two,\none\"\n\"four,\nthree\"\n"
+        );
+
+        let quoted_bom_source = directory.join("quoted-bom.csv");
+        let quoted_bom_destination = directory.join("quoted-bom-joined.csv");
+        fs::write(&quoted_bom_source, b"\"\xEF\xBB\xBFone\",two\n").unwrap();
+        let quoted_bom_session = Session::open(
+            &quoted_bom_source,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let quoted_bom_join = ColumnTransformation::Join {
+            source_columns: vec![1, 0],
+            separator: b"|".to_vec(),
+            output_header: None,
+        };
+        let job = quoted_bom_session
+            .start_save_as_with_transformation(
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                quoted_bom_join.clone(),
+                &quoted_bom_destination,
+            )
+            .unwrap();
+        wait_for_save_as(job, None, Duration::from_millis(1)).unwrap();
+        validate_saved_transformation(
+            &quoted_bom_session,
+            &quoted_bom_destination,
+            &quoted_bom_join,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&quoted_bom_destination).unwrap(),
+            b"two|\xEF\xBB\xBFone\n"
+        );
+
+        let leading_bom_source = directory.join("leading-bom.csv");
+        let leading_bom_destination = directory.join("leading-bom-joined.csv");
+        fs::write(&leading_bom_source, b"\"\xEF\xBB\xBFone\",two\n").unwrap();
+        transform_save_as_command(vec![
+            leading_bom_source.to_string_lossy().into_owned(),
+            "--output".into(),
+            leading_bom_destination.to_string_lossy().into_owned(),
+            "--join".into(),
+            "1,2".into(),
+            "|".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read(&leading_bom_destination).unwrap(),
+            b"\"\xEF\xBB\xBFone|two\"\n"
+        );
+
+        let empty_source = directory.join("empty-fields.csv");
+        let empty_destination = directory.join("empty-fields-joined.csv");
+        fs::write(&empty_source, b",").unwrap();
+        transform_save_as_command(vec![
+            empty_source.to_string_lossy().into_owned(),
+            "--output".into(),
+            empty_destination.to_string_lossy().into_owned(),
+            "--join".into(),
+            "1,2".into(),
+            String::new(),
+        ])
+        .unwrap();
+        assert_eq!(fs::read(&empty_destination).unwrap(), b"\"\"");
         fs::remove_dir_all(directory).unwrap();
     }
 

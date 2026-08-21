@@ -8,9 +8,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use memchr::memmem::Finder;
-use quarry_delimited::{RecordScanner, parse_record};
+use quarry_delimited::RecordScanner;
 
-use crate::{DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session};
+use crate::{
+    DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session, parse_source_record,
+};
 
 const DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const MATCH_PUBLISH_BATCH: usize = 256;
@@ -535,10 +537,11 @@ pub(crate) fn validate_query(query: &FilterQuery) -> Result<(), QuarryError> {
 pub(crate) fn matching_fields<'a>(
     record: &'a [u8],
     delimiter: u8,
+    physical_row: u64,
     query: &FilterQuery,
     finders: &[Finder<'_>],
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
-    let fields = parse_record(record, delimiter)?;
+    let fields = parse_source_record(record, delimiter, physical_row)?;
     debug_assert_eq!(query.predicates.len(), finders.len());
     let matches = query
         .predicates
@@ -613,7 +616,7 @@ fn run_filter(
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, query, &finders) {
+                        match matching_fields(&record, delimiter, row_number, query, &finders) {
                             Ok(Some(_)) => pending_matches.push((row_number, record_start)),
                             Ok(None) => {}
                             Err(error) => deferred_error = Some(error),
@@ -658,7 +661,7 @@ fn run_filter(
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, query, &finders) {
+                        match matching_fields(&record, delimiter, row_number, query, &finders) {
                             Ok(Some(_)) => {
                                 pending_matches.push((row_number, record_start));
                                 if pending_matches.len() == MATCH_PUBLISH_BATCH {
@@ -834,7 +837,8 @@ fn run_filtered_read(
                         limit: config.max_record_bytes,
                     });
                 }
-                if let Some(fields) = matching_fields(&record, delimiter, &plan.query, &finders)?
+                if let Some(fields) =
+                    matching_fields(&record, delimiter, row_number, &plan.query, &finders)?
                     && match_ordinal >= plan.start_match
                 {
                     rows.push(FilterMatch {
@@ -868,7 +872,8 @@ fn run_filtered_read(
                             limit: config.max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, &plan.query, &finders) {
+                        match matching_fields(&record, delimiter, row_number, &plan.query, &finders)
+                        {
                             Ok(Some(fields)) => {
                                 if match_ordinal >= plan.start_match {
                                     rows.push(FilterMatch {
@@ -1047,6 +1052,27 @@ mod tests {
             }),
             Err(QuarryError::InvalidOption(_))
         ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filters_and_reads_a_headerless_bom_quoted_multiline_first_record() {
+        let path = fixture(b"\xEF\xBB\xBF\"one\ncontinued\",x\nother,y\n");
+        let session = session(&path, HeaderMode::NoHeader);
+        let index = session
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"one\ncontinued".to_vec(),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert_eq!(index.matches_found(), 1);
+        let rows = session.read_filtered_rows(&index, 0, 1).unwrap();
+        assert_eq!(rows[0].row, 0);
+        assert_eq!(rows[0].fields, [b"one\ncontinued".to_vec(), b"x".to_vec()]);
         fs::remove_file(path).unwrap();
     }
 

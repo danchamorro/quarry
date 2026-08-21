@@ -3,6 +3,7 @@ mod filter;
 mod index;
 mod search;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -14,8 +15,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 pub use export::{
-    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterExportSummary, SaveAsJob,
-    SaveAsOutcome, SaveAsProgress, SaveAsSummary,
+    ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress,
+    FilterExportSummary, MAX_TRANSFORMATION_COLUMNS, SaveAsJob, SaveAsOutcome, SaveAsProgress,
+    SaveAsSummary, SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress,
+    SplitAnalysisSummary,
 };
 pub use filter::{
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
@@ -29,6 +32,20 @@ const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
 const DEFAULT_BOOTSTRAP_LIMIT: usize = 64 * 1024 * 1024;
 const DEFAULT_READ_CHUNK: usize = 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+pub(crate) fn parse_source_record(
+    record: &[u8],
+    delimiter: u8,
+    physical_row: u64,
+) -> Result<Vec<Cow<'_, [u8]>>, ParseError> {
+    let record = if physical_row == 0 {
+        record.strip_prefix(UTF8_BOM).unwrap_or(record)
+    } else {
+        record
+    };
+    parse_record(record, delimiter)
+}
 
 #[derive(Debug)]
 pub enum QuarryError {
@@ -345,9 +362,9 @@ fn read_initial_records(
 fn materialize_rows(bytes: &[u8], ends: &[u64], delimiter: u8) -> Result<Vec<Row>, QuarryError> {
     let mut rows = Vec::with_capacity(ends.len());
     let mut start = 0;
-    for &end in ends {
+    for (physical_row, &end) in ends.iter().enumerate() {
         let end = end as usize;
-        let fields = parse_record(&bytes[start..end], delimiter)?
+        let fields = parse_source_record(&bytes[start..end], delimiter, physical_row as u64)?
             .into_iter()
             .map(|field| field.into_owned())
             .collect();
@@ -380,9 +397,11 @@ fn detect_delimiter(sample: &[u8]) -> u8 {
 
         let mut start = 0;
         let mut frequencies = HashMap::new();
-        for end in ends {
+        for (physical_row, end) in ends.into_iter().enumerate() {
             let end = end as usize;
-            let Ok(fields) = parse_record(&sample[start..end], delimiter) else {
+            let Ok(fields) =
+                parse_source_record(&sample[start..end], delimiter, physical_row as u64)
+            else {
                 frequencies.clear();
                 break;
             };
@@ -505,7 +524,7 @@ fn read_rows_from_index(
         let read = file.read(&mut chunk)?;
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
-                let fields = parse_record(&record, delimiter)?
+                let fields = parse_source_record(&record, delimiter, row_number)?
                     .into_iter()
                     .map(|field| field.into_owned())
                     .collect();
@@ -527,7 +546,7 @@ fn read_rows_from_index(
                         limit: max_record_bytes,
                     });
                 } else if deferred_error.is_none() {
-                    match parse_record(&record, delimiter) {
+                    match parse_source_record(&record, delimiter, row_number) {
                         Ok(fields) => rows.push(Row {
                             offset: record_start,
                             fields: fields.into_iter().map(|field| field.into_owned()).collect(),
@@ -621,6 +640,38 @@ mod tests {
         let rows = session.read_rows(&index, 2, 2).unwrap();
         assert_eq!(rows[0].fields[0], b"multi\nline");
         assert_eq!(rows[1].fields[0], b"c");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opens_and_reads_a_bom_prefixed_quoted_multiline_first_record() {
+        let path = fixture(b"\xEF\xBB\xBF\"one\ncontinued\",two\nlast,row\n");
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                rows: 2,
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(session.first_rows[0].fields[0], b"one\ncontinued");
+        assert_eq!(session.first_rows[0].fields[1], b"two");
+
+        let index = session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 1,
+                checkpoint_every: 1,
+                memory_budget_bytes: 64,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(index.indexed_rows(), 2);
+        let rows = session.read_rows(&index, 0, 2).unwrap();
+        assert_eq!(rows[0].fields[0], b"one\ncontinued");
+        assert_eq!(rows[1].fields, [b"last".to_vec(), b"row".to_vec()]);
         fs::remove_file(path).unwrap();
     }
 

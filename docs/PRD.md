@@ -45,7 +45,10 @@ the viewer encounters them.
 
 Phase 5 has delivered direct in-grid header and existing data-cell editing,
 sparse unsaved document state, atomic Save with metadata-based conflict
-detection, and no-clobber Save As. Structural transformations are next.
+detection, no-clobber Save As, and repeatable Split and Join edits applied from
+selected grid columns. Each confirmed operation materializes a private CSV and
+reopens it as the ordinary editable working copy. Explicit output reorder/drop
+and overlay-aware find/replace remain.
 Disk-aware sorting remains a candidate if it does not delay the core milestone.
 
 Not required: general-purpose text-editor behavior, formulas, charts, database
@@ -56,12 +59,40 @@ mutation, or EmEditor feature parity.
 
 Edit headers and cells directly in the grid. Existing UTF-8 data cells support
 multiline input and use sparse unsaved document state keyed by stable physical
-record row and source-column identity. Missing fields in ragged rows and
-invalid UTF-8 cells fail explicitly rather than creating or corrupting data.
-Search and filters continue to scan the unchanged source, so they remain
-unavailable while data-cell edits are unsaved. Later slices add split/join,
-explicit rename/reorder/drop transformations, overlay-aware find/replace, and
-transformed filtered output.
+record row and column identity in the current indexed document. Missing fields
+in ragged rows and invalid UTF-8 cells fail explicitly rather than creating or
+corrupting data.
+Search and filters scan the active indexed CSV, so they remain unavailable
+while sparse cell or header edits are unsaved. After a structural operation is
+materialized and reindexed, its working CSV becomes the ordinary searchable
+document. Split replaces one selected column with the fields found by a
+non-empty literal separator. Quarry derives the resulting width from the
+current data plus sparse edits, keeps the original header on the first result,
+and creates blank editable headers for additional results. If the separator is
+absent from the selected column, the operation reports that no split is
+possible and leaves the document unchanged. Join combines at least two
+selected columns in document order with a literal separator that may be empty,
+inserts the result at the leftmost selected position, keeps that position's
+current header, and removes the selected originals. Both operations renumber
+the changed document schema.
+
+Users start **Split Columns…** or **Combine Columns…** from the context menu of
+the numbered column headers. A compact modal uses the current selection and
+asks only for the operation's separator. **OK** starts a bounded background
+stream into a private working CSV, and **Cancel** does nothing. Quarry opens and
+indexes the completed working file as the normal editable grid. Users may edit
+the resulting cells and headers or repeat Split and Combine commands before
+writing a file. One-level structural Undo and Redo move between adjacent
+document versions. Quarry displays at most 32 document columns per viewport and
+applies the core 65,536-column structural safety limit. Bounded display work does
+not otherwise limit Save or Save As.
+
+Numbered column headers expose their selected state and **Split Columns…** and
+**Combine Columns…** context actions to accessibility clients. The dialog
+heading, selected-column summary, separator field, OK, Cancel, background
+status, and cancellation action have stable accessible names and remain
+keyboard operable. After materialization, focus returns to the ordinary grid
+and the affected working columns remain selected.
 
 Save As writes a selected destination, leaves the previous source unchanged,
 and makes the new file current only after success. Save writes through a
@@ -69,13 +100,16 @@ same-directory temporary file, preserves standard file permissions, rejects
 the Save when a metadata-visible source change is found at startup or
 immediately before replacement, flushes and syncs, then atomically replaces the
 current regular file. Final-path symbolic links require Save As. Neither
-operation mutates records in place.
+operation mutates records in place. Discard Changes removes every sparse edit
+and private working version, then restores the last opened or saved file.
 
-Save and Save As copy unedited records byte for byte and serialize only edited
-records with the document delimiter and original line ending. For a fixed edit
-set, memory depends on the bounded scanner record and sparse overlay rather
-than source-file size. Overlay memory may grow with the number and size of
-edits.
+Save and Save As scan the current indexed CSV, copy unedited records byte for
+byte, and serialize only records with newer sparse edits using the document
+delimiter and original line ending. For a fixed edit set, RAM depends on the
+bounded scanner record and sparse overlay rather than file size. A structural
+operation uses disk proportional to the current CSV, plus one prior private CSV
+when retained for one-level Undo. Overlay memory may grow with the number and
+size of edits.
 
 ## Progressive opening
 1. Open the file and sample a bounded region.
@@ -94,7 +128,7 @@ Initial targets:
 - Initial viewing memory: under 500 MB target.
 - No RAM growth proportional to file size during read-only viewing.
 - Responsive UI during indexing, search, filtering, filtered navigation,
-  export, and editing.
+  export, editing, Split, and Join.
 - Streaming Save and Save As with memory bounded by scanner limits and the
   sparse edit set rather than source-file size.
 - Long operations cancellable.

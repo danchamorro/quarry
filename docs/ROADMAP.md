@@ -2,7 +2,7 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress: 2026-08-18
+## Current progress: 2026-08-20
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -11,7 +11,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 | Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
-| Phase 5: Direct editing and transformations | In progress | Inline header and data-cell editing, unsaved-change protection, atomic Save with metadata-based conflict detection, no-clobber Save As, and deterministic [1 GB and 12 GB direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md) are implemented; structural transformations remain |
+| Phase 5: Direct editing and transformations | In progress | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); the desktop now applies repeatable Split and Combine commands from selected columns to the ordinary editable working copy; reorder/drop and overlay-aware find/replace remain |
 
 ### Phase 1 checklist
 
@@ -101,8 +101,9 @@ opening, format controls, literal search, copy, column controls, diagnostics,
 and an adaptive grid that keeps at least 40 rows visible in the maximized
 reference window.
 Phase 4 filtering and streaming filtered export are complete. Phase 5 now has
-direct in-grid header and data-cell editing plus sparse streaming persistence.
-Cosmetic redesign remains outside the current scope.
+direct in-grid header and data-cell editing, sparse streaming persistence, and
+repeatable selected-column Split and Combine commands in the ordinary editable
+grid. Cosmetic redesign remains outside the current scope.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -158,11 +159,18 @@ unchanged.
 
 Edit values where they appear in the grid. Keep committed edits as sparse
 unsaved document state until an explicit Save or Save As. Header rename and
-editing existing data cells use stable source identities. Later slices add
-structural row and column transformations.
+editing existing data cells use stable identities in the current indexed
+document. Select numbered column headers, open **Split Columns…** or
+**Combine Columns…** from their context menu, enter a literal separator in a
+compact OK/Cancel dialog, and continue in the same editable grid.
+Each confirmed operation streams the current document into a bounded private
+working CSV, reopens it as the ordinary indexed document, and supports more
+edits or transformations without building a file-sized in-memory model.
+One-level structural Undo and Redo reopen the preceding or subsequent document
+version.
 
-**Next:** define and implement the first explicit structural transformation,
-starting with split/join while preserving the same publication guarantees.
+**Next:** add explicit output reorder/drop choices while keeping the Columns
+manager view-only.
 
 ### Phase 5 checklist
 
@@ -195,19 +203,29 @@ starting with split/join while preserving the same publication guarantees.
 - [x] Record exact output, source preservation, cancellation, throughput, and
   peak RSS on deterministic 1 GB and 12 GB datasets in the
   [direct-cell editing validation](benchmarks/2026-08-18-direct-cell-editing.md).
-- [ ] Add split/join transformations without building a file-sized in-memory
-  document model.
+- [x] Add selected-column Split and Combine context actions without building a
+  file-sized in-memory document model. Use a compact OK/Cancel dialog, derive
+  Split width from the current data, materialize each confirmed operation into
+  a private working CSV, reopen it in the ordinary editable grid, and allow
+  repeated edits and transformations. One-level structural Undo and Redo move
+  between adjacent document versions. Save and Save As publish the current
+  working document, while Discard restores the last opened or saved file.
+  Record exact semantic first/middle/final validation, source preservation,
+  cancellation, throughput, and peak RSS for the persistence engine on
+  deterministic 1 GB and 12 GB datasets in the [split/join transformation
+  validation](benchmarks/2026-08-19-split-join-transformations.md).
 - [ ] Add explicit output reorder/drop choices while keeping the Columns
   manager view-only.
 - [ ] Add overlay-aware find/replace with bounded progress and cancellation.
 
 The Columns manager remains view-only and does not mark the document changed.
-A transformed Save As may explicitly use its arranged order. Hidden columns
-remain in output unless the user explicitly excludes them.
+Future output reorder/drop controls must be explicit and separate from that
+view arrangement. Hidden columns remain in output unless the user explicitly
+excludes them.
 
-**Phase 5 exit:** direct edits remain responsive on the 12 GB reference file,
-unsaved changes cannot be lost silently, and Save and Save As never expose a
-partial or corrupted file.
+**Phase 5 exit:** direct edits and structural transformations remain responsive
+on the 12 GB reference file, unsaved changes cannot be lost silently, and Save
+and Save As never expose a partial or corrupted file.
 
 ## Phase 6 — Sorting
 Type semantics, external run generation, spill management, merge, stable row-order abstraction, disk-space estimation.

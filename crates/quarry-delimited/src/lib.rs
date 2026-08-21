@@ -9,6 +9,7 @@ use memchr::{memchr, memchr3};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseErrorKind {
     InvalidDelimiter,
+    FieldLimitExceeded(usize),
     UnexpectedQuote,
     UnexpectedAfterQuote(u8),
     UnterminatedQuote,
@@ -31,6 +32,9 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
             ParseErrorKind::InvalidDelimiter => write!(f, "invalid delimiter"),
+            ParseErrorKind::FieldLimitExceeded(limit) => {
+                write!(f, "record exceeds the configured {limit}-field limit")
+            }
             ParseErrorKind::UnexpectedQuote => {
                 write!(f, "unexpected quote at byte {}", self.offset)
             }
@@ -66,6 +70,9 @@ pub struct RecordScanner {
     delimiter: u8,
     state: ScanState,
     record_start: u64,
+    bom_prefix: [u8; 3],
+    bom_prefix_len: usize,
+    bom_checked: bool,
 }
 
 impl RecordScanner {
@@ -79,6 +86,9 @@ impl RecordScanner {
             delimiter,
             state: ScanState::FieldStart,
             record_start,
+            bom_prefix: [0; 3],
+            bom_prefix_len: 0,
+            bom_checked: record_start != 0,
         })
     }
 
@@ -92,6 +102,59 @@ impl RecordScanner {
         bytes: &[u8],
         absolute_start: u64,
         mut on_record_end: impl FnMut(u64),
+    ) -> Result<u64, ParseError> {
+        const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
+
+        if self.bom_checked {
+            return self.scan_data_chunk(bytes, absolute_start, &mut on_record_end);
+        }
+
+        if absolute_start != self.bom_prefix_len as u64 {
+            let prefix = self.bom_prefix;
+            let prefix_len = self.bom_prefix_len;
+            self.bom_checked = true;
+            let mut records = self.scan_data_chunk(&prefix[..prefix_len], 0, &mut on_record_end)?;
+            records += self.scan_data_chunk(bytes, absolute_start, &mut on_record_end)?;
+            return Ok(records);
+        }
+
+        let mut index = 0;
+        while index < bytes.len() && self.bom_prefix_len < UTF8_BOM.len() {
+            if bytes[index] != UTF8_BOM[self.bom_prefix_len] {
+                let prefix = self.bom_prefix;
+                let prefix_len = self.bom_prefix_len;
+                self.bom_checked = true;
+                let mut records =
+                    self.scan_data_chunk(&prefix[..prefix_len], 0, &mut on_record_end)?;
+                records += self.scan_data_chunk(
+                    &bytes[index..],
+                    absolute_start + index as u64,
+                    &mut on_record_end,
+                )?;
+                return Ok(records);
+            }
+            self.bom_prefix[self.bom_prefix_len] = bytes[index];
+            self.bom_prefix_len += 1;
+            index += 1;
+        }
+
+        if self.bom_prefix_len < UTF8_BOM.len() {
+            return Ok(0);
+        }
+
+        self.bom_checked = true;
+        self.scan_data_chunk(
+            &bytes[index..],
+            absolute_start + index as u64,
+            &mut on_record_end,
+        )
+    }
+
+    fn scan_data_chunk(
+        &mut self,
+        bytes: &[u8],
+        absolute_start: u64,
+        on_record_end: &mut impl FnMut(u64),
     ) -> Result<u64, ParseError> {
         let mut index = 0;
         let mut records = 0;
@@ -200,6 +263,13 @@ impl RecordScanner {
         absolute_end: u64,
         mut on_record_end: impl FnMut(u64),
     ) -> Result<bool, ParseError> {
+        if !self.bom_checked {
+            let prefix = self.bom_prefix;
+            let prefix_len = self.bom_prefix_len;
+            self.bom_checked = true;
+            self.scan_data_chunk(&prefix[..prefix_len], 0, &mut on_record_end)?;
+        }
+
         match self.state {
             ScanState::Quoted => {
                 return Err(ParseError::new(
@@ -227,12 +297,26 @@ impl RecordScanner {
 }
 
 pub fn parse_record(record: &[u8], delimiter: u8) -> Result<Vec<Cow<'_, [u8]>>, ParseError> {
+    parse_record_with_field_limit(record, delimiter, usize::MAX)
+}
+
+pub fn parse_record_with_field_limit(
+    record: &[u8],
+    delimiter: u8,
+    max_fields: usize,
+) -> Result<Vec<Cow<'_, [u8]>>, ParseError> {
     validate_delimiter(delimiter)?;
     let record = strip_record_ending(record);
     let mut fields: Vec<Cow<'_, [u8]>> = Vec::new();
     let mut start = 0;
 
     loop {
+        if fields.len() == max_fields {
+            return Err(ParseError::new(
+                start as u64,
+                ParseErrorKind::FieldLimitExceeded(max_fields),
+            ));
+        }
         if start == record.len() {
             fields.push(Cow::Borrowed(&[]));
             break;
@@ -326,8 +410,7 @@ fn validate_delimiter(delimiter: u8) -> Result<(), ParseError> {
 mod tests {
     use std::borrow::Cow;
 
-    use super::{ParseErrorKind, RecordScanner, parse_record};
-
+    use super::{ParseErrorKind, RecordScanner, parse_record, parse_record_with_field_limit};
     fn fields(input: &[u8]) -> Vec<Vec<u8>> {
         parse_record(input, b',')
             .unwrap()
@@ -380,6 +463,49 @@ mod tests {
                 .unwrap();
             assert_eq!(ends, expected, "split {split}");
         }
+    }
+
+    #[test]
+    fn scanner_ignores_an_initial_bom_for_quoted_multiline_framing_across_tiny_chunks() {
+        let first = b"\xEF\xBB\xBF\"one\ncontinued\",two\n";
+        let second = b"last,row\n";
+        let input = [first.as_slice(), second.as_slice()].concat();
+        let mut scanner = RecordScanner::new(b',').unwrap();
+        let mut ends = Vec::new();
+
+        for (offset, byte) in input.iter().enumerate() {
+            scanner
+                .scan_chunk(std::slice::from_ref(byte), offset as u64, |end| {
+                    ends.push(end)
+                })
+                .unwrap();
+        }
+        assert!(
+            !scanner
+                .finish(input.len() as u64, |end| ends.push(end))
+                .unwrap()
+        );
+        assert_eq!(ends, [first.len() as u64, input.len() as u64]);
+    }
+
+    #[test]
+    fn scanner_does_not_ignore_a_bom_on_a_later_record() {
+        let input = b"a,b\n\xEF\xBB\xBF\"c\",d\n";
+        let mut scanner = RecordScanner::new(b',').unwrap();
+        assert_eq!(
+            scanner.scan_chunk(input, 0, |_| {}).unwrap_err().kind,
+            ParseErrorKind::UnexpectedQuote
+        );
+    }
+
+    #[test]
+    fn bounded_parser_stops_before_parsing_the_first_excess_field() {
+        assert_eq!(
+            parse_record_with_field_limit(b"a,b,\"unterminated", b',', 2)
+                .unwrap_err()
+                .kind,
+            ParseErrorKind::FieldLimitExceeded(2)
+        );
     }
 
     #[test]
