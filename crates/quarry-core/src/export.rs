@@ -1757,43 +1757,22 @@ impl ExportTarget {
             self.remove_temporary()?;
             return Ok(FilterExportOutcome::Cancelled);
         }
+        if let Err(error) = self.ensure_source_unchanged() {
+            self.remove_temporary()?;
+            return Err(error);
+        }
         let publish_result = match &self.publication {
-            Publication::CreateNew => publish_no_replace(&self.temporary, &self.destination),
-            Publication::GuardedCreateNew {
-                source_path,
-                source,
-                source_stamp,
-            } => {
-                if !source_matches_stamp(source, source_path, source_stamp)? {
-                    self.remove_temporary()?;
-                    return Err(QuarryError::SourceChanged);
-                }
+            Publication::CreateNew | Publication::GuardedCreateNew { .. } => {
                 publish_no_replace(&self.temporary, &self.destination)
             }
-            Publication::GuardedCreateWorkingCopy {
-                source_path,
-                source,
-                source_stamp,
-            } => {
-                if !source_matches_stamp(source, source_path, source_stamp)? {
-                    self.remove_temporary()?;
-                    return Err(QuarryError::SourceChanged);
-                }
+            Publication::GuardedCreateWorkingCopy { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {
                     self.remove_temporary()?;
                     return Ok(FilterExportOutcome::Cancelled);
                 }
                 publish_no_replace(&self.temporary, &self.destination)
             }
-            Publication::ReplaceSource { source_stamp, .. } => {
-                let unchanged = fs::symlink_metadata(&self.destination)
-                    .ok()
-                    .filter(|metadata| !metadata.file_type().is_symlink())
-                    .is_some_and(|metadata| SourceStamp::from_metadata(&metadata) == *source_stamp);
-                if !unchanged {
-                    self.remove_temporary()?;
-                    return Err(QuarryError::SourceChanged);
-                }
+            Publication::ReplaceSource { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {
                     self.remove_temporary()?;
                     return Ok(FilterExportOutcome::Cancelled);
@@ -1801,9 +1780,6 @@ impl ExportTarget {
                 fs::rename(&self.temporary, &self.destination)
             }
             Publication::GuardedReplaceExisting {
-                source_path,
-                source,
-                source_stamp,
                 destination_file,
                 destination_stamp,
                 ..
@@ -1816,9 +1792,7 @@ impl ExportTarget {
                     })
                     && SourceStamp::from_metadata(&destination_file.metadata()?)
                         == *destination_stamp;
-                if !source_matches_stamp(source, source_path, source_stamp)?
-                    || !destination_unchanged
-                {
+                if !destination_unchanged {
                     self.remove_temporary()?;
                     return Err(QuarryError::SourceChanged);
                 }

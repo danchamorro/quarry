@@ -245,7 +245,7 @@ through existing physical-row paths. A separate lazy row-order index remains
 deferred until a later feature proves it is needed.
 
 The deterministic [Phase 6A release validation](benchmarks/2026-08-21-stable-text-sort.md)
-measured 16.86 MiB and 17.48 MiB peak process RSS for the 1 GB and 12 GB sorts.
+measured 16.88 MiB and 17.55 MiB peak process RSS for the 1 GB and 12 GB sorts.
 Measured peak temporary disk was 2.12 GiB and 24.65 GiB, both below the
 conservative preflight estimate. Complete order and preservation scans passed,
 the prepublication multiset and stable-tie checks passed, source hashes remained

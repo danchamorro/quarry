@@ -5,9 +5,9 @@
 Phase 6A is complete. The implementation, deterministic regressions, and
 release measurements on the deterministic 1 GB and 12 GB fixtures all pass.
 
-The 1 GB sort completed in 15.439 seconds with 16.86 MiB peak process RSS and
-2.12 GiB measured peak temporary disk. The 12 GB sort completed in 242.216
-seconds with 17.48 MiB peak process RSS and 24.65 GiB measured peak temporary
+The 1 GB sort completed in 16.382 seconds with 16.88 MiB peak process RSS and
+2.12 GiB measured peak temporary disk. The 12 GB sort completed in 253.132
+seconds with 17.55 MiB peak process RSS and 24.65 GiB measured peak temporary
 disk. Both outputs preserved the exact data-row count and raw header, matched
 the source byte size, passed a complete sorted-order scan, verified bounded
 record-multiset preservation and exact stable tie order before publication, and
@@ -52,30 +52,32 @@ The validation CLI reports the worker's wall time, peak temporary bytes, merge
 passes, exact data/header counts, cancellation latency, peak process RSS, and
 streaming FNV-1a fingerprints. Completion also requires a bounded dual
 fingerprint of the effective record multiset and exact increasing source
-ordinals for adjacent equal keys. SHA-256 is recorded separately before and
-after the runs using the platform `shasum` tool.
+ordinals for adjacent equal keys. Raw headers are compared in fixed 64 KiB
+chunks. SHA-256 is recorded separately before and after the runs using the
+platform `shasum` tool.
 
 ## Regression evidence
 
-`cargo test --workspace --locked --offline` passed 190 tests:
+`cargo test --workspace --locked --offline` passed 195 tests:
 
 | Package | Tests |
 |---|---:|
 | AppKit | 1 |
-| CLI | 19 |
-| Core | 99 |
+| CLI | 21 |
+| Core | 101 |
 | Delimited parser | 9 |
-| egui desktop | 62 |
+| egui desktop | 63 |
 
 The sort-specific regressions cover stable ascending and descending order,
 quoted multiline keys, ragged rows, sparse overlays, header renames, BOM and
 unterminated-record handling, forced multipass merging, the merge-memory bound,
 the disk formula, source conflicts, output record limits, owner-only files,
 cancellation cleanup, record-multiset preservation, exact equal-key ordinal
-order, accessibility, visible merge progress, and structural Undo and Redo.
-Focused regressions also verify the measured peak-temporary-disk, merge-pass,
-header-count, frozen-elapsed-time, cancellation-latency, and file fingerprint
-reporting paths.
+order, cancellation during initial-run flushing, accessibility, visible merge
+progress, and structural Undo and Redo. Focused regressions also verify the
+measured peak-temporary-disk, merge-pass, header-count, streamed raw-header
+comparison, frozen-elapsed-time, cancellation-latency, observed permissions,
+and file fingerprint reporting paths.
 
 Strict workspace linting, formatting, and whitespace checks also pass.
 
@@ -140,8 +142,8 @@ temporary artifact should remain.
 
 | Dataset | Sort time | Throughput | Peak RSS | Estimated temporary disk | Measured peak temporary disk | Runs | Merge passes | Validation scan |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Deterministic 1 GB | 15.439 s | 61.77 MiB/s | 16.86 MiB | 4,286,594,700 bytes (3.99 GiB) | 2,279,612,666 bytes (2.12 GiB) | 289 | 8 | 8.317 s |
-| Deterministic 12 GB | 242.216 s | 47.25 MiB/s | 17.48 MiB | 51,439,139,964 bytes (47.91 GiB) | 26,470,708,694 bytes (24.65 GiB) | 3,453 | 11 | 99.742 s |
+| Deterministic 1 GB | 16.382 s | 58.21 MiB/s | 16.88 MiB | 4,286,594,700 bytes (3.99 GiB) | 2,279,612,666 bytes (2.12 GiB) | 289 | 8 | 8.515 s |
+| Deterministic 12 GB | 253.132 s | 45.21 MiB/s | 17.55 MiB | 51,439,139,964 bytes (47.91 GiB) | 26,470,708,694 bytes (24.65 GiB) | 3,453 | 11 | 100.726 s |
 
 Both outputs had exactly one 101-byte raw header and the exact source data-row
 count. Output byte size equaled source byte size, every row passed the complete
@@ -157,8 +159,8 @@ passed before publication, and owner-only permissions were retained.
 
 | Dataset | Requested threshold | Bytes scanned | Rows processed | Temporary bytes | Worker time | Cancellation latency | Peak RSS | Published or leftover artifact |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| Deterministic 1 GB | 64 MiB | 68,157,440 | 343,442 | 75,496,242 | 0.272 s | 2.933 ms | 16.66 MiB | No |
-| Deterministic 12 GB | 64 MiB | 68,157,440 | 343,965 | 75,496,242 | 0.275 s | 2.838 ms | 15.20 MiB | No |
+| Deterministic 1 GB | 64 MiB | 68,157,440 | 345,177 | 75,496,242 | 0.284 s | 3.052 ms | 16.64 MiB | No |
+| Deterministic 12 GB | 64 MiB | 68,157,440 | 343,442 | 75,496,242 | 0.277 s | 3.035 ms | 16.81 MiB | No |
 
 Both cancellation runs stopped before the full source scan, published no
 destination, removed all run and staging files, and retained the original

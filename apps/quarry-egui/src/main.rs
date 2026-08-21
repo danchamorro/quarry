@@ -3789,7 +3789,9 @@ impl Document {
         let key = (found.row, found.column);
         let source = self
             .source_cell(found.row, found.column)
-            .expect("a revealed match has a loaded source cell")
+            .ok_or_else(|| {
+                "The current matched cell is no longer available for replacement.".to_owned()
+            })?
             .to_vec();
         let effective = self
             .cell_edits
@@ -10637,6 +10639,43 @@ mod tests {
         );
         assert!(!document.can_replace_current(b"aa"));
         assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn replace_current_reports_an_overlay_match_without_a_source_cell() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overlay-only-replace.csv");
+        fs::write(&path, b"first,second\nvalue\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.search_query = b"needle".to_vec();
+        document.last_match = Some(SearchMatch {
+            row: 1,
+            column: 1,
+            record_offset: 0,
+        });
+        document.reveal_cell = Some((1, 1));
+        document.cell_edits.insert((1, 1), b"needle".to_vec());
+
+        assert!(document.can_replace_current(b"needle"));
+        assert_eq!(
+            document
+                .replace_current_match(b"needle", b"replacement")
+                .unwrap_err(),
+            "The current matched cell is no longer available for replacement."
+        );
+        assert_eq!(
+            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            Some(b"needle".as_slice())
+        );
+        document.shutdown();
     }
 
     #[test]

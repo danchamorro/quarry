@@ -56,9 +56,7 @@ from selected grid columns. Each confirmed operation materializes a private CSV
 and reopens it as the ordinary editable working copy. Explicit selected-column
 Move and Delete use that same workflow while the Columns manager remains
 view-only. Overlay-aware Find Next, Replace in Cell, and bounded Replace All
-complete Phase 5. Phase 6A adds stable single-column text sorting through a
-disk-aware external merge worker. The desktop, core, and validation CLI passed
-the deterministic 1 GB and 12 GB release validation.
+complete Phase 5.
 
 Edit headers and cells directly in the grid. Existing UTF-8 data cells support
 multiline input and use sparse unsaved document state keyed by stable physical
@@ -115,10 +113,7 @@ ordinary editable grid.
 
 Numbered column headers expose their selected state and **Split Columns…**,
 **Combine Columns…**, **Move Selected Columns…**, and **Delete Selected
-Columns** context actions to accessibility clients. With exactly one selected
-column, **Sort Rows…** opens an accessible ascending/descending text-sort
-dialog with explicit semantics, a conservative temporary-disk allowance, Sort,
-and Cancel. Transformation dialog
+Columns** context actions to accessibility clients. Transformation dialog
 headings, selected-column summaries, labelled fields, confirmation and Cancel
 buttons, background status, and cancellation actions have stable accessible
 names and remain keyboard operable. After materialization, focus returns to the
@@ -151,11 +146,15 @@ Replace All timings.
 
 ## Version 0.3: sorting (complete)
 
-Phase 6A sorts data rows by exactly one selected
+Phase 6A adds stable single-column text sorting through a disk-aware external
+merge worker. The desktop, core, and validation CLI passed the deterministic
+1 GB and 12 GB release validation. It sorts data rows by exactly one selected
 numbered column as case-sensitive text, ascending or descending. The header
 stays fixed, missing ragged fields compare as empty values, and equal keys keep
-their current row order. The disk-aware external merge worker builds bounded
-runs, caps merge payload memory, reports a conservative temporary-space
+their current row order. With exactly one selected column, **Sort Rows…** opens
+an accessible ascending/descending text-sort dialog with explicit semantics, a
+conservative temporary-disk allowance, Sort, and Cancel. That worker builds
+bounded runs, caps merge payload memory, reports a conservative temporary-space
 allowance before starting, and publishes only a complete private sorted CSV.
 The desktop immediately reopens that CSV as Modified and reuses Save, Save As,
 Discard, Undo, and Redo. Cancellation, failure, or a source conflict leaves the

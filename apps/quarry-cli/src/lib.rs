@@ -29,6 +29,7 @@ type SortRun = (SortOutcome, SortProgress, Option<u64>);
 
 const MAX_LIVE_BENCHMARK_MILLIS: u128 = 60_000;
 const FILTER_SAMPLE_ROWS: usize = 100;
+const RAW_HEADER_COMPARE_BUFFER_BYTES: usize = 64 * 1024;
 
 pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let mut args = args.into_iter();
@@ -909,6 +910,8 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         }
     };
     let completion_evidence = matches!(&outcome, SortOutcome::Complete(_));
+    let artifact_permissions =
+        sort_artifact_permissions(published_bytes.map(|_| destination.as_path()))?;
 
     println!("Quarry guarded sort validation artifact\n");
     println!("Source: {}", session.path().display());
@@ -918,7 +921,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         source_size_before
     );
     println!("Destination: {}", destination.display());
-    println!("Artifact permissions: owner-only");
+    println!("Artifact permissions: {artifact_permissions}");
     println!(
         "Delimiter: {}",
         display_delimiter(session.dialect.delimiter)
@@ -1098,8 +1101,27 @@ fn wait_for_sort(
 
 struct SortValidation {
     data_rows: u64,
-    header_bytes: Option<usize>,
+    header_bytes: Option<u64>,
     elapsed: Duration,
+}
+
+fn sort_artifact_permissions(path: Option<&Path>) -> CliResult<String> {
+    let Some(path) = path else {
+        return Ok("n/a (not published)".to_owned());
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        Ok(format!("{mode:04o} (observed Unix mode)"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok("n/a (Unix mode unavailable)".to_owned())
+    }
 }
 
 fn validate_sorted_output(
@@ -1128,14 +1150,14 @@ fn validate_sorted_output(
     if output_index.indexed_rows() != source_index.indexed_rows() {
         return Err("sorted output record count changed".into());
     }
-    let header_bytes = match (
-        raw_header(source.path(), source, source_index)?,
-        raw_header(destination, &output, &output_index)?,
-    ) {
-        (Some(source), Some(output)) if source == output => Some(source.len()),
-        (None, None) => None,
-        _ => return Err("sorted output raw header changed".into()),
-    };
+    let header_bytes = compare_raw_headers(
+        source.path(),
+        source,
+        source_index,
+        destination,
+        &output,
+        &output_index,
+    )?;
 
     let data_start = u64::from(source.dialect.has_header);
     let mut next_row = data_start;
@@ -1172,11 +1194,45 @@ fn validate_sorted_output(
     })
 }
 
-fn raw_header(
-    path: &Path,
-    session: &Session,
-    index: &StructuralIndex,
-) -> CliResult<Option<Vec<u8>>> {
+fn compare_raw_headers(
+    source_path: &Path,
+    source: &Session,
+    source_index: &StructuralIndex,
+    destination_path: &Path,
+    destination: &Session,
+    destination_index: &StructuralIndex,
+) -> CliResult<Option<u64>> {
+    let source_end = raw_header_end(source, source_index)?;
+    let destination_end = raw_header_end(destination, destination_index)?;
+    let (Some(source_end), Some(destination_end)) = (source_end, destination_end) else {
+        return if source_end.is_none() && destination_end.is_none() {
+            Ok(None)
+        } else {
+            Err("sorted output raw header changed".into())
+        };
+    };
+    if source_end != destination_end {
+        return Err("sorted output raw header changed".into());
+    }
+
+    let mut source_file = File::open(source_path)?;
+    let mut destination_file = File::open(destination_path)?;
+    let mut source_buffer = [0_u8; RAW_HEADER_COMPARE_BUFFER_BYTES];
+    let mut destination_buffer = [0_u8; RAW_HEADER_COMPARE_BUFFER_BYTES];
+    let mut remaining = source_end;
+    while remaining > 0 {
+        let length = usize::try_from(remaining.min(RAW_HEADER_COMPARE_BUFFER_BYTES as u64))?;
+        source_file.read_exact(&mut source_buffer[..length])?;
+        destination_file.read_exact(&mut destination_buffer[..length])?;
+        if source_buffer[..length] != destination_buffer[..length] {
+            return Err("sorted output raw header changed".into());
+        }
+        remaining -= length as u64;
+    }
+    Ok(Some(source_end))
+}
+
+fn raw_header_end(session: &Session, index: &StructuralIndex) -> CliResult<Option<u64>> {
     if !session.dialect.has_header {
         return Ok(None);
     }
@@ -1185,10 +1241,7 @@ fn raw_header(
         return Err("headered source does not contain a header row".into());
     }
     let end = rows.get(1).map_or(session.file_size, |row| row.offset);
-    let length = usize::try_from(end).map_err(|_| "header is too large to validate")?;
-    let mut header = vec![0_u8; length];
-    File::open(path)?.read_exact(&mut header)?;
-    Ok(Some(header))
+    Ok(Some(end))
 }
 
 fn fnv1a64_file(path: &Path) -> CliResult<u64> {
@@ -2688,16 +2741,16 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        FilterSamples, data_search_position, edit_save_as_command, export_command, filter_command,
-        fnv1a64_file, generate_file, latency_stats, parse_header_mode, parse_size,
-        parse_sort_direction, physical_to_data_row, record_filter_sample, sample_filtered_rows,
-        search_command, sort_save_as_command, transform_save_as_command,
-        validate_saved_transformation, validate_sort_completion_evidence, viewport_command,
-        wait_for_save_as,
+        FilterSamples, RAW_HEADER_COMPARE_BUFFER_BYTES, compare_raw_headers, data_search_position,
+        edit_save_as_command, export_command, filter_command, fnv1a64_file, generate_file,
+        latency_stats, parse_header_mode, parse_size, parse_sort_direction, physical_to_data_row,
+        record_filter_sample, sample_filtered_rows, search_command, sort_artifact_permissions,
+        sort_save_as_command, transform_save_as_command, validate_saved_transformation,
+        validate_sort_completion_evidence, viewport_command, wait_for_save_as,
     };
     use quarry_core::{
-        ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, OpenOptions, Session,
-        SortDirection,
+        ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, IndexConfig, OpenOptions,
+        Session, SortDirection,
     };
 
     #[test]
@@ -3484,6 +3537,116 @@ mod tests {
                 .to_string(),
             "sort did not verify stable equal-key ordering"
         );
+    }
+
+    #[test]
+    fn sort_artifact_permissions_report_observed_mode_or_not_published() {
+        assert_eq!(
+            sort_artifact_permissions(None).unwrap(),
+            "n/a (not published)"
+        );
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "quarry-sort-permissions-{}-{suffix}.tmp",
+            std::process::id()
+        ));
+        fs::write(&path, b"artifact").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o640);
+            fs::set_permissions(&path, permissions).unwrap();
+            assert_eq!(
+                sort_artifact_permissions(Some(&path)).unwrap(),
+                "0640 (observed Unix mode)"
+            );
+        }
+        #[cfg(not(unix))]
+        assert_eq!(
+            sort_artifact_permissions(Some(&path)).unwrap(),
+            "n/a (Unix mode unavailable)"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn raw_header_comparison_streams_a_single_record_header() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-sort-raw-header-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        let header = vec![b'a'; RAW_HEADER_COMPARE_BUFFER_BYTES * 2 + 17];
+        fs::write(&source, &header).unwrap();
+        fs::write(&destination, &header).unwrap();
+
+        let open = |path| {
+            Session::open(
+                path,
+                OpenOptions {
+                    rows: 1,
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        let source_session = open(&source);
+        let source_index = source_session
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let destination_session = open(&destination);
+        let destination_index = destination_session
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert_eq!(
+            compare_raw_headers(
+                &source,
+                &source_session,
+                &source_index,
+                &destination,
+                &destination_session,
+                &destination_index,
+            )
+            .unwrap(),
+            Some(header.len() as u64)
+        );
+
+        let mut changed = header;
+        *changed.last_mut().unwrap() = b'b';
+        fs::write(&destination, changed).unwrap();
+        assert_eq!(
+            compare_raw_headers(
+                &source,
+                &source_session,
+                &source_index,
+                &destination,
+                &destination_session,
+                &destination_index,
+            )
+            .unwrap_err()
+            .to_string(),
+            "sorted output raw header changed"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

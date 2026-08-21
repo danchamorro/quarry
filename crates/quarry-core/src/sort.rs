@@ -603,6 +603,7 @@ struct SortVerification {
 struct OutputVerifier {
     expected_records: RecordMultisetFingerprint,
     observed_records: RecordMultisetFingerprint,
+    adjacencies_checked: u64,
 }
 
 impl OutputVerifier {
@@ -610,7 +611,24 @@ impl OutputVerifier {
         Self {
             expected_records,
             observed_records: RecordMultisetFingerprint::default(),
+            adjacencies_checked: 0,
         }
+    }
+
+    fn verify_adjacent(
+        &mut self,
+        previous_key: &[u8],
+        previous_ordinal: u64,
+        current_key: &[u8],
+        current_ordinal: u64,
+    ) -> Result<(), QuarryError> {
+        if previous_key == current_key && current_ordinal <= previous_ordinal {
+            return Err(invalid_sort_output(
+                "sorted output changed equal-key row order",
+            ));
+        }
+        self.adjacencies_checked = self.adjacencies_checked.saturating_add(1);
+        Ok(())
     }
 
     fn observe(&mut self, record: &[u8], inserted_ending: &[u8]) -> Result<(), QuarryError> {
@@ -631,25 +649,16 @@ impl OutputVerifier {
                 "sorted output did not preserve the effective record multiset",
             ));
         }
+        if self.adjacencies_checked != self.observed_records.count.saturating_sub(1) {
+            return Err(invalid_sort_output(
+                "sorted output did not verify every adjacent row",
+            ));
+        }
         Ok(SortVerification {
             record_multiset_verified: true,
             stable_ties_verified: true,
         })
     }
-}
-
-fn verify_adjacent_tie_order(
-    previous_key: &[u8],
-    previous_ordinal: u64,
-    current_key: &[u8],
-    current_ordinal: u64,
-) -> Result<(), QuarryError> {
-    if previous_key == current_key && current_ordinal <= previous_ordinal {
-        return Err(invalid_sort_output(
-            "sorted output changed equal-key row order",
-        ));
-    }
-    Ok(())
 }
 
 fn hash_bytes(bytes: &[u8], domain: u64) -> u64 {
@@ -670,6 +679,12 @@ struct ScanSummary {
     runs: Vec<PathBuf>,
     rows: u64,
     records: RecordMultisetFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuilderStep {
+    Complete,
+    Cancelled,
 }
 
 struct InitialRunBuilder<'a> {
@@ -726,7 +741,7 @@ impl<'a> InitialRunBuilder<'a> {
         }
     }
 
-    fn process(&mut self, record: &[u8], physical_row: u64) -> Result<(), QuarryError> {
+    fn process(&mut self, record: &[u8], physical_row: u64) -> Result<BuilderStep, QuarryError> {
         if record.len() > self.config.max_record_bytes {
             return Err(QuarryError::RecordTooLarge {
                 limit: self.config.max_record_bytes,
@@ -779,7 +794,7 @@ impl<'a> InitialRunBuilder<'a> {
             }
             self.header = Some(header);
             self.shared.header_rows.store(1, Ordering::Release);
-            return Ok(());
+            return Ok(BuilderStep::Complete);
         }
 
         let row_edits: Vec<(usize, &[u8])> = self
@@ -828,8 +843,9 @@ impl<'a> InitialRunBuilder<'a> {
             .saturating_add(24);
         if !self.entries.is_empty()
             && self.entry_bytes.saturating_add(entry_size) > self.config.run_memory_bytes
+            && self.flush()? == BuilderStep::Cancelled
         {
-            self.flush()?;
+            return Ok(BuilderStep::Cancelled);
         }
         self.records.observe(&effective_record);
         self.entries.push(RunEntry {
@@ -840,19 +856,19 @@ impl<'a> InitialRunBuilder<'a> {
         self.entry_bytes = self.entry_bytes.saturating_add(entry_size);
         self.rows = self.rows.saturating_add(1);
         self.shared.rows_sorted.store(self.rows, Ordering::Release);
-        Ok(())
+        Ok(BuilderStep::Complete)
     }
 
-    fn flush(&mut self) -> Result<(), QuarryError> {
+    fn flush(&mut self) -> Result<BuilderStep, QuarryError> {
         if self.entries.is_empty() {
-            return Ok(());
+            return Ok(BuilderStep::Complete);
         }
         self.entries
             .sort_by(|left, right| compare_entries(left, right, self.spec.direction));
         let (path, mut writer) = self.workspace.create_run()?;
         for entry in self.entries.drain(..) {
             if self.shared.cancel_requested.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(BuilderStep::Cancelled);
             }
             let bytes = write_entry(&mut writer, &entry)?;
             self.shared.add_temporary_bytes(bytes);
@@ -861,10 +877,10 @@ impl<'a> InitialRunBuilder<'a> {
         self.runs.push(path);
         self.entry_bytes = 0;
         self.shared.runs_created.fetch_add(1, Ordering::AcqRel);
-        Ok(())
+        Ok(BuilderStep::Complete)
     }
 
-    fn finish(mut self, physical_rows: u64) -> Result<ScanSummary, QuarryError> {
+    fn finish(mut self, physical_rows: u64) -> Result<ScanOutcome, QuarryError> {
         if self.has_header && self.header.is_none() {
             return Err(QuarryError::InvalidOption(
                 "source does not contain a header row",
@@ -877,14 +893,16 @@ impl<'a> InitialRunBuilder<'a> {
         {
             return Err(QuarryError::InvalidOption("cell edit row is out of range"));
         }
-        self.flush()?;
-        Ok(ScanSummary {
+        if self.flush()? == BuilderStep::Cancelled {
+            return Ok(ScanOutcome::Cancelled);
+        }
+        Ok(ScanOutcome::Complete(ScanSummary {
             header: self.header,
             preferred_ending: self.preferred_ending,
             runs: self.runs,
             rows: self.rows,
             records: self.records,
-        })
+        }))
     }
 }
 
@@ -935,8 +953,12 @@ fn create_initial_runs(
             let finish_result = scanner.finish(absolute_start, |_| {
                 if shared.cancel_requested.load(Ordering::Acquire) {
                     cancelled = true;
-                } else if let Err(error) = builder.process(&record, physical_row) {
-                    deferred_error = Some(error);
+                } else {
+                    match builder.process(&record, physical_row) {
+                        Ok(BuilderStep::Complete) => {}
+                        Ok(BuilderStep::Cancelled) => cancelled = true,
+                        Err(error) => deferred_error = Some(error),
+                    }
                 }
                 record.clear();
                 physical_row = physical_row.saturating_add(1);
@@ -951,7 +973,7 @@ fn create_initial_runs(
                 return Err(error);
             }
             finish_result?;
-            return builder.finish(physical_row).map(ScanOutcome::Complete);
+            return builder.finish(physical_row);
         }
 
         let mut segment_start = 0_usize;
@@ -968,8 +990,12 @@ fn create_initial_runs(
                         deferred_error = Some(QuarryError::RecordTooLarge {
                             limit: config.max_record_bytes,
                         });
-                    } else if let Err(error) = builder.process(&record, physical_row) {
-                        deferred_error = Some(error);
+                    } else {
+                        match builder.process(&record, physical_row) {
+                            Ok(BuilderStep::Complete) => {}
+                            Ok(BuilderStep::Cancelled) => cancelled = true,
+                            Err(error) => deferred_error = Some(error),
+                        }
                     }
                 }
             }
@@ -1310,7 +1336,7 @@ fn merge_runs_to_output(
             return Ok(None);
         }
         if let Some(previous) = pending.take() {
-            verify_adjacent_tie_order(
+            verifier.verify_adjacent(
                 &previous.key,
                 previous.ordinal,
                 &item.head.key,
@@ -1711,12 +1737,71 @@ mod tests {
 
     #[test]
     fn adjacent_tie_verifier_rejects_reordered_equal_key_ordinals() {
-        let error = verify_adjacent_tie_order(b"same", 1, b"same", 0).unwrap_err();
+        let mut verifier = OutputVerifier::new(RecordMultisetFingerprint::default());
+        let error = verifier
+            .verify_adjacent(b"same", 1, b"same", 0)
+            .unwrap_err();
         assert!(matches!(
             error,
             QuarryError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData
         ));
         assert!(error.to_string().contains("changed equal-key row order"));
+    }
+
+    #[test]
+    fn output_verifier_rejects_a_missing_adjacency_check() {
+        let mut expected = RecordMultisetFingerprint::default();
+        expected.observe(b"first\n");
+        expected.observe(b"second\n");
+        let mut verifier = OutputVerifier::new(expected);
+        verifier.observe(b"first\n", b"").unwrap();
+        verifier.observe(b"second\n", b"").unwrap();
+
+        let error = verifier.finish().unwrap_err();
+        assert!(matches!(
+            error,
+            QuarryError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("did not verify every adjacent row")
+        );
+    }
+
+    #[test]
+    fn initial_run_flush_cancellation_propagates_as_cancelled() {
+        let directory = case();
+        let destination = directory.join("sorted.csv");
+        let workspace = RunWorkspace::create(&destination).unwrap();
+        let shared = SharedState::new(4);
+        let header_renames = BTreeMap::new();
+        let cell_edits = BTreeMap::new();
+        let mut builder = InitialRunBuilder::new(
+            b',',
+            false,
+            &header_renames,
+            &cell_edits,
+            SortSpec {
+                column: 0,
+                direction: SortDirection::Ascending,
+            },
+            false,
+            SortConfig {
+                run_memory_bytes: 1024,
+                ..tiny_config()
+            },
+            &workspace,
+            &shared,
+        );
+        assert_eq!(builder.process(b"b\n", 0).unwrap(), BuilderStep::Complete);
+        assert_eq!(builder.process(b"a\n", 1).unwrap(), BuilderStep::Complete);
+        shared.request_cancel();
+
+        assert!(matches!(builder.finish(2).unwrap(), ScanOutcome::Cancelled));
+        workspace.cleanup().unwrap();
+        assert!(sort_artifacts(&directory).is_empty());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
