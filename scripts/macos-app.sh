@@ -15,6 +15,7 @@ LEGACY_BACKUP_ARCHIVE="$BACKUP_DIR/Quarry-Egui-legacy.zip"
 PLIST_TEMPLATE="$ROOT/packaging/macos/Info.plist"
 ICON_SOURCE="$ROOT/assets/quarry-logo-v3.png"
 LOCK_FILE="/private/tmp/$BUNDLE_ID.$UID.lock"
+APP_INSTALL_LOCK_FILE="/private/tmp/$BUNDLE_ID.$UID.install.lock"
 PACKAGE_STAGE=""
 INSTALL_STAGE=""
 INSTALL_PREVIOUS=""
@@ -103,8 +104,14 @@ require_app_closed() {
 
 run_with_lock() {
     [[ "${QUARRY_PACKAGE_LOCKED:-}" == 1 ]] && return
-    exec /usr/bin/lockf -t 0 "$LOCK_FILE" \
+    exec /usr/bin/lockf -k -t 0 "$LOCK_FILE" \
         /usr/bin/env QUARRY_PACKAGE_LOCKED=1 "$0" "$@"
+}
+
+acquire_app_install_lock() {
+    exec 9>>"$APP_INSTALL_LOCK_FILE" \
+        || fail "could not open the application installation lock."
+    /usr/bin/lockf -s -t 0 9 || fail "Quit Quarry before installing an update."
 }
 
 backup_app() {
@@ -202,6 +209,7 @@ package_app() {
 install_app() {
     local candidate
 
+    acquire_app_install_lock
     require_app_closed
     [[ -d /Applications && -w /Applications ]] || fail "/Applications is not writable for this account."
     package_app

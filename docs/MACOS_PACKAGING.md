@@ -47,10 +47,10 @@ The command performs a locked release build, creates
 icon, applies an ad-hoc signature without a timestamp, and verifies the bundle.
 It rechecks the Git revision and working state after compilation and stops if
 either changed during the build.
-Two consecutive runs from the same checkout, Rust toolchain, and macOS SDK
-produced identical plist, executable, and icon payload hashes. Because the Rust
-channel and macOS SDK are not pinned by this workflow, this is not a claim of
-byte-identical output across machines or toolchain updates.
+Two consecutive runs from the same checkout, pinned Rust 1.88.0 toolchain, and
+macOS SDK produced identical plist, executable, and icon payload hashes. The
+runner-provided macOS SDK is not pinned, so this is not a claim of byte-identical
+output across machines or SDK updates.
 
 Verify a packaged candidate again with:
 
@@ -66,7 +66,8 @@ Verify a packaged candidate again with:
 
 The installer:
 
-1. Acquires the exclusive per-user package and installation lock.
+1. Acquires the exclusive per-user package lock and the application installation
+   lock that every current Quarry process holds in shared mode.
 2. Refuses to continue while Quarry or the legacy prototype is running.
 3. Builds and verifies a fresh candidate.
 4. If a current app exists, saves it as a verified rollback archive.
@@ -80,6 +81,9 @@ The installer:
 
 Concurrent package or install commands from the same user fail without touching
 shared candidates, backups, or the installed application.
+Quarry also fails closed when launched during installation, before opening a
+window or reading an input file. Process-name checks remain for legacy builds
+that do not yet participate in the installation lock.
 An existing canonical or legacy bundle that fails validation is also left
 untouched, and the update stops.
 

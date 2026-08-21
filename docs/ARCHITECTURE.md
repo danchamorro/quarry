@@ -392,10 +392,17 @@ The package command performs a locked release build, injects the Cargo version,
 full-history commit-count build number, full commit, source status, and
 architecture, converts the checked-in logo to `Quarry.icns`, applies an ad-hoc
 signature, and strictly verifies the candidate. The CI macOS job runs the same
-command. Matching payload hashes are expected only from the same checkout, Rust
-toolchain, and macOS SDK; the workflow does not pin those external inputs.
-The package and install commands share a per-user native file lock, and the
-packager rejects a checkout that changes while Cargo is building.
+command. Matching payload hashes are expected only from the same checkout,
+pinned Rust 1.88.0 toolchain, and macOS SDK; the workflow does not pin the
+runner-provided SDK. The package and install commands share a per-user native
+file lock, and the packager rejects a checkout that changes while Cargo is
+building.
+
+The egui app holds a shared per-user installation lock for its process lifetime,
+while installation holds the exclusive form through replacement and rollback.
+This prevents a participating app from starting during a bundle swap. Process
+name checks remain as a migration guard for legacy builds that predate the
+cooperative lock.
 
 Installation copies the verified candidate beside the final destination,
 verifies it again, then swaps it into the canonical path. When a prior installed

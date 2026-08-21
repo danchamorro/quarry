@@ -47,9 +47,9 @@ Quarry is not trying to become a generic IDE or spreadsheet. Feature proposals s
 ## Suggested local workflow
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-cargo build --workspace --release
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --release --locked
 ```
 
 These commands match the required CI checks and release-build validation.

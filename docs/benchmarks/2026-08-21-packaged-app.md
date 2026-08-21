@@ -5,9 +5,10 @@
 The repeatable package workflow, canonical installation, rollback archive,
 strict signature verification, installed-app interaction journey, and clean
 release gate pass. Commit `493b20d521e116be5eb327f8a38bc042608daf11`
-was packaged and installed with `QuarrySourceStatus=clean` and the same value in
-`QuarryGitRevision`. This evidence update is documentation-only and follows the
-validated implementation commit.
+was packaged and installed with `QuarrySourceStatus=clean` and
+`QuarryGitRevision` equal to commit
+`493b20d521e116be5eb327f8a38bc042608daf11`. This evidence update is
+documentation-only and follows the validated implementation commit.
 
 ## Environment
 

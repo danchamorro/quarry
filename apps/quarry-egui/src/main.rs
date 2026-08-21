@@ -2,6 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use std::fs::{File, OpenOptions as FsOpenOptions};
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
 use quarry_core::{
@@ -40,7 +45,41 @@ const STRUCTURAL_POSITION_INPUT_ID: &str = "quarry-structural-position-input";
 const SOURCE_CHANGED_NOTICE: &str =
     "The source file changed outside Quarry. Discard changes and reopen it.";
 
+#[cfg(target_os = "macos")]
+fn acquire_install_lock_at(path: &Path) -> std::io::Result<File> {
+    let file = FsOpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    // SAFETY: flock only reads the valid descriptor owned by `file`.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        Ok(file)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_install_lock() -> std::io::Result<File> {
+    // SAFETY: geteuid has no preconditions and does not dereference memory.
+    let user_id = unsafe { libc::geteuid() };
+    acquire_install_lock_at(Path::new(&format!(
+        "/private/tmp/{APP_ID}.{user_id}.install.lock"
+    )))
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "macos")]
+    let _install_lock = match acquire_install_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("Quarry cannot start while an update is in progress: {error}");
+            return Ok(());
+        }
+    };
+
     let started = Instant::now();
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
@@ -6448,6 +6487,30 @@ mod tests {
         select_column, selected_split_column, selection_text, show_column_manager,
         show_filter_manager, show_grid, show_structural_dialog, sort_merge_progress,
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_install_lock_excludes_bundle_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("install.lock");
+        let app_lock = super::acquire_install_lock_at(&path).unwrap();
+        let blocked = std::process::Command::new("/usr/bin/lockf")
+            .args(["-k", "-s", "-t", "0"])
+            .arg(&path)
+            .arg("/usr/bin/true")
+            .status()
+            .unwrap();
+        assert_eq!(blocked.code(), Some(75));
+
+        drop(app_lock);
+        let acquired = std::process::Command::new("/usr/bin/lockf")
+            .args(["-k", "-s", "-t", "0"])
+            .arg(&path)
+            .arg("/usr/bin/true")
+            .status()
+            .unwrap();
+        assert!(acquired.success());
+    }
 
     fn click_accessible_button(
         label: &str,
