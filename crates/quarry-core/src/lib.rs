@@ -2,6 +2,7 @@ mod export;
 mod filter;
 mod index;
 mod search;
+mod sort;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -16,9 +17,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub use export::{
     ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress,
-    FilterExportSummary, MAX_TRANSFORMATION_COLUMNS, SaveAsJob, SaveAsOutcome, SaveAsProgress,
-    SaveAsSummary, SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress,
-    SplitAnalysisSummary,
+    FilterExportSummary, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob,
+    ReplaceAllOutcome, ReplaceAllSummary, SaveAsJob, SaveAsOutcome, SaveAsProgress, SaveAsSummary,
+    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, SplitAnalysisSummary,
 };
 pub use filter::{
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
@@ -27,6 +28,10 @@ pub use filter::{
 pub use index::{Checkpoint, IndexConfig, IndexJob, IndexProgress, StructuralIndex};
 use quarry_delimited::{ParseError, RecordScanner, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
+pub use sort::{
+    SortDirection, SortJob, SortOutcome, SortProgress, SortSpec, SortSummary,
+    estimate_sort_temporary_bytes,
+};
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
 const DEFAULT_BOOTSTRAP_LIMIT: usize = 64 * 1024 * 1024;

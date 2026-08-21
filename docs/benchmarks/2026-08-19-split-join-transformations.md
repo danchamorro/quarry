@@ -47,6 +47,10 @@ source hash unchanged.
   the combined value at the leftmost selected position, and removes the
   selected originals. Its literal separator may be empty. The desktop keeps the
   leftmost selected current header for the joined result.
+- Move and Delete later added `ColumnTransformation::Arrange` to this same
+  materialization worker. Arrange retains unique known source columns in an
+  explicit output order and appends any undiscovered trailing ragged fields.
+  It was not part of these historical timed CLI runs.
 - In the desktop, Split keeps the source header on the first result and creates
   blank editable headers for additional results. The benchmark commands use
   explicit deterministic fixture headers so exact historical output hashes
@@ -172,7 +176,9 @@ Core and CLI regressions cover:
   data rather than a raw file prefix;
 - a headerless, no-final-newline Join of two empty fields that serializes as
   `""` so reopening retains one empty record rather than a zero-byte file;
-- sparse header/cell overlays applying before transformation;
+- Arrange reorder and deletion, missing-field padding, undiscovered trailing
+  ragged-field preservation, unchanged source bytes, temporary-file cleanup,
+  and sparse header/cell overlays applying before transformation;
 - invalid, duplicate, or oversized column specifications and serialized-record
   limits; and
 - cancellation with neither destination nor temporary output left behind.
@@ -206,4 +212,11 @@ a time, and uses the same 65,536-column structural trust limit as the core and
 CLI. Desktop repetition is outside these one-operation measurements. The
 private working CSV uses disk space proportional to the current document, plus
 one adjacent working copy when retained for one-level structural Undo or Redo.
-This slice does not provide output reorder/drop or overlay-aware find/replace.
+Move and Delete reuse the measured worker and have exact core regression
+coverage, but no separate 1 GB or 12 GB timing is claimed for Arrange.
+Replace All later reused the same bounded private rewrite worker, progress,
+cancellation, guarded publication, and working-copy lifecycle. Exact core and
+desktop regressions cover overlay-first replacement, non-overlapping matches,
+no-match behavior, record limits, cancellation, cleanup, accessibility, and
+Undo. This historical report does not claim separate 1 GB or 12 GB Replace All
+timings.

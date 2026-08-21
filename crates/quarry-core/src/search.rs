@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -88,6 +89,7 @@ pub struct SearchJob {
 }
 
 impl SearchJob {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         path: PathBuf,
         file_size: u64,
@@ -95,8 +97,17 @@ impl SearchJob {
         needle: Vec<u8>,
         start: SearchPosition,
         checkpoint: Checkpoint,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
         max_record_bytes: usize,
     ) -> Result<Self, QuarryError> {
+        if cell_edits
+            .values()
+            .any(|value| value.len() > max_record_bytes)
+        {
+            return Err(QuarryError::RecordTooLarge {
+                limit: max_record_bytes,
+            });
+        }
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(checkpoint.offset))?;
         let shared = Arc::new(SharedState::new(
@@ -113,6 +124,7 @@ impl SearchJob {
                     &needle,
                     start,
                     checkpoint,
+                    &cell_edits,
                     max_record_bytes,
                     &worker_state,
                 );
@@ -177,10 +189,21 @@ impl Session {
         needle: Vec<u8>,
         start: SearchPosition,
     ) -> Result<SearchJob, QuarryError> {
+        self.start_search_with_cell_edits(index, needle, start, BTreeMap::new())
+    }
+
+    pub fn start_search_with_cell_edits(
+        &self,
+        index: &StructuralIndex,
+        needle: Vec<u8>,
+        start: SearchPosition,
+        mut cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+    ) -> Result<SearchJob, QuarryError> {
         if needle.is_empty() {
             return Err(QuarryError::InvalidOption("search query must not be empty"));
         }
         let data_start = u64::from(self.dialect.has_header);
+        cell_edits.retain(|(row, _), _| *row >= data_start);
         let start = if start.row < data_start {
             SearchPosition {
                 row: data_start,
@@ -197,17 +220,20 @@ impl Session {
             needle,
             start,
             checkpoint,
+            cell_edits,
             DEFAULT_MAX_RECORD_BYTES,
         )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_search(
     mut file: File,
     delimiter: u8,
     needle: &[u8],
     start: SearchPosition,
     checkpoint: Checkpoint,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     max_record_bytes: usize,
     shared: &SharedState,
 ) -> Result<SearchOutcome, QuarryError> {
@@ -238,9 +264,15 @@ fn run_search(
                             limit: max_record_bytes,
                         });
                     }
-                    if let Some(found) =
-                        find_record(&finder, &record, delimiter, row_number, record_start, start)?
-                    {
+                    if let Some(found) = find_record(
+                        &finder,
+                        &record,
+                        delimiter,
+                        row_number,
+                        record_start,
+                        start,
+                        cell_edits,
+                    )? {
                         return Ok(SearchOutcome::Match(found));
                     }
                 }
@@ -274,6 +306,7 @@ fn run_search(
                             row_number,
                             record_start,
                             start,
+                            cell_edits,
                         ) {
                             Ok(result) => found = result,
                             Err(error) => deferred_error = Some(error),
@@ -324,6 +357,7 @@ fn find_record(
     row: u64,
     record_offset: u64,
     start: SearchPosition,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
 ) -> Result<Option<SearchMatch>, QuarryError> {
     let first_column = if row == start.row { start.column } else { 0 };
     let fields = parse_source_record(record, delimiter, row)?;
@@ -331,7 +365,12 @@ fn find_record(
         .iter()
         .enumerate()
         .skip(first_column)
-        .find(|(_, field)| finder.find(field.as_ref()).is_some())
+        .find(|(column, field)| {
+            let value = cell_edits
+                .get(&(row, *column))
+                .map_or_else(|| field.as_ref(), Vec::as_slice);
+            finder.find(value).is_some()
+        })
         .map(|(column, _)| SearchMatch {
             row,
             column,
@@ -341,6 +380,7 @@ fn find_record(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs::{self, File};
     use std::io::Write;
     use std::sync::Arc;
@@ -495,6 +535,76 @@ mod tests {
     }
 
     #[test]
+    fn search_uses_sparse_cell_edits_as_effective_values() {
+        let path = fixture(b"left,right\nsource-hit,plain\nother,source-only\n");
+        let (session, index) = session_and_index(&path, true);
+        let edits = BTreeMap::from([
+            ((1, 0), b"edited".to_vec()),
+            ((2, 1), b"overlay-hit".to_vec()),
+        ]);
+
+        assert_eq!(
+            session
+                .start_search_with_cell_edits(
+                    &index,
+                    b"source-hit".to_vec(),
+                    SearchPosition { row: 0, column: 0 },
+                    edits.clone(),
+                )
+                .unwrap()
+                .wait()
+                .unwrap(),
+            SearchOutcome::NotFound
+        );
+        assert!(matches!(
+            session
+                .start_search_with_cell_edits(
+                    &index,
+                    b"overlay-hit".to_vec(),
+                    SearchPosition { row: 0, column: 0 },
+                    edits,
+                )
+                .unwrap()
+                .wait()
+                .unwrap(),
+            SearchOutcome::Match(super::SearchMatch {
+                row: 2,
+                column: 1,
+                ..
+            })
+        ));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn search_ignores_cell_edits_without_existing_data_cells() {
+        let path = fixture(b"header\nvalue\n");
+        let (session, index) = session_and_index(&path, true);
+        let edits = BTreeMap::from([
+            ((0, 0), b"impossible-hit".to_vec()),
+            ((1, 9), b"impossible-hit".to_vec()),
+            ((99, 0), b"impossible-hit".to_vec()),
+        ]);
+
+        assert_eq!(
+            session
+                .start_search_with_cell_edits(
+                    &index,
+                    b"impossible-hit".to_vec(),
+                    SearchPosition { row: 0, column: 0 },
+                    edits,
+                )
+                .unwrap()
+                .wait()
+                .unwrap(),
+            SearchOutcome::NotFound
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn searches_unterminated_final_record_from_a_checkpoint() {
         let path = fixture(b"a,b\r\nc,target");
         let session = Session::open(
@@ -553,6 +663,7 @@ mod tests {
             b"missing",
             SearchPosition { row: 0, column: 0 },
             Checkpoint { row: 0, offset: 0 },
+            &BTreeMap::new(),
             DEFAULT_MAX_RECORD_BYTES,
             &shared,
         )
@@ -601,6 +712,7 @@ mod tests {
             b"missing".to_vec(),
             SearchPosition { row: 0, column: 0 },
             checkpoint,
+            BTreeMap::new(),
             8,
         )
         .unwrap();
@@ -613,6 +725,20 @@ mod tests {
             Err(QuarryError::RecordTooLarge { limit: 8 })
         ));
         assert_eq!(DEFAULT_MAX_RECORD_BYTES, 64 * 1024 * 1024);
+
+        assert!(matches!(
+            SearchJob::start(
+                session.path().to_path_buf(),
+                session.file_size,
+                session.dialect.delimiter,
+                b"missing".to_vec(),
+                SearchPosition { row: 0, column: 0 },
+                checkpoint,
+                BTreeMap::from([((0, 0), vec![b'x'; 9])]),
+                8,
+            ),
+            Err(QuarryError::RecordTooLarge { limit: 8 })
+        ));
 
         fs::remove_file(path).unwrap();
     }
