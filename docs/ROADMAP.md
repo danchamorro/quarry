@@ -13,6 +13,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
 | Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover selected-column Move/Delete, overlay-aware Find Next, and Replace in Cell; bounded Replace All reuses the measured private rewrite worker |
 | Phase 6: Sorting | Complete | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup |
+| Phase 7: Hardening | In progress | Phase 7A repeatable packaging, canonical installation, rollback archive, and the installed-app journey pass in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); the clean committed release install remains |
 
 ### Phase 1 checklist
 
@@ -110,6 +111,8 @@ Replace in Cell, and bounded Replace All use effective unsaved cell values.
 Cosmetic redesign remains outside the current scope.
 Phase 6 is complete. Stable, selected-column text sorting works in the ordinary
 editable grid and passed the deterministic 1 GB and 12 GB release gate.
+Phase 7A has one repeatable macOS package command and one canonical installed
+application. Its final clean committed release install remains.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -175,8 +178,7 @@ edits or transformations without building a file-sized in-memory model.
 One-level structural Undo and Redo reopen the preceding or subsequent document
 version.
 
-**Next:** begin Phase 7A with reproducible desktop packaging and one canonical
-installed Quarry application.
+**Next:** complete the Phase 7A clean committed package and installation gate.
 
 ### Phase 5 checklist
 
@@ -293,19 +295,30 @@ performance runs, benchmark dashboard.
 
 ### Phase 7A checklist: desktop packaging and installation
 
-- [ ] Build the release binary and `.app` bundle through one reproducible
-  command with versioned bundle metadata.
-- [ ] Install or update one canonical `/Applications/Quarry Egui.app` without
-  leaving another bundle with the same application identity active.
-- [ ] Sign the packaged app consistently; add notarization once the required
-  Apple Developer identity and credentials are available.
-- [ ] Smoke-test opening, editing, sorting, Save As, and relaunch from the
-  installed app rather than the build directory.
-- [ ] Document installation, update, verification, and rollback steps.
+- [x] Build the locked release binary and `target/package/Quarry.app` candidate
+  through one repeatable command with stable name, identifier, executable,
+  icon, version, build number, commit, source status, and architecture metadata.
+- [x] Install or update only canonical `/Applications/Quarry.app`; when a prior
+  app exists, preserve a verified rollback archive outside `/Applications` and
+  restore it on failure. Remove legacy and staging bundles after verification.
+- [x] Apply and strictly verify a consistent ad-hoc signature. Add Developer ID
+  signing and notarization only when the required identity and credentials are
+  available.
+- [x] Smoke-test opening, inline editing, stable sorting, Save As, exact source
+  preservation, exact output, quit, relaunch, and reopen from the installed app.
+- [x] Document package, installation, update, verification, rollback, and
+  signing limits in the [macOS packaging guide](MACOS_PACKAGING.md).
+- [ ] Commit Phase 7A, rebuild and install from that clean source, and verify
+  `QuarrySourceStatus=clean` with `QuarryGitRevision` equal to the release commit.
 
-**Phase 7A exit:** the installed desktop app is reproducible, identifies its
-build, launches the current binary from one canonical location, and passes the
-packaged-app smoke test.
+**Phase 7A exit:** the package workflow is repeatable from the same checkout,
+Rust toolchain, and macOS SDK. The installed app identifies its build, launches
+the current binary from one canonical location, and passes the packaged-app
+smoke test.
+
+**Phase 7A exit pending:** all functional and interaction checks pass in the
+[packaged-app validation](benchmarks/2026-08-21-packaged-app.md). The clean
+committed package and installation check remains.
 
 ## Later possibilities
 Cross-platform front ends, plugin/API surface, schema inference, SQL-like querying, compressed files, CLI recipes, multi-file operations.

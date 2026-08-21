@@ -25,6 +25,7 @@ const SCROLLBAR_WIDTH: f32 = 18.0;
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 const MAX_VISIBLE_COLUMNS: usize = 32;
 const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
+const APP_ID: &str = "io.github.danchamorro.quarry";
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PATH_INPUT_ID: &str = "quarry-path-input";
 const JUMP_INPUT_ID: &str = "quarry-jump-input";
@@ -44,7 +45,7 @@ fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_app_id("com.quarry.egui-prototype")
+            .with_app_id(APP_ID)
             .with_inner_size([1280.0, 780.0])
             .with_min_inner_size([860.0, 540.0]),
         centered: true,

@@ -380,6 +380,36 @@ because even a header rename can shift every later byte offset. Unchanged
 records remain byte-preserving where possible; edited records are serialized
 with the document dialect.
 
+## macOS packaging and application identity
+
+The internal `quarry-egui` release binary is packaged as the customer-facing
+`/Applications/Quarry.app`. The stable bundle identifier is
+`io.github.danchamorro.quarry`, and the bundle executable is `Quarry`.
+`packaging/macos/Info.plist`, `assets/quarry-logo-v3.png`, and
+`scripts/macos-app.sh` are the versioned packaging inputs.
+
+The package command performs a locked release build, injects the Cargo version,
+full-history commit-count build number, full commit, source status, and
+architecture, converts the checked-in logo to `Quarry.icns`, applies an ad-hoc
+signature, and strictly verifies the candidate. The CI macOS job runs the same
+command. Matching payload hashes are expected only from the same checkout, Rust
+toolchain, and macOS SDK; the workflow does not pin those external inputs.
+The package and install commands share a per-user native file lock, and the
+packager rejects a checkout that changes while Cargo is building.
+
+Installation copies the verified candidate beside the final destination,
+verifies it again, then swaps it into the canonical path. When a prior installed
+app exists, it remains available for in-operation restoration and a verified
+zip archive is retained under `~/Library/Application Support/Quarry/Backups`.
+The installed plist and signed executable must exactly match the candidate.
+After success, the installer removes any legacy app and staged candidate so
+LaunchServices has one active application with the canonical identity.
+
+Build artifacts under `target` are not acceptance-test applications. Packaged
+interaction checks launch `/Applications/Quarry.app`. Developer ID signing,
+hardened runtime, notarization, stapling, and Gatekeeper assessment remain a
+later distribution boundary.
+
 ## UI selection
 [ADR 0003](adr/0003-select-egui-ui.md) records the measured egui and AppKit
 bake-off. It selects egui while keeping core independent of the UI. AppKit stays

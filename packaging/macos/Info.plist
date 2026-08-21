@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Quarry</string>
+	<key>CFBundleExecutable</key>
+	<string>Quarry</string>
+	<key>CFBundleIconFile</key>
+	<string>Quarry.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.danchamorro.quarry</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Quarry</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>QuarryArchitecture</key>
+	<string>unknown</string>
+	<key>QuarryGitRevision</key>
+	<string>unknown</string>
+	<key>QuarrySourceStatus</key>
+	<string>unknown</string>
+</dict>
+</plist>

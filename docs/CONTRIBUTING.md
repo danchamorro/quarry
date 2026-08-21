@@ -53,6 +53,17 @@ cargo build --workspace --release
 ```
 
 These commands match the required CI checks and release-build validation.
+Changes to macOS packaging, identity, icons, or bundle resources must also run:
+
+```bash
+./scripts/macos-app.sh self-test
+./scripts/macos-app.sh package
+./scripts/macos-app.sh verify target/package/Quarry.app
+```
+
+Installation is not part of the normal contributor loop. Maintainer release
+validation follows the installed-app checklist in
+[`MACOS_PACKAGING.md`](MACOS_PACKAGING.md).
 
 ## Pull requests
 Keep changes focused. Explain the problem, design, tradeoffs, tests, and performance impact. Screenshots are useful for UI work; benchmark tables are useful for engine work.
