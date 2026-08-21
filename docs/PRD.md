@@ -45,7 +45,7 @@ the viewer encounters them.
 
 Phase 5 has delivered direct in-grid header and existing data-cell editing,
 sparse unsaved document state, atomic Save with metadata-based conflict
-detection, no-clobber Save As, and repeatable Split and Join edits applied from
+detection, no-clobber Save As, and repeatable Split and Combine edits applied from
 selected grid columns. Each confirmed operation materializes a private CSV and
 reopens it as the ordinary editable working copy. Explicit output reorder/drop
 and overlay-aware find/replace remain.
@@ -70,7 +70,7 @@ non-empty literal separator. Quarry derives the resulting width from the
 current data plus sparse edits, keeps the original header on the first result,
 and creates blank editable headers for additional results. If the separator is
 absent from the selected column, the operation reports that no split is
-possible and leaves the document unchanged. Join combines at least two
+possible and leaves the document unchanged. Combine merges at least two
 selected columns in document order with a literal separator that may be empty,
 inserts the result at the leftmost selected position, keeps that position's
 current header, and removes the selected originals. Both operations renumber
@@ -128,7 +128,7 @@ Initial targets:
 - Initial viewing memory: under 500 MB target.
 - No RAM growth proportional to file size during read-only viewing.
 - Responsive UI during indexing, search, filtering, filtered navigation,
-  export, editing, Split, and Join.
+  export, editing, Split, and Combine.
 - Streaming Save and Save As with memory bounded by scanner limits and the
   sparse edit set rather than source-file size.
 - Long operations cancellable.

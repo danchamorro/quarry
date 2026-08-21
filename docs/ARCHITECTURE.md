@@ -16,6 +16,8 @@ quarry-core
    +-- Bounded filtered-row read worker
    +-- Streaming filtered-export worker
    +-- Streaming edited Save and Save As worker
+   +-- Split analysis worker
+   +-- Streaming structural materialization worker
    |
 quarry-delimited
    +-- Record scanner
@@ -112,12 +114,13 @@ match, and at most a 64 MiB clipboard payload.
 cache remains deferred.
 
 Before a structural operation, unsaved cell and header values remain a sparse
-overlay on the active indexed CSV. A confirmed Split or Join does not stay as a
-lazy operation. A bounded worker materializes the operation and sparse overlay
-into a private working CSV, then Quarry reopens that file as the ordinary
-indexed document. Split first makes a cancellable analysis pass that retains
-only the current bounded record and width counters. The materialization pass
-retains a fixed read chunk, one bounded decoded record, and its output fields.
+overlay on the active indexed CSV. A confirmed Split or Combine does not stay
+as a lazy operation. A bounded worker materializes the operation and sparse
+overlay into a private working CSV, then Quarry reopens that file as the
+ordinary indexed document. Split first makes a cancellable analysis pass that
+retains only the current bounded record and width counters. The materialization
+pass retains a fixed read chunk, one bounded decoded record, and its output
+fields.
 RAM therefore grows with user changes, schema width, and record size rather
 than file size.
 
@@ -155,9 +158,9 @@ Search and filter workers scan the active indexed CSV rather than a sparse
 overlay. The viewer therefore disables new searches and filters while sparse
 cell or header edits exist and requires an active filter to be cleared before
 editing. This keeps displayed results from silently disagreeing with the
-unsaved document. Once a Split or Join has materialized and its private working
-CSV has been indexed, that file is the active searchable document. Overlay-aware
-search and filtering remain a later slice.
+unsaved document. Once a Split or Combine has materialized and its private
+working CSV has been indexed, that file is the active searchable document.
+Overlay-aware search and filtering remain a later slice.
 
 A `FilterQuery` owns one or more `FilterPredicate` values. Each predicate stores
 a source column, a case-sensitive contains or equality operator, and its literal
@@ -247,6 +250,11 @@ previous logical source unchanged.
 
 ## Column transformations
 
+The desktop calls the multi-column operation **Combine Columns…**, while
+`quarry-core` represents that operation as `ColumnTransformation::Join`. This
+section uses Combine for the user-facing operation and Join only for the engine
+variant.
+
 The numbered grid headers own structural selection. The context menu for one
 selected column offers **Split Columns…**; selecting at least two columns also
 offers **Combine Columns…**. Each command opens a compact modal prefilled from
@@ -260,14 +268,14 @@ schema. The original header stays on the first result, additional headers are
 blank and editable, and following columns move to their new one-based document
 positions. Rows with fewer parts receive empty fields. If no value contains the
 separator, Split reports that nothing can be split and does not materialize a
-new generation. Join reads the selected columns in document order, combines
+new generation. Combine reads the selected columns in document order, combines
 them with the separator, inserts the result at the leftmost selected position,
 and removes the selected originals. The result keeps the leftmost selected
 current header. Missing selected fields in ragged rows are empty, and the
 resulting header remains editable.
 
 OK starts the bounded background operation. Split performs its analysis pass,
-then Split or Join streams the current document into a newly reserved private
+then Split or Combine streams the current document into a newly reserved private
 working CSV. Only that one operation is evaluated during the stream. After the
 worker succeeds, Quarry opens and indexes the result as the normal editable
 grid. The user can edit the result or apply another Split or Combine command,

@@ -36,7 +36,8 @@ source hash unchanged.
 
 ## Persistence engine under test
 
-- The benchmark applies existing sparse header and cell edits before its
+- The timed benchmark commands use no sparse header or cell edits. Core
+  regressions separately verify that existing sparse edits apply before an
   isolated structural operation.
 - Split uses a non-empty literal separator, keeps the unsplit remainder in the
   final field, and pads rows with fewer parts using empty fields. The desktop
@@ -98,7 +99,7 @@ target/release/quarry-bench generate \
   --output fixtures/generated/search-1gb.csv --seed 1
 target/release/quarry-bench generate \
   --size 12GB --columns 11 --delimiter , \
-  --output generated-12gb.csv --seed 1
+  --output fixtures/generated/search-12gb.csv --seed 1
 ```
 
 Run Split independently on either fixture:
@@ -179,8 +180,8 @@ Core and CLI regressions cover:
 ## Acceptance
 
 - [x] Split and Join each stream without a file-sized output model.
-- [x] Header and cell overlays apply before each isolated persistence-engine
-  transformation.
+- [x] Core regressions confirm that header and cell overlays apply before each
+  isolated persistence-engine transformation.
 - [x] Header, resulting schema, record count, and first/middle/final data rows pass
   exact semantic validation on both deterministic datasets.
 - [x] Save As leaves each source unchanged and publishes only complete output.
