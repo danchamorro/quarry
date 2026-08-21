@@ -2,7 +2,7 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress: 2026-08-20
+## Current progress: 2026-08-21
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -11,7 +11,8 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 | Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
-| Phase 5: Direct editing and transformations | In progress | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); the desktop now applies repeatable Split and Combine commands from selected columns to the ordinary editable working copy; reorder/drop and overlay-aware find/replace remain |
+| Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover selected-column Move/Delete, overlay-aware Find Next, and Replace in Cell; bounded Replace All reuses the measured private rewrite worker |
+| Phase 6: Sorting | Complete | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup |
 
 ### Phase 1 checklist
 
@@ -100,10 +101,15 @@ pacing becomes measurable with the viewer-alpha grid.
 opening, format controls, literal search, copy, column controls, diagnostics,
 and an adaptive grid that keeps at least 40 rows visible in the maximized
 reference window.
-Phase 4 filtering and streaming filtered export are complete. Phase 5 now has
+Phase 4 filtering and streaming filtered export are complete. Phase 5 has
 direct in-grid header and data-cell editing, sparse streaming persistence, and
 repeatable selected-column Split and Combine commands in the ordinary editable
-grid. Cosmetic redesign remains outside the current scope.
+grid. Explicit Move and Delete use the same selected numbered columns and
+working-copy lifecycle while the Columns manager remains view-only. Find Next,
+Replace in Cell, and bounded Replace All use effective unsaved cell values.
+Cosmetic redesign remains outside the current scope.
+Phase 6 is complete. Stable, selected-column text sorting works in the ordinary
+editable grid and passed the deterministic 1 GB and 12 GB release gate.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -169,8 +175,8 @@ edits or transformations without building a file-sized in-memory model.
 One-level structural Undo and Redo reopen the preceding or subsequent document
 version.
 
-**Next:** add explicit output reorder/drop choices while keeping the Columns
-manager view-only.
+**Next:** begin Phase 7A with reproducible desktop packaging and one canonical
+installed Quarry application.
 
 ### Phase 5 checklist
 
@@ -214,26 +220,91 @@ manager view-only.
   cancellation, throughput, and peak RSS for the persistence engine on
   deterministic 1 GB and 12 GB datasets in the [split/join transformation
   validation](benchmarks/2026-08-19-split-join-transformations.md).
-- [ ] Add explicit output reorder/drop choices while keeping the Columns
-  manager view-only.
-- [ ] Add overlay-aware find/replace with bounded progress and cancellation.
+- [x] Add explicit **Move Selected Columns…** and **Delete Selected Columns**
+  actions to numbered-header context menus while keeping the Columns manager
+  view-only. Move the selection as one ordered block to a one-based destination
+  without changing history for an identity move. Reject deleting every known
+  column, preserve undiscovered trailing ragged fields, materialize through the
+  existing cancellable private working-copy path, and retain Save, Save As,
+  Discard, and structural Undo/Redo behavior. Exact Arrange regressions cover
+  semantics and source safety; the existing [Split/Join transformation
+  validation](benchmarks/2026-08-19-split-join-transformations.md) supplies the
+  shared worker's 1 GB and 12 GB bounded-memory and cancellation evidence.
+- [x] Make literal Find Next overlay-aware so unsaved cell values replace their
+  source values during matching. Add **Replace in Cell** for the current match
+  and a bounded, cancellable **Replace All** that applies sparse edits first,
+  skips the header, materializes a private working CSV, and participates in
+  Save, Save As, Discard, and one-level Undo/Redo. Replace All reuses the
+  private rewrite worker measured by the 1 GB and 12 GB persistence
+  validations; exact core and desktop regressions cover overlay-first
+  semantics, non-overlapping replacement, no-match, record limits,
+  cancellation, cleanup, accessibility, and change history.
 
 The Columns manager remains view-only and does not mark the document changed.
-Future output reorder/drop controls must be explicit and separate from that
-view arrangement. Hidden columns remain in output unless the user explicitly
-excludes them.
+Move and Delete are explicit and separate from that view arrangement. Hidden
+columns remain in output; to delete one, show it and select it explicitly.
 
-**Phase 5 exit:** direct edits and structural transformations remain responsive
-on the 12 GB reference file, unsaved changes cannot be lost silently, and Save
+**Phase 5 exit met:** direct edits, explicit output reorder/drop, overlay-aware
+Find Next, Replace in Cell, bounded Replace All, and structural transformations
+use workers with 1 GB and 12 GB bounded-memory evidence. Exact regressions own
+the newer feature semantics, unsaved changes cannot be lost silently, and Save
 and Save As never expose a partial or corrupted file.
 
 ## Phase 6 — Sorting
-Type semantics, external run generation, spill management, merge, stable row-order abstraction, disk-space estimation.
+
+Phase 6 is complete. Phase 6A lets users select exactly one numbered
+column and apply a stable ascending or descending, case-sensitive text sort to
+data rows while keeping the header fixed. Missing ragged fields compare as
+empty values, and equal keys retain their current row order. The implementation
+and deterministic 1 GB and 12 GB release evidence pass.
+
+### Phase 6A checklist
+
+- [x] Add an accessible **Sort Rows…** action with one selected column, order,
+  explicit text semantics, a temporary-disk estimate, Sort, and Cancel.
+- [x] Generate bounded in-memory runs, spill owner-only framed run files, and
+  merge them with bounded fan-in into a private sorted working CSV.
+- [x] Apply current sparse edits before key comparison and output, then reopen
+  the sorted result in the ordinary grid as Modified with existing Save, Save
+  As, Discard, and one-level Undo/Redo behavior.
+- [x] Preserve the source and current document on cancellation, failure, or a
+  source-stamp conflict, and remove every unpublished run and staging file.
+- [x] Cover stable ascending/descending order, quoted and multiline keys,
+  ragged rows, sparse overlays, forced multi-run merging, cancellation, cleanup,
+  accessibility, and change history with exact regressions.
+- [x] Record deterministic 1 GB and 12 GB time, peak RSS, peak temporary disk,
+  merge passes, exact row/header preservation, source hashes, and cancellation
+  latency before marking Phase 6A complete.
+
+**Phase 6A exit:** stable text sorting immediately appears in the editable grid,
+memory stays bounded with respect to file size, required temporary disk is
+clear before starting, and cancellation cannot expose a partial result.
+
+**Phase 6A exit met:** the [release validation](benchmarks/2026-08-21-stable-text-sort.md)
+records complete 1 GB and 12 GB success and cancellation runs. Peak RSS stays
+below 18 MiB, measured temporary disk stays below the conservative estimate,
+source hashes remain unchanged, and cancellation leaves no output or run files.
 
 ## Phase 7 — Hardening
 Persistent indexes, invalidation, malformed-data UX, encoding strategy,
 packaging/signing/notarization, accessibility audit, controlled cold-cache
 performance runs, benchmark dashboard.
+
+### Phase 7A checklist: desktop packaging and installation
+
+- [ ] Build the release binary and `.app` bundle through one reproducible
+  command with versioned bundle metadata.
+- [ ] Install or update one canonical `/Applications/Quarry Egui.app` without
+  leaving another bundle with the same application identity active.
+- [ ] Sign the packaged app consistently; add notarization once the required
+  Apple Developer identity and credentials are available.
+- [ ] Smoke-test opening, editing, sorting, Save As, and relaunch from the
+  installed app rather than the build directory.
+- [ ] Document installation, update, verification, and rollback steps.
+
+**Phase 7A exit:** the installed desktop app is reproducible, identifies its
+build, launches the current binary from one canonical location, and passes the
+packaged-app smoke test.
 
 ## Later possibilities
 Cross-platform front ends, plugin/API surface, schema inference, SQL-like querying, compressed files, CLI recipes, multi-file operations.

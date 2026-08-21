@@ -79,6 +79,26 @@ pub struct SaveAsProgress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralReplacement {
+    pub needle: Vec<u8>,
+    pub replacement: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceAllSummary {
+    pub destination: PathBuf,
+    pub bytes_written: u64,
+    pub replacements: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceAllOutcome {
+    Complete(ReplaceAllSummary),
+    NoMatch,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitAnalysisSummary {
     pub rows_scanned: u64,
     pub max_pieces: usize,
@@ -114,6 +134,10 @@ pub enum ColumnTransformation {
         source_columns: Vec<usize>,
         separator: Vec<u8>,
         output_header: Option<Vec<u8>>,
+    },
+    Arrange {
+        source_width: usize,
+        output_columns: Vec<usize>,
     },
 }
 
@@ -224,6 +248,10 @@ impl ColumnTransformation {
                 }
                 Ok(output)
             }
+            Self::Arrange {
+                source_width,
+                output_columns,
+            } => Ok(arrange_fields(fields, *source_width, output_columns)),
         }
     }
 
@@ -256,6 +284,7 @@ impl ColumnTransformation {
                     "join output header requires a headered source",
                 )),
             },
+            Self::Arrange { .. } => Ok(()),
         }
     }
 
@@ -315,6 +344,39 @@ impl ColumnTransformation {
                     ));
                 }
             }
+            Self::Arrange {
+                source_width,
+                output_columns,
+            } => {
+                if *source_width == 0 || *source_width > MAX_TRANSFORMATION_COLUMNS {
+                    return Err(QuarryError::InvalidOption(
+                        "arrange source width exceeds the supported limit",
+                    ));
+                }
+                if output_columns.is_empty() {
+                    return Err(QuarryError::InvalidOption(
+                        "arrange requires at least one output column",
+                    ));
+                }
+                if output_columns.len() > MAX_TRANSFORMATION_COLUMNS
+                    || output_columns.iter().any(|column| *column >= *source_width)
+                {
+                    return Err(QuarryError::InvalidOption(
+                        "arrange output columns exceed the supported source width",
+                    ));
+                }
+                if output_columns
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != output_columns.len()
+                {
+                    return Err(QuarryError::InvalidOption(
+                        "arrange output columns must be unique",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -348,12 +410,16 @@ impl ColumnTransformation {
         match self {
             Self::Split { source_column, .. } => column == *source_column,
             Self::Join { source_columns, .. } => source_columns.contains(&column),
+            Self::Arrange {
+                source_width,
+                output_columns,
+            } => column < *source_width && !output_columns.contains(&column),
         }
     }
 
     fn joined_columns(&self) -> BTreeSet<usize> {
         match self {
-            Self::Split { .. } => BTreeSet::new(),
+            Self::Split { .. } | Self::Arrange { .. } => BTreeSet::new(),
             Self::Join { source_columns, .. } => source_columns.iter().copied().collect(),
         }
     }
@@ -364,12 +430,20 @@ impl ColumnTransformation {
         joined_columns: &BTreeSet<usize>,
     ) -> Result<Vec<Vec<u8>>, QuarryError> {
         self.validate_input_width(fields.len())?;
+        if let Self::Arrange {
+            source_width,
+            output_columns,
+        } = self
+        {
+            return Ok(arrange_fields(fields, *source_width, output_columns));
+        }
         let last_source_column = match self {
             Self::Split { source_column, .. } => *source_column,
             Self::Join { source_columns, .. } => *source_columns
                 .iter()
                 .max()
                 .expect("join columns are validated"),
+            Self::Arrange { .. } => unreachable!("arrange returned above"),
         };
         fields.resize_with(
             fields.len().max(last_source_column.saturating_add(1)),
@@ -415,6 +489,27 @@ impl ColumnTransformation {
             _ => unreachable!("header options are validated before saving"),
         }
     }
+}
+
+fn arrange_fields(
+    mut fields: Vec<Vec<u8>>,
+    source_width: usize,
+    output_columns: &[usize],
+) -> Vec<Vec<u8>> {
+    let trailing = if fields.len() > source_width {
+        fields.split_off(source_width)
+    } else {
+        Vec::new()
+    };
+    let mut output = Vec::with_capacity(output_columns.len() + trailing.len());
+    output.extend(output_columns.iter().map(|column| {
+        fields
+            .get_mut(*column)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }));
+    output.extend(trailing);
+    output
 }
 
 struct PreparedColumnTransformation {
@@ -763,9 +858,22 @@ impl Drop for SplitAnalysisJob {
     }
 }
 
+enum SaveWorkerOutcome {
+    Complete {
+        summary: SaveAsSummary,
+        replacements: u64,
+    },
+    NoMatch,
+    Cancelled,
+}
+
 pub struct SaveAsJob {
     shared: Arc<SharedState>,
-    handle: Option<JoinHandle<Result<SaveAsOutcome, QuarryError>>>,
+    handle: Option<JoinHandle<Result<SaveWorkerOutcome, QuarryError>>>,
+}
+
+pub struct ReplaceAllJob {
+    inner: SaveAsJob,
 }
 
 enum SaveTarget {
@@ -789,6 +897,7 @@ struct PreparedSaveEdits {
     headers: BTreeMap<usize, Vec<u8>>,
     cells: BTreeMap<(u64, usize), Vec<u8>>,
     transformation: Option<PreparedColumnTransformation>,
+    replacement: Option<LiteralReplacement>,
 }
 
 impl PreparedSaveEdits {
@@ -811,10 +920,21 @@ impl PreparedSaveEdits {
             });
         let mut current_row = None;
         let mut row_value_bytes = 0_usize;
-        for ((row, _), value) in &self.cells {
+        for ((row, column), value) in &self.cells {
             if current_row != Some(*row) {
                 current_row = Some(*row);
                 row_value_bytes = 0;
+            }
+            if self.transformation.as_ref().is_some_and(|transformation| {
+                matches!(
+                    &transformation.transformation,
+                    ColumnTransformation::Arrange {
+                        source_width,
+                        output_columns,
+                    } if *column < *source_width && !output_columns.contains(column)
+                )
+            }) {
+                continue;
             }
             row_value_bytes = row_value_bytes.saturating_add(value.len());
             if row_value_bytes > max_record_bytes {
@@ -848,6 +968,7 @@ impl PreparedSaveEdits {
                     header_clone_bytes = header_clone_bytes.saturating_add(header.len());
                 }
             }
+            ColumnTransformation::Arrange { .. } => {}
         }
         (header_clone_bytes <= max_record_bytes)
             .then_some(())
@@ -856,7 +977,16 @@ impl PreparedSaveEdits {
 }
 
 impl SaveEdits {
-    fn prepare(self, has_header: bool) -> Result<PreparedSaveEdits, QuarryError> {
+    fn prepare(
+        self,
+        has_header: bool,
+        replacement: Option<LiteralReplacement>,
+    ) -> Result<PreparedSaveEdits, QuarryError> {
+        if replacement.is_some() && self.transformation.is_some() {
+            return Err(QuarryError::InvalidOption(
+                "replacement and column transformation cannot run together",
+            ));
+        }
         Ok(PreparedSaveEdits {
             headers: self.headers,
             cells: self.cells,
@@ -864,6 +994,7 @@ impl SaveEdits {
                 .transformation
                 .map(|transformation| PreparedColumnTransformation::new(transformation, has_header))
                 .transpose()?,
+            replacement,
         })
     }
 }
@@ -878,8 +1009,45 @@ impl SaveAsJob {
         target: SaveTarget,
         config: ExportConfig,
     ) -> Result<Self, QuarryError> {
+        Self::start_worker(
+            source_path,
+            file_size,
+            delimiter,
+            has_header,
+            edits,
+            None,
+            target,
+            config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_worker(
+        source_path: PathBuf,
+        file_size: u64,
+        delimiter: u8,
+        has_header: bool,
+        edits: SaveEdits,
+        replacement: Option<LiteralReplacement>,
+        target: SaveTarget,
+        config: ExportConfig,
+    ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption("save-as chunk must be non-zero"));
+        }
+        if let Some(replacement) = &replacement {
+            if replacement.needle.is_empty() {
+                return Err(QuarryError::InvalidOption(
+                    "replacement needle must not be empty",
+                ));
+            }
+            if replacement.needle.len() > config.max_record_bytes
+                || replacement.replacement.len() > config.max_record_bytes
+            {
+                return Err(QuarryError::RecordTooLarge {
+                    limit: config.max_record_bytes,
+                });
+            }
         }
         if !has_header && !edits.headers.is_empty() {
             return Err(QuarryError::InvalidOption(
@@ -896,7 +1064,7 @@ impl SaveAsJob {
                 "cell edits must target data rows",
             ));
         }
-        let edits = edits.prepare(has_header)?;
+        let edits = edits.prepare(has_header, replacement)?;
         edits.validate_size_lower_bounds(config.max_record_bytes)?;
         let source = File::open(&source_path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -943,13 +1111,13 @@ impl SaveAsJob {
                     &worker_state,
                 );
                 match &result {
-                    Ok(SaveAsOutcome::Cancelled) => {
+                    Ok(SaveWorkerOutcome::Cancelled) => {
                         worker_state.cancelled.store(true, Ordering::Release);
                     }
                     Err(error) => {
                         *worker_state.error.lock().unwrap() = Some(error.to_string());
                     }
-                    Ok(SaveAsOutcome::Complete(_)) => {}
+                    Ok(SaveWorkerOutcome::Complete { .. } | SaveWorkerOutcome::NoMatch) => {}
                 }
                 result
             })?;
@@ -986,12 +1154,20 @@ impl SaveAsJob {
         }
     }
 
-    pub fn wait(mut self) -> Result<SaveAsOutcome, QuarryError> {
+    fn wait_worker(mut self) -> Result<SaveWorkerOutcome, QuarryError> {
         self.handle
             .take()
             .expect("save-as handle is present")
             .join()
             .map_err(|_| QuarryError::WorkerPanicked)?
+    }
+
+    pub fn wait(self) -> Result<SaveAsOutcome, QuarryError> {
+        match self.wait_worker()? {
+            SaveWorkerOutcome::Complete { summary, .. } => Ok(SaveAsOutcome::Complete(summary)),
+            SaveWorkerOutcome::Cancelled => Ok(SaveAsOutcome::Cancelled),
+            SaveWorkerOutcome::NoMatch => unreachable!("save jobs do not request replacement"),
+        }
     }
 }
 
@@ -1000,6 +1176,35 @@ impl Drop for SaveAsJob {
         if let Some(handle) = self.handle.take() {
             self.cancel();
             let _ = handle.join();
+        }
+    }
+}
+
+impl ReplaceAllJob {
+    pub fn progress(&self) -> SaveAsProgress {
+        self.inner.progress()
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.inner.error()
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    pub fn wait(self) -> Result<ReplaceAllOutcome, QuarryError> {
+        match self.inner.wait_worker()? {
+            SaveWorkerOutcome::Complete {
+                summary,
+                replacements,
+            } => Ok(ReplaceAllOutcome::Complete(ReplaceAllSummary {
+                destination: summary.destination,
+                bytes_written: summary.bytes_written,
+                replacements,
+            })),
+            SaveWorkerOutcome::NoMatch => Ok(ReplaceAllOutcome::NoMatch),
+            SaveWorkerOutcome::Cancelled => Ok(ReplaceAllOutcome::Cancelled),
         }
     }
 }
@@ -1144,6 +1349,33 @@ impl Session {
         )
     }
 
+    pub fn start_create_replaced_working_copy(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        replacement: LiteralReplacement,
+        destination: impl AsRef<Path>,
+    ) -> Result<ReplaceAllJob, QuarryError> {
+        let inner = SaveAsJob::start_worker(
+            self.path.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.dialect.has_header,
+            SaveEdits {
+                headers: header_renames,
+                cells: cell_edits,
+                transformation: None,
+            },
+            Some(replacement),
+            SaveTarget::WorkingCopy(
+                destination.as_ref().to_path_buf(),
+                self.source_stamp.clone(),
+            ),
+            DEFAULT_EXPORT_CONFIG,
+        )?;
+        Ok(ReplaceAllJob { inner })
+    }
+
     pub fn start_save_to_original(
         &self,
         header_renames: BTreeMap<usize, Vec<u8>>,
@@ -1257,7 +1489,7 @@ enum Publication {
     },
 }
 
-struct ExportTarget {
+pub(crate) struct ExportTarget {
     writer: Option<BufWriter<File>>,
     temporary: PathBuf,
     destination: PathBuf,
@@ -1290,7 +1522,7 @@ impl ExportTarget {
         )
     }
 
-    fn new_private_guarded(
+    pub(crate) fn new_private_guarded(
         source_path: &Path,
         destination: PathBuf,
         source: &File,
@@ -1455,7 +1687,7 @@ impl ExportTarget {
         .into())
     }
 
-    fn write_all(&mut self, bytes: &[u8]) -> Result<(), QuarryError> {
+    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), QuarryError> {
         self.writer
             .as_mut()
             .expect("export writer is present")
@@ -1463,12 +1695,46 @@ impl ExportTarget {
         Ok(())
     }
 
-    fn publish(
+    fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
+        let unchanged = match &self.publication {
+            Publication::CreateNew => true,
+            Publication::GuardedCreateNew {
+                source_path,
+                source,
+                source_stamp,
+            }
+            | Publication::GuardedCreateWorkingCopy {
+                source_path,
+                source,
+                source_stamp,
+            }
+            | Publication::GuardedReplaceExisting {
+                source_path,
+                source,
+                source_stamp,
+                ..
+            } => source_matches_stamp(source, source_path, source_stamp)?,
+            Publication::ReplaceSource { source_stamp, .. } => {
+                fs::symlink_metadata(&self.destination)
+                    .ok()
+                    .filter(|metadata| !metadata.file_type().is_symlink())
+                    .is_some_and(|metadata| SourceStamp::from_metadata(&metadata) == *source_stamp)
+            }
+        };
+        unchanged.then_some(()).ok_or(QuarryError::SourceChanged)
+    }
+
+    pub(crate) fn publish(
         mut self,
         rows_written: u64,
         bytes_written: u64,
         cancel_requested: &AtomicBool,
     ) -> Result<FilterExportOutcome, QuarryError> {
+        if cancel_requested.load(Ordering::Acquire) {
+            drop(self.writer.take());
+            self.remove_temporary()?;
+            return Ok(FilterExportOutcome::Cancelled);
+        }
         let mut writer = self.writer.take().expect("export writer is present");
         writer.flush()?;
         let file = writer.into_inner().map_err(|error| error.into_error())?;
@@ -1600,7 +1866,7 @@ impl Drop for ExportTarget {
     }
 }
 
-fn source_matches_stamp(
+pub(crate) fn source_matches_stamp(
     source: &File,
     source_path: &Path,
     expected: &SourceStamp,
@@ -1748,6 +2014,11 @@ fn run_export(
     }
 }
 
+struct SaveCopySummary {
+    bytes_written: u64,
+    replacements: u64,
+}
+
 fn run_save_as(
     mut source: File,
     mut output: ExportTarget,
@@ -1756,8 +2027,12 @@ fn run_save_as(
     edits: &PreparedSaveEdits,
     config: ExportConfig,
     shared: &SharedState,
-) -> Result<SaveAsOutcome, QuarryError> {
-    let copied = if edits.cells.is_empty() && edits.transformation.is_none() && has_header {
+) -> Result<SaveWorkerOutcome, QuarryError> {
+    let copied = if edits.cells.is_empty()
+        && edits.transformation.is_none()
+        && edits.replacement.is_none()
+        && has_header
+    {
         copy_with_rewritten_header(
             &mut source,
             &mut output,
@@ -1766,6 +2041,12 @@ fn run_save_as(
             config,
             shared,
         )
+        .map(|result| {
+            result.map(|bytes_written| SaveCopySummary {
+                bytes_written,
+                replacements: 0,
+            })
+        })
     } else {
         copy_with_rewritten_records(
             &mut source,
@@ -1778,20 +2059,35 @@ fn run_save_as(
         )
     };
     match copied {
-        Ok(Some(bytes_written)) => {
-            match output.publish(0, bytes_written, &shared.cancel_requested)? {
-                FilterExportOutcome::Complete(summary) => {
-                    Ok(SaveAsOutcome::Complete(SaveAsSummary {
-                        destination: summary.destination,
-                        bytes_written: summary.bytes_written,
-                    }))
-                }
-                FilterExportOutcome::Cancelled => Ok(SaveAsOutcome::Cancelled),
+        Ok(Some(summary)) if edits.replacement.is_some() && summary.replacements == 0 => {
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                output.discard()?;
+                return Ok(SaveWorkerOutcome::Cancelled);
+            }
+            let source_guard = output.ensure_source_unchanged();
+            output.discard()?;
+            source_guard?;
+            Ok(SaveWorkerOutcome::NoMatch)
+        }
+        Ok(Some(summary)) => {
+            match output.publish(
+                summary.replacements,
+                summary.bytes_written,
+                &shared.cancel_requested,
+            )? {
+                FilterExportOutcome::Complete(published) => Ok(SaveWorkerOutcome::Complete {
+                    summary: SaveAsSummary {
+                        destination: published.destination,
+                        bytes_written: published.bytes_written,
+                    },
+                    replacements: published.rows_written,
+                }),
+                FilterExportOutcome::Cancelled => Ok(SaveWorkerOutcome::Cancelled),
             }
         }
         Ok(None) => {
             output.discard()?;
-            Ok(SaveAsOutcome::Cancelled)
+            Ok(SaveWorkerOutcome::Cancelled)
         }
         Err(error) => {
             output.discard()?;
@@ -2018,15 +2314,16 @@ fn copy_with_rewritten_records(
     edits: &PreparedSaveEdits,
     config: ExportConfig,
     shared: &SharedState,
-) -> Result<Option<u64>, QuarryError> {
+) -> Result<Option<SaveCopySummary>, QuarryError> {
     let mut scanner = RecordScanner::new(delimiter)?;
     let mut chunk = vec![0; config.chunk_bytes];
     let mut record = Vec::new();
     let mut absolute_start = 0_u64;
     let mut row_number = 0_u64;
     let mut bytes_written = 0_u64;
+    let mut replacements = 0_u64;
     let mut next_cell_edit_row = edits.cells.first_key_value().map(|((row, _), _)| *row);
-    let rewrites_every_record = edits.transformation.is_some();
+    let rewrites_every_record = edits.transformation.is_some() || edits.replacement.is_some();
 
     loop {
         if shared.cancel_requested.load(Ordering::Acquire) {
@@ -2053,7 +2350,10 @@ fn copy_with_rewritten_records(
                         edits,
                         config.max_record_bytes,
                     ) {
-                        Ok(written) => bytes_written = bytes_written.saturating_add(written),
+                        Ok(written) => {
+                            bytes_written = bytes_written.saturating_add(written.bytes_written);
+                            replacements = replacements.saturating_add(written.replacements);
+                        }
                         Err(error) => deferred_error = Some(error),
                     }
                     if has_cell_edits {
@@ -2084,7 +2384,10 @@ fn copy_with_rewritten_records(
             if next_cell_edit_row.is_some() {
                 return Err(QuarryError::InvalidOption("cell edit row is out of range"));
             }
-            return Ok(Some(bytes_written));
+            return Ok(Some(SaveCopySummary {
+                bytes_written,
+                replacements,
+            }));
         }
 
         let mut segment_start = 0_usize;
@@ -2111,7 +2414,10 @@ fn copy_with_rewritten_records(
                             edits,
                             config.max_record_bytes,
                         ) {
-                            Ok(written) => bytes_written = bytes_written.saturating_add(written),
+                            Ok(written) => {
+                                bytes_written = bytes_written.saturating_add(written.bytes_written);
+                                replacements = replacements.saturating_add(written.replacements);
+                            }
                             Err(error) => deferred_error = Some(error),
                         }
                     } else {
@@ -2177,7 +2483,7 @@ fn write_saved_record(
     has_header: bool,
     edits: &PreparedSaveEdits,
     max_record_bytes: usize,
-) -> Result<u64, QuarryError> {
+) -> Result<SaveCopySummary, QuarryError> {
     if record.len() > max_record_bytes {
         return Err(QuarryError::RecordTooLarge {
             limit: max_record_bytes,
@@ -2192,10 +2498,41 @@ fn write_saved_record(
             has_header && row_number == 0,
             edits,
             max_record_bytes,
+        )
+        .map(|bytes_written| SaveCopySummary {
+            bytes_written,
+            replacements: 0,
+        });
+    }
+    if let Some(replacement) = &edits.replacement {
+        if has_header && row_number == 0 {
+            let bytes_written = if edits.headers.is_empty() {
+                output.write_all(record)?;
+                record.len() as u64
+            } else {
+                write_rewritten_header(output, record, delimiter, &edits.headers, max_record_bytes)?
+            };
+            return Ok(SaveCopySummary {
+                bytes_written,
+                replacements: 0,
+            });
+        }
+        return write_replaced_data_record(
+            output,
+            record,
+            row_number,
+            delimiter,
+            &edits.cells,
+            replacement,
+            max_record_bytes,
         );
     }
     if row_number == 0 && !edits.headers.is_empty() {
-        return write_rewritten_header(output, record, delimiter, &edits.headers, max_record_bytes);
+        return write_rewritten_header(output, record, delimiter, &edits.headers, max_record_bytes)
+            .map(|bytes_written| SaveCopySummary {
+                bytes_written,
+                replacements: 0,
+            });
     }
     let has_cell_edits = edits
         .cells
@@ -2210,10 +2547,134 @@ fn write_saved_record(
             delimiter,
             &edits.cells,
             max_record_bytes,
-        );
+        )
+        .map(|bytes_written| SaveCopySummary {
+            bytes_written,
+            replacements: 0,
+        });
     }
     output.write_all(record)?;
-    Ok(record.len() as u64)
+    Ok(SaveCopySummary {
+        bytes_written: record.len() as u64,
+        replacements: 0,
+    })
+}
+
+fn write_replaced_data_record(
+    output: &mut ExportTarget,
+    record: &[u8],
+    row_number: u64,
+    delimiter: u8,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    replacement: &LiteralReplacement,
+    max_record_bytes: usize,
+) -> Result<SaveCopySummary, QuarryError> {
+    if record.len() > max_record_bytes {
+        return Err(QuarryError::RecordTooLarge {
+            limit: max_record_bytes,
+        });
+    }
+    let original = record;
+    let (prefix, record) = if row_number == 0 {
+        record
+            .strip_prefix(UTF8_BOM)
+            .map_or((&[][..], record), |record| (UTF8_BOM, record))
+    } else {
+        (&[][..], record)
+    };
+    let ending = if record.ends_with(b"\r\n") {
+        b"\r\n".as_slice()
+    } else if record.ends_with(b"\n") {
+        b"\n".as_slice()
+    } else {
+        b"".as_slice()
+    };
+    let fields = parse_record(record, delimiter)?;
+    let row_edits = cell_edits.range((row_number, 0)..=(row_number, usize::MAX));
+    if row_edits
+        .clone()
+        .next_back()
+        .is_some_and(|((_, column), _)| *column >= fields.len())
+    {
+        return Err(QuarryError::InvalidOption(
+            "cell edit column is out of range",
+        ));
+    }
+    let has_cell_edits = row_edits.clone().next().is_some();
+    let mut replacements = 0_u64;
+    let mut decoded_bytes = 0_usize;
+    let mut replaced_fields = Vec::with_capacity(fields.len());
+    for (column, field) in fields.iter().enumerate() {
+        let value = cell_edits
+            .get(&(row_number, column))
+            .map_or_else(|| field.as_ref(), Vec::as_slice);
+        let (value, count) = replace_literal(value, replacement, max_record_bytes)?;
+        decoded_bytes = decoded_bytes.saturating_add(value.len());
+        if decoded_bytes > max_record_bytes {
+            return Err(QuarryError::RecordTooLarge {
+                limit: max_record_bytes,
+            });
+        }
+        replacements = replacements.saturating_add(count);
+        replaced_fields.push(value);
+    }
+
+    if replacements == 0 && !has_cell_edits {
+        output.write_all(original)?;
+        return Ok(SaveCopySummary {
+            bytes_written: original.len() as u64,
+            replacements: 0,
+        });
+    }
+    let bytes_written = write_serialized_fields(
+        output,
+        prefix,
+        &replaced_fields,
+        delimiter,
+        ending,
+        row_number == 0,
+        max_record_bytes,
+    )?;
+    Ok(SaveCopySummary {
+        bytes_written,
+        replacements,
+    })
+}
+
+fn replace_literal(
+    field: &[u8],
+    replacement: &LiteralReplacement,
+    max_record_bytes: usize,
+) -> Result<(Vec<u8>, u64), QuarryError> {
+    let finder = Finder::new(&replacement.needle);
+    let mut count = 0_usize;
+    let mut remainder = field;
+    while let Some(position) = finder.find(remainder) {
+        count = count.saturating_add(1);
+        remainder = &remainder[position + replacement.needle.len()..];
+    }
+    if count == 0 {
+        return Ok((field.to_vec(), 0));
+    }
+    let output_len = field
+        .len()
+        .saturating_sub(replacement.needle.len().saturating_mul(count))
+        .saturating_add(replacement.replacement.len().saturating_mul(count));
+    if output_len > max_record_bytes {
+        return Err(QuarryError::RecordTooLarge {
+            limit: max_record_bytes,
+        });
+    }
+
+    let mut output = Vec::with_capacity(output_len);
+    let mut remainder = field;
+    while let Some(position) = finder.find(remainder) {
+        output.extend_from_slice(&remainder[..position]);
+        output.extend_from_slice(&replacement.replacement);
+        remainder = &remainder[position + replacement.needle.len()..];
+    }
+    output.extend_from_slice(remainder);
+    Ok((output, count as u64))
 }
 
 fn write_transformed_record(
@@ -2797,8 +3258,9 @@ mod tests {
 
     use super::{
         ColumnTransformation, ExportConfig, ExportTarget, FilterExportJob, FilterExportOutcome,
-        MAX_TRANSFORMATION_COLUMNS, SaveAsJob, SaveAsOutcome, SaveEdits, SaveTarget, SharedState,
-        SplitAnalysisJob, SplitAnalysisOutcome, WorkerCompletion, split_field,
+        LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob, ReplaceAllOutcome,
+        SaveAsJob, SaveAsOutcome, SaveEdits, SaveTarget, SharedState, SplitAnalysisJob,
+        SplitAnalysisOutcome, WorkerCompletion, split_field,
     };
     use crate::{
         FilterOperator, FilterQuery, HeaderMode, IndexConfig, OpenOptions, QuarryError, Session,
@@ -2870,6 +3332,17 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !job.progress().done {
             assert!(Instant::now() < deadline, "save-as did not finish promptly");
+            thread::yield_now();
+        }
+    }
+
+    fn wait_until_replace_done(job: &ReplaceAllJob) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !job.progress().done {
+            assert!(
+                Instant::now() < deadline,
+                "replace-all did not finish promptly"
+            );
             thread::yield_now();
         }
     }
@@ -2955,6 +3428,288 @@ mod tests {
             join.transform_fields(&excessive_width),
             Err(QuarryError::InvalidOption(_))
         ));
+    }
+
+    #[test]
+    fn arrange_reorders_drops_pads_and_preserves_undiscovered_trailing_fields() {
+        let arrange = ColumnTransformation::Arrange {
+            source_width: 4,
+            output_columns: vec![2, 0],
+        };
+
+        assert_eq!(
+            arrange
+                .transform_fields(&[
+                    b"one".to_vec(),
+                    b"two".to_vec(),
+                    b"three".to_vec(),
+                    b"four".to_vec(),
+                ])
+                .unwrap(),
+            [b"three".to_vec(), b"one".to_vec()]
+        );
+        assert_eq!(
+            arrange.transform_header_fields(&[b"id".to_vec()]).unwrap(),
+            [Vec::new(), b"id".to_vec()]
+        );
+        assert_eq!(
+            arrange
+                .transform_fields(&[
+                    b"1".to_vec(),
+                    b"Ada".to_vec(),
+                    b"London".to_vec(),
+                    b"drop".to_vec(),
+                    b"unknown one".to_vec(),
+                    b"unknown two".to_vec(),
+                ])
+                .unwrap(),
+            [
+                b"London".to_vec(),
+                b"1".to_vec(),
+                b"unknown one".to_vec(),
+                b"unknown two".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn arrange_rejects_empty_duplicate_and_out_of_range_layouts() {
+        for transformation in [
+            ColumnTransformation::Arrange {
+                source_width: 0,
+                output_columns: vec![0],
+            },
+            ColumnTransformation::Arrange {
+                source_width: 2,
+                output_columns: Vec::new(),
+            },
+            ColumnTransformation::Arrange {
+                source_width: 2,
+                output_columns: vec![0, 0],
+            },
+            ColumnTransformation::Arrange {
+                source_width: 2,
+                output_columns: vec![2],
+            },
+            ColumnTransformation::Arrange {
+                source_width: MAX_TRANSFORMATION_COLUMNS + 1,
+                output_columns: vec![0],
+            },
+        ] {
+            assert!(matches!(
+                transformation.transform_fields(&[b"value".to_vec()]),
+                Err(QuarryError::InvalidOption(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn arrange_working_copy_applies_overlays_before_projection_and_cleans_staging() {
+        let source_bytes = b"id,name\n1,Ada,London,tail\n2,Grace\n";
+        let expected = b",account\nParis,10,tail\n,2\n";
+        let source = fixture(source_bytes);
+        let original = session(&source, b',', HeaderMode::FirstRow);
+        let working_path = destination(&source, "arranged-working.csv");
+        let job = original
+            .start_create_working_copy(
+                BTreeMap::from([(0, b"account".to_vec())]),
+                BTreeMap::from([((1, 0), b"10".to_vec()), ((1, 2), b"Paris".to_vec())]),
+                ColumnTransformation::Arrange {
+                    source_width: 3,
+                    output_columns: vec![2, 0],
+                },
+                &working_path,
+            )
+            .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&working_path).unwrap(), expected);
+        assert!(temporary_exports(&working_path).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(working_path).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn arrange_preflight_ignores_oversized_edits_to_dropped_columns() {
+        let source = fixture(b"a,b");
+        let destination = destination(&source, "arranged.csv");
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let job = SaveAsJob::start_with_edits(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::from([((0, 1), vec![b'x'; 9])]),
+                transformation: Some(ColumnTransformation::Arrange {
+                    source_width: 2,
+                    output_columns: vec![0],
+                }),
+            },
+            SaveTarget::New(destination.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: 3,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(fs::read(&destination).unwrap(), b"a");
+        assert!(temporary_exports(&destination).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(destination).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn replace_all_applies_sparse_edits_first_skips_headers_and_preserves_ragged_rows() {
+        let source_bytes = b"first,second,third\r\n\"aba aba\",before,tail\r\nnone,\"aba,aba\"\r\n";
+        let expected = b"aba header,second,third\r\nX X,Xba,tail\r\nnone,\"X,X\"\r\n";
+        let source = fixture(source_bytes);
+        let source_session = session(&source, b',', HeaderMode::FirstRow);
+        let working_path = destination(&source, "replaced-working.csv");
+        let job = source_session
+            .start_create_replaced_working_copy(
+                BTreeMap::from([(0, b"aba header".to_vec())]),
+                BTreeMap::from([((1, 1), b"ababa".to_vec())]),
+                LiteralReplacement {
+                    needle: b"aba".to_vec(),
+                    replacement: b"X".to_vec(),
+                },
+                &working_path,
+            )
+            .unwrap();
+
+        wait_until_replace_done(&job);
+        let ReplaceAllOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("replacement should publish a working copy");
+        };
+        assert_eq!(summary.destination, working_path);
+        assert_eq!(summary.replacements, 5);
+        assert_eq!(summary.bytes_written, expected.len() as u64);
+        assert_eq!(fs::read(&working_path).unwrap(), expected);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(temporary_exports(&working_path).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(working_path).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn replace_all_no_match_discards_overlays_staging_and_destination() {
+        let source_bytes = b"label,value\nnone,here\n";
+        let source = fixture(source_bytes);
+        let source_session = session(&source, b',', HeaderMode::FirstRow);
+        let working_path = destination(&source, "no-match-working.csv");
+        let job = source_session
+            .start_create_replaced_working_copy(
+                BTreeMap::from([(0, b"changed".to_vec())]),
+                BTreeMap::from([((1, 1), b"still here".to_vec())]),
+                LiteralReplacement {
+                    needle: b"absent".to_vec(),
+                    replacement: b"replacement".to_vec(),
+                },
+                &working_path,
+            )
+            .unwrap();
+
+        wait_until_replace_done(&job);
+        assert_eq!(job.wait().unwrap(), ReplaceAllOutcome::NoMatch);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!working_path.exists());
+        assert!(temporary_exports(&working_path).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn replace_all_enforces_output_record_limit_without_publication() {
+        let source = fixture(b"x,x\n");
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "oversized-replacement.csv");
+        let inner = SaveAsJob::start_worker(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            Some(LiteralReplacement {
+                needle: b"x".to_vec(),
+                replacement: b"12345678".to_vec(),
+            }),
+            SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: 12,
+            },
+        )
+        .unwrap();
+        let job = ReplaceAllJob { inner };
+
+        wait_until_replace_done(&job);
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::RecordTooLarge { limit: 12 })
+        ));
+        assert!(!working_path.exists());
+        assert!(temporary_exports(&working_path).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn cancelling_replace_all_discards_private_output() {
+        let source_bytes = b"hit,value\n".repeat(500_000);
+        let source = fixture(&source_bytes);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "cancelled-replacement.csv");
+        let inner = SaveAsJob::start_worker(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            Some(LiteralReplacement {
+                needle: b"hit".to_vec(),
+                replacement: b"matched".to_vec(),
+            }),
+            SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+            },
+        )
+        .unwrap();
+        let job = ReplaceAllJob { inner };
+        job.cancel();
+        wait_until_replace_done(&job);
+        assert!(job.progress().cancelled);
+        assert_eq!(job.wait().unwrap(), ReplaceAllOutcome::Cancelled);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!working_path.exists());
+        assert!(temporary_exports(&working_path).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
     }
 
     #[test]
@@ -4538,6 +5293,25 @@ mod tests {
 
         assert_eq!(
             output.publish(1, 14, &cancel_requested).unwrap(),
+            FilterExportOutcome::Cancelled
+        );
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn cancellation_before_publication_does_not_flush_buffered_output() {
+        let source = fixture(b"source");
+        let destination = destination(&source, "cancelled-buffered-publish.csv");
+        let mut output = ExportTarget::new(&source, destination.clone()).unwrap();
+        let mut unflushable = std::io::BufWriter::new(File::open(&output.temporary).unwrap());
+        unflushable.write_all(b"buffered bytes").unwrap();
+        drop(output.writer.replace(unflushable));
+
+        assert_eq!(
+            output.publish(1, 14, &AtomicBool::new(true)).unwrap(),
             FilterExportOutcome::Cancelled
         );
         assert!(!destination.exists());

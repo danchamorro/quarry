@@ -8,9 +8,10 @@ use quarry_core::{
     ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex,
     FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery,
     FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress,
-    MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, Row, SaveAsJob, SaveAsOutcome, SearchJob,
-    SearchMatch, SearchOutcome, SearchPosition, SearchProgress, Session, SplitAnalysisJob,
-    SplitAnalysisOutcome, StructuralIndex,
+    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob,
+    ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch, SearchOutcome,
+    SearchPosition, SearchProgress, Session, SortDirection, SortJob, SortOutcome, SortSpec,
+    SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex, estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
 
@@ -28,11 +29,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PATH_INPUT_ID: &str = "quarry-path-input";
 const JUMP_INPUT_ID: &str = "quarry-jump-input";
 const FIND_INPUT_ID: &str = "quarry-find-input";
+const REPLACE_INPUT_ID: &str = "quarry-replace-input";
 const COLUMN_INPUT_ID: &str = "quarry-column-input";
 const COLUMN_POSITION_INPUT_ID: &str = "quarry-column-position-input";
 const FILTER_COLUMN_INPUT_ID: &str = "quarry-filter-column-input";
 const FILTER_VALUE_INPUT_ID: &str = "quarry-filter-value-input";
 const STRUCTURAL_SEPARATOR_INPUT_ID: &str = "quarry-structural-separator-input";
+const STRUCTURAL_POSITION_INPUT_ID: &str = "quarry-structural-position-input";
 const SOURCE_CHANGED_NOTICE: &str =
     "The source file changed outside Quarry. Discard changes and reopen it.";
 
@@ -62,6 +65,7 @@ struct QuarryApp {
     path_input: String,
     jump_input: String,
     find_input: String,
+    replace_input: String,
     column_input: String,
     column_position_input: String,
     columns_open: bool,
@@ -85,10 +89,18 @@ struct FilterRuleDraft {
     value_input: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StructuralRequest {
     Split,
     Combine,
+    Move,
+    Sort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GridColumnRequest {
+    Dialog(StructuralDialog),
+    Delete(Vec<usize>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +108,8 @@ struct StructuralDialog {
     request: StructuralRequest,
     columns: Vec<usize>,
     separator: String,
+    position: String,
+    sort_direction: SortDirection,
 }
 
 impl StructuralDialog {
@@ -104,6 +118,8 @@ impl StructuralDialog {
             request: StructuralRequest::Split,
             columns: vec![column],
             separator: String::new(),
+            position: String::new(),
+            sort_direction: SortDirection::Ascending,
         }
     }
 
@@ -112,6 +128,31 @@ impl StructuralDialog {
             request: StructuralRequest::Combine,
             columns,
             separator: String::new(),
+            position: String::new(),
+            sort_direction: SortDirection::Ascending,
+        }
+    }
+
+    fn move_columns(columns: Vec<usize>) -> Self {
+        let position = columns
+            .first()
+            .map_or_else(String::new, |column| column.saturating_add(1).to_string());
+        Self {
+            request: StructuralRequest::Move,
+            columns,
+            separator: String::new(),
+            position,
+            sort_direction: SortDirection::Ascending,
+        }
+    }
+
+    fn sort(column: usize) -> Self {
+        Self {
+            request: StructuralRequest::Sort,
+            columns: vec![column],
+            separator: String::new(),
+            position: String::new(),
+            sort_direction: SortDirection::Ascending,
         }
     }
 }
@@ -136,6 +177,7 @@ impl QuarryApp {
             path_input,
             jump_input: "1".into(),
             find_input: String::new(),
+            replace_input: String::new(),
             column_input: "1".into(),
             column_position_input: "1".into(),
             columns_open: false,
@@ -179,7 +221,7 @@ impl QuarryApp {
                 return Err("Cancel the active save before opening another file.".into());
             }
             if document.structural_job.is_some() {
-                return Err("Cancel the active column edit before opening another file.".into());
+                return Err("Cancel the active change before opening another file.".into());
             }
             document.commit_edits();
             if document.is_dirty() {
@@ -406,7 +448,7 @@ impl QuarryApp {
                     .is_some_and(|document| document.structural_job.is_some())
                 {
                     self.notice =
-                        Some("Cancel the active column edit before discarding changes.".into());
+                        Some("Cancel the active change before discarding changes.".into());
                     return;
                 }
                 let structural = self
@@ -484,6 +526,10 @@ impl QuarryApp {
             Action::Jump => parse_data_row(&self.jump_input, document.data_start)
                 .and_then(|start| document.navigate(start)),
             Action::FindNext => document.start_find_next(self.find_input.as_bytes()),
+            Action::ReplaceCurrent => document
+                .replace_current_match(self.find_input.as_bytes(), self.replace_input.as_bytes()),
+            Action::ReplaceAll => document
+                .start_replace_all(self.find_input.as_bytes(), self.replace_input.as_bytes()),
             Action::CancelSearch => {
                 document.cancel_search();
                 Ok(())
@@ -597,6 +643,15 @@ impl QuarryApp {
                     StructuralRequest::Combine => {
                         document.start_combine(dialog.columns, dialog.separator.as_bytes().to_vec())
                     }
+                    StructuralRequest::Move => parse_move_position(
+                        &dialog.position,
+                        document.total_columns,
+                        dialog.columns.len(),
+                    )
+                    .and_then(|position| document.start_move_columns(dialog.columns, position)),
+                    StructuralRequest::Sort => {
+                        document.start_sort_rows(dialog.columns[0], dialog.sort_direction)
+                    }
                 });
         match result {
             Ok(()) => {
@@ -607,12 +662,21 @@ impl QuarryApp {
         }
     }
 
+    fn apply_delete_columns(&mut self, columns: Vec<usize>) {
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "Open a file before editing columns.".to_owned())
+            .and_then(|document| document.start_delete_columns(columns));
+        self.notice = result.err();
+    }
+
     fn install_materialized_working_copy(
         &mut self,
         ready: MaterializedWorkingCopy,
     ) -> Result<(), String> {
         let Some(current) = self.document.as_ref() else {
-            return Err("The document closed before the column edit finished.".into());
+            return Err("The document closed before the change finished.".into());
         };
         let options = current.current_open_options();
         let logical_path = current.logical_path.clone();
@@ -640,19 +704,18 @@ impl QuarryApp {
         self.path_input = logical_path.to_string_lossy().into_owned();
         self.columns_open = false;
         self.structural_dialog = None;
-        self.notice = Some("Column edit applied. Save to keep it, or discard changes.".into());
+        self.notice = Some(ready.notice);
         Ok(())
     }
 
     fn swap_structural_history(&mut self, redo: bool) -> Result<(), String> {
         let Some(current) = self.document.as_mut() else {
-            return Err("Open a file before undoing a column edit.".into());
+            return Err("Open a file before undoing a change.".into());
         };
         current.commit_edits();
         if !redo && (!current.header_renames.is_empty() || current.has_cell_edits()) {
             return Err(
-                "Save or discard later header and cell edits before undoing the column edit."
-                    .into(),
+                "Save or discard later header and cell edits before undoing the change.".into(),
             );
         }
         if current.save_job.is_some()
@@ -664,7 +727,7 @@ impl QuarryApp {
         let state = current
             .working_copy
             .as_ref()
-            .ok_or_else(|| "There is no column edit to undo or redo.".to_owned())?;
+            .ok_or_else(|| "There is no change to undo or redo.".to_owned())?;
         let target = if redo {
             state.redo.clone()
         } else {
@@ -672,9 +735,9 @@ impl QuarryApp {
         }
         .ok_or_else(|| {
             if redo {
-                "There is no column edit to redo.".to_owned()
+                "There is no change to redo.".to_owned()
             } else {
-                "There is no column edit to undo.".to_owned()
+                "There is no change to undo.".to_owned()
             }
         })?;
         if !redo && target.path == current.logical_path {
@@ -731,9 +794,9 @@ impl QuarryApp {
         self.structural_dialog = None;
         self.columns_open = false;
         self.notice = Some(if redo {
-            "Column edit restored.".into()
+            "Change restored.".into()
         } else {
-            "Column edit undone.".into()
+            "Change undone.".into()
         });
         Ok(())
     }
@@ -1126,10 +1189,10 @@ impl eframe::App for QuarryApp {
                             if ui
                                 .add_enabled(
                                     document.can_undo_structural(),
-                                    egui::Button::new("Undo Column Edit"),
+                                    egui::Button::new("Undo Change"),
                                 )
                                 .on_disabled_hover_text(
-                                    "Save or discard later cell and header edits before undoing the column edit.",
+                                    "Save or discard later cell and header edits before undoing the change.",
                                 )
                                 .clicked()
                             {
@@ -1138,7 +1201,7 @@ impl eframe::App for QuarryApp {
                             if ui
                                 .add_enabled(
                                     document.can_redo_structural(),
-                                    egui::Button::new("Redo Column Edit"),
+                                    egui::Button::new("Redo Change"),
                                 )
                                 .clicked()
                             {
@@ -1165,17 +1228,16 @@ impl eframe::App for QuarryApp {
                     } else {
                         let search_progress = document.search_progress();
                         let search_status = document.search_status.as_deref().or_else(|| {
-                            if document.has_cell_edits() {
-                                Some("Save or discard cell edits before searching the source file.")
-                            } else {
-                                (!document.is_search_ready())
-                                    .then_some("Search is available after indexing completes.")
-                            }
+                            (!document.is_search_ready())
+                                .then_some("Search is available after indexing completes.")
                         });
+                        let can_replace = document.can_replace_current(self.find_input.as_bytes());
                         if let Some(search_action) = search_controls(
                             ui,
                             &mut self.find_input,
+                            &mut self.replace_input,
                             document.is_search_ready(),
+                            can_replace,
                             search_progress.as_ref(),
                             search_status,
                         ) {
@@ -1231,13 +1293,14 @@ impl eframe::App for QuarryApp {
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::ProgressBar::new(progress.fraction)
+                                    .animate(progress.animate)
                                     .desired_width(260.0)
                                     .text(progress.label),
                             );
                             if ui
                                 .add_enabled(
                                     !document.structural_cancel_requested,
-                                    egui::Button::new("Cancel Column Edit"),
+                                    egui::Button::new("Cancel Change"),
                                 )
                                 .clicked()
                             {
@@ -1360,13 +1423,13 @@ impl eframe::App for QuarryApp {
         }
 
         let mut grid_error = None;
-        let mut requested_structural_dialog = None;
+        let mut requested_column_edit = None;
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
             .show(ctx, |ui| {
                 if let Some(document) = self.document.as_mut() {
                     match show_grid(ui, document) {
-                        Ok(dialog) => requested_structural_dialog = dialog,
+                        Ok(request) => requested_column_edit = request,
                         Err(error) => grid_error = Some(error),
                     }
                 } else {
@@ -1378,8 +1441,11 @@ impl eframe::App for QuarryApp {
                     });
                 }
             });
-        if let Some(dialog) = requested_structural_dialog {
-            self.open_structural_dialog(dialog);
+        if let Some(request) = requested_column_edit {
+            match request {
+                GridColumnRequest::Dialog(dialog) => self.open_structural_dialog(dialog),
+                GridColumnRequest::Delete(columns) => self.apply_delete_columns(columns),
+            }
         }
         let structural_dialog_action = self
             .structural_dialog
@@ -1560,6 +1626,8 @@ enum Action {
     DiscardChanges,
     Jump,
     FindNext,
+    ReplaceCurrent,
+    ReplaceAll,
     CancelSearch,
     ApplyFilter,
     CancelFilter,
@@ -1867,9 +1935,28 @@ fn show_structural_dialog(
     document: &Document,
 ) -> Option<StructuralDialogAction> {
     let mut action = None;
+    let sort_disk = (dialog.request == StructuralRequest::Sort)
+        .then(|| document.sort_temporary_disk_estimate())
+        .flatten();
+    let sort_description = (dialog.request == StructuralRequest::Sort).then(|| {
+        let disk = sort_disk.map_or_else(
+            || "Temporary disk allowance is available after indexing finishes.".to_owned(),
+            |bytes| {
+                format!(
+                    "Conservative temporary disk allowance: {}.",
+                    format_bytes(bytes)
+                )
+            },
+        );
+        format!(
+            "Case-sensitive text. Equal values keep their original order (stable sort). The header stays fixed. Missing values sort as empty cells. {disk}"
+        )
+    });
     let title = match dialog.request {
         StructuralRequest::Split => "Split Columns",
         StructuralRequest::Combine => "Combine Columns",
+        StructuralRequest::Move => "Move Columns",
+        StructuralRequest::Sort => "Sort Rows",
     };
     let modal = egui::Modal::new(egui::Id::new("quarry-structural-dialog")).show(ctx, |ui| {
         ui.set_min_width(360.0);
@@ -1896,31 +1983,106 @@ fn show_structural_dialog(
             if dialog.columns.len() == 1 { "" } else { "s" }
         ));
         ui.add_space(6.0);
-        let label = ui.label("Separator");
-        let separator = ui
-            .add_sized(
-                [ui.available_width(), 26.0],
-                egui::TextEdit::singleline(&mut dialog.separator)
-                    .id(egui::Id::new(STRUCTURAL_SEPARATOR_INPUT_ID))
-                    .hint_text("Enter a literal separator"),
-            )
-            .labelled_by(label.id);
-        let valid =
-            !dialog.separator.is_empty() || matches!(dialog.request, StructuralRequest::Combine);
-        if !valid {
-            ui.small("Enter the text that separates each value.");
-        }
+        let (valid, field_has_focus, disabled_reason) = match dialog.request {
+            StructuralRequest::Split | StructuralRequest::Combine => {
+                let label = ui.label("Separator");
+                let separator = ui
+                    .add_sized(
+                        [ui.available_width(), 26.0],
+                        egui::TextEdit::singleline(&mut dialog.separator)
+                            .id(egui::Id::new(STRUCTURAL_SEPARATOR_INPUT_ID))
+                            .hint_text("Enter a literal separator"),
+                    )
+                    .labelled_by(label.id);
+                let valid = !dialog.separator.is_empty()
+                    || matches!(dialog.request, StructuralRequest::Combine);
+                let reason =
+                    (!valid).then(|| "Enter the text that separates each value.".to_owned());
+                if let Some(reason) = &reason {
+                    ui.small(reason);
+                }
+                (valid, separator.has_focus(), reason)
+            }
+            StructuralRequest::Move => {
+                let label = ui.label("Destination position");
+                let position = ui
+                    .add_sized(
+                        [ui.available_width(), 26.0],
+                        egui::TextEdit::singleline(&mut dialog.position)
+                            .id(egui::Id::new(STRUCTURAL_POSITION_INPUT_ID))
+                            .hint_text("Enter a 1-based output position"),
+                    )
+                    .labelled_by(label.id);
+                let _ = ui.ctx().accesskit_node_builder(position.id, |node| {
+                    node.set_label("Destination position");
+                });
+                let reason = parse_move_position(
+                    &dialog.position,
+                    document.total_columns,
+                    dialog.columns.len(),
+                )
+                .err();
+                if let Some(reason) = &reason {
+                    ui.small(reason);
+                } else {
+                    ui.small("The selected columns will start at this output position.");
+                }
+                (reason.is_none(), position.has_focus(), reason)
+            }
+            StructuralRequest::Sort => {
+                ui.label("Direction");
+                ui.horizontal(|ui| {
+                    ui.radio_value(
+                        &mut dialog.sort_direction,
+                        SortDirection::Ascending,
+                        "Ascending",
+                    );
+                    ui.radio_value(
+                        &mut dialog.sort_direction,
+                        SortDirection::Descending,
+                        "Descending",
+                    );
+                });
+                ui.small("Text comparison is case-sensitive.");
+                ui.small("Equal values keep their original order (stable sort).");
+                ui.small("The header stays fixed. Missing values sort as empty cells.");
+                let reason = sort_disk.is_none().then(|| {
+                    "Wait for indexing to finish so Quarry can calculate temporary disk space."
+                        .to_owned()
+                });
+                if let Some(bytes) = sort_disk {
+                    ui.small(format!(
+                        "Conservative temporary disk allowance: {}.",
+                        format_bytes(bytes)
+                    ));
+                } else if let Some(reason) = &reason {
+                    ui.small(reason);
+                }
+                (reason.is_none(), false, reason)
+            }
+        };
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
                 action = Some(StructuralDialogAction::Cancel);
             }
-            let apply = ui
-                .add_enabled(valid, egui::Button::new("OK"))
-                .on_disabled_hover_text("Enter a non-empty separator before splitting.");
+            let submit_label = match dialog.request {
+                StructuralRequest::Move => "Move",
+                StructuralRequest::Sort => "Sort",
+                StructuralRequest::Split | StructuralRequest::Combine => "OK",
+            };
+            let mut apply = ui.add_enabled(valid, egui::Button::new(submit_label));
+            if let Some(reason) = disabled_reason {
+                apply = apply.on_disabled_hover_text(reason);
+            }
+            if let Some(description) = sort_description.as_deref() {
+                let _ = ui.ctx().accesskit_node_builder(apply.id, |node| {
+                    node.set_description(description);
+                });
+            }
             if apply.clicked()
                 || (valid
-                    && separator.has_focus()
+                    && field_has_focus
                     && ui.input(|input| input.key_pressed(egui::Key::Enter)))
             {
                 action = Some(StructuralDialogAction::Apply);
@@ -2170,23 +2332,27 @@ fn column_action_button(
 fn search_controls(
     ui: &mut egui::Ui,
     query: &mut String,
+    replacement: &mut String,
     index_ready: bool,
+    can_replace: bool,
     progress: Option<&SearchProgress>,
     status: Option<&str>,
 ) -> Option<Action> {
     let mut action = None;
+    let searching = progress.is_some();
     ui.horizontal(|ui| {
-        let searching = progress.is_some();
         let label = ui.label("Find (literal, case-sensitive)");
         let input = ui
             .add_enabled(
                 !searching,
                 egui::TextEdit::singleline(query)
                     .id(egui::Id::new(FIND_INPUT_ID))
-                    .hint_text("Text to find"),
+                    .hint_text("Text to find")
+                    .desired_width(180.0),
             )
             .labelled_by(label.id);
         let can_find = index_ready && !searching && !query.is_empty();
+        let can_replace_all = index_ready && !query.is_empty() && query != replacement;
         if ui
             .add_enabled(can_find, egui::Button::new("Find Next"))
             .clicked()
@@ -2195,6 +2361,36 @@ fn search_controls(
                 && ui.input(|input| input.key_pressed(egui::Key::Enter)))
         {
             action = Some(Action::FindNext);
+        }
+
+        let label = ui.label("Replace with (literal)");
+        let input = ui
+            .add_enabled(
+                !searching,
+                egui::TextEdit::singleline(replacement)
+                    .id(egui::Id::new(REPLACE_INPUT_ID))
+                    .hint_text("Replacement text")
+                    .desired_width(180.0),
+            )
+            .labelled_by(label.id);
+        let can_replace = can_replace && !searching;
+        if ui
+            .add_enabled(can_replace, egui::Button::new("Replace in Cell"))
+            .clicked()
+            || (can_replace
+                && input.lost_focus()
+                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+        {
+            action = Some(Action::ReplaceCurrent);
+        }
+        if ui
+            .add_enabled(
+                can_replace_all && !searching,
+                egui::Button::new("Replace All"),
+            )
+            .clicked()
+        {
+            action = Some(Action::ReplaceAll);
         }
 
         if let Some(progress) = progress {
@@ -2334,7 +2530,7 @@ enum GridSelection {
 #[derive(Default)]
 struct GridInteraction {
     selection: Option<GridSelection>,
-    structural_dialog: Option<StructuralDialog>,
+    column_request: Option<GridColumnRequest>,
 }
 
 impl GridSelection {
@@ -2403,6 +2599,12 @@ struct WorkingCopySnapshot {
     overlay: StructuralOverlay,
 }
 
+struct MaterializationPreparation {
+    undo: WorkingCopySnapshot,
+    destination: PathBuf,
+    renames: BTreeMap<usize, Vec<u8>>,
+}
+
 enum StructuralJob {
     AnalyzingSplit {
         job: SplitAnalysisJob,
@@ -2415,16 +2617,46 @@ enum StructuralJob {
         selected_columns: BTreeSet<usize>,
         undo: WorkingCopySnapshot,
     },
+    Replacing {
+        job: ReplaceAllJob,
+        destination: PathBuf,
+        selected_columns: BTreeSet<usize>,
+        undo: WorkingCopySnapshot,
+    },
+    Sorting {
+        job: SortJob,
+        destination: PathBuf,
+        selected_columns: BTreeSet<usize>,
+        undo: WorkingCopySnapshot,
+        column: usize,
+        direction: SortDirection,
+    },
 }
 
 struct MaterializedWorkingCopy {
     path: PathBuf,
     selected_columns: BTreeSet<usize>,
+    notice: String,
 }
 
 struct StructuralProgressDisplay {
     fraction: f32,
     label: String,
+    animate: bool,
+}
+
+fn sort_merge_progress(
+    bytes_scanned: u64,
+    total_bytes: u64,
+    done: bool,
+) -> Option<StructuralProgressDisplay> {
+    (!done && (total_bytes == 0 || bytes_scanned >= total_bytes)).then(|| {
+        StructuralProgressDisplay {
+            fraction: 0.9,
+            label: "Merging sorted rows…".into(),
+            animate: true,
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2853,11 +3085,156 @@ impl Document {
         )
     }
 
-    fn begin_materialization(
+    fn start_move_columns(&mut self, columns: Vec<usize>, position: usize) -> Result<(), String> {
+        let selected = validated_column_selection(columns, self.total_columns)?;
+        let remaining = (0..self.total_columns)
+            .filter(|column| !selected.contains(column))
+            .collect::<Vec<_>>();
+        if position > remaining.len() {
+            return Err(format!(
+                "Destination position must be between 1 and {}.",
+                remaining.len().saturating_add(1)
+            ));
+        }
+        let mut output_columns = Vec::with_capacity(self.total_columns);
+        output_columns.extend_from_slice(&remaining[..position]);
+        output_columns.extend(selected.iter().copied());
+        output_columns.extend_from_slice(&remaining[position..]);
+        let selected_columns =
+            (position..position.saturating_add(selected.len())).collect::<BTreeSet<_>>();
+        self.start_arrangement(output_columns, selected_columns)
+    }
+
+    fn start_delete_columns(&mut self, columns: Vec<usize>) -> Result<(), String> {
+        let selected = validated_column_selection(columns, self.total_columns)?;
+        if selected.len() == self.total_columns {
+            return Err("At least one column must remain.".into());
+        }
+        let output_columns = (0..self.total_columns)
+            .filter(|column| !selected.contains(column))
+            .collect::<Vec<_>>();
+        let first_deleted = *selected
+            .iter()
+            .next()
+            .expect("validated selection is not empty");
+        let nearest = first_deleted.min(output_columns.len() - 1);
+        self.start_arrangement(output_columns, BTreeSet::from([nearest]))
+    }
+
+    fn start_arrangement(
         &mut self,
-        transformation: ColumnTransformation,
+        output_columns: Vec<usize>,
         selected_columns: BTreeSet<usize>,
     ) -> Result<(), String> {
+        if let Some(reason) = self.structural_edit_disabled_reason() {
+            return Err(reason.into());
+        }
+        if output_columns.iter().copied().eq(0..self.total_columns) {
+            self.structural_status = Some("Columns are already in that position.".into());
+            return Ok(());
+        }
+        self.commit_edits();
+        self.cancel_search();
+        self.begin_materialization(
+            ColumnTransformation::Arrange {
+                source_width: self.total_columns,
+                output_columns,
+            },
+            selected_columns,
+        )
+    }
+
+    fn start_sort_rows(&mut self, column: usize, direction: SortDirection) -> Result<(), String> {
+        if let Some(reason) = self.structural_edit_disabled_reason() {
+            return Err(reason.into());
+        }
+        if self.sort_temporary_disk_estimate().is_none() {
+            return Err(
+                "Wait for indexing to finish so Quarry can calculate temporary disk space.".into(),
+            );
+        }
+        self.validate_column(column)?;
+        self.commit_edits();
+        self.cancel_search();
+        let MaterializationPreparation {
+            undo,
+            destination,
+            renames,
+        } = self.prepare_materialization()?;
+        let job = match self.session.start_create_sorted_working_copy(
+            renames,
+            self.cell_edits.clone(),
+            SortSpec { column, direction },
+            &destination,
+        ) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(error) => {
+                self.cleanup_empty_working_copy();
+                return Err(error.to_string());
+            }
+        };
+        self.structural_job = Some(StructuralJob::Sorting {
+            job,
+            destination,
+            selected_columns: BTreeSet::from([column]),
+            undo,
+            column,
+            direction,
+        });
+        self.structural_status = Some("Sorting rows…".into());
+        self.structural_cancel_requested = false;
+        Ok(())
+    }
+
+    fn sort_temporary_disk_estimate(&self) -> Option<u64> {
+        let data_rows = self
+            .index
+            .as_ref()?
+            .indexed_rows()
+            .saturating_sub(self.data_start);
+        let effective_bytes_upper_bound = self.header_renames.values().fold(
+            self.session
+                .file_size
+                .saturating_add(data_rows.saturating_mul(2)),
+            |bytes, value| bytes.saturating_add(serialized_field_upper_bound(value.as_bytes())),
+        );
+        let effective_bytes_upper_bound = self
+            .cell_edits
+            .values()
+            .fold(effective_bytes_upper_bound, |bytes, value| {
+                bytes.saturating_add(serialized_field_upper_bound(value))
+            });
+        let effective_bytes_upper_bound =
+            self.header_edit
+                .as_ref()
+                .map_or(effective_bytes_upper_bound, |edit| {
+                    effective_bytes_upper_bound
+                        .saturating_add(serialized_field_upper_bound(edit.draft.as_bytes()))
+                });
+        let effective_bytes_upper_bound =
+            self.cell_edit
+                .as_ref()
+                .map_or(effective_bytes_upper_bound, |edit| {
+                    effective_bytes_upper_bound
+                        .saturating_add(serialized_field_upper_bound(edit.draft.as_bytes()))
+                });
+        Some(estimate_sort_temporary_bytes(
+            effective_bytes_upper_bound,
+            data_rows,
+        ))
+    }
+
+    fn prepare_materialization(&mut self) -> Result<MaterializationPreparation, String> {
         if self.original_session.is_none() {
             match self.session.ensure_source_unchanged() {
                 Ok(()) => {}
@@ -2901,6 +3278,23 @@ impl Document {
             .iter()
             .map(|(column, name)| (*column, name.as_bytes().to_vec()))
             .collect();
+        Ok(MaterializationPreparation {
+            undo,
+            destination,
+            renames,
+        })
+    }
+
+    fn begin_materialization(
+        &mut self,
+        transformation: ColumnTransformation,
+        selected_columns: BTreeSet<usize>,
+    ) -> Result<(), String> {
+        let MaterializationPreparation {
+            undo,
+            destination,
+            renames,
+        } = self.prepare_materialization()?;
         let job = match self.session.start_create_working_copy(
             renames,
             self.cell_edits.clone(),
@@ -2934,6 +3328,80 @@ impl Document {
         Ok(())
     }
 
+    fn start_replace_all(&mut self, query: &[u8], replacement: &[u8]) -> Result<(), String> {
+        if let Some(reason) = self.structural_edit_disabled_reason() {
+            return Err(reason.into());
+        }
+        if query.is_empty() {
+            return Err("Enter text to find.".into());
+        }
+        if query == replacement {
+            self.structural_status = Some(
+                "Search and replacement text are identical. The document was not changed.".into(),
+            );
+            return Ok(());
+        }
+        self.commit_edits();
+        self.cancel_search();
+        let selected_columns = self.selected_columns.clone();
+        let MaterializationPreparation {
+            undo,
+            destination,
+            renames,
+        } = self.prepare_materialization()?;
+        let job = match self.session.start_create_replaced_working_copy(
+            renames,
+            self.cell_edits.clone(),
+            LiteralReplacement {
+                needle: query.to_vec(),
+                replacement: replacement.to_vec(),
+            },
+            destination.clone(),
+        ) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(error) => {
+                self.cleanup_empty_working_copy();
+                return Err(error.to_string());
+            }
+        };
+        self.structural_job = Some(StructuralJob::Replacing {
+            job,
+            destination,
+            selected_columns,
+            undo,
+        });
+        self.structural_status = Some("Replacing matches…".into());
+        self.structural_cancel_requested = false;
+        Ok(())
+    }
+
+    fn accept_materialized_change(&mut self, undo: WorkingCopySnapshot) {
+        let state = self
+            .working_copy
+            .as_mut()
+            .expect("materialization owns a working-copy directory");
+        let current_path = self.session.path().to_path_buf();
+        for obsolete in [state.undo.take(), state.redo.take()].into_iter().flatten() {
+            if obsolete.path != current_path && obsolete.path.starts_with(state.directory.path()) {
+                let _ = std::fs::remove_file(obsolete.path);
+            }
+        }
+        debug_assert_eq!(undo.path, current_path);
+        state.undo = Some(undo);
+        state.redo = None;
+        self.structural_status = None;
+    }
+
     fn poll_structural_edit(&mut self) -> Result<Option<MaterializedWorkingCopy>, String> {
         let Some(job) = self.structural_job.as_ref() else {
             return Ok(None);
@@ -2941,6 +3409,8 @@ impl Document {
         let done = match job {
             StructuralJob::AnalyzingSplit { job, .. } => job.progress().done,
             StructuralJob::Materializing { job, .. } => job.progress().done,
+            StructuralJob::Replacing { job, .. } => job.progress().done,
+            StructuralJob::Sorting { job, .. } => job.progress().done,
         };
         if !done {
             return Ok(None);
@@ -3003,25 +3473,11 @@ impl Document {
             } => match job.wait() {
                 Ok(SaveAsOutcome::Complete(summary)) => {
                     debug_assert_eq!(summary.destination, destination);
-                    let state = self
-                        .working_copy
-                        .as_mut()
-                        .expect("materialization owns a working-copy directory");
-                    let current_path = self.session.path().to_path_buf();
-                    for obsolete in [state.undo.take(), state.redo.take()].into_iter().flatten() {
-                        if obsolete.path != current_path
-                            && obsolete.path.starts_with(state.directory.path())
-                        {
-                            let _ = std::fs::remove_file(obsolete.path);
-                        }
-                    }
-                    debug_assert_eq!(undo.path, current_path);
-                    state.undo = Some(undo);
-                    state.redo = None;
-                    self.structural_status = None;
+                    self.accept_materialized_change(undo);
                     Ok(Some(MaterializedWorkingCopy {
                         path: summary.destination,
                         selected_columns,
+                        notice: "Column edit applied. Save to keep it, or discard changes.".into(),
                     }))
                 }
                 Ok(SaveAsOutcome::Cancelled) => {
@@ -3044,6 +3500,93 @@ impl Document {
                     Err(error.to_string())
                 }
             },
+            StructuralJob::Replacing {
+                job,
+                destination,
+                selected_columns,
+                undo,
+            } => match job.wait() {
+                Ok(ReplaceAllOutcome::Complete(summary)) => {
+                    debug_assert_eq!(summary.destination, destination);
+                    self.accept_materialized_change(undo);
+                    let count = summary.replacements;
+                    Ok(Some(MaterializedWorkingCopy {
+                        path: summary.destination,
+                        selected_columns,
+                        notice: format!(
+                            "Replaced {count} occurrence{}. Save to keep it, or discard changes.",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                    }))
+                }
+                Ok(ReplaceAllOutcome::NoMatch) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("No matches found. The document was not changed.".into());
+                    Ok(None)
+                }
+                Ok(ReplaceAllOutcome::Cancelled) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Replace All cancelled. The document was not changed.".into());
+                    Ok(None)
+                }
+                Err(QuarryError::SourceChanged) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.invalidate_changed_source();
+                    Err(SOURCE_CHANGED_NOTICE.into())
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Replace All failed. The document was not changed.".into());
+                    Err(error.to_string())
+                }
+            },
+            StructuralJob::Sorting {
+                job,
+                destination,
+                selected_columns,
+                undo,
+                column,
+                direction,
+            } => match job.wait() {
+                Ok(SortOutcome::Complete(summary)) => {
+                    debug_assert_eq!(summary.destination, destination);
+                    self.accept_materialized_change(undo);
+                    Ok(Some(MaterializedWorkingCopy {
+                        path: summary.destination,
+                        selected_columns,
+                        notice: format!(
+                            "Sorted rows by column {} {}. Save to keep it, or discard changes.",
+                            column.saturating_add(1),
+                            sort_direction_label(direction).to_lowercase()
+                        ),
+                    }))
+                }
+                Ok(SortOutcome::Cancelled) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Sort cancelled. The document was not changed.".into());
+                    Ok(None)
+                }
+                Err(QuarryError::SourceChanged) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.invalidate_changed_source();
+                    Err(SOURCE_CHANGED_NOTICE.into())
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Sort failed. The document was not changed.".into());
+                    Err(error.to_string())
+                }
+            },
         }
     }
 
@@ -3054,9 +3597,11 @@ impl Document {
         match job {
             StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
             StructuralJob::Materializing { job, .. } => job.cancel(),
+            StructuralJob::Replacing { job, .. } => job.cancel(),
+            StructuralJob::Sorting { job, .. } => job.cancel(),
         }
         self.structural_cancel_requested = true;
-        self.structural_status = Some("Cancelling column edit…".into());
+        self.structural_status = Some("Cancelling change…".into());
     }
 
     fn cleanup_empty_working_copy(&mut self) {
@@ -3083,7 +3628,7 @@ impl Document {
 
     fn structural_progress(&self) -> Option<StructuralProgressDisplay> {
         let job = self.structural_job.as_ref()?;
-        let (bytes_scanned, total_bytes, done, operation) = match job {
+        let (bytes_scanned, total_bytes, done, operation, sorting) = match job {
             StructuralJob::AnalyzingSplit { job, .. } => {
                 let progress = job.progress();
                 (
@@ -3091,6 +3636,7 @@ impl Document {
                     progress.total_bytes,
                     progress.done,
                     "Checking split width",
+                    false,
                 )
             }
             StructuralJob::Materializing { job, .. } => {
@@ -3100,9 +3646,33 @@ impl Document {
                     progress.total_bytes,
                     progress.done,
                     "Applying column edit",
+                    false,
+                )
+            }
+            StructuralJob::Replacing { job, .. } => {
+                let progress = job.progress();
+                (
+                    progress.bytes_scanned,
+                    progress.total_bytes,
+                    progress.done,
+                    "Replacing matches",
+                    false,
+                )
+            }
+            StructuralJob::Sorting { job, .. } => {
+                let progress = job.progress();
+                (
+                    progress.bytes_scanned,
+                    progress.total_bytes,
+                    progress.done,
+                    "Sorting rows",
+                    true,
                 )
             }
         };
+        if sorting && let Some(progress) = sort_merge_progress(bytes_scanned, total_bytes, done) {
+            return Some(progress);
+        }
         let fraction = if total_bytes == 0 {
             if done { 1.0 } else { 0.0 }
         } else {
@@ -3111,6 +3681,7 @@ impl Document {
         Some(StructuralProgressDisplay {
             fraction,
             label: format!("{operation} · {:.1}%", fraction * 100.0),
+            animate: false,
         })
     }
 
@@ -3152,9 +3723,6 @@ impl Document {
         if self.search_job.is_some() {
             return Err("A search is already running.".into());
         }
-        if self.has_cell_edits() {
-            return Err("Save or discard cell edits before searching the source file.".into());
-        }
         if !self.is_search_ready() {
             return Err("Search is available after indexing completes.".into());
         }
@@ -3177,12 +3745,68 @@ impl Document {
         let index = self.index.as_ref().expect("index was checked above");
         self.search_job = Some(
             self.session
-                .start_search(index, query.to_vec(), position)
+                .start_search_with_cell_edits(
+                    index,
+                    query.to_vec(),
+                    position,
+                    self.cell_edits.clone(),
+                )
                 .map_err(|error| error.to_string())?,
         );
         self.search_status = None;
         self.reveal_cell = None;
         Ok(())
+    }
+
+    fn can_replace_current(&self, query: &[u8]) -> bool {
+        if query.is_empty()
+            || self.search_job.is_some()
+            || self.cell_edit.is_some()
+            || self.header_edit.is_some()
+            || self.search_query != query
+        {
+            return false;
+        }
+        let Some(found) = self.last_match.as_ref() else {
+            return false;
+        };
+        self.reveal_cell == Some((found.row, found.column))
+            && self
+                .effective_cell(found.row, found.column)
+                .is_some_and(|value| value.windows(query.len()).any(|part| part == query))
+    }
+
+    fn replace_current_match(&mut self, query: &[u8], replacement: &[u8]) -> Result<(), String> {
+        if !self.can_replace_current(query) {
+            return Err("Find a current match before replacing it.".into());
+        }
+        let found = self
+            .last_match
+            .expect("replaceable match was checked above");
+        let key = (found.row, found.column);
+        let source = self
+            .source_cell(found.row, found.column)
+            .expect("a revealed match has a loaded source cell")
+            .to_vec();
+        let effective = self
+            .cell_edits
+            .get(&key)
+            .map_or(source.as_slice(), Vec::as_slice);
+        let next = replace_literal_all(effective, query, replacement)
+            .expect("replaceable match contains the query");
+        if next.as_slice() != effective {
+            self.invalidate_structural_redo();
+            if next == source {
+                self.cell_edits.remove(&key);
+            } else {
+                self.cell_edits.insert(key, next);
+            }
+        }
+        self.selection = Some(GridSelection::Cell {
+            row: found.row,
+            column: found.column,
+        });
+        self.start_find_next(query)
     }
 
     fn poll_search(&mut self) -> Result<(), String> {
@@ -3698,7 +4322,6 @@ impl Document {
         self.index.is_some()
             && self.progress.done
             && !self.progress.cancelled
-            && !self.has_cell_edits()
             && self.structural_job.is_none()
     }
 
@@ -4111,6 +4734,8 @@ impl Document {
             match job {
                 StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
                 StructuralJob::Materializing { job, .. } => job.cancel(),
+                StructuralJob::Replacing { job, .. } => job.cancel(),
+                StructuralJob::Sorting { job, .. } => job.cancel(),
             }
         }
         self.structural_cancel_requested = false;
@@ -4468,6 +5093,22 @@ impl Document {
         }
     }
 
+    fn source_cell(&self, row: u64, column: usize) -> Option<&[u8]> {
+        let index = usize::try_from(row.checked_sub(self.buffer_start)?).ok()?;
+        self.buffered_rows
+            .get(index)?
+            .fields
+            .get(column)
+            .map(Vec::as_slice)
+    }
+
+    fn effective_cell(&self, row: u64, column: usize) -> Option<&[u8]> {
+        self.cell_edits
+            .get(&(row, column))
+            .map(Vec::as_slice)
+            .or_else(|| self.source_cell(row, column))
+    }
+
     fn cell_value<'a>(&'a self, row: u64, column: usize, source: &'a [u8]) -> &'a [u8] {
         if let Some(edit) = self
             .cell_edit
@@ -4693,6 +5334,57 @@ fn parse_column_position(value: &str, total_columns: usize) -> Result<usize, Str
     Ok(position - 1)
 }
 
+fn parse_move_position(
+    value: &str,
+    total_columns: usize,
+    selected_columns: usize,
+) -> Result<usize, String> {
+    if selected_columns == 0 {
+        return Err("Select at least one numbered column first.".into());
+    }
+    if selected_columns > total_columns {
+        return Err("A selected column is outside this file.".into());
+    }
+    let position: usize = value
+        .trim()
+        .parse()
+        .map_err(|_| "Destination position must be a positive whole number.".to_owned())?;
+    if position == 0 {
+        return Err("Destination positions start at 1.".into());
+    }
+    let maximum = total_columns - selected_columns + 1;
+    if position > maximum {
+        return Err(format!(
+            "Destination position must be between 1 and {maximum}."
+        ));
+    }
+    Ok(position - 1)
+}
+
+fn replace_literal_all(value: &[u8], query: &[u8], replacement: &[u8]) -> Option<Vec<u8>> {
+    if query.is_empty() {
+        return None;
+    }
+    let mut start = 0;
+    let mut output = Vec::with_capacity(value.len());
+    let mut replaced = false;
+    while let Some(relative) = value[start..]
+        .windows(query.len())
+        .position(|part| part == query)
+    {
+        let found = start + relative;
+        output.extend_from_slice(&value[start..found]);
+        output.extend_from_slice(replacement);
+        start = found + query.len();
+        replaced = true;
+    }
+    if !replaced {
+        return None;
+    }
+    output.extend_from_slice(&value[start..]);
+    Some(output)
+}
+
 impl Drop for Document {
     fn drop(&mut self) {
         self.shutdown();
@@ -4724,6 +5416,23 @@ fn selected_split_column(selected_columns: &BTreeSet<usize>) -> Option<usize> {
     } else {
         None
     }
+}
+
+fn validated_column_selection(
+    columns: Vec<usize>,
+    total_columns: usize,
+) -> Result<BTreeSet<usize>, String> {
+    if columns.is_empty() {
+        return Err("Select at least one numbered column first.".into());
+    }
+    if columns.iter().any(|column| *column >= total_columns) {
+        return Err("A selected column is outside this file.".into());
+    }
+    let selected = columns.iter().copied().collect::<BTreeSet<_>>();
+    if selected.len() != columns.len() {
+        return Err("Select each column only once.".into());
+    }
+    Ok(selected)
 }
 
 fn select_column(
@@ -4800,7 +5509,7 @@ fn paint_column_selection(ui: &egui::Ui, selected: bool) {
 fn show_grid(
     ui: &mut egui::Ui,
     document: &mut Document,
-) -> Result<Option<StructuralDialog>, String> {
+) -> Result<Option<GridColumnRequest>, String> {
     if document.source_changed {
         ui.centered_and_justified(|ui| {
             ui.label(SOURCE_CHANGED_NOTICE);
@@ -4905,7 +5614,7 @@ fn show_grid(
             document.selected_columns.clear();
             document.column_selection_anchor = None;
         }
-        Ok(interaction.structural_dialog)
+        Ok(interaction.column_request)
     })
     .inner
 }
@@ -4965,11 +5674,11 @@ fn show_table(
             ));
         }
         let selection_help = if document.selected_columns.is_empty() {
-            "Click numbers. Shift-click: range. Command/Ctrl-click: add/remove. Right-click: Split/Combine."
+            "Click numbers. Shift-click: range. Command/Ctrl-click: add/remove. Right-click: column tools and row sorting."
                 .to_owned()
         } else {
             format!(
-                "{} selected. Shift-click: range. Command/Ctrl-click: add/remove. Right-click: Split/Combine.",
+                "{} selected. Shift-click: range. Command/Ctrl-click: add/remove. Right-click: column tools and row sorting.",
                 document.selected_columns.len()
             )
         };
@@ -5056,7 +5765,7 @@ fn show_table(
                                 let response = ui
                                     .add_sized([width, COLUMN_RULER_HEIGHT], button)
                                     .on_hover_text(
-                                        "Click to select. Shift-click a range. Command/Ctrl-click to add or remove. Right-click a selected number for Split/Combine.",
+                                        "Click to select. Shift-click a range. Command/Ctrl-click to add or remove. Right-click a selected number for column tools and row sorting.",
                                     );
                                 if column_focus_requested == Some(column) {
                                     response.request_focus();
@@ -5151,12 +5860,12 @@ fn show_table(
                                         )
                                         .clicked()
                                     {
-                                        interaction.structural_dialog = Some(
-                                            StructuralDialog::split(
+                                        interaction.column_request = Some(
+                                            GridColumnRequest::Dialog(StructuralDialog::split(
                                                 split_column.expect(
                                                     "enabled split has one selected column",
                                                 ),
-                                            ),
+                                            )),
                                         );
                                         ui.close();
                                     }
@@ -5175,8 +5884,68 @@ fn show_table(
                                         )
                                         .clicked()
                                     {
-                                        interaction.structural_dialog =
-                                            Some(StructuralDialog::combine(combine_columns));
+                                        interaction.column_request = Some(
+                                            GridColumnRequest::Dialog(StructuralDialog::combine(
+                                                combine_columns.clone(),
+                                            )),
+                                        );
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .add_enabled(
+                                            !combine_columns.is_empty(),
+                                            egui::Button::new("Move Selected Columns…"),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Select at least one numbered column first.",
+                                        )
+                                        .clicked()
+                                    {
+                                        interaction.column_request = Some(
+                                            GridColumnRequest::Dialog(
+                                                StructuralDialog::move_columns(
+                                                    combine_columns.clone(),
+                                                ),
+                                            ),
+                                        );
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !combine_columns.is_empty()
+                                                && combine_columns.len()
+                                                    < document.total_columns,
+                                            egui::Button::new("Delete Selected Columns"),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "At least one column must remain.",
+                                        )
+                                        .clicked()
+                                    {
+                                        interaction.column_request = Some(
+                                            GridColumnRequest::Delete(combine_columns),
+                                        );
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .add_enabled(
+                                            split_column.is_some(),
+                                            egui::Button::new("Sort Rows…"),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Select exactly one numbered column first.",
+                                        )
+                                        .clicked()
+                                    {
+                                        interaction.column_request = Some(
+                                            GridColumnRequest::Dialog(StructuralDialog::sort(
+                                                split_column.expect(
+                                                    "enabled sort has one selected column",
+                                                ),
+                                            )),
+                                        );
                                         ui.close();
                                     }
                                     });
@@ -5624,6 +6393,20 @@ fn display_delimiter(delimiter: u8) -> &'static str {
     }
 }
 
+fn sort_direction_label(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Ascending => "Ascending",
+        SortDirection::Descending => "Descending",
+    }
+}
+
+fn serialized_field_upper_bound(value: &[u8]) -> u64 {
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2)
+        .saturating_add(2)
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -5648,15 +6431,16 @@ mod tests {
     use super::{
         Action, COLUMN_INPUT_ID, COLUMN_POSITION_INPUT_ID, ColumnCommand, ColumnView,
         DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterProgress, FilterQuery,
-        GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row, SOURCE_CHANGED_NOTICE,
-        SearchMatch, SearchProgress, Session, StructuralDialog, StructuralDialogAction,
-        column_drop_position, column_ruler_divider_stroke, column_selection_fill,
-        column_window_controls, configure_style, copy_control, filtered_export_controls,
-        filtered_export_file_name, logical_viewport_start, max_viewport_start, page_controls,
-        parse_column_position, parse_data_row, parse_file_column, row_for_scroll_fraction,
+        GridColumnRequest, GridSelection, HeaderMode, IndexConfig, OpenOptions, QuarryApp, Row,
+        SOURCE_CHANGED_NOTICE, SearchMatch, SearchProgress, Session, StructuralDialog,
+        StructuralDialogAction, column_drop_position, column_ruler_divider_stroke,
+        column_selection_fill, column_window_controls, configure_style, copy_control,
+        estimate_sort_temporary_bytes, filtered_export_controls, filtered_export_file_name,
+        logical_viewport_start, max_viewport_start, page_controls, parse_column_position,
+        parse_data_row, parse_file_column, parse_move_position, row_for_scroll_fraction,
         save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
         selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
-        show_structural_dialog,
+        show_structural_dialog, sort_merge_progress,
     };
 
     fn click_accessible_button(
@@ -6738,10 +7522,10 @@ mod tests {
         assert!(document.reveal_cell.is_none());
         assert!(document.is_dirty());
         assert_eq!(document.copy_selection_text().unwrap(), "changed\r\nvalue");
-        assert_eq!(
-            document.start_find_next(b"first").unwrap_err(),
-            "Save or discard cell edits before searching the source file."
-        );
+        document.start_find_next(b"first").unwrap();
+        finish_search(&mut document);
+        let found = document.last_match.as_ref().unwrap();
+        assert_eq!((found.row, found.column), (1, 0));
         assert_eq!(
             document
                 .start_filter(FilterQuery::single(
@@ -8414,15 +9198,26 @@ mod tests {
                 opened_dialog = show_grid(ui, app.document.as_mut().unwrap()).unwrap();
             });
         });
-        let combine_target = menu_output
+        let menu_tree = menu_output
             .platform_output
             .accesskit_update
-            .expect("the selected-column menu should be accessible")
+            .expect("the selected-column menu should be accessible");
+        let combine_target = menu_tree
             .nodes
             .iter()
             .find(|(_, node)| node.label() == Some("Combine Columns…") && !node.is_disabled())
             .map(|(id, _)| *id)
             .expect("Combine Columns should be enabled for two selected headers");
+        let sort_node = menu_tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Sort Rows…"))
+            .map(|(_, node)| node)
+            .expect("Sort Rows should be present");
+        assert!(
+            sort_node.is_disabled(),
+            "Sort Rows should require exactly one selected column"
+        );
         let _ = ctx.run(
             egui::RawInput {
                 events: vec![egui::Event::AccessKitActionRequest(
@@ -8440,7 +9235,11 @@ mod tests {
                 });
             },
         );
-        let mut dialog = opened_dialog.expect("Combine Columns should open its dialog");
+        let GridColumnRequest::Dialog(mut dialog) =
+            opened_dialog.expect("Combine Columns should open its dialog")
+        else {
+            panic!("Combine Columns should request a dialog");
+        };
         assert_eq!(dialog.columns, vec![0, 1]);
         dialog.separator = " ".into();
         app.open_structural_dialog(dialog);
@@ -8483,6 +9282,272 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.label() == Some("Select file column 2 (age)"))
         );
+    }
+
+    #[test]
+    fn move_and_delete_columns_use_the_editable_grid_and_structural_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("move-delete-columns.csv");
+        fs::write(&source, b"a,b,c,d\nA1,B1,C1,D1\nA2,B2,C2,D2\n").unwrap();
+        let original = fs::read(&source).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        assert!(parse_move_position("0", 4, 2).is_err());
+        assert!(parse_move_position("4", 4, 2).is_err());
+        assert_eq!(
+            app.document
+                .as_mut()
+                .unwrap()
+                .start_delete_columns(vec![0, 1, 2, 3])
+                .unwrap_err(),
+            "At least one column must remain."
+        );
+        assert!(app.document.as_ref().unwrap().working_copy.is_none());
+
+        let mut dialog = StructuralDialog::move_columns(vec![1, 3]);
+        assert_eq!(dialog.position, "2");
+        dialog.position = "1".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(grid_input(), |ctx| {
+            assert_eq!(
+                show_structural_dialog(ctx, &mut dialog, app.document.as_ref().unwrap()),
+                None
+            );
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("the move dialog should be accessible");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::TextInput
+                && node.label() == Some("Destination position")
+                && node.value() == Some("1")
+        }));
+        for label in ["Move", "Cancel"] {
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(label)),
+                "missing accessible move control {label}"
+            );
+        }
+
+        app.open_structural_dialog(dialog);
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.total_columns, 4);
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            ["b", "d", "a", "c"].map(|field| field.as_bytes().to_vec())
+        );
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            ["B1", "D1", "A1", "C1"].map(|field| field.as_bytes().to_vec())
+        );
+        assert_eq!(document.selected_columns, BTreeSet::from([0, 1]));
+        assert_eq!(document.column_selection_anchor, Some(0));
+        assert!(document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let redo_path = app
+            .document
+            .as_ref()
+            .unwrap()
+            .working_copy
+            .as_ref()
+            .unwrap()
+            .redo
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        {
+            let document = app.document.as_mut().unwrap();
+            assert_eq!(
+                document.session.first_rows[0].fields,
+                ["a", "b", "c", "d"].map(|field| field.as_bytes().to_vec())
+            );
+            document.start_move_columns(vec![0], 0).unwrap();
+            assert!(document.structural_job.is_none());
+            assert_eq!(
+                document
+                    .working_copy
+                    .as_ref()
+                    .unwrap()
+                    .redo
+                    .as_ref()
+                    .unwrap()
+                    .path,
+                redo_path
+            );
+        }
+
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        app.apply_delete_columns(vec![0, 2]);
+        assert!(app.notice.is_none());
+        finish_structural_edit(&mut app);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.total_columns, 2);
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            ["d", "c"].map(|field| field.as_bytes().to_vec())
+        );
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            ["D1", "C1"].map(|field| field.as_bytes().to_vec())
+        );
+        assert_eq!(document.selected_columns, BTreeSet::from([0]));
+        assert_eq!(document.column_selection_anchor, Some(0));
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        assert_eq!(
+            app.document.as_ref().unwrap().session.first_rows[0].fields,
+            ["b", "d", "a", "c"].map(|field| field.as_bytes().to_vec())
+        );
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        assert_eq!(
+            app.document.as_ref().unwrap().session.first_rows[0].fields,
+            ["d", "c"].map(|field| field.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn sort_merge_progress_stays_active_until_the_worker_finishes() {
+        let progress = sort_merge_progress(100, 100, false).unwrap();
+        assert_eq!(progress.fraction, 0.9);
+        assert_eq!(progress.label, "Merging sorted rows…");
+        assert!(progress.animate);
+        assert!(sort_merge_progress(100, 100, true).is_none());
+    }
+
+    #[test]
+    fn sort_dialog_is_accessible_and_sort_uses_structural_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("sort-from-grid.csv");
+        fs::write(
+            &source,
+            b"key,name\nb,first-b\nA,upper\n,missing\na,lower\nb,second-b\n",
+        )
+        .unwrap();
+        let original = fs::read(&source).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(
+            document.sort_temporary_disk_estimate(),
+            Some(estimate_sort_temporary_bytes(
+                document.session.file_size.saturating_add(10),
+                5,
+            ))
+        );
+        app.document.as_mut().unwrap().selected_columns = BTreeSet::from([0]);
+
+        let mut dialog = StructuralDialog::sort(0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(grid_input(), |ctx| {
+            assert_eq!(
+                show_structural_dialog(ctx, &mut dialog, app.document.as_ref().unwrap()),
+                None
+            );
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("the sort dialog should be accessible");
+        let accessible_labels = tree
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect::<Vec<_>>();
+        for label in ["Ascending", "Descending", "Sort", "Cancel"] {
+            assert!(
+                accessible_labels.iter().any(|candidate| candidate == label),
+                "missing accessible sort control or explanation {label}: {accessible_labels:?}"
+            );
+        }
+        let sort_description = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Sort"))
+            .and_then(|(_, node)| node.description())
+            .expect("the Sort button should describe sort semantics");
+        for detail in [
+            "Case-sensitive text.",
+            "stable sort",
+            "header stays fixed",
+            "Missing values sort as empty cells",
+            "Conservative temporary disk allowance:",
+        ] {
+            assert!(
+                sort_description.contains(detail),
+                "missing accessible sort detail {detail}: {sort_description}"
+            );
+        }
+
+        app.open_structural_dialog(dialog);
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            ["key", "name"].map(|value| value.as_bytes().to_vec())
+        );
+        let sorted_names = document
+            .session
+            .first_rows
+            .iter()
+            .skip(1)
+            .map(|row| row.fields[1].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sorted_names,
+            ["missing", "upper", "lower", "first-b", "second-b"]
+                .map(|value| value.as_bytes().to_vec())
+        );
+        assert_eq!(document.selected_columns, BTreeSet::from([0]));
+        assert!(document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let original_names = app
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .first_rows
+            .iter()
+            .skip(1)
+            .map(|row| row.fields[1].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            original_names,
+            ["first-b", "upper", "missing", "lower", "second-b"]
+                .map(|value| value.as_bytes().to_vec())
+        );
+
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let redone_names = app
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .first_rows
+            .iter()
+            .skip(1)
+            .map(|row| row.fields[1].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(redone_names, sorted_names);
     }
 
     #[test]
@@ -8624,7 +9689,7 @@ mod tests {
             *id == target && node.supports_action(egui::accesskit::Action::ShowContextMenu)
         }));
 
-        let output = ctx.run(
+        let _ = ctx.run(
             egui::RawInput {
                 events: vec![egui::Event::AccessKitActionRequest(
                     egui::accesskit::ActionRequest {
@@ -8641,11 +9706,22 @@ mod tests {
                 });
             },
         );
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
         let menu_tree = output
             .platform_output
             .accesskit_update
             .expect("the column menu should be accessible");
-        for label in ["Split Columns…", "Combine Columns…"] {
+        for label in [
+            "Split Columns…",
+            "Combine Columns…",
+            "Move Selected Columns…",
+            "Delete Selected Columns",
+            "Sort Rows…",
+        ] {
             assert!(
                 menu_tree
                     .nodes
@@ -8654,6 +9730,49 @@ mod tests {
                 "missing accessible column menu item {label}"
             );
         }
+        let (_delete_target, delete_node) = menu_tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Delete Selected Columns"))
+            .expect("Delete Selected Columns should be present");
+        assert!(
+            !delete_node.is_disabled(),
+            "Delete Selected Columns should be enabled for {:?} of {} columns",
+            document.selected_columns,
+            document.total_columns
+        );
+        let (sort_target, sort_node) = menu_tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Sort Rows…"))
+            .expect("Sort Rows should be present");
+        assert!(
+            !sort_node.is_disabled(),
+            "Sort Rows should be enabled for exactly one selected column"
+        );
+        let sort_target = *sort_target;
+        let mut request = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: sort_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    request = show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert_eq!(
+            request,
+            Some(GridColumnRequest::Dialog(StructuralDialog::sort(0)))
+        );
     }
 
     #[test]
@@ -9262,10 +10381,36 @@ mod tests {
     #[test]
     fn search_controls_are_accessible_and_clickable() {
         let mut query = "needle".to_owned();
+        let mut replacement = "replacement".to_owned();
         let find = click_accessible_button("Find Next", |ui| {
-            search_controls(ui, &mut query, true, None, None)
+            search_controls(ui, &mut query, &mut replacement, true, false, None, None)
         });
         assert!(matches!(find, Some(Action::FindNext)));
+        let replace = click_accessible_button("Replace in Cell", |ui| {
+            search_controls(ui, &mut query, &mut replacement, true, true, None, None)
+        });
+        assert!(matches!(replace, Some(Action::ReplaceCurrent)));
+        let replace_all = click_accessible_button("Replace All", |ui| {
+            search_controls(ui, &mut query, &mut replacement, true, false, None, None)
+        });
+        assert!(matches!(replace_all, Some(Action::ReplaceAll)));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                search_controls(ui, &mut query, &mut replacement, true, true, None, None);
+            });
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("search controls should be accessible");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::TextInput
+                && !node.labelled_by().is_empty()
+                && node.value() == Some("replacement")
+        }));
 
         let progress = SearchProgress {
             bytes_scanned: 50,
@@ -9276,7 +10421,15 @@ mod tests {
             cancelled: false,
         };
         let cancel = click_accessible_button("Cancel Search", |ui| {
-            search_controls(ui, &mut query, true, Some(&progress), None)
+            search_controls(
+                ui,
+                &mut query,
+                &mut replacement,
+                true,
+                false,
+                Some(&progress),
+                None,
+            )
         });
         assert!(matches!(cancel, Some(Action::CancelSearch)));
     }
@@ -9356,6 +10509,120 @@ mod tests {
         );
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn find_next_uses_unsaved_cell_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("find-overlay.csv");
+        fs::write(&path, b"first,second\nneedle,one\nother,two\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        document.begin_cell_edit(1, 0, b"needle".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "hidden".into();
+        document.commit_cell_edit();
+        document.begin_cell_edit(2, 1, b"two".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "overlay needle".into();
+        document.commit_cell_edit();
+
+        document.start_find_next(b"needle").unwrap();
+        finish_search(&mut document);
+        let found = document.last_match.as_ref().unwrap();
+        assert_eq!((found.row, found.column), (2, 1));
+        assert_eq!(document.reveal_cell, Some((2, 1)));
+        assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn replace_current_replaces_all_non_overlapping_matches_and_advances() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replace-current.csv");
+        fs::write(&path, b"first,second\naaaa,x\nx,aa\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        document.start_find_next(b"aa").unwrap();
+        finish_search(&mut document);
+        assert!(document.can_replace_current(b"aa"));
+        document.replace_current_match(b"aa", b"x").unwrap();
+        assert_eq!(document.cell_edits.get(&(1, 0)).unwrap(), b"xx");
+        finish_search(&mut document);
+        let next = document.last_match.as_ref().unwrap();
+        assert_eq!((next.row, next.column), (2, 1));
+
+        document.replace_current_match(b"aa", b"").unwrap();
+        assert_eq!(document.cell_edits.get(&(2, 1)).unwrap(), b"");
+        finish_search(&mut document);
+        assert_eq!(
+            document.search_status.as_deref(),
+            Some("No further matches.")
+        );
+        assert!(!document.can_replace_current(b"aa"));
+        assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn replace_all_materializes_effective_cells_and_uses_change_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replace-all.csv");
+        let source = b"name\nplain\nsource needle\n";
+        fs::write(&path, source).unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.begin_cell_edit(1, 0, b"plain".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "overlay needle needle".into();
+        document.commit_cell_edit();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.find_input = "needle".into();
+        app.replace_input = "x".into();
+        app.document = Some(document);
+        app.apply(&egui::Context::default(), Action::ReplaceAll);
+        finish_structural_edit(&mut app);
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), source);
+        assert_ne!(document.session.path(), path);
+        assert_eq!(
+            fs::read(document.session.path()).unwrap(),
+            b"name\noverlay x x\nsource x\n"
+        );
+        assert!(document.is_dirty());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Replaced 3 occurrences. Save to keep it, or discard changes.")
+        );
+
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), path);
+        assert_eq!(
+            document.cell_edits.get(&(1, 0)).map(Vec::as_slice),
+            Some(b"overlay needle needle".as_slice())
+        );
     }
 
     #[test]

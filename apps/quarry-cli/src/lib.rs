@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -12,7 +12,8 @@ use quarry_core::{
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
     FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress, MAX_TRANSFORMATION_COLUMNS,
     OpenOptions, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome,
-    SearchPosition, SearchProgress, Session, StructuralIndex,
+    SearchPosition, SearchProgress, Session, SortDirection, SortJob, SortOutcome, SortProgress,
+    SortSpec, StructuralIndex, estimate_sort_temporary_bytes,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -24,6 +25,7 @@ type FilterExportRun = (
     Option<(u64, Duration)>,
 );
 type SaveAsRun = (SaveAsOutcome, SaveAsProgress, Option<(u64, Duration)>);
+type SortRun = (SortOutcome, SortProgress, Option<u64>);
 
 const MAX_LIVE_BENCHMARK_MILLIS: u128 = 60_000;
 const FILTER_SAMPLE_ROWS: usize = 100;
@@ -38,6 +40,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("export") => export_command(args.collect()),
         Some("edit-save-as") => edit_save_as_command(args.collect()),
         Some("transform-save-as") => transform_save_as_command(args.collect()),
+        Some("sort-save-as") => sort_save_as_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -74,6 +77,9 @@ fn print_help() {
          (--split COLUMN SEPARATOR OUTPUT_COUNT | --join COLUMNS SEPARATOR) \
          [--output-header NAME]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
+           quarry sort-save-as <SOURCE> <DESTINATION> --column N \
+         --order asc|desc [--delimiter ,] [--header auto|first-row|none] \
+         [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]"
     );
@@ -768,6 +774,418 @@ enum RequestedColumnTransformation {
         source_columns: Vec<usize>,
         separator: Vec<u8>,
     },
+}
+
+fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
+    let mut source = None;
+    let mut destination = None;
+    let mut column = None;
+    let mut direction = None;
+    let mut delimiter = None;
+    let mut header_mode = HeaderMode::Auto;
+    let mut cancel_after_bytes = None;
+    let mut cache_state = "unknown".to_owned();
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
+            "--order" => {
+                direction = Some(parse_sort_direction(value(&args, &mut cursor, "--order")?)?)
+            }
+            "--delimiter" => {
+                delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
+            }
+            "--header" => header_mode = parse_header_mode(value(&args, &mut cursor, "--header")?)?,
+            "--cancel-after-bytes" => {
+                cancel_after_bytes =
+                    Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
+            }
+            "--cache-state" => {
+                cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
+                if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
+                    return Err("--cache-state must be unknown, cold, or warm".into());
+                }
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            argument if source.is_none() => source = Some(PathBuf::from(argument)),
+            argument if destination.is_none() => destination = Some(PathBuf::from(argument)),
+            argument => return Err(format!("unexpected argument {argument:?}").into()),
+        }
+        cursor += 1;
+    }
+
+    let source = source.ok_or("sort-save-as requires a source file path")?;
+    let destination = destination.ok_or("sort-save-as requires a destination file path")?;
+    let column = column.ok_or("sort-save-as requires --column")?;
+    if column == 0 {
+        return Err("sort column must be at least 1".into());
+    }
+    let direction = direction.ok_or("sort-save-as requires --order")?;
+    if cancel_after_bytes == Some(0) {
+        return Err("cancel-after-bytes must be non-zero".into());
+    }
+
+    let session = Session::open(
+        &source,
+        OpenOptions {
+            delimiter,
+            header_mode,
+            ..OpenOptions::default()
+        },
+    )?;
+    if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
+        return Err("cancel-after-bytes must be less than file size".into());
+    }
+    let source_index = session.start_indexing(IndexConfig::default())?.wait()?;
+    let spec = SortSpec {
+        column: column - 1,
+        direction,
+    };
+    let source_size_before = session.file_size;
+    let data_rows = source_index
+        .indexed_rows()
+        .saturating_sub(u64::from(session.dialect.has_header));
+    let estimated_temporary_bytes = estimate_sort_temporary_bytes(
+        source_size_before.saturating_add(data_rows.saturating_mul(2)),
+        data_rows,
+    );
+    let job = session.start_create_sorted_working_copy(
+        BTreeMap::new(),
+        BTreeMap::new(),
+        spec,
+        &destination,
+    )?;
+    let (outcome, progress, cancellation_requested_at) =
+        wait_for_sort(job, cancel_after_bytes, Duration::from_millis(1))?;
+    let sort_peak_rss = peak_rss_bytes();
+    let sort_current_rss = current_rss_bytes();
+    let source_size_after = std::fs::metadata(session.path())?.len();
+    if source_size_after != source_size_before {
+        return Err("source file size changed during sort".into());
+    }
+    let source_hash = fnv1a64_file(session.path())?;
+
+    let (outcome_label, published_bytes, validation, output_hash) = match &outcome {
+        SortOutcome::Complete(summary) => {
+            let output_size = std::fs::metadata(&summary.destination)?.len();
+            if summary.destination != destination
+                || summary.rows_sorted != progress.rows_sorted
+                || summary.runs_created != progress.runs_created
+                || summary.bytes_written != progress.bytes_written
+                || summary.peak_temporary_bytes != progress.peak_temporary_bytes
+                || summary.merge_passes != progress.merge_passes
+                || summary.header_rows != progress.header_rows
+                || summary.elapsed != progress.elapsed
+                || output_size != summary.bytes_written
+            {
+                return Err("published output does not match sort progress".into());
+            }
+            let validation =
+                validate_sorted_output(&session, &source_index, &summary.destination, spec)?;
+            if validation.data_rows != summary.rows_sorted
+                || summary.header_rows != u64::from(session.dialect.has_header)
+            {
+                return Err("sort summary does not preserve exact row/header counts".into());
+            }
+            (
+                "complete",
+                Some(output_size),
+                Some(validation),
+                Some(fnv1a64_file(&summary.destination)?),
+            )
+        }
+        SortOutcome::Cancelled => {
+            if destination.exists() {
+                return Err("cancelled sort published a destination file".into());
+            }
+            ("cancelled", None, None, None)
+        }
+    };
+
+    println!("Quarry guarded sort validation artifact\n");
+    println!("Source: {}", session.path().display());
+    println!(
+        "Source size: {} ({} bytes)",
+        human_bytes(source_size_before),
+        source_size_before
+    );
+    println!("Destination: {}", destination.display());
+    println!("Artifact permissions: owner-only");
+    println!(
+        "Delimiter: {}",
+        display_delimiter(session.dialect.delimiter)
+    );
+    println!(
+        "Header: {}",
+        if session.dialect.has_header {
+            "first row"
+        } else {
+            "none"
+        }
+    );
+    println!("Cache state: {cache_state}");
+    println!("Sort column: {column}");
+    println!(
+        "Sort order: {}",
+        match direction {
+            SortDirection::Ascending => "ascending",
+            SortDirection::Descending => "descending",
+        }
+    );
+    println!(
+        "Estimated temporary disk: {} ({} bytes)",
+        human_bytes(estimated_temporary_bytes),
+        estimated_temporary_bytes
+    );
+    println!(
+        "Peak temporary disk: {} ({} bytes)",
+        human_bytes(progress.peak_temporary_bytes),
+        progress.peak_temporary_bytes
+    );
+    println!("Outcome: {outcome_label}");
+    println!("Rows sorted: {}", progress.rows_sorted);
+    println!("Header rows: {}", progress.header_rows);
+    println!("Sorted runs created: {}", progress.runs_created);
+    println!("Merge passes: {}", progress.merge_passes);
+    println!(
+        "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
+        human_bytes(progress.bytes_scanned),
+        progress.bytes_scanned,
+        human_bytes(progress.total_bytes),
+        progress.total_bytes
+    );
+    println!(
+        "Output bytes written: {} ({} bytes)",
+        human_bytes(progress.bytes_written),
+        progress.bytes_written
+    );
+    println!("Sort wall time: {:.3} s", progress.elapsed.as_secs_f64());
+    println!("Source size unchanged: yes ({source_size_after} bytes)");
+    println!("Source FNV-1a 64: {source_hash:016x}");
+    println!(
+        "Destination published: {}",
+        if published_bytes.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if let Some(bytes) = published_bytes {
+        println!("Published size: {} ({bytes} bytes)", human_bytes(bytes));
+    }
+    if let Some(hash) = output_hash {
+        println!("Output FNV-1a 64: {hash:016x}");
+    }
+    if let Some(validation) = validation {
+        println!(
+            "Exact data row count preserved: yes ({})",
+            validation.data_rows
+        );
+        if let Some(header_bytes) = validation.header_bytes {
+            println!("Exact raw header preserved: yes ({header_bytes} bytes)");
+        } else {
+            println!("Exact raw header preserved: n/a (headerless source)");
+        }
+        println!(
+            "Validation index and reads: {:.3} s",
+            validation.elapsed.as_secs_f64()
+        );
+    }
+    if let Some(requested_at) = cancellation_requested_at {
+        println!(
+            "Cancellation requested after: {} ({} bytes)",
+            human_bytes(requested_at),
+            requested_at
+        );
+    }
+    if let Some(latency) = progress.cancellation_latency {
+        println!(
+            "Cancellation latency: {:.3} ms",
+            latency.as_secs_f64() * 1000.0
+        );
+    }
+    println!(
+        "Current process memory after sort: {}",
+        optional_bytes(sort_current_rss)
+    );
+    println!(
+        "Peak process RSS through sort: {}",
+        optional_bytes(sort_peak_rss)
+    );
+    Ok(())
+}
+
+fn parse_sort_direction(value: &str) -> CliResult<SortDirection> {
+    match value {
+        "asc" => Ok(SortDirection::Ascending),
+        "desc" => Ok(SortDirection::Descending),
+        _ => Err("--order must be asc or desc".into()),
+    }
+}
+
+fn parse_header_mode(value: &str) -> CliResult<HeaderMode> {
+    match value {
+        "auto" => Ok(HeaderMode::Auto),
+        "first-row" => Ok(HeaderMode::FirstRow),
+        "none" => Ok(HeaderMode::NoHeader),
+        _ => Err("--header must be auto, first-row, or none".into()),
+    }
+}
+
+fn wait_for_sort(
+    job: SortJob,
+    cancel_after_bytes: Option<u64>,
+    poll_interval: Duration,
+) -> CliResult<SortRun> {
+    let mut cancellation = None;
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if cancellation.is_none()
+            && cancel_after_bytes.is_some_and(|threshold| progress.bytes_scanned >= threshold)
+        {
+            job.cancel();
+            cancellation = Some(progress.bytes_scanned);
+        }
+        thread::sleep(poll_interval);
+    }
+
+    let progress = job.progress();
+    let outcome = job.wait()?;
+    if cancel_after_bytes.is_some() && cancellation.is_none() {
+        return Err("sort finished before cancellation threshold".into());
+    }
+    if cancel_after_bytes.is_some() && !matches!(&outcome, SortOutcome::Cancelled) {
+        return Err("sort completed before cancellation took effect".into());
+    }
+    if cancel_after_bytes.is_some()
+        && (!progress.cancelled || progress.cancellation_latency.is_none())
+    {
+        return Err("sort did not report completed cancellation metrics".into());
+    }
+    if cancel_after_bytes.is_some() && progress.bytes_scanned >= progress.total_bytes {
+        return Err("sort reached end of file before cancellation took effect".into());
+    }
+    Ok((outcome, progress, cancellation))
+}
+
+struct SortValidation {
+    data_rows: u64,
+    header_bytes: Option<usize>,
+    elapsed: Duration,
+}
+
+fn validate_sorted_output(
+    source: &Session,
+    source_index: &StructuralIndex,
+    destination: &Path,
+    spec: SortSpec,
+) -> CliResult<SortValidation> {
+    const VALIDATION_ROWS: usize = 1_000;
+
+    let started = Instant::now();
+    let output = Session::open(
+        destination,
+        OpenOptions {
+            rows: 1,
+            delimiter: Some(source.dialect.delimiter),
+            header_mode: if source.dialect.has_header {
+                HeaderMode::FirstRow
+            } else {
+                HeaderMode::NoHeader
+            },
+            ..OpenOptions::default()
+        },
+    )?;
+    let output_index = output.start_indexing(IndexConfig::default())?.wait()?;
+    if output_index.indexed_rows() != source_index.indexed_rows() {
+        return Err("sorted output record count changed".into());
+    }
+    let header_bytes = match (
+        raw_header(source.path(), source, source_index)?,
+        raw_header(destination, &output, &output_index)?,
+    ) {
+        (Some(source), Some(output)) if source == output => Some(source.len()),
+        (None, None) => None,
+        _ => return Err("sorted output raw header changed".into()),
+    };
+
+    let data_start = u64::from(source.dialect.has_header);
+    let mut next_row = data_start;
+    let mut previous_key: Option<Vec<u8>> = None;
+    while next_row < output_index.indexed_rows() {
+        let remaining = output_index.indexed_rows() - next_row;
+        let rows = output.read_rows(
+            &output_index,
+            next_row,
+            remaining.min(VALIDATION_ROWS as u64) as usize,
+        )?;
+        if rows.is_empty() {
+            return Err("sorted output validation row is missing".into());
+        }
+        for row in &rows {
+            let key = row.fields.get(spec.column).cloned().unwrap_or_default();
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| match spec.direction {
+                    SortDirection::Ascending => previous > &key,
+                    SortDirection::Descending => previous < &key,
+                })
+            {
+                return Err("sorted output is out of order".into());
+            }
+            previous_key = Some(key);
+        }
+        next_row += rows.len() as u64;
+    }
+    Ok(SortValidation {
+        data_rows: next_row - data_start,
+        header_bytes,
+        elapsed: started.elapsed(),
+    })
+}
+
+fn raw_header(
+    path: &Path,
+    session: &Session,
+    index: &StructuralIndex,
+) -> CliResult<Option<Vec<u8>>> {
+    if !session.dialect.has_header {
+        return Ok(None);
+    }
+    let rows = session.read_rows(index, 0, 2)?;
+    if rows.is_empty() {
+        return Err("headered source does not contain a header row".into());
+    }
+    let end = rows.get(1).map_or(session.file_size, |row| row.offset);
+    let length = usize::try_from(end).map_err(|_| "header is too large to validate")?;
+    let mut header = vec![0_u8; length];
+    File::open(path)?.read_exact(&mut header)?;
+    Ok(Some(header))
+}
+
+fn fnv1a64_file(path: &Path) -> CliResult<u64> {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut hash = OFFSET;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hash);
+        }
+        for byte in &buffer[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
 }
 
 fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
@@ -2249,12 +2667,14 @@ mod tests {
 
     use super::{
         FilterSamples, data_search_position, edit_save_as_command, export_command, filter_command,
-        generate_file, latency_stats, parse_size, physical_to_data_row, record_filter_sample,
-        sample_filtered_rows, search_command, transform_save_as_command,
+        fnv1a64_file, generate_file, latency_stats, parse_header_mode, parse_size,
+        parse_sort_direction, physical_to_data_row, record_filter_sample, sample_filtered_rows,
+        search_command, sort_save_as_command, transform_save_as_command,
         validate_saved_transformation, viewport_command, wait_for_save_as,
     };
     use quarry_core::{
         ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, OpenOptions, Session,
+        SortDirection,
     };
 
     #[test]
@@ -2936,6 +3356,177 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0], source.file_name().unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sort_save_as_parses_required_arguments_and_dialect_overrides() {
+        assert!(matches!(
+            parse_sort_direction("asc").unwrap(),
+            SortDirection::Ascending
+        ));
+        assert!(matches!(
+            parse_sort_direction("desc").unwrap(),
+            SortDirection::Descending
+        ));
+        assert_eq!(
+            parse_sort_direction("ascending").unwrap_err().to_string(),
+            "--order must be asc or desc"
+        );
+        assert_eq!(parse_header_mode("auto").unwrap(), HeaderMode::Auto);
+        assert_eq!(
+            parse_header_mode("first-row").unwrap(),
+            HeaderMode::FirstRow
+        );
+        assert_eq!(parse_header_mode("none").unwrap(), HeaderMode::NoHeader);
+        assert_eq!(
+            parse_header_mode("yes").unwrap_err().to_string(),
+            "--header must be auto, first-row, or none"
+        );
+
+        for (args, expected) in [
+            (vec![], "sort-save-as requires a source file path"),
+            (
+                vec!["source.csv"],
+                "sort-save-as requires a destination file path",
+            ),
+            (
+                vec!["source.csv", "sorted.csv"],
+                "sort-save-as requires --column",
+            ),
+            (
+                vec!["source.csv", "sorted.csv", "--column", "1"],
+                "sort-save-as requires --order",
+            ),
+            (
+                vec![
+                    "source.csv",
+                    "sorted.csv",
+                    "--column",
+                    "0",
+                    "--order",
+                    "asc",
+                ],
+                "sort column must be at least 1",
+            ),
+            (
+                vec![
+                    "source.csv",
+                    "sorted.csv",
+                    "--column",
+                    "1",
+                    "--order",
+                    "asc",
+                    "--cancel-after-bytes",
+                    "0",
+                ],
+                "cancel-after-bytes must be non-zero",
+            ),
+        ] {
+            let error =
+                sort_save_as_command(args.into_iter().map(str::to_owned).collect()).unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn sort_file_hash_is_deterministic() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "quarry-sort-hash-{}-{suffix}.txt",
+            std::process::id()
+        ));
+        fs::write(&path, b"").unwrap();
+        assert_eq!(fnv1a64_file(&path).unwrap(), 0xcbf2_9ce4_8422_2325);
+        fs::write(&path, b"a").unwrap();
+        assert_eq!(fnv1a64_file(&path).unwrap(), 0xaf63_dc4c_8601_ec8c);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sort_save_as_writes_exact_stable_output_and_preserves_source() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-sort-save-as-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.psv");
+        let destination = directory.join("sorted.psv");
+        let source_bytes = b"name|note\r\nbeta|\"line one\nline two\"\r\nalpha|\"comma, value\"\r\nalpha|plain\r\n";
+        let expected = b"name|note\r\nalpha|\"comma, value\"\r\nalpha|plain\r\nbeta|\"line one\nline two\"\r\n";
+        fs::write(&source, source_bytes).unwrap();
+
+        sort_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+            "--column".into(),
+            "1".into(),
+            "--order".into(),
+            "asc".into(),
+            "--delimiter".into(),
+            "|".into(),
+            "--header".into(),
+            "first-row".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sort_save_as_cancellation_preserves_source_and_cleans_output() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-sort-save-as-cancellation-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        generate_file(&source, 64 * 1024 * 1024, 11, b',', 7).unwrap();
+        let source_size = fs::metadata(&source).unwrap().len();
+
+        sort_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+            "--column".into(),
+            "1".into(),
+            "--order".into(),
+            "desc".into(),
+            "--header".into(),
+            "first-row".into(),
+            "--cancel-after-bytes".into(),
+            "1".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::metadata(&source).unwrap().len(), source_size);
+        assert!(!destination.exists());
+        let names = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![source.file_name().unwrap()]);
         fs::remove_dir_all(directory).unwrap();
     }
 

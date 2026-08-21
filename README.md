@@ -34,8 +34,16 @@ one or more AND-combined contains/equality filter predicates; and cancellable,
 streaming filtered export to a new file. Existing UTF-8 headers and data cells
 can be edited directly in the grid, then written through atomic Save with
 metadata-based conflict detection or no-clobber Save As. Selected columns can
-also be split or joined into a private working copy that reopens as the same
-editable grid, then edited further or transformed again before Save or Save As.
+also be split, combined, moved, or deleted through a private working copy that
+reopens as the same editable grid, then edited further or transformed again
+before Save or Save As. Literal Find Next sees unsaved cell values, Replace in
+Cell edits the current match, and bounded Replace All materializes a private
+working copy without changing the source until Save.
+
+One selected numbered column can now sort all data rows by stable,
+case-sensitive text in ascending or descending order. The sorted result opens
+in the same Modified grid and uses the existing Undo, Redo, Discard, Save, and
+Save As workflow.
 
 ## Performance direction
 The initial reference workload is a **10 GB delimited file**. Quarry should show useful first rows within seconds, keep memory bounded, remain interactive during scans, and avoid full-file copies for read-only work.
@@ -71,15 +79,24 @@ equality predicates with AND semantics. A background worker parses each row
 once, builds a bounded adaptive match index, and serves bounded filtered row
 ranges through cancellable reads without retaining every matching row. Safe,
 cancellable streaming export passed the 1 GB and 12 GB validation. Phase 5 is
-in progress. Existing headers and UTF-8 data cells can now be edited directly
+complete. Existing headers and UTF-8 data cells can be edited directly
 in the grid. Atomic Save uses metadata-based conflict detection, and no-clobber
 Save As leaves the previous source unchanged. Both stream the sparse edit
 overlay without loading the file into memory. The direct-cell Save As path is
 measured on deterministic 1 GB and 12 GB files. Streaming split and join are
 also implemented and validated on both deterministic datasets. The desktop
 workflow applies each operation from selected grid columns, reopens the result
-as the normal editable working copy, and supports repeated operations. Explicit
-output reorder/drop is next.
+as the normal editable working copy, and supports repeated operations. Selected
+columns can also move as one block or be deleted explicitly without turning the
+view-only Columns manager into an output editor. Find Next searches unsaved cell
+values, Replace in Cell changes the current matched cell, and cancellable
+Replace All uses the same bounded private rewrite worker and change history.
+Phase 6A stable single-column text sorting is complete across the core,
+desktop, and validation CLI. Deterministic 1 GB and 12 GB release runs passed
+complete order and preservation scans with peak RSS below 18 MiB, measured
+temporary disk below the conservative estimate, unchanged source hashes, and
+prompt cancellation without leftover files. Phase 7 hardening begins with
+reproducible packaging and one canonical installed desktop application.
 
 ```bash
 cargo run --release -p quarry-cli -- open huge.csv
@@ -96,8 +113,14 @@ Use **Choose…** for the native macOS picker, drop one local file onto the
 window, or type a path and select **Open**. Current delimiter and header
 selections apply to newly opened files; changes to the open document wait for
 **Apply / Reopen**. After indexing completes, **Find Next** searches decoded
-cells from the first visible data row and jumps directly to the matching row
-and column.
+data cells from the first visible data row, including unsaved cell values, and
+jumps directly to the matching row and column. Enter replacement text and use
+**Replace in Cell** to replace every non-overlapping occurrence in the current
+matched cell and continue to the next match. **Replace All** applies the same
+literal, case-sensitive replacement across every data cell after applying
+unsaved cell edits. It reports progress, can be cancelled, skips the header,
+and reopens a successful result as an unsaved private working copy. No match,
+cancellation, or failure leaves the document unchanged.
 
 Use **Filters…** to choose a one-based file column and a literal, case-sensitive
 **Contains** or **Equals** predicate. Select **Add AND rule** to combine more
@@ -117,9 +140,9 @@ to edit it in the grid. Press **Shift+Enter** to insert a newline, **Enter** to
 commit the in-memory change, or **Escape** to cancel the active edit. Quarry
 does not modify the file until **Save** or **Save As…** succeeds. Missing cells
 in ragged rows and invalid UTF-8 cells remain non-editable. Clear an active
-filter before editing; save or discard current data-cell edits before starting
-a new search or filter because those background workers scan the active indexed
-CSV rather than the sparse edit overlay.
+filter before editing. Find and Replace use current unsaved cell values;
+filtering still requires data-cell edits to be saved or discarded because the
+filter worker scans the active indexed CSV.
 
 Plain-click a column number to select one column. **Shift-click** another number
 to select a contiguous range of shown columns, or **Command/Ctrl-click** to
@@ -139,8 +162,8 @@ that position's current header.
 **OK** runs the operation in the background, including a cancellable data scan
 to determine Split width, and streams the current document plus sparse edits to
 a private working CSV. Quarry then reopens that result as the normal editable
-grid. Continue editing cells or headers, or apply more Split and Combine
-commands in any order. **Cancel** leaves the document unchanged, and one-level
+grid. Continue editing cells or headers, or apply Split, Combine, Move, and
+Delete in any order. **Cancel** leaves the document unchanged, and one-level
 structural Undo and Redo move between adjacent document versions. The source
 file is not modified until **Save** succeeds; **Save As…** writes and opens a new
 file while preserving the previous source, and **Discard Changes** removes the
@@ -148,6 +171,27 @@ private working copies and restores the last opened or saved file. Quarry
 displays at most 32 document columns per viewport and applies the core
 65,536-column structural safety limit. Persistence is not otherwise limited by
 the bounded viewport.
+
+Right-click a selected numbered header and choose **Move Selected Columns…** to
+move every selected column as one block. Enter the one-based destination for
+the block's first output position after Quarry removes it from the current
+order, then choose **Move**. Unselected columns retain their order, and moving a
+block to its current position changes nothing. **Delete Selected Columns**
+starts without a dialog; Quarry prevents deleting every known column and
+selects the nearest survivor. Hidden columns remain in the file; to delete one,
+show it and select it explicitly. Both actions preserve
+later undiscovered fields in ragged rows and use the same background progress,
+cancellation, Undo/Redo, Discard, Save, and Save As workflow as Split and
+Combine.
+
+Select exactly one numbered header and choose **Sort Rows…** to order every
+data row by that column. Choose ascending or descending in the compact dialog.
+Comparison is case-sensitive text, missing ragged fields compare as empty, the
+header stays fixed, and equal values retain their current order. Quarry waits
+for indexing to finish so it can show a conservative temporary-disk allowance
+before Sort is enabled. A successful result immediately replaces the grid as a
+Modified private working copy; cancellation or failure leaves the document
+unchanged.
 
 Reproduce a filtered export from the CLI without loading the entire source or
 retaining all matches in memory:
@@ -173,7 +217,13 @@ cargo run --release -p quarry-cli --bin quarry-bench -- edit-save-as huge.csv \
 Measure the streaming persistence engine with exact header, record-count,
 schema, and first/middle/final row validation. These benchmark commands use one
 deterministic operation per run; they are persistence evidence rather than the
-desktop interaction contract:
+desktop interaction contract. Move and Delete reuse this measured bounded
+worker; exact core regressions cover their ordering, sparse edits, ragged rows,
+and source preservation without adding another benchmark-only CLI mode.
+Replace All also reuses the private rewrite worker measured here; exact core
+and desktop regressions cover its overlay-first replacement, no-match,
+cancellation, cleanup, and Undo behavior without claiming separate 1 GB or
+12 GB Replace All timings:
 
 ```bash
 cargo run --release -p quarry-cli --bin quarry-bench -- transform-save-as huge.csv \
@@ -186,15 +236,24 @@ cargo run --release -p quarry-cli --bin quarry-bench -- transform-save-as huge.c
   --cache-state warm
 ```
 
+Exercise stable text sorting through the guarded owner-only validation
+artifact and automatic read-back check:
+
+```bash
+cargo run --release -p quarry-cli --bin quarry-bench -- sort-save-as \
+  huge.csv sorted.csv --column 1 --order asc --header first-row \
+  --cache-state unknown
+```
+
 Use **Columns…** to view or hide a one-based file column, move it to any display
 position, drag it by its handle inside the Columns window, or reset the layout.
 Hidden columns remain part of that display order. The main grid headers stay
 resize-only, which prevents accidental reordering while browsing. Each header
 shows its stable, one-based document-column number above the column name. A
 Split or Combine command creates a new current document schema and renumbers
-affected positions; later view-only hide and reorder actions preserve those
-new identities for search and copy. Quarry renders at most 32 data columns at
-once.
+affected positions. Move and Delete also create a new document schema, while
+later view-only hide and reorder actions preserve those new identities for
+search and copy. Quarry renders at most 32 data columns at once.
 Header columns are known immediately; extra fields in later ragged rows are
 appended when Quarry encounters them.
 
@@ -263,6 +322,7 @@ See the [12 GB engine benchmark](docs/benchmarks/2026-08-14-large-file.md),
 [filtered-export validation](docs/benchmarks/2026-08-16-filtered-export.md),
 [direct-cell editing validation](docs/benchmarks/2026-08-18-direct-cell-editing.md),
 [split/join transformation validation](docs/benchmarks/2026-08-19-split-join-transformations.md),
+[Phase 6A stable-text-sort validation](docs/benchmarks/2026-08-21-stable-text-sort.md),
 [initial engine decision](docs/adr/0001-initial-engine.md),
 [viewport cache decision](docs/adr/0002-defer-viewport-cache.md), and
 [UI decision](docs/adr/0003-select-egui-ui.md).
