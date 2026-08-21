@@ -98,10 +98,11 @@ complete order and preservation scans with peak RSS below 20 MiB, measured
 temporary disk below the conservative estimate, unchanged source hashes, and
 prompt cancellation without leftover files. The worker now also verifies the
 effective record multiset and exact stable tie order before publication. Phase
-7A now has a repeatable package and canonical `/Applications/Quarry.app`
-workflow under validation. The installed-app journey passes open, inline edit,
-sort, Save As, exact source preservation, quit, relaunch, and reopen. The final
-release gate is a clean committed package and install.
+7A desktop packaging is complete. The full installed-app interaction journey
+passes, and clean committed build 29 installs as the canonical
+`/Applications/Quarry.app`, reports matching source metadata, and reopens the
+validated output. Phase 7B next focuses on polishing current workflows before
+the missing-feature inventory.
 
 ## Install Quarry
 

@@ -13,7 +13,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
 | Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover selected-column Move/Delete, overlay-aware Find Next, and Replace in Cell; bounded Replace All reuses the measured private rewrite worker |
 | Phase 6: Sorting | Complete | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup |
-| Phase 7: Hardening | In progress | Phase 7A repeatable packaging, canonical installation, rollback archive, and the installed-app journey pass in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); the clean committed release install remains |
+| Phase 7: Hardening | In progress | Phase 7A packaging and installation are complete in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); Phase 7B workflow polish and feature-gap review are next |
 
 ### Phase 1 checklist
 
@@ -111,8 +111,8 @@ Replace in Cell, and bounded Replace All use effective unsaved cell values.
 Cosmetic redesign remains outside the current scope.
 Phase 6 is complete. Stable, selected-column text sorting works in the ordinary
 editable grid and passed the deterministic 1 GB and 12 GB release gate.
-Phase 7A has one repeatable macOS package command and one canonical installed
-application. Its final clean committed release install remains.
+Phase 7A is complete with one repeatable macOS package command, one canonical
+installed application, and a clean committed release install.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -178,7 +178,8 @@ edits or transformations without building a file-sized in-memory model.
 One-level structural Undo and Redo reopen the preceding or subsequent document
 version.
 
-**Next:** complete the Phase 7A clean committed package and installation gate.
+**Next:** begin Phase 7B with workflow polish, refinement, and a feature-gap
+review after the current interactions are coherent.
 
 ### Phase 5 checklist
 
@@ -308,7 +309,7 @@ performance runs, benchmark dashboard.
   preservation, exact output, quit, relaunch, and reopen from the installed app.
 - [x] Document package, installation, update, verification, rollback, and
   signing limits in the [macOS packaging guide](MACOS_PACKAGING.md).
-- [ ] Commit Phase 7A, rebuild and install from that clean source, and verify
+- [x] Commit Phase 7A, rebuild and install from that clean source, and verify
   `QuarrySourceStatus=clean` with `QuarryGitRevision` equal to the release commit.
 
 **Phase 7A exit:** the package workflow is repeatable from the same checkout,
@@ -316,9 +317,23 @@ Rust toolchain, and macOS SDK. The installed app identifies its build, launches
 the current binary from one canonical location, and passes the packaged-app
 smoke test.
 
-**Phase 7A exit pending:** all functional and interaction checks pass in the
-[packaged-app validation](benchmarks/2026-08-21-packaged-app.md). The clean
-committed package and installation check remains.
+**Phase 7A exit met:** the clean implementation commit and installed bundle
+match in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md).
+
+### Phase 7B checklist: workflow polish and feature-gap review
+
+- [ ] Dogfood opening, navigation, column selection, filters, transformations,
+  editing, sorting, Save, Save As, discard, Undo, and Redo as connected desktop
+  workflows.
+- [ ] Refine discoverability, feedback, terminology, and interaction details in
+  existing features before adding new workflows.
+- [ ] Complete focused keyboard, accessibility, appearance, and window-size
+  checks across the current interface.
+- [ ] Inventory missing editor features after the polish pass and prioritize
+  them by user value, implementation risk, and large-file constraints.
+
+**Phase 7B exit:** current core workflows feel coherent and usable, and the
+remaining feature gaps are documented in priority order.
 
 ## Later possibilities
 Cross-platform front ends, plugin/API surface, schema inference, SQL-like querying, compressed files, CLI recipes, multi-file operations.

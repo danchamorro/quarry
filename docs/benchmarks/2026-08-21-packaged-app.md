@@ -2,11 +2,12 @@
 
 ## Status
 
-The repeatable package workflow, canonical installation, rollback archive, strict
-signature verification, and installed-app interaction journey pass. The final
-release gate remains pending until the implementation is committed and the app
-is rebuilt and installed with `QuarrySourceStatus=clean` and that commit in
-`QuarryGitRevision`.
+The repeatable package workflow, canonical installation, rollback archive,
+strict signature verification, installed-app interaction journey, and clean
+release gate pass. Commit `493b20d521e116be5eb327f8a38bc042608daf11`
+was packaged and installed with `QuarrySourceStatus=clean` and the same value in
+`QuarryGitRevision`. This evidence update is documentation-only and follows the
+validated implementation commit.
 
 ## Environment
 
@@ -20,8 +21,8 @@ is rebuilt and installed with `QuarrySourceStatus=clean` and that commit in
 | Xcode | 26.6 (17F113) |
 | macOS SDK | 26.5 |
 | App version | 0.1.0 |
-| Build version | 28 |
-| Validation source revision | `4c411dd24de3b7745ac838c6ea17a971b8f1fc71` plus Phase 7A working changes |
+| Build version | 29 |
+| Validation source revision | `493b20d521e116be5eb327f8a38bc042608daf11` |
 | Installed path | `/Applications/Quarry.app` |
 | Bundle identifier | `io.github.danchamorro.quarry` |
 | Signature | Ad hoc, strict verification passed |
@@ -33,8 +34,8 @@ SDK, and machine produced identical payload hashes:
 
 | Payload | SHA-256 |
 |---|---|
-| `Contents/Info.plist` | `4c91fcc6779e74bf90a9d9ed6356f2e5f7617cd28c8ed5740ca5b1f140cb08d6` |
-| `Contents/MacOS/Quarry` | `79771ae7b9c657f5870a8d9fd26d2a4207d347c9885867acdae22c3deb24b1fb` |
+| `Contents/Info.plist` | `98946407b147e802a824d62581cbd1941ac7b2c653b1aae761e87ca88659e31d` |
+| `Contents/MacOS/Quarry` | `f5c1f259beb3e3f2b539201371748691c5d87feb91dbfda5420b4cdf117a96e1` |
 | `Contents/Resources/Quarry.icns` | `b252894d5a3a2c7aa76bf1dc76b5ffe483a55406d7d4032498c190021048aecb` |
 
 The installer verified the candidate before replacement, installed an exact
@@ -81,6 +82,10 @@ From `/Applications/Quarry.app`:
 8. Quarry quit, relaunched from the canonical application, reopened the output,
    and showed the same clean values and order.
 
+After the clean release install, build 29 was launched from
+`/Applications/Quarry.app` and reopened the saved output with the same five
+values in the recorded order.
+
 | File | SHA-256 |
 |---|---|
 | Unchanged source | `e236f1a14b2761eb593617bd8f80f5834a5ae897d38dfe74bb48b13b51d7886d` |
@@ -97,7 +102,7 @@ From `/Applications/Quarry.app`:
 - [x] A verified rollback archive exists outside `/Applications`.
 - [x] Open, edit, sort, Save As, exact source preservation, exact output, quit,
   relaunch, and reopen pass from the installed app.
-- [ ] Rebuild and install from the committed Phase 7A revision with a clean
+- [x] Rebuild and install from the committed Phase 7A revision with a clean
   source marker.
 
 Ad-hoc signing is sufficient only for this local alpha validation. This record
