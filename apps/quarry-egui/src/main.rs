@@ -4707,14 +4707,13 @@ fn headers_for(session: &Session, columns: &[usize]) -> Vec<String> {
 }
 
 fn column_name(session: &Session, column: usize) -> String {
-    if session.dialect.has_header {
-        if let Some(field) = session
+    if session.dialect.has_header
+        && let Some(field) = session
             .first_rows
             .first()
             .and_then(|row| row.fields.get(column))
-        {
-            return field_text(field);
-        }
+    {
+        return field_text(field);
     }
     format!("Column {}", column + 1)
 }
