@@ -25,6 +25,8 @@ const OVERSCAN_ROWS: usize = 2;
 const ROW_HEIGHT: f32 = 17.0;
 const COLUMN_RULER_HEIGHT: f32 = 22.0;
 const HEADER_HEIGHT: f32 = COLUMN_RULER_HEIGHT + ROW_HEIGHT;
+const ROW_NUMBER_WIDTH: f32 = 74.0;
+const MAX_RENDERED_COLUMNS: usize = 64;
 const SCROLLBAR_WIDTH: f32 = 18.0;
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
@@ -515,6 +517,9 @@ impl QuarryApp {
             }
             Action::CopySelection => return self.copy_selection(ctx),
             Action::OpenColumns => {
+                ctx.data_mut(|data| {
+                    data.remove::<usize>(egui::Id::new("quarry-selected-managed-column"));
+                });
                 self.columns_open = true;
                 return;
             }
@@ -1202,9 +1207,15 @@ impl eframe::App for QuarryApp {
                             action = Some(Action::OpenColumns);
                         }
                         if ui
-                            .button("Auto-fit columns")
+                            .add_enabled(
+                                document.columns.shown_count() <= MAX_RENDERED_COLUMNS,
+                                egui::Button::new("Auto-fit columns"),
+                            )
                             .on_hover_text(
                                 "Fit every shown column to its header and loaded cell values",
+                            )
+                            .on_disabled_hover_text(
+                                "Auto-fit is available when 64 or fewer columns are shown. Hide columns first.",
                             )
                             .clicked()
                         {
@@ -1398,17 +1409,20 @@ impl eframe::App for QuarryApp {
                             ui.separator();
                             ui.label(format!("viewport {:.3} ms", read.as_secs_f64() * 1000.0));
                         }
-                        ui.separator();
                         if document.filter_active() {
-                            ui.label(format!(
-                                "matches {}–{} of {}",
-                                document.filter_viewport_start.saturating_add(1),
-                                document
-                                    .filter_viewport_start
-                                    .saturating_add(document.visible_row_count() as u64),
-                                document.available_filter_rows()
-                            ));
+                            if document.available_filter_rows() > 0 {
+                                ui.separator();
+                                ui.label(format!(
+                                    "matches {}–{} of {}",
+                                    document.filter_viewport_start.saturating_add(1),
+                                    document
+                                        .filter_viewport_start
+                                        .saturating_add(document.visible_row_count() as u64),
+                                    document.available_filter_rows()
+                                ));
+                            }
                         } else {
+                            ui.separator();
                             ui.label(format!(
                                 "rows {}–{}",
                                 document.display_start(),
@@ -1882,6 +1896,7 @@ fn show_column_manager(
                                 })
                                 .inner_margin(egui::Margin::symmetric(8, 4))
                                 .show(ui, |ui| {
+                                    ui.set_min_height(row_height - 8.0);
                                     ui.horizontal(|ui| {
                                         let name = document.column_name(column);
                                         let mut shown = !document.columns.hidden[column];
@@ -5542,6 +5557,34 @@ fn paint_column_selection(ui: &egui::Ui, selected: bool) {
     }
 }
 
+fn rendered_column_range(
+    viewport: egui::Rect,
+    total_columns: usize,
+    column_width: f32,
+    column_spacing: f32,
+    focused_column: Option<usize>,
+) -> std::ops::Range<usize> {
+    if total_columns <= MAX_RENDERED_COLUMNS {
+        return 0..total_columns;
+    }
+    let maximum_start = total_columns - MAX_RENDERED_COLUMNS;
+    let start = focused_column.map_or_else(
+        || {
+            let stride = column_width + column_spacing;
+            let first_visible = ((viewport.min.x - ROW_NUMBER_WIDTH - column_spacing).max(0.0)
+                / stride)
+                .floor() as usize;
+            first_visible.saturating_sub(1).min(maximum_start)
+        },
+        |column| {
+            column
+                .saturating_sub(MAX_RENDERED_COLUMNS / 2)
+                .min(maximum_start)
+        },
+    );
+    start..start + MAX_RENDERED_COLUMNS
+}
+
 fn show_grid(
     ui: &mut egui::Ui,
     document: &mut Document,
@@ -5675,81 +5718,147 @@ fn show_table(
     let auto_fit_columns = std::mem::take(&mut document.auto_fit_columns);
     let grid_height = ui.available_height();
     let viewport_width = ui.available_width();
-    let column_width =
-        ((viewport_width - 82.0) / document.headers.len().max(1) as f32).clamp(80.0, 160.0);
-    let content_width =
-        74.0 + document.headers.len() as f32 * (column_width + ui.spacing().item_spacing.x);
+    let virtualized = document.headers.len() > MAX_RENDERED_COLUMNS;
+    let column_spacing = ui.spacing().item_spacing.x;
+    let column_width = if virtualized {
+        ((viewport_width - ROW_NUMBER_WIDTH) / MAX_RENDERED_COLUMNS.saturating_sub(2).max(1) as f32
+            - column_spacing)
+            .max(80.0)
+    } else {
+        ((viewport_width - 82.0) / document.headers.len().max(1) as f32).clamp(80.0, 160.0)
+    };
+    let column_stride = column_width + column_spacing;
+    let content_width = ROW_NUMBER_WIDTH + document.headers.len() as f32 * column_stride;
     let body_height =
         (grid_height - HEADER_HEIGHT - ui.spacing().scroll.allocated_width()).max(ROW_HEIGHT);
-    let visible_headers = document
-        .columns
-        .visible
-        .iter()
-        .copied()
-        .zip(document.headers.iter().cloned())
-        .collect::<Vec<_>>();
-    let header_min_widths = visible_headers
-        .iter()
-        .map(|(_, name)| {
-            if auto_fit_columns {
-                ui.painter()
-                    .layout_no_wrap(
-                        name.clone(),
-                        FontId::new(13.0, FontFamily::Monospace),
-                        ui.visuals().text_color(),
-                    )
-                    .size()
-                    .x
-                    + 12.0
-            } else {
-                80.0
-            }
-        })
-        .collect::<Vec<_>>();
+    let focused_source_column = reveal_cell
+        .map(|(_, column)| column)
+        .or(column_focus_requested)
+        .or(cell_focus_requested.map(|(_, column)| column))
+        .or(active_header_edit.as_ref().map(|edit| edit.column))
+        .or(active_cell_edit.as_ref().map(|edit| edit.column));
+    let focused_column = focused_source_column.and_then(|column| {
+        document
+            .columns
+            .visible
+            .iter()
+            .position(|visible| *visible == column)
+    });
 
-    egui::ScrollArea::horizontal()
+    let mut horizontal_scroll = egui::ScrollArea::horizontal()
         .id_salt("quarry-grid-horizontal")
         .auto_shrink([false, false])
-        .max_height(grid_height)
-        .show(ui, |ui| {
-            ui.set_min_width(content_width.max(viewport_width));
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let divider_left = ui.cursor().left();
-            let divider_y = ui.cursor().top() + COLUMN_RULER_HEIGHT;
-            let mut table = TableBuilder::new(ui)
-                .id_salt("quarry-grid")
-                .striped(true)
-                .resizable(true)
-                .vscroll(false)
-                .auto_shrink([false, false])
-                .min_scrolled_height(body_height)
-                .max_scroll_height(body_height)
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .cell_layout(Layout::left_to_right(Align::Center))
-                .column(Column::exact(74.0).clip(true));
-            for header_min_width in &header_min_widths {
-                table = table.column(
+        .max_height(grid_height);
+    if virtualized && let Some(column) = focused_column {
+        let target_x = ROW_NUMBER_WIDTH + column_spacing + column as f32 * column_stride;
+        horizontal_scroll = horizontal_scroll
+            .horizontal_scroll_offset((target_x - (viewport_width - column_width) / 2.0).max(0.0));
+    }
+
+    horizontal_scroll.show_viewport(ui, |ui, viewport| {
+        let rendered_range = rendered_column_range(
+            viewport,
+            document.headers.len(),
+            column_width,
+            column_spacing,
+            virtualized.then_some(focused_column).flatten(),
+        );
+        let spacer_width = (rendered_range.start > 0)
+            .then_some(rendered_range.start as f32 * column_stride - column_spacing);
+        let visible_headers = rendered_range
+            .clone()
+            .map(|visible_column| {
+                (
+                    visible_column,
+                    document.columns.visible[visible_column],
+                    document.headers[visible_column].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let header_min_widths = visible_headers
+            .iter()
+            .map(|(_, _, name)| {
+                if auto_fit_columns && !virtualized {
+                    ui.painter()
+                        .layout_no_wrap(
+                            name.clone(),
+                            FontId::new(13.0, FontFamily::Monospace),
+                            ui.visuals().text_color(),
+                        )
+                        .size()
+                        .x
+                        + 12.0
+                } else {
+                    80.0
+                }
+            })
+            .collect::<Vec<_>>();
+
+        ui.set_min_width(content_width.max(viewport_width));
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let divider_left = ui.cursor().left();
+        let divider_y = ui.cursor().top() + COLUMN_RULER_HEIGHT;
+        let mut table = TableBuilder::new(ui)
+            .id_salt(if virtualized {
+                "quarry-grid-virtual"
+            } else {
+                "quarry-grid"
+            })
+            .striped(true)
+            .resizable(!virtualized)
+            .vscroll(false)
+            .auto_shrink([false, false])
+            .min_scrolled_height(body_height)
+            .max_scroll_height(body_height)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .cell_layout(Layout::left_to_right(Align::Center))
+            .column(
+                Column::exact(ROW_NUMBER_WIDTH)
+                    .clip(true)
+                    .resizable(false),
+            );
+        if let Some(spacer_width) = spacer_width {
+            table = table.column(
+                Column::exact(spacer_width)
+                    .clip(true)
+                    .resizable(false),
+            );
+        }
+        for header_min_width in &header_min_widths {
+            table = if virtualized {
+                table.column(
+                    Column::exact(column_width)
+                        .clip(true)
+                        .resizable(false),
+                )
+            } else {
+                table.column(
                     Column::initial(column_width)
                         .at_least(header_min_width.max(80.0))
                         .clip(true)
                         .resizable(true)
                         .auto_size_this_frame(auto_fit_columns),
-                );
-            }
-            if auto_fit_columns {
-                table.reset();
-            }
-            table
-                .header(HEADER_HEIGHT, |mut header| {
-                    header.col(|ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.add_space(COLUMN_RULER_HEIGHT);
-                        });
+                )
+            };
+        }
+        if auto_fit_columns && !virtualized {
+            table.reset();
+        }
+        table
+            .header(HEADER_HEIGHT, |mut header| {
+                header.col(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add_space(COLUMN_RULER_HEIGHT);
                     });
-                    for (column, name) in &visible_headers {
-                        let column = *column;
-                        header.col(|ui| {
+                });
+                if spacer_width.is_some() {
+                    header.col(|_| {});
+                }
+                for (_, column, name) in &visible_headers {
+                    let column = *column;
+                    header.col(|ui| {
+                        ui.push_id(("column-header", column), |ui| {
                             let selected = document.selected_columns.contains(&column);
                             paint_column_selection(ui, selected);
                             ui.vertical(|ui| {
@@ -6019,10 +6128,11 @@ fn show_table(
                                 }
                             });
                         });
-                    }
-                })
-                .body(|body| {
-                    body.rows(ROW_HEIGHT, row_count, |mut table_row| {
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, row_count, |mut table_row| {
                         let row_index = table_row.index();
                         let (record_row, fields) = document
                             .visible_row(row_index)
@@ -6069,9 +6179,12 @@ fn show_table(
                                 },
                             );
                         });
-                        for (visible_column, column) in
-                            document.columns.visible.iter().copied().enumerate()
-                        {
+                        if spacer_width.is_some() {
+                            table_row.col(|_| {});
+                        }
+                        for (visible_column, column, _) in &visible_headers {
+                            let visible_column = *visible_column;
+                            let column = *column;
                             table_row.col(|ui| {
                                 ui.scope_builder(
                                     egui::UiBuilder::new()
@@ -6197,8 +6310,8 @@ fn show_table(
                                 );
                             });
                         }
-                    });
                 });
+            });
             ui.painter().line_segment(
                 [
                     egui::pos2(divider_left, divider_y),
@@ -6437,12 +6550,13 @@ mod tests {
     use super::{
         Action, ColumnCommand, ColumnView, DelimiterMode, Document, FIND_INPUT_ID, FilterOperator,
         FilterProgress, FilterQuery, GridColumnRequest, GridSelection, HeaderMode, IndexConfig,
-        OpenOptions, QuarryApp, REPLACE_INPUT_ID, Row, SOURCE_CHANGED_NOTICE, SearchMatch,
-        SearchProgress, Session, StructuralDialog, StructuralDialogAction, WorkingCopyState,
-        column_drop_position, column_ruler_divider_stroke, column_selection_fill, configure_style,
-        copy_control, estimate_sort_temporary_bytes, filtered_export_controls,
-        filtered_export_file_name, logical_viewport_start, max_viewport_start, page_controls,
-        parse_data_row, parse_file_column, parse_move_position, row_for_scroll_fraction,
+        MAX_RENDERED_COLUMNS, OpenOptions, QuarryApp, REPLACE_INPUT_ID, ROW_NUMBER_WIDTH, Row,
+        SOURCE_CHANGED_NOTICE, SearchMatch, SearchProgress, Session, StructuralDialog,
+        StructuralDialogAction, WorkingCopyState, column_drop_position,
+        column_ruler_divider_stroke, column_selection_fill, configure_style, copy_control,
+        estimate_sort_temporary_bytes, filtered_export_controls, filtered_export_file_name,
+        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
+        parse_file_column, parse_move_position, rendered_column_range, row_for_scroll_fraction,
         save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
         selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
         show_structural_dialog, sort_merge_progress,
@@ -6972,6 +7086,56 @@ mod tests {
         );
         document.shutdown();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn zero_match_filter_footer_omits_an_invalid_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty-filter.csv");
+        fs::write(&path, b"name,status\nfirst,keep\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"missing".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(&mut document);
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_style(&ctx);
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.document = Some(document);
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let painted_text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(painted_text.contains(&"No matching rows"));
+        assert!(
+            painted_text
+                .iter()
+                .all(|text| !text.starts_with("matches "))
+        );
+
+        app.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -8692,6 +8856,108 @@ mod tests {
     }
 
     #[test]
+    fn very_wide_column_ranges_stay_bounded_and_reach_the_last_column() {
+        let column_width = 80.0;
+        let column_spacing = 4.0;
+        let total_columns = 65_536;
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1_200.0, 800.0));
+        assert_eq!(
+            rendered_column_range(viewport, total_columns, column_width, column_spacing, None,),
+            0..MAX_RENDERED_COLUMNS
+        );
+
+        let content_width =
+            ROW_NUMBER_WIDTH + total_columns as f32 * (column_width + column_spacing);
+        let last_viewport = viewport.translate(egui::vec2(content_width - viewport.width(), 0.0));
+        let last = rendered_column_range(
+            last_viewport,
+            total_columns,
+            column_width,
+            column_spacing,
+            None,
+        );
+        assert_eq!(last.len(), MAX_RENDERED_COLUMNS);
+        assert_eq!(last.end, total_columns);
+
+        let focused = rendered_column_range(
+            viewport,
+            total_columns,
+            column_width,
+            column_spacing,
+            Some(40_000),
+        );
+        assert!(focused.contains(&40_000));
+        assert_eq!(
+            rendered_column_range(viewport, 42, column_width, column_spacing, None),
+            0..42
+        );
+    }
+
+    #[test]
+    fn very_wide_grid_renders_a_bounded_last_column_window() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quarry-very-wide-{name}.csv"));
+        let total_columns = 65_536;
+        let headers = (1..=total_columns)
+            .map(|column| format!("c{column}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let values = (1..=total_columns)
+            .map(|column| format!("v{column}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(&path, format!("{headers}\n{values}\n")).unwrap();
+
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.reveal_cell = Some((1, total_columns - 1));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_grid(ui, &mut document).unwrap();
+            });
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present");
+        let numbered_headers = tree
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.starts_with("Select file column "))
+            })
+            .count();
+        assert!(numbered_headers <= MAX_RENDERED_COLUMNS);
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label()
+                .is_some_and(|label| label.starts_with("Select file column 65536 (c65536)"))
+        }));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label().is_some_and(|label| {
+                label.starts_with("Select row 1, column 65536 (c65536): v65536")
+            })
+        }));
+        assert_eq!(document.columns.visible.len(), total_columns);
+        assert!(document.reveal_cell.is_none());
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn column_view_hides_reorders_resets_and_keeps_every_shown_column() {
         let mut view = ColumnView::new(40);
         assert_eq!(view.visible, (0..40).collect::<Vec<_>>());
@@ -8764,6 +9030,7 @@ mod tests {
         app.document = Some(document);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
+        configure_style(&ctx);
         let mut open = true;
         let mut search = String::new();
         let mut command = None;
@@ -8785,6 +9052,30 @@ mod tests {
         }));
         assert!(tree.nodes.iter().any(|(_, node)| {
             node.label() == Some("Select and drag column 1 to reorder") && !node.is_hidden()
+        }));
+        let drag_bounds = [1, 2].map(|column| {
+            let label = format!("Select and drag column {column} to reorder");
+            tree.nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label.as_str()))
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("{label} should have bounds"))
+        });
+        let row_height = drag_bounds[0].y1 - drag_bounds[0].y0;
+        let row_stride = drag_bounds[1].y0 - drag_bounds[0].y0;
+        assert!((row_height - 36.0).abs() < f64::EPSILON);
+        assert!(
+            (row_stride - (36.0 + f64::from(ctx.style().spacing.item_spacing.y))).abs()
+                < f64::EPSILON
+        );
+
+        ctx.data_mut(|data| {
+            data.insert_persisted(egui::Id::new("quarry-selected-managed-column"), 1_usize);
+        });
+        app.apply(&ctx, Action::OpenColumns);
+        assert!(ctx.data_mut(|data| {
+            data.get_persisted::<usize>(egui::Id::new("quarry-selected-managed-column"))
+                .is_none()
         }));
 
         search = "c40".into();
@@ -11062,7 +11353,9 @@ mod tests {
 
         let mut document = Document::open(&path, OpenOptions::default()).unwrap();
         document.visible_rows = document.buffered_rows.len() + 3;
+        let deadline = Instant::now() + Duration::from_secs(2);
         while !document.job.as_ref().unwrap().progress().done {
+            assert!(Instant::now() < deadline, "index refill timed out");
             std::thread::yield_now();
         }
 
