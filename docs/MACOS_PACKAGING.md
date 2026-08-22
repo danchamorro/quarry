@@ -15,6 +15,10 @@ application:
 | Current validated architecture | Apple Silicon (`arm64`) |
 | Icon source | `assets/quarry-logo-v3.png` |
 
+The bundle declares Quarry as an editor for macOS CSV documents. Finder,
+**Open With**, and a default-app association therefore deliver CSV file-open
+requests to the running application instead of rejecting the format.
+
 The package records the Cargo version, the full-history Git commit count as its
 numeric build version, the full Git commit, the built architecture, and whether
 the source tree was clean. A release candidate is acceptable only when

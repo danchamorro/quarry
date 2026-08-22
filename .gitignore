@@ -1,4 +1,5 @@
 /target/
 /LARGE_FILE.csv
+/LARGE_FILE_*.csv
 /fixtures/generated/
 *.qidx

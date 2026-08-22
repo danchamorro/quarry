@@ -16,6 +16,7 @@ PLIST_TEMPLATE="$ROOT/packaging/macos/Info.plist"
 ICON_SOURCE="$ROOT/assets/quarry-logo-v3.png"
 LOCK_FILE="/private/tmp/$BUNDLE_ID.$UID.lock"
 APP_INSTALL_LOCK_FILE="/private/tmp/$BUNDLE_ID.$UID.install.lock"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 PACKAGE_STAGE=""
 INSTALL_STAGE=""
 INSTALL_PREVIOUS=""
@@ -32,6 +33,7 @@ fail() {
 
 require_macos() {
     [[ "$(uname -s)" == "Darwin" ]] || fail "macOS packaging must run on macOS."
+    [[ -x "$LSREGISTER" ]] || fail "LaunchServices registration tool is unavailable."
     for command in cargo codesign git lipo lockf plutil rustc sips unzip; do
         command -v "$command" >/dev/null || fail "required command is unavailable: $command"
     done
@@ -55,7 +57,7 @@ verify_signed_app() {
     /usr/bin/codesign --verify --deep --strict --verbose=2 "$app"
 }
 
-verify_app() {
+verify_app_identity() {
     local app="$1"
     local plist="$app/Contents/Info.plist"
 
@@ -75,6 +77,25 @@ verify_app() {
         printf 'error: app icon is missing from %s\n' "$app" >&2
         return 1
     }
+}
+
+verify_app() {
+    local app="$1"
+    local plist="$app/Contents/Info.plist"
+
+    verify_app_identity "$app" || return 1
+    [[ "$(plist_value CFBundleDocumentTypes.0.CFBundleTypeRole "$plist")" == Editor ]] || {
+        printf 'error: CSV editor role is missing from %s\n' "$app" >&2
+        return 1
+    }
+    [[ "$(plist_value CFBundleDocumentTypes.0.LSItemContentTypes.0 "$plist")" == public.comma-separated-values-text ]] || {
+        printf 'error: CSV document support is missing from %s\n' "$app" >&2
+        return 1
+    }
+}
+
+register_app() {
+    "$LSREGISTER" -f "$1"
 }
 
 make_icon() {
@@ -216,7 +237,7 @@ install_app() {
     require_app_closed
 
     if [[ -e "$INSTALL_APP" ]]; then
-        verify_app "$INSTALL_APP" || fail "the current installed app is not a valid rollback source."
+        verify_app_identity "$INSTALL_APP" || fail "the current installed app is not a valid rollback source."
         backup_app "$INSTALL_APP" "$BACKUP_ARCHIVE"
     fi
     if [[ -e "$LEGACY_INSTALL_APP" ]]; then
@@ -243,7 +264,8 @@ install_app() {
     fi
     if ! verify_app "$INSTALL_APP" \
         || ! /usr/bin/cmp -s "$PACKAGE_APP/Contents/Info.plist" "$INSTALL_APP/Contents/Info.plist" \
-        || ! /usr/bin/cmp -s "$PACKAGE_APP/Contents/MacOS/$EXECUTABLE" "$INSTALL_APP/Contents/MacOS/$EXECUTABLE"
+        || ! /usr/bin/cmp -s "$PACKAGE_APP/Contents/MacOS/$EXECUTABLE" "$INSTALL_APP/Contents/MacOS/$EXECUTABLE" \
+        || ! register_app "$INSTALL_APP"
     then
         fail "installation verification failed; the previous app will be restored."
     fi
@@ -275,6 +297,9 @@ rollback_install() {
             if [[ -e "$INSTALL_APP" ]] || ! /bin/mv "$INSTALL_PREVIOUS" "$INSTALL_APP"; then
                 restored=false
             fi
+        fi
+        if [[ -e "$INSTALL_APP" ]] && ! register_app "$INSTALL_APP"; then
+            restored=false
         fi
     fi
     if [[ "$restored" == true ]]; then
@@ -313,6 +338,7 @@ self_test_rollback() {
     local test_root
 
     test_root="$(mktemp -d /private/tmp/quarry-rollback-test.XXXXXX)"
+    LSREGISTER=/usr/bin/true
     INSTALL_APP="$test_root/Quarry.app"
     INSTALL_STAGE="$test_root/.quarry-install.test"
     INSTALL_PREVIOUS="$INSTALL_STAGE/previous.app"

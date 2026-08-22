@@ -6,9 +6,22 @@ use std::time::{Duration, Instant};
 use std::fs::{File, OpenOptions as FsOpenOptions};
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::sync::{
+    Mutex, OnceLock,
+    mpsc::{self, Receiver, Sender},
+};
 
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
+#[cfg(target_os = "macos")]
+use objc2::runtime::{AnyObject, Imp, Sel};
+#[cfg(target_os = "macos")]
+use objc2::{ffi, sel};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSApplication;
+#[cfg(target_os = "macos")]
+use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 use quarry_core::{
     ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex,
     FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery,
@@ -46,6 +59,111 @@ const SOURCE_CHANGED_NOTICE: &str =
 const QUARRY_YELLOW: Color32 = Color32::from_rgb(233, 196, 106);
 const QUARRY_YELLOW_TEXT: Color32 = Color32::from_rgb(122, 88, 20);
 const QUARRY_SELECTED_TEXT: Color32 = Color32::from_rgb(47, 38, 18);
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct OpenDocumentTarget {
+    sender: Sender<PathBuf>,
+    context: Option<egui::Context>,
+}
+
+#[cfg(target_os = "macos")]
+static OPEN_DOCUMENT_TARGET: OnceLock<Mutex<Option<OpenDocumentTarget>>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn file_url_path(url: &NSURL) -> Option<PathBuf> {
+    if url.isFileURL() {
+        url.to_file_path()
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C-unwind" fn application_open_urls(
+    _delegate: &AnyObject,
+    _selector: Sel,
+    _application: &NSApplication,
+    urls: &NSArray<NSURL>,
+) {
+    let target = OPEN_DOCUMENT_TARGET
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("open-document target lock should not be poisoned")
+        .clone();
+    let Some(target) = target else {
+        return;
+    };
+    for index in 0..urls.count() {
+        let url = urls.objectAtIndex(index);
+        if let Some(path) = file_url_path(&url) {
+            let _ = target.sender.send(path);
+        }
+    }
+    if let Some(context) = target.context {
+        context.request_repaint();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_open_document_handler() -> Receiver<PathBuf> {
+    let (sender, receiver) = mpsc::channel();
+    *OPEN_DOCUMENT_TARGET
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("open-document target lock should not be poisoned") = Some(OpenDocumentTarget {
+        sender,
+        context: None,
+    });
+
+    let mtm = MainThreadMarker::new().expect("macOS document handling runs on the main thread");
+    let application = NSApplication::sharedApplication(mtm);
+    let delegate = application
+        .delegate()
+        .expect("winit installed an app delegate");
+    let delegate_object: &AnyObject = AsRef::<AnyObject>::as_ref(&*delegate);
+    let class = delegate_object.class();
+    let selector = sel!(application:openURLs:);
+    if class.instance_method(selector).is_none() {
+        let implementation: Imp = unsafe {
+            std::mem::transmute(
+                application_open_urls
+                    as unsafe extern "C-unwind" fn(
+                        &AnyObject,
+                        Sel,
+                        &NSApplication,
+                        &NSArray<NSURL>,
+                    ),
+            )
+        };
+        let added = unsafe {
+            ffi::class_addMethod(
+                class as *const _ as *mut _,
+                selector,
+                implementation,
+                c"v@:@@".as_ptr(),
+            )
+        };
+        assert!(
+            added.as_bool(),
+            "failed to install macOS open-document handler"
+        );
+        application.setDelegate(None);
+        application.setDelegate(Some(&delegate));
+    }
+    receiver
+}
+
+#[cfg(target_os = "macos")]
+fn attach_open_document_context(context: &egui::Context) {
+    let mut target = OPEN_DOCUMENT_TARGET
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("open-document target lock should not be poisoned");
+    if let Some(target) = target.as_mut() {
+        target.context = Some(context.clone());
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn acquire_install_lock_at(path: &Path) -> std::io::Result<File> {
@@ -93,6 +211,28 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    #[cfg(target_os = "macos")]
+    {
+        let event_loop =
+            winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
+        let open_document_receiver = install_open_document_handler();
+        let mut app = eframe::create_native(
+            "Quarry — Viewer Alpha",
+            options,
+            Box::new(move |creation| {
+                configure_style(&creation.egui_ctx);
+                attach_open_document_context(&creation.egui_ctx);
+                let mut app = QuarryApp::new(initial_path, started);
+                app.open_document_receiver = Some(open_document_receiver);
+                Ok(Box::new(app))
+            }),
+            &event_loop,
+        );
+        event_loop.run_app(&mut app)?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
     eframe::run_native(
         "Quarry — Viewer Alpha",
         options,
@@ -121,6 +261,8 @@ struct QuarryApp {
     close_after_save: bool,
     started: Instant,
     logged_first_update: bool,
+    #[cfg(target_os = "macos")]
+    open_document_receiver: Option<Receiver<PathBuf>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +374,8 @@ impl QuarryApp {
             close_after_save: false,
             started,
             logged_first_update: false,
+            #[cfg(target_os = "macos")]
+            open_document_receiver: None,
         };
         if let Some(path) = initial_path {
             app.open_path_and_report(path);
@@ -461,6 +605,18 @@ impl QuarryApp {
                 "{error} Ignored {ignored} additional dropped item(s)."
             )),
         };
+    }
+
+    #[cfg(target_os = "macos")]
+    fn poll_open_documents(&mut self) {
+        let paths = self
+            .open_document_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_iter().map(Some).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !paths.is_empty() {
+            self.handle_dropped_paths(paths);
+        }
     }
 
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
@@ -888,6 +1044,9 @@ impl eframe::App for QuarryApp {
         }
 
         self.intercept_dirty_close(ctx);
+
+        #[cfg(target_os = "macos")]
+        self.poll_open_documents();
 
         let dropped_paths = ctx.input(|input| {
             input
@@ -11565,6 +11724,35 @@ mod tests {
         for path in [first, second, malformed] {
             fs::remove_file(path).unwrap();
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_open_document_urls_preserve_file_paths() {
+        let path = std::env::temp_dir().join("quarry open document.csv");
+        let url = objc2_foundation::NSURL::from_file_path(&path).unwrap();
+        assert_eq!(super::file_url_path(&url), Some(path));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queued_macos_open_document_uses_the_source_file() {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source = std::env::temp_dir().join(format!("quarry-native-open-{name}.csv"));
+        fs::write(&source, b"name,value\nfirst,1\n").unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_document_receiver = Some(receiver);
+        sender.send(source.clone()).unwrap();
+        app.poll_open_documents();
+
+        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
+        app.document.as_mut().unwrap().shutdown();
+        fs::remove_file(source).unwrap();
     }
 
     #[test]
