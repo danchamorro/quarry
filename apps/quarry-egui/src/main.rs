@@ -44,6 +44,9 @@ const STRUCTURAL_SEPARATOR_INPUT_ID: &str = "quarry-structural-separator-input";
 const STRUCTURAL_POSITION_INPUT_ID: &str = "quarry-structural-position-input";
 const SOURCE_CHANGED_NOTICE: &str =
     "The source file changed outside Quarry. Discard changes and reopen it.";
+const QUARRY_YELLOW: Color32 = Color32::from_rgb(233, 196, 106);
+const QUARRY_YELLOW_TEXT: Color32 = Color32::from_rgb(122, 88, 20);
+const QUARRY_SELECTED_TEXT: Color32 = Color32::from_rgb(47, 38, 18);
 
 #[cfg(target_os = "macos")]
 fn acquire_install_lock_at(path: &Path) -> std::io::Result<File> {
@@ -1033,7 +1036,7 @@ impl eframe::App for QuarryApp {
                         RichText::new("VIEWER ALPHA")
                             .monospace()
                             .size(10.0)
-                            .color(Color32::from_rgb(49, 85, 217)),
+                            .color(QUARRY_YELLOW_TEXT),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let state = if self.document.as_ref().is_some_and(Document::is_dirty) {
@@ -6080,7 +6083,7 @@ fn show_table(
                                 let color = if selected {
                                     ui.visuals().selection.stroke.color
                                 } else {
-                                    Color32::from_rgb(49, 85, 217)
+                                    QUARRY_YELLOW_TEXT
                                 };
                                 let response = ui.add_sized(
                                     [ui.available_width(), ROW_HEIGHT],
@@ -6311,8 +6314,9 @@ fn configure_style(ctx: &egui::Context) {
 
     let mut visuals = egui::Visuals::light();
     visuals.override_text_color = Some(Color32::from_rgb(24, 35, 42));
-    visuals.selection.bg_fill = Color32::from_rgb(49, 85, 217);
-    visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
+    visuals.hyperlink_color = QUARRY_YELLOW_TEXT;
+    visuals.selection.bg_fill = QUARRY_YELLOW;
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, QUARRY_SELECTED_TEXT);
     visuals.widgets.inactive.bg_fill = Color32::from_rgb(238, 242, 244);
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(220, 228, 233);
     visuals.widgets.active.bg_fill = Color32::from_rgb(204, 218, 227);
@@ -6487,6 +6491,20 @@ mod tests {
         select_column, selected_split_column, selection_text, show_column_manager,
         show_filter_manager, show_grid, show_structural_dialog, sort_merge_progress,
     };
+
+    #[test]
+    fn theme_uses_readable_soft_yellow_accents() {
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        let style = ctx.style();
+
+        assert_eq!(style.visuals.selection.bg_fill, super::QUARRY_YELLOW);
+        assert_eq!(
+            style.visuals.selection.stroke.color,
+            super::QUARRY_SELECTED_TEXT
+        );
+        assert_eq!(style.visuals.hyperlink_color, super::QUARRY_YELLOW_TEXT);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
