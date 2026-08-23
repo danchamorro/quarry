@@ -5,6 +5,10 @@
 Phase 6A is complete. The implementation, deterministic regressions, and
 release measurements on the deterministic 1 GB and 12 GB fixtures all pass.
 
+This report preserves the original Phase 6A release evidence. The current
+engine uses adaptive merge fan-in and a 16 MiB initial-run budget; see the
+[later 12 GB optimization benchmark](2026-08-23-12gb-sort-performance.md).
+
 The 1 GB sort completed in 16.382 seconds with 16.88 MiB peak process RSS and
 2.12 GiB measured peak temporary disk. The 12 GB sort completed in 253.132
 seconds with 17.55 MiB peak process RSS and 24.65 GiB measured peak temporary
@@ -26,15 +30,15 @@ left the source SHA-256 unchanged.
 - Preserve the source and current document on cancellation, failure, or a
   source conflict.
 
-## Resource and publication bounds
+## Original resource and publication bounds
 
-The worker builds 8 MiB runs and spills owner-only framed files. Merge heap
-entries retain keys and record lengths, while only one pending key and one
-selected record body are loaded at a time. Effective merge fan-in reserves
-those two maximum-record payloads before admitting heap keys; the default
-64 MiB record cap therefore uses fan-in two and stays within the 256 MiB payload
-budget. Multipass run files and guarded output use owner-only storage and are
-removed after success, cancellation, or failure.
+The original Phase 6A worker built 8 MiB runs and spilled owner-only framed
+files. Merge heap entries retained keys and record lengths, while only one
+pending key and one selected record body were loaded at a time. Its effective
+merge fan-in reserved two maximum-record payloads before admitting heap keys;
+the default 64 MiB record cap therefore used fan-in two and stayed within the
+256 MiB payload budget. Multipass run files and guarded output used owner-only
+storage and were removed after success, cancellation, or failure.
 
 Before sorting, the desktop waits for indexing to finish and reports a
 conservative temporary-disk allowance. The bound is four times the effective
