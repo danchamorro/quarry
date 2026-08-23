@@ -1,5 +1,9 @@
 # Column controls validation
 
+> **Current behavior:** later Phase 7B polish made every shown column
+> horizontally reachable and raised the bounded render window to 64 columns.
+> The measurements below retain the then-current 32-column behavior.
+
 ## Decision
 
 Ship direct access to every known source column with view-only hide/show,

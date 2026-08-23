@@ -2,7 +2,7 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress: 2026-08-21
+## Current progress: 2026-08-22
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -11,9 +11,14 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 | Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
-| Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover selected-column Move/Delete, overlay-aware Find Next, and Replace in Cell; bounded Replace All reuses the measured private rewrite worker |
+| Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover selected-column Move/Delete, overlay-aware Find Next, and Replace in Cell; production Replace All is measured directly at [12 GB](benchmarks/2026-08-22-12gb-replace-all.md) and [50 GB](benchmarks/2026-08-22-50gb-capability-suite.md) |
 | Phase 6: Sorting | Complete | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup |
-| Phase 7: Hardening | In progress | Phase 7A packaging and installation are complete in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); Phase 7B workflow polish and feature-gap review are next |
+| Phase 7: Hardening | In progress | Phase 7A packaging and installation are complete in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); Phase 7B workflow polish and feature-gap review are underway |
+
+Cross-phase evidence: the [50 GB capability suite](benchmarks/2026-08-22-50gb-capability-suite.md)
+measures progressive open, complete indexing, navigation, Find, filtering,
+filtered export, sparse Save As, Replace All, Split, Combine, and stable Sort on
+a 48.25 GiB file while preserving bounded process memory and the source file.
 
 ### Phase 1 checklist
 
@@ -89,7 +94,8 @@ pacing becomes measurable with the viewer-alpha grid.
 - [x] Add direct manual access to every known column plus view-only hide/show
   and arbitrary reorder controls inside the Columns manager, while preserving
   resize-only grid headers with stable one-based file-column numbers, bounded
-  32-column rendering, search reveal, reset behavior, and accessibility.
+  64-column rendering with horizontal access to every shown column, search
+  reveal, reset behavior, and accessibility.
 - [x] Cover the column controls with deterministic wide-file regressions and a
   [12 GB viewer check](benchmarks/2026-08-16-column-controls.md).
 - [x] Make the default grid dynamically fit compact rows to the available

@@ -100,9 +100,10 @@ stream into a private working CSV, and **Cancel** does nothing. Quarry opens and
 indexes the completed working file as the normal editable grid. Users may edit
 the resulting cells and headers or repeat any structural column command before
 writing a file. One-level structural Undo and Redo move between adjacent
-document versions. Quarry displays at most 32 document columns per viewport and
-applies the core 65,536-column structural safety limit. Bounded display work does
-not otherwise limit Save or Save As.
+document versions. Every shown document column is horizontally reachable while
+the renderer paints at most 64 columns at once. Quarry applies the core
+65,536-column structural safety limit. Bounded display work does not otherwise
+limit Save or Save As.
 
 Users start **Move Selected Columns…** or **Delete Selected Columns** from the
 same numbered-header context menu. Move uses a compact modal with the selected
@@ -141,8 +142,10 @@ guarded publication, and working-copy history. It retains a fixed read chunk,
 one bounded decoded record and its output fields, plus the sparse overlay and
 literal inputs rather than a file-sized replacement list. Existing 1 GB and
 12 GB persistence measurements cover the shared worker; exact core and desktop
-regressions own Replace All semantics without claiming separate large-file
-Replace All timings.
+regressions own Replace All semantics. The
+[12 GB Replace All benchmark](benchmarks/2026-08-22-12gb-replace-all.md) and
+[50 GB capability suite](benchmarks/2026-08-22-50gb-capability-suite.md)
+measure the production Replace All path directly.
 
 ## Version 0.3: sorting (complete)
 

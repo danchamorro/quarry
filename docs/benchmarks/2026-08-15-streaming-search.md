@@ -1,5 +1,9 @@
 # Streaming literal search — 2026-08-15
 
+> **Current behavior:** later Phase 7B polish made every shown column
+> horizontally reachable and raised the bounded render window to 64 columns.
+> The implementation notes below retain the then-current 32-column behavior.
+
 ## Decision
 
 Ship the first bounded search slice: literal, case-sensitive **Find Next** over

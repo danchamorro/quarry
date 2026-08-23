@@ -73,19 +73,18 @@ Optimize common paths without compromising quoted fields, escaped quotes, embedd
 ## Viewport
 The engine seeks from the nearest checkpoint and parses every field in a
 bounded row range. The egui viewer's active viewport buffer retains the visible
-rows plus two rows of overscan on each side and renders at most 32 columns at a
-time. Column windowing limits UI work; it does not project fields out of the
-parsed rows.
+rows plus two rows of overscan on each side and renders at most 64 columns at a
+time. Horizontal windowing keeps every shown column reachable while limiting
+UI work; it does not project fields out of the parsed rows.
 
 ## Column views
 The viewer keeps source column indexes as the canonical identity for search,
 selection, and copy. A UI-only column view stores display order, hidden state,
-the first shown position, and a visible list capped at 32 source columns.
-View, hide/show, arbitrary move-to-position, manager-only drag, first-columns,
-and reset actions update this metadata without changing parsed rows or output
-order. Drag handles exist only in the Columns manager; main-grid headers remain
-resize-only. A search match automatically shows and centers its source column,
-while row copy continues to serialize every source field in file order.
+the horizontal position, and the complete shown-column list. Search,
+hide/show, manager-only drag, and reset actions update this metadata without
+changing parsed rows or output order. Main-grid headers remain resize-only. A
+search match automatically shows and centers its source column, while row copy
+continues to serialize every source field in file order.
 
 View order and hidden state remain non-dirty UI metadata. They affect saved
 output only through an explicit transformed-output choice.
@@ -352,8 +351,9 @@ into a newly reserved private working CSV. Only that one operation is evaluated
 during the stream. After the worker succeeds, Quarry opens and indexes the
 result as the normal editable grid. The user can edit the result or apply
 another structural command, which repeats the same process from the current
-working CSV. The viewport displays at most 32 working-document columns at a
-time, and the desktop uses the core 65,536-column structural trust limit.
+working CSV. Every shown working-document column is horizontally reachable;
+the viewport paints at most 64 at a time, and the desktop uses the core
+65,536-column structural trust limit.
 
 The grid exposes column selection state and context actions through AccessKit.
 The modals bind visible labels to their input fields, provide named confirmation
@@ -437,8 +437,11 @@ cancellation, guarded-publication, and working-copy paths. Exact core and
 desktop regressions validate Arrange ordering and deletion plus replacement
 overlay precedence, non-overlapping matches, no-match behavior, record limits,
 accessibility, Undo, source preservation, cancellation, and temporary-file
-cleanup. Separate large-file Move, Delete, and Replace All timings are not
-claimed because they add no new worker-path evidence.
+cleanup. The [12 GB Replace All benchmark](benchmarks/2026-08-22-12gb-replace-all.md)
+and [50 GB capability suite](benchmarks/2026-08-22-50gb-capability-suite.md)
+measure the production Replace All path directly. Separate large-file Move and
+Delete timings are not claimed because those operations add no new worker-path
+evidence.
 
 ## Architecture rule
 **If a feature only works because the entire file fits in RAM, it is not a finished Quarry feature.**

@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use quarry_core::{
     ColumnTransformation, Dialect, FilterExportJob, FilterExportOutcome, FilterExportProgress,
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
-    FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress, MAX_TRANSFORMATION_COLUMNS,
-    OpenOptions, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome,
-    SearchPosition, SearchProgress, Session, SortDirection, SortJob, SortOutcome, SortProgress,
-    SortSpec, StructuralIndex, estimate_sort_temporary_bytes,
+    FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress, LiteralReplacement,
+    MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob,
+    SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
+    Session, SortDirection, SortJob, SortOutcome, SortProgress, SortSpec, SplitAnalysisJob,
+    SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex, estimate_sort_temporary_bytes,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -25,6 +26,7 @@ type FilterExportRun = (
     Option<(u64, Duration)>,
 );
 type SaveAsRun = (SaveAsOutcome, SaveAsProgress, Option<(u64, Duration)>);
+type ReplaceAllRun = (ReplaceAllOutcome, SaveAsProgress, Option<(u64, Duration)>);
 type SortRun = (SortOutcome, SortProgress, Option<u64>);
 
 const MAX_LIVE_BENCHMARK_MILLIS: u128 = 60_000;
@@ -40,6 +42,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("filter") => filter_command(args.collect()),
         Some("export") => export_command(args.collect()),
         Some("edit-save-as") => edit_save_as_command(args.collect()),
+        Some("replace-all-save-as") => replace_all_save_as_command(args.collect()),
         Some("transform-save-as") => transform_save_as_command(args.collect()),
         Some("sort-save-as") => sort_save_as_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
@@ -56,7 +59,7 @@ fn print_help() {
         "Quarry\n\n\
          Usage:\n  \
            quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
-         [--jump-count 5] [--cache-state unknown|cold|warm] [--no-wait]\n  \
+         [--jump-count 5] [--cache-state unknown|cold|warm] [--metrics-only] [--no-wait]\n  \
            quarry viewport <FILE> [--iterations 500] [--rows 100] \
          [--seed 1] [--cache-state unknown|cold|warm] [--live] \
          [--interval-ms 16] [--chunk-bytes 1048576]\n  \
@@ -74,8 +77,12 @@ fn print_help() {
            quarry edit-save-as <FILE> --output FILE \
          --edit DATA_ROW COLUMN VALUE [--edit DATA_ROW COLUMN VALUE]... \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
+           quarry replace-all-save-as <FILE> --output FILE --query LITERAL \
+         --replacement LITERAL [--cancel-after-bytes N] \
+         [--cache-state unknown|cold|warm]\n  \
            quarry transform-save-as <FILE> --output FILE \
-         (--split COLUMN SEPARATOR OUTPUT_COUNT | --join COLUMNS SEPARATOR) \
+         (--split COLUMN SEPARATOR OUTPUT_COUNT | --split-auto COLUMN SEPARATOR | \
+         --join COLUMNS SEPARATOR) \
          [--output-header NAME]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry sort-save-as <SOURCE> <DESTINATION> --column N \
@@ -764,12 +771,193 @@ fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
     Ok(())
 }
 
+fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
+    let mut path = None;
+    let mut destination = None;
+    let mut query = None;
+    let mut replacement = None;
+    let mut cancel_after_bytes = None;
+    let mut cache_state = "unknown".to_owned();
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
+            "--query" => query = Some(value(&args, &mut cursor, "--query")?.as_bytes().to_vec()),
+            "--replacement" => {
+                replacement = Some(
+                    value(&args, &mut cursor, "--replacement")?
+                        .as_bytes()
+                        .to_vec(),
+                )
+            }
+            "--cancel-after-bytes" => {
+                cancel_after_bytes =
+                    Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
+            }
+            "--cache-state" => {
+                cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
+                if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
+                    return Err("--cache-state must be unknown, cold, or warm".into());
+                }
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            argument if path.is_none() => path = Some(PathBuf::from(argument)),
+            argument => return Err(format!("unexpected argument {argument:?}").into()),
+        }
+        cursor += 1;
+    }
+
+    let path = path.ok_or("replace-all-save-as requires a file path")?;
+    let destination = destination.ok_or("replace-all-save-as requires --output")?;
+    let query = query.ok_or("replace-all-save-as requires --query")?;
+    let replacement = replacement.ok_or("replace-all-save-as requires --replacement")?;
+    if query.is_empty() {
+        return Err("replace-all query must not be empty".into());
+    }
+    if query == replacement {
+        return Err("replace-all query and replacement must differ".into());
+    }
+    if cancel_after_bytes == Some(0) {
+        return Err("cancel-after-bytes must be non-zero".into());
+    }
+
+    let session = Session::open(&path, OpenOptions::default())?;
+    if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
+        return Err("cancel-after-bytes must be less than file size".into());
+    }
+    let source_size_before = session.file_size;
+    let job = session.start_create_replaced_working_copy(
+        BTreeMap::new(),
+        BTreeMap::new(),
+        LiteralReplacement {
+            needle: query.clone(),
+            replacement: replacement.clone(),
+        },
+        &destination,
+    )?;
+    let (outcome, progress, cancellation) =
+        wait_for_replace_all(job, cancel_after_bytes, Duration::from_millis(1))?;
+    let source_size_after = std::fs::metadata(session.path())?.len();
+    if source_size_after != source_size_before {
+        return Err("source file size changed during Replace All".into());
+    }
+    let replace_peak_rss = peak_rss_bytes();
+    let replace_current_rss = current_rss_bytes();
+
+    let (outcome_label, published_bytes, replacements) = match &outcome {
+        ReplaceAllOutcome::Complete(summary) => {
+            let output_size = std::fs::metadata(&summary.destination)?.len();
+            if summary.bytes_written != progress.bytes_written
+                || output_size != summary.bytes_written
+                || summary.replacements == 0
+            {
+                return Err("published output does not match Replace All progress".into());
+            }
+            ("complete", Some(output_size), summary.replacements)
+        }
+        ReplaceAllOutcome::NoMatch => {
+            if destination.exists() {
+                return Err("no-match Replace All published a destination file".into());
+            }
+            ("no match", None, 0)
+        }
+        ReplaceAllOutcome::Cancelled => {
+            if destination.exists() {
+                return Err("cancelled Replace All published a destination file".into());
+            }
+            ("cancelled", None, 0)
+        }
+    };
+
+    println!("Quarry Replace All Save As benchmark\n");
+    println!("Source: {}", session.path().display());
+    println!(
+        "Source size: {} ({} bytes)",
+        human_bytes(source_size_before),
+        source_size_before
+    );
+    println!("Destination: {}", destination.display());
+    println!(
+        "Build: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!("Replace All cache state: {cache_state}");
+    println!("Query: {}", render_field(&query));
+    println!("Replacement: {}", render_field(&replacement));
+    println!("Outcome: {outcome_label}");
+    println!("Replacements: {replacements}");
+    println!(
+        "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
+        human_bytes(progress.bytes_scanned),
+        progress.bytes_scanned,
+        human_bytes(progress.total_bytes),
+        progress.total_bytes
+    );
+    println!(
+        "Output bytes written: {} ({} bytes)",
+        human_bytes(progress.bytes_written),
+        progress.bytes_written
+    );
+    println!("Replace All time: {:.3} s", progress.elapsed.as_secs_f64());
+    println!(
+        "Scan throughput: {}/s",
+        human_bytes(rate(progress.bytes_scanned, progress.elapsed))
+    );
+    println!(
+        "Output throughput: {}/s",
+        human_bytes(rate(progress.bytes_written, progress.elapsed))
+    );
+    println!("Source size unchanged: yes ({source_size_after} bytes)");
+    println!(
+        "Destination published: {}",
+        if published_bytes.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if let Some(bytes) = published_bytes {
+        println!("Published size: {} ({bytes} bytes)", human_bytes(bytes));
+    }
+    if let Some((requested_at, latency)) = cancellation {
+        println!(
+            "Cancellation requested after: {} ({} bytes)",
+            human_bytes(requested_at),
+            requested_at
+        );
+        println!(
+            "Poll-inclusive cancellation latency: {:.3} ms",
+            latency.as_secs_f64() * 1000.0
+        );
+    }
+    println!(
+        "Current process memory after Replace All: {}",
+        optional_bytes(replace_current_rss)
+    );
+    println!(
+        "Peak process memory through Replace All: {}",
+        optional_bytes(replace_peak_rss)
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 enum RequestedColumnTransformation {
     Split {
         source_column: usize,
         separator: Vec<u8>,
         output_count: usize,
+    },
+    SplitAuto {
+        source_column: usize,
+        separator: Vec<u8>,
     },
     Join {
         source_columns: Vec<usize>,
@@ -1277,7 +1465,10 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
             "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
             "--split" => {
                 if requested.is_some() {
-                    return Err("transform-save-as requires exactly one --split or --join".into());
+                    return Err(
+                        "transform-save-as requires exactly one --split, --split-auto, or --join"
+                            .into(),
+                    );
                 }
                 let operands = args
                     .get(cursor + 1..cursor + 4)
@@ -1305,9 +1496,38 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
                 });
                 cursor += 3;
             }
+            "--split-auto" => {
+                if requested.is_some() {
+                    return Err(
+                        "transform-save-as requires exactly one --split, --split-auto, or --join"
+                            .into(),
+                    );
+                }
+                let operands = args
+                    .get(cursor + 1..cursor + 3)
+                    .ok_or("--split-auto requires COLUMN SEPARATOR")?;
+                let source_column = operands[0].parse::<usize>()?;
+                if source_column == 0 {
+                    return Err("split column must be at least 1".into());
+                }
+                if operands[1].is_empty() {
+                    return Err("split separator must not be empty".into());
+                }
+                if source_column > MAX_TRANSFORMATION_COLUMNS {
+                    return Err("split columns exceed the supported limit".into());
+                }
+                requested = Some(RequestedColumnTransformation::SplitAuto {
+                    source_column: source_column - 1,
+                    separator: operands[1].as_bytes().to_vec(),
+                });
+                cursor += 2;
+            }
             "--join" => {
                 if requested.is_some() {
-                    return Err("transform-save-as requires exactly one --split or --join".into());
+                    return Err(
+                        "transform-save-as requires exactly one --split, --split-auto, or --join"
+                            .into(),
+                    );
                 }
                 let operands = args
                     .get(cursor + 1..cursor + 3)
@@ -1344,7 +1564,8 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
 
     let path = path.ok_or("transform-save-as requires a file path")?;
     let destination = destination.ok_or("transform-save-as requires --output")?;
-    let requested = requested.ok_or("transform-save-as requires exactly one --split or --join")?;
+    let mut requested = requested
+        .ok_or("transform-save-as requires exactly one --split, --split-auto, or --join")?;
     if cancel_after_bytes == Some(0) {
         return Err("cancel-after-bytes must be non-zero".into());
     }
@@ -1353,8 +1574,79 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
-    let transformation =
-        resolve_column_transformation(&requested, output_headers, session.dialect.has_header)?;
+    let mut split_analysis = None;
+    let mut auto_split = false;
+    let mut auto_source_header = None;
+    if let RequestedColumnTransformation::SplitAuto {
+        source_column,
+        separator,
+    } = &requested
+    {
+        let source_column = *source_column;
+        let separator = separator.clone();
+        let source_width = session
+            .first_rows
+            .iter()
+            .map(|row| row.fields.len())
+            .max()
+            .unwrap_or_default()
+            .max(source_column + 1);
+        let max_pieces = MAX_TRANSFORMATION_COLUMNS
+            .saturating_sub(source_width)
+            .saturating_add(1);
+        if max_pieces < 2 {
+            return Err("splitting would exceed the supported column limit".into());
+        }
+        let job = session.start_analyze_split(
+            BTreeMap::new(),
+            source_column,
+            separator.clone(),
+            max_pieces,
+        )?;
+        let (outcome, progress) = wait_for_split_analysis(job)?;
+        let summary = match outcome {
+            SplitAnalysisOutcome::Complete(summary) if summary.max_pieces >= 2 => summary,
+            SplitAnalysisOutcome::Complete(_) => {
+                return Err("split separator was not found in the selected column".into());
+            }
+            SplitAnalysisOutcome::Cancelled => {
+                return Err("split analysis was cancelled".into());
+            }
+        };
+        auto_source_header = session.dialect.has_header.then(|| {
+            session
+                .first_rows
+                .first()
+                .and_then(|row| row.fields.get(source_column))
+                .cloned()
+                .unwrap_or_default()
+        });
+        requested = RequestedColumnTransformation::Split {
+            source_column,
+            separator,
+            output_count: summary.max_pieces,
+        };
+        split_analysis = Some((progress, summary.rows_scanned, summary.max_pieces));
+        auto_split = true;
+    }
+    let transformation = if auto_split && output_headers.is_empty() {
+        let RequestedColumnTransformation::Split {
+            source_column,
+            separator,
+            output_count,
+        } = &requested
+        else {
+            unreachable!("auto split resolves to an explicit split")
+        };
+        ColumnTransformation::split_with_blank_headers(
+            *source_column,
+            separator.clone(),
+            *output_count,
+            auto_source_header,
+        )?
+    } else {
+        resolve_column_transformation(&requested, output_headers, session.dialect.has_header)?
+    };
     let source_size_before = session.file_size;
     let job = session.start_save_as_with_transformation(
         BTreeMap::new(),
@@ -1413,6 +1705,24 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Save As cache state: {cache_state}");
+    if let Some((analysis, rows_scanned, output_count)) = split_analysis {
+        println!("Split width: full-file analysis");
+        println!(
+            "Split analysis bytes scanned: {} ({} bytes)",
+            human_bytes(analysis.bytes_scanned),
+            analysis.bytes_scanned
+        );
+        println!("Split analysis rows scanned: {rows_scanned}");
+        println!("Discovered output columns: {output_count}");
+        println!(
+            "Split analysis time: {:.3} s",
+            analysis.elapsed.as_secs_f64()
+        );
+        println!(
+            "Split analysis throughput: {}/s",
+            human_bytes(rate(analysis.bytes_scanned, analysis.elapsed))
+        );
+    }
     match &requested {
         RequestedColumnTransformation::Split {
             source_column,
@@ -1438,6 +1748,9 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
                     .join(",")
             );
             println!("Separator: {}", render_field(separator));
+        }
+        RequestedColumnTransformation::SplitAuto { .. } => {
+            unreachable!("auto split resolves before reporting")
         }
     }
     println!("Outcome: {outcome_label}");
@@ -1573,7 +1886,20 @@ fn resolve_column_transformation(
                 output_header: has_header.then(|| output_headers.into_iter().next().unwrap()),
             })
         }
+        RequestedColumnTransformation::SplitAuto { .. } => {
+            unreachable!("auto split resolves before transformation")
+        }
     }
+}
+
+fn wait_for_split_analysis(
+    job: SplitAnalysisJob,
+) -> CliResult<(SplitAnalysisOutcome, SplitAnalysisProgress)> {
+    while !job.progress().done {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let progress = job.progress();
+    Ok((job.wait()?, progress))
 }
 
 fn validate_saved_transformation(
@@ -1682,6 +2008,42 @@ fn wait_for_save_as(
     }
     if cancel_after_bytes.is_some() && progress.bytes_scanned >= progress.total_bytes {
         return Err("Save As reached end of file before cancellation took effect".into());
+    }
+    Ok((outcome, progress, cancellation))
+}
+
+fn wait_for_replace_all(
+    job: ReplaceAllJob,
+    cancel_after_bytes: Option<u64>,
+    poll_interval: Duration,
+) -> CliResult<ReplaceAllRun> {
+    let mut cancellation = None;
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if cancellation.is_none()
+            && cancel_after_bytes.is_some_and(|threshold| progress.bytes_scanned >= threshold)
+        {
+            let started = Instant::now();
+            job.cancel();
+            cancellation = Some((progress.bytes_scanned, started));
+        }
+        thread::sleep(poll_interval);
+    }
+
+    let progress = job.progress();
+    let outcome = job.wait()?;
+    let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
+    if cancel_after_bytes.is_some() && cancellation.is_none() {
+        return Err("Replace All finished before cancellation threshold".into());
+    }
+    if cancel_after_bytes.is_some() && !matches!(&outcome, ReplaceAllOutcome::Cancelled) {
+        return Err("Replace All completed before cancellation took effect".into());
+    }
+    if cancel_after_bytes.is_some() && progress.bytes_scanned >= progress.total_bytes {
+        return Err("Replace All reached end of file before cancellation took effect".into());
     }
     Ok((outcome, progress, cancellation))
 }
@@ -2316,6 +2678,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     let mut jump_count = 5_usize;
     let mut cache_state = "unknown".to_owned();
     let mut wait_for_index = true;
+    let mut metrics_only = false;
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -2332,6 +2695,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--metrics-only" => metrics_only = true,
             "--no-wait" => wait_for_index = false,
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -2395,14 +2759,16 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     println!("Current memory: {}", optional_bytes(memory_at_first_rows));
     println!("Memory before open: {}", optional_bytes(memory_before));
     println!();
-    for (number, row) in session.first_rows.iter().take(5).enumerate() {
-        let rendered = row
-            .fields
-            .iter()
-            .map(|field| render_field(field))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        println!("row {number} @{}: {rendered}", row.offset);
+    if !metrics_only {
+        for (number, row) in session.first_rows.iter().take(5).enumerate() {
+            let rendered = row
+                .fields
+                .iter()
+                .map(|field| render_field(field))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            println!("row {number} @{}: {rendered}", row.offset);
+        }
     }
 
     if !wait_for_index {
@@ -2426,7 +2792,14 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
             let requested_end = start.saturating_add(jump_count as u64);
             if !progress.done && progress.rows_scanned >= requested_end {
                 let index = job.snapshot();
-                print_jump(&session, &index, start, jump_count, Some(progress))?;
+                print_jump(
+                    &session,
+                    &index,
+                    start,
+                    jump_count,
+                    Some(progress),
+                    !metrics_only,
+                )?;
                 pending_jump = None;
             }
         }
@@ -2466,7 +2839,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     );
 
     if let Some(start) = pending_jump {
-        print_jump(&session, &index, start, jump_count, None)?;
+        print_jump(&session, &index, start, jump_count, None, !metrics_only)?;
     }
 
     println!("Current memory: {}", optional_bytes(current_rss_bytes()));
@@ -2480,6 +2853,7 @@ fn print_jump(
     start: u64,
     count: usize,
     live_progress: Option<IndexProgress>,
+    render_rows: bool,
 ) -> CliResult<()> {
     let began = Instant::now();
     let selected = session.read_rows(index, start, count)?;
@@ -2497,17 +2871,19 @@ fn print_jump(
             selected.len()
         );
     }
-    for (offset, row) in selected.iter().enumerate() {
-        println!(
-            "row {} @{}: {}",
-            start + offset as u64,
-            row.offset,
-            row.fields
-                .iter()
-                .map(|field| render_field(field))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        );
+    if render_rows {
+        for (offset, row) in selected.iter().enumerate() {
+            println!(
+                "row {} @{}: {}",
+                start + offset as u64,
+                row.offset,
+                row.fields
+                    .iter()
+                    .map(|field| render_field(field))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
     }
     Ok(())
 }
@@ -2744,9 +3120,10 @@ mod tests {
         FilterSamples, RAW_HEADER_COMPARE_BUFFER_BYTES, compare_raw_headers, data_search_position,
         edit_save_as_command, export_command, filter_command, fnv1a64_file, generate_file,
         latency_stats, parse_header_mode, parse_size, parse_sort_direction, physical_to_data_row,
-        record_filter_sample, sample_filtered_rows, search_command, sort_artifact_permissions,
-        sort_save_as_command, transform_save_as_command, validate_saved_transformation,
-        validate_sort_completion_evidence, viewport_command, wait_for_save_as,
+        record_filter_sample, replace_all_save_as_command, sample_filtered_rows, search_command,
+        sort_artifact_permissions, sort_save_as_command, transform_save_as_command,
+        validate_saved_transformation, validate_sort_completion_evidence, viewport_command,
+        wait_for_save_as,
     };
     use quarry_core::{
         ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, IndexConfig, OpenOptions,
@@ -3436,6 +3813,71 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_save_as_is_exact_and_cancellation_cleans_private_output() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-replace-all-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("replaced.csv");
+        let source_bytes = b"name,note\none,alpha alpha\ntwo,beta\n";
+        fs::write(&source, source_bytes).unwrap();
+
+        replace_all_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+            "--query".into(),
+            "alpha".into(),
+            "--replacement".into(),
+            "gamma".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"name,note\none,gamma gamma\ntwo,beta\n"
+        );
+
+        let cancellation_directory = directory.join("cancel");
+        fs::create_dir(&cancellation_directory).unwrap();
+        let cancellation_source = cancellation_directory.join("source.csv");
+        let cancellation_destination = cancellation_directory.join("replaced.csv");
+        generate_file(&cancellation_source, 64 * 1024 * 1024, 11, b',', 7).unwrap();
+        let source_size = fs::metadata(&cancellation_source).unwrap().len();
+        replace_all_save_as_command(vec![
+            cancellation_source.to_string_lossy().into_owned(),
+            "--output".into(),
+            cancellation_destination.to_string_lossy().into_owned(),
+            "--query".into(),
+            "a".into(),
+            "--replacement".into(),
+            "A".into(),
+            "--cancel-after-bytes".into(),
+            "1".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(&cancellation_source).unwrap().len(),
+            source_size
+        );
+        assert!(!cancellation_destination.exists());
+        let names = fs::read_dir(&cancellation_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![cancellation_source.file_name().unwrap()]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn sort_save_as_parses_required_arguments_and_dialect_overrides() {
         assert!(matches!(
             parse_sort_direction("asc").unwrap(),
@@ -3746,9 +4188,20 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let source = directory.join("source.csv");
         let split = directory.join("split.csv");
+        let auto_split = directory.join("auto-split.csv");
         let joined = directory.join("joined.csv");
         let source_bytes = b"name,city,state\nAda::Lovelace,London,UK\nGrace,Arlington,US\n";
         fs::write(&source, source_bytes).unwrap();
+
+        transform_save_as_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--output".into(),
+            auto_split.to_string_lossy().into_owned(),
+            "--split-auto".into(),
+            "1".into(),
+            "::".into(),
+        ])
+        .unwrap();
 
         transform_save_as_command(vec![
             source.to_string_lossy().into_owned(),
@@ -3781,6 +4234,10 @@ mod tests {
         assert_eq!(
             fs::read(&split).unwrap(),
             b"first,last,city,state\nAda,Lovelace,London,UK\nGrace,,Arlington,US\n"
+        );
+        assert_eq!(
+            fs::read(&auto_split).unwrap(),
+            b"name,,city,state\nAda,Lovelace,London,UK\nGrace,,Arlington,US\n"
         );
         assert_eq!(
             fs::read(&joined).unwrap(),

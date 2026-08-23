@@ -1,5 +1,9 @@
 # Split and join transformation validation: 2026-08-19
 
+> **Current behavior:** later Phase 7B polish made every shown working-document
+> column horizontally reachable and raised the bounded render window to 64
+> columns. The limits below retain the then-current 32-column behavior.
+
 ## Summary
 
 This report validates the bounded persistence engine used to materialize Split
@@ -218,5 +222,6 @@ Replace All later reused the same bounded private rewrite worker, progress,
 cancellation, guarded publication, and working-copy lifecycle. Exact core and
 desktop regressions cover overlay-first replacement, non-overlapping matches,
 no-match behavior, record limits, cancellation, cleanup, accessibility, and
-Undo. This historical report does not claim separate 1 GB or 12 GB Replace All
-timings.
+Undo. This historical run did not include separate Replace All timings. A
+current-build direct measurement is recorded in the
+[12 GB Replace All benchmark](2026-08-22-12gb-replace-all.md).
