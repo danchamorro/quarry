@@ -332,6 +332,8 @@ match in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md).
 
 ### Phase 7B checklist: workflow polish and feature-gap review
 
+- [x] Add data-cell context actions to copy a value, filter to its exact value,
+  or exclude it from its source column through the bounded filter path.
 - [ ] Dogfood opening, navigation, column selection, filters, transformations,
   editing, sorting, Save, Save As, discard, Undo, and Redo as connected desktop
   workflows.

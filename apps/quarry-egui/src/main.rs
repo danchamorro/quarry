@@ -2789,6 +2789,8 @@ enum GridSelection {
 struct GridInteraction {
     selection: Option<GridSelection>,
     column_request: Option<GridColumnRequest>,
+    filter_query: Option<FilterQuery>,
+    copy_selection: bool,
 }
 
 impl GridSelection {
@@ -5858,6 +5860,12 @@ fn show_grid(
             document.selected_columns.clear();
             document.column_selection_anchor = None;
         }
+        if interaction.copy_selection {
+            ui.ctx().copy_text(document.copy_selection_text()?);
+        }
+        if let Some(query) = interaction.filter_query {
+            document.start_filter(query)?;
+        }
         Ok(interaction.column_request)
     })
     .inner
@@ -6436,6 +6444,41 @@ fn show_table(
                                                 ),
                                             )
                                         });
+                                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                            node.set_description(
+                                                "Activate to select. Open the context menu to copy or filter by this value.",
+                                            );
+                                            node.add_action(
+                                                egui::accesskit::Action::ShowContextMenu,
+                                            );
+                                        });
+                                        let accesskit_context_menu = ui.input_mut(|input| {
+                                            let mut requested = false;
+                                            input.consume_accesskit_action_requests(
+                                                response.id,
+                                                |request| {
+                                                    let matches = request.action
+                                                        == egui::accesskit::Action::ShowContextMenu;
+                                                    requested |= matches;
+                                                    matches
+                                                },
+                                            );
+                                            requested
+                                        });
+                                        let keyboard_context_menu = response.has_focus()
+                                            && ui.input(|input| {
+                                                input.modifiers.shift
+                                                    && input.key_pressed(egui::Key::F10)
+                                            });
+                                        let open_context_menu = response.secondary_clicked()
+                                            || keyboard_context_menu
+                                            || accesskit_context_menu;
+                                        if open_context_menu {
+                                            interaction.selection = Some(GridSelection::Cell {
+                                                row: record_row,
+                                                column,
+                                            });
+                                        }
                                         if response.clicked() {
                                             response.request_focus();
                                             interaction.selection = Some(GridSelection::Cell {
@@ -6443,6 +6486,72 @@ fn show_table(
                                                 column,
                                             });
                                         }
+                                        let popup_command = if open_context_menu {
+                                            Some(egui::SetOpenCommand::Bool(true))
+                                        } else if response.clicked() {
+                                            Some(egui::SetOpenCommand::Bool(false))
+                                        } else {
+                                            None
+                                        };
+                                        let can_filter = source.is_some()
+                                            && document.is_filter_ready()
+                                            && !document.has_cell_edits()
+                                            && document.search_job.is_none()
+                                            && document.filter_job.is_none()
+                                            && document.export_job.is_none();
+                                        egui::Popup::menu(&response)
+                                            .open_memory(popup_command)
+                                            .show(|ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        can_filter,
+                                                        egui::Button::new(
+                                                            "Filter to This Value",
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    interaction.filter_query = Some(
+                                                        FilterQuery::single(
+                                                            column,
+                                                            FilterOperator::Equals,
+                                                            value
+                                                                .expect(
+                                                                    "enabled filtering has a cell value",
+                                                                )
+                                                                .to_vec(),
+                                                        ),
+                                                    );
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        can_filter,
+                                                        egui::Button::new(
+                                                            "Filter Out This Value",
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    interaction.filter_query = Some(
+                                                        FilterQuery::single(
+                                                            column,
+                                                            FilterOperator::NotEquals,
+                                                            value
+                                                                .expect(
+                                                                    "enabled filtering has a cell value",
+                                                                )
+                                                                .to_vec(),
+                                                        ),
+                                                    );
+                                                    ui.close();
+                                                }
+                                                ui.separator();
+                                                if ui.button("Copy").clicked() {
+                                                    interaction.copy_selection = true;
+                                                    ui.close();
+                                                }
+                                            });
                                         if cell_focus_requested == Some((record_row, column)) {
                                             response.request_focus();
                                         }
@@ -10195,6 +10304,133 @@ mod tests {
             request,
             Some(GridColumnRequest::Dialog(StructuralDialog::sort(0)))
         );
+    }
+
+    #[test]
+    fn data_cell_context_menu_copies_and_filters_the_full_clicked_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("cell-context-menu.csv");
+        fs::write(
+            &source,
+            b"name,note\nalpha,\"line one\nline two\"\nbeta,other\n",
+        )
+        .unwrap();
+        let mut document = Document::open(
+            &source,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        let _ = click_grid_control("Select row 2, column 1 (name): beta", &mut document);
+        assert!(matches!(
+            document.selection,
+            Some(GridSelection::Cell { row: 2, column: 0 })
+        ));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let cell_label = "Select row 1, column 2 (note): line one\\nline two";
+        let open_menu = |document: &mut Document| {
+            let target = grid_control_id(&ctx, cell_label, document);
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::ShowContextMenu,
+                            target,
+                            data: None,
+                        },
+                    )],
+                    ..grid_input()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_grid(ui, document).unwrap();
+                    });
+                },
+            );
+            assert!(matches!(
+                document.selection,
+                Some(GridSelection::Cell { row: 1, column: 1 })
+            ));
+            render_grid(&ctx, document)
+        };
+        let menu_item = |output: &egui::FullOutput, label: &str| {
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("the cell menu should be accessible")
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label() == Some(label)
+                        && node.supports_action(egui::accesskit::Action::Click)
+                        && !node.is_disabled()
+                })
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| panic!("missing enabled cell menu item {label}"))
+        };
+        let click_item = |target, document: &mut Document| {
+            ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Click,
+                            target,
+                            data: None,
+                        },
+                    )],
+                    ..grid_input()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_grid(ui, document).unwrap();
+                    });
+                },
+            )
+        };
+
+        let menu = open_menu(&mut document);
+        for label in ["Filter to This Value", "Filter Out This Value", "Copy"] {
+            let _ = menu_item(&menu, label);
+        }
+        let copy_target = menu_item(&menu, "Copy");
+        let output = click_item(copy_target, &mut document);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "line one\nline two")
+        }));
+
+        let menu = open_menu(&mut document);
+        let filter_target = menu_item(&menu, "Filter to This Value");
+        let _ = click_item(filter_target, &mut document);
+        assert_eq!(
+            document.filter_query,
+            Some(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"line one\nline two".to_vec(),
+            ))
+        );
+        finish_filter(&mut document);
+        document.clear_filter().unwrap();
+
+        let menu = open_menu(&mut document);
+        let exclude_target = menu_item(&menu, "Filter Out This Value");
+        let _ = click_item(exclude_target, &mut document);
+        assert_eq!(
+            document.filter_query,
+            Some(FilterQuery::single(
+                1,
+                FilterOperator::NotEquals,
+                b"line one\nline two".to_vec(),
+            ))
+        );
+        finish_filter(&mut document);
     }
 
     #[test]

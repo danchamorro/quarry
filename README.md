@@ -35,7 +35,7 @@ working memory bounded and does not change the source until you choose
 | Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
 | Find and replace | Literal, case-sensitive Find Next; Replace in Cell; cancellable Replace All across data cells |
-| Filter and export | Contains, Equals, and Does not equal predicates; multiple AND rules; incremental results; bounded match indexes; cancellable filtered export |
+| Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, and Does not equal predicates; multiple AND rules; incremental results; bounded match indexes; cancellable filtered export |
 | Edit | Direct cell and header editing; multiline values; Undo and Redo; Discard Changes |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or Delete; continue editing the result before saving |
 | Sort | Stable ascending and descending text sort; fixed header; deterministic order for equal values; cancellation and disk preflight |
@@ -158,8 +158,9 @@ of the UI framework and is exercised directly by the benchmark CLI.
    not right for the file.
 2. Scroll continuously, jump to a one-based data row, page through the file, or
    horizontally scroll through every shown column.
-3. Double-click a cell or header to edit it. Use Find and Replace for literal
-   changes, or Filter to build one or more AND rules and export the matches.
+3. Double-click a cell or header to edit it. Right-click a data cell to Copy,
+   Filter to This Value, or Filter Out This Value. Use Filters to build multiple
+   literal, case-sensitive AND rules and export the matches.
 4. Select numbered column headers, then right-click to Split, Combine, Move,
    Delete, or Sort. Completed operations return to the ordinary editable grid.
 5. Use Undo, Redo, or Discard Changes while experimenting. Choose Save to update
