@@ -173,8 +173,8 @@ new filter begins. An active filter must be cleared before editing or using
 Find/Replace. Overlay-aware filtering is not part of Phase 5.
 
 A `FilterQuery` owns one or more `FilterPredicate` values. Each predicate stores
-a source column, a case-sensitive contains or equality operator, and its literal
-value. All predicates use AND semantics. The scanner parses each bounded record
+a source column, a case-sensitive contains, equality, or inequality operator,
+and its literal value. All predicates use AND semantics. The scanner parses each bounded record
 once, then evaluates every predicate against the decoded fields. A missing
 column or any failed predicate rejects that row. `FilterQuery::single` keeps
 single-predicate callers compatible with the same path.

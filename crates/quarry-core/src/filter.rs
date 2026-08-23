@@ -45,6 +45,7 @@ const DEFAULT_FILTER_READ_CONFIG: FilterReadConfig = FilterReadConfig {
 pub enum FilterOperator {
     Contains,
     Equals,
+    NotEquals,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,6 +555,7 @@ pub(crate) fn matching_fields<'a>(
             match predicate.operator {
                 FilterOperator::Contains => finder.find(field.as_ref()).is_some(),
                 FilterOperator::Equals => field.as_ref() == predicate.value.as_slice(),
+                FilterOperator::NotEquals => field.as_ref() != predicate.value.as_slice(),
             }
         });
     Ok(matches.then_some(fields))
@@ -984,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_decoded_multiline_contains_equals_empty_and_ragged_rows() {
+    fn filters_decoded_multiline_contains_equals_not_equals_empty_and_ragged_rows() {
         let mut bytes = b"id,note\n1,\"prefix ".to_vec();
         bytes.extend(std::iter::repeat_n(b'x', crate::DEFAULT_READ_CHUNK));
         bytes.extend_from_slice(b"\ntarget \"\"quoted\"\"\"\n2,target\n3,\n4\n5,other");
@@ -1027,6 +1029,44 @@ mod tests {
         assert_eq!(
             empty_rows.iter().map(|row| row.row).collect::<Vec<_>>(),
             [3]
+        );
+
+        let not_target = session
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::NotEquals,
+                b"target".to_vec(),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            session
+                .read_filtered_rows(&not_target, 0, 10)
+                .unwrap()
+                .iter()
+                .map(|row| row.row)
+                .collect::<Vec<_>>(),
+            [1, 3, 5]
+        );
+
+        let not_empty = session
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::NotEquals,
+                Vec::new(),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            session
+                .read_filtered_rows(&not_empty, 0, 10)
+                .unwrap()
+                .iter()
+                .map(|row| row.row)
+                .collect::<Vec<_>>(),
+            [1, 2, 5]
         );
 
         assert!(matches!(

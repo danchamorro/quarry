@@ -66,13 +66,13 @@ fn print_help() {
            quarry search <FILE> --query LITERAL [--start-row 1] \
          [--start-column 1] [--cancel-after-bytes N] \
          [--cache-state unknown|warm]\n  \
-           quarry filter <FILE> --column N --operator contains|equals \
-         --value LITERAL [--and N contains|equals LITERAL]... \
+           quarry filter <FILE> --column N --operator contains|equals|not-equals \
+         --value LITERAL [--and N contains|equals|not-equals LITERAL]... \
          [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry export <FILE> --output FILE --column N \
-         --operator contains|equals --value LITERAL \
-         [--and N contains|equals LITERAL]... [--cancel-after-bytes N] \
+         --operator contains|equals|not-equals --value LITERAL \
+         [--and N contains|equals|not-equals LITERAL]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry edit-save-as <FILE> --output FILE \
          --edit DATA_ROW COLUMN VALUE [--edit DATA_ROW COLUMN VALUE]... \
@@ -97,7 +97,8 @@ fn parse_filter_operator(value: &str, option: &str) -> CliResult<FilterOperator>
     match value {
         "contains" => Ok(FilterOperator::Contains),
         "equals" => Ok(FilterOperator::Equals),
-        _ => Err(format!("{option} must be contains or equals").into()),
+        "not-equals" => Ok(FilterOperator::NotEquals),
+        _ => Err(format!("{option} must be contains, equals, or not-equals").into()),
     }
 }
 
@@ -126,7 +127,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
             "--and" => {
                 let operands = args
                     .get(cursor + 1..cursor + 4)
-                    .ok_or("--and requires COLUMN contains|equals VALUE")?;
+                    .ok_or("--and requires COLUMN contains|equals|not-equals VALUE")?;
                 let column = operands[0].parse::<usize>()?;
                 let operator = parse_filter_operator(&operands[1], "--and operator")?;
                 let value = operands[2].as_bytes().to_vec();
@@ -212,6 +213,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
             match predicate.operator {
                 FilterOperator::Contains => "contains",
                 FilterOperator::Equals => "equals",
+                FilterOperator::NotEquals => "not-equals",
             },
             render_field(&predicate.value)
         );
@@ -351,7 +353,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
             "--and" => {
                 let operands = args
                     .get(cursor + 1..cursor + 4)
-                    .ok_or("--and requires COLUMN contains|equals VALUE")?;
+                    .ok_or("--and requires COLUMN contains|equals|not-equals VALUE")?;
                 let column = operands[0].parse::<usize>()?;
                 let operator = parse_filter_operator(&operands[1], "--and operator")?;
                 let value = operands[2].as_bytes().to_vec();
@@ -462,6 +464,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
             match predicate.operator {
                 FilterOperator::Contains => "contains",
                 FilterOperator::Equals => "equals",
+                FilterOperator::NotEquals => "not-equals",
             },
             render_field(&predicate.value)
         );
@@ -3318,7 +3321,7 @@ mod tests {
                     "--value",
                     "x",
                 ],
-                "--operator must be contains or equals",
+                "--operator must be contains, equals, or not-equals",
             ),
             (
                 vec![
@@ -3361,7 +3364,7 @@ mod tests {
                     "2",
                     "equals",
                 ],
-                "--and requires COLUMN contains|equals VALUE",
+                "--and requires COLUMN contains|equals|not-equals VALUE",
             ),
             (
                 vec![
@@ -3409,7 +3412,7 @@ mod tests {
                     "regex",
                     "x",
                 ],
-                "--and operator must be contains or equals",
+                "--and operator must be contains, equals, or not-equals",
             ),
         ] {
             let error = filter_command(args.into_iter().map(str::to_owned).collect()).unwrap_err();
@@ -3433,7 +3436,9 @@ mod tests {
         for (operator, value) in [
             ("contains", "line one\nline two"),
             ("equals", "needle"),
+            ("not-equals", "needle"),
             ("equals", ""),
+            ("not-equals", ""),
         ] {
             filter_command(vec![
                 path.to_string_lossy().into_owned(),

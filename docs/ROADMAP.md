@@ -142,11 +142,11 @@ controls, jump-to-row, streaming search, copy, status, diagnostics.
 **Exit:** Quarry is genuinely useful for inspecting huge files.
 
 ## Phase 4 — Filters and export
-Contains/equality filters, multiple AND predicates, incremental results, filtered navigation, streaming export, progress/cancellation.
+Contains, equality, and inequality filters, multiple AND predicates, incremental results, filtered navigation, streaming export, progress/cancellation.
 
 ### Phase 4 checklist
 
-- [x] Add literal, case-sensitive contains and equality predicates over one
+- [x] Add literal, case-sensitive contains, equality, and inequality predicates over one
   selected source column.
 - [x] Build an adaptive match index with a fixed memory budget, background
   progress, prompt cancellation, and joined worker lifecycle.
