@@ -21,7 +21,7 @@ use crate::{
 };
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
-const DEFAULT_RUN_MEMORY_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_RUN_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MERGE_FAN_IN: usize = 32;
 const MERGE_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 static NEXT_SORT_ID: AtomicU64 = AtomicU64::new(0);
@@ -425,10 +425,10 @@ fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
     Ok(())
 }
 
-fn effective_merge_fan_in(config: SortConfig) -> usize {
-    let total_slots = MERGE_MEMORY_BUDGET_BYTES / config.max_record_bytes;
-    let key_slots = total_slots.saturating_sub(2);
-    config.merge_fan_in.min(key_slots.max(2))
+fn effective_merge_fan_in(config: SortConfig, max_key_bytes: usize) -> usize {
+    let key_bytes = max_key_bytes.max(1);
+    let key_slots = MERGE_MEMORY_BUDGET_BYTES.saturating_sub(config.max_record_bytes) / key_bytes;
+    config.merge_fan_in.min(key_slots.saturating_sub(1).max(2))
 }
 
 fn source_has_bom(source: &mut File) -> Result<bool, QuarryError> {
@@ -678,6 +678,7 @@ struct ScanSummary {
     preferred_ending: Vec<u8>,
     runs: Vec<PathBuf>,
     rows: u64,
+    max_key_bytes: usize,
     records: RecordMultisetFingerprint,
 }
 
@@ -704,6 +705,7 @@ struct InitialRunBuilder<'a> {
     entry_bytes: usize,
     runs: Vec<PathBuf>,
     rows: u64,
+    max_key_bytes: usize,
     records: RecordMultisetFingerprint,
 }
 
@@ -737,6 +739,7 @@ impl<'a> InitialRunBuilder<'a> {
             entry_bytes: 0,
             runs: Vec::new(),
             rows: 0,
+            max_key_bytes: 0,
             records: RecordMultisetFingerprint::default(),
         }
     }
@@ -813,6 +816,7 @@ impl<'a> InitialRunBuilder<'a> {
             .map(|(_, value)| (*value).to_vec())
             .or_else(|| fields.get(self.spec.column).map(|field| field.to_vec()))
             .unwrap_or_default();
+        self.max_key_bytes = self.max_key_bytes.max(key.len());
         let effective_record =
             if row_edits.is_empty() && !(physical_row > 0 && body.starts_with(UTF8_BOM)) {
                 body.to_vec()
@@ -901,6 +905,7 @@ impl<'a> InitialRunBuilder<'a> {
             preferred_ending: self.preferred_ending,
             runs: self.runs,
             rows: self.rows,
+            max_key_bytes: self.max_key_bytes,
             records: self.records,
         }))
     }
@@ -1116,7 +1121,7 @@ fn run_sort_inner(
         return Ok(None);
     }
 
-    let merge_fan_in = effective_merge_fan_in(config);
+    let merge_fan_in = effective_merge_fan_in(config, scan.max_key_bytes);
     while scan.runs.len() > merge_fan_in {
         let mut next = Vec::with_capacity(scan.runs.len().div_ceil(merge_fan_in));
         for group in scan.runs.chunks(merge_fan_in) {
@@ -1805,6 +1810,45 @@ mod tests {
     }
 
     #[test]
+    fn initial_run_scan_reports_the_longest_decoded_key() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        fs::write(&source, b"id,key\n1,x\n2,\"long,key\"\n").unwrap();
+        let mut source_file = File::open(&source).unwrap();
+        let workspace = RunWorkspace::create(&destination).unwrap();
+        let shared = SharedState::new(fs::metadata(&source).unwrap().len());
+
+        let outcome = create_initial_runs(
+            &mut source_file,
+            b',',
+            true,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            SortSpec {
+                column: 1,
+                direction: SortDirection::Ascending,
+            },
+            false,
+            SortConfig {
+                run_memory_bytes: 1024,
+                ..tiny_config()
+            },
+            &workspace,
+            &shared,
+        )
+        .unwrap();
+        let ScanOutcome::Complete(summary) = outcome else {
+            panic!("scan unexpectedly cancelled");
+        };
+        assert_eq!(summary.max_key_bytes, b"long,key".len());
+
+        workspace.cleanup().unwrap();
+        assert!(sort_artifacts(&directory).is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn cancellation_removes_private_output_and_all_sort_runs() {
         let directory = case();
         let source = directory.join("source.csv");
@@ -1977,11 +2021,55 @@ mod tests {
     }
 
     #[test]
+    fn observed_key_width_uses_a_wide_stable_merge() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        fs::write(&source, b"value,key\nr1,b\nr2,a\nr3,c\nr4,a\nr5,b\n").unwrap();
+        let source_session = session(&source, HeaderMode::FirstRow);
+        let job = start_custom(
+            &source_session,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            SortSpec {
+                column: 1,
+                direction: SortDirection::Ascending,
+            },
+            &destination,
+            SortConfig {
+                run_memory_bytes: 1,
+                merge_fan_in: 4,
+                ..tiny_config()
+            },
+        );
+
+        wait_done(&job);
+        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("sort unexpectedly cancelled");
+        };
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"value,key\nr2,a\nr4,a\nr1,b\nr5,b\nr3,c\n"
+        );
+        assert_eq!(summary.merge_passes, 2);
+        assert!(summary.stable_ties_verified);
+        assert!(sort_artifacts(&directory).is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn merge_fan_in_keeps_every_retained_payload_within_the_memory_budget() {
-        let fan_in = effective_merge_fan_in(DEFAULT_SORT_CONFIG);
+        assert_eq!(
+            effective_merge_fan_in(DEFAULT_SORT_CONFIG, 32),
+            DEFAULT_MERGE_FAN_IN
+        );
+        let fan_in =
+            effective_merge_fan_in(DEFAULT_SORT_CONFIG, DEFAULT_SORT_CONFIG.max_record_bytes);
         assert_eq!(fan_in, 2);
-        let heap_keys = fan_in.saturating_mul(DEFAULT_SORT_CONFIG.max_record_bytes);
-        let pending_key = DEFAULT_SORT_CONFIG.max_record_bytes;
+        let max_key_bytes = DEFAULT_SORT_CONFIG.max_record_bytes;
+        let heap_keys = fan_in.saturating_mul(max_key_bytes);
+        let pending_key = max_key_bytes;
         let pending_record = DEFAULT_SORT_CONFIG.max_record_bytes;
         let retained_payload = heap_keys
             .saturating_add(pending_key)

@@ -91,16 +91,19 @@ separate deterministic 12,000,000,037-byte write fixture with 61,413,211 rows.
 | Replace All | 291,058 replacements in 61.541 s | 1,044,664 replacements in 328.476 s |
 | Split | Explicit two-way rewrite in 65.314 s | Automatic analysis and rewrite in 455.508 s |
 | Combine | Two-column rewrite in 63.289 s | Two-column rewrite in 328.264 s |
-| Stable Sort | 61,413,211 rows in 4 min 13.132 s | 225,437,755 rows in 18 min 33.443 s |
+| Stable Sort | 117,168,829 rows by `FIRSTNAME` in 2 min 22.211 s | 225,437,755 rows in 18 min 33.443 s (pre-optimization run) |
 
 Across these full-file operations, the largest reported non-sort peak RSS was
-25.62 MiB at 12 GB and 24.53 MiB at 50 GB. Stable Sort used 17.55 MiB and
-24.65 GiB peak temporary disk at 12 GB, then 19.38 MiB and 102.91 GiB at 50 GB.
+25.62 MiB at 12 GB and 24.53 MiB at 50 GB. The current 12 GB Stable Sort used
+49.89 MiB peak RSS and 25.91 GiB peak temporary disk. The earlier 50 GB sort
+used 19.38 MiB peak RSS and 102.91 GiB peak temporary disk.
 
 These are verified results at two scales, not a controlled scaling contest.
 The fixtures, predicates, cache states, and application revisions differ.
 Operation times exclude later benchmark-only validation passes. macOS caches
 were not purged, so no result is presented as a controlled cold-cache claim.
+The 50 GB sort still proves completion and correctness, but its timing predates
+the adaptive merge optimization and is not a current throughput estimate.
 
 <details>
 <summary><strong>Benchmark reports and methodology</strong></summary>
@@ -113,7 +116,8 @@ were not purged, so no result is presented as a controlled cold-cache claim.
 - [12 GB direct editing and Save As](docs/benchmarks/2026-08-18-direct-cell-editing.md)
 - [12 GB Replace All](docs/benchmarks/2026-08-22-12gb-replace-all.md)
 - [12 GB Split and Combine](docs/benchmarks/2026-08-19-split-join-transformations.md)
-- [12 GB stable Sort](docs/benchmarks/2026-08-21-stable-text-sort.md)
+- [Original deterministic stable Sort validation](docs/benchmarks/2026-08-21-stable-text-sort.md)
+- [Current 12 GB `FIRSTNAME` sort optimization](docs/benchmarks/2026-08-23-12gb-sort-performance.md)
 - [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
 
 </details>
