@@ -2416,6 +2416,11 @@ fn show_filter_manager(
                                 FilterOperator::Equals,
                                 "Equals",
                             );
+                            ui.selectable_value(
+                                &mut rule.operator,
+                                FilterOperator::NotEquals,
+                                "Does not equal",
+                            );
                         })
                         .response
                         .labelled_by(label.id);
@@ -2449,7 +2454,8 @@ fn show_filter_manager(
                 && !rules.is_empty()
                 && rules.iter().all(|rule| {
                     parse_file_column(&rule.column_input, document.total_columns).is_ok()
-                        && (rule.operator == FilterOperator::Equals || !rule.value_input.is_empty())
+                        && (rule.operator != FilterOperator::Contains
+                            || !rule.value_input.is_empty())
                 });
             if ui
                 .add_enabled(can_apply, egui::Button::new("Apply filters"))
@@ -2457,7 +2463,7 @@ fn show_filter_manager(
             {
                 action = Some(Action::ApplyFilter);
             }
-            ui.small("Contains requires a value. Equals can match an empty cell. Values are literal and case-sensitive.");
+            ui.small("Contains requires a value. Equals and Does not equal can compare with an empty cell. Values are literal and case-sensitive.");
             if document.has_cell_edits() {
                 ui.small("Save or discard cell edits before filtering the source file.");
             }
@@ -2552,6 +2558,7 @@ fn filter_operator_label(operator: FilterOperator) -> &'static str {
     match operator {
         FilterOperator::Contains => "Contains",
         FilterOperator::Equals => "Equals",
+        FilterOperator::NotEquals => "Does not equal",
     }
 }
 
@@ -7452,7 +7459,7 @@ mod tests {
     }
 
     #[test]
-    fn applying_two_filter_rules_shows_only_rows_matching_both() {
+    fn applying_equal_and_not_equal_rules_shows_only_rows_matching_both() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -7475,8 +7482,8 @@ mod tests {
             },
             super::FilterRuleDraft {
                 column_input: "3".into(),
-                operator: FilterOperator::Equals,
-                value_input: "east".into(),
+                operator: FilterOperator::NotEquals,
+                value_input: "west".into(),
             },
         ];
         let ctx = egui::Context::default();
