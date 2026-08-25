@@ -23,13 +23,14 @@ use objc2_app_kit::NSApplication;
 #[cfg(target_os = "macos")]
 use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 use quarry_core::{
-    ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex,
-    FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery,
-    FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress,
-    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob,
-    ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch, SearchOutcome,
-    SearchPosition, SearchProgress, Session, SortDirection, SortJob, SortOutcome, SortSpec,
-    SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex, estimate_sort_temporary_bytes,
+    CaseSensitivity, ColumnTransformation, FilterExportJob, FilterExportOutcome,
+    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
+    FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
+    IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
+    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob,
+    SearchMatch, SearchOutcome, SearchPosition, SearchProgress, Session, SortDirection, SortJob,
+    SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
 
@@ -248,6 +249,9 @@ struct QuarryApp {
     jump_input: String,
     find_input: String,
     replace_input: String,
+    find_match_case: bool,
+    filter_match_case: bool,
+    sort_match_case: bool,
     column_search_input: String,
     columns_open: bool,
     structural_dialog: Option<StructuralDialog>,
@@ -361,6 +365,9 @@ impl QuarryApp {
             jump_input: "1".into(),
             find_input: String::new(),
             replace_input: String::new(),
+            find_match_case: false,
+            filter_match_case: false,
+            sort_match_case: false,
             column_search_input: String::new(),
             columns_open: false,
             structural_dialog: None,
@@ -723,11 +730,20 @@ impl QuarryApp {
             }
             Action::Jump => parse_data_row(&self.jump_input, document.data_start)
                 .and_then(|start| document.navigate(start)),
-            Action::FindNext => document.start_find_next(self.find_input.as_bytes()),
-            Action::ReplaceCurrent => document
-                .replace_current_match(self.find_input.as_bytes(), self.replace_input.as_bytes()),
-            Action::ReplaceAll => document
-                .start_replace_all(self.find_input.as_bytes(), self.replace_input.as_bytes()),
+            Action::FindNext => document.start_find_next_with_case(
+                self.find_input.as_bytes(),
+                case_sensitivity(self.find_match_case),
+            ),
+            Action::ReplaceCurrent => document.replace_current_match_with_case(
+                self.find_input.as_bytes(),
+                self.replace_input.as_bytes(),
+                case_sensitivity(self.find_match_case),
+            ),
+            Action::ReplaceAll => document.start_replace_all_with_case(
+                self.find_input.as_bytes(),
+                self.replace_input.as_bytes(),
+                case_sensitivity(self.find_match_case),
+            ),
             Action::CancelSearch => {
                 document.cancel_search();
                 Ok(())
@@ -747,7 +763,12 @@ impl QuarryApp {
                             })
                     })
                     .collect::<Result<Vec<_>, _>>();
-                predicates.and_then(|predicates| document.start_filter(FilterQuery { predicates }))
+                predicates.and_then(|predicates| {
+                    document.start_filter(FilterQuery {
+                        predicates,
+                        case_sensitivity: case_sensitivity(self.filter_match_case),
+                    })
+                })
             }
             Action::CancelFilter => {
                 document.cancel_filter();
@@ -832,9 +853,11 @@ impl QuarryApp {
                         dialog.columns.len(),
                     )
                     .and_then(|position| document.start_move_columns(dialog.columns, position)),
-                    StructuralRequest::Sort => {
-                        document.start_sort_rows(dialog.columns[0], dialog.sort_direction)
-                    }
+                    StructuralRequest::Sort => document.start_sort_rows_with_case(
+                        dialog.columns[0],
+                        dialog.sort_direction,
+                        case_sensitivity(self.sort_match_case),
+                    ),
                 });
         match result {
             Ok(()) => {
@@ -1426,11 +1449,15 @@ impl eframe::App for QuarryApp {
                             (!document.is_search_ready())
                                 .then_some("Search is available after indexing completes.")
                         });
-                        let can_replace = document.can_replace_current(self.find_input.as_bytes());
+                        let can_replace = document.can_replace_current_with_case(
+                            self.find_input.as_bytes(),
+                            case_sensitivity(self.find_match_case),
+                        );
                         if let Some(search_action) = search_controls(
                             ui,
                             &mut self.find_input,
                             &mut self.replace_input,
+                            &mut self.find_match_case,
                             document.is_search_ready(),
                             can_replace,
                             search_progress.as_ref(),
@@ -1659,6 +1686,7 @@ impl eframe::App for QuarryApp {
                 ctx,
                 &mut self.filters_open,
                 &mut self.filter_rules,
+                &mut self.filter_match_case,
                 document,
             )
         });
@@ -1672,7 +1700,11 @@ impl eframe::App for QuarryApp {
             .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
             .show(ctx, |ui| {
                 if let Some(document) = self.document.as_mut() {
-                    match show_grid(ui, document) {
+                    match show_grid_with_filter_case(
+                        ui,
+                        document,
+                        case_sensitivity(self.filter_match_case),
+                    ) {
                         Ok(request) => requested_column_edit = request,
                         Err(error) => grid_error = Some(error),
                     }
@@ -1695,7 +1727,9 @@ impl eframe::App for QuarryApp {
             .structural_dialog
             .as_mut()
             .zip(self.document.as_ref())
-            .and_then(|(dialog, document)| show_structural_dialog(ctx, dialog, document));
+            .and_then(|(dialog, document)| {
+                show_structural_dialog(ctx, dialog, &mut self.sort_match_case, document)
+            });
         if let Some(action) = structural_dialog_action {
             self.apply_structural_dialog_action(action);
         }
@@ -2183,6 +2217,7 @@ enum StructuralDialogAction {
 fn show_structural_dialog(
     ctx: &egui::Context,
     dialog: &mut StructuralDialog,
+    sort_match_case: &mut bool,
     document: &Document,
 ) -> Option<StructuralDialogAction> {
     let mut action = None;
@@ -2199,8 +2234,13 @@ fn show_structural_dialog(
                 )
             },
         );
+        let case = if *sort_match_case {
+            "Letter case must match."
+        } else {
+            "Letter case is ignored."
+        };
         format!(
-            "Case-sensitive text. Equal values keep their original order (stable sort). The header stays fixed. Missing values sort as empty cells. {disk}"
+            "{case} Equal values keep their original order (stable sort). The header stays fixed. Missing values sort as empty cells. {disk}"
         )
     });
     let title = match dialog.request {
@@ -2294,7 +2334,12 @@ fn show_structural_dialog(
                         "Descending",
                     );
                 });
-                ui.small("Text comparison is case-sensitive.");
+                ui.checkbox(sort_match_case, "Match case");
+                ui.small(if *sort_match_case {
+                    "Uppercase and lowercase letters sort separately."
+                } else {
+                    "Uppercase and lowercase letters sort together."
+                });
                 ui.small("Equal values keep their original order (stable sort).");
                 ui.small("The header stays fixed. Missing values sort as empty cells.");
                 let reason = sort_disk.is_none().then(|| {
@@ -2350,6 +2395,7 @@ fn show_filter_manager(
     ctx: &egui::Context,
     open: &mut bool,
     rules: &mut Vec<FilterRuleDraft>,
+    match_case: &mut bool,
     document: &Document,
 ) -> Option<Action> {
     let mut action = None;
@@ -2361,7 +2407,10 @@ fn show_filter_manager(
         .vscroll(true)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.label("Show only rows where all rules match (AND).");
+            ui.label(
+                "Rows must match every filtered column. Equals and Contains values in the same column are alternatives.",
+            );
+            ui.checkbox(match_case, "Match case");
             ui.add_space(6.0);
             let rule_count = rules.len();
             let sole_rule = rule_count == 1;
@@ -2432,7 +2481,7 @@ fn show_filter_manager(
                             egui::TextEdit::multiline(&mut rule.value_input)
                                 .desired_rows(2)
                                 .id(filter_value_input_id(index))
-                                .hint_text("Literal, case-sensitive text"),
+                                .hint_text("Literal text"),
                         )
                         .labelled_by(label.id);
                 });
@@ -2441,7 +2490,7 @@ fn show_filter_manager(
             if let Some(index) = remove_index {
                 rules.remove(index);
             }
-            if ui.button("Add AND rule").clicked() {
+            if ui.button("Add rule").clicked() {
                 surrender_filter_text_focus(ui.ctx(), rules.len());
                 rules.push(FilterRuleDraft::default());
             }
@@ -2463,7 +2512,7 @@ fn show_filter_manager(
             {
                 action = Some(Action::ApplyFilter);
             }
-            ui.small("Contains requires a value. Equals and Does not equal can compare with an empty cell. Values are literal and case-sensitive.");
+            ui.small("Contains requires a value. Equals and Does not equal can compare with an empty cell. Values are literal.");
             if document.has_cell_edits() {
                 ui.small("Save or discard cell edits before filtering the source file.");
             }
@@ -2499,9 +2548,10 @@ fn show_filter_manager(
             if let Some(query) = document.filter_query.as_ref() {
                 ui.add_space(6.0);
                 ui.label(format!(
-                    "Active: {} rule{} (all must match)",
+                    "Active: {} rule{} ({})",
                     query.predicates.len(),
-                    if query.predicates.len() == 1 { "" } else { "s" }
+                    if query.predicates.len() == 1 { "" } else { "s" },
+                    case_sensitivity_label(query.case_sensitivity),
                 ));
                 for (index, predicate) in query.predicates.iter().enumerate() {
                     let value = field_text(&predicate.value);
@@ -2562,6 +2612,21 @@ fn filter_operator_label(operator: FilterOperator) -> &'static str {
     }
 }
 
+fn case_sensitivity(match_case: bool) -> CaseSensitivity {
+    if match_case {
+        CaseSensitivity::Sensitive
+    } else {
+        CaseSensitivity::Insensitive
+    }
+}
+
+fn case_sensitivity_label(case_sensitivity: CaseSensitivity) -> &'static str {
+    match case_sensitivity {
+        CaseSensitivity::Insensitive => "case-insensitive",
+        CaseSensitivity::Sensitive => "case-sensitive",
+    }
+}
+
 fn column_drop_position(source_position: usize, insertion: usize, total_columns: usize) -> usize {
     insertion
         .saturating_sub(usize::from(source_position < insertion))
@@ -2587,10 +2652,12 @@ fn column_action_button(
     response.clicked()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_controls(
     ui: &mut egui::Ui,
     query: &mut String,
     replacement: &mut String,
+    match_case: &mut bool,
     index_ready: bool,
     can_replace: bool,
     progress: Option<&SearchProgress>,
@@ -2599,7 +2666,7 @@ fn search_controls(
     let mut action = None;
     let searching = progress.is_some();
     ui.horizontal(|ui| {
-        let label = ui.label("Find (literal, case-sensitive)");
+        let label = ui.label("Find (literal)");
         let input = ui
             .add_enabled(
                 !searching,
@@ -2650,6 +2717,8 @@ fn search_controls(
         {
             action = Some(Action::ReplaceAll);
         }
+
+        ui.add_enabled(!searching, egui::Checkbox::new(match_case, "Match case"));
 
         if let Some(progress) = progress {
             let fraction = if progress.total_bytes == 0 {
@@ -3031,6 +3100,7 @@ struct Document {
     progress: IndexProgress,
     search_job: Option<SearchJob>,
     search_query: Vec<u8>,
+    search_case_sensitivity: CaseSensitivity,
     last_match: Option<SearchMatch>,
     search_status: Option<String>,
     filter_job: Option<FilterJob>,
@@ -3161,6 +3231,7 @@ impl Document {
             progress,
             search_job: None,
             search_query: Vec::new(),
+            search_case_sensitivity: CaseSensitivity::Insensitive,
             last_match: None,
             search_status: None,
             filter_job: None,
@@ -3388,7 +3459,12 @@ impl Document {
         )
     }
 
-    fn start_sort_rows(&mut self, column: usize, direction: SortDirection) -> Result<(), String> {
+    fn start_sort_rows_with_case(
+        &mut self,
+        column: usize,
+        direction: SortDirection,
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<(), String> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
             return Err(reason.into());
         }
@@ -3408,7 +3484,11 @@ impl Document {
         let job = match self.session.start_create_sorted_working_copy(
             renames,
             self.cell_edits.clone(),
-            SortSpec { column, direction },
+            SortSpec {
+                column,
+                direction,
+                case_sensitivity,
+            },
             &destination,
         ) {
             Ok(job) => job,
@@ -3572,7 +3652,17 @@ impl Document {
         Ok(())
     }
 
+    #[cfg(test)]
     fn start_replace_all(&mut self, query: &[u8], replacement: &[u8]) -> Result<(), String> {
+        self.start_replace_all_with_case(query, replacement, CaseSensitivity::Insensitive)
+    }
+
+    fn start_replace_all_with_case(
+        &mut self,
+        query: &[u8],
+        replacement: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<(), String> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
             return Err(reason.into());
         }
@@ -3599,6 +3689,7 @@ impl Document {
             LiteralReplacement {
                 needle: query.to_vec(),
                 replacement: replacement.to_vec(),
+                case_sensitivity,
             },
             destination.clone(),
         ) {
@@ -3958,7 +4049,16 @@ impl Document {
         Ok(())
     }
 
+    #[cfg(test)]
     fn start_find_next(&mut self, query: &[u8]) -> Result<(), String> {
+        self.start_find_next_with_case(query, CaseSensitivity::Insensitive)
+    }
+
+    fn start_find_next_with_case(
+        &mut self,
+        query: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<(), String> {
         if query.is_empty() {
             return Err("Enter text to find.".into());
         }
@@ -3972,9 +4072,10 @@ impl Document {
             return Err("Search is available after indexing completes.".into());
         }
         self.commit_edits();
-        if self.search_query != query {
+        if self.search_query != query || self.search_case_sensitivity != case_sensitivity {
             self.search_query.clear();
             self.search_query.extend_from_slice(query);
+            self.search_case_sensitivity = case_sensitivity;
             self.last_match = None;
         }
         let position = self.last_match.as_ref().map_or(
@@ -3990,11 +4091,12 @@ impl Document {
         let index = self.index.as_ref().expect("index was checked above");
         self.search_job = Some(
             self.session
-                .start_search_with_cell_edits(
+                .start_search_with_cell_edits_and_case(
                     index,
                     query.to_vec(),
                     position,
                     self.cell_edits.clone(),
+                    case_sensitivity,
                 )
                 .map_err(|error| error.to_string())?,
         );
@@ -4003,7 +4105,16 @@ impl Document {
         Ok(())
     }
 
+    #[cfg(test)]
     fn can_replace_current(&self, query: &[u8]) -> bool {
+        self.can_replace_current_with_case(query, CaseSensitivity::Insensitive)
+    }
+
+    fn can_replace_current_with_case(
+        &self,
+        query: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> bool {
         if query.is_empty()
             || self.search_job.is_some()
             || self.save_job.is_some()
@@ -4011,6 +4122,7 @@ impl Document {
             || self.cell_edit.is_some()
             || self.header_edit.is_some()
             || self.search_query != query
+            || self.search_case_sensitivity != case_sensitivity
         {
             return false;
         }
@@ -4020,11 +4132,21 @@ impl Document {
         self.reveal_cell == Some((found.row, found.column))
             && self
                 .effective_cell(found.row, found.column)
-                .is_some_and(|value| value.windows(query.len()).any(|part| part == query))
+                .is_some_and(|value| literal_contains(value, query, case_sensitivity))
     }
 
+    #[cfg(test)]
     fn replace_current_match(&mut self, query: &[u8], replacement: &[u8]) -> Result<(), String> {
-        if !self.can_replace_current(query) {
+        self.replace_current_match_with_case(query, replacement, CaseSensitivity::Insensitive)
+    }
+
+    fn replace_current_match_with_case(
+        &mut self,
+        query: &[u8],
+        replacement: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<(), String> {
+        if !self.can_replace_current_with_case(query, case_sensitivity) {
             return Err("Find a current match before replacing it.".into());
         }
         let found = self
@@ -4041,7 +4163,7 @@ impl Document {
             .cell_edits
             .get(&key)
             .map_or(source.as_slice(), Vec::as_slice);
-        let next = replace_literal_all(effective, query, replacement)
+        let next = replace_literal_all_with_case(effective, query, replacement, case_sensitivity)
             .expect("replaceable match contains the query");
         if next.as_slice() != effective {
             self.invalidate_structural_redo();
@@ -4055,7 +4177,7 @@ impl Document {
             row: found.row,
             column: found.column,
         });
-        self.start_find_next(query)
+        self.start_find_next_with_case(query, case_sensitivity)
     }
 
     fn poll_search(&mut self) -> Result<(), String> {
@@ -5580,7 +5702,26 @@ fn parse_move_position(
     Ok(position - 1)
 }
 
-fn replace_literal_all(value: &[u8], query: &[u8], replacement: &[u8]) -> Option<Vec<u8>> {
+fn literal_contains(value: &[u8], query: &[u8], case_sensitivity: CaseSensitivity) -> bool {
+    !query.is_empty()
+        && value
+            .windows(query.len())
+            .any(|part| literal_equals(part, query, case_sensitivity))
+}
+
+fn literal_equals(left: &[u8], right: &[u8], case_sensitivity: CaseSensitivity) -> bool {
+    match case_sensitivity {
+        CaseSensitivity::Insensitive => left.eq_ignore_ascii_case(right),
+        CaseSensitivity::Sensitive => left == right,
+    }
+}
+
+fn replace_literal_all_with_case(
+    value: &[u8],
+    query: &[u8],
+    replacement: &[u8],
+    case_sensitivity: CaseSensitivity,
+) -> Option<Vec<u8>> {
     if query.is_empty() {
         return None;
     }
@@ -5589,7 +5730,7 @@ fn replace_literal_all(value: &[u8], query: &[u8], replacement: &[u8]) -> Option
     let mut replaced = false;
     while let Some(relative) = value[start..]
         .windows(query.len())
-        .position(|part| part == query)
+        .position(|part| literal_equals(part, query, case_sensitivity))
     {
         let found = start + relative;
         output.extend_from_slice(&value[start..found]);
@@ -5753,9 +5894,10 @@ fn rendered_column_range(
     start..start + MAX_RENDERED_COLUMNS
 }
 
-fn show_grid(
+fn show_grid_with_filter_case(
     ui: &mut egui::Ui,
     document: &mut Document,
+    filter_case_sensitivity: CaseSensitivity,
 ) -> Result<Option<GridColumnRequest>, String> {
     if document.source_changed {
         ui.centered_and_justified(|ui| {
@@ -5852,7 +5994,7 @@ fn show_grid(
         ui.separator();
         let interaction = ui
             .allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::Min), |ui| {
-                show_table(ui, document, reveal_cell)
+                show_table(ui, document, reveal_cell, filter_case_sensitivity)
             })
             .inner;
         if let Some(selection) = interaction.selection {
@@ -5871,10 +6013,19 @@ fn show_grid(
     .inner
 }
 
+#[cfg(test)]
+fn show_grid(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+) -> Result<Option<GridColumnRequest>, String> {
+    show_grid_with_filter_case(ui, document, CaseSensitivity::Insensitive)
+}
+
 fn show_table(
     ui: &mut egui::Ui,
     document: &mut Document,
     reveal_cell: Option<(u64, usize)>,
+    filter_case_sensitivity: CaseSensitivity,
 ) -> GridInteraction {
     let row_count = document.visible_row_count();
     let mut interaction = GridInteraction::default();
@@ -6511,17 +6662,19 @@ fn show_table(
                                                     )
                                                     .clicked()
                                                 {
-                                                    interaction.filter_query = Some(
-                                                        FilterQuery::single(
+                                                    interaction.filter_query = Some(FilterQuery {
+                                                        predicates: vec![FilterPredicate {
                                                             column,
-                                                            FilterOperator::Equals,
-                                                            value
+                                                            operator: FilterOperator::Equals,
+                                                            value: value
                                                                 .expect(
                                                                     "enabled filtering has a cell value",
                                                                 )
                                                                 .to_vec(),
-                                                        ),
-                                                    );
+                                                        }],
+                                                        case_sensitivity:
+                                                            filter_case_sensitivity,
+                                                    });
                                                     ui.close();
                                                 }
                                                 if ui
@@ -6533,17 +6686,19 @@ fn show_table(
                                                     )
                                                     .clicked()
                                                 {
-                                                    interaction.filter_query = Some(
-                                                        FilterQuery::single(
+                                                    interaction.filter_query = Some(FilterQuery {
+                                                        predicates: vec![FilterPredicate {
                                                             column,
-                                                            FilterOperator::NotEquals,
-                                                            value
+                                                            operator: FilterOperator::NotEquals,
+                                                            value: value
                                                                 .expect(
                                                                     "enabled filtering has a cell value",
                                                                 )
                                                                 .to_vec(),
-                                                        ),
-                                                    );
+                                                        }],
+                                                        case_sensitivity:
+                                                            filter_case_sensitivity,
+                                                    });
                                                     ui.close();
                                                 }
                                                 ui.separator();
@@ -6823,18 +6978,19 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        Action, ColumnCommand, ColumnView, DelimiterMode, Document, FIND_INPUT_ID, FilterOperator,
-        FilterProgress, FilterQuery, GridColumnRequest, GridSelection, HeaderMode, IndexConfig,
-        MAX_RENDERED_COLUMNS, OpenOptions, QuarryApp, REPLACE_INPUT_ID, ROW_NUMBER_WIDTH, Row,
-        SOURCE_CHANGED_NOTICE, SearchMatch, SearchProgress, Session, StructuralDialog,
-        StructuralDialogAction, WorkingCopyState, column_drop_position,
-        column_ruler_divider_stroke, column_selection_fill, configure_style, copy_control,
-        estimate_sort_temporary_bytes, filtered_export_controls, filtered_export_file_name,
-        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
-        parse_file_column, parse_move_position, rendered_column_range, row_for_scroll_fraction,
-        save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
-        selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
-        show_structural_dialog, sort_merge_progress,
+        Action, CaseSensitivity, ColumnCommand, ColumnView, DelimiterMode, Document, FIND_INPUT_ID,
+        FilterOperator, FilterPredicate, FilterProgress, FilterQuery, GridColumnRequest,
+        GridSelection, HeaderMode, IndexConfig, MAX_RENDERED_COLUMNS, OpenOptions, QuarryApp,
+        REPLACE_INPUT_ID, ROW_NUMBER_WIDTH, Row, SOURCE_CHANGED_NOTICE, SearchMatch,
+        SearchProgress, Session, StructuralDialog, StructuralDialogAction, WorkingCopyState,
+        column_drop_position, column_ruler_divider_stroke, column_selection_fill, configure_style,
+        copy_control, estimate_sort_temporary_bytes, filtered_export_controls,
+        filtered_export_file_name, logical_viewport_start, max_viewport_start, page_controls,
+        parse_data_row, parse_file_column, parse_move_position, rendered_column_range,
+        row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row, search_controls,
+        select_column, selected_split_column, selection_text, show_column_manager,
+        show_filter_manager, show_grid, show_grid_with_filter_case, show_structural_dialog,
+        sort_merge_progress,
     };
 
     #[test]
@@ -7260,6 +7416,7 @@ mod tests {
                 ctx,
                 &mut app.filters_open,
                 &mut app.filter_rules,
+                &mut app.filter_match_case,
                 app.document.as_ref().unwrap(),
             );
         });
@@ -7286,6 +7443,9 @@ mod tests {
         }));
         assert!(tree.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::ComboBox && !node.labelled_by().is_empty()
+        }));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::CheckBox && node.label() == Some("Match case")
         }));
         let target = tree
             .nodes
@@ -7321,6 +7481,7 @@ mod tests {
                     ctx,
                     &mut app.filters_open,
                     &mut app.filter_rules,
+                    &mut app.filter_match_case,
                     app.document.as_ref().unwrap(),
                 );
             },
@@ -7344,6 +7505,7 @@ mod tests {
                     ctx,
                     &mut app.filters_open,
                     &mut app.filter_rules,
+                    &mut app.filter_match_case,
                     app.document.as_ref().unwrap(),
                 );
             },
@@ -7433,9 +7595,10 @@ mod tests {
         ctx.enable_accesskit();
         let mut open = true;
         let mut rules = vec![super::FilterRuleDraft::default()];
+        let mut match_case = false;
 
         let output = ctx.run(grid_input(), |ctx| {
-            let _ = show_filter_manager(ctx, &mut open, &mut rules, &document);
+            let _ = show_filter_manager(ctx, &mut open, &mut rules, &mut match_case, &document);
         });
         let tree = output
             .platform_output
@@ -7451,11 +7614,11 @@ mod tests {
             .iter()
             .find(|(_, node)| {
                 node.role() == egui::accesskit::Role::Button
-                    && node.label() == Some("Add AND rule")
+                    && node.label() == Some("Add rule")
                     && node.supports_action(egui::accesskit::Action::Click)
             })
             .map(|(id, _)| *id)
-            .expect("Add AND rule should be accessible");
+            .expect("Add rule should be accessible");
 
         ctx.memory_mut(|memory| memory.request_focus(super::filter_value_input_id(0)));
         let _ = ctx.run(
@@ -7470,7 +7633,7 @@ mod tests {
                 ..grid_input()
             },
             |ctx| {
-                let _ = show_filter_manager(ctx, &mut open, &mut rules, &document);
+                let _ = show_filter_manager(ctx, &mut open, &mut rules, &mut match_case, &document);
             },
         );
         assert_eq!(rules.len(), 2);
@@ -7483,7 +7646,7 @@ mod tests {
         rules[1].value_input = "second".into();
 
         let output = ctx.run(grid_input(), |ctx| {
-            let _ = show_filter_manager(ctx, &mut open, &mut rules, &document);
+            let _ = show_filter_manager(ctx, &mut open, &mut rules, &mut match_case, &document);
         });
         let tree = output
             .platform_output
@@ -7552,7 +7715,7 @@ mod tests {
                 ..grid_input()
             },
             |ctx| {
-                let _ = show_filter_manager(ctx, &mut open, &mut rules, &document);
+                let _ = show_filter_manager(ctx, &mut open, &mut rules, &mut match_case, &document);
             },
         );
         assert_eq!(rules.len(), 1);
@@ -7568,15 +7731,15 @@ mod tests {
     }
 
     #[test]
-    fn applying_equal_and_not_equal_rules_shows_only_rows_matching_both() {
+    fn applying_same_column_values_keeps_alternatives_and_narrows_other_columns() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("quarry-filter-and-{name}.csv"));
+        let path = std::env::temp_dir().join(format!("quarry-filter-groups-{name}.csv"));
         fs::write(
             &path,
-            b"id,status,region\n1,keep,east\n2,keep,west\n3,skip,east\n4,keep,east\n",
+            b"id,state,status\n1,TX,active\n2,FL,active\n3,CA,active\n4,TX,inactive\n",
         )
         .unwrap();
 
@@ -7587,12 +7750,17 @@ mod tests {
             super::FilterRuleDraft {
                 column_input: "2".into(),
                 operator: FilterOperator::Equals,
-                value_input: "keep".into(),
+                value_input: "tx".into(),
+            },
+            super::FilterRuleDraft {
+                column_input: "2".into(),
+                operator: FilterOperator::Equals,
+                value_input: "fL".into(),
             },
             super::FilterRuleDraft {
                 column_input: "3".into(),
                 operator: FilterOperator::NotEquals,
-                value_input: "west".into(),
+                value_input: "INACTIVE".into(),
             },
         ];
         let ctx = egui::Context::default();
@@ -7601,7 +7769,11 @@ mod tests {
 
         let document = app.document.as_mut().unwrap();
         finish_filter(document);
-        assert_eq!(document.filter_query.as_ref().unwrap().predicates.len(), 2);
+        assert_eq!(document.filter_query.as_ref().unwrap().predicates.len(), 3);
+        assert_eq!(
+            document.filter_query.as_ref().unwrap().case_sensitivity,
+            CaseSensitivity::Insensitive
+        );
         assert_eq!(document.available_filter_rows(), 2);
         assert_eq!(
             document
@@ -7609,10 +7781,11 @@ mod tests {
                 .iter()
                 .map(|row| row.fields[0].as_slice())
                 .collect::<Vec<_>>(),
-            vec![b"1".as_slice(), b"4".as_slice()]
+            vec![b"1".as_slice(), b"2".as_slice()]
         );
         assert!(document.visible_filter_rows().iter().all(|row| {
-            row.fields[1].as_slice() == b"keep" && row.fields[2].as_slice() == b"east"
+            matches!(row.fields[1].as_slice(), b"TX" | b"FL")
+                && row.fields[2].as_slice() == b"active"
         }));
 
         document.shutdown();
@@ -9842,7 +10015,12 @@ mod tests {
         ctx.enable_accesskit();
         let output = ctx.run(grid_input(), |ctx| {
             assert_eq!(
-                show_structural_dialog(ctx, &mut dialog, app.document.as_ref().unwrap()),
+                show_structural_dialog(
+                    ctx,
+                    &mut dialog,
+                    &mut app.sort_match_case,
+                    app.document.as_ref().unwrap(),
+                ),
                 None
             );
         });
@@ -9965,7 +10143,7 @@ mod tests {
         let source = directory.path().join("sort-from-grid.csv");
         fs::write(
             &source,
-            b"key,name\nb,first-b\nA,upper\n,missing\na,lower\nb,second-b\n",
+            b"key,name\nb,first-b\na,lower\n,missing\nA,upper\nb,second-b\n",
         )
         .unwrap();
         let original = fs::read(&source).unwrap();
@@ -9986,7 +10164,12 @@ mod tests {
         ctx.enable_accesskit();
         let output = ctx.run(grid_input(), |ctx| {
             assert_eq!(
-                show_structural_dialog(ctx, &mut dialog, app.document.as_ref().unwrap()),
+                show_structural_dialog(
+                    ctx,
+                    &mut dialog,
+                    &mut app.sort_match_case,
+                    app.document.as_ref().unwrap(),
+                ),
                 None
             );
         });
@@ -9999,7 +10182,7 @@ mod tests {
             .iter()
             .filter_map(|(_, node)| node.label().map(str::to_owned))
             .collect::<Vec<_>>();
-        for label in ["Ascending", "Descending", "Sort", "Cancel"] {
+        for label in ["Ascending", "Descending", "Match case", "Sort", "Cancel"] {
             assert!(
                 accessible_labels.iter().any(|candidate| candidate == label),
                 "missing accessible sort control or explanation {label}: {accessible_labels:?}"
@@ -10012,7 +10195,7 @@ mod tests {
             .and_then(|(_, node)| node.description())
             .expect("the Sort button should describe sort semantics");
         for detail in [
-            "Case-sensitive text.",
+            "Letter case is ignored.",
             "stable sort",
             "header stays fixed",
             "Missing values sort as empty cells",
@@ -10041,7 +10224,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             sorted_names,
-            ["missing", "upper", "lower", "first-b", "second-b"]
+            ["missing", "lower", "upper", "first-b", "second-b"]
                 .map(|value| value.as_bytes().to_vec())
         );
         assert_eq!(document.selected_columns, BTreeSet::from([0]));
@@ -10062,7 +10245,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             original_names,
-            ["first-b", "upper", "missing", "lower", "second-b"]
+            ["first-b", "lower", "missing", "upper", "second-b"]
                 .map(|value| value.as_bytes().to_vec())
         );
 
@@ -10113,7 +10296,12 @@ mod tests {
         ctx.enable_accesskit();
         let output = ctx.run(grid_input(), |ctx| {
             assert_eq!(
-                show_structural_dialog(ctx, dialog, app.document.as_ref().unwrap()),
+                show_structural_dialog(
+                    ctx,
+                    dialog,
+                    &mut app.sort_match_case,
+                    app.document.as_ref().unwrap(),
+                ),
                 None
             );
         });
@@ -10375,7 +10563,9 @@ mod tests {
                 .map(|(id, _)| *id)
                 .unwrap_or_else(|| panic!("missing enabled cell menu item {label}"))
         };
-        let click_item = |target, document: &mut Document| {
+        let click_item = |target,
+                          document: &mut Document,
+                          filter_case_sensitivity: CaseSensitivity| {
             ctx.run(
                 egui::RawInput {
                     events: vec![egui::Event::AccessKitActionRequest(
@@ -10389,7 +10579,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        show_grid(ui, document).unwrap();
+                        show_grid_with_filter_case(ui, document, filter_case_sensitivity).unwrap();
                     });
                 },
             )
@@ -10400,35 +10590,41 @@ mod tests {
             let _ = menu_item(&menu, label);
         }
         let copy_target = menu_item(&menu, "Copy");
-        let output = click_item(copy_target, &mut document);
+        let output = click_item(copy_target, &mut document, CaseSensitivity::Insensitive);
         assert!(output.platform_output.commands.iter().any(|command| {
             matches!(command, egui::OutputCommand::CopyText(text) if text == "line one\nline two")
         }));
 
         let menu = open_menu(&mut document);
         let filter_target = menu_item(&menu, "Filter to This Value");
-        let _ = click_item(filter_target, &mut document);
+        let _ = click_item(filter_target, &mut document, CaseSensitivity::Insensitive);
         assert_eq!(
             document.filter_query,
-            Some(FilterQuery::single(
-                1,
-                FilterOperator::Equals,
-                b"line one\nline two".to_vec(),
-            ))
+            Some(FilterQuery {
+                predicates: vec![FilterPredicate {
+                    column: 1,
+                    operator: FilterOperator::Equals,
+                    value: b"line one\nline two".to_vec(),
+                }],
+                case_sensitivity: CaseSensitivity::Insensitive,
+            })
         );
         finish_filter(&mut document);
         document.clear_filter().unwrap();
 
         let menu = open_menu(&mut document);
         let exclude_target = menu_item(&menu, "Filter Out This Value");
-        let _ = click_item(exclude_target, &mut document);
+        let _ = click_item(exclude_target, &mut document, CaseSensitivity::Sensitive);
         assert_eq!(
             document.filter_query,
-            Some(FilterQuery::single(
-                1,
-                FilterOperator::NotEquals,
-                b"line one\nline two".to_vec(),
-            ))
+            Some(FilterQuery {
+                predicates: vec![FilterPredicate {
+                    column: 1,
+                    operator: FilterOperator::NotEquals,
+                    value: b"line one\nline two".to_vec(),
+                }],
+                case_sensitivity: CaseSensitivity::Sensitive,
+            })
         );
         finish_filter(&mut document);
     }
@@ -11074,16 +11270,44 @@ mod tests {
     fn search_controls_are_accessible_and_clickable() {
         let mut query = "needle".to_owned();
         let mut replacement = "replacement".to_owned();
+        let mut match_case = false;
         let find = click_accessible_button("Find Next", |ui| {
-            search_controls(ui, &mut query, &mut replacement, true, false, None, None)
+            search_controls(
+                ui,
+                &mut query,
+                &mut replacement,
+                &mut match_case,
+                true,
+                false,
+                None,
+                None,
+            )
         });
         assert!(matches!(find, Some(Action::FindNext)));
         let replace = click_accessible_button("Replace in Cell", |ui| {
-            search_controls(ui, &mut query, &mut replacement, true, true, None, None)
+            search_controls(
+                ui,
+                &mut query,
+                &mut replacement,
+                &mut match_case,
+                true,
+                true,
+                None,
+                None,
+            )
         });
         assert!(matches!(replace, Some(Action::ReplaceCurrent)));
         let replace_all = click_accessible_button("Replace All", |ui| {
-            search_controls(ui, &mut query, &mut replacement, true, false, None, None)
+            search_controls(
+                ui,
+                &mut query,
+                &mut replacement,
+                &mut match_case,
+                true,
+                false,
+                None,
+                None,
+            )
         });
         assert!(matches!(replace_all, Some(Action::ReplaceAll)));
 
@@ -11091,7 +11315,16 @@ mod tests {
         ctx.enable_accesskit();
         let output = ctx.run(grid_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                search_controls(ui, &mut query, &mut replacement, true, true, None, None);
+                search_controls(
+                    ui,
+                    &mut query,
+                    &mut replacement,
+                    &mut match_case,
+                    true,
+                    true,
+                    None,
+                    None,
+                );
             });
         });
         let tree = output
@@ -11102,6 +11335,9 @@ mod tests {
             node.role() == egui::accesskit::Role::TextInput
                 && !node.labelled_by().is_empty()
                 && node.value() == Some("replacement")
+        }));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::CheckBox && node.label() == Some("Match case")
         }));
 
         let progress = SearchProgress {
@@ -11117,6 +11353,7 @@ mod tests {
                 ui,
                 &mut query,
                 &mut replacement,
+                &mut match_case,
                 true,
                 false,
                 Some(&progress),
@@ -11201,6 +11438,44 @@ mod tests {
         );
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn find_mode_is_part_of_the_cursor_and_replace_in_cell_uses_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("find-case.csv");
+        fs::write(&path, b"value\nNeedle needle\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        document
+            .start_find_next_with_case(b"needle", CaseSensitivity::Insensitive)
+            .unwrap();
+        finish_search(&mut document);
+        assert!(document.can_replace_current_with_case(b"needle", CaseSensitivity::Insensitive));
+        assert!(!document.can_replace_current_with_case(b"needle", CaseSensitivity::Sensitive));
+
+        document
+            .start_find_next_with_case(b"needle", CaseSensitivity::Sensitive)
+            .unwrap();
+        finish_search(&mut document);
+        document
+            .replace_current_match_with_case(b"needle", b"X", CaseSensitivity::Sensitive)
+            .unwrap();
+        assert_eq!(
+            document.cell_edits.get(&(1, 0)).map(Vec::as_slice),
+            Some(b"Needle X".as_slice())
+        );
+
+        document.cancel_search();
+        document.shutdown();
     }
 
     #[test]

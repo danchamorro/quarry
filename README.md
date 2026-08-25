@@ -34,11 +34,11 @@ working memory bounded and does not change the source until you choose
 |---|---|
 | Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
-| Find and replace | Literal, case-sensitive Find Next; Replace in Cell; cancellable Replace All across data cells |
-| Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, and Does not equal predicates; multiple AND rules; incremental results; bounded match indexes; cancellable filtered export |
+| Find and replace | Literal Find Next, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
+| Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, and Does not equal predicates; same-column alternatives with AND across columns; case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
 | Edit | Direct cell and header editing; multiline values; Undo and Redo; Discard Changes |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or Delete; continue editing the result before saving |
-| Sort | Stable ascending and descending text sort; fixed header; deterministic order for equal values; cancellation and disk preflight |
+| Sort | Stable ascending and descending text sort; case-insensitive by default with a per-tool Match case option; fixed header; deterministic order for equal values; cancellation and disk preflight |
 | Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |
 
 ## Install Quarry
@@ -158,11 +158,16 @@ of the UI framework and is exercised directly by the benchmark CLI.
    not right for the file.
 2. Scroll continuously, jump to a one-based data row, page through the file, or
    horizontally scroll through every shown column.
-3. Double-click a cell or header to edit it. Right-click a data cell to Copy,
-   Filter to This Value, or Filter Out This Value. Use Filters to build multiple
-   literal, case-sensitive AND rules and export the matches.
+3. Double-click a cell or header to edit it. Find/Replace ignores case by
+   default; turn on its **Match case** option for exact matching. Right-click a
+   data cell to Copy, Filter to This Value, or Filter Out This Value. Use
+   Filters to build literal rules and export the matches. The Filters tool also
+   ignores case by default and has its own **Match case** option; the two
+   right-click filter actions inherit that Filters setting. Equals and Contains
+   values in one column are alternatives; every filtered column must match.
 4. Select numbered column headers, then right-click to Split, Combine, Move,
-   Delete, or Sort. Completed operations return to the ordinary editable grid.
+   Delete, or Sort. Sort ignores case by default and has its own **Match case**
+   option. Completed operations return to the ordinary editable grid.
 5. Use Undo, Redo, or Discard Changes while experimenting. Choose Save to update
    the guarded source or Save As to publish a separate file.
 

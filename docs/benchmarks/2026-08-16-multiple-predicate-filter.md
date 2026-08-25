@@ -1,35 +1,50 @@
 # Multiple AND-predicate filter validation: 2026-08-16
 
+> Current behavior note (2026-08-24): Quarry now treats Equals and Contains
+> values within one column as alternatives, applies all Does not equal rules,
+> and requires every filtered column to match. The results below preserve the
+> original distinct-column AND benchmark evidence.
+
 ## Decision
 
-Ship multiple literal, case-sensitive filter predicates with AND semantics.
-Quarry parses each record once, evaluates every predicate against its decoded
-fields, and retains only adaptive match checkpoints under the existing fixed
-memory budget. Single-predicate commands remain compatible through
-`FilterQuery::single`.
+Ship multiple literal filter predicates under the current grouped contract.
+Matching is ASCII case-insensitive by default; **Match case** selects exact byte
+matching. Within one source column, Equals and Contains values are alternatives,
+while every Does not equal predicate excludes its value. Every filtered source
+column must match (AND). Quarry parses each record once and retains only adaptive
+match checkpoints under the existing fixed memory budget.
 
 The deterministic 1 GB intersection returned the exact 251 matches with a
 5.88 KiB filter index and 5.16 MiB peak process RSS. The 12 GB scan reached the
 exact end of the file with 3.92 MiB peak RSS. At the time of this measurement,
 streaming filtered export was the next Phase 4 slice. It is now complete and
 documented in the [filtered-export validation](2026-08-16-filtered-export.md).
-OR, regex, and case-insensitive matching remain deferred.
+These recorded 2026-08-16 measurements used two distinct filtered columns under
+the then-current case-sensitive contract. They remain historical evidence for
+exact distinct-column intersection, end-of-file scanning, and bounded memory.
+Arbitrary Boolean grouping, regex, and locale-aware Unicode case folding remain
+deferred.
 
 ## Implementation
 
-- A `FilterPredicate` owns one source column, a contains or equality operator,
-  and a literal byte value. A nonempty `FilterQuery` owns the ordered predicate
-  list.
-- The scanner parses each bounded record once. The record matches only when all
-  predicates match their decoded fields. A missing source column rejects the
-  record.
+- A `FilterPredicate` owns one source column, a Contains, Equals, or Does not
+  equal operator, and a literal byte value. A nonempty `FilterQuery` owns the
+  ordered predicate list and its comparison mode.
+- The scanner parses each bounded record once and groups predicates by source
+  column. A column passes when it matches at least one Equals or Contains value,
+  if present, and matches none of its Does not equal values. All filtered
+  columns must pass. A missing filtered column rejects the record.
+- The default comparison folds ASCII letters only. **Match case** compares exact
+  bytes. Other bytes are unchanged in either mode.
 - The adaptive filter index owns the complete query, exact match count, and
   bounded checkpoints. Filtered row reads reevaluate the same query from the
   nearest checkpoint instead of retaining every matching row.
 - The CLI keeps `--column`, `--operator`, and `--value` as the first predicate.
-  Repeatable `--and COLUMN contains|equals VALUE` triples add rules.
-- The egui Filters window supports adding and removing AND rules. It keeps
-  filtering and match-only navigation in background workers.
+  Repeatable `--and COLUMN contains|equals|not-equals VALUE` triples add rules;
+  their columns determine the grouped matching behavior.
+- The egui Filters window supports adding and removing rules plus its own
+  **Match case** option. Cell context-menu filters inherit that setting.
+  Filtering and match-only navigation stay in background workers.
 
 ## Environment
 
@@ -147,12 +162,19 @@ All listed gates passed.
 
 ## Limits
 
-- Multiple predicates use AND semantics only.
-- Matching remains literal and case-sensitive, with contains and equality
-  operators.
+- Filter grouping supports alternative Equals and Contains values within one
+  column, all Does not equal exclusions within that column, and AND across
+  filtered columns. Arbitrary nested AND/OR expressions are not supported.
+- Matching is literal and ASCII case-insensitive by default, with exact byte
+  matching available through **Match case**. Regex, wildcard, locale-aware, and
+  full Unicode case folding are not supported.
 - Filter construction remains a sequential full scan.
 - Filtered reads may rescan records between retained match checkpoints.
 - The filter index remains process-local and is not persisted.
-- Streaming filtered export is not part of this validation.
+- The recorded results cover the historical case-sensitive, distinct-column
+  query. They do not separately benchmark same-column alternatives, Does not
+  equal predicates, or ASCII-insensitive matching.
+- Streaming filtered export was not part of this validation; it is covered by
+  the later [filtered-export validation](2026-08-16-filtered-export.md).
 - Peak RSS comes from the process `getrusage` measurement used by the other
   Quarry benchmarks.

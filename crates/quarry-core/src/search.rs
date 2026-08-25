@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use memchr::memmem::Finder;
 use quarry_delimited::RecordScanner;
 
+use crate::case::ByteMatcher;
 use crate::{
-    Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
-    StructuralIndex, parse_source_record,
+    CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError,
+    Session, StructuralIndex, parse_source_record,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,7 @@ impl SearchJob {
         file_size: u64,
         delimiter: u8,
         needle: Vec<u8>,
+        case_sensitivity: CaseSensitivity,
         start: SearchPosition,
         checkpoint: Checkpoint,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
@@ -122,6 +123,7 @@ impl SearchJob {
                     file,
                     delimiter,
                     &needle,
+                    case_sensitivity,
                     start,
                     checkpoint,
                     &cell_edits,
@@ -189,7 +191,29 @@ impl Session {
         needle: Vec<u8>,
         start: SearchPosition,
     ) -> Result<SearchJob, QuarryError> {
-        self.start_search_with_cell_edits(index, needle, start, BTreeMap::new())
+        self.start_search_with_cell_edits_and_case(
+            index,
+            needle,
+            start,
+            BTreeMap::new(),
+            CaseSensitivity::Sensitive,
+        )
+    }
+
+    pub fn start_search_with_case(
+        &self,
+        index: &StructuralIndex,
+        needle: Vec<u8>,
+        start: SearchPosition,
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<SearchJob, QuarryError> {
+        self.start_search_with_cell_edits_and_case(
+            index,
+            needle,
+            start,
+            BTreeMap::new(),
+            case_sensitivity,
+        )
     }
 
     pub fn start_search_with_cell_edits(
@@ -197,7 +221,24 @@ impl Session {
         index: &StructuralIndex,
         needle: Vec<u8>,
         start: SearchPosition,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+    ) -> Result<SearchJob, QuarryError> {
+        self.start_search_with_cell_edits_and_case(
+            index,
+            needle,
+            start,
+            cell_edits,
+            CaseSensitivity::Sensitive,
+        )
+    }
+
+    pub fn start_search_with_cell_edits_and_case(
+        &self,
+        index: &StructuralIndex,
+        needle: Vec<u8>,
+        start: SearchPosition,
         mut cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        case_sensitivity: CaseSensitivity,
     ) -> Result<SearchJob, QuarryError> {
         if needle.is_empty() {
             return Err(QuarryError::InvalidOption("search query must not be empty"));
@@ -218,6 +259,7 @@ impl Session {
             self.file_size,
             self.dialect.delimiter,
             needle,
+            case_sensitivity,
             start,
             checkpoint,
             cell_edits,
@@ -231,13 +273,14 @@ fn run_search(
     mut file: File,
     delimiter: u8,
     needle: &[u8],
+    case_sensitivity: CaseSensitivity,
     start: SearchPosition,
     checkpoint: Checkpoint,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     max_record_bytes: usize,
     shared: &SharedState,
 ) -> Result<SearchOutcome, QuarryError> {
-    let finder = Finder::new(needle);
+    let matcher = ByteMatcher::new(needle, case_sensitivity);
     let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset)?;
     let mut chunk = vec![0; DEFAULT_READ_CHUNK];
     let mut absolute_start = checkpoint.offset;
@@ -265,7 +308,7 @@ fn run_search(
                         });
                     }
                     if let Some(found) = find_record(
-                        &finder,
+                        &matcher,
                         &record,
                         delimiter,
                         row_number,
@@ -300,7 +343,7 @@ fn run_search(
                         });
                     } else {
                         match find_record(
-                            &finder,
+                            &matcher,
                             &record,
                             delimiter,
                             row_number,
@@ -351,7 +394,7 @@ fn run_search(
 }
 
 fn find_record(
-    finder: &Finder<'_>,
+    matcher: &ByteMatcher<'_>,
     record: &[u8],
     delimiter: u8,
     row: u64,
@@ -369,7 +412,7 @@ fn find_record(
             let value = cell_edits
                 .get(&(row, *column))
                 .map_or_else(|| field.as_ref(), Vec::as_slice);
-            finder.find(value).is_some()
+            matcher.find(value).is_some()
         })
         .map(|(column, _)| SearchMatch {
             row,
@@ -392,8 +435,8 @@ mod tests {
         SearchJob, SearchOutcome, SearchPosition, SharedState, WorkerCompletion, run_search,
     };
     use crate::{
-        Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, HeaderMode, IndexConfig,
-        OpenOptions, QuarryError, Session,
+        CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, HeaderMode,
+        IndexConfig, OpenOptions, QuarryError, Session,
     };
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -474,9 +517,28 @@ mod tests {
     }
 
     #[test]
-    fn search_is_case_sensitive_honors_cursor_and_completes_exactly() {
+    fn search_case_mode_honors_cursor_and_completes_exactly() {
         let path = fixture(b"needle,header\nNeedle,needle\nneedle,tail\n");
         let (session, index) = session_and_index(&path, true);
+
+        let insensitive = session
+            .start_search_with_case(
+                &index,
+                b"needle".to_vec(),
+                SearchPosition { row: 0, column: 0 },
+                CaseSensitivity::Insensitive,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            insensitive,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 1,
+                column: 0,
+                ..
+            })
+        ));
 
         let first = session
             .start_search(
@@ -661,6 +723,7 @@ mod tests {
             file,
             b',',
             b"missing",
+            CaseSensitivity::Sensitive,
             SearchPosition { row: 0, column: 0 },
             Checkpoint { row: 0, offset: 0 },
             &BTreeMap::new(),
@@ -710,6 +773,7 @@ mod tests {
             session.file_size,
             session.dialect.delimiter,
             b"missing".to_vec(),
+            CaseSensitivity::Sensitive,
             SearchPosition { row: 0, column: 0 },
             checkpoint,
             BTreeMap::new(),
@@ -732,6 +796,7 @@ mod tests {
                 session.file_size,
                 session.dialect.delimiter,
                 b"missing".to_vec(),
+                CaseSensitivity::Sensitive,
                 SearchPosition { row: 0, column: 0 },
                 checkpoint,
                 BTreeMap::from([((0, 0), vec![b'x'; 9])]),

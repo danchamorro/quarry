@@ -8,13 +8,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    ColumnTransformation, Dialect, FilterExportJob, FilterExportOutcome, FilterExportProgress,
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
-    FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress, LiteralReplacement,
-    MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob,
-    SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
-    Session, SortDirection, SortJob, SortOutcome, SortProgress, SortSpec, SplitAnalysisJob,
-    SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex, estimate_sort_temporary_bytes,
+    CaseSensitivity, ColumnTransformation, Dialect, FilterExportJob, FilterExportOutcome,
+    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
+    FilterProgress, FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress,
+    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome,
+    SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition,
+    SearchProgress, Session, SortDirection, SortJob, SortOutcome, SortProgress, SortSpec,
+    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex,
+    estimate_sort_temporary_bytes,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -838,6 +839,7 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
         LiteralReplacement {
             needle: query.clone(),
             replacement: replacement.clone(),
+            case_sensitivity: CaseSensitivity::Sensitive,
         },
         &destination,
     )?;
@@ -1035,6 +1037,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let spec = SortSpec {
         column: column - 1,
         direction,
+        case_sensitivity: CaseSensitivity::Sensitive,
     };
     let source_size_before = session.file_size;
     let data_rows = source_index

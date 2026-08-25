@@ -35,13 +35,20 @@ Data operations professionals, data engineers, ETL developers, analysts, databas
 Required: local file opening; delimiter detection/override; header selection;
 virtualized grid; navigation; jump-to-row; view-only column
 resize/hide/show/reorder; streaming search; bounded copy of one cell or row;
-one or more AND-combined literal filter predicates; background structural
+one or more literal filter predicates with same-column alternatives and AND
+across filtered columns; background structural
 indexing; safe streaming filtered export to a new file;
 progress/cancellation; parsing metadata; diagnostics and benchmarks.
 
 Column controls operate on stable source-column identities. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
+
+Find/Replace, Filters, and Sort each expose their own **Match case** option.
+Each option is off by default, so its tool compares ASCII letters without
+regard to case. Turning it on uses exact case-sensitive text matching. The
+Filter to This Value and Filter Out This Value cell actions inherit the current
+Filters setting.
 
 Not required: general-purpose text-editor behavior, formulas, charts, database
 connectivity, plugins, cloud sync, collaboration, direct in-place byte
@@ -65,13 +72,14 @@ in ragged rows and invalid UTF-8 cells fail explicitly rather than creating or
 corrupting data.
 Find Next scans the active indexed CSV while treating each sparse data-cell edit
 as that cell's effective value. Replace in Cell changes every non-overlapping
-literal occurrence in the current matched cell and continues searching.
-Replace All applies sparse cell edits first, skips the header, and streams every
-data row through the bounded private rewrite worker. A successful replacement
-reopens as the ordinary unsaved working document; no match, cancellation, or
-failure changes nothing. Filters still require unsaved data-cell edits to be
-saved or discarded. After a materialized operation is reindexed, its working
-CSV becomes the ordinary searchable document. Split replaces one selected
+literal occurrence that matches the Find/Replace case setting in the current
+matched cell and continues searching. Replace All uses that same setting,
+applies sparse cell edits first, skips the header, and streams every data row
+through the bounded private rewrite worker. A successful replacement reopens as
+the ordinary unsaved working document; no match, cancellation, or failure
+changes nothing. Filters still require unsaved data-cell edits to be saved or
+discarded. After a materialized operation is reindexed, its working CSV becomes
+the ordinary searchable document. Split replaces one selected
 column with the fields found by a
 non-empty literal separator. Quarry derives the resulting width from the
 current data plus sparse edits, keeps the original header on the first result,
@@ -152,11 +160,13 @@ measure the production Replace All path directly.
 Phase 6A adds stable single-column text sorting through a disk-aware external
 merge worker. The desktop, core, and validation CLI passed the deterministic
 1 GB and 12 GB release validation. It sorts data rows by exactly one selected
-numbered column as case-sensitive text, ascending or descending. The header
-stays fixed, missing ragged fields compare as empty values, and equal keys keep
-their current row order. With exactly one selected column, **Sort Rows…** opens
-an accessible ascending/descending text-sort dialog with explicit semantics, a
-conservative temporary-disk allowance, Sort, and Cancel. That worker builds
+numbered column as ASCII case-insensitive text by default, ascending or
+descending. The Sort tool's **Match case** option switches to exact
+case-sensitive ordering. The header stays fixed, missing ragged fields compare
+as empty values, and equal keys keep their current row order. With exactly one
+selected column, **Sort Rows…** opens an accessible ascending/descending
+text-sort dialog with explicit semantics, a conservative temporary-disk
+allowance, Sort, and Cancel. That worker builds
 bounded runs, caps merge payload memory, reports a conservative temporary-space
 allowance before starting, and publishes only a complete private sorted CSV.
 The desktop immediately reopens that CSV as Modified and reuses Save, Save As,
@@ -165,8 +175,8 @@ current document unchanged. Exact regressions and deterministic 1 GB and 12 GB
 release runs pass with peak RSS below 20 MiB, measured temporary storage below
 the conservative estimate, bounded effective-record multiset evidence, exact
 stable-tie source-ordinal checks, unchanged source hashes, and prompt
-cancellation without leftovers. Numeric, date, locale-aware, case-insensitive,
-and multi-column sorting remain later slices.
+cancellation without leftovers. Numeric, date, locale-aware, and multi-column
+sorting remain later slices.
 
 ## Version 0.4: desktop packaging and installation
 
