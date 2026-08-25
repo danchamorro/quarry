@@ -92,8 +92,8 @@ rather than a continuous source-row range.
 - Right-click a cell and choose **Copy** to copy its full decoded value,
   including embedded newlines.
 
-A copied row is serialized as tab-separated text in the current displayed
-column order. Copy is limited to 64 MiB.
+A copied row is serialized as tab-separated text in the underlying file-column
+order, including columns hidden in the current view. Copy is limited to 64 MiB.
 
 ### Edit cells and headers
 
@@ -122,7 +122,8 @@ Find and Replace use literal text, not regular expressions.
 1. Enter a value in **Find (literal)**.
 2. Leave **Match case** off to ignore ASCII letter case, or turn it on for an
    exact case match.
-3. Click **Find Next**. Quarry selects and reveals the next matching cell.
+3. Click **Find Next**. Quarry scrolls to and reveals the next matching cell
+   without changing the current selection.
 4. To change that cell, enter text in **Replace with (literal)** and click
    **Replace in Cell**.
 5. To change every match, click **Replace All**.
