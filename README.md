@@ -56,6 +56,17 @@ retains a valid prior build for rollback. See the
 [macOS packaging guide](docs/MACOS_PACKAGING.md) for update, rollback, signing,
 and package-only instructions.
 
+## Quick start
+
+1. Install Quarry, then open a CSV, TSV, pipe-delimited, or semicolon-delimited
+   file from Finder, **Choose…**, drag and drop, or a typed path.
+2. Edit the grid directly. Use **Filters…** to narrow or export rows, and use
+   the numbered column rulers to select columns for reshaping or sorting.
+3. Use **Save** to update the source or **Save As…** to create a separate file.
+
+See the [User guide](docs/USER_GUIDE.md) for navigation, editing, case matching,
+filter rules, column tools, sorting, and safe save behavior.
+
 ## Performance at 12 GB and 50 GB
 
 Quarry uses two complementary benchmark tracks that answer different product
@@ -151,26 +162,6 @@ the adaptive merge optimization and is not a current throughput estimate.
 The production desktop interface uses egui. The data engine remains independent
 of the UI framework and is exercised directly by the benchmark CLI.
 
-## Using Quarry
-
-1. Open a delimited file from Finder, **Choose…**, drag and drop, or a typed
-   path. Select a delimiter or header override only when automatic detection is
-   not right for the file.
-2. Scroll continuously, jump to a one-based data row, page through the file, or
-   horizontally scroll through every shown column.
-3. Double-click a cell or header to edit it. Find/Replace ignores case by
-   default; turn on its **Match case** option for exact matching. Right-click a
-   data cell to Copy, Filter to This Value, or Filter Out This Value. Use
-   Filters to build literal rules and export the matches. The Filters tool also
-   ignores case by default and has its own **Match case** option; the two
-   right-click filter actions inherit that Filters setting. Equals and Contains
-   values in one column are alternatives; every filtered column must match.
-4. Select numbered column headers, then right-click to Split, Combine, Move,
-   Delete, or Sort. Sort ignores case by default and has its own **Match case**
-   option. Completed operations return to the ordinary editable grid.
-5. Use Undo, Redo, or Discard Changes while experimenting. Choose Save to update
-   the guarded source or Save As to publish a separate file.
-
 ## Development
 
 Launch the desktop app directly from Cargo:
@@ -199,6 +190,7 @@ rules, cache declarations, resource measurements, and limitations.
 
 ## Project documents
 
+- [User guide](docs/USER_GUIDE.md)
 - [Product requirements](docs/PRD.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Roadmap](docs/ROADMAP.md)
