@@ -14,8 +14,12 @@ use quarry_delimited::{
     ParseErrorKind, RecordScanner, parse_record, parse_record_with_field_limit,
 };
 
-use crate::filter::{FilterQuery, matching_fields, validate_query};
-use crate::{DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session, SourceStamp};
+use crate::case::ByteMatcher;
+use crate::filter::{FilterQuery, matching_fields, predicate_groups, validate_query};
+use crate::{
+    CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
+    SourceStamp,
+};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -82,6 +86,7 @@ pub struct SaveAsProgress {
 pub struct LiteralReplacement {
     pub needle: Vec<u8>,
     pub replacement: Vec<u8>,
+    pub case_sensitivity: CaseSensitivity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2620,10 +2625,10 @@ fn replace_literal(
     replacement: &LiteralReplacement,
     max_record_bytes: usize,
 ) -> Result<(Vec<u8>, u64), QuarryError> {
-    let finder = Finder::new(&replacement.needle);
+    let matcher = ByteMatcher::new(&replacement.needle, replacement.case_sensitivity);
     let mut count = 0_usize;
     let mut remainder = field;
-    while let Some(position) = finder.find(remainder) {
+    while let Some(position) = matcher.find(remainder) {
         count = count.saturating_add(1);
         remainder = &remainder[position + replacement.needle.len()..];
     }
@@ -2642,7 +2647,7 @@ fn replace_literal(
 
     let mut output = Vec::with_capacity(output_len);
     let mut remainder = field;
-    while let Some(position) = finder.find(remainder) {
+    while let Some(position) = matcher.find(remainder) {
         output.extend_from_slice(&remainder[..position]);
         output.extend_from_slice(&replacement.replacement);
         remainder = &remainder[position + replacement.needle.len()..];
@@ -3058,11 +3063,12 @@ fn scan_export(
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<ScanOutcome, QuarryError> {
-    let finders: Vec<_> = query
+    let matchers: Vec<_> = query
         .predicates
         .iter()
-        .map(|predicate| Finder::new(&predicate.value))
+        .map(|predicate| ByteMatcher::new(&predicate.value, query.case_sensitivity))
         .collect();
+    let groups = predicate_groups(query);
     let mut scanner = RecordScanner::new(delimiter)?;
     let mut chunk = vec![0; config.chunk_bytes];
     let mut absolute_start = 0_u64;
@@ -3089,7 +3095,8 @@ fn scan_export(
                     data_start,
                     delimiter,
                     query,
-                    &finders,
+                    &matchers,
+                    &groups,
                     config.max_record_bytes,
                     output,
                     &mut rows_written,
@@ -3135,7 +3142,8 @@ fn scan_export(
                         data_start,
                         delimiter,
                         query,
-                        &finders,
+                        &matchers,
+                        &groups,
                         config.max_record_bytes,
                         output,
                         &mut rows_written,
@@ -3182,7 +3190,8 @@ fn process_record(
     data_start: u64,
     delimiter: u8,
     query: &FilterQuery,
-    finders: &[Finder<'_>],
+    matchers: &[ByteMatcher<'_>],
+    groups: &[Vec<usize>],
     max_record_bytes: usize,
     output: &mut ExportTarget,
     rows_written: &mut u64,
@@ -3194,7 +3203,7 @@ fn process_record(
         });
     }
     if row_number < data_start
-        || matching_fields(record, delimiter, row_number, query, finders)?.is_some()
+        || matching_fields(record, delimiter, row_number, query, matchers, groups)?.is_some()
     {
         output.write_all(record)?;
         *bytes_written = bytes_written.saturating_add(record.len() as u64);
@@ -3237,7 +3246,8 @@ mod tests {
         SplitAnalysisOutcome, WorkerCompletion, split_field,
     };
     use crate::{
-        FilterOperator, FilterQuery, HeaderMode, IndexConfig, OpenOptions, QuarryError, Session,
+        CaseSensitivity, FilterOperator, FilterQuery, HeaderMode, IndexConfig, OpenOptions,
+        QuarryError, Session,
     };
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -3277,7 +3287,12 @@ mod tests {
     }
 
     fn query() -> FilterQuery {
-        FilterQuery::single(2, FilterOperator::Equals, b"keep".to_vec())
+        FilterQuery::single_with_case(
+            2,
+            FilterOperator::Equals,
+            b"keep".to_vec(),
+            CaseSensitivity::Insensitive,
+        )
     }
 
     fn temporary_exports(destination: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -3544,19 +3559,20 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_applies_sparse_edits_first_skips_headers_and_preserves_ragged_rows() {
-        let source_bytes = b"first,second,third\r\n\"aba aba\",before,tail\r\nnone,\"aba,aba\"\r\n";
-        let expected = b"aba header,second,third\r\nX X,Xba,tail\r\nnone,\"X,X\"\r\n";
+    fn replace_all_ignores_case_applies_edits_first_and_skips_headers() {
+        let source_bytes = b"first,second,third\r\n\"ABA aBa\",before,tail\r\nnone,\"aBA,Aba\"\r\n";
+        let expected = b"aba header,second,third\r\nX X,XbA,tail\r\nnone,\"X,X\"\r\n";
         let source = fixture(source_bytes);
         let source_session = session(&source, b',', HeaderMode::FirstRow);
         let working_path = destination(&source, "replaced-working.csv");
         let job = source_session
             .start_create_replaced_working_copy(
                 BTreeMap::from([(0, b"aba header".to_vec())]),
-                BTreeMap::from([((1, 1), b"ababa".to_vec())]),
+                BTreeMap::from([((1, 1), b"AbAbA".to_vec())]),
                 LiteralReplacement {
                     needle: b"aba".to_vec(),
                     replacement: b"X".to_vec(),
+                    case_sensitivity: CaseSensitivity::Insensitive,
                 },
                 &working_path,
             )
@@ -3591,6 +3607,7 @@ mod tests {
                 LiteralReplacement {
                     needle: b"absent".to_vec(),
                     replacement: b"replacement".to_vec(),
+                    case_sensitivity: CaseSensitivity::Sensitive,
                 },
                 &working_path,
             )
@@ -3624,6 +3641,7 @@ mod tests {
             Some(LiteralReplacement {
                 needle: b"x".to_vec(),
                 replacement: b"12345678".to_vec(),
+                case_sensitivity: CaseSensitivity::Sensitive,
             }),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
@@ -3665,6 +3683,7 @@ mod tests {
             Some(LiteralReplacement {
                 needle: b"hit".to_vec(),
                 replacement: b"matched".to_vec(),
+                case_sensitivity: CaseSensitivity::Sensitive,
             }),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
@@ -5152,9 +5171,9 @@ mod tests {
 
     #[test]
     fn exports_raw_header_and_matching_records_without_changing_the_source() {
-        let source_bytes = b"id;note;kind\r\n1;\"line one\nline \"\"two\"\"\";keep\r\n2;plain;drop\r\n3;\"last;value\";keep";
+        let source_bytes = b"id;note;kind\r\n1;\"line one\nline \"\"two\"\"\";keep\r\n2;plain;drop\r\n3;\"last;value\";KEEP";
         let expected =
-            b"id;note;kind\r\n1;\"line one\nline \"\"two\"\"\";keep\r\n3;\"last;value\";keep";
+            b"id;note;kind\r\n1;\"line one\nline \"\"two\"\"\";keep\r\n3;\"last;value\";KEEP";
         let source = fixture(source_bytes);
         let destination = destination(&source, "filtered.csv");
         let session = session(&source, b';', HeaderMode::FirstRow);

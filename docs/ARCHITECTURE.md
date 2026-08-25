@@ -147,7 +147,15 @@ replacement until cancellation finishes. App shutdown joins active output
 workers so temporary-output cleanup is guaranteed.
 
 ## Search and filtering
-Literal Find Next uses a cancellable core worker after structural indexing. It
+
+Find/Replace, Filters, and Sort each carry an independent case-sensitivity
+setting with their operation input. The unchecked default folds ASCII letters
+for comparison while leaving all other bytes unchanged. **Match case** selects
+raw byte comparison. This preserves byte offsets and invalid UTF-8 handling
+without claiming locale-aware or full Unicode case folding.
+
+Literal Find Next uses the Find/Replace setting in a cancellable core worker
+after structural indexing. It
 starts at the nearest row checkpoint, scans fixed 1 MiB chunks with the shared
 delimited-record scanner, parses one bounded record at a time, substitutes any
 sparse edit for the corresponding existing data cell, and retains only the
@@ -159,9 +167,10 @@ file size or match count.
 
 **Replace in Cell** operates only on the revealed current Find match. It
 replaces every non-overlapping literal occurrence in that cell's effective
-value, records the result in the existing sparse edit map, and starts the next
-search. **Replace All** applies sparse data-cell edits first, skips the header,
-and streams every data record through the existing private rewrite worker. A
+value under the same Find/Replace case setting, records the result in the
+existing sparse edit map, and starts the next search. **Replace All** also uses
+that setting, applies sparse data-cell edits first, skips the header, and
+streams every data record through the existing private rewrite worker. A
 successful run publishes and reindexes a private working CSV, then participates
 in the existing one-level change history. No match, cancellation, record-limit
 failure, or source conflict publishes a result. Exact core and desktop
@@ -172,12 +181,16 @@ overlay, so the viewer requires those edits to be saved or discarded before a
 new filter begins. An active filter must be cleared before editing or using
 Find/Replace. Overlay-aware filtering is not part of Phase 5.
 
-A `FilterQuery` owns one or more `FilterPredicate` values. Each predicate stores
-a source column, a case-sensitive contains, equality, or inequality operator,
-and its literal value. All predicates use AND semantics. The scanner parses each bounded record
-once, then evaluates every predicate against the decoded fields. A missing
-column or any failed predicate rejects that row. `FilterQuery::single` keeps
-single-predicate callers compatible with the same path.
+A `FilterQuery` owns the Filters tool's case setting and one or more
+`FilterPredicate` values. Each predicate stores a source column, a contains,
+equality, or inequality operator, and its literal value. Equals and Contains
+predicates within one source column are alternatives. Does not equal predicates
+within that column all apply, and every filtered source column must match. The
+scanner parses each bounded record once, then evaluates the grouped predicates
+using the query's ASCII-folded or exact comparison mode. A missing filtered
+column rejects that row. `FilterQuery::single` keeps single-predicate callers
+compatible with the same path. Filter to This Value and Filter Out This Value
+construct their query with the current Filters setting.
 
 The sequential worker counts every matching row while retaining only adaptive
 match checkpoints under a fixed budget. When the budget fills, the checkpoint
@@ -209,10 +222,11 @@ publishes the destination. The source path itself is rejected as a destination.
 
 ## Phase 6 sorting
 
-Phase 6A sorts data rows by exactly one selected
-numbered column using stable, case-sensitive text ordering. The header remains
-fixed, missing ragged fields compare as empty values, and equal keys keep their
-current row order.
+Phase 6A sorts data rows by exactly one selected numbered column using stable,
+ASCII case-insensitive text ordering by default. The Sort tool's **Match case**
+setting switches key comparison to raw bytes. The header remains fixed, missing
+ragged fields compare as empty values, and keys equal under the selected mode
+keep their current row order.
 
 The core worker generates 8 MiB in-memory runs, spills owner-only framed run
 files, and uses multipass merging into a private sorted working CSV. Merge

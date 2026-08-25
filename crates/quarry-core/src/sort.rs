@@ -16,8 +16,8 @@ use quarry_delimited::{RecordScanner, parse_record};
 
 use crate::export::{ExportTarget, source_matches_stamp};
 use crate::{
-    DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, FilterExportOutcome, QuarryError, Session,
-    SourceStamp,
+    CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, FilterExportOutcome,
+    QuarryError, Session, SourceStamp,
 };
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -36,6 +36,7 @@ pub enum SortDirection {
 pub struct SortSpec {
     pub column: usize,
     pub direction: SortDirection,
+    pub case_sensitivity: CaseSensitivity,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -810,12 +811,15 @@ impl<'a> InitialRunBuilder<'a> {
                 "cell edit column is out of range",
             ));
         }
-        let key = row_edits
+        let mut key = row_edits
             .iter()
             .find(|(column, _)| *column == self.spec.column)
             .map(|(_, value)| (*value).to_vec())
             .or_else(|| fields.get(self.spec.column).map(|field| field.to_vec()))
             .unwrap_or_default();
+        if self.spec.case_sensitivity == CaseSensitivity::Insensitive {
+            key.make_ascii_lowercase();
+        }
         self.max_key_bytes = self.max_key_bytes.max(key.len());
         let effective_record =
             if row_edits.is_empty() && !(physical_row > 0 && body.starts_with(UTF8_BOM)) {
@@ -1596,12 +1600,12 @@ mod tests {
     }
 
     #[test]
-    fn ascending_multipass_sort_applies_overlays_and_keeps_header_multiline_and_ragged_rows() {
+    fn case_insensitive_multipass_sort_keeps_equal_case_variants_stable() {
         let directory = case();
         let source = directory.join("source.csv");
         let destination = directory.join("sorted.csv");
-        let source_bytes = b"\xEF\xBB\xBFid,note,key\r\n1,\"first\nline\",b\r\n2,\"quoted \"\"value\"\"\",a\r\n3,ragged\r\n4,last,a";
-        let expected = b"\xEF\xBB\xBFID,note,key\r\n3,ragged\r\n1,\"first\nline\",a\r\n2,\"changed,comma\",a\r\n4,last,a";
+        let source_bytes = b"\xEF\xBB\xBFid,note,key\r\n1,\"first\nline\",B\r\n2,\"quoted \"\"value\"\"\",A\r\n3,ragged\r\n4,last,a";
+        let expected = b"\xEF\xBB\xBFID,note,key\r\n3,ragged\r\n1,\"first\nline\",a\r\n2,\"changed,comma\",A\r\n4,last,a";
         fs::write(&source, source_bytes).unwrap();
         let source_session = session(&source, HeaderMode::FirstRow);
         let job = start_custom(
@@ -1611,6 +1615,7 @@ mod tests {
             SortSpec {
                 column: 2,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Insensitive,
             },
             &destination,
             tiny_config(),
@@ -1662,6 +1667,7 @@ mod tests {
             SortSpec {
                 column: 1,
                 direction: SortDirection::Descending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             &destination,
             config,
@@ -1691,6 +1697,7 @@ mod tests {
             SortSpec {
                 column: 1,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             &destination,
             tiny_config(),
@@ -1790,6 +1797,7 @@ mod tests {
             SortSpec {
                 column: 0,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             false,
             SortConfig {
@@ -1828,6 +1836,7 @@ mod tests {
             SortSpec {
                 column: 1,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             false,
             SortConfig {
@@ -1862,6 +1871,7 @@ mod tests {
             SortSpec {
                 column: 1,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             &destination,
             SortConfig {
@@ -1900,6 +1910,7 @@ mod tests {
             SortSpec {
                 column: 0,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             &destination,
             SortConfig {
@@ -1953,6 +1964,7 @@ mod tests {
             SortSpec {
                 column: 1,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             destination.clone(),
             output,
@@ -1997,6 +2009,7 @@ mod tests {
             SortSpec {
                 column: 1,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             &destination,
             tiny_config(),
@@ -2034,6 +2047,7 @@ mod tests {
             SortSpec {
                 column: 1,
                 direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
             },
             &destination,
             SortConfig {

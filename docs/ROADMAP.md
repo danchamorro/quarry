@@ -10,7 +10,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 1 — Prove the core | Complete | Progressive open, correct parsing, bounded indexing, live navigation, cancellation, and the measured [no-cache decision](adr/0002-defer-viewport-cache.md) |
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
-| Phase 4: Filters and export | Complete | Bounded single and multiple AND-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
+| Phase 4: Filters and export | Complete | Bounded single and grouped multi-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
 | Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover selected-column Move/Delete, overlay-aware Find Next, and Replace in Cell; production Replace All is measured directly at [12 GB](benchmarks/2026-08-22-12gb-replace-all.md) and [50 GB](benchmarks/2026-08-22-50gb-capability-suite.md) |
 | Phase 6: Sorting | Complete | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md); the current engine also passed the optimized [117-million-row `FIRSTNAME` sort](benchmarks/2026-08-23-12gb-sort-performance.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup |
 | Phase 7: Hardening | In progress | Phase 7A packaging and installation are complete in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); Phase 7B workflow polish and feature-gap review are underway |
@@ -77,8 +77,9 @@ pacing becomes measurable with the viewer-alpha grid.
   [live-index latency result](benchmarks/2026-08-15-live-index-latency.md).
 - [x] Expose file size, column count, delimiter/header mode, indexed rows,
   first-row time, and viewport latency in the viewer status area.
-- [x] Add literal, case-sensitive Find Next over decoded cells with background
-  progress, cancellation, same-query resume, and direct row-and-column reveal.
+- [x] Add literal Find Next over decoded cells with case-insensitive matching by
+  default, a per-tool **Match case** option, background progress, cancellation,
+  same-query resume, and direct row-and-column reveal.
 - [x] Record quoted/multiline correctness on a deterministic fixture, plus
   complete-scan throughput, cancellation, and measured peak RSS on the
   deterministic 1 GB and 12 GB datasets in the
@@ -142,12 +143,17 @@ controls, jump-to-row, streaming search, copy, status, diagnostics.
 **Exit:** Quarry is genuinely useful for inspecting huge files.
 
 ## Phase 4 — Filters and export
-Contains, equality, and inequality filters, multiple AND predicates, incremental results, filtered navigation, streaming export, progress/cancellation.
+Contains, equality, and inequality filters, same-column alternatives, AND
+across filtered columns, case-insensitive matching by default with a per-tool
+**Match case** option, incremental results, filtered navigation, streaming
+export, progress/cancellation.
 
 ### Phase 4 checklist
 
-- [x] Add literal, case-sensitive contains, equality, and inequality predicates over one
-  selected source column.
+- [x] Add literal contains, equality, and inequality predicates over one
+  selected source column with case-insensitive matching by default and a
+  per-tool **Match case** option. Make cell-context filter actions inherit that
+  Filters setting.
 - [x] Build an adaptive match index with a fixed memory budget, background
   progress, prompt cancellation, and joined worker lifecycle.
 - [x] Serve bounded filtered row ranges from the nearest match checkpoint in a
@@ -157,9 +163,10 @@ Contains, equality, and inequality filters, multiple AND predicates, incremental
   deterministic regressions.
 - [x] Record complete-scan throughput, cancellation, bounded index memory, and
   peak RSS on the deterministic 1 GB and 12 GB datasets.
-- [x] Combine multiple predicates with AND semantics, parse each row once, keep
-  the adaptive index bounded, preserve single-predicate compatibility, and
-  record 1 GB and 12 GB evidence in the
+- [x] Combine multiple predicates with same-column include alternatives, all
+  same-column exclusions, and AND across filtered columns; parse each row once,
+  keep the adaptive index bounded, preserve single-predicate compatibility,
+  and record 1 GB and 12 GB evidence in the
   [multiple-predicate filter validation](benchmarks/2026-08-16-multiple-predicate-filter.md).
 - [x] Stream filtered rows to a new output file with progress, cancellation,
   source-file safety, exact output validation, and bounded 1 GB and 12 GB RSS
@@ -243,11 +250,12 @@ review after the current interactions are coherent.
   source values during matching. Add **Replace in Cell** for the current match
   and a bounded, cancellable **Replace All** that applies sparse edits first,
   skips the header, materializes a private working CSV, and participates in
-  Save, Save As, Discard, and one-level Undo/Redo. Replace All reuses the
-  private rewrite worker measured by the 1 GB and 12 GB persistence
-  validations; exact core and desktop regressions cover overlay-first
-  semantics, non-overlapping replacement, no-match, record limits,
-  cancellation, cleanup, accessibility, and change history.
+  Save, Save As, Discard, and one-level Undo/Redo. Find/Replace is
+  case-insensitive by default and exposes its own **Match case** option.
+  Replace All reuses the private rewrite worker measured by the 1 GB and 12 GB
+  persistence validations; exact core and desktop regressions cover
+  overlay-first semantics, non-overlapping replacement, no-match, record
+  limits, cancellation, cleanup, accessibility, and change history.
 
 The Columns manager remains view-only and does not mark the document changed.
 Move and Delete are explicit and separate from that view arrangement. Hidden
@@ -262,15 +270,17 @@ and Save As never expose a partial or corrupted file.
 ## Phase 6 — Sorting
 
 Phase 6 is complete. Phase 6A lets users select exactly one numbered
-column and apply a stable ascending or descending, case-sensitive text sort to
-data rows while keeping the header fixed. Missing ragged fields compare as
-empty values, and equal keys retain their current row order. The implementation
+column and apply a stable ascending or descending text sort to data rows. Sort
+is case-insensitive by default and exposes its own **Match case** option. The
+header stays fixed, missing ragged fields compare as empty values, and keys
+equal under the selected mode retain their current row order. The implementation
 and deterministic 1 GB and 12 GB release evidence pass.
 
 ### Phase 6A checklist
 
 - [x] Add an accessible **Sort Rows…** action with one selected column, order,
-  explicit text semantics, a temporary-disk estimate, Sort, and Cancel.
+  explicit text and case semantics, a per-tool **Match case** option, a
+  temporary-disk estimate, Sort, and Cancel.
 - [x] Generate bounded in-memory runs, spill owner-only framed run files, and
   merge them with bounded fan-in into a private sorted working CSV.
 - [x] Apply current sparse edits before key comparison and output, then reopen

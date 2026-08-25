@@ -1,3 +1,4 @@
+mod case;
 mod export;
 mod filter;
 mod index;
@@ -15,6 +16,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+pub use case::CaseSensitivity;
 pub use export::{
     ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress,
     FilterExportSummary, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob,

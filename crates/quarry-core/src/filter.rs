@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use memchr::memmem::Finder;
 use quarry_delimited::RecordScanner;
 
+use crate::case::ByteMatcher;
 use crate::{
-    DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session, parse_source_record,
+    CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
+    parse_source_record,
 };
 
 const DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES: usize = 16 * 1024 * 1024;
@@ -58,16 +59,27 @@ pub struct FilterPredicate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterQuery {
     pub predicates: Vec<FilterPredicate>,
+    pub case_sensitivity: CaseSensitivity,
 }
 
 impl FilterQuery {
     pub fn single(column: usize, operator: FilterOperator, value: Vec<u8>) -> Self {
+        Self::single_with_case(column, operator, value, CaseSensitivity::Sensitive)
+    }
+
+    pub fn single_with_case(
+        column: usize,
+        operator: FilterOperator,
+        value: Vec<u8>,
+        case_sensitivity: CaseSensitivity,
+    ) -> Self {
         Self {
             predicates: vec![FilterPredicate {
                 column,
                 operator,
                 value,
             }],
+            case_sensitivity,
         }
     }
 }
@@ -535,29 +547,60 @@ pub(crate) fn validate_query(query: &FilterQuery) -> Result<(), QuarryError> {
     Ok(())
 }
 
+pub(crate) fn predicate_groups(query: &FilterQuery) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (index, predicate) in query.predicates.iter().enumerate() {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| query.predicates[group[0]].column == predicate.column)
+        {
+            group.push(index);
+        } else {
+            groups.push(vec![index]);
+        }
+    }
+    groups
+}
+
 pub(crate) fn matching_fields<'a>(
     record: &'a [u8],
     delimiter: u8,
     physical_row: u64,
     query: &FilterQuery,
-    finders: &[Finder<'_>],
+    matchers: &[ByteMatcher<'_>],
+    groups: &[Vec<usize>],
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
     let fields = parse_source_record(record, delimiter, physical_row)?;
-    debug_assert_eq!(query.predicates.len(), finders.len());
-    let matches = query
-        .predicates
-        .iter()
-        .zip(finders)
-        .all(|(predicate, finder)| {
-            let Some(field) = fields.get(predicate.column) else {
-                return false;
-            };
+    debug_assert_eq!(query.predicates.len(), matchers.len());
+    let matches = groups.iter().all(|group| {
+        let Some(&first) = group.first() else {
+            return true;
+        };
+        let Some(field) = fields.get(query.predicates[first].column) else {
+            return false;
+        };
+        let field: &[u8] = field.as_ref();
+        let mut has_inclusion = false;
+        let mut inclusion_matches = false;
+        for &index in group {
+            let predicate = &query.predicates[index];
             match predicate.operator {
-                FilterOperator::Contains => finder.find(field.as_ref()).is_some(),
-                FilterOperator::Equals => field.as_ref() == predicate.value.as_slice(),
-                FilterOperator::NotEquals => field.as_ref() != predicate.value.as_slice(),
+                FilterOperator::Contains => {
+                    has_inclusion = true;
+                    inclusion_matches |= matchers[index].find(field).is_some();
+                }
+                FilterOperator::Equals => {
+                    has_inclusion = true;
+                    inclusion_matches |= matchers[index].equals(field);
+                }
+                FilterOperator::NotEquals if matchers[index].equals(field) => {
+                    return false;
+                }
+                FilterOperator::NotEquals => {}
             }
-        });
+        }
+        !has_inclusion || inclusion_matches
+    });
     Ok(matches.then_some(fields))
 }
 
@@ -585,11 +628,12 @@ fn run_filter(
     max_record_bytes: usize,
     shared: &SharedState,
 ) -> Result<(), QuarryError> {
-    let finders: Vec<_> = query
+    let matchers: Vec<_> = query
         .predicates
         .iter()
-        .map(|predicate| Finder::new(&predicate.value))
+        .map(|predicate| ByteMatcher::new(&predicate.value, query.case_sensitivity))
         .collect();
+    let groups = predicate_groups(query);
     let mut scanner = RecordScanner::new(delimiter)?;
     let mut chunk = vec![0; chunk_bytes];
     let mut absolute_start = 0_u64;
@@ -618,7 +662,9 @@ fn run_filter(
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, row_number, query, &finders) {
+                        match matching_fields(
+                            &record, delimiter, row_number, query, &matchers, &groups,
+                        ) {
                             Ok(Some(_)) => pending_matches.push((row_number, record_start)),
                             Ok(None) => {}
                             Err(error) => deferred_error = Some(error),
@@ -663,7 +709,9 @@ fn run_filter(
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, row_number, query, &finders) {
+                        match matching_fields(
+                            &record, delimiter, row_number, query, &matchers, &groups,
+                        ) {
                             Ok(Some(_)) => {
                                 pending_matches.push((row_number, record_start));
                                 if pending_matches.len() == MATCH_PUBLISH_BATCH {
@@ -806,12 +854,13 @@ fn run_filtered_read(
     config: FilterReadConfig,
     shared: Option<&FilterReadSharedState>,
 ) -> Result<FilterReadOutcome, QuarryError> {
-    let finders: Vec<_> = plan
+    let matchers: Vec<_> = plan
         .query
         .predicates
         .iter()
-        .map(|predicate| Finder::new(&predicate.value))
+        .map(|predicate| ByteMatcher::new(&predicate.value, plan.query.case_sensitivity))
         .collect();
+    let groups = predicate_groups(&plan.query);
     let mut scanner = RecordScanner::at_offset(delimiter, plan.checkpoint.offset)?;
     let mut chunk = vec![0; config.chunk_bytes];
     let mut absolute_start = plan.checkpoint.offset;
@@ -839,9 +888,14 @@ fn run_filtered_read(
                         limit: config.max_record_bytes,
                     });
                 }
-                if let Some(fields) =
-                    matching_fields(&record, delimiter, row_number, &plan.query, &finders)?
-                    && match_ordinal >= plan.start_match
+                if let Some(fields) = matching_fields(
+                    &record,
+                    delimiter,
+                    row_number,
+                    &plan.query,
+                    &matchers,
+                    &groups,
+                )? && match_ordinal >= plan.start_match
                 {
                     rows.push(FilterMatch {
                         match_ordinal,
@@ -874,8 +928,14 @@ fn run_filtered_read(
                             limit: config.max_record_bytes,
                         });
                     } else {
-                        match matching_fields(&record, delimiter, row_number, &plan.query, &finders)
-                        {
+                        match matching_fields(
+                            &record,
+                            delimiter,
+                            row_number,
+                            &plan.query,
+                            &matchers,
+                            &groups,
+                        ) {
                             Ok(Some(fields)) => {
                                 if match_ordinal >= plan.start_match {
                                     rows.push(FilterMatch {
@@ -937,7 +997,7 @@ mod tests {
         FilterReadOutcome, FilterReadSharedState, FilterScanConfig, SharedState, WorkerCompletion,
         prepare_filtered_read,
     };
-    use crate::{HeaderMode, OpenOptions, QuarryError, Session};
+    use crate::{CaseSensitivity, HeaderMode, OpenOptions, QuarryError, Session};
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1083,12 +1143,14 @@ mod tests {
                         value: Vec::new(),
                     },
                 ],
+                case_sensitivity: CaseSensitivity::Sensitive,
             }),
             Err(QuarryError::InvalidOption(_))
         ));
         assert!(matches!(
             session.start_filter(FilterQuery {
                 predicates: Vec::new(),
+                case_sensitivity: CaseSensitivity::Sensitive,
             }),
             Err(QuarryError::InvalidOption(_))
         ));
@@ -1135,6 +1197,7 @@ mod tests {
                     value: b"line one\nline two".to_vec(),
                 },
             ],
+            case_sensitivity: CaseSensitivity::Sensitive,
         };
 
         let index = session.start_filter(query.clone()).unwrap().wait().unwrap();
@@ -1150,6 +1213,104 @@ mod tests {
                 (1, b"1".as_slice(), b"line one\nline two".as_slice()),
                 (4, b"4".as_slice(), b"line one\nline two".as_slice()),
             ]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn same_column_inclusions_are_alternatives_and_exclusions_accumulate() {
+        let path = fixture(
+            b"id,state,status\n1,TX,active\n2,FL,active\n3,CA,active\n4,TX,inactive\n5,FL,inactive\n6,,active\n7\n",
+        );
+        let session = session(&path, HeaderMode::FirstRow);
+        let state = |operator, value: &[u8]| FilterPredicate {
+            column: 1,
+            operator,
+            value: value.to_vec(),
+        };
+        let matching_ids = |predicates| {
+            let index = session
+                .start_filter(FilterQuery {
+                    predicates,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                })
+                .unwrap()
+                .wait()
+                .unwrap();
+            session
+                .read_filtered_rows(&index, 0, usize::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.fields[0].clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            matching_ids(vec![
+                state(FilterOperator::Equals, b"TX"),
+                state(FilterOperator::Equals, b"FL"),
+                FilterPredicate {
+                    column: 2,
+                    operator: FilterOperator::Equals,
+                    value: b"active".to_vec(),
+                },
+            ]),
+            [b"1".to_vec(), b"2".to_vec()]
+        );
+        assert_eq!(
+            matching_ids(vec![
+                state(FilterOperator::NotEquals, b"TX"),
+                state(FilterOperator::NotEquals, b"FL"),
+            ]),
+            [b"3".to_vec(), b"6".to_vec()]
+        );
+        assert_eq!(
+            matching_ids(vec![
+                state(FilterOperator::Equals, b"TX"),
+                state(FilterOperator::Equals, b"FL"),
+                state(FilterOperator::NotEquals, b"FL"),
+            ]),
+            [b"1".to_vec(), b"4".to_vec()]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn case_insensitive_filter_applies_to_contains_equals_and_exclusions() {
+        let path = fixture(b"id,state\n1,TX\n2,tx\n3,Fl\n4,cA\n5,NY\n");
+        let session = session(&path, HeaderMode::FirstRow);
+        let query = FilterQuery {
+            predicates: vec![
+                FilterPredicate {
+                    column: 1,
+                    operator: FilterOperator::Equals,
+                    value: b"TX".to_vec(),
+                },
+                FilterPredicate {
+                    column: 1,
+                    operator: FilterOperator::Contains,
+                    value: b"fl".to_vec(),
+                },
+                FilterPredicate {
+                    column: 1,
+                    operator: FilterOperator::NotEquals,
+                    value: b"ca".to_vec(),
+                },
+            ],
+            case_sensitivity: CaseSensitivity::Insensitive,
+        };
+
+        let index = session.start_filter(query.clone()).unwrap().wait().unwrap();
+        assert_eq!(index.query(), &query);
+        assert_eq!(index.matches_found(), 3);
+        assert_eq!(
+            session
+                .read_filtered_rows(&index, 0, usize::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.fields[0].clone())
+                .collect::<Vec<_>>(),
+            [b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]
         );
         fs::remove_file(path).unwrap();
     }
