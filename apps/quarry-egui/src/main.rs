@@ -39,7 +39,7 @@ use quarry_core::{
 use tempfile::TempDir;
 
 const BOOTSTRAP_ROWS: usize = 40;
-const OVERSCAN_ROWS: usize = 2;
+const OVERSCAN_ROWS: usize = 16;
 const ROW_HEIGHT: f32 = 17.0;
 const COLUMN_RULER_HEIGHT: f32 = 22.0;
 const HEADER_HEIGHT: f32 = COLUMN_RULER_HEIGHT + ROW_HEIGHT;
@@ -54,6 +54,7 @@ const STATUS_BAR_HEIGHT: f32 = 32.0;
 const STATUS_JOB_WIDTH: f32 = 360.0;
 const STATUS_CANCEL_WIDTH: f32 = 112.0;
 const DOCUMENT_MENU_WIDTH: f32 = 260.0;
+const FORMAT_MENU_WIDTH: f32 = 240.0;
 const JUMP_INPUT_ID: &str = "quarry-jump-input";
 const FIND_INPUT_ID: &str = "quarry-find-input";
 const REPLACE_INPUT_ID: &str = "quarry-replace-input";
@@ -267,6 +268,7 @@ struct QuarryApp {
     filters_open: bool,
     delimiter_mode: DelimiterMode,
     header_mode: HeaderMode,
+    format_draft: Option<(DelimiterMode, HeaderMode)>,
     document: Option<Document>,
     notice: Option<String>,
     footer_status: Option<String>,
@@ -381,6 +383,7 @@ impl QuarryApp {
             filters_open: false,
             delimiter_mode: DelimiterMode::Auto,
             header_mode: HeaderMode::Auto,
+            format_draft: None,
             document: None,
             notice: None,
             footer_status: None,
@@ -397,6 +400,7 @@ impl QuarryApp {
         app
     }
 
+    #[cfg(test)]
     fn open_options(&self) -> OpenOptions {
         OpenOptions {
             delimiter: self.delimiter_mode.delimiter(),
@@ -405,8 +409,16 @@ impl QuarryApp {
         }
     }
 
+    #[cfg(test)]
     fn open_path(&mut self, path: PathBuf) -> Result<(), String> {
         self.open_path_with_options(path, self.open_options())
+    }
+
+    fn open_new_path(&mut self, path: PathBuf) -> Result<(), String> {
+        self.open_path_with_options(path, OpenOptions::default())?;
+        self.delimiter_mode = DelimiterMode::Auto;
+        self.header_mode = HeaderMode::Auto;
+        Ok(())
     }
 
     fn open_path_with_options(
@@ -457,13 +469,14 @@ impl QuarryApp {
         self.structural_dialog = None;
         self.filter_rules = vec![FilterRuleDraft::default()];
         self.filters_open = false;
+        self.format_draft = None;
         self.document = Some(document);
         self.footer_status = None;
         Ok(())
     }
 
     fn open_path_and_report(&mut self, path: PathBuf) {
-        let result = self.open_path(path);
+        let result = self.open_new_path(path);
         self.notice = result.err();
     }
 
@@ -594,7 +607,8 @@ impl QuarryApp {
         }
     }
 
-    fn reopen_document(&mut self) {
+    fn reopen_document(&mut self, delimiter_mode: DelimiterMode, header_mode: HeaderMode) {
+        self.format_draft = None;
         let Some(path) = self
             .document
             .as_ref()
@@ -603,7 +617,19 @@ impl QuarryApp {
             self.notice = Some("Open a file first.".into());
             return;
         };
-        self.open_path_and_report(path);
+        let result = self.open_path_with_options(
+            path,
+            OpenOptions {
+                delimiter: delimiter_mode.delimiter(),
+                header_mode,
+                ..OpenOptions::default()
+            },
+        );
+        if result.is_ok() {
+            self.delimiter_mode = delimiter_mode;
+            self.header_mode = header_mode;
+        }
+        self.notice = result.err();
     }
 
     fn reload_document(&mut self) {
@@ -628,7 +654,7 @@ impl QuarryApp {
             return;
         };
         let ignored = count.saturating_sub(1);
-        let result = self.open_path(path);
+        let result = self.open_new_path(path);
         self.notice = match (result, ignored) {
             (Ok(()), 0) => None,
             (Ok(()), ignored) => Some(format!(
@@ -659,7 +685,9 @@ impl QuarryApp {
         }
         match action {
             Action::Choose => return self.choose_file(),
-            Action::Reopen => return self.reopen_document(),
+            Action::ReopenWithFormat(delimiter, header) => {
+                return self.reopen_document(delimiter, header);
+            }
             Action::ReloadFromDisk => return self.reload_document(),
             Action::ChooseSaveAs => {
                 self.choose_save_as();
@@ -736,7 +764,7 @@ impl QuarryApp {
         }
         let result = match action {
             Action::Choose
-            | Action::Reopen
+            | Action::ReopenWithFormat(_, _)
             | Action::ReloadFromDisk
             | Action::Save
             | Action::ChooseSaveAs
@@ -980,6 +1008,7 @@ impl QuarryApp {
         }
         current.shutdown();
         self.document = Some(replacement);
+        self.format_draft = None;
         self.columns_open = false;
         self.structural_dialog = None;
         self.notice = None;
@@ -1381,60 +1410,14 @@ impl eframe::App for QuarryApp {
                     if let Some(document_action) = document_menu(ui, self.document.as_ref()) {
                         action = Some(document_action);
                     }
-                });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    let delimiter_label = ui.label("Delimiter");
-                    let _ = egui::ComboBox::from_id_salt("quarry-delimiter-mode")
-                        .selected_text(self.delimiter_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in DelimiterMode::ALL {
-                                ui.selectable_value(&mut self.delimiter_mode, mode, mode.label());
-                            }
-                        })
-                        .response
-                        .labelled_by(delimiter_label.id);
-
-                    let header_label = ui.label("Header");
-                    let _ = egui::ComboBox::from_id_salt("quarry-header-mode")
-                        .selected_text(header_mode_label(self.header_mode))
-                        .show_ui(ui, |ui| {
-                            for mode in
-                                [HeaderMode::Auto, HeaderMode::FirstRow, HeaderMode::NoHeader]
-                            {
-                                ui.selectable_value(
-                                    &mut self.header_mode,
-                                    mode,
-                                    header_mode_label(mode),
-                                );
-                            }
-                        })
-                        .response
-                        .labelled_by(header_label.id);
-
-                    if ui
-                        .add_enabled(
-                            self.document.is_some()
-                                && !self.document.as_ref().is_some_and(Document::is_dirty)
-                                && self
-                                    .document
-                                    .as_ref()
-                                    .is_none_or(|document| {
-                                        document.export_job.is_none()
-                                            && document.structural_job.is_none()
-                                    }),
-                            egui::Button::new("Apply / Reopen"),
-                        )
-                        .on_disabled_hover_text(
-                            if self.document.as_ref().is_some_and(Document::is_dirty) {
-                                "Discard or save your changes before reopening the file."
-                            } else {
-                                "Cancel the active export and wait for it to finish first."
-                            },
-                        )
-                        .clicked()
-                    {
-                        action = Some(Action::Reopen);
+                    if let Some(format_action) = format_menu(
+                        ui,
+                        self.document.as_ref(),
+                        self.delimiter_mode,
+                        self.header_mode,
+                        &mut self.format_draft,
+                    ) {
+                        action = Some(format_action);
                     }
                 });
 
@@ -1786,7 +1769,7 @@ impl eframe::App for QuarryApp {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DelimiterMode {
     Auto,
     Comma,
@@ -1833,10 +1816,28 @@ fn header_mode_label(mode: HeaderMode) -> &'static str {
     }
 }
 
+fn compact_header_mode_label(mode: HeaderMode) -> &'static str {
+    match mode {
+        HeaderMode::Auto => "Auto",
+        HeaderMode::FirstRow => "Header row",
+        HeaderMode::NoHeader => "No header",
+    }
+}
+
+fn detected_delimiter_label(delimiter: u8) -> &'static str {
+    match delimiter {
+        b',' => "Comma",
+        b'\t' => "Tab",
+        b'|' => "Pipe",
+        b';' => "Semicolon",
+        _ => "Custom",
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Choose,
-    Reopen,
+    ReopenWithFormat(DelimiterMode, HeaderMode),
     ReloadFromDisk,
     Save,
     PageUp,
@@ -2199,6 +2200,174 @@ fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) 
     action
 }
 
+fn menu_button_with_arrow(
+    ui: &mut egui::Ui,
+    arrow_salt: &'static str,
+    button: egui::Button<'_>,
+    width: f32,
+) -> egui::Response {
+    let arrow_id = ui.id().with(arrow_salt);
+    let button = button
+        .right_text(egui::Atom::custom(arrow_id, egui::vec2(10.0, 10.0)))
+        .min_size(egui::vec2(width, 24.0))
+        .truncate();
+    let direction = ui.layout().main_dir();
+    let rendered = ui
+        .allocate_ui_with_layout(
+            egui::vec2(width, 24.0),
+            Layout::centered_and_justified(direction),
+            |ui| button.atom_ui(ui),
+        )
+        .inner;
+    if let Some(rect) = rendered.rect(arrow_id) {
+        let mut arrow = rendered.response.clone();
+        arrow.rect = rect;
+        egui::collapsing_header::paint_default_icon(ui, 1.0, &arrow);
+    }
+    rendered.response
+}
+
+fn format_menu(
+    ui: &mut egui::Ui,
+    document: Option<&Document>,
+    applied_delimiter: DelimiterMode,
+    applied_header: HeaderMode,
+    draft: &mut Option<(DelimiterMode, HeaderMode)>,
+) -> Option<Action> {
+    let document_open = document.is_some();
+    let label = if document_open {
+        format!(
+            "Format: {} · {}",
+            applied_delimiter.label(),
+            compact_header_mode_label(applied_header)
+        )
+    } else {
+        "Format".to_owned()
+    };
+    let response = ui
+        .add_enabled_ui(document_open, |ui| {
+            menu_button_with_arrow(
+                ui,
+                "format-menu-arrow",
+                egui::Button::new(RichText::new(label.clone()).atom_shrink(true)),
+                FORMAT_MENU_WIDTH,
+            )
+        })
+        .inner
+        .on_disabled_hover_text("Open a file first.");
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            document_open,
+            label.replace(" · ", ", "),
+        )
+    });
+    if let Some(document) = document {
+        let dialect = document.session.dialect;
+        let description = format!(
+            "Applied {}, {}. Detected {}, {}.",
+            applied_delimiter.label(),
+            compact_header_mode_label(applied_header),
+            detected_delimiter_label(dialect.delimiter),
+            if dialect.has_header {
+                "Header row"
+            } else {
+                "No header"
+            }
+        );
+        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_description(description);
+        });
+    }
+    let mut popup_open = draft.is_some();
+    if response.clicked() {
+        popup_open = !popup_open;
+        *draft = popup_open.then_some((applied_delimiter, applied_header));
+    }
+
+    let mut discard_draft = false;
+    let menu = egui::Popup::menu(&response)
+        .open_bool(&mut popup_open)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(340.0);
+            let dialect = document
+                .expect("disabled Format control cannot open")
+                .session
+                .dialect;
+            ui.label(format!(
+                "Applied: {} · {}",
+                applied_delimiter.label(),
+                compact_header_mode_label(applied_header)
+            ));
+            ui.label(format!(
+                "Detected: {} · {}",
+                detected_delimiter_label(dialect.delimiter),
+                if dialect.has_header {
+                    "Header row"
+                } else {
+                    "No header"
+                }
+            ));
+            ui.separator();
+
+            let (draft_delimiter, draft_header) =
+                draft.get_or_insert((applied_delimiter, applied_header));
+            ui.label("Delimiter");
+            ui.horizontal_wrapped(|ui| {
+                for mode in DelimiterMode::ALL {
+                    ui.radio_value(draft_delimiter, mode, mode.label());
+                }
+            });
+            ui.add_space(4.0);
+            ui.label("Header");
+            ui.horizontal_wrapped(|ui| {
+                for mode in [HeaderMode::Auto, HeaderMode::FirstRow, HeaderMode::NoHeader] {
+                    ui.radio_value(draft_header, mode, header_mode_label(mode));
+                }
+            });
+            ui.separator();
+
+            let selected = (*draft_delimiter, *draft_header);
+            let changed = selected != (applied_delimiter, applied_header);
+            let dirty = document.is_some_and(Document::is_dirty);
+            let operation_active = document.is_some_and(|document| {
+                document.save_job.is_some()
+                    || document.export_job.is_some()
+                    || document.structural_job.is_some()
+            });
+            let mut action = None;
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    discard_draft = true;
+                    ui.close();
+                }
+                let reopen = ui
+                    .add_enabled(
+                        changed && !dirty && !operation_active,
+                        egui::Button::new("Reopen with Changes"),
+                    )
+                    .on_disabled_hover_text(if !changed {
+                        "Choose a different delimiter or header mode first."
+                    } else if dirty {
+                        "Discard or save your changes before reopening the file."
+                    } else {
+                        "Cancel the active file operation and wait for it to finish first."
+                    });
+                if reopen.clicked() {
+                    action = Some(Action::ReopenWithFormat(selected.0, selected.1));
+                    discard_draft = true;
+                    ui.close();
+                }
+            });
+            action
+        });
+    if !popup_open || menu.is_none() || discard_draft {
+        *draft = None;
+    }
+    menu.and_then(|inner| inner.inner)
+}
+
 fn document_menu(ui: &mut egui::Ui, document: Option<&Document>) -> Option<Action> {
     let document_open = document.is_some();
     let dirty = document.is_some_and(Document::is_dirty);
@@ -2228,25 +2397,12 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>) -> Option<Actio
     } else {
         Color32::TRANSPARENT
     });
-    let arrow_id = ui.id().with("document-menu-arrow");
-    let button = egui::Button::new((marker, RichText::new(filename.clone()).atom_shrink(true)))
-        .right_text(egui::Atom::custom(arrow_id, egui::vec2(10.0, 10.0)))
-        .min_size(egui::vec2(DOCUMENT_MENU_WIDTH, 24.0))
-        .truncate();
-    let direction = ui.layout().main_dir();
-    let rendered = ui
-        .allocate_ui_with_layout(
-            egui::vec2(DOCUMENT_MENU_WIDTH, 24.0),
-            Layout::centered_and_justified(direction),
-            |ui| button.atom_ui(ui),
-        )
-        .inner;
-    if let Some(rect) = rendered.rect(arrow_id) {
-        let mut arrow = rendered.response.clone();
-        arrow.rect = rect;
-        egui::collapsing_header::paint_default_icon(ui, 1.0, &arrow);
-    }
-    let response = rendered.response;
+    let response = menu_button_with_arrow(
+        ui,
+        "document-menu-arrow",
+        egui::Button::new((marker, RichText::new(filename.clone()).atom_shrink(true))),
+        DOCUMENT_MENU_WIDTH,
+    );
     let menu = egui::Popup::menu(&response).show(|ui| {
         ui.set_min_width(190.0);
         let mut action = None;
@@ -7576,6 +7732,180 @@ mod tests {
         app.document.as_mut().unwrap().shutdown();
     }
 
+    #[test]
+    fn format_menu_is_accessible_and_cancel_discards_its_draft() {
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let (_, format) = accessible_button(&output, "Format");
+        assert!(format.is_disabled());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("format-menu.csv");
+        fs::write(&path, b"name,value\nfirst,1\n").unwrap();
+        app.open_new_path(path).unwrap();
+
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let (format_id, format) = accessible_button(&output, "Format: Auto, Auto");
+        assert!(!format.is_disabled());
+        let bounds = format.bounds().expect("Format menu should have bounds");
+        assert!(bounds.x1 - bounds.x0 <= super::FORMAT_MENU_WIDTH as f64 + 1.0);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: format_id,
+                        data: None,
+                    },
+                )],
+                ..grid_input_with_width(860.0)
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("open Format menu should be accessible");
+        assert_eq!(
+            accessible_button(&output, "Format: Auto, Auto")
+                .1
+                .description(),
+            Some("Applied Auto, Auto. Detected Comma, Header row.")
+        );
+        assert!(
+            accessible_button(&output, "Reopen with Changes")
+                .1
+                .is_disabled()
+        );
+
+        let tab_position = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label() == Some("Tab") && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .and_then(|(_, node)| node.bounds())
+            .map(|bounds| {
+                egui::pos2(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                )
+            })
+            .expect("Tab should be an accessible format choice");
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(tab_position),
+                    egui::Event::PointerButton {
+                        pos: tab_position,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: tab_position,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..grid_input_with_width(860.0)
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert_eq!(
+            app.format_draft,
+            Some((DelimiterMode::Tab, HeaderMode::Auto))
+        );
+        assert!(
+            !accessible_button(&output, "Reopen with Changes")
+                .1
+                .is_disabled()
+        );
+
+        let reopen = accessible_button(&output, "Reopen with Changes").0;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: reopen,
+                        data: None,
+                    },
+                )],
+                ..grid_input_with_width(860.0)
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        assert_eq!(app.format_draft, None);
+        assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
+        assert_eq!(app.header_mode, HeaderMode::Auto);
+
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let (format_id, _) = accessible_button(&output, "Format: Tab, Auto");
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: format_id,
+                        data: None,
+                    },
+                )],
+                ..grid_input_with_width(860.0)
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let cancel = accessible_button(&output, "Cancel").0;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: cancel,
+                        data: None,
+                    },
+                )],
+                ..grid_input_with_width(860.0)
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        assert_eq!(app.format_draft, None);
+        assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
+
+        app.delimiter_mode = DelimiterMode::Semicolon;
+        app.header_mode = HeaderMode::FirstRow;
+        for width in [860.0, 1280.0] {
+            let output = ctx.run(grid_input_with_width(width), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            });
+            let (_, format) = accessible_button(&output, "Format: Semicolon, Header row");
+            let bounds = format.bounds().expect("Format menu should have bounds");
+            assert!(bounds.x1 - bounds.x0 <= super::FORMAT_MENU_WIDTH as f64 + 1.0);
+        }
+
+        app.document.as_mut().unwrap().shutdown();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn app_install_lock_excludes_bundle_replacement() {
@@ -8943,6 +9273,8 @@ mod tests {
         assert_eq!(document.session.path(), path);
         assert_eq!(document.column_name(0), "button_name");
         assert!(!document.is_dirty());
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::FirstRow);
         assert_eq!(
             fs::read(&path).unwrap(),
             b"button_name,value\nfirst,\"line one\nline two\"\n"
@@ -9069,6 +9401,8 @@ mod tests {
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.data_start, 0);
         assert!(!document.is_dirty());
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::NoHeader);
         assert_eq!(
             fs::read(&source).unwrap(),
             b"\xEF\xBB\xBFsaved,1\nsecond,2\n"
@@ -9085,6 +9419,8 @@ mod tests {
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.data_start, 0);
         assert!(!document.is_dirty());
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::NoHeader);
         assert_eq!(
             fs::read(&source).unwrap(),
             b"\xEF\xBB\xBFsaved,1\nsecond,2\n"
@@ -9384,6 +9720,8 @@ mod tests {
         assert_eq!(document.session.path(), destination);
         assert_eq!(document.column_name(0), "renamed");
         assert!(!document.is_dirty());
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::FirstRow);
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
         assert_eq!(
             fs::read(&destination).unwrap(),
@@ -10685,7 +11023,9 @@ mod tests {
 
         app.open_structural_dialog(dialog);
         app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        app.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader));
         finish_structural_edit(&mut app);
+        assert_eq!(app.format_draft, None);
         let document = app.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 4);
         assert_eq!(
@@ -13014,6 +13354,23 @@ mod tests {
         assert!(document.buffered_rows.len() <= capacity);
 
         let first = document.data_start;
+        document.navigate(first + 100).unwrap();
+        document.last_viewport_read = None;
+        let mut refills = 0;
+        for _ in 0..48 {
+            document
+                .scroll_by_points(-super::ROW_HEIGHT / 4.0, super::ROW_HEIGHT)
+                .unwrap();
+            refills += usize::from(document.last_viewport_read.take().is_some());
+        }
+        assert_eq!(document.viewport_start, first + 112);
+        assert!(
+            refills <= 1,
+            "trackpad-sized scrolling refilled {refills} times"
+        );
+
+        document.navigate(first).unwrap();
+
         let row_stride = super::ROW_HEIGHT;
         document
             .scroll_by_points(-(row_stride - 1.0), row_stride)
@@ -13242,7 +13599,11 @@ mod tests {
         fs::write(&malformed, b"\"unterminated").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
+        app.delimiter_mode = DelimiterMode::Comma;
+        app.header_mode = HeaderMode::FirstRow;
         app.open_path(first.clone()).unwrap();
+        assert_eq!(app.delimiter_mode, DelimiterMode::Comma);
+        assert_eq!(app.header_mode, HeaderMode::FirstRow);
         app.document.as_mut().unwrap().move_column(1, 0).unwrap();
         app.document
             .as_mut()
@@ -13251,6 +13612,8 @@ mod tests {
             .unwrap();
         app.open_picker_result(None);
         assert_eq!(app.document.as_ref().unwrap().session.path(), first);
+        assert_eq!(app.delimiter_mode, DelimiterMode::Comma);
+        assert_eq!(app.header_mode, HeaderMode::FirstRow);
 
         app.open_path_and_report(malformed.clone());
         let document = app.document.as_ref().unwrap();
@@ -13258,16 +13621,26 @@ mod tests {
         assert_eq!(document.columns.order, [1, 0]);
         assert!(document.columns.hidden[0]);
         assert!(app.notice.as_deref().unwrap().contains("unterminated"));
+        assert_eq!(app.delimiter_mode, DelimiterMode::Comma);
+        assert_eq!(app.header_mode, HeaderMode::FirstRow);
 
-        app.handle_dropped_paths(vec![Some(second.clone()), Some(first.clone())]);
+        app.open_picker_result(Some(second.clone()));
+        assert_eq!(app.document.as_ref().unwrap().session.path(), second);
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::Auto);
+        app.reopen_document(DelimiterMode::Comma, HeaderMode::FirstRow);
+
+        app.handle_dropped_paths(vec![Some(first.clone()), Some(second.clone())]);
         let document = app.document.as_ref().unwrap();
-        assert_eq!(document.session.path(), second);
+        assert_eq!(document.session.path(), first);
         assert_eq!(document.columns.order, [0, 1]);
         assert!(document.columns.hidden.iter().all(|hidden| !hidden));
         assert!(app.notice.as_deref().unwrap().contains("ignored 1"));
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::Auto);
 
         app.handle_dropped_paths(vec![None]);
-        assert_eq!(app.document.as_ref().unwrap().session.path(), second);
+        assert_eq!(app.document.as_ref().unwrap().session.path(), first);
         assert!(app.notice.as_deref().unwrap().contains("local file"));
 
         app.document.as_mut().unwrap().shutdown();
@@ -13297,11 +13670,15 @@ mod tests {
 
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut app = QuarryApp::new(None, Instant::now());
+        app.delimiter_mode = DelimiterMode::Tab;
+        app.header_mode = HeaderMode::NoHeader;
         app.open_document_receiver = Some(receiver);
         sender.send(source.clone()).unwrap();
         app.poll_open_documents();
 
         assert_eq!(app.document.as_ref().unwrap().session.path(), source);
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::Auto);
         app.document.as_mut().unwrap().shutdown();
         fs::remove_file(source).unwrap();
     }
@@ -13316,52 +13693,48 @@ mod tests {
         fs::write(&path, b"name,value\nfirst,1\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.open_path(path.clone()).unwrap();
+        app.open_new_path(path.clone()).unwrap();
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::Auto);
         assert_eq!(
             app.document.as_ref().unwrap().session.dialect.delimiter,
             b','
         );
         assert!(app.document.as_ref().unwrap().session.dialect.has_header);
 
-        app.delimiter_mode = DelimiterMode::Tab;
-        app.header_mode = HeaderMode::NoHeader;
-        fs::write(&path, b"name,value\nsecond,2\n").unwrap();
+        app.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader));
+        fs::write(&path, b"name\tvalue\nsecond\t2\n").unwrap();
         app.reload_document();
         let document = app.document.as_ref().unwrap();
         assert_eq!(document.session.path(), path);
         assert_eq!(document.session.dialect.delimiter, b',');
         assert!(document.session.dialect.has_header);
-        assert_eq!(document.headers, ["name", "value"]);
-        assert_eq!(document.buffered_rows[0].fields[0], b"second");
-        assert_eq!(
-            app.document.as_ref().unwrap().session.dialect.delimiter,
-            b','
-        );
-        assert!(app.document.as_ref().unwrap().session.dialect.has_header);
+        assert_eq!(document.headers, ["name\tvalue"]);
+        assert_eq!(document.buffered_rows[0].fields[0], b"second\t2");
+        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.header_mode, HeaderMode::Auto);
+        assert_eq!(app.format_draft, None);
 
-        app.reopen_document();
+        app.reopen_document(DelimiterMode::Tab, HeaderMode::NoHeader);
         let document = app.document.as_ref().unwrap();
         assert_eq!(document.session.path(), path);
         assert_eq!(document.session.dialect.delimiter, b'\t');
         assert!(!document.session.dialect.has_header);
-        assert_eq!(document.headers, ["Column 1"]);
-        assert_eq!(document.buffered_rows[0].fields[0], b"name,value");
-
-        app.delimiter_mode = DelimiterMode::Comma;
-        app.header_mode = HeaderMode::FirstRow;
-        app.reopen_document();
-        let document = app.document.as_ref().unwrap();
-        assert_eq!(document.headers, ["name", "value"]);
-        assert_eq!(document.buffered_rows[0].fields[0], b"second");
-        assert_eq!(document.buffered_rows[0].fields[1], b"2");
+        assert_eq!(document.headers, ["Column 1", "Column 2"]);
+        assert_eq!(document.buffered_rows[0].fields[0], b"name");
+        assert_eq!(document.buffered_rows[0].fields[1], b"value");
+        assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
+        assert_eq!(app.header_mode, HeaderMode::NoHeader);
         assert_eq!(DelimiterMode::Pipe.delimiter(), Some(b'|'));
         assert_eq!(DelimiterMode::Semicolon.delimiter(), Some(b';'));
 
         fs::write(&path, b"\"unterminated").unwrap();
-        app.reload_document();
+        app.reopen_document(DelimiterMode::Comma, HeaderMode::FirstRow);
         let document = app.document.as_ref().unwrap();
-        assert_eq!(document.headers, ["name", "value"]);
-        assert_eq!(document.buffered_rows[0].fields[0], b"second");
+        assert_eq!(document.headers, ["Column 1", "Column 2"]);
+        assert_eq!(document.buffered_rows[0].fields[0], b"name");
+        assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
+        assert_eq!(app.header_mode, HeaderMode::NoHeader);
         assert!(app.notice.as_deref().unwrap().contains("unterminated"));
 
         app.document.as_mut().unwrap().shutdown();

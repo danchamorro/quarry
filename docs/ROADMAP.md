@@ -58,7 +58,7 @@ pacing becomes measurable with the viewer-alpha grid.
   content.
 - [x] Keep the header visible and retain horizontal scrolling, row jump, and
   Page Up/Page Down navigation.
-- [x] Materialize only the visible rows plus a two-row overscan on each side.
+- [x] Materialize only the visible rows plus a 16-row overscan on each side.
 - [x] Cover progressive refill, wheel and page movement, empty files, first,
   midpoint, final, 117-million-row, overflow, and exact-final-record behavior
   with regression tests.

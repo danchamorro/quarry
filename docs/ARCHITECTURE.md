@@ -73,7 +73,7 @@ Optimize common paths without compromising quoted fields, escaped quotes, embedd
 ## Viewport
 The engine seeks from the nearest checkpoint and parses every field in a
 bounded row range. The egui viewer's active viewport buffer retains the visible
-rows plus two rows of overscan on each side and renders at most 64 columns at a
+rows plus 16 rows of overscan on each side and renders at most 64 columns at a
 time. Horizontal windowing keeps every shown column reachable while limiting
 UI work; it does not project fields out of the parsed rows.
 
