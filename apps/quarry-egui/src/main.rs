@@ -733,7 +733,6 @@ impl QuarryApp {
                 self.notice = None;
                 return;
             }
-            Action::CopySelection => return self.copy_selection(ctx),
             Action::OpenColumns => {
                 ctx.data_mut(|data| {
                     data.remove::<usize>(egui::Id::new("quarry-selected-managed-column"));
@@ -770,7 +769,6 @@ impl QuarryApp {
             | Action::ChooseSaveAs
             | Action::ChooseFilteredExport
             | Action::DiscardChanges
-            | Action::CopySelection
             | Action::OpenColumns
             | Action::UndoStructuralEdit
             | Action::RedoStructuralEdit
@@ -1477,9 +1475,6 @@ impl eframe::App for QuarryApp {
                         if ui.button(filter_label).clicked() {
                             action = Some(Action::OpenFilters);
                         }
-                        if let Some(copy_action) = copy_control(ui, document.selection.is_some()) {
-                            action = Some(copy_action);
-                        }
                         let find_disabled_reason = "Clear the filter before using Find.";
                         let find = ui
                             .add_enabled(!filter_active, egui::Button::new("Find"))
@@ -1862,7 +1857,6 @@ enum Action {
     CancelFilter,
     ClearFilter,
     CancelExport,
-    CopySelection,
     Cancel,
 }
 
@@ -2499,13 +2493,6 @@ fn page_controls(ui: &mut egui::Ui) -> Option<Action> {
     } else {
         None
     }
-}
-
-fn copy_control(ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
-    ui.add_enabled(enabled, egui::Button::new("Copy"))
-        .on_hover_text("Copy the selected cell or row (⌘C)")
-        .clicked()
-        .then_some(Action::CopySelection)
 }
 
 fn filter_column_input_id(rule_index: usize) -> egui::Id {
@@ -7569,13 +7556,13 @@ mod tests {
         MAX_RENDERED_COLUMNS, OpenOptions, QuarryApp, REPLACE_INPUT_ID, ROW_NUMBER_WIDTH, Row,
         SOURCE_CHANGED_NOTICE, SearchMatch, Session, StructuralDialog, StructuralDialogAction,
         WorkingCopyState, active_job_controls, column_drop_position, column_ruler_divider_stroke,
-        column_selection_fill, configure_style, copy_control, estimate_sort_temporary_bytes,
-        filter_button_label, filtered_export_file_name, first_active_job, footer_range_text,
-        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
-        parse_file_column, parse_move_position, rendered_column_range, row_for_scroll_fraction,
-        save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
-        selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
-        show_grid_with_filter_case, show_structural_dialog, sort_merge_progress,
+        column_selection_fill, configure_style, estimate_sort_temporary_bytes, filter_button_label,
+        filtered_export_file_name, first_active_job, footer_range_text, logical_viewport_start,
+        max_viewport_start, page_controls, parse_data_row, parse_file_column, parse_move_position,
+        rendered_column_range, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
+        search_controls, select_column, selected_split_column, selection_text, show_column_manager,
+        show_filter_manager, show_grid, show_grid_with_filter_case, show_structural_dialog,
+        sort_merge_progress,
     };
 
     #[test]
@@ -7983,10 +7970,6 @@ mod tests {
         action
     }
 
-    fn click_page_control(label: &str) -> Option<Action> {
-        click_accessible_button(label, page_controls)
-    }
-
     fn grid_input_with_width(width: f32) -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -8281,17 +8264,60 @@ mod tests {
     #[test]
     fn page_navigation_controls_are_clickable() {
         assert!(matches!(
-            click_page_control("Page Up"),
+            click_accessible_button("Page Up", page_controls),
             Some(Action::PageUp)
         ));
         assert!(matches!(
-            click_page_control("Page Down"),
+            click_accessible_button("Page Down", page_controls),
             Some(Action::PageDown)
         ));
-        assert!(matches!(
-            click_accessible_button("Copy", |ui| copy_control(ui, true)),
-            Some(Action::CopySelection)
-        ));
+    }
+
+    #[test]
+    fn page_keys_move_one_viewport_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("page-keys.csv");
+        let mut file = File::create(&source).unwrap();
+        writeln!(file, "name").unwrap();
+        for row in 1..=250 {
+            writeln!(file, "row{row}").unwrap();
+        }
+        drop(file);
+
+        let mut document = Document::open(&source, OpenOptions::default()).unwrap();
+        finish_index(&mut document);
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.document = Some(document);
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let document = app.document.as_ref().unwrap();
+        let first = document.viewport_start;
+        let page = document.visible_rows as u64;
+
+        for (key, expected) in [
+            (egui::Key::PageDown, first + page),
+            (egui::Key::PageUp, first),
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..grid_input()
+                },
+                |ctx| {
+                    eframe::App::update(&mut app, ctx, &mut frame);
+                },
+            );
+            assert_eq!(app.document.as_ref().unwrap().viewport_start, expected);
+        }
     }
 
     #[test]
