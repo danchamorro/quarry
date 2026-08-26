@@ -847,7 +847,11 @@ impl QuarryApp {
         self.notice = result.err();
     }
 
-    fn apply_column_command(&mut self, command: ColumnCommand) {
+    fn apply_column_command(&mut self, ctx: &egui::Context, command: ColumnCommand) {
+        if command == ColumnCommand::AutoFit {
+            self.apply(ctx, Action::AutoFitColumns);
+            return;
+        }
         let Some(document) = self.document.as_mut() else {
             return;
         };
@@ -858,6 +862,7 @@ impl QuarryApp {
                 document.reset_columns();
                 Ok(())
             }
+            ColumnCommand::AutoFit => unreachable!("auto-fit routes through the app action"),
         };
         self.notice = result.err();
     }
@@ -1537,21 +1542,6 @@ impl eframe::App for QuarryApp {
                         if ui.button("Columns…").clicked() {
                             action = Some(Action::OpenColumns);
                         }
-                        if ui
-                            .add_enabled(
-                                document.columns.shown_count() <= MAX_RENDERED_COLUMNS,
-                                egui::Button::new("Auto-fit columns"),
-                            )
-                            .on_hover_text(
-                                "Fit every shown column to its header and loaded cell values",
-                            )
-                            .on_disabled_hover_text(
-                                "Auto-fit is available when 64 or fewer columns are shown. Hide columns first.",
-                            )
-                            .clicked()
-                        {
-                            action = Some(Action::AutoFitColumns);
-                        }
                         if document.working_copy.is_some() {
                             if ui
                                 .add_enabled(
@@ -1575,11 +1565,7 @@ impl eframe::App for QuarryApp {
                                 action = Some(Action::RedoStructuralEdit);
                             }
                         }
-                        let filter_label = if filter_active {
-                            "Filters active…"
-                        } else {
-                            "Filters…"
-                        };
+                        let filter_label = filter_button_label(document.filter_query.as_ref());
                         if ui.button(filter_label).clicked() {
                             action = Some(Action::OpenFilters);
                         }
@@ -1720,7 +1706,7 @@ impl eframe::App for QuarryApp {
             )
         });
         if let Some(command) = column_command {
-            self.apply_column_command(command);
+            self.apply_column_command(ctx, command);
         }
 
         let filter_action = self.document.as_ref().and_then(|document| {
@@ -2390,6 +2376,7 @@ enum ColumnCommand {
     SetShown { column: usize, shown: bool },
     Move { column: usize, position: usize },
     Reset,
+    AutoFit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2587,6 +2574,19 @@ fn show_column_manager(
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Drag to reorder · Uncheck to hide");
+                if ui
+                    .add_enabled(
+                        document.columns.shown_count() <= MAX_RENDERED_COLUMNS,
+                        egui::Button::new("Auto-fit columns"),
+                    )
+                    .on_hover_text("Fit every shown column to its header and loaded cell values")
+                    .on_disabled_hover_text(
+                        "Auto-fit is available when 64 or fewer columns are shown. Hide columns first.",
+                    )
+                    .clicked()
+                {
+                    command = Some(ColumnCommand::AutoFit);
+                }
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Done").clicked() {
                         close_requested = true;
@@ -2598,6 +2598,13 @@ fn show_column_manager(
         *open = false;
     }
     command
+}
+
+fn filter_button_label(filter_query: Option<&FilterQuery>) -> String {
+    filter_query.map_or_else(
+        || "Filters…".to_owned(),
+        |query| format!("Filters ({})…", query.predicates.len()),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7349,12 +7356,12 @@ mod tests {
         SOURCE_CHANGED_NOTICE, SearchMatch, Session, StructuralDialog, StructuralDialogAction,
         WorkingCopyState, active_job_controls, column_drop_position, column_ruler_divider_stroke,
         column_selection_fill, configure_style, copy_control, estimate_sort_temporary_bytes,
-        filtered_export_file_name, first_active_job, footer_range_text, logical_viewport_start,
-        max_viewport_start, page_controls, parse_data_row, parse_file_column, parse_move_position,
-        rendered_column_range, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
-        search_controls, select_column, selected_split_column, selection_text, show_column_manager,
-        show_filter_manager, show_grid, show_grid_with_filter_case, show_structural_dialog,
-        sort_merge_progress,
+        filter_button_label, filtered_export_file_name, first_active_job, footer_range_text,
+        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
+        parse_file_column, parse_move_position, rendered_column_range, row_for_scroll_fraction,
+        save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
+        selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
+        show_grid_with_filter_case, show_structural_dialog, sort_merge_progress,
     };
 
     #[test]
@@ -8127,6 +8134,10 @@ mod tests {
                 value_input: "INACTIVE".into(),
             },
         ];
+        assert_eq!(
+            filter_button_label(app.document.as_ref().unwrap().filter_query.as_ref()),
+            "Filters…"
+        );
         let ctx = egui::Context::default();
         app.apply(&ctx, Action::ApplyFilter);
         assert!(app.notice.is_none());
@@ -8134,6 +8145,10 @@ mod tests {
         let document = app.document.as_mut().unwrap();
         finish_filter(document);
         assert_eq!(document.filter_query.as_ref().unwrap().predicates.len(), 3);
+        assert_eq!(
+            filter_button_label(document.filter_query.as_ref()),
+            "Filters (3)…"
+        );
         assert_eq!(
             document.filter_query.as_ref().unwrap().case_sensitivity,
             CaseSensitivity::Insensitive
@@ -9946,7 +9961,7 @@ mod tests {
             "1  c1",
             app.document.as_ref().unwrap(),
         );
-        app.apply_column_command(command);
+        app.apply_column_command(&ctx, command);
         assert!(app.document.as_ref().unwrap().columns.hidden[0]);
 
         let command = click_column_manager_control(
@@ -9954,7 +9969,7 @@ mod tests {
             "Reset columns",
             app.document.as_ref().unwrap(),
         );
-        app.apply_column_command(command);
+        app.apply_column_command(&ctx, command);
         assert_eq!(
             app.document.as_ref().unwrap().columns.order,
             (0..40).collect::<Vec<_>>()
@@ -9968,10 +9983,21 @@ mod tests {
                 .iter()
                 .all(|hidden| !hidden)
         );
-        app.apply_column_command(ColumnCommand::Move {
-            column: 39,
-            position: 0,
-        });
+        let command = click_column_manager_control(
+            egui::accesskit::Role::Button,
+            "Auto-fit columns",
+            app.document.as_ref().unwrap(),
+        );
+        app.apply_column_command(&ctx, command);
+        assert!(app.document.as_ref().unwrap().auto_fit_columns);
+
+        app.apply_column_command(
+            &ctx,
+            ColumnCommand::Move {
+                column: 39,
+                position: 0,
+            },
+        );
         assert_eq!(
             &app.document.as_ref().unwrap().columns.order[..3],
             &[39, 0, 1]
