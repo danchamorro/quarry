@@ -22,14 +22,16 @@ use objc2::{ffi, sel};
 use objc2_app_kit::NSApplication;
 #[cfg(target_os = "macos")]
 use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
+#[cfg(test)]
+use quarry_core::SearchProgress;
 use quarry_core::{
     CaseSensitivity, ColumnTransformation, FilterExportJob, FilterExportOutcome,
     FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
     FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
     IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
     QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob,
-    SearchMatch, SearchOutcome, SearchPosition, SearchProgress, Session, SortDirection, SortJob,
-    SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection, SortJob, SortOutcome,
+    SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
     estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
@@ -46,6 +48,9 @@ const MIN_THUMB_HEIGHT: f32 = 24.0;
 const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
 const APP_ID: &str = "io.github.danchamorro.quarry";
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const STATUS_BAR_HEIGHT: f32 = 32.0;
+const STATUS_JOB_WIDTH: f32 = 360.0;
+const STATUS_CANCEL_WIDTH: f32 = 112.0;
 const PATH_INPUT_ID: &str = "quarry-path-input";
 const JUMP_INPUT_ID: &str = "quarry-jump-input";
 const FIND_INPUT_ID: &str = "quarry-find-input";
@@ -261,6 +266,7 @@ struct QuarryApp {
     header_mode: HeaderMode,
     document: Option<Document>,
     notice: Option<String>,
+    footer_status: Option<String>,
     close_confirmation_open: bool,
     close_after_save: bool,
     started: Instant,
@@ -377,6 +383,7 @@ impl QuarryApp {
             header_mode: HeaderMode::Auto,
             document: None,
             notice: None,
+            footer_status: None,
             close_confirmation_open: false,
             close_after_save: false,
             started,
@@ -454,6 +461,7 @@ impl QuarryApp {
         self.filter_rules = vec![FilterRuleDraft::default()];
         self.filters_open = false;
         self.document = Some(document);
+        self.footer_status = None;
         Ok(())
     }
 
@@ -552,6 +560,9 @@ impl QuarryApp {
             .ok_or_else(|| "Open a file before saving.".to_owned())
             .and_then(Document::start_save);
         self.notice = result.err();
+        if self.notice.is_none() {
+            self.footer_status = None;
+        }
         self.notice.is_none()
     }
 
@@ -565,6 +576,9 @@ impl QuarryApp {
             .ok_or_else(|| "Open a file before using Save As.".to_owned())
             .and_then(|document| document.start_save_as(destination));
         self.notice = result.err();
+        if self.notice.is_none() {
+            self.footer_status = None;
+        }
         self.notice.is_none()
     }
 
@@ -578,6 +592,9 @@ impl QuarryApp {
             .ok_or_else(|| "Open and filter a file before exporting.".to_owned())
             .and_then(|document| document.start_filtered_export(destination));
         self.notice = result.err();
+        if self.notice.is_none() {
+            self.footer_status = None;
+        }
     }
 
     fn reopen_document(&mut self) {
@@ -792,6 +809,24 @@ impl QuarryApp {
                 Ok(())
             }
         };
+        if result.is_ok()
+            && matches!(
+                action,
+                Action::FindNext
+                    | Action::ReplaceCurrent
+                    | Action::ReplaceAll
+                    | Action::ApplyFilter
+                    | Action::ClearFilter
+                    | Action::CancelSearch
+                    | Action::CancelFilter
+                    | Action::CancelExport
+                    | Action::CancelSave
+                    | Action::CancelStructuralEdit
+                    | Action::Cancel
+            )
+        {
+            self.footer_status = None;
+        }
         self.notice = result.err();
     }
 
@@ -863,6 +898,11 @@ impl QuarryApp {
             Ok(()) => {
                 self.structural_dialog = None;
                 self.notice = None;
+                self.footer_status = self
+                    .document
+                    .as_ref()
+                    .filter(|document| document.structural_job.is_none())
+                    .and_then(|document| document.structural_status.clone());
             }
             Err(error) => self.notice = Some(error),
         }
@@ -875,6 +915,13 @@ impl QuarryApp {
             .ok_or_else(|| "Open a file before editing columns.".to_owned())
             .and_then(|document| document.start_delete_columns(columns));
         self.notice = result.err();
+        if self.notice.is_none() {
+            self.footer_status = self
+                .document
+                .as_ref()
+                .filter(|document| document.structural_job.is_none())
+                .and_then(|document| document.structural_status.clone());
+        }
     }
 
     fn install_materialized_working_copy(
@@ -910,7 +957,8 @@ impl QuarryApp {
         self.path_input = logical_path.to_string_lossy().into_owned();
         self.columns_open = false;
         self.structural_dialog = None;
-        self.notice = Some(ready.notice);
+        self.notice = None;
+        self.footer_status = Some(ready.notice);
         Ok(())
     }
 
@@ -999,7 +1047,8 @@ impl QuarryApp {
         self.path_input = logical_path.to_string_lossy().into_owned();
         self.structural_dialog = None;
         self.columns_open = false;
-        self.notice = Some(if redo {
+        self.notice = None;
+        self.footer_status = Some(if redo {
             "Change restored.".into()
         } else {
             "Change undone.".into()
@@ -1086,23 +1135,64 @@ impl eframe::App for QuarryApp {
         if let Some(document) = &mut self.document
             && let Err(error) = document.poll()
         {
+            self.footer_status = None;
             self.notice = Some(error);
         }
-        if let Some(document) = &mut self.document
-            && let Err(error) = document.poll_search()
-        {
-            self.notice = Some(error);
+        if let Some(document) = &mut self.document {
+            let was_active = document.search_job.is_some();
+            match document.poll_search() {
+                Ok(()) if was_active && document.search_job.is_none() => {
+                    self.notice = None;
+                    self.footer_status = document.search_status.clone();
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    self.footer_status = None;
+                    self.notice = Some(error);
+                }
+            }
         }
-        if let Some(document) = &mut self.document
-            && let Err(error) = document.poll_filter()
-        {
-            self.notice = Some(error);
+        if let Some(document) = &mut self.document {
+            let was_active = document.filter_job.is_some();
+            match document.poll_filter() {
+                Ok(()) if was_active && document.filter_job.is_none() => {
+                    self.notice = None;
+                    self.footer_status = document.filter_status.clone();
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    self.footer_status = None;
+                    self.notice = Some(error);
+                }
+            }
         }
-        if let Some(document) = &mut self.document
-            && let Err(error) = document.poll_filtered_export()
-        {
-            self.notice = Some(error);
+        if let Some(document) = &mut self.document {
+            let was_active = document.export_job.is_some();
+            match document.poll_filtered_export() {
+                Ok(()) if was_active && document.export_job.is_none() => {
+                    let status = document.export_status.clone();
+                    if status
+                        .as_deref()
+                        .is_some_and(|status| status.starts_with("Export failed"))
+                    {
+                        self.footer_status = None;
+                        self.notice = status;
+                    } else {
+                        self.notice = None;
+                        self.footer_status = status;
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    self.footer_status = None;
+                    self.notice = Some(error);
+                }
+            }
         }
+        let structural_was_active = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.structural_job.is_some());
         let structural_result = self
             .document
             .as_mut()
@@ -1110,12 +1200,33 @@ impl eframe::App for QuarryApp {
         match structural_result {
             Ok(Some(ready)) => {
                 if let Err(error) = self.install_materialized_working_copy(ready) {
+                    self.footer_status = None;
                     self.notice = Some(error);
                 }
             }
+            Ok(None)
+                if structural_was_active
+                    && self
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| document.structural_job.is_none()) =>
+            {
+                self.notice = None;
+                self.footer_status = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.structural_status.clone());
+            }
             Ok(None) => {}
-            Err(error) => self.notice = Some(error),
+            Err(error) => {
+                self.footer_status = None;
+                self.notice = Some(error);
+            }
         }
+        let save_was_active = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.save_job.is_some());
         let save_result = self.document.as_mut().map_or(Ok(None), Document::poll_save);
         match save_result {
             Ok(Some((destination, in_place))) => {
@@ -1136,7 +1247,8 @@ impl eframe::App for QuarryApp {
                 };
                 match self.replace_document_with_options(destination.clone(), options) {
                     Ok(()) => {
-                        self.notice = Some(if in_place {
+                        self.notice = None;
+                        self.footer_status = Some(if in_place {
                             format!("Saved {}.", destination.display())
                         } else {
                             format!("Saved as {}.", destination.display())
@@ -1151,6 +1263,7 @@ impl eframe::App for QuarryApp {
                             document.shutdown();
                         }
                         self.path_input = destination.to_string_lossy().into_owned();
+                        self.footer_status = None;
                         self.notice = Some(format!(
                             "Saved {} but could not reload it: {error}. Reopen the file to continue.",
                             destination.display()
@@ -1164,6 +1277,7 @@ impl eframe::App for QuarryApp {
                         if let Some(document) = self.document.as_mut() {
                             document.save_status = None;
                         }
+                        self.footer_status = None;
                         self.notice = Some(format!(
                             "Saved {} but could not open it: {error}",
                             destination.display()
@@ -1176,6 +1290,18 @@ impl eframe::App for QuarryApp {
                 }
             }
             Ok(None) => {
+                if save_was_active
+                    && self
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| document.save_job.is_none())
+                {
+                    self.notice = None;
+                    self.footer_status = self
+                        .document
+                        .as_ref()
+                        .and_then(|document| document.save_status.clone());
+                }
                 if self.close_after_save
                     && self
                         .document
@@ -1187,6 +1313,7 @@ impl eframe::App for QuarryApp {
                 }
             }
             Err(error) => {
+                self.footer_status = None;
                 self.notice = Some(error);
                 if self.close_after_save {
                     self.close_after_save = false;
@@ -1345,21 +1472,6 @@ impl eframe::App for QuarryApp {
                 });
 
                 if let Some(document) = &self.document {
-                    if document.is_indexing() {
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            let progress = document.indexed_fraction();
-                            let status = document.index_status();
-                            ui.add(
-                                egui::ProgressBar::new(progress)
-                                    .desired_width((ui.available_width() - 104.0).max(160.0))
-                                    .text(format!("{status} · {:.1}%", progress * 100.0)),
-                            );
-                            if ui.button("Cancel").clicked() {
-                                action = Some(Action::Cancel);
-                            }
-                        });
-                    }
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         let filter_active = document.filter_active();
@@ -1444,11 +1556,6 @@ impl eframe::App for QuarryApp {
                             action = Some(export_action);
                         }
                     } else {
-                        let search_progress = document.search_progress();
-                        let search_status = document.search_status.as_deref().or_else(|| {
-                            (!document.is_search_ready())
-                                .then_some("Search is available after indexing completes.")
-                        });
                         let can_replace = document.can_replace_current_with_case(
                             self.find_input.as_bytes(),
                             case_sensitivity(self.find_match_case),
@@ -1460,81 +1567,10 @@ impl eframe::App for QuarryApp {
                             &mut self.find_match_case,
                             document.is_search_ready(),
                             can_replace,
-                            search_progress.as_ref(),
-                            search_status,
+                            document.search_job.is_some(),
                         ) {
                             action = Some(search_action);
                         }
-                    }
-                    if let Some(progress) = document.save_job.as_ref().map(SaveAsJob::progress) {
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            let fraction = if progress.total_bytes == 0 {
-                                if progress.done { 1.0 } else { 0.0 }
-                            } else {
-                                (progress.bytes_scanned as f32 / progress.total_bytes as f32)
-                                    .clamp(0.0, 1.0)
-                            };
-                            let operation = if document.saving_in_place {
-                                "Save"
-                            } else {
-                                "Save As"
-                            };
-                            let status = if document.save_cancel_requested {
-                                format!("Cancelling {operation}")
-                            } else if progress.done {
-                                format!("{operation} finished")
-                            } else {
-                                "Saving edited file".into()
-                            };
-                            ui.add(
-                                egui::ProgressBar::new(fraction)
-                                    .desired_width(260.0)
-                                    .text(format!("{status} · {:.1}%", fraction * 100.0)),
-                            );
-                            if document.save_job.is_some()
-                                && ui
-                                    .add_enabled(
-                                        !document.save_cancel_requested,
-                                        egui::Button::new(format!("Cancel {operation}")),
-                                    )
-                                    .clicked()
-                            {
-                                action = Some(Action::CancelSave);
-                            }
-                        });
-                    }
-                    if let Some(status) = document.save_status.as_deref() {
-                        let response = ui.label(status);
-                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-                            node.set_live(egui::accesskit::Live::Polite);
-                        });
-                    }
-                    if let Some(progress) = document.structural_progress() {
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::ProgressBar::new(progress.fraction)
-                                    .animate(progress.animate)
-                                    .desired_width(260.0)
-                                    .text(progress.label),
-                            );
-                            if ui
-                                .add_enabled(
-                                    !document.structural_cancel_requested,
-                                    egui::Button::new("Cancel Change"),
-                                )
-                                .clicked()
-                            {
-                                action = Some(Action::CancelStructuralEdit);
-                            }
-                        });
-                    }
-                    if let Some(status) = document.structural_status.as_deref() {
-                        let response = ui.label(status);
-                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-                            node.set_live(egui::accesskit::Live::Polite);
-                        });
                     }
                 }
 
@@ -1545,103 +1581,18 @@ impl eframe::App for QuarryApp {
             });
 
         egui::TopBottomPanel::bottom("quarry-status")
-            .frame(panel_frame(Color32::from_rgb(230, 235, 238)))
+            .exact_height(STATUS_BAR_HEIGHT)
+            .frame(
+                panel_frame(Color32::from_rgb(230, 235, 238))
+                    .inner_margin(egui::Margin::symmetric(14, 4)),
+            )
             .show(ctx, |ui| {
                 if let Some(document) = &self.document {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format_bytes(document.session.file_size));
-                        ui.separator();
-                        ui.label(format!("{} columns", document.total_columns));
-                        ui.separator();
-                        ui.label(format!(
-                            "{} delimiter",
-                            display_delimiter(document.session.dialect.delimiter)
-                        ));
-                        if document.is_dirty() {
-                            ui.separator();
-                            ui.colored_label(
-                                Color32::from_rgb(171, 65, 53),
-                                "Modified (not saved)",
-                            );
-                        }
-                        ui.separator();
-                        ui.label(if document.session.dialect.has_header {
-                            "header row"
-                        } else {
-                            "no header"
-                        });
-                        ui.separator();
-                        ui.label(format!(
-                            "{} data rows indexed",
-                            document.available_data_rows()
-                        ));
-                        if let Some(message) =
-                            document.filter_empty_message(document.visible_row_count())
-                        {
-                            ui.label(message);
-                        } else if document.filter_active() {
-                            ui.separator();
-                            ui.label(format!(
-                                "{} filter matches",
-                                document.available_filter_rows()
-                            ));
-                        }
-                        ui.separator();
-                        ui.label(format!(
-                            "first rows {:.3} ms",
-                            document.session.metrics.first_rows.as_secs_f64() * 1000.0
-                        ));
-                        if let Some(read) = document.last_viewport_read {
-                            ui.separator();
-                            ui.label(format!("viewport {:.3} ms", read.as_secs_f64() * 1000.0));
-                        }
-                        if document.filter_active() {
-                            if document.available_filter_rows() > 0 {
-                                ui.separator();
-                                ui.label(format!(
-                                    "matches {}–{} of {}",
-                                    document.filter_viewport_start.saturating_add(1),
-                                    document
-                                        .filter_viewport_start
-                                        .saturating_add(document.visible_row_count() as u64),
-                                    document.available_filter_rows()
-                                ));
-                            }
-                        } else {
-                            ui.separator();
-                            ui.label(format!(
-                                "rows {}–{}",
-                                document.display_start(),
-                                document.display_end()
-                            ));
-                        }
-                        ui.separator();
-                        let shown_columns = document.columns.shown_count();
-                        if shown_columns == 0 && document.total_columns > 0 {
-                            ui.label(format!("all {} columns hidden", document.total_columns));
-                        } else {
-                            ui.label(format!(
-                                "view columns {}–{} of {} shown ({} total)",
-                                document.columns.start.saturating_add(1),
-                                document
-                                    .columns
-                                    .start
-                                    .saturating_add(document.headers.len()),
-                                shown_columns,
-                                document.total_columns
-                            ));
-                        }
-                        ui.separator();
-                        let selection = document.selected_columns.len();
-                        ui.label(if selection == 0 {
-                            "no columns selected".to_owned()
-                        } else {
-                            format!("{selection} selected")
-                        })
-                        .on_hover_text(
-                            "Shift-click: range · Command/Ctrl-click: add/remove · Right-click: column tools and row sorting",
-                        );
-                    });
+                    if let Some(footer_action) =
+                        status_bar(ui, document, self.footer_status.as_deref())
+                    {
+                        action = Some(footer_action);
+                    }
                 } else {
                     ui.label("No file open · pass a path or paste one above");
                 }
@@ -1880,7 +1831,7 @@ fn header_mode_label(mode: HeaderMode) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Open,
     Choose,
@@ -1909,6 +1860,340 @@ enum Action {
     CancelExport,
     CopySelection,
     Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ActiveJobDisplay {
+    label: String,
+    fraction: f32,
+    animate: bool,
+    cancel_action: Action,
+    cancel_label: &'static str,
+    cancel_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveJobKind {
+    Structural,
+    Save,
+    Export,
+    Filter,
+    Search,
+    Index,
+}
+
+impl ActiveJobKind {
+    fn cancel_action(self) -> Action {
+        match self {
+            Self::Structural => Action::CancelStructuralEdit,
+            Self::Save => Action::CancelSave,
+            Self::Export => Action::CancelExport,
+            Self::Filter => Action::CancelFilter,
+            Self::Search => Action::CancelSearch,
+            Self::Index => Action::Cancel,
+        }
+    }
+
+    fn cancel_label(self, saving_in_place: bool) -> &'static str {
+        match self {
+            Self::Structural => "Cancel Change",
+            Self::Save if saving_in_place => "Cancel Save",
+            Self::Save => "Cancel Save As",
+            Self::Export => "Cancel Export",
+            Self::Filter => "Cancel filter",
+            Self::Search => "Cancel Search",
+            Self::Index => "Cancel",
+        }
+    }
+}
+
+fn first_active_job(active: [bool; 6]) -> Option<ActiveJobKind> {
+    active
+        .into_iter()
+        .zip([
+            ActiveJobKind::Structural,
+            ActiveJobKind::Save,
+            ActiveJobKind::Export,
+            ActiveJobKind::Filter,
+            ActiveJobKind::Search,
+            ActiveJobKind::Index,
+        ])
+        .find_map(|(active, kind)| active.then_some(kind))
+}
+
+fn progress_fraction(bytes_scanned: u64, total_bytes: u64, done: bool) -> f32 {
+    if total_bytes == 0 {
+        if done { 1.0 } else { 0.0 }
+    } else {
+        (bytes_scanned as f32 / total_bytes as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn active_job_display(document: &Document) -> Option<ActiveJobDisplay> {
+    let active = first_active_job([
+        document.structural_job.is_some(),
+        document.save_job.is_some(),
+        document.export_job.is_some(),
+        document.filter_job.is_some(),
+        document.search_job.is_some(),
+        document.job.is_some(),
+    ])?;
+
+    if active == ActiveJobKind::Structural {
+        let progress = document
+            .structural_progress()
+            .expect("active structural job has progress");
+        return Some(ActiveJobDisplay {
+            label: progress.label,
+            fraction: progress.fraction,
+            animate: progress.animate,
+            cancel_action: active.cancel_action(),
+            cancel_label: active.cancel_label(document.saving_in_place),
+            cancel_enabled: !document.structural_cancel_requested,
+        });
+    }
+
+    if active == ActiveJobKind::Save {
+        let job = document.save_job.as_ref().expect("active save job exists");
+        let progress = job.progress();
+        let fraction =
+            progress_fraction(progress.bytes_scanned, progress.total_bytes, progress.done);
+        let operation = if document.saving_in_place {
+            "Save"
+        } else {
+            "Save As"
+        };
+        let label = if document.save_cancel_requested {
+            format!("Cancelling {operation} · {:.1}%", fraction * 100.0)
+        } else {
+            format!("Saving edited file · {:.1}%", fraction * 100.0)
+        };
+        return Some(ActiveJobDisplay {
+            label,
+            fraction,
+            animate: false,
+            cancel_action: active.cancel_action(),
+            cancel_label: active.cancel_label(document.saving_in_place),
+            cancel_enabled: !document.save_cancel_requested && !progress.done,
+        });
+    }
+
+    if active == ActiveJobKind::Export {
+        let job = document
+            .export_job
+            .as_ref()
+            .expect("active export job exists");
+        let progress = job.progress();
+        let fraction =
+            progress_fraction(progress.bytes_scanned, progress.total_bytes, progress.done);
+        return Some(ActiveJobDisplay {
+            label: format!(
+                "{} · {:.1}%",
+                if document.export_cancel_requested {
+                    "Cancelling export"
+                } else {
+                    "Exporting"
+                },
+                fraction * 100.0
+            ),
+            fraction,
+            animate: false,
+            cancel_action: active.cancel_action(),
+            cancel_label: active.cancel_label(document.saving_in_place),
+            cancel_enabled: !document.export_cancel_requested && !progress.done,
+        });
+    }
+
+    if active == ActiveJobKind::Filter {
+        let job = document
+            .filter_job
+            .as_ref()
+            .expect("active filter job exists");
+        let progress = job.progress();
+        let fraction = progress_fraction(progress.bytes_scanned, progress.file_size, progress.done);
+        return Some(ActiveJobDisplay {
+            label: format!(
+                "{} · {:.1}%",
+                if progress.cancelled {
+                    "Cancelling filter"
+                } else {
+                    "Filtering"
+                },
+                fraction * 100.0
+            ),
+            fraction,
+            animate: false,
+            cancel_action: active.cancel_action(),
+            cancel_label: active.cancel_label(document.saving_in_place),
+            cancel_enabled: !progress.cancelled && !progress.done,
+        });
+    }
+
+    if active == ActiveJobKind::Search {
+        let job = document
+            .search_job
+            .as_ref()
+            .expect("active search job exists");
+        let progress = job.progress();
+        let fraction =
+            progress_fraction(progress.bytes_scanned, progress.total_bytes, progress.done);
+        return Some(ActiveJobDisplay {
+            label: format!(
+                "{} · {:.1}%",
+                if progress.cancelled {
+                    "Cancelling search"
+                } else {
+                    "Searching"
+                },
+                fraction * 100.0
+            ),
+            fraction,
+            animate: false,
+            cancel_action: active.cancel_action(),
+            cancel_label: active.cancel_label(document.saving_in_place),
+            cancel_enabled: !progress.cancelled && !progress.done,
+        });
+    }
+
+    document.job.as_ref().map(|job| {
+        let progress = job.progress();
+        let fraction = progress_fraction(progress.bytes_scanned, progress.file_size, progress.done);
+        ActiveJobDisplay {
+            label: format!(
+                "{} · {:.1}%",
+                if progress.cancelled {
+                    "Cancelling index"
+                } else {
+                    "Indexing"
+                },
+                fraction * 100.0
+            ),
+            fraction,
+            animate: false,
+            cancel_action: active.cancel_action(),
+            cancel_label: active.cancel_label(document.saving_in_place),
+            cancel_enabled: !progress.cancelled && !progress.done,
+        }
+    })
+}
+
+fn footer_range_text(document: &Document) -> String {
+    if document.filter_active() {
+        let total = document.available_filter_rows();
+        let visible = document.visible_row_count() as u64;
+        if document.filter_job.is_some() && total == 0 {
+            return "Finding matching rows…".into();
+        }
+        if document.filter_rows_loading() && visible == 0 {
+            return "Loading matching rows…".into();
+        }
+        if total == 0 {
+            return "No matching rows".into();
+        }
+        if visible == 0 {
+            return format!("{total} filter matches");
+        }
+        let start = document.filter_viewport_start.saturating_add(1);
+        let end = document
+            .filter_viewport_start
+            .saturating_add(visible)
+            .min(total);
+        format!("matches {start}–{end} of {total}")
+    } else {
+        format!(
+            "rows {}–{} of {}",
+            document.display_start(),
+            document.display_end(),
+            document.available_data_rows()
+        )
+    }
+}
+
+fn active_job_controls(ui: &mut egui::Ui, display: &ActiveJobDisplay) -> Option<Action> {
+    let clicked = ui
+        .add_enabled(
+            display.cancel_enabled,
+            egui::Button::new(display.cancel_label).min_size(egui::vec2(STATUS_CANCEL_WIDTH, 0.0)),
+        )
+        .clicked();
+    ui.add(
+        egui::ProgressBar::new(display.fraction)
+            .animate(display.animate)
+            .desired_width(ui.available_width())
+            .text(&display.label),
+    );
+    clicked.then_some(display.cancel_action)
+}
+
+fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) -> Option<Action> {
+    let active_job = active_job_display(document);
+    let available_width = ui.available_width();
+    let gap = ui.spacing().item_spacing.x;
+    let job_width = STATUS_JOB_WIDTH.min((available_width - 180.0).max(0.0));
+    let metadata_width = (available_width - job_width - gap).max(0.0);
+    let height = ui.available_height();
+    let mut action = None;
+
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(metadata_width, height),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                if document.is_dirty() {
+                    ui.colored_label(Color32::from_rgb(171, 65, 53), "Modified (not saved)");
+                    ui.separator();
+                }
+                ui.label(footer_range_text(document));
+
+                if metadata_width >= 540.0 {
+                    ui.separator();
+                    ui.label(format_bytes(document.session.file_size));
+                }
+                if metadata_width >= 650.0 {
+                    ui.separator();
+                    ui.label(format!("{} columns", document.total_columns));
+                }
+                let shown = document.columns.shown_count();
+                if metadata_width >= 760.0 && shown != document.total_columns {
+                    ui.separator();
+                    ui.label(format!("{shown} shown"));
+                }
+                let selected = document.selected_columns.len();
+                if metadata_width >= 840.0 && selected > 0 {
+                    ui.separator();
+                    ui.label(format!("{selected} selected"));
+                }
+            },
+        );
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(job_width, height),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                if let Some(display) = active_job.as_ref() {
+                    action = active_job_controls(ui, display);
+                    return;
+                }
+
+                let status = app_status.or_else(|| {
+                    let status = document.index_status();
+                    (!matches!(status, "Index failed" | "Source changed")).then_some(status)
+                });
+                if let Some(status) = status {
+                    let response = ui
+                        .add(egui::Label::new(status).truncate())
+                        .on_hover_text(status);
+                    let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                        node.set_live(egui::accesskit::Live::Polite);
+                    });
+                } else if let Some(read) = document.last_viewport_read {
+                    ui.weak(format!("viewport {:.3} ms", read.as_secs_f64() * 1000.0));
+                }
+            },
+        );
+    });
+
+    action
 }
 
 fn page_controls(ui: &mut egui::Ui) -> Option<Action> {
@@ -2516,34 +2801,6 @@ fn show_filter_manager(
             if document.has_cell_edits() {
                 ui.small("Save or discard cell edits before filtering the source file.");
             }
-            if let Some(progress) = document.filter_progress() {
-                ui.add_space(8.0);
-                let fraction = if progress.file_size == 0 {
-                    if progress.done { 1.0 } else { 0.0 }
-                } else {
-                    (progress.bytes_scanned as f32 / progress.file_size as f32).clamp(0.0, 1.0)
-                };
-                let text = if progress.cancelled && !progress.done {
-                    format!(
-                        "Cancelling · {:.1}% · {} matches",
-                        fraction * 100.0,
-                        progress.matches_found
-                    )
-                } else if !progress.done {
-                    format!(
-                        "Filtering · {:.1}% · {} matches",
-                        fraction * 100.0,
-                        progress.matches_found
-                    )
-                } else {
-                    format!("{} matches", progress.matches_found)
-                };
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .desired_width(ui.available_width())
-                        .text(text),
-                );
-            }
 
             if let Some(query) = document.filter_query.as_ref() {
                 ui.add_space(6.0);
@@ -2565,41 +2822,22 @@ fn show_filter_manager(
                     ));
                 }
             }
-            if let Some(status) = document.filter_status.as_deref() {
-                let response = ui.label(status);
-                let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-                    node.set_live(egui::accesskit::Live::Polite);
-                });
-            } else if document.search_job.is_some() {
+            if document.search_job.is_some() {
                 ui.label("Cancel the active search before filtering.");
             } else if document.total_columns == 0 {
                 ui.label("Open a file with at least one column to filter rows.");
             }
 
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        document.filter_job.is_some()
-                            && document
-                                .filter_progress()
-                                .is_some_and(|progress| !progress.done && !progress.cancelled),
-                        egui::Button::new("Cancel filter"),
-                    )
-                    .clicked()
-                {
-                    action = Some(Action::CancelFilter);
-                }
-                if ui
-                    .add_enabled(
-                        document.filter_active() && document.export_job.is_none(),
-                        egui::Button::new("Clear filter"),
-                    )
-                    .clicked()
-                {
-                    action = Some(Action::ClearFilter);
-                }
-            });
+            if ui
+                .add_enabled(
+                    document.filter_active() && document.export_job.is_none(),
+                    egui::Button::new("Clear filter"),
+                )
+                .clicked()
+            {
+                action = Some(Action::ClearFilter);
+            }
         });
     action
 }
@@ -2660,11 +2898,9 @@ fn search_controls(
     match_case: &mut bool,
     index_ready: bool,
     can_replace: bool,
-    progress: Option<&SearchProgress>,
-    status: Option<&str>,
+    searching: bool,
 ) -> Option<Action> {
     let mut action = None;
-    let searching = progress.is_some();
     ui.horizontal(|ui| {
         let label = ui.label("Find (literal)");
         let input = ui
@@ -2719,35 +2955,6 @@ fn search_controls(
         }
 
         ui.add_enabled(!searching, egui::Checkbox::new(match_case, "Match case"));
-
-        if let Some(progress) = progress {
-            let fraction = if progress.total_bytes == 0 {
-                if progress.done { 1.0 } else { 0.0 }
-            } else {
-                (progress.bytes_scanned as f32 / progress.total_bytes as f32).clamp(0.0, 1.0)
-            };
-            let text = if progress.cancelled {
-                format!("Cancelling search · {:.1}%", fraction * 100.0)
-            } else {
-                format!("Searching · {:.1}%", fraction * 100.0)
-            };
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_width(180.0)
-                    .text(text),
-            );
-            if ui
-                .add_enabled(!progress.cancelled, egui::Button::new("Cancel Search"))
-                .clicked()
-            {
-                action = Some(Action::CancelSearch);
-            }
-        } else if let Some(status) = status {
-            let response = ui.label(status);
-            let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-                node.set_live(egui::accesskit::Live::Polite);
-            });
-        }
     });
     action
 }
@@ -2772,55 +2979,7 @@ fn filtered_export_controls(ui: &mut egui::Ui, document: &Document) -> Option<Ac
         {
             action = Some(Action::ChooseFilteredExport);
         }
-
-        if let Some(progress) = document.filtered_export_progress() {
-            let fraction = if progress.total_bytes == 0 {
-                if progress.done { 1.0 } else { 0.0 }
-            } else {
-                (progress.bytes_scanned as f32 / progress.total_bytes as f32).clamp(0.0, 1.0)
-            };
-            let verb = if document.export_cancel_requested {
-                "Cancelling export"
-            } else if progress.cancelled {
-                "Export cancelled"
-            } else if document
-                .export_status
-                .as_deref()
-                .is_some_and(|status| status.starts_with("Export failed"))
-            {
-                "Export failed"
-            } else if progress.done {
-                "Export finished"
-            } else {
-                "Exporting"
-            };
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_width(220.0)
-                    .text(format!(
-                        "{verb} · {:.1}% · {} rows",
-                        fraction * 100.0,
-                        progress.rows_written
-                    )),
-            );
-        }
-        if document.export_job.is_some()
-            && ui
-                .add_enabled(
-                    !document.export_cancel_requested,
-                    egui::Button::new("Cancel Export"),
-                )
-                .clicked()
-        {
-            action = Some(Action::CancelExport);
-        }
     });
-    if let Some(status) = document.export_status.as_deref() {
-        let response = ui.label(status);
-        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-            node.set_live(egui::accesskit::Live::Polite);
-        });
-    }
     action
 }
 
@@ -4212,6 +4371,7 @@ impl Document {
         Ok(())
     }
 
+    #[cfg(test)]
     fn search_progress(&self) -> Option<SearchProgress> {
         self.search_job.as_ref().map(SearchJob::progress)
     }
@@ -4449,13 +4609,6 @@ impl Document {
         }
     }
 
-    fn filtered_export_progress(&self) -> Option<FilterExportProgress> {
-        self.export_job
-            .as_ref()
-            .map(FilterExportJob::progress)
-            .or(self.export_progress)
-    }
-
     fn is_filtered_export_ready(&self) -> bool {
         self.filter_query.is_some()
             && !self.has_cell_edits()
@@ -4649,18 +4802,6 @@ impl Document {
 
     fn filter_rows_loading(&self) -> bool {
         self.filter_read.is_some() || self.pending_filter_read.is_some()
-    }
-
-    fn filter_empty_message(&self, row_count: usize) -> Option<&'static str> {
-        if !self.filter_active() || row_count != 0 {
-            None
-        } else if self.available_filter_rows() == 0 && self.filter_job.is_some() {
-            Some("Finding matching rows…")
-        } else if self.filter_rows_loading() {
-            Some("Loading matching rows…")
-        } else {
-            Some("No matching rows")
-        }
     }
 
     fn available_filter_rows(&self) -> u64 {
@@ -5069,10 +5210,6 @@ impl Document {
         }
     }
 
-    fn is_indexing(&self) -> bool {
-        self.job.is_some() && !self.progress.done
-    }
-
     fn index_status(&self) -> &'static str {
         if self.source_changed {
             "Source changed"
@@ -5147,6 +5284,7 @@ impl Document {
         self.available_rows().saturating_sub(self.data_start)
     }
 
+    #[cfg(test)]
     fn indexed_fraction(&self) -> f32 {
         if self.session.file_size == 0 && (self.progress.done || self.index.is_some()) {
             1.0
@@ -6932,16 +7070,6 @@ fn ensure_copy_capacity(output: &str, added: usize, max_bytes: usize) -> Result<
     }
 }
 
-fn display_delimiter(delimiter: u8) -> &'static str {
-    match delimiter {
-        b',' => "comma",
-        b'\t' => "tab",
-        b'|' => "pipe",
-        b';' => "semicolon",
-        _ => "custom",
-    }
-}
-
 fn sort_direction_label(direction: SortDirection) -> &'static str {
     match direction {
         SortDirection::Ascending => "Ascending",
@@ -6978,19 +7106,19 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        Action, CaseSensitivity, ColumnCommand, ColumnView, DelimiterMode, Document, FIND_INPUT_ID,
-        FilterOperator, FilterPredicate, FilterProgress, FilterQuery, GridColumnRequest,
-        GridSelection, HeaderMode, IndexConfig, MAX_RENDERED_COLUMNS, OpenOptions, QuarryApp,
-        REPLACE_INPUT_ID, ROW_NUMBER_WIDTH, Row, SOURCE_CHANGED_NOTICE, SearchMatch,
-        SearchProgress, Session, StructuralDialog, StructuralDialogAction, WorkingCopyState,
-        column_drop_position, column_ruler_divider_stroke, column_selection_fill, configure_style,
-        copy_control, estimate_sort_temporary_bytes, filtered_export_controls,
-        filtered_export_file_name, logical_viewport_start, max_viewport_start, page_controls,
-        parse_data_row, parse_file_column, parse_move_position, rendered_column_range,
-        row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row, search_controls,
-        select_column, selected_split_column, selection_text, show_column_manager,
-        show_filter_manager, show_grid, show_grid_with_filter_case, show_structural_dialog,
-        sort_merge_progress,
+        Action, ActiveJobDisplay, ActiveJobKind, CaseSensitivity, ColumnCommand, ColumnView,
+        DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterPredicate, FilterProgress,
+        FilterQuery, GridColumnRequest, GridSelection, HeaderMode, IndexConfig,
+        MAX_RENDERED_COLUMNS, OpenOptions, QuarryApp, REPLACE_INPUT_ID, ROW_NUMBER_WIDTH, Row,
+        SOURCE_CHANGED_NOTICE, SearchMatch, Session, StructuralDialog, StructuralDialogAction,
+        WorkingCopyState, active_job_controls, column_drop_position, column_ruler_divider_stroke,
+        column_selection_fill, configure_style, copy_control, estimate_sort_temporary_bytes,
+        filtered_export_controls, filtered_export_file_name, first_active_job, footer_range_text,
+        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
+        parse_file_column, parse_move_position, rendered_column_range, row_for_scroll_fraction,
+        save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
+        selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
+        show_grid_with_filter_case, show_structural_dialog, sort_merge_progress,
     };
 
     #[test]
@@ -7832,6 +7960,7 @@ mod tests {
                 b"keep".to_vec(),
             ))
             .unwrap();
+        assert_eq!(footer_range_text(&document), "Finding matching rows…");
         finish_filter(&mut document);
         assert!(document.is_filtered_export_ready());
         assert!(matches!(
@@ -9189,10 +9318,8 @@ mod tests {
         document.navigate_filter(100).unwrap();
         assert!(document.filter_read.is_some());
         assert!(document.visible_filter_rows().is_empty());
-        assert_eq!(
-            document.filter_empty_message(document.visible_row_count()),
-            Some("Loading matching rows…")
-        );
+        assert!(document.filter_rows_loading());
+        assert_eq!(footer_range_text(&document), "Loading matching rows…");
 
         document.navigate_filter(500).unwrap();
         assert!(document.filter_read.as_ref().unwrap().cancel_requested);
@@ -11279,8 +11406,7 @@ mod tests {
                 &mut match_case,
                 true,
                 false,
-                None,
-                None,
+                false,
             )
         });
         assert!(matches!(find, Some(Action::FindNext)));
@@ -11292,8 +11418,7 @@ mod tests {
                 &mut match_case,
                 true,
                 true,
-                None,
-                None,
+                false,
             )
         });
         assert!(matches!(replace, Some(Action::ReplaceCurrent)));
@@ -11305,8 +11430,7 @@ mod tests {
                 &mut match_case,
                 true,
                 false,
-                None,
-                None,
+                false,
             )
         });
         assert!(matches!(replace_all, Some(Action::ReplaceAll)));
@@ -11322,8 +11446,7 @@ mod tests {
                     &mut match_case,
                     true,
                     true,
-                    None,
-                    None,
+                    false,
                 );
             });
         });
@@ -11339,28 +11462,90 @@ mod tests {
         assert!(tree.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::CheckBox && node.label() == Some("Match case")
         }));
+    }
 
-        let progress = SearchProgress {
-            bytes_scanned: 50,
-            total_bytes: 100,
-            rows_scanned: 4,
-            elapsed: Duration::from_millis(1),
-            done: false,
-            cancelled: false,
-        };
-        let cancel = click_accessible_button("Cancel Search", |ui| {
-            search_controls(
-                ui,
-                &mut query,
-                &mut replacement,
-                &mut match_case,
-                true,
+    #[test]
+    fn shared_job_controls_route_every_cancel_action() {
+        for (kind, saving_in_place, label, expected) in [
+            (
+                ActiveJobKind::Structural,
                 false,
-                Some(&progress),
-                None,
-            )
-        });
-        assert!(matches!(cancel, Some(Action::CancelSearch)));
+                "Cancel Change",
+                Action::CancelStructuralEdit,
+            ),
+            (ActiveJobKind::Save, true, "Cancel Save", Action::CancelSave),
+            (
+                ActiveJobKind::Save,
+                false,
+                "Cancel Save As",
+                Action::CancelSave,
+            ),
+            (
+                ActiveJobKind::Export,
+                false,
+                "Cancel Export",
+                Action::CancelExport,
+            ),
+            (
+                ActiveJobKind::Filter,
+                false,
+                "Cancel filter",
+                Action::CancelFilter,
+            ),
+            (
+                ActiveJobKind::Search,
+                false,
+                "Cancel Search",
+                Action::CancelSearch,
+            ),
+            (ActiveJobKind::Index, false, "Cancel", Action::Cancel),
+        ] {
+            assert_eq!(kind.cancel_action(), expected);
+            assert_eq!(kind.cancel_label(saving_in_place), label);
+            let display = ActiveJobDisplay {
+                label: "Working · 50.0%".into(),
+                fraction: 0.5,
+                animate: false,
+                cancel_action: kind.cancel_action(),
+                cancel_label: kind.cancel_label(saving_in_place),
+                cancel_enabled: true,
+            };
+            let action = click_accessible_button(label, |ui| active_job_controls(ui, &display));
+            assert_eq!(action, Some(expected));
+        }
+    }
+
+    #[test]
+    fn active_job_priority_is_deterministic() {
+        for (active, expected) in [
+            ([false; 6], None),
+            (
+                [true, true, true, true, true, true],
+                Some(ActiveJobKind::Structural),
+            ),
+            (
+                [false, true, true, true, true, true],
+                Some(ActiveJobKind::Save),
+            ),
+            (
+                [false, false, true, true, true, true],
+                Some(ActiveJobKind::Export),
+            ),
+            (
+                [false, false, false, true, true, true],
+                Some(ActiveJobKind::Filter),
+            ),
+            (
+                [false, false, false, false, true, true],
+                Some(ActiveJobKind::Search),
+            ),
+            (
+                [false, false, false, false, false, true],
+                Some(ActiveJobKind::Index),
+            ),
+        ] {
+            assert_eq!(first_active_job(active), expected);
+        }
     }
 
     #[test]
@@ -11659,8 +11844,9 @@ mod tests {
             b"name\noverlay x x\nsource x\n"
         );
         assert!(document.is_dirty());
+        assert!(app.notice.is_none());
         assert_eq!(
-            app.notice.as_deref(),
+            app.footer_status.as_deref(),
             Some("Replaced 3 occurrences. Save to keep it, or discard changes.")
         );
 
