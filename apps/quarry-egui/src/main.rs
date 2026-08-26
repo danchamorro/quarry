@@ -255,6 +255,8 @@ struct QuarryApp {
     find_input: String,
     replace_input: String,
     find_match_case: bool,
+    find_bar_open: bool,
+    replace_expanded: bool,
     filter_match_case: bool,
     sort_match_case: bool,
     column_search_input: String,
@@ -372,6 +374,8 @@ impl QuarryApp {
             find_input: String::new(),
             replace_input: String::new(),
             find_match_case: false,
+            find_bar_open: false,
+            replace_expanded: false,
             filter_match_case: false,
             sort_match_case: false,
             column_search_input: String::new(),
@@ -457,6 +461,8 @@ impl QuarryApp {
         self.jump_input = "1".into();
         self.column_search_input.clear();
         self.columns_open = false;
+        self.find_bar_open = false;
+        self.replace_expanded = false;
         self.structural_dialog = None;
         self.filter_rules = vec![FilterRuleDraft::default()];
         self.filters_open = false;
@@ -747,6 +753,10 @@ impl QuarryApp {
             }
             Action::Jump => parse_data_row(&self.jump_input, document.data_start)
                 .and_then(|start| document.navigate(start)),
+            Action::FindPrevious => document.start_find_previous_with_case(
+                self.find_input.as_bytes(),
+                case_sensitivity(self.find_match_case),
+            ),
             Action::FindNext => document.start_find_next_with_case(
                 self.find_input.as_bytes(),
                 case_sensitivity(self.find_match_case),
@@ -812,7 +822,8 @@ impl QuarryApp {
         if result.is_ok()
             && matches!(
                 action,
-                Action::FindNext
+                Action::FindPrevious
+                    | Action::FindNext
                     | Action::ReplaceCurrent
                     | Action::ReplaceAll
                     | Action::ApplyFilter
@@ -825,7 +836,13 @@ impl QuarryApp {
                     | Action::Cancel
             )
         {
-            self.footer_status = None;
+            self.footer_status = if matches!(action, Action::FindPrevious | Action::FindNext)
+                && document.search_job.is_none()
+            {
+                document.search_status.clone()
+            } else {
+                None
+            };
         }
         self.notice = result.err();
     }
@@ -1262,6 +1279,9 @@ impl eframe::App for QuarryApp {
                         if let Some(mut document) = self.document.take() {
                             document.shutdown();
                         }
+                        self.find_bar_open = false;
+                        self.replace_expanded = false;
+                        surrender_find_controls_focus(ctx);
                         self.path_input = destination.to_string_lossy().into_owned();
                         self.footer_status = None;
                         self.notice = Some(format!(
@@ -1320,6 +1340,23 @@ impl eframe::App for QuarryApp {
                     self.close_confirmation_open = true;
                 }
             }
+        }
+
+        let find_available = self
+            .document
+            .as_ref()
+            .is_some_and(|document| !document.filter_active());
+        let mut focus_find = false;
+        if find_available
+            && !self.close_confirmation_open
+            && self.structural_dialog.is_none()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F))
+        {
+            self.find_bar_open = true;
+            focus_find = true;
+        }
+        if !self.find_bar_open {
+            surrender_find_controls_focus(ctx);
         }
 
         let mut action = None;
@@ -1549,29 +1586,20 @@ impl eframe::App for QuarryApp {
                         if let Some(copy_action) = copy_control(ui, document.selection.is_some()) {
                             action = Some(copy_action);
                         }
+                        let find_disabled_reason = "Clear the filter before using Find.";
+                        let find = ui
+                            .add_enabled(!filter_active, egui::Button::new("Find"))
+                            .on_disabled_hover_text(find_disabled_reason);
+                        if filter_active {
+                            let _ = ui.ctx().accesskit_node_builder(find.id, |node| {
+                                node.set_description(find_disabled_reason);
+                            });
+                        }
+                        if find.clicked() {
+                            self.find_bar_open = true;
+                            focus_find = true;
+                        }
                     });
-                    ui.add_space(2.0);
-                    if document.filter_active() {
-                        if let Some(export_action) = filtered_export_controls(ui, document) {
-                            action = Some(export_action);
-                        }
-                    } else {
-                        let can_replace = document.can_replace_current_with_case(
-                            self.find_input.as_bytes(),
-                            case_sensitivity(self.find_match_case),
-                        );
-                        if let Some(search_action) = search_controls(
-                            ui,
-                            &mut self.find_input,
-                            &mut self.replace_input,
-                            &mut self.find_match_case,
-                            document.is_search_ready(),
-                            can_replace,
-                            document.search_job.is_some(),
-                        ) {
-                            action = Some(search_action);
-                        }
-                    }
                 }
 
                 if let Some(notice) = &self.notice {
@@ -1579,6 +1607,69 @@ impl eframe::App for QuarryApp {
                     ui.colored_label(Color32::from_rgb(171, 65, 53), notice);
                 }
             });
+
+        if self.find_bar_open {
+            let mut close_find = false;
+            let find_escape_allowed = !self.columns_open
+                && !self.filters_open
+                && !self.close_confirmation_open
+                && self.structural_dialog.is_none()
+                && self.document.as_ref().is_none_or(|document| {
+                    document.cell_edit.is_none() && document.header_edit.is_none()
+                });
+            egui::TopBottomPanel::top("quarry-find")
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(238, 242, 244))
+                        .inner_margin(egui::Margin::symmetric(10, 5))
+                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 209, 213))),
+                )
+                .show(ctx, |ui| {
+                    if focus_find {
+                        ui.memory_mut(|memory| {
+                            memory.request_focus(egui::Id::new(FIND_INPUT_ID));
+                        });
+                    }
+                    if let Some(document) = self.document.as_ref() {
+                        let can_find_previous = document.can_find_previous_with_case(
+                            self.find_input.as_bytes(),
+                            case_sensitivity(self.find_match_case),
+                        );
+                        let can_replace = document.can_replace_current_with_case(
+                            self.find_input.as_bytes(),
+                            case_sensitivity(self.find_match_case),
+                        );
+                        let (search_action, close_requested) = search_controls(
+                            ui,
+                            &mut self.find_input,
+                            &mut self.replace_input,
+                            &mut self.find_match_case,
+                            &mut self.replace_expanded,
+                            document.is_search_ready(),
+                            can_find_previous,
+                            can_replace,
+                            document.search_job.is_some(),
+                            document.filter_active(),
+                        );
+                        if let Some(search_action) = search_action {
+                            action = Some(search_action);
+                        }
+                        let escape_pressed =
+                            ctx.input(|input| input.key_pressed(egui::Key::Escape));
+                        close_find = close_requested && (find_escape_allowed || !escape_pressed);
+                        if close_find && escape_pressed {
+                            ctx.input_mut(|input| {
+                                let modifiers = input.modifiers;
+                                input.consume_key(modifiers, egui::Key::Escape);
+                            });
+                        }
+                    }
+                });
+            if close_find {
+                self.find_bar_open = false;
+                surrender_find_controls_focus(ctx);
+            }
+        }
 
         egui::TopBottomPanel::bottom("quarry-status")
             .exact_height(STATUS_BAR_HEIGHT)
@@ -1850,6 +1941,7 @@ enum Action {
     ChooseFilteredExport,
     DiscardChanges,
     Jump,
+    FindPrevious,
     FindNext,
     ReplaceCurrent,
     ReplaceAll,
@@ -2234,6 +2326,21 @@ fn surrender_filter_text_focus(ctx: &egui::Context, filter_rule_count: usize) {
     if let Some(focused) =
         focused.filter(|focused| is_filter_text_input(*focused, filter_rule_count))
     {
+        ctx.memory_mut(|memory| memory.surrender_focus(focused));
+    }
+}
+
+fn find_controls_have_focus(ctx: &egui::Context) -> bool {
+    ctx.memory(|memory| {
+        memory.focused().is_some_and(|focused| {
+            focused == egui::Id::new(FIND_INPUT_ID) || focused == egui::Id::new(REPLACE_INPUT_ID)
+        })
+    })
+}
+
+fn surrender_find_controls_focus(ctx: &egui::Context) {
+    let focused = ctx.memory(|memory| memory.focused());
+    if let Some(focused) = focused.filter(|_| find_controls_have_focus(ctx)) {
         ctx.memory_mut(|memory| memory.surrender_focus(focused));
     }
 }
@@ -2829,15 +2936,32 @@ fn show_filter_manager(
             }
 
             ui.add_space(8.0);
-            if ui
-                .add_enabled(
-                    document.filter_active() && document.export_job.is_none(),
-                    egui::Button::new("Clear filter"),
-                )
-                .clicked()
-            {
-                action = Some(Action::ClearFilter);
-            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        document.filter_active() && document.export_job.is_none(),
+                        egui::Button::new("Clear filter"),
+                    )
+                    .clicked()
+                {
+                    action = Some(Action::ClearFilter);
+                }
+                if document.filter_active()
+                    && ui
+                        .add_enabled(
+                            document.is_filtered_export_ready() && !document.is_dirty(),
+                            egui::Button::new("Export Filtered Rows…"),
+                        )
+                        .on_hover_text(if document.is_dirty() {
+                            "Save or discard your changes before exporting filtered rows."
+                        } else {
+                            "Export all matching rows to a new file"
+                        })
+                        .clicked()
+                {
+                    action = Some(Action::ChooseFilteredExport);
+                }
+            });
         });
     action
 }
@@ -2896,91 +3020,133 @@ fn search_controls(
     query: &mut String,
     replacement: &mut String,
     match_case: &mut bool,
+    replace_expanded: &mut bool,
     index_ready: bool,
+    can_find_previous: bool,
     can_replace: bool,
     searching: bool,
-) -> Option<Action> {
+    filter_active: bool,
+) -> (Option<Action>, bool) {
     let mut action = None;
+    let mut close_requested = false;
     ui.horizontal(|ui| {
         let label = ui.label("Find (literal)");
+        let input_id = egui::Id::new(FIND_INPUT_ID);
         let input = ui
             .add_enabled(
-                !searching,
+                !searching && !filter_active,
                 egui::TextEdit::singleline(query)
-                    .id(egui::Id::new(FIND_INPUT_ID))
+                    .id(input_id)
                     .hint_text("Text to find")
                     .desired_width(180.0),
             )
             .labelled_by(label.id);
-        let can_find = index_ready && !searching && !query.is_empty();
-        let can_replace_all = index_ready && !query.is_empty() && query != replacement;
+        if (input.has_focus() || input.lost_focus() && !input.clicked_elsewhere())
+            && ui.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            close_requested = true;
+        }
+        let can_find = index_ready && !searching && !filter_active && !query.is_empty();
+        let enter_pressed =
+            input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        let previous_shortcut = enter_pressed && ui.input(|input| input.modifiers.shift);
+        let next_shortcut = enter_pressed && !ui.input(|input| input.modifiers.shift);
+        if ui
+            .add_enabled(
+                can_find && can_find_previous,
+                egui::Button::new("Find Previous"),
+            )
+            .on_disabled_hover_text("Find another match before moving back.")
+            .clicked()
+            || (can_find && can_find_previous && previous_shortcut)
+        {
+            action = Some(Action::FindPrevious);
+        }
         if ui
             .add_enabled(can_find, egui::Button::new("Find Next"))
             .clicked()
-            || (can_find
-                && input.lost_focus()
-                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            || (can_find && next_shortcut)
         {
             action = Some(Action::FindNext);
         }
 
-        let label = ui.label("Replace with (literal)");
-        let input = ui
-            .add_enabled(
-                !searching,
-                egui::TextEdit::singleline(replacement)
-                    .id(egui::Id::new(REPLACE_INPUT_ID))
-                    .hint_text("Replacement text")
-                    .desired_width(180.0),
-            )
-            .labelled_by(label.id);
-        let can_replace = can_replace && !searching;
-        if ui
-            .add_enabled(can_replace, egui::Button::new("Replace in Cell"))
-            .clicked()
-            || (can_replace
-                && input.lost_focus()
-                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-        {
-            action = Some(Action::ReplaceCurrent);
+        ui.add_enabled(
+            !searching && !filter_active,
+            egui::Checkbox::new(match_case, "Match case"),
+        );
+        let was_expanded = *replace_expanded;
+        let replace = ui.add_enabled(
+            !searching && !filter_active,
+            egui::Button::new("Replace").selected(*replace_expanded),
+        );
+        if replace.clicked() {
+            *replace_expanded = !*replace_expanded;
         }
-        if ui
-            .add_enabled(
-                can_replace_all && !searching,
-                egui::Button::new("Replace All"),
-            )
-            .clicked()
-        {
-            action = Some(Action::ReplaceAll);
-        }
-
-        ui.add_enabled(!searching, egui::Checkbox::new(match_case, "Match case"));
-    });
-    action
-}
-
-fn filtered_export_controls(ui: &mut egui::Ui, document: &Document) -> Option<Action> {
-    if !document.filter_active() {
-        return None;
-    }
-    let mut action = None;
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                document.is_filtered_export_ready() && !document.is_dirty(),
-                egui::Button::new("Export Filtered Rows…"),
-            )
-            .on_hover_text(if document.is_dirty() {
-                "Save or discard your changes before exporting filtered rows."
+        let _ = ui.ctx().accesskit_node_builder(replace.id, |node| {
+            node.set_toggled(if *replace_expanded {
+                egui::accesskit::Toggled::True
             } else {
-                "Export all matching rows to a new file"
-            })
-            .clicked()
-        {
-            action = Some(Action::ChooseFilteredExport);
+                egui::accesskit::Toggled::False
+            });
+        });
+        if was_expanded && !*replace_expanded {
+            ui.memory_mut(|memory| {
+                memory.surrender_focus(egui::Id::new(REPLACE_INPUT_ID));
+            });
+        }
+        if ui.button("Close find").clicked() {
+            close_requested = true;
         }
     });
-    action
+
+    if *replace_expanded {
+        ui.horizontal(|ui| {
+            let label = ui.label("Replace with (literal)");
+            let input_id = egui::Id::new(REPLACE_INPUT_ID);
+            let input = ui
+                .add_enabled(
+                    !searching && !filter_active,
+                    egui::TextEdit::singleline(replacement)
+                        .id(input_id)
+                        .hint_text("Replacement text")
+                        .desired_width(180.0),
+                )
+                .labelled_by(label.id);
+            if (input.has_focus() || input.lost_focus() && !input.clicked_elsewhere())
+                && ui.input(|input| input.key_pressed(egui::Key::Escape))
+            {
+                close_requested = true;
+            }
+            let can_replace = can_replace && !searching && !filter_active;
+            if ui
+                .add_enabled(can_replace, egui::Button::new("Replace in Cell"))
+                .on_disabled_hover_text("Use Find Next or Find Previous to select a match first.")
+                .clicked()
+                || (can_replace
+                    && input.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                action = Some(Action::ReplaceCurrent);
+            }
+            if ui
+                .add_enabled(
+                    index_ready
+                        && !searching
+                        && !filter_active
+                        && !query.is_empty()
+                        && query != replacement,
+                    egui::Button::new("Replace All"),
+                )
+                .clicked()
+            {
+                action = Some(Action::ReplaceAll);
+            }
+        });
+    }
+    if filter_active {
+        ui.small("Clear the filter before using Find.");
+    }
+    (action, close_requested)
 }
 
 fn filtered_export_file_name(source: &Path) -> String {
@@ -3261,6 +3427,8 @@ struct Document {
     search_query: Vec<u8>,
     search_case_sensitivity: CaseSensitivity,
     last_match: Option<SearchMatch>,
+    search_history: Vec<SearchMatch>,
+    search_history_index: Option<usize>,
     search_status: Option<String>,
     filter_job: Option<FilterJob>,
     filter_index: Option<FilterIndex>,
@@ -3392,6 +3560,8 @@ impl Document {
             search_query: Vec::new(),
             search_case_sensitivity: CaseSensitivity::Insensitive,
             last_match: None,
+            search_history: Vec::new(),
+            search_history_index: None,
             search_status: None,
             filter_job: None,
             filter_index: None,
@@ -4222,7 +4392,7 @@ impl Document {
             return Err("Enter text to find.".into());
         }
         if self.filter_active() {
-            return Err("Clear the filter before using Find Next.".into());
+            return Err("Clear the filter before using Find.".into());
         }
         if self.search_job.is_some() {
             return Err("A search is already running.".into());
@@ -4236,6 +4406,14 @@ impl Document {
             self.search_query.extend_from_slice(query);
             self.search_case_sensitivity = case_sensitivity;
             self.last_match = None;
+            self.search_history.clear();
+            self.search_history_index = None;
+        }
+        if let Some(index) = self.search_history_index
+            && let Some(found) = self.search_history.get(index.saturating_add(1)).copied()
+        {
+            self.search_history_index = Some(index + 1);
+            return self.show_search_match(found);
         }
         let position = self.last_match.as_ref().map_or(
             SearchPosition {
@@ -4264,6 +4442,38 @@ impl Document {
         Ok(())
     }
 
+    fn can_find_previous_with_case(&self, query: &[u8], case_sensitivity: CaseSensitivity) -> bool {
+        !query.is_empty()
+            && self.search_job.is_none()
+            && !self.filter_active()
+            && self.is_search_ready()
+            && self.search_query == query
+            && self.search_case_sensitivity == case_sensitivity
+            && match self.search_history_index {
+                Some(index) => index > 0,
+                None => !self.search_history.is_empty(),
+            }
+    }
+
+    fn start_find_previous_with_case(
+        &mut self,
+        query: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<(), String> {
+        self.commit_edits();
+        if !self.can_find_previous_with_case(query, case_sensitivity) {
+            return Err("Find at least two matches before moving back.".into());
+        }
+        let index = self.search_history_index.map_or_else(
+            || self.search_history.len().checked_sub(1),
+            |index| index.checked_sub(1),
+        );
+        let index = index.expect("a previous match was checked above");
+        let found = self.search_history[index];
+        self.search_history_index = Some(index);
+        self.show_search_match(found)
+    }
+
     #[cfg(test)]
     fn can_replace_current(&self, query: &[u8]) -> bool {
         self.can_replace_current_with_case(query, CaseSensitivity::Insensitive)
@@ -4288,10 +4498,13 @@ impl Document {
         let Some(found) = self.last_match.as_ref() else {
             return false;
         };
-        self.reveal_cell == Some((found.row, found.column))
-            && self
-                .effective_cell(found.row, found.column)
-                .is_some_and(|value| literal_contains(value, query, case_sensitivity))
+        matches!(
+            self.selection,
+            Some(GridSelection::Cell { row, column })
+                if row == found.row && column == found.column
+        ) && self
+            .effective_cell(found.row, found.column)
+            .is_some_and(|value| literal_contains(value, query, case_sensitivity))
     }
 
     #[cfg(test)]
@@ -4336,7 +4549,28 @@ impl Document {
             row: found.row,
             column: found.column,
         });
+        if let Some(index) = self.search_history_index.take() {
+            self.search_history.truncate(index);
+        }
         self.start_find_next_with_case(query, case_sensitivity)
+    }
+
+    fn show_search_match(&mut self, found: SearchMatch) -> Result<(), String> {
+        let row = found.row;
+        let column = found.column;
+        self.navigate(row)?;
+        self.center_column(column);
+        self.reveal_cell = Some((row, column));
+        self.selection = Some(GridSelection::Cell { row, column });
+        self.selected_columns.clear();
+        self.column_selection_anchor = None;
+        self.search_status = Some(format!(
+            "Found row {}, column {}.",
+            row.saturating_sub(self.data_start).saturating_add(1),
+            column.saturating_add(1)
+        ));
+        self.last_match = Some(found);
+        Ok(())
     }
 
     fn poll_search(&mut self) -> Result<(), String> {
@@ -4349,17 +4583,12 @@ impl Document {
         let job = self.search_job.take().expect("search job is present");
         match job.wait().map_err(|error| error.to_string())? {
             SearchOutcome::Match(found) => {
-                let row = found.row;
-                let column = found.column;
-                self.navigate(row)?;
-                self.center_column(column);
-                self.reveal_cell = Some((row, column));
-                self.search_status = Some(format!(
-                    "Found row {}, column {}.",
-                    row.saturating_sub(self.data_start).saturating_add(1),
-                    column.saturating_add(1)
-                ));
-                self.last_match = Some(found);
+                if let Some(index) = self.search_history_index {
+                    self.search_history.truncate(index + 1);
+                }
+                self.search_history.push(found);
+                self.search_history_index = self.search_history.len().checked_sub(1);
+                self.show_search_match(found)?;
             }
             SearchOutcome::NotFound => {
                 self.search_status = Some("No further matches.".into());
@@ -5109,6 +5338,8 @@ impl Document {
         }
         self.search_query.clear();
         self.last_match = None;
+        self.search_history.clear();
+        self.search_history_index = None;
         self.search_status = None;
         self.reveal_cell = None;
     }
@@ -5136,6 +5367,11 @@ impl Document {
         self.cell_edits.clear();
         self.selection = None;
         self.reveal_cell = None;
+        self.search_query.clear();
+        self.last_match = None;
+        self.search_history.clear();
+        self.search_history_index = None;
+        self.search_status = None;
         self.cell_focus_requested = None;
         self.column_focus_requested = None;
         if self.session.path() == self.logical_path {
@@ -7113,12 +7349,12 @@ mod tests {
         SOURCE_CHANGED_NOTICE, SearchMatch, Session, StructuralDialog, StructuralDialogAction,
         WorkingCopyState, active_job_controls, column_drop_position, column_ruler_divider_stroke,
         column_selection_fill, configure_style, copy_control, estimate_sort_temporary_bytes,
-        filtered_export_controls, filtered_export_file_name, first_active_job, footer_range_text,
-        logical_viewport_start, max_viewport_start, page_controls, parse_data_row,
-        parse_file_column, parse_move_position, rendered_column_range, row_for_scroll_fraction,
-        save_as_file_name, scroll_fraction_for_row, search_controls, select_column,
-        selected_split_column, selection_text, show_column_manager, show_filter_manager, show_grid,
-        show_grid_with_filter_case, show_structural_dialog, sort_merge_progress,
+        filtered_export_file_name, first_active_job, footer_range_text, logical_viewport_start,
+        max_viewport_start, page_controls, parse_data_row, parse_file_column, parse_move_position,
+        rendered_column_range, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
+        search_controls, select_column, selected_split_column, selection_text, show_column_manager,
+        show_filter_manager, show_grid, show_grid_with_filter_case, show_structural_dialog,
+        sort_merge_progress,
     };
 
     #[test]
@@ -7939,10 +8175,14 @@ mod tests {
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
+        let mut open = true;
+        let mut rules = vec![super::FilterRuleDraft::default()];
+        let mut match_case = false;
         let output = ctx.run(grid_input(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                assert!(filtered_export_controls(ui, &document).is_none());
-            });
+            assert!(
+                show_filter_manager(ctx, &mut open, &mut rules, &mut match_case, &document,)
+                    .is_none()
+            );
         });
         let tree = output
             .platform_output
@@ -7963,12 +8203,40 @@ mod tests {
         assert_eq!(footer_range_text(&document), "Finding matching rows…");
         finish_filter(&mut document);
         assert!(document.is_filtered_export_ready());
-        assert!(matches!(
-            click_accessible_button("Export Filtered Rows…", |ui| {
-                filtered_export_controls(ui, &document)
-            }),
-            Some(Action::ChooseFilteredExport)
-        ));
+        let output = ctx.run(grid_input(), |ctx| {
+            let _ = show_filter_manager(ctx, &mut open, &mut rules, &mut match_case, &document);
+        });
+        let target = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree should be present")
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Export Filtered Rows…")
+                    && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .expect("completed filter should enable filtered export");
+        let mut action = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                action =
+                    show_filter_manager(ctx, &mut open, &mut rules, &mut match_case, &document);
+            },
+        );
+        assert_eq!(action, Some(Action::ChooseFilteredExport));
 
         document.shutdown();
         fs::remove_file(path).unwrap();
@@ -8616,13 +8884,17 @@ mod tests {
         let mut app = QuarryApp::new(None, Instant::now());
         app.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
-        let document = app.document.as_mut().unwrap();
-        document.rename_header(0, "renamed".into()).unwrap();
-        document.start_save().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !document.save_job.as_ref().unwrap().progress().done {
-            assert!(Instant::now() < deadline, "save timed out");
-            std::thread::yield_now();
+        app.find_bar_open = true;
+        app.replace_expanded = true;
+        {
+            let document = app.document.as_mut().unwrap();
+            document.rename_header(0, "renamed".into()).unwrap();
+            document.start_save().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !document.save_job.as_ref().unwrap().progress().done {
+                assert!(Instant::now() < deadline, "save timed out");
+                std::thread::yield_now();
+            }
         }
         fs::rename(&path, &moved).unwrap();
 
@@ -8632,6 +8904,8 @@ mod tests {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
         assert!(app.document.is_none());
+        assert!(!app.find_bar_open);
+        assert!(!app.replace_expanded);
         assert!(
             app.notice
                 .as_deref()
@@ -11197,6 +11471,7 @@ mod tests {
             matches!(command, egui::OutputCommand::CopyText(text) if text == "line one\nline two")
         }));
 
+        app.find_bar_open = true;
         ctx.memory_mut(|memory| {
             memory.request_focus(egui::Id::new(FIND_INPUT_ID));
         });
@@ -11256,6 +11531,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut app = QuarryApp::new(None, Instant::now());
+        app.find_bar_open = true;
+        app.replace_expanded = true;
         app.replace_input = "copy this".into();
         app.document = Some(document);
         let mut frame = eframe::Frame::_new_kittest();
@@ -11398,42 +11675,7 @@ mod tests {
         let mut query = "needle".to_owned();
         let mut replacement = "replacement".to_owned();
         let mut match_case = false;
-        let find = click_accessible_button("Find Next", |ui| {
-            search_controls(
-                ui,
-                &mut query,
-                &mut replacement,
-                &mut match_case,
-                true,
-                false,
-                false,
-            )
-        });
-        assert!(matches!(find, Some(Action::FindNext)));
-        let replace = click_accessible_button("Replace in Cell", |ui| {
-            search_controls(
-                ui,
-                &mut query,
-                &mut replacement,
-                &mut match_case,
-                true,
-                true,
-                false,
-            )
-        });
-        assert!(matches!(replace, Some(Action::ReplaceCurrent)));
-        let replace_all = click_accessible_button("Replace All", |ui| {
-            search_controls(
-                ui,
-                &mut query,
-                &mut replacement,
-                &mut match_case,
-                true,
-                false,
-                false,
-            )
-        });
-        assert!(matches!(replace_all, Some(Action::ReplaceAll)));
+        let mut replace_expanded = false;
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -11444,8 +11686,150 @@ mod tests {
                     &mut query,
                     &mut replacement,
                     &mut match_case,
+                    &mut replace_expanded,
                     true,
                     true,
+                    true,
+                    false,
+                    false,
+                );
+            });
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("collapsed search controls should be accessible");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.label() == Some("Close find")
+        }));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label() == Some("Replace")
+                && node.toggled() == Some(egui::accesskit::Toggled::False)
+        }));
+        assert!(!tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::TextInput && node.value() == Some("replacement")
+        }));
+        let replace_target = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Replace"))
+            .map(|(id, _)| *id)
+            .expect("Replace should be accessible");
+        let output = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: replace_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    search_controls(
+                        ui,
+                        &mut query,
+                        &mut replacement,
+                        &mut match_case,
+                        &mut replace_expanded,
+                        true,
+                        true,
+                        true,
+                        false,
+                        false,
+                    );
+                });
+            },
+        );
+        assert!(replace_expanded);
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("expanding Replace should publish its updated accessibility state");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label() == Some("Replace")
+                && node.toggled() == Some(egui::accesskit::Toggled::True)
+        }));
+
+        let find = click_accessible_button("Find Next", |ui| {
+            search_controls(
+                ui,
+                &mut query,
+                &mut replacement,
+                &mut match_case,
+                &mut replace_expanded,
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .0
+        });
+        assert!(matches!(find, Some(Action::FindNext)));
+        let previous = click_accessible_button("Find Previous", |ui| {
+            search_controls(
+                ui,
+                &mut query,
+                &mut replacement,
+                &mut match_case,
+                &mut replace_expanded,
+                true,
+                true,
+                false,
+                false,
+                false,
+            )
+            .0
+        });
+        assert!(matches!(previous, Some(Action::FindPrevious)));
+        let replace = click_accessible_button("Replace in Cell", |ui| {
+            search_controls(
+                ui,
+                &mut query,
+                &mut replacement,
+                &mut match_case,
+                &mut replace_expanded,
+                true,
+                false,
+                true,
+                false,
+                false,
+            )
+            .0
+        });
+        assert!(matches!(replace, Some(Action::ReplaceCurrent)));
+        let replace_all = click_accessible_button("Replace All", |ui| {
+            search_controls(
+                ui,
+                &mut query,
+                &mut replacement,
+                &mut match_case,
+                &mut replace_expanded,
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .0
+        });
+        assert!(matches!(replace_all, Some(Action::ReplaceAll)));
+
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                search_controls(
+                    ui,
+                    &mut query,
+                    &mut replacement,
+                    &mut match_case,
+                    &mut replace_expanded,
+                    true,
+                    true,
+                    true,
+                    false,
                     false,
                 );
             });
@@ -11462,6 +11846,208 @@ mod tests {
         assert!(tree.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::CheckBox && node.label() == Some("Match case")
         }));
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label() == Some("Replace")
+                && node.toggled() == Some(egui::accesskit::Toggled::True)
+        }));
+    }
+
+    #[test]
+    fn find_bar_shortcuts_are_contextual_and_focus_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("find-shortcuts.csv");
+        fs::write(&path, b"name\nfirst\n").unwrap();
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(path.clone()).unwrap();
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+
+        let _ = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert!(!app.find_bar_open);
+
+        let command = egui::Modifiers::COMMAND;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: command,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(app.find_bar_open);
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new(FIND_INPUT_ID))));
+
+        let path_position = ctx
+            .read_response(egui::Id::new(super::PATH_INPUT_ID))
+            .expect("path input should be rendered")
+            .rect
+            .center();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(path_position),
+                    egui::Event::PointerButton {
+                        pos: path_position,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: path_position,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(app.find_bar_open);
+
+        app.document
+            .as_mut()
+            .unwrap()
+            .begin_cell_edit(1, 0, b"first".to_vec())
+            .unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(FIND_INPUT_ID)));
+        let _ = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(app.find_bar_open);
+        assert!(app.document.as_ref().unwrap().cell_edit.is_none());
+
+        let _ = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(FIND_INPUT_ID)));
+        let _ = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new(FIND_INPUT_ID))));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(!app.find_bar_open);
+        assert!(!ctx.memory(|memory| memory.has_focus(egui::Id::new(FIND_INPUT_ID))));
+
+        app.find_bar_open = true;
+        app.replace_expanded = true;
+        app.open_path(path).unwrap();
+        assert!(!app.find_bar_open);
+        assert!(!app.replace_expanded);
+        app.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn filtered_find_button_explains_why_it_is_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("filtered-find.csv");
+        fs::write(&path, b"name\nfirst\nsecond\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"first".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(&mut document);
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.document = Some(document);
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("filtered toolbar should be accessible");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label() == Some("Find")
+                && node.is_disabled()
+                && node.description() == Some("Clear the filter before using Find.")
+        }));
+
+        let command = egui::Modifiers::COMMAND;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: command,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        assert!(!app.find_bar_open);
+
+        app.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -11589,6 +12175,10 @@ mod tests {
         assert_eq!(document.viewport_start, 25);
         assert_eq!(document.reveal_cell, Some((25, 2)));
         assert_eq!(
+            document.selection,
+            Some(GridSelection::Cell { row: 25, column: 2 })
+        );
+        assert_eq!(
             document.search_status.as_deref(),
             Some("Found row 25, column 3.")
         );
@@ -11598,6 +12188,20 @@ mod tests {
         let second = document.last_match.as_ref().unwrap();
         assert_eq!((second.row, second.column), (30, 1));
         assert_eq!(document.viewport_start, 30);
+
+        document
+            .start_find_previous_with_case(b"needle", CaseSensitivity::Insensitive)
+            .unwrap();
+        let previous = document.last_match.as_ref().unwrap();
+        assert_eq!((previous.row, previous.column), (25, 2));
+        assert_eq!(
+            document.selection,
+            Some(GridSelection::Cell { row: 25, column: 2 })
+        );
+        document.start_find_next(b"needle").unwrap();
+        assert!(document.search_job.is_none());
+        let forward = document.last_match.as_ref().unwrap();
+        assert_eq!((forward.row, forward.column), (30, 1));
 
         document.start_find_next(b"fresh").unwrap();
         finish_search(&mut document);
@@ -11644,6 +12248,11 @@ mod tests {
             .start_find_next_with_case(b"needle", CaseSensitivity::Insensitive)
             .unwrap();
         finish_search(&mut document);
+        assert_eq!(
+            document.selection,
+            Some(GridSelection::Cell { row: 1, column: 0 })
+        );
+        document.reveal_cell.take();
         assert!(document.can_replace_current_with_case(b"needle", CaseSensitivity::Insensitive));
         assert!(!document.can_replace_current_with_case(b"needle", CaseSensitivity::Sensitive));
 
@@ -11748,7 +12357,7 @@ mod tests {
             column: 1,
             record_offset: 0,
         });
-        document.reveal_cell = Some((1, 1));
+        document.selection = Some(GridSelection::Cell { row: 1, column: 1 });
         document.cell_edits.insert((1, 1), b"needle".to_vec());
 
         assert!(document.can_replace_current(b"needle"));
