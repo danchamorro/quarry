@@ -12,7 +12,9 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 
-use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, TextStyle};
+use eframe::egui::{
+    self, Align, AtomExt, Color32, FontFamily, FontId, Layout, RichText, TextStyle,
+};
 use egui_extras::{Column, TableBuilder};
 #[cfg(target_os = "macos")]
 use objc2::runtime::{AnyObject, Imp, Sel};
@@ -51,7 +53,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const STATUS_BAR_HEIGHT: f32 = 32.0;
 const STATUS_JOB_WIDTH: f32 = 360.0;
 const STATUS_CANCEL_WIDTH: f32 = 112.0;
-const PATH_INPUT_ID: &str = "quarry-path-input";
+const DOCUMENT_MENU_WIDTH: f32 = 260.0;
 const JUMP_INPUT_ID: &str = "quarry-jump-input";
 const FIND_INPUT_ID: &str = "quarry-find-input";
 const REPLACE_INPUT_ID: &str = "quarry-replace-input";
@@ -250,7 +252,6 @@ fn main() -> eframe::Result<()> {
 }
 
 struct QuarryApp {
-    path_input: String,
     jump_input: String,
     find_input: String,
     replace_input: String,
@@ -364,12 +365,7 @@ impl Default for FilterRuleDraft {
 
 impl QuarryApp {
     fn new(initial_path: Option<PathBuf>, started: Instant) -> Self {
-        let path_input = initial_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let mut app = Self {
-            path_input,
             jump_input: "1".into(),
             find_input: String::new(),
             replace_input: String::new(),
@@ -409,15 +405,15 @@ impl QuarryApp {
         }
     }
 
-    fn open_typed_path(&mut self) {
-        if self.path_input.trim().is_empty() {
-            self.notice = Some("Enter a file path to open.".into());
-            return;
-        }
-        self.open_path_and_report(PathBuf::from(self.path_input.trim()));
+    fn open_path(&mut self, path: PathBuf) -> Result<(), String> {
+        self.open_path_with_options(path, self.open_options())
     }
 
-    fn open_path(&mut self, path: PathBuf) -> Result<(), String> {
+    fn open_path_with_options(
+        &mut self,
+        path: PathBuf,
+        options: OpenOptions,
+    ) -> Result<(), String> {
         if let Some(document) = self.document.as_mut() {
             if document.save_job.is_some() {
                 return Err("Cancel the active save before opening another file.".into());
@@ -440,11 +436,7 @@ impl QuarryApp {
                     .into(),
             );
         }
-        self.replace_document(path)
-    }
-
-    fn replace_document(&mut self, path: PathBuf) -> Result<(), String> {
-        self.replace_document_with_options(path, self.open_options())
+        self.replace_document_with_options(path, options)
     }
 
     fn replace_document_with_options(
@@ -457,7 +449,6 @@ impl QuarryApp {
         if let Some(current) = self.document.as_mut() {
             current.shutdown();
         }
-        self.path_input = path.to_string_lossy().into_owned();
         self.jump_input = "1".into();
         self.column_search_input.clear();
         self.columns_open = false;
@@ -615,6 +606,19 @@ impl QuarryApp {
         self.open_path_and_report(path);
     }
 
+    fn reload_document(&mut self) {
+        let Some((path, options)) = self.document.as_ref().map(|document| {
+            (
+                document.logical_path.clone(),
+                document.current_open_options(),
+            )
+        }) else {
+            self.notice = Some("Open a file first.".into());
+            return;
+        };
+        self.notice = self.open_path_with_options(path, options).err();
+    }
+
     fn handle_dropped_paths(&mut self, dropped: Vec<Option<PathBuf>>) {
         let count = dropped.len();
         let Some(path) = dropped.into_iter().flatten().next() else {
@@ -654,9 +658,9 @@ impl QuarryApp {
             document.commit_edits();
         }
         match action {
-            Action::Open => return self.open_typed_path(),
             Action::Choose => return self.choose_file(),
             Action::Reopen => return self.reopen_document(),
+            Action::ReloadFromDisk => return self.reload_document(),
             Action::ChooseSaveAs => {
                 self.choose_save_as();
                 return;
@@ -731,9 +735,9 @@ impl QuarryApp {
             return;
         }
         let result = match action {
-            Action::Open
-            | Action::Choose
+            Action::Choose
             | Action::Reopen
+            | Action::ReloadFromDisk
             | Action::Save
             | Action::ChooseSaveAs
             | Action::ChooseFilteredExport
@@ -976,7 +980,6 @@ impl QuarryApp {
         }
         current.shutdown();
         self.document = Some(replacement);
-        self.path_input = logical_path.to_string_lossy().into_owned();
         self.columns_open = false;
         self.structural_dialog = None;
         self.notice = None;
@@ -1066,7 +1069,6 @@ impl QuarryApp {
         replacement.working_copy = Some(state);
         current.shutdown();
         self.document = Some(replacement);
-        self.path_input = logical_path.to_string_lossy().into_owned();
         self.structural_dialog = None;
         self.columns_open = false;
         self.notice = None;
@@ -1287,7 +1289,6 @@ impl eframe::App for QuarryApp {
                         self.find_bar_open = false;
                         self.replace_expanded = false;
                         surrender_find_controls_focus(ctx);
-                        self.path_input = destination.to_string_lossy().into_owned();
                         self.footer_status = None;
                         self.notice = Some(format!(
                             "Saved {} but could not reload it: {error}. Reopen the file to continue.",
@@ -1377,47 +1378,8 @@ impl eframe::App for QuarryApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let export_active = self.document.as_ref().is_some_and(|document| {
-                        document.export_job.is_some()
-                            || document.save_job.is_some()
-                            || document.structural_job.is_some()
-                    });
-                    let dirty = self.document.as_ref().is_some_and(Document::is_dirty);
-                    let label = ui.label("File");
-                    let width = (ui.available_width() - 168.0).max(200.0);
-                    let response = ui
-                        .add_sized(
-                            [width, 24.0],
-                            egui::TextEdit::singleline(&mut self.path_input)
-                                .id(egui::Id::new(PATH_INPUT_ID))
-                                .hint_text("/path/to/file.csv"),
-                        )
-                        .labelled_by(label.id);
-                    if ui
-                        .add_enabled(!export_active && !dirty, egui::Button::new("Choose…"))
-                        .on_disabled_hover_text(if dirty {
-                            "Discard or save your changes before opening another file."
-                        } else {
-                            "Cancel the active export and wait for it to finish first."
-                        })
-                        .clicked()
-                    {
-                        action = Some(Action::Choose);
-                    }
-                    if ui
-                        .add_enabled(!export_active && !dirty, egui::Button::new("Open"))
-                        .on_disabled_hover_text(if dirty {
-                            "Discard or save your changes before opening another file."
-                        } else {
-                            "Cancel the active export and wait for it to finish first."
-                        })
-                        .clicked()
-                        || (!export_active
-                            && !dirty
-                            && response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                    {
-                        action = Some(Action::Open);
+                    if let Some(document_action) = document_menu(ui, self.document.as_ref()) {
+                        action = Some(document_action);
                     }
                 });
                 ui.add_space(2.0);
@@ -1473,43 +1435,6 @@ impl eframe::App for QuarryApp {
                         .clicked()
                     {
                         action = Some(Action::Reopen);
-                    }
-                    if let Some(document) = self.document.as_ref()
-                        && ui
-                            .add_enabled(document.is_save_ready(), egui::Button::new("Save"))
-                            .on_hover_text("Save changes to this file (⌘S)")
-                            .on_disabled_hover_text(
-                                "Make a change, or wait for the active file operation to finish.",
-                            )
-                            .clicked()
-                    {
-                        action = Some(Action::Save);
-                    }
-                    if let Some(document) = self
-                        .document
-                        .as_ref()
-                        .filter(|document| document.is_dirty())
-                    {
-                        if ui
-                            .add_enabled(document.is_save_ready(), egui::Button::new("Save As…"))
-                            .on_disabled_hover_text("Wait for the active file operation to finish.")
-                            .clicked()
-                        {
-                            action = Some(Action::ChooseSaveAs);
-                        }
-                        if ui
-                            .add_enabled(
-                                document.save_job.is_none()
-                                    && document.structural_job.is_none(),
-                                egui::Button::new("Discard Changes"),
-                            )
-                            .on_disabled_hover_text(
-                                "Wait for the active file operation to finish.",
-                            )
-                            .clicked()
-                        {
-                            action = Some(Action::DiscardChanges);
-                        }
                     }
                 });
 
@@ -1671,7 +1596,7 @@ impl eframe::App for QuarryApp {
                         action = Some(footer_action);
                     }
                 } else {
-                    ui.label("No file open · pass a path or paste one above");
+                    ui.label("No file open");
                 }
             });
 
@@ -1910,9 +1835,9 @@ fn header_mode_label(mode: HeaderMode) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
-    Open,
     Choose,
     Reopen,
+    ReloadFromDisk,
     Save,
     PageUp,
     PageDown,
@@ -2274,6 +2199,140 @@ fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) 
     action
 }
 
+fn document_menu(ui: &mut egui::Ui, document: Option<&Document>) -> Option<Action> {
+    let document_open = document.is_some();
+    let dirty = document.is_some_and(Document::is_dirty);
+    let file_operation_active = document.is_some_and(|document| {
+        document.export_job.is_some()
+            || document.save_job.is_some()
+            || document.structural_job.is_some()
+    });
+    let save_ready = document.is_some_and(Document::is_save_ready);
+    let discard_ready = document.is_some_and(|document| {
+        document.is_dirty() && document.save_job.is_none() && document.structural_job.is_none()
+    });
+    let (filename, full_path) = document.map_or_else(
+        || ("File".to_owned(), None),
+        |document| {
+            (
+                document.logical_path.file_name().map_or_else(
+                    || document.logical_path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
+                Some(document.logical_path.display().to_string()),
+            )
+        },
+    );
+    let marker = RichText::new("●").color(if dirty {
+        QUARRY_YELLOW_TEXT
+    } else {
+        Color32::TRANSPARENT
+    });
+    let arrow_id = ui.id().with("document-menu-arrow");
+    let button = egui::Button::new((marker, RichText::new(filename.clone()).atom_shrink(true)))
+        .right_text(egui::Atom::custom(arrow_id, egui::vec2(10.0, 10.0)))
+        .min_size(egui::vec2(DOCUMENT_MENU_WIDTH, 24.0))
+        .truncate();
+    let direction = ui.layout().main_dir();
+    let rendered = ui
+        .allocate_ui_with_layout(
+            egui::vec2(DOCUMENT_MENU_WIDTH, 24.0),
+            Layout::centered_and_justified(direction),
+            |ui| button.atom_ui(ui),
+        )
+        .inner;
+    if let Some(rect) = rendered.rect(arrow_id) {
+        let mut arrow = rendered.response.clone();
+        arrow.rect = rect;
+        egui::collapsing_header::paint_default_icon(ui, 1.0, &arrow);
+    }
+    let response = rendered.response;
+    let menu = egui::Popup::menu(&response).show(|ui| {
+        ui.set_min_width(190.0);
+        let mut action = None;
+        let open = ui
+            .add_enabled(!file_operation_active && !dirty, egui::Button::new("Open…"))
+            .on_disabled_hover_text(if dirty {
+                "Discard or save your changes before opening another file."
+            } else {
+                "Cancel the active export and wait for it to finish first."
+            });
+        if open.clicked() {
+            action = Some(Action::Choose);
+        }
+        let reload = ui
+            .add_enabled(
+                document_open && !file_operation_active && !dirty,
+                egui::Button::new("Reload from Disk"),
+            )
+            .on_disabled_hover_text(if !document_open {
+                "Open a file first."
+            } else if dirty {
+                "Discard or save your changes before reloading the file."
+            } else {
+                "Cancel the active file operation and wait for it to finish first."
+            });
+        if reload.clicked() {
+            action = Some(Action::ReloadFromDisk);
+        }
+        ui.separator();
+        let save = ui
+            .add_enabled(save_ready, egui::Button::new("Save"))
+            .on_hover_text("Save changes to this file (⌘S)")
+            .on_disabled_hover_text(
+                "Make a change, or wait for the active file operation to finish.",
+            );
+        if save.clicked() {
+            action = Some(Action::Save);
+        }
+        let save_as = ui
+            .add_enabled(save_ready, egui::Button::new("Save As…"))
+            .on_disabled_hover_text(if !document_open {
+                "Open a file before using Save As."
+            } else if !dirty {
+                "Make a change before using Save As."
+            } else {
+                "Wait for the active file operation to finish."
+            });
+        if save_as.clicked() {
+            action = Some(Action::ChooseSaveAs);
+        }
+        let discard = ui
+            .add_enabled(discard_ready, egui::Button::new("Discard Changes"))
+            .on_disabled_hover_text(if !document_open {
+                "Open a file first."
+            } else if !dirty {
+                "There are no changes to discard."
+            } else {
+                "Wait for the active file operation to finish."
+            });
+        if discard.clicked() {
+            action = Some(Action::DiscardChanges);
+        }
+        action
+    });
+    let accessibility_label = if document_open {
+        format!("File menu: {filename}")
+    } else {
+        "File menu".to_owned()
+    };
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessibility_label.clone())
+    });
+    if let Some(full_path) = full_path {
+        let description = if dirty {
+            format!("Modified file at {full_path}")
+        } else {
+            full_path.clone()
+        };
+        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_description(description);
+        });
+        let _ = response.on_hover_text(full_path);
+    }
+    menu.and_then(|inner| inner.inner)
+}
+
 fn page_controls(ui: &mut egui::Ui) -> Option<Action> {
     let page_up = ui.button("Page Up").clicked();
     let page_down = ui.button("Page Down").clicked();
@@ -2346,7 +2405,6 @@ fn selection_copy_requested(
     let text_input_focused = ctx.memory(|memory| {
         memory.focused().is_some_and(|focused| {
             [
-                PATH_INPUT_ID,
                 JUMP_INPUT_ID,
                 FIND_INPUT_ID,
                 REPLACE_INPUT_ID,
@@ -7378,6 +7436,146 @@ mod tests {
         assert_eq!(style.visuals.hyperlink_color, super::QUARRY_YELLOW_TEXT);
     }
 
+    #[test]
+    fn document_menu_is_bounded_accessible_and_reflects_dirty_state() {
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let (menu_id, menu_node) = accessible_button(&output, "File menu");
+        assert!(menu_node.supports_action(egui::accesskit::Action::Click));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: menu_id,
+                        data: None,
+                    },
+                )],
+                ..grid_input_with_width(860.0)
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        for label in [
+            "Open…",
+            "Reload from Disk",
+            "Save",
+            "Save As…",
+            "Discard Changes",
+        ] {
+            let (_, node) = accessible_button(&output, label);
+            assert_eq!(!node.is_disabled(), label == "Open…");
+        }
+
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let filename = format!(
+            "quarry-document-menu-{}-{name}.csv",
+            "very-long-filename-".repeat(7)
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(&filename);
+        fs::write(&path, b"name,value\nfirst,1\n").unwrap();
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(path.clone()).unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let document_label = format!("File menu: {filename}");
+        let (menu_id, menu_node) = accessible_button(&output, &document_label);
+        let clean_bounds = menu_node
+            .bounds()
+            .expect("document menu should have bounds");
+        let menu_width = clean_bounds.x1 - clean_bounds.x0;
+        assert!(
+            menu_width <= super::DOCUMENT_MENU_WIDTH as f64 + 1.0,
+            "document menu width was {menu_width}"
+        );
+        assert_eq!(
+            menu_node.description(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: menu_id,
+                        data: None,
+                    },
+                )],
+                ..grid_input_with_width(860.0)
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        for label in ["Open…", "Reload from Disk"] {
+            assert!(!accessible_button(&output, label).1.is_disabled());
+        }
+        for label in ["Save", "Save As…", "Discard Changes"] {
+            assert!(accessible_button(&output, label).1.is_disabled());
+        }
+
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "changed".into())
+            .unwrap();
+        let dirty_ctx = egui::Context::default();
+        dirty_ctx.enable_accesskit();
+        let output = dirty_ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let (menu_id, menu_node) = accessible_button(&output, &document_label);
+        assert_eq!(menu_node.bounds(), Some(clean_bounds));
+        let modified_description = format!("Modified file at {}", path.display());
+        assert_eq!(menu_node.description(), Some(modified_description.as_str()));
+        let _ = dirty_ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: menu_id,
+                        data: None,
+                    },
+                )],
+                ..grid_input_with_width(860.0)
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        let output = dirty_ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        for label in ["Open…", "Reload from Disk"] {
+            assert!(accessible_button(&output, label).1.is_disabled());
+        }
+        for label in ["Save", "Save As…", "Discard Changes"] {
+            assert!(!accessible_button(&output, label).1.is_disabled());
+        }
+
+        app.document.as_mut().unwrap().shutdown();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn app_install_lock_excludes_bundle_replacement() {
@@ -7402,6 +7600,24 @@ mod tests {
         assert!(acquired.success());
     }
 
+    fn accessible_button<'a>(
+        output: &'a egui::FullOutput,
+        label: &str,
+    ) -> (egui::accesskit::NodeId, &'a egui::accesskit::Node) {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree should be present")
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.label() == Some(label)
+            })
+            .map(|(id, node)| (*id, node))
+            .unwrap_or_else(|| panic!("{label} is not an accessible button"))
+    }
+
     fn click_accessible_button(
         label: &str,
         mut render: impl FnMut(&mut egui::Ui) -> Option<Action>,
@@ -7414,19 +7630,8 @@ mod tests {
                 action = render(ui);
             });
         });
-        let target = output
-            .platform_output
-            .accesskit_update
-            .expect("accessibility tree should be present")
-            .nodes
-            .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.label() == Some(label)
-                    && node.supports_action(egui::accesskit::Action::Click)
-            })
-            .map(|(id, _)| *id)
-            .unwrap_or_else(|| panic!("{label} is not an accessible button"));
+        let (target, node) = accessible_button(&output, label);
+        assert!(node.supports_action(egui::accesskit::Action::Click));
 
         let _ = ctx.run(
             egui::RawInput {
@@ -8695,19 +8900,28 @@ mod tests {
         let output = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
-        let save_button = output
-            .platform_output
-            .accesskit_update
-            .expect("accessibility tree should be present")
-            .nodes
-            .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.label() == Some("Save")
-                    && node.supports_action(egui::accesskit::Action::Click)
-            })
-            .map(|(id, _)| *id)
-            .expect("Save should be an accessible button");
+        let filename = path.file_name().unwrap().to_string_lossy();
+        let (document_menu, _) = accessible_button(&output, &format!("File menu: {filename}"));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: document_menu,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            },
+        );
+        let output = ctx.run(grid_input(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let (save_button, save_node) = accessible_button(&output, "Save");
+        assert!(!save_node.is_disabled());
         let _ = ctx.run(
             egui::RawInput {
                 events: vec![egui::Event::AccessKitActionRequest(
@@ -8971,7 +9185,7 @@ mod tests {
 
         app.apply(&ctx, Action::DiscardChanges);
         fs::rename(&moved, &path).unwrap();
-        app.reopen_document();
+        app.reload_document();
         let document = app.document.as_ref().unwrap();
         assert!(!document.source_changed);
         assert!(!document.is_dirty());
@@ -10762,7 +10976,7 @@ mod tests {
             .path()
             .to_path_buf();
         let document = app.document.as_ref().unwrap();
-        assert_eq!(app.path_input, source.to_string_lossy());
+        assert_eq!(document.logical_path, source);
         assert_ne!(document.session.path(), source);
         assert_eq!(document.total_columns, 3);
         assert_eq!(
@@ -11916,8 +12130,8 @@ mod tests {
         assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new(FIND_INPUT_ID))));
 
         let path_position = ctx
-            .read_response(egui::Id::new(super::PATH_INPUT_ID))
-            .expect("path input should be rendered")
+            .read_response(egui::Id::new(super::JUMP_INPUT_ID))
+            .expect("data row input should be rendered")
             .rect
             .center();
         let _ = ctx.run(
@@ -13028,9 +13242,7 @@ mod tests {
         fs::write(&malformed, b"\"unterminated").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.path_input = format!("  {}\n", first.display());
-        app.open_typed_path();
-        assert!(app.notice.is_none());
+        app.open_path(first.clone()).unwrap();
         app.document.as_mut().unwrap().move_column(1, 0).unwrap();
         app.document
             .as_mut()
@@ -13095,7 +13307,7 @@ mod tests {
     }
 
     #[test]
-    fn format_changes_wait_for_reopen() {
+    fn reload_uses_applied_format_and_reopen_uses_draft() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -13113,6 +13325,14 @@ mod tests {
 
         app.delimiter_mode = DelimiterMode::Tab;
         app.header_mode = HeaderMode::NoHeader;
+        fs::write(&path, b"name,value\nsecond,2\n").unwrap();
+        app.reload_document();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), path);
+        assert_eq!(document.session.dialect.delimiter, b',');
+        assert!(document.session.dialect.has_header);
+        assert_eq!(document.headers, ["name", "value"]);
+        assert_eq!(document.buffered_rows[0].fields[0], b"second");
         assert_eq!(
             app.document.as_ref().unwrap().session.dialect.delimiter,
             b','
@@ -13132,10 +13352,17 @@ mod tests {
         app.reopen_document();
         let document = app.document.as_ref().unwrap();
         assert_eq!(document.headers, ["name", "value"]);
-        assert_eq!(document.buffered_rows[0].fields[0], b"first");
-        assert_eq!(document.buffered_rows[0].fields[1], b"1");
+        assert_eq!(document.buffered_rows[0].fields[0], b"second");
+        assert_eq!(document.buffered_rows[0].fields[1], b"2");
         assert_eq!(DelimiterMode::Pipe.delimiter(), Some(b'|'));
         assert_eq!(DelimiterMode::Semicolon.delimiter(), Some(b';'));
+
+        fs::write(&path, b"\"unterminated").unwrap();
+        app.reload_document();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.headers, ["name", "value"]);
+        assert_eq!(document.buffered_rows[0].fields[0], b"second");
+        assert!(app.notice.as_deref().unwrap().contains("unterminated"));
 
         app.document.as_mut().unwrap().shutdown();
         drop(app);
