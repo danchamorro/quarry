@@ -1267,6 +1267,14 @@ impl eframe::App for QuarryApp {
         #[cfg(target_os = "macos")]
         self.poll_open_documents();
 
+        let local_file_hovered = self.document.is_none()
+            && ctx.input(|input| {
+                input
+                    .raw
+                    .hovered_files
+                    .iter()
+                    .any(|file| file.path.is_some())
+            });
         let dropped_paths = ctx.input(|input| {
             input
                 .raw
@@ -1778,6 +1786,7 @@ impl eframe::App for QuarryApp {
 
         let mut grid_error = None;
         let mut requested_column_edit = None;
+        let mut empty_state_action = None;
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
             .show(ctx, |ui| {
@@ -1791,14 +1800,12 @@ impl eframe::App for QuarryApp {
                         Err(error) => grid_error = Some(error),
                     }
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.heading("Open a delimited file");
-                            ui.label("Quarry reads the first viewport before indexing the rest.");
-                        });
-                    });
+                    empty_state_action = show_empty_state(ui, local_file_hovered);
                 }
             });
+        if let Some(action) = empty_state_action {
+            self.apply(ctx, action);
+        }
         if let Some(request) = requested_column_edit {
             match request {
                 GridColumnRequest::Dialog(dialog) => self.open_structural_dialog(dialog),
@@ -2678,6 +2685,41 @@ fn page_controls(ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
     } else {
         None
     }
+}
+
+fn show_empty_state(ui: &mut egui::Ui, local_file_hovered: bool) -> Option<Action> {
+    let mut action = None;
+    let fill = if local_file_hovered {
+        WARNING_FILL
+    } else {
+        Color32::from_rgb(250, 251, 251)
+    };
+    let stroke = if local_file_hovered {
+        egui::Stroke::new(2.0, QUARRY_YELLOW)
+    } else {
+        egui::Stroke::new(1.0, Color32::from_rgb(200, 209, 213))
+    };
+
+    let available = ui.available_rect_before_wrap();
+    let drop_rect = egui::Rect::from_center_size(
+        available.center(),
+        egui::vec2(available.width().min(520.0), available.height().min(112.0)),
+    );
+    ui.expand_to_include_rect(drop_rect);
+    ui.painter()
+        .rect(drop_rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(drop_rect.shrink(24.0))
+            .layout(egui::Layout::left_to_right(Align::Center).with_main_align(Align::Center)),
+        |ui| {
+            ui.label(RichText::new("Drop a delimited file here, or").size(16.0));
+            if ui.button("Open…").clicked() {
+                action = Some(Action::Choose);
+            }
+        },
+    );
+    action
 }
 
 fn filter_column_input_id(rule_index: usize) -> egui::Id {
@@ -7770,8 +7812,8 @@ mod tests {
         notice_strip, page_controls, parse_data_row, parse_file_column, parse_move_position,
         rendered_column_range, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
         search_controls, select_column, selected_split_column, selection_text, show_column_manager,
-        show_filter_manager, show_grid, show_grid_with_filter_case, show_structural_dialog,
-        sort_merge_progress,
+        show_empty_state, show_filter_manager, show_grid, show_grid_with_filter_case,
+        show_structural_dialog, sort_merge_progress,
     };
 
     #[test]
@@ -8341,6 +8383,97 @@ mod tests {
             assert!(accessible_button(&output, "Find").1.is_disabled());
         }
 
+        app.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn empty_state_routes_open_and_dropped_files_through_existing_actions() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut action = None;
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = show_empty_state(ui, false);
+            });
+        });
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("empty state should be accessible");
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.value() == Some("Drop a delimited file here, or")
+                || node.label() == Some("Drop a delimited file here, or")
+        }));
+        assert_eq!(
+            click_accessible_button("Open…", |ui| show_empty_state(ui, false)),
+            Some(Action::Choose)
+        );
+
+        for width in [860.0, 1967.0] {
+            let ctx = egui::Context::default();
+            let mut available = None;
+            let output = ctx.run(grid_input_with_width(width), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    available = Some(ui.available_rect_before_wrap());
+                    show_empty_state(ui, false);
+                });
+            });
+            let available = available.unwrap();
+            let drop_rect = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.fill == egui::Color32::from_rgb(250, 251, 251)
+                            && rect.stroke.color == egui::Color32::from_rgb(200, 209, 213) =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .expect("empty-state drop zone should be painted");
+            assert!((drop_rect.center().x - available.center().x).abs() < 1.0);
+            assert!((drop_rect.center().y - available.center().y).abs() < 1.0);
+            assert!((drop_rect.width() - available.width().min(520.0)).abs() < 1.0);
+            assert!((drop_rect.height() - available.height().min(112.0)).abs() < 1.0);
+            assert!(available.contains_rect(drop_rect));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dropped.csv");
+        fs::write(&path, b"name,value\nfirst,1\n").unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let hover_ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut hover_input = grid_input();
+        hover_input.hovered_files = vec![egui::HoveredFile {
+            path: Some(path.clone()),
+            ..Default::default()
+        }];
+        let hovered = hover_ctx.run(hover_input, |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert!(app.document.is_none(), "hovering must not open a file");
+        assert!(hovered.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                egui::epaint::Shape::Rect(rect)
+                    if rect.fill == super::WARNING_FILL
+                        && rect.stroke.color == super::QUARRY_YELLOW
+                        && rect.stroke.width == 2.0
+            )
+        }));
+
+        let mut drop_input = grid_input();
+        drop_input.dropped_files = vec![egui::DroppedFile {
+            path: Some(path.clone()),
+            ..Default::default()
+        }];
+        let _ = hover_ctx.run(drop_input, |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert_eq!(app.document.as_ref().unwrap().session.path(), path);
         app.document.as_mut().unwrap().shutdown();
     }
 
