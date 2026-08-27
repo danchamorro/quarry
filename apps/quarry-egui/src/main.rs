@@ -68,6 +68,9 @@ const SOURCE_CHANGED_NOTICE: &str =
 const QUARRY_YELLOW: Color32 = Color32::from_rgb(233, 196, 106);
 const QUARRY_YELLOW_TEXT: Color32 = Color32::from_rgb(122, 88, 20);
 const QUARRY_SELECTED_TEXT: Color32 = Color32::from_rgb(47, 38, 18);
+const ERROR_FILL: Color32 = Color32::from_rgb(250, 232, 229);
+const ERROR_TEXT: Color32 = Color32::from_rgb(171, 65, 53);
+const WARNING_FILL: Color32 = Color32::from_rgb(250, 242, 214);
 
 #[cfg(target_os = "macos")]
 #[derive(Clone)]
@@ -270,14 +273,68 @@ struct QuarryApp {
     header_mode: HeaderMode,
     format_draft: Option<(DelimiterMode, HeaderMode)>,
     document: Option<Document>,
-    notice: Option<String>,
-    footer_status: Option<String>,
+    notice: Option<AppMessage>,
+    footer_status: Option<AppMessage>,
     close_confirmation_open: bool,
     close_after_save: bool,
     started: Instant,
     logged_first_update: bool,
     #[cfg(target_os = "macos")]
     open_document_receiver: Option<Receiver<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageSeverity {
+    Error,
+    Warning,
+    Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppMessage {
+    text: String,
+    severity: MessageSeverity,
+}
+
+impl AppMessage {
+    fn error(text: impl Into<String>) -> Self {
+        Self::new(text, MessageSeverity::Error)
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self::new(text, MessageSeverity::Warning)
+    }
+
+    fn status(text: impl Into<String>) -> Self {
+        Self::new(text, MessageSeverity::Status)
+    }
+
+    fn new(text: impl Into<String>, severity: MessageSeverity) -> Self {
+        Self {
+            text: text.into(),
+            severity,
+        }
+    }
+}
+
+impl std::ops::Deref for AppMessage {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for AppMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.text)
+    }
+}
+
+impl PartialEq<&str> for AppMessage {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,9 +469,10 @@ impl QuarryApp {
     #[cfg(test)]
     fn open_path(&mut self, path: PathBuf) -> Result<(), String> {
         self.open_path_with_options(path, self.open_options())
+            .map_err(|message| message.text)
     }
 
-    fn open_new_path(&mut self, path: PathBuf) -> Result<(), String> {
+    fn open_new_path(&mut self, path: PathBuf) -> Result<(), AppMessage> {
         self.open_path_with_options(path, OpenOptions::default())?;
         self.delimiter_mode = DelimiterMode::Auto;
         self.header_mode = HeaderMode::Auto;
@@ -425,17 +483,23 @@ impl QuarryApp {
         &mut self,
         path: PathBuf,
         options: OpenOptions,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppMessage> {
         if let Some(document) = self.document.as_mut() {
             if document.save_job.is_some() {
-                return Err("Cancel the active save before opening another file.".into());
+                return Err(AppMessage::warning(
+                    "Cancel the active save before opening another file.",
+                ));
             }
             if document.structural_job.is_some() {
-                return Err("Cancel the active change before opening another file.".into());
+                return Err(AppMessage::warning(
+                    "Cancel the active change before opening another file.",
+                ));
             }
             document.commit_edits();
             if document.is_dirty() {
-                return Err("Discard or save your changes before opening another file.".into());
+                return Err(AppMessage::warning(
+                    "Discard or save your changes before opening another file.",
+                ));
             }
         }
         if self
@@ -443,10 +507,9 @@ impl QuarryApp {
             .as_ref()
             .is_some_and(|document| document.export_job.is_some())
         {
-            return Err(
-                "Cancel the active export and wait for it to finish before opening another file."
-                    .into(),
-            );
+            return Err(AppMessage::warning(
+                "Cancel the active export and wait for it to finish before opening another file.",
+            ));
         }
         self.replace_document_with_options(path, options)
     }
@@ -455,9 +518,9 @@ impl QuarryApp {
         &mut self,
         path: PathBuf,
         options: OpenOptions,
-    ) -> Result<(), String> {
-        let mut document = Document::prepare(&path, options)?;
-        document.start_indexing()?;
+    ) -> Result<(), AppMessage> {
+        let mut document = Document::prepare(&path, options).map_err(AppMessage::error)?;
+        document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.document.as_mut() {
             current.shutdown();
         }
@@ -489,13 +552,16 @@ impl QuarryApp {
     fn choose_file(&mut self) {
         if let Some(document) = self.document.as_mut() {
             if document.save_job.is_some() {
-                self.notice = Some("Cancel the active save before opening another file.".into());
+                self.notice = Some(AppMessage::warning(
+                    "Cancel the active save before opening another file.",
+                ));
                 return;
             }
             document.commit_edits();
             if document.is_dirty() {
-                self.notice =
-                    Some("Discard or save your changes before opening another file.".into());
+                self.notice = Some(AppMessage::warning(
+                    "Discard or save your changes before opening another file.",
+                ));
                 return;
             }
         }
@@ -508,13 +574,16 @@ impl QuarryApp {
     fn choose_filtered_export(&mut self) {
         if let Some(document) = self.document.as_mut() {
             if document.save_job.is_some() {
-                self.notice = Some("Cancel the active save before exporting filtered rows.".into());
+                self.notice = Some(AppMessage::warning(
+                    "Cancel the active save before exporting filtered rows.",
+                ));
                 return;
             }
             document.commit_edits();
             if document.is_dirty() {
-                self.notice =
-                    Some("Save or discard your changes before exporting filtered rows.".into());
+                self.notice = Some(AppMessage::warning(
+                    "Save or discard your changes before exporting filtered rows.",
+                ));
                 return;
             }
         }
@@ -523,7 +592,9 @@ impl QuarryApp {
             .as_ref()
             .map(|document| document.logical_path.clone())
         else {
-            self.notice = Some("Open and filter a file before exporting.".into());
+            self.notice = Some(AppMessage::warning(
+                "Open and filter a file before exporting.",
+            ));
             return;
         };
         let mut dialog = rfd::FileDialog::new()
@@ -537,20 +608,20 @@ impl QuarryApp {
 
     fn choose_save_as(&mut self) -> bool {
         let Some(document) = self.document.as_mut() else {
-            self.notice = Some("Open a file before using Save As.".into());
+            self.notice = Some(AppMessage::warning("Open a file before using Save As."));
             return false;
         };
         document.commit_edits();
         if !document.is_save_ready() {
-            self.notice = Some(if document.save_job.is_some() {
-                "A save operation is already running.".into()
+            self.notice = Some(AppMessage::warning(if document.save_job.is_some() {
+                "A save operation is already running."
             } else if document.export_job.is_some() {
-                "Cancel the active export before using Save As.".into()
+                "Cancel the active export before using Save As."
             } else if document.source_changed {
-                SOURCE_CHANGED_NOTICE.into()
+                SOURCE_CHANGED_NOTICE
             } else {
-                "Make a change before using Save As.".into()
-            });
+                "Make a change before using Save As."
+            }));
             return false;
         }
         let source = document.logical_path.clone();
@@ -567,7 +638,7 @@ impl QuarryApp {
         let result = self
             .document
             .as_mut()
-            .ok_or_else(|| "Open a file before saving.".to_owned())
+            .ok_or_else(|| AppMessage::warning("Open a file before saving."))
             .and_then(Document::start_save);
         self.notice = result.err();
         if self.notice.is_none() {
@@ -583,7 +654,7 @@ impl QuarryApp {
         let result = self
             .document
             .as_mut()
-            .ok_or_else(|| "Open a file before using Save As.".to_owned())
+            .ok_or_else(|| AppMessage::warning("Open a file before using Save As."))
             .and_then(|document| document.start_save_as(destination));
         self.notice = result.err();
         if self.notice.is_none() {
@@ -599,7 +670,7 @@ impl QuarryApp {
         let result = self
             .document
             .as_mut()
-            .ok_or_else(|| "Open and filter a file before exporting.".to_owned())
+            .ok_or_else(|| AppMessage::warning("Open and filter a file before exporting."))
             .and_then(|document| document.start_filtered_export(destination));
         self.notice = result.err();
         if self.notice.is_none() {
@@ -614,7 +685,7 @@ impl QuarryApp {
             .as_ref()
             .map(|document| document.logical_path.clone())
         else {
-            self.notice = Some("Open a file first.".into());
+            self.notice = Some(AppMessage::warning("Open a file first."));
             return;
         };
         let result = self.open_path_with_options(
@@ -639,7 +710,7 @@ impl QuarryApp {
                 document.current_open_options(),
             )
         }) else {
-            self.notice = Some("Open a file first.".into());
+            self.notice = Some(AppMessage::warning("Open a file first."));
             return;
         };
         self.notice = self.open_path_with_options(path, options).err();
@@ -648,22 +719,23 @@ impl QuarryApp {
     fn handle_dropped_paths(&mut self, dropped: Vec<Option<PathBuf>>) {
         let count = dropped.len();
         let Some(path) = dropped.into_iter().flatten().next() else {
-            self.notice = Some(format!(
+            self.notice = Some(AppMessage::warning(format!(
                 "Ignored {count} dropped item(s); Quarry can only open a local file."
-            ));
+            )));
             return;
         };
         let ignored = count.saturating_sub(1);
         let result = self.open_new_path(path);
         self.notice = match (result, ignored) {
             (Ok(()), 0) => None,
-            (Ok(()), ignored) => Some(format!(
+            (Ok(()), ignored) => Some(AppMessage::warning(format!(
                 "Opened one file and ignored {ignored} additional dropped item(s)."
-            )),
+            ))),
             (Err(error), 0) => Some(error),
-            (Err(error), ignored) => Some(format!(
-                "{error} Ignored {ignored} additional dropped item(s)."
-            )),
+            (Err(mut error), ignored) => {
+                error.text = format!("{error} Ignored {ignored} additional dropped item(s).");
+                Some(error)
+            }
         };
     }
 
@@ -704,8 +776,9 @@ impl QuarryApp {
                     .as_ref()
                     .is_some_and(|document| document.structural_job.is_some())
                 {
-                    self.notice =
-                        Some("Cancel the active change before discarding changes.".into());
+                    self.notice = Some(AppMessage::warning(
+                        "Cancel the active change before discarding changes.",
+                    ));
                     return;
                 }
                 let structural = self
@@ -724,8 +797,9 @@ impl QuarryApp {
                 }
                 if let Some(document) = self.document.as_mut() {
                     if document.save_job.is_some() {
-                        self.notice =
-                            Some("Wait for the save to finish before discarding changes.".into());
+                        self.notice = Some(AppMessage::warning(
+                            "Wait for the save to finish before discarding changes.",
+                        ));
                         return;
                     }
                     document.discard_edits();
@@ -758,7 +832,7 @@ impl QuarryApp {
             return;
         };
         if document.source_changed {
-            self.notice = Some(SOURCE_CHANGED_NOTICE.into());
+            self.notice = Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             return;
         }
         let result = match action {
@@ -775,27 +849,34 @@ impl QuarryApp {
             | Action::OpenFilters => {
                 unreachable!()
             }
-            Action::PageUp => document.page(-1),
-            Action::PageDown => document.page(1),
+            Action::PageUp => document.page(-1).map_err(AppMessage::error),
+            Action::PageDown => document.page(1).map_err(AppMessage::error),
             Action::AutoFitColumns => {
                 document.auto_fit_columns = true;
                 Ok(())
             }
             Action::Jump => parse_data_row(&self.jump_input, document.data_start)
-                .and_then(|start| document.navigate(start)),
-            Action::FindPrevious => document.start_find_previous_with_case(
-                self.find_input.as_bytes(),
-                case_sensitivity(self.find_match_case),
-            ),
-            Action::FindNext => document.start_find_next_with_case(
-                self.find_input.as_bytes(),
-                case_sensitivity(self.find_match_case),
-            ),
-            Action::ReplaceCurrent => document.replace_current_match_with_case(
-                self.find_input.as_bytes(),
-                self.replace_input.as_bytes(),
-                case_sensitivity(self.find_match_case),
-            ),
+                .map_err(AppMessage::warning)
+                .and_then(|start| document.navigate(start).map_err(AppMessage::error)),
+            Action::FindPrevious => document
+                .start_find_previous_with_case(
+                    self.find_input.as_bytes(),
+                    case_sensitivity(self.find_match_case),
+                )
+                .map_err(AppMessage::warning),
+            Action::FindNext => document
+                .start_find_next_with_case(
+                    self.find_input.as_bytes(),
+                    case_sensitivity(self.find_match_case),
+                )
+                .map_err(AppMessage::warning),
+            Action::ReplaceCurrent => document
+                .replace_current_match_with_case(
+                    self.find_input.as_bytes(),
+                    self.replace_input.as_bytes(),
+                    case_sensitivity(self.find_match_case),
+                )
+                .map_err(AppMessage::warning),
             Action::ReplaceAll => document.start_replace_all_with_case(
                 self.find_input.as_bytes(),
                 self.replace_input.as_bytes(),
@@ -820,18 +901,22 @@ impl QuarryApp {
                             })
                     })
                     .collect::<Result<Vec<_>, _>>();
-                predicates.and_then(|predicates| {
-                    document.start_filter(FilterQuery {
-                        predicates,
-                        case_sensitivity: case_sensitivity(self.filter_match_case),
+                predicates
+                    .map_err(AppMessage::warning)
+                    .and_then(|predicates| {
+                        document
+                            .start_filter(FilterQuery {
+                                predicates,
+                                case_sensitivity: case_sensitivity(self.filter_match_case),
+                            })
+                            .map_err(AppMessage::warning)
                     })
-                })
             }
             Action::CancelFilter => {
                 document.cancel_filter();
                 Ok(())
             }
-            Action::ClearFilter => document.clear_filter(),
+            Action::ClearFilter => document.clear_filter().map_err(AppMessage::warning),
             Action::CancelExport => {
                 document.cancel_filtered_export();
                 Ok(())
@@ -869,7 +954,7 @@ impl QuarryApp {
             self.footer_status = if matches!(action, Action::FindPrevious | Action::FindNext)
                 && document.search_job.is_none()
             {
-                document.search_status.clone()
+                document.search_status.clone().map(AppMessage::status)
             } else {
                 None
             };
@@ -894,7 +979,7 @@ impl QuarryApp {
             }
             ColumnCommand::AutoFit => unreachable!("auto-fit routes through the app action"),
         };
-        self.notice = result.err();
+        self.notice = result.err().map(AppMessage::warning);
     }
 
     fn open_structural_dialog(&mut self, dialog: StructuralDialog) {
@@ -912,7 +997,7 @@ impl QuarryApp {
                 self.structural_dialog = Some(dialog);
                 self.notice = None;
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.notice = Some(AppMessage::warning(error)),
         }
     }
 
@@ -927,7 +1012,7 @@ impl QuarryApp {
         let result =
             self.document
                 .as_mut()
-                .ok_or_else(|| "Open a file before editing columns.".to_owned())
+                .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
                 .and_then(|document| match dialog.request {
                     StructuralRequest::Split => document
                         .start_split(dialog.columns[0], dialog.separator.as_bytes().to_vec()),
@@ -939,6 +1024,7 @@ impl QuarryApp {
                         document.total_columns,
                         dialog.columns.len(),
                     )
+                    .map_err(AppMessage::warning)
                     .and_then(|position| document.start_move_columns(dialog.columns, position)),
                     StructuralRequest::Sort => document.start_sort_rows_with_case(
                         dialog.columns[0],
@@ -954,7 +1040,8 @@ impl QuarryApp {
                     .document
                     .as_ref()
                     .filter(|document| document.structural_job.is_none())
-                    .and_then(|document| document.structural_status.clone());
+                    .and_then(|document| document.structural_status.clone())
+                    .map(AppMessage::status);
             }
             Err(error) => self.notice = Some(error),
         }
@@ -964,7 +1051,7 @@ impl QuarryApp {
         let result = self
             .document
             .as_mut()
-            .ok_or_else(|| "Open a file before editing columns.".to_owned())
+            .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
             .and_then(|document| document.start_delete_columns(columns));
         self.notice = result.err();
         if self.notice.is_none() {
@@ -972,7 +1059,8 @@ impl QuarryApp {
                 .document
                 .as_ref()
                 .filter(|document| document.structural_job.is_none())
-                .and_then(|document| document.structural_status.clone());
+                .and_then(|document| document.structural_status.clone())
+                .map(AppMessage::status);
         }
     }
 
@@ -1010,41 +1098,43 @@ impl QuarryApp {
         self.columns_open = false;
         self.structural_dialog = None;
         self.notice = None;
-        self.footer_status = Some(ready.notice);
+        self.footer_status = Some(AppMessage::status(ready.notice));
         Ok(())
     }
 
-    fn swap_structural_history(&mut self, redo: bool) -> Result<(), String> {
+    fn swap_structural_history(&mut self, redo: bool) -> Result<(), AppMessage> {
         let Some(current) = self.document.as_mut() else {
-            return Err("Open a file before undoing a change.".into());
+            return Err(AppMessage::warning("Open a file before undoing a change."));
         };
         current.commit_edits();
         if !redo && (!current.header_renames.is_empty() || current.has_cell_edits()) {
-            return Err(
-                "Save or discard later header and cell edits before undoing the change.".into(),
-            );
+            return Err(AppMessage::warning(
+                "Save or discard later header and cell edits before undoing the change.",
+            ));
         }
         if current.save_job.is_some()
             || current.export_job.is_some()
             || current.structural_job.is_some()
         {
-            return Err("Wait for the active file operation to finish.".into());
+            return Err(AppMessage::warning(
+                "Wait for the active file operation to finish.",
+            ));
         }
         let state = current
             .working_copy
             .as_ref()
-            .ok_or_else(|| "There is no change to undo or redo.".to_owned())?;
+            .ok_or_else(|| AppMessage::warning("There is no change to undo or redo."))?;
         let target = if redo {
             state.redo.clone()
         } else {
             state.undo.clone()
         }
         .ok_or_else(|| {
-            if redo {
-                "There is no change to redo.".to_owned()
+            AppMessage::warning(if redo {
+                "There is no change to redo."
             } else {
-                "There is no change to undo.".to_owned()
-            }
+                "There is no change to undo."
+            })
         })?;
         if !redo && target.path == current.logical_path {
             let original = current
@@ -1055,9 +1145,9 @@ impl QuarryApp {
                 Ok(()) => {}
                 Err(QuarryError::SourceChanged) => {
                     current.invalidate_changed_source();
-                    return Err(SOURCE_CHANGED_NOTICE.into());
+                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(AppMessage::error(error.to_string())),
             }
         }
 
@@ -1070,11 +1160,12 @@ impl QuarryApp {
                 cell_edits: current.cell_edits.clone(),
             },
         };
-        let mut replacement = Document::prepare(&target.path, options)?;
+        let mut replacement =
+            Document::prepare(&target.path, options).map_err(AppMessage::error)?;
         replacement.header_renames = target.overlay.header_renames.clone();
         replacement.cell_edits = target.overlay.cell_edits.clone();
         replacement.refresh_column_headers();
-        replacement.start_indexing()?;
+        replacement.start_indexing().map_err(AppMessage::error)?;
 
         let current = self
             .document
@@ -1099,11 +1190,11 @@ impl QuarryApp {
         self.structural_dialog = None;
         self.columns_open = false;
         self.notice = None;
-        self.footer_status = Some(if redo {
-            "Change restored.".into()
+        self.footer_status = Some(AppMessage::status(if redo {
+            "Change restored."
         } else {
-            "Change undone.".into()
-        });
+            "Change undone."
+        }));
         Ok(())
     }
 
@@ -1118,7 +1209,7 @@ impl QuarryApp {
                 ctx.copy_text(text);
                 self.notice = None;
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.notice = Some(AppMessage::warning(error)),
         }
     }
 
@@ -1187,19 +1278,19 @@ impl eframe::App for QuarryApp {
             && let Err(error) = document.poll()
         {
             self.footer_status = None;
-            self.notice = Some(error);
+            self.notice = Some(AppMessage::error(error));
         }
         if let Some(document) = &mut self.document {
             let was_active = document.search_job.is_some();
             match document.poll_search() {
                 Ok(()) if was_active && document.search_job.is_none() => {
                     self.notice = None;
-                    self.footer_status = document.search_status.clone();
+                    self.footer_status = document.search_status.clone().map(AppMessage::status);
                 }
                 Ok(()) => {}
                 Err(error) => {
                     self.footer_status = None;
-                    self.notice = Some(error);
+                    self.notice = Some(AppMessage::error(error));
                 }
             }
         }
@@ -1208,12 +1299,12 @@ impl eframe::App for QuarryApp {
             match document.poll_filter() {
                 Ok(()) if was_active && document.filter_job.is_none() => {
                     self.notice = None;
-                    self.footer_status = document.filter_status.clone();
+                    self.footer_status = document.filter_status.clone().map(AppMessage::status);
                 }
                 Ok(()) => {}
                 Err(error) => {
                     self.footer_status = None;
-                    self.notice = Some(error);
+                    self.notice = Some(AppMessage::error(error));
                 }
             }
         }
@@ -1227,16 +1318,16 @@ impl eframe::App for QuarryApp {
                         .is_some_and(|status| status.starts_with("Export failed"))
                     {
                         self.footer_status = None;
-                        self.notice = status;
+                        self.notice = status.map(AppMessage::error);
                     } else {
                         self.notice = None;
-                        self.footer_status = status;
+                        self.footer_status = status.map(AppMessage::status);
                     }
                 }
                 Ok(()) => {}
                 Err(error) => {
                     self.footer_status = None;
-                    self.notice = Some(error);
+                    self.notice = Some(AppMessage::error(error));
                 }
             }
         }
@@ -1252,7 +1343,7 @@ impl eframe::App for QuarryApp {
             Ok(Some(ready)) => {
                 if let Err(error) = self.install_materialized_working_copy(ready) {
                     self.footer_status = None;
-                    self.notice = Some(error);
+                    self.notice = Some(AppMessage::error(error));
                 }
             }
             Ok(None)
@@ -1266,7 +1357,8 @@ impl eframe::App for QuarryApp {
                 self.footer_status = self
                     .document
                     .as_ref()
-                    .and_then(|document| document.structural_status.clone());
+                    .and_then(|document| document.structural_status.clone())
+                    .map(AppMessage::status);
             }
             Ok(None) => {}
             Err(error) => {
@@ -1299,11 +1391,11 @@ impl eframe::App for QuarryApp {
                 match self.replace_document_with_options(destination.clone(), options) {
                     Ok(()) => {
                         self.notice = None;
-                        self.footer_status = Some(if in_place {
+                        self.footer_status = Some(AppMessage::status(if in_place {
                             format!("Saved {}.", destination.display())
                         } else {
                             format!("Saved as {}.", destination.display())
-                        });
+                        }));
                         if self.close_after_save {
                             self.close_after_save = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1317,10 +1409,10 @@ impl eframe::App for QuarryApp {
                         self.replace_expanded = false;
                         surrender_find_controls_focus(ctx);
                         self.footer_status = None;
-                        self.notice = Some(format!(
+                        self.notice = Some(AppMessage::error(format!(
                             "Saved {} but could not reload it: {error}. Reopen the file to continue.",
                             destination.display()
-                        ));
+                        )));
                         if self.close_after_save {
                             self.close_after_save = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1331,10 +1423,10 @@ impl eframe::App for QuarryApp {
                             document.save_status = None;
                         }
                         self.footer_status = None;
-                        self.notice = Some(format!(
+                        self.notice = Some(AppMessage::error(format!(
                             "Saved {} but could not open it: {error}",
                             destination.display()
-                        ));
+                        )));
                         if self.close_after_save {
                             self.close_after_save = false;
                             self.close_confirmation_open = true;
@@ -1353,7 +1445,8 @@ impl eframe::App for QuarryApp {
                     self.footer_status = self
                         .document
                         .as_ref()
-                        .and_then(|document| document.save_status.clone());
+                        .and_then(|document| document.save_status.clone())
+                        .map(AppMessage::status);
                 }
                 if self.close_after_save
                     && self
@@ -1491,11 +1584,24 @@ impl eframe::App for QuarryApp {
                     });
                 }
 
-                if let Some(notice) = &self.notice {
-                    ui.add_space(6.0);
-                    ui.colored_label(Color32::from_rgb(171, 65, 53), notice);
-                }
             });
+
+        if let Some(notice) = self.notice.as_ref() {
+            let fill = match notice.severity {
+                MessageSeverity::Error => ERROR_FILL,
+                MessageSeverity::Warning => WARNING_FILL,
+                MessageSeverity::Status => unreachable!("status messages belong in the footer"),
+            };
+            let mut dismiss = false;
+            egui::TopBottomPanel::top("quarry-notice")
+                .frame(panel_frame(fill).inner_margin(egui::Margin::symmetric(10, 5)))
+                .show(ctx, |ui| {
+                    dismiss = notice_strip(ui, notice);
+                });
+            if dismiss {
+                self.notice = None;
+            }
+        }
 
         if self.find_bar_open {
             let mut close_find = false;
@@ -1680,7 +1786,7 @@ impl eframe::App for QuarryApp {
             self.copy_selection(ctx);
         }
         if grid_error.is_some() {
-            self.notice = grid_error;
+            self.notice = grid_error.map(AppMessage::error);
         }
 
         if self.close_confirmation_open {
@@ -2121,6 +2227,29 @@ fn active_job_controls(ui: &mut egui::Ui, display: &ActiveJobDisplay) -> Option<
             .text(&display.label),
     );
     clicked.then_some(display.cancel_action)
+}
+
+fn notice_strip(ui: &mut egui::Ui, notice: &AppMessage) -> bool {
+    let (color, live) = match notice.severity {
+        MessageSeverity::Error => (ERROR_TEXT, egui::accesskit::Live::Assertive),
+        MessageSeverity::Warning => (QUARRY_YELLOW_TEXT, egui::accesskit::Live::Polite),
+        MessageSeverity::Status => unreachable!("status messages belong in the footer"),
+    };
+    let mut dismiss = false;
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 90.0).max(0.0);
+        let response = ui.add_sized(
+            egui::vec2(width, 0.0),
+            egui::Label::new(RichText::new(&notice.text).color(color)).wrap(),
+        );
+        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_live(live);
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            dismiss = ui.button("Dismiss").clicked();
+        });
+    });
+    dismiss
 }
 
 fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) -> Option<Action> {
@@ -3847,18 +3976,18 @@ impl Document {
         }
     }
 
-    fn start_split(&mut self, source_column: usize, separator: Vec<u8>) -> Result<(), String> {
+    fn start_split(&mut self, source_column: usize, separator: Vec<u8>) -> Result<(), AppMessage> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
-            return Err(reason.into());
+            return Err(AppMessage::warning(reason));
         }
         if source_column >= self.total_columns {
-            return Err(format!(
+            return Err(AppMessage::warning(format!(
                 "Column {} is outside this file.",
                 source_column.saturating_add(1)
-            ));
+            )));
         }
         if separator.is_empty() {
-            return Err("Enter a non-empty separator.".into());
+            return Err(AppMessage::warning("Enter a non-empty separator."));
         }
         self.commit_edits();
         self.cancel_search();
@@ -3867,9 +3996,9 @@ impl Document {
             .saturating_add(1)
             .min(MAX_TRANSFORMATION_COLUMNS);
         if max_pieces < 2 {
-            return Err(format!(
+            return Err(AppMessage::warning(format!(
                 "Splitting would exceed the {MAX_TRANSFORMATION_COLUMNS}-column file limit."
-            ));
+            )));
         }
         let job = match self.session.start_analyze_split(
             self.cell_edits.clone(),
@@ -3880,9 +4009,9 @@ impl Document {
             Ok(job) => job,
             Err(QuarryError::SourceChanged) => {
                 self.invalidate_changed_source();
-                return Err(SOURCE_CHANGED_NOTICE.into());
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(AppMessage::error(error.to_string())),
         };
         self.structural_job = Some(StructuralJob::AnalyzingSplit {
             job,
@@ -3898,22 +4027,26 @@ impl Document {
         &mut self,
         source_columns: Vec<usize>,
         separator: Vec<u8>,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppMessage> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
-            return Err(reason.into());
+            return Err(AppMessage::warning(reason));
         }
         if source_columns.len() < 2 {
-            return Err("Select at least two columns to combine.".into());
+            return Err(AppMessage::warning(
+                "Select at least two columns to combine.",
+            ));
         }
         if source_columns
             .iter()
             .any(|column| *column >= self.total_columns)
         {
-            return Err("A selected column is outside this file.".into());
+            return Err(AppMessage::warning(
+                "A selected column is outside this file.",
+            ));
         }
         let mut unique = BTreeSet::new();
         if source_columns.iter().any(|column| !unique.insert(*column)) {
-            return Err("Select each column only once.".into());
+            return Err(AppMessage::warning("Select each column only once."));
         }
         self.commit_edits();
         self.cancel_search();
@@ -3937,16 +4070,21 @@ impl Document {
         )
     }
 
-    fn start_move_columns(&mut self, columns: Vec<usize>, position: usize) -> Result<(), String> {
-        let selected = validated_column_selection(columns, self.total_columns)?;
+    fn start_move_columns(
+        &mut self,
+        columns: Vec<usize>,
+        position: usize,
+    ) -> Result<(), AppMessage> {
+        let selected =
+            validated_column_selection(columns, self.total_columns).map_err(AppMessage::warning)?;
         let remaining = (0..self.total_columns)
             .filter(|column| !selected.contains(column))
             .collect::<Vec<_>>();
         if position > remaining.len() {
-            return Err(format!(
+            return Err(AppMessage::warning(format!(
                 "Destination position must be between 1 and {}.",
                 remaining.len().saturating_add(1)
-            ));
+            )));
         }
         let mut output_columns = Vec::with_capacity(self.total_columns);
         output_columns.extend_from_slice(&remaining[..position]);
@@ -3957,10 +4095,11 @@ impl Document {
         self.start_arrangement(output_columns, selected_columns)
     }
 
-    fn start_delete_columns(&mut self, columns: Vec<usize>) -> Result<(), String> {
-        let selected = validated_column_selection(columns, self.total_columns)?;
+    fn start_delete_columns(&mut self, columns: Vec<usize>) -> Result<(), AppMessage> {
+        let selected =
+            validated_column_selection(columns, self.total_columns).map_err(AppMessage::warning)?;
         if selected.len() == self.total_columns {
-            return Err("At least one column must remain.".into());
+            return Err(AppMessage::warning("At least one column must remain."));
         }
         let output_columns = (0..self.total_columns)
             .filter(|column| !selected.contains(column))
@@ -3977,9 +4116,9 @@ impl Document {
         &mut self,
         output_columns: Vec<usize>,
         selected_columns: BTreeSet<usize>,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppMessage> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
-            return Err(reason.into());
+            return Err(AppMessage::warning(reason));
         }
         if output_columns.iter().copied().eq(0..self.total_columns) {
             self.structural_status = Some("Columns are already in that position.".into());
@@ -4001,16 +4140,16 @@ impl Document {
         column: usize,
         direction: SortDirection,
         case_sensitivity: CaseSensitivity,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppMessage> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
-            return Err(reason.into());
+            return Err(AppMessage::warning(reason));
         }
         if self.sort_temporary_disk_estimate().is_none() {
-            return Err(
-                "Wait for indexing to finish so Quarry can calculate temporary disk space.".into(),
-            );
+            return Err(AppMessage::warning(
+                "Wait for indexing to finish so Quarry can calculate temporary disk space.",
+            ));
         }
-        self.validate_column(column)?;
+        self.validate_column(column).map_err(AppMessage::warning)?;
         self.commit_edits();
         self.cancel_search();
         let MaterializationPreparation {
@@ -4032,16 +4171,16 @@ impl Document {
             Err(QuarryError::SourceChanged) => {
                 self.cleanup_empty_working_copy();
                 self.invalidate_changed_source();
-                return Err(SOURCE_CHANGED_NOTICE.into());
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
             Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.cleanup_empty_working_copy();
                 self.invalidate_changed_source();
-                return Err(SOURCE_CHANGED_NOTICE.into());
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
             Err(error) => {
                 self.cleanup_empty_working_copy();
-                return Err(error.to_string());
+                return Err(AppMessage::error(error.to_string()));
             }
         };
         self.structural_job = Some(StructuralJob::Sorting {
@@ -4095,32 +4234,32 @@ impl Document {
         ))
     }
 
-    fn prepare_materialization(&mut self) -> Result<MaterializationPreparation, String> {
+    fn prepare_materialization(&mut self) -> Result<MaterializationPreparation, AppMessage> {
         if self.original_session.is_none() {
             match self.session.ensure_source_unchanged() {
                 Ok(()) => {}
                 Err(QuarryError::SourceChanged) => {
                     self.invalidate_changed_source();
-                    return Err(SOURCE_CHANGED_NOTICE.into());
+                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(AppMessage::error(error.to_string())),
             }
             let original = match Session::open(&self.logical_path, self.current_open_options()) {
                 Ok(original) => original,
                 Err(QuarryError::SourceChanged) => {
                     self.invalidate_changed_source();
-                    return Err(SOURCE_CHANGED_NOTICE.into());
+                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
                 Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     self.invalidate_changed_source();
-                    return Err(SOURCE_CHANGED_NOTICE.into());
+                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(AppMessage::error(error.to_string())),
             };
             self.original_session = Some(original);
         }
         if self.working_copy.is_none() {
-            self.working_copy = Some(WorkingCopyState::new()?);
+            self.working_copy = Some(WorkingCopyState::new().map_err(AppMessage::error)?);
         }
         let undo = WorkingCopySnapshot {
             path: self.session.path().to_path_buf(),
@@ -4150,7 +4289,7 @@ impl Document {
         &mut self,
         transformation: ColumnTransformation,
         selected_columns: BTreeSet<usize>,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppMessage> {
         let MaterializationPreparation {
             undo,
             destination,
@@ -4166,16 +4305,16 @@ impl Document {
             Err(QuarryError::SourceChanged) => {
                 self.cleanup_empty_working_copy();
                 self.invalidate_changed_source();
-                return Err(SOURCE_CHANGED_NOTICE.into());
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
             Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.cleanup_empty_working_copy();
                 self.invalidate_changed_source();
-                return Err(SOURCE_CHANGED_NOTICE.into());
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
             Err(error) => {
                 self.cleanup_empty_working_copy();
-                return Err(error.to_string());
+                return Err(AppMessage::error(error.to_string()));
             }
         };
         self.structural_job = Some(StructuralJob::Materializing {
@@ -4192,6 +4331,7 @@ impl Document {
     #[cfg(test)]
     fn start_replace_all(&mut self, query: &[u8], replacement: &[u8]) -> Result<(), String> {
         self.start_replace_all_with_case(query, replacement, CaseSensitivity::Insensitive)
+            .map_err(|message| message.text)
     }
 
     fn start_replace_all_with_case(
@@ -4199,12 +4339,12 @@ impl Document {
         query: &[u8],
         replacement: &[u8],
         case_sensitivity: CaseSensitivity,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppMessage> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
-            return Err(reason.into());
+            return Err(AppMessage::warning(reason));
         }
         if query.is_empty() {
-            return Err("Enter text to find.".into());
+            return Err(AppMessage::warning("Enter text to find."));
         }
         if query == replacement {
             self.structural_status = Some(
@@ -4234,16 +4374,16 @@ impl Document {
             Err(QuarryError::SourceChanged) => {
                 self.cleanup_empty_working_copy();
                 self.invalidate_changed_source();
-                return Err(SOURCE_CHANGED_NOTICE.into());
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
             Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.cleanup_empty_working_copy();
                 self.invalidate_changed_source();
-                return Err(SOURCE_CHANGED_NOTICE.into());
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
             Err(error) => {
                 self.cleanup_empty_working_copy();
-                return Err(error.to_string());
+                return Err(AppMessage::error(error.to_string()));
             }
         };
         self.structural_job = Some(StructuralJob::Replacing {
@@ -4274,7 +4414,7 @@ impl Document {
         self.structural_status = None;
     }
 
-    fn poll_structural_edit(&mut self) -> Result<Option<MaterializedWorkingCopy>, String> {
+    fn poll_structural_edit(&mut self) -> Result<Option<MaterializedWorkingCopy>, AppMessage> {
         let Some(job) = self.structural_job.as_ref() else {
             return Ok(None);
         };
@@ -4312,7 +4452,7 @@ impl Document {
                         summary.max_pieces,
                         source_header,
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| AppMessage::error(error.to_string()))?;
                     let selected_columns =
                         (source_column..source_column.saturating_add(summary.max_pieces)).collect();
                     self.begin_materialization(transformation, selected_columns)?;
@@ -4320,7 +4460,9 @@ impl Document {
                 }
                 Ok(SplitAnalysisOutcome::Complete(_)) => {
                     self.structural_status = None;
-                    Err("The separator was not found in the selected column.".into())
+                    Err(AppMessage::warning(
+                        "The separator was not found in the selected column.",
+                    ))
                 }
                 Ok(SplitAnalysisOutcome::Cancelled) => {
                     self.structural_status =
@@ -4329,12 +4471,12 @@ impl Document {
                 }
                 Err(QuarryError::SourceChanged) => {
                     self.invalidate_changed_source();
-                    Err(SOURCE_CHANGED_NOTICE.into())
+                    Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
                     self.structural_status =
                         Some("Split failed. The document was not changed.".into());
-                    Err(error.to_string())
+                    Err(AppMessage::error(error.to_string()))
                 }
             },
             StructuralJob::Materializing {
@@ -4362,14 +4504,14 @@ impl Document {
                 Err(QuarryError::SourceChanged) => {
                     let _ = std::fs::remove_file(destination);
                     self.invalidate_changed_source();
-                    Err(SOURCE_CHANGED_NOTICE.into())
+                    Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
                     let _ = std::fs::remove_file(destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Column edit failed. The document was not changed.".into());
-                    Err(error.to_string())
+                    Err(AppMessage::error(error.to_string()))
                 }
             },
             StructuralJob::Replacing {
@@ -4408,14 +4550,14 @@ impl Document {
                 Err(QuarryError::SourceChanged) => {
                     let _ = std::fs::remove_file(destination);
                     self.invalidate_changed_source();
-                    Err(SOURCE_CHANGED_NOTICE.into())
+                    Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
                     let _ = std::fs::remove_file(destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Replace All failed. The document was not changed.".into());
-                    Err(error.to_string())
+                    Err(AppMessage::error(error.to_string()))
                 }
             },
             StructuralJob::Sorting {
@@ -4449,14 +4591,14 @@ impl Document {
                 Err(QuarryError::SourceChanged) => {
                     let _ = std::fs::remove_file(destination);
                     self.invalidate_changed_source();
-                    Err(SOURCE_CHANGED_NOTICE.into())
+                    Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
                     let _ = std::fs::remove_file(destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Sort failed. The document was not changed.".into());
-                    Err(error.to_string())
+                    Err(AppMessage::error(error.to_string()))
                 }
             },
         }
@@ -4960,35 +5102,43 @@ impl Document {
         self.schedule_filter_buffer(self.filter_viewport_start)
     }
 
-    fn start_filtered_export(&mut self, destination: PathBuf) -> Result<(), String> {
+    fn start_filtered_export(&mut self, destination: PathBuf) -> Result<(), AppMessage> {
         if self.save_job.is_some() {
-            return Err("Cancel the active save before exporting filtered rows.".into());
+            return Err(AppMessage::warning(
+                "Cancel the active save before exporting filtered rows.",
+            ));
         }
         self.commit_edits();
         if self.is_dirty() {
-            return Err("Save or discard your changes before exporting filtered rows.".into());
+            return Err(AppMessage::warning(
+                "Save or discard your changes before exporting filtered rows.",
+            ));
         }
         if self.export_job.is_some() {
-            return Err("A filtered export is already running.".into());
+            return Err(AppMessage::warning("A filtered export is already running."));
         }
         let query = self
             .filter_query
             .clone()
-            .ok_or_else(|| "Apply a filter before exporting rows.".to_owned())?;
-        let progress = self
-            .filter_progress()
-            .ok_or_else(|| "Wait for filtering to complete before exporting.".to_owned())?;
+            .ok_or_else(|| AppMessage::warning("Apply a filter before exporting rows."))?;
+        let progress = self.filter_progress().ok_or_else(|| {
+            AppMessage::warning("Wait for filtering to complete before exporting.")
+        })?;
         if self.filter_job.is_some() || !progress.done {
-            return Err("Wait for filtering to complete before exporting.".into());
+            return Err(AppMessage::warning(
+                "Wait for filtering to complete before exporting.",
+            ));
         }
         if progress.cancelled {
-            return Err("Run the filter to completion before exporting.".into());
+            return Err(AppMessage::warning(
+                "Run the filter to completion before exporting.",
+            ));
         }
 
         let job = self
             .session
             .start_filtered_export(query, destination)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| AppMessage::error(error.to_string()))?;
         self.export_progress = Some(job.progress());
         self.export_job = Some(job);
         self.export_status = Some(
@@ -5065,27 +5215,29 @@ impl Document {
             && self.structural_job.is_none()
     }
 
-    fn start_save(&mut self) -> Result<(), String> {
+    fn start_save(&mut self) -> Result<(), AppMessage> {
         self.start_save_operation(None)
     }
 
-    fn start_save_as(&mut self, destination: PathBuf) -> Result<(), String> {
+    fn start_save_as(&mut self, destination: PathBuf) -> Result<(), AppMessage> {
         self.start_save_operation(Some(destination))
     }
 
-    fn start_save_operation(&mut self, destination: Option<PathBuf>) -> Result<(), String> {
+    fn start_save_operation(&mut self, destination: Option<PathBuf>) -> Result<(), AppMessage> {
         if self.source_changed {
-            return Err(SOURCE_CHANGED_NOTICE.into());
+            return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
         }
         if self.save_job.is_some() {
-            return Err("A save operation is already running.".into());
+            return Err(AppMessage::warning("A save operation is already running."));
         }
         if self.export_job.is_some() {
-            return Err("Cancel the active export before saving.".into());
+            return Err(AppMessage::warning(
+                "Cancel the active export before saving.",
+            ));
         }
         self.commit_edits();
         if !self.is_dirty() {
-            return Err("Make a change before saving.".into());
+            return Err(AppMessage::warning("Make a change before saving."));
         }
         let renames = self
             .header_renames
@@ -5113,9 +5265,9 @@ impl Document {
             Ok(job) => job,
             Err(QuarryError::SourceChanged) => {
                 self.invalidate_changed_source();
-                return Err(SOURCE_CHANGED_NOTICE.into());
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(AppMessage::error(error.to_string())),
         };
         self.save_job = Some(job);
         self.save_status = Some("Saving edited file…".into());
@@ -5124,7 +5276,7 @@ impl Document {
         Ok(())
     }
 
-    fn poll_save(&mut self) -> Result<Option<(PathBuf, bool)>, String> {
+    fn poll_save(&mut self) -> Result<Option<(PathBuf, bool)>, AppMessage> {
         let Some(job) = self.save_job.as_ref() else {
             return Ok(None);
         };
@@ -5149,7 +5301,7 @@ impl Document {
             }
             Err(QuarryError::SourceChanged) => {
                 self.invalidate_changed_source();
-                Err(SOURCE_CHANGED_NOTICE.into())
+                Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
             }
             Err(error) => {
                 self.save_status = Some(if in_place {
@@ -5157,7 +5309,7 @@ impl Document {
                 } else {
                     "Save As failed. No output file was created.".into()
                 });
-                Err(error.to_string())
+                Err(AppMessage::error(error.to_string()))
             }
         }
     }
@@ -7550,15 +7702,16 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        Action, ActiveJobDisplay, ActiveJobKind, CaseSensitivity, ColumnCommand, ColumnView,
-        DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterPredicate, FilterProgress,
-        FilterQuery, GridColumnRequest, GridSelection, HeaderMode, IndexConfig,
-        MAX_RENDERED_COLUMNS, OpenOptions, QuarryApp, REPLACE_INPUT_ID, ROW_NUMBER_WIDTH, Row,
-        SOURCE_CHANGED_NOTICE, SearchMatch, Session, StructuralDialog, StructuralDialogAction,
-        WorkingCopyState, active_job_controls, column_drop_position, column_ruler_divider_stroke,
-        column_selection_fill, configure_style, estimate_sort_temporary_bytes, filter_button_label,
-        filtered_export_file_name, first_active_job, footer_range_text, logical_viewport_start,
-        max_viewport_start, page_controls, parse_data_row, parse_file_column, parse_move_position,
+        Action, ActiveJobDisplay, ActiveJobKind, AppMessage, CaseSensitivity, ColumnCommand,
+        ColumnView, DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterPredicate,
+        FilterProgress, FilterQuery, GridColumnRequest, GridSelection, HeaderMode, IndexConfig,
+        MAX_RENDERED_COLUMNS, MessageSeverity, OpenOptions, QuarryApp, REPLACE_INPUT_ID,
+        ROW_NUMBER_WIDTH, Row, SOURCE_CHANGED_NOTICE, SearchMatch, Session, StructuralDialog,
+        StructuralDialogAction, WorkingCopyState, active_job_controls, column_drop_position,
+        column_ruler_divider_stroke, column_selection_fill, configure_style,
+        estimate_sort_temporary_bytes, filter_button_label, filtered_export_file_name,
+        first_active_job, footer_range_text, logical_viewport_start, max_viewport_start,
+        notice_strip, page_controls, parse_data_row, parse_file_column, parse_move_position,
         rendered_column_range, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
         search_controls, select_column, selected_split_column, selection_text, show_column_manager,
         show_filter_manager, show_grid, show_grid_with_filter_case, show_structural_dialog,
@@ -7968,6 +8121,89 @@ mod tests {
             },
         );
         action
+    }
+
+    #[test]
+    fn notice_sources_use_explicit_severity() {
+        let missing = std::env::temp_dir().join("quarry-missing-notice-source.csv");
+        let mut app = QuarryApp::new(None, Instant::now());
+
+        app.open_path_and_report(missing);
+        let failed_open = app.notice.as_ref().unwrap().severity;
+
+        app.save_current();
+        let blocked_save = app.notice.as_ref().unwrap().severity;
+
+        app.copy_selection(&egui::Context::default());
+        let blocked_copy = app.notice.as_ref().unwrap().severity;
+
+        app.handle_dropped_paths(vec![None]);
+        let ignored_drop = app.notice.as_ref().unwrap().severity;
+
+        for (source, actual, expected) in [
+            ("failed open", failed_open, MessageSeverity::Error),
+            ("blocked save", blocked_save, MessageSeverity::Warning),
+            ("blocked copy", blocked_copy, MessageSeverity::Warning),
+            ("ignored drop", ignored_drop, MessageSeverity::Warning),
+        ] {
+            assert_eq!(actual, expected, "wrong severity for {source}");
+        }
+    }
+
+    #[test]
+    fn notice_strip_is_dismissible_and_announces_its_severity() {
+        for (notice, expected_live) in [
+            (
+                AppMessage::error("Could not open the file."),
+                egui::accesskit::Live::Assertive,
+            ),
+            (
+                AppMessage::warning("Choose a column first."),
+                egui::accesskit::Live::Polite,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut dismissed = false;
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    dismissed = notice_strip(ui, &notice);
+                });
+            });
+            assert!(!dismissed);
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.live() == Some(expected_live)),
+                "notice text should use the expected live-region priority"
+            );
+            let (target, node) = accessible_button(&output, "Dismiss");
+            assert!(node.supports_action(egui::accesskit::Action::Click));
+
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Click,
+                            target,
+                            data: None,
+                        },
+                    )],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        dismissed = notice_strip(ui, &notice);
+                    });
+                },
+            );
+            assert!(dismissed);
+        }
     }
 
     fn grid_input_with_width(width: f32) -> egui::RawInput {
@@ -9423,6 +9659,11 @@ mod tests {
         let mut frame = eframe::Frame::_new_kittest();
         assert!(app.save_current());
         let _ = finish_app_save(&mut app, &ctx, &mut frame);
+        assert!(app.notice.is_none());
+        assert_eq!(
+            app.footer_status.as_ref().map(|message| message.severity),
+            Some(MessageSeverity::Status)
+        );
         let document = app.document.as_ref().unwrap();
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.data_start, 0);
@@ -9930,7 +10171,7 @@ mod tests {
             cancelled: false,
         });
 
-        app.notice = Some("unchanged".into());
+        app.notice = Some(AppMessage::warning("unchanged"));
         app.export_picker_result(None);
         assert_eq!(app.notice.as_deref(), Some("unchanged"));
         app.export_picker_result(Some(first.clone()));
@@ -11789,6 +12030,11 @@ mod tests {
 
         app.swap_structural_history(false).unwrap();
         finish_index(app.document.as_mut().unwrap());
+        assert_eq!(app.footer_status.as_deref(), Some("Change undone."));
+        assert_eq!(
+            app.footer_status.as_ref().map(|message| message.severity),
+            Some(MessageSeverity::Status)
+        );
         let document = app.document.as_mut().unwrap();
         assert_eq!(document.session.path(), source);
         assert_eq!(document.total_columns, 3);
