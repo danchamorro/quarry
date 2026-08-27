@@ -50,11 +50,16 @@ const MIN_THUMB_HEIGHT: f32 = 24.0;
 const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
 const APP_ID: &str = "io.github.danchamorro.quarry";
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TOOLBAR_HEIGHT: f32 = 38.0;
 const STATUS_BAR_HEIGHT: f32 = 32.0;
 const STATUS_JOB_WIDTH: f32 = 360.0;
 const STATUS_CANCEL_WIDTH: f32 = 112.0;
-const DOCUMENT_MENU_WIDTH: f32 = 260.0;
-const FORMAT_MENU_WIDTH: f32 = 240.0;
+const DOCUMENT_MENU_WIDTH: f32 = 220.0;
+const FORMAT_MENU_WIDTH: f32 = 190.0;
+const COMPACT_DOCUMENT_MENU_WIDTH: f32 = 132.0;
+const COMPACT_FORMAT_MENU_WIDTH: f32 = 90.0;
+const TOOLBAR_JUMP_WIDTH: f32 = 52.0;
+const TOOLBAR_FILTER_WIDTH: f32 = 78.0;
 const JUMP_INPUT_ID: &str = "quarry-jump-input";
 const FIND_INPUT_ID: &str = "quarry-find-input";
 const REPLACE_INPUT_ID: &str = "quarry-replace-input";
@@ -1487,6 +1492,7 @@ impl eframe::App for QuarryApp {
 
         let mut action = None;
         egui::TopBottomPanel::top("quarry-toolbar")
+            .exact_height(TOOLBAR_HEIGHT)
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(230, 235, 238))
@@ -1497,93 +1503,132 @@ impl eframe::App for QuarryApp {
                     )),
             )
             .show(ctx, |ui| {
+                let document = self.document.as_ref();
+                let document_open = document.is_some();
+                let filter_active = document.is_some_and(Document::filter_active);
+                let compact = ui.available_width() < 1_000.0;
+                ui.spacing_mut().item_spacing.x = if compact { 4.0 } else { 6.0 };
+                ui.spacing_mut().button_padding.x = if compact { 5.0 } else { 8.0 };
                 ui.horizontal(|ui| {
-                    if let Some(document_action) = document_menu(ui, self.document.as_ref()) {
+                    if let Some(document_action) = document_menu(
+                        ui,
+                        document,
+                        if compact {
+                            COMPACT_DOCUMENT_MENU_WIDTH
+                        } else {
+                            DOCUMENT_MENU_WIDTH
+                        },
+                    ) {
                         action = Some(document_action);
                     }
                     if let Some(format_action) = format_menu(
                         ui,
-                        self.document.as_ref(),
+                        document,
                         self.delimiter_mode,
                         self.header_mode,
                         &mut self.format_draft,
+                        compact,
+                        if compact {
+                            COMPACT_FORMAT_MENU_WIDTH
+                        } else {
+                            FORMAT_MENU_WIDTH
+                        },
                     ) {
                         action = Some(format_action);
                     }
-                });
+                    let label = ui.label("Row");
+                    let jump_enabled = document_open && !filter_active;
+                    let jump = ui
+                        .add_enabled(
+                            jump_enabled,
+                            egui::TextEdit::singleline(&mut self.jump_input)
+                                .id(egui::Id::new(JUMP_INPUT_ID))
+                                .horizontal_align(Align::RIGHT)
+                                .desired_width(TOOLBAR_JUMP_WIDTH),
+                        )
+                        .labelled_by(label.id);
+                    if ui
+                        .add_enabled(jump_enabled, egui::Button::new("Go"))
+                        .clicked()
+                        || (jump_enabled
+                            && jump.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                    {
+                        action = Some(Action::Jump);
+                    }
+                    if let Some(page_action) = page_controls(ui, document_open) {
+                        action = Some(page_action);
+                    }
 
-                if let Some(document) = &self.document {
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        let filter_active = document.filter_active();
-                        let label = ui.label("Data row");
-                        let jump = ui
-                            .add_enabled(
-                                !filter_active,
-                                egui::TextEdit::singleline(&mut self.jump_input)
-                                    .id(egui::Id::new(JUMP_INPUT_ID))
-                                    .horizontal_align(Align::RIGHT)
-                                    .desired_width(120.0),
-                            )
-                            .labelled_by(label.id);
-                        if ui
-                            .add_enabled(!filter_active, egui::Button::new("Jump"))
-                            .clicked()
-                            || (!filter_active
-                                && jump.lost_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                        {
-                            action = Some(Action::Jump);
-                        }
-                        if let Some(page_action) = page_controls(ui) {
-                            action = Some(page_action);
-                        }
-                        if ui.button("Columns…").clicked() {
-                            action = Some(Action::OpenColumns);
-                        }
-                        if document.working_copy.is_some() {
-                            if ui
-                                .add_enabled(
-                                    document.can_undo_structural(),
-                                    egui::Button::new("Undo Change"),
-                                )
-                                .on_disabled_hover_text(
-                                    "Save or discard later cell and header edits before undoing the change.",
-                                )
-                                .clicked()
-                            {
-                                action = Some(Action::UndoStructuralEdit);
-                            }
-                            if ui
-                                .add_enabled(
-                                    document.can_redo_structural(),
-                                    egui::Button::new("Redo Change"),
-                                )
-                                .clicked()
-                            {
-                                action = Some(Action::RedoStructuralEdit);
-                            }
-                        }
-                        let filter_label = filter_button_label(document.filter_query.as_ref());
-                        if ui.button(filter_label).clicked() {
-                            action = Some(Action::OpenFilters);
-                        }
-                        let find_disabled_reason = "Clear the filter before using Find.";
-                        let find = ui
-                            .add_enabled(!filter_active, egui::Button::new("Find"))
-                            .on_disabled_hover_text(find_disabled_reason);
-                        if filter_active {
-                            let _ = ui.ctx().accesskit_node_builder(find.id, |node| {
-                                node.set_description(find_disabled_reason);
-                            });
-                        }
-                        if find.clicked() {
-                            self.find_bar_open = true;
-                            focus_find = true;
-                        }
+                    let can_undo = document.is_some_and(Document::can_undo_structural);
+                    let undo = ui
+                        .add_enabled(can_undo, egui::Button::new("Undo"))
+                        .on_disabled_hover_text(
+                            "Save or discard later cell and header edits before undoing the change.",
+                        );
+                    undo.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            can_undo,
+                            "Undo Change",
+                        )
                     });
-                }
+                    if undo.clicked() {
+                        action = Some(Action::UndoStructuralEdit);
+                    }
 
+                    let can_redo = document.is_some_and(Document::can_redo_structural);
+                    let redo = ui.add_enabled(can_redo, egui::Button::new("Redo"));
+                    redo.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            can_redo,
+                            "Redo Change",
+                        )
+                    });
+                    if redo.clicked() {
+                        action = Some(Action::RedoStructuralEdit);
+                    }
+
+                    if ui
+                        .add_enabled(document_open, egui::Button::new("Columns…"))
+                        .clicked()
+                    {
+                        action = Some(Action::OpenColumns);
+                    }
+                    let filter_label = filter_button_label(
+                        document.and_then(|document| document.filter_query.as_ref()),
+                    );
+                    let filters = ui
+                        .add_enabled_ui(document_open, |ui| {
+                            ui.add_sized(
+                                [TOOLBAR_FILTER_WIDTH, 24.0],
+                                egui::Button::new(filter_label).truncate(),
+                            )
+                        })
+                        .inner;
+                    if filters.clicked() {
+                        action = Some(Action::OpenFilters);
+                    }
+
+                    let find_disabled_reason = if document_open {
+                        "Clear the filter before using Find."
+                    } else {
+                        "Open a file first."
+                    };
+                    let find = ui
+                        .add_enabled(jump_enabled, egui::Button::new("Find"))
+                        .on_disabled_hover_text(find_disabled_reason);
+                    if !jump_enabled {
+                        let _ = ui.ctx().accesskit_node_builder(find.id, |node| {
+                            node.set_description(find_disabled_reason);
+                        });
+                    }
+                    if find.clicked() {
+                        self.find_bar_open = true;
+                        focus_find = true;
+                    }
+                });
             });
 
         if let Some(notice) = self.notice.as_ref() {
@@ -2356,9 +2401,11 @@ fn format_menu(
     applied_delimiter: DelimiterMode,
     applied_header: HeaderMode,
     draft: &mut Option<(DelimiterMode, HeaderMode)>,
+    compact: bool,
+    width: f32,
 ) -> Option<Action> {
     let document_open = document.is_some();
-    let label = if document_open {
+    let accessibility_label = if document_open {
         format!(
             "Format: {} · {}",
             applied_delimiter.label(),
@@ -2367,13 +2414,18 @@ fn format_menu(
     } else {
         "Format".to_owned()
     };
+    let label = if compact && document_open {
+        applied_delimiter.label().to_owned()
+    } else {
+        accessibility_label.clone()
+    };
     let response = ui
         .add_enabled_ui(document_open, |ui| {
             menu_button_with_arrow(
                 ui,
                 "format-menu-arrow",
                 egui::Button::new(RichText::new(label.clone()).atom_shrink(true)),
-                FORMAT_MENU_WIDTH,
+                width,
             )
         })
         .inner
@@ -2382,7 +2434,7 @@ fn format_menu(
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             document_open,
-            label.replace(" · ", ", "),
+            accessibility_label.replace(" · ", ", "),
         )
     });
     if let Some(document) = document {
@@ -2491,7 +2543,7 @@ fn format_menu(
     menu.and_then(|inner| inner.inner)
 }
 
-fn document_menu(ui: &mut egui::Ui, document: Option<&Document>) -> Option<Action> {
+fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> Option<Action> {
     let document_open = document.is_some();
     let dirty = document.is_some_and(Document::is_dirty);
     let file_operation_active = document.is_some_and(|document| {
@@ -2524,7 +2576,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>) -> Option<Actio
         ui,
         "document-menu-arrow",
         egui::Button::new((marker, RichText::new(filename.clone()).atom_shrink(true))),
-        DOCUMENT_MENU_WIDTH,
+        width,
     );
     let menu = egui::Popup::menu(&response).show(|ui| {
         ui.set_min_width(190.0);
@@ -2612,9 +2664,13 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>) -> Option<Actio
     menu.and_then(|inner| inner.inner)
 }
 
-fn page_controls(ui: &mut egui::Ui) -> Option<Action> {
-    let page_up = ui.button("Page Up").clicked();
-    let page_down = ui.button("Page Down").clicked();
+fn page_controls(ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
+    let page_up = ui
+        .add_enabled(enabled, egui::Button::new("Page Up"))
+        .clicked();
+    let page_down = ui
+        .add_enabled(enabled, egui::Button::new("Page Down"))
+        .clicked();
     if page_up {
         Some(Action::PageUp)
     } else if page_down {
@@ -8046,6 +8102,248 @@ mod tests {
         app.document.as_mut().unwrap().shutdown();
     }
 
+    #[test]
+    fn toolbar_stays_single_row_and_in_bounds_at_supported_widths() {
+        let central_panel_top = |output: &egui::FullOutput, width: f32| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.fill == egui::Color32::from_rgb(244, 247, 248)
+                            && rect.rect.width() >= width - 1.0
+                            && rect.rect.height() > 100.0 =>
+                    {
+                        Some(rect.rect.top())
+                    }
+                    _ => None,
+                })
+                .next()
+                .expect("central panel should be painted")
+        };
+        let assert_toolbar =
+            |ctx: &egui::Context, output: &egui::FullOutput, labels: &[&str], width: f32| {
+                let bounds = labels
+                    .iter()
+                    .map(|label| {
+                        accessible_button(output, label)
+                            .1
+                            .bounds()
+                            .unwrap_or_else(|| panic!("{label} should have bounds"))
+                    })
+                    .collect::<Vec<_>>();
+                for pair in bounds.windows(2) {
+                    assert!(
+                        pair[0].x1 <= pair[1].x0,
+                        "toolbar controls should remain left-to-right"
+                    );
+                }
+                let first = bounds[0];
+                let first_center = (first.y0 + first.y1) / 2.0;
+                assert!(
+                    bounds
+                        .iter()
+                        .all(|bounds| ((bounds.y0 + bounds.y1) / 2.0 - first_center).abs() < 1.0)
+                );
+                assert!(bounds.last().unwrap().x1 <= f64::from(width - 10.0));
+
+                let tree = output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .expect("toolbar should be accessible");
+                let row_input = tree
+                    .nodes
+                    .iter()
+                    .find_map(|(_, node)| {
+                        (node.role() == egui::accesskit::Role::TextInput
+                            && !node.labelled_by().is_empty())
+                        .then_some(node)
+                    })
+                    .expect("Row input should be accessible");
+                assert!(
+                    row_input.labelled_by().iter().any(|label_id| {
+                        tree.nodes
+                            .iter()
+                            .any(|(id, node)| id == label_id && node.value() == Some("Row"))
+                    }),
+                    "Row input labels: {:?}",
+                    row_input
+                        .labelled_by()
+                        .iter()
+                        .filter_map(|label_id| tree.nodes.iter().find(|(id, _)| id == label_id))
+                        .collect::<Vec<_>>()
+                );
+                let row_input = row_input.bounds().expect("Row input should have bounds");
+                assert!(
+                    bounds[1].x1 <= row_input.x0,
+                    "Format ended at {}, Row input started at {}",
+                    bounds[1].x1,
+                    row_input.x0
+                );
+                assert!(
+                    row_input.x1 <= bounds[2].x0,
+                    "Row input ended at {}, Go started at {}",
+                    row_input.x1,
+                    bounds[2].x0
+                );
+                assert!(((row_input.y0 + row_input.y1) / 2.0 - first_center).abs() < 1.0);
+
+                let height =
+                    egui::containers::panel::PanelState::load(ctx, egui::Id::new("quarry-toolbar"))
+                        .expect("toolbar panel state should be stored")
+                        .size()
+                        .y;
+                assert!(
+                    (height - (super::TOOLBAR_HEIGHT + 2.0)).abs() < 0.1,
+                    "toolbar frame height was {height}"
+                );
+                central_panel_top(output, width)
+            };
+
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        let empty_labels = [
+            "File menu",
+            "Format",
+            "Go",
+            "Page Up",
+            "Page Down",
+            "Undo Change",
+            "Redo Change",
+            "Columns…",
+            "Filters…",
+            "Find",
+        ];
+        let widths = [860.0, 1280.0];
+        let mut empty_tops = [0.0; 2];
+        for (index, width) in widths.into_iter().enumerate() {
+            let output = ctx.run(grid_input_with_width(width), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            });
+            empty_tops[index] = assert_toolbar(&ctx, &output, &empty_labels, width);
+            for label in &empty_labels[1..] {
+                assert!(accessible_button(&output, label).1.is_disabled());
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let filename = format!("{}toolbar.csv", "long-file-name-".repeat(12));
+        let path = directory.path().join(&filename);
+        let mut contents = b"name,value\n".to_vec();
+        contents.extend_from_slice(&b"first,1\n".repeat(131_072));
+        fs::write(&path, contents).unwrap();
+        app.open_new_path(path).unwrap();
+        let document = app.document.as_mut().unwrap();
+        let initial_job = document.job.take().expect("index job should be active");
+        initial_job.cancel();
+        initial_job.wait().unwrap();
+        let slow_job = document
+            .session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 1,
+                ..IndexConfig::default()
+            })
+            .unwrap();
+        document.progress = slow_job.progress();
+        document.job = Some(slow_job);
+        document.last_poll = Instant::now();
+        let document_label = format!("File menu: {filename}");
+        let document_labels = [
+            document_label.as_str(),
+            "Format: Auto, Auto",
+            "Go",
+            "Page Up",
+            "Page Down",
+            "Undo Change",
+            "Redo Change",
+            "Columns…",
+            "Filters…",
+            "Find",
+        ];
+        for (index, width) in widths.into_iter().enumerate() {
+            let output = ctx.run(grid_input_with_width(width), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            });
+            assert_eq!(
+                assert_toolbar(&ctx, &output, &document_labels, width),
+                empty_tops[index]
+            );
+            assert!(
+                app.document
+                    .as_ref()
+                    .unwrap()
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| !job.progress().done),
+                "indexing should remain active during layout assertions"
+            );
+        }
+        finish_index(app.document.as_mut().unwrap());
+
+        for (index, width) in widths.into_iter().enumerate() {
+            let output = ctx.run(grid_input_with_width(width), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            });
+            assert_eq!(
+                assert_toolbar(&ctx, &output, &document_labels, width),
+                empty_tops[index]
+            );
+        }
+
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "changed".into())
+            .unwrap();
+        for (index, width) in widths.into_iter().enumerate() {
+            let output = ctx.run(grid_input_with_width(width), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            });
+            assert_eq!(
+                assert_toolbar(&ctx, &output, &document_labels, width),
+                empty_tops[index]
+            );
+        }
+
+        app.document.as_mut().unwrap().filter_query = Some(FilterQuery {
+            predicates: (0..12)
+                .map(|_| FilterPredicate {
+                    column: 0,
+                    operator: FilterOperator::Equals,
+                    value: b"first".to_vec(),
+                })
+                .collect(),
+            case_sensitivity: CaseSensitivity::Insensitive,
+        });
+        let filtered_labels = [
+            document_label.as_str(),
+            "Format: Auto, Auto",
+            "Go",
+            "Page Up",
+            "Page Down",
+            "Undo Change",
+            "Redo Change",
+            "Columns…",
+            "Filters (12)…",
+            "Find",
+        ];
+        for (index, width) in widths.into_iter().enumerate() {
+            let output = ctx.run(grid_input_with_width(width), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut frame);
+            });
+            assert_eq!(
+                assert_toolbar(&ctx, &output, &filtered_labels, width),
+                empty_tops[index]
+            );
+            assert!(accessible_button(&output, "Find").1.is_disabled());
+        }
+
+        app.document.as_mut().unwrap().shutdown();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn app_install_lock_excludes_bundle_replacement() {
@@ -8500,11 +8798,11 @@ mod tests {
     #[test]
     fn page_navigation_controls_are_clickable() {
         assert!(matches!(
-            click_accessible_button("Page Up", page_controls),
+            click_accessible_button("Page Up", |ui| page_controls(ui, true)),
             Some(Action::PageUp)
         ));
         assert!(matches!(
-            click_accessible_button("Page Down", page_controls),
+            click_accessible_button("Page Down", |ui| page_controls(ui, true)),
             Some(Action::PageDown)
         ));
     }
