@@ -34,7 +34,7 @@ working memory bounded and does not change the source until you choose
 |---|---|
 | Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
-| Find and replace | Literal Find Next, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
+| Find and replace | Literal Find Next and Find Previous, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
 | Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, and Does not equal predicates; same-column alternatives with AND across columns; case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
 | Edit | Direct cell and header editing; multiline values; Undo and Redo; Discard Changes |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or Delete; continue editing the result before saving |
@@ -59,7 +59,8 @@ and package-only instructions.
 ## Quick start
 
 1. Install Quarry, then open a CSV, TSV, pipe-delimited, or semicolon-delimited
-   file from Finder, **Choose…**, drag and drop, or a typed path.
+   file from Finder, through **Open…** in Quarry's file menu, or by dropping it
+   onto the Quarry window.
 2. Edit the grid directly. Use **Filters…** to narrow or export rows, and use
    the numbered column rulers to select columns for reshaping or sorting.
 3. Use **Save** to update the source or **Save As…** to create a separate file.
