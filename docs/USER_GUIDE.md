@@ -38,14 +38,13 @@ Quarry supports comma, tab, pipe, and semicolon-delimited files. Open a file in
 any of these ways:
 
 - Double-click it in Finder after associating its file type with Quarry.
-- Click **Choose…** and select the file.
-- Drag a local file into the Quarry window.
-- Enter its full path in **File**, then click **Open** or press Enter.
+- Open Quarry's file menu, choose **Open…**, and select the file.
+- Drop a local file onto the centered target shown when no file is open.
 
 Quarry detects the delimiter and header row automatically. If the result is
-wrong, choose the correct **Delimiter** or **Header** setting, then click
-**Apply / Reopen**. You must save or discard unsaved changes before reopening
-the file with different settings.
+wrong, open **Format**, choose the correct delimiter and header settings, then
+click **Reopen with Changes**. You must save or discard unsaved changes before
+reopening the file with different settings.
 
 ### 3. Understand the grid
 
@@ -54,8 +53,16 @@ the file with different settings.
 - The row below the ruler contains the column names when the file has a header.
 - The numbers on the left identify data rows. The header is not counted as a
   data row.
-- The footer reports file size, delimiter, header mode, indexed rows, the
-  visible row and column ranges, and the current selection.
+- The file menu shows the current filename. A yellow dot marks unsaved changes,
+  and the menu contains Open, Reload from Disk, Save, Save As, and Discard
+  Changes.
+- **Format** shows the applied delimiter and header mode. Opening it also shows
+  what Quarry originally detected.
+- The footer keeps the visible row range in view, adds file and selection
+  metadata when space allows, and reserves its right side for status, progress,
+  and the active operation's cancel button.
+- Warnings and errors appear in a dismissible strip below the toolbar. Ordinary
+  completion and informational messages stay in the footer.
 
 Quarry displays the first rows before the complete file index is ready. You can
 start reading and filtering immediately. Find and Sort become available after
@@ -66,7 +73,7 @@ indexing finishes.
 1. Double-click a cell.
 2. Change its value and press Enter.
 3. Confirm that the footer says **Modified (not saved)**.
-4. Click **Save As…** and choose a new filename.
+4. Open the file menu, choose **Save As…**, and select a new filename.
 
 This creates an edited copy and preserves the original file.
 
@@ -76,9 +83,10 @@ This creates an edited copy and preserves the original file.
 
 - Scroll vertically with the mouse, trackpad, or the right-side scrollbar.
 - Scroll horizontally to reach every shown column.
-- Enter a one-based row number in **Data row**, then click **Jump** or press
+- Enter a one-based data-row number in **Row**, then click **Go** or press
   Enter.
-- Use **Page Up** and **Page Down**, or the keyboard Page Up and Page Down keys.
+- Click **Page Up** or **Page Down**, or use the keyboard Page Up and Page Down
+  keys.
 
 The number of visible rows follows the available window height. When a filter
 is active, direct row jumping is disabled because the grid is showing matches
@@ -88,7 +96,7 @@ rather than a continuous source-row range.
 
 - Click a cell to select it.
 - Click a number on the left to select the whole displayed row.
-- Click **Copy** or press Command+C on macOS.
+- Press Command+C on macOS.
 - Right-click a cell and choose **Copy** to copy its full decoded value,
   including embedded newlines.
 
@@ -104,7 +112,7 @@ order, including columns hidden in the current view. Copy is limited to 64 MiB.
 3. Press Enter to keep the edit, or press Escape to cancel it.
 
 Clicking elsewhere also keeps the active edit. The source file is not changed
-until you use **Save**.
+until you choose **Save** from the file menu or press Command+S.
 
 #### Rename a header
 
@@ -119,23 +127,29 @@ header row.
 
 Find and Replace use literal text, not regular expressions.
 
-1. Enter a value in **Find (literal)**.
-2. Leave **Match case** off to ignore ASCII letter case, or turn it on for an
+1. Click **Find** in the toolbar, or press Command+F, to open the Find strip.
+2. Enter a value in **Find (literal)**.
+3. Leave **Match case** off to ignore ASCII letter case, or turn it on for an
    exact case match.
-3. Click **Find Next**. Quarry scrolls to and reveals the next matching cell
-   without changing the current selection.
-4. To change that cell, enter text in **Replace with (literal)** and click
-   **Replace in Cell**.
-5. To change every match, click **Replace All**.
+4. Click **Find Next**, or press Enter in the Find field. Quarry scrolls to,
+   reveals, and highlights the matching cell.
+5. After finding more than one match, use **Find Previous**, or press
+   Shift+Enter in the Find field, to move backward.
+6. To change the current match, click **Replace** to reveal the replacement
+   row, enter text in **Replace with (literal)**, and click **Replace in Cell**.
+7. To change every match, click **Replace All**.
 
 **Replace in Cell** replaces every non-overlapping occurrence in the current
-matching cell, then continues the search. **Replace All** scans the whole file
-and creates an unsaved working version. Replace All changes data cells only and
-leaves the header unchanged. Use **Cancel Search** or **Cancel Change** to stop
-a running operation.
+matching cell, then continues the search. It remains unavailable until Find has
+selected a current match. **Replace All** scans the whole file and creates an
+unsaved working version. Replace All changes data cells only and leaves the
+header unchanged. Use the footer's **Cancel Search** or **Cancel Change** button
+to stop a running operation. Use **Close find**, or Escape while a Find field
+has focus, to return to the single toolbar row.
 
-Find becomes available after indexing finishes. Find and Replace are hidden
-while a filter is active, so clear the filter before searching.
+Find actions become available after indexing finishes. Find is disabled while
+a filter is active. If the Find strip was already open, it remains visible but
+disabled until you clear the filter.
 
 ### Filter rows
 
@@ -174,9 +188,10 @@ Filter rules work as follows:
 - **Contains** requires a value. **Equals** and **Does not equal** can compare
   against an empty cell.
 
-Filtering is case-insensitive by default. Click **Filters active…** to inspect
-the current rules, use **Clear filter** to return to all rows, or use **Cancel
-filter** while a scan is running.
+Filtering is case-insensitive by default. After applying rules, the toolbar
+button changes to **Filters (N)…**, where N is the number of active rules. Open
+it to inspect the rules, use **Clear filter** to return to all rows, or use the
+footer's **Cancel filter** button while a scan is running.
 
 Unsaved cell edits must be saved or discarded before filtering. Column
 transformations that have already produced a working file can be filtered.
@@ -185,9 +200,9 @@ transformations that have already produced a working file can be filtered.
 
 After a filter finishes:
 
-1. Click **Export Filtered Rows…**.
+1. Open **Filters (N)…** and click **Export Filtered Rows…**.
 2. Choose a new destination.
-3. Wait for the export to finish, or click **Cancel Export**.
+3. Wait for the export to finish, or click **Cancel Export** in the footer.
 
 The export contains the header, when present, plus every matching row. It
 writes a new file and does not replace the source. Save or discard unsaved
@@ -249,7 +264,7 @@ values directly next to each other. The completed result is an unsaved change.
 
 Delete begins immediately after validation and does not show another
 confirmation dialog. At least one column must remain. The source is still
-unchanged until you save. **Undo Change** can restore the previous layout unless
+unchanged until you save. **Undo** can restore the previous layout unless
 later cell or header edits are unsaved; **Discard Changes** restores the source
 layout and removes every unsaved change.
 
@@ -280,7 +295,7 @@ Click **Columns…** to change the view without changing the CSV structure:
 - Use **Search columns** to find a column by name or original number.
 - Uncheck a column to hide it, or check it to show it.
 - Click and drag a column row to change its displayed position.
-- Click **Reset** to restore the default visibility and order.
+- Click **Reset columns** to restore the default visibility and order.
 - Click **Done** to close the window.
 
 These choices are view-only. They do not create an unsaved file change, and
@@ -288,11 +303,20 @@ they do not alter the order written by Save. Original file-column numbers stay
 attached to their columns after a view reorder. Split, Combine, Move, and Delete
 create a newly numbered working document.
 
-Click **Auto-fit columns** to fit every shown column to its header and the cell
-values already loaded into the grid. Auto-fit is available when 64 or fewer
-columns are shown.
+Click **Auto-fit columns** at the bottom of the **Columns…** window to fit every
+shown column to its header and the cell values already loaded into the grid.
+Auto-fit is available when 64 or fewer columns are shown.
 
 ### Save, Save As, and discard
+
+The leftmost toolbar control reads **File** before a file is open and shows the
+current filename afterward. Its menu contains **Open…**, **Reload from Disk**,
+**Save**, **Save As…**, and **Discard Changes**. A yellow dot beside the filename
+and **Modified (not saved)** in the footer identify unsaved work.
+
+**Reload from Disk** rereads the current path with the applied format.
+**Reopen with Changes** in the Format menu applies a confirmed delimiter or
+header change instead.
 
 - **Save** safely replaces the current file after the complete write succeeds.
 - **Save As…** writes to a new unused path, preserves the previous source, and
@@ -300,7 +324,7 @@ columns are shown.
 - **Discard Changes** restores the last opened or saved file and removes all
   unsaved cell, header, Replace All, Split, Combine, Move, Delete, and Sort
   changes.
-- **Undo Change** and **Redo Change** move one step between completed whole-file
+- **Undo** and **Redo** move one step between completed whole-file
   working versions. They are not a per-cell edit history, and they are
   unavailable while later cell or header edits remain unsaved.
 
@@ -329,16 +353,20 @@ setting.
 
 | Action | Mouse or keyboard |
 |---|---|
-| Open a typed file path | Enter in **File** |
-| Jump to a data row | Enter in **Data row** |
+| Open a file | **Open…** in the file menu or empty-state target |
+| Jump to a data row | Enter in **Row**, or click **Go** |
 | Edit a cell | Double-click, or select and press Enter or F2 |
 | Keep a cell edit | Enter or click elsewhere |
 | Add a newline inside a cell | Shift+Enter |
 | Cancel a cell or header edit | Escape |
 | Rename a header | Click the header name |
-| Copy the selected cell or row | Command+C, or **Copy** |
-| Save | Command+S, or **Save** |
-| Move by one page | Page Up or Page Down |
+| Copy the selected cell or row | Command+C, or cell context-menu **Copy** |
+| Save | Command+S, or file menu **Save** |
+| Open Find | Command+F, or **Find** |
+| Find the next match | Enter in Find, or **Find Next** |
+| Return to a prior match | Shift+Enter in Find, or **Find Previous** |
+| Close Find | **Close find**, or Escape while a Find field has focus |
+| Move by one page | **Page Up**, **Page Down**, or the matching key |
 | Select a column range | Shift-click numbered columns |
 | Add or remove selected columns | Command-click or Ctrl-click numbered columns |
 | Open a focused context menu | Shift+F10 |
@@ -347,16 +375,19 @@ setting.
 
 | Problem | What to do |
 |---|---|
-| The delimiter or header is wrong | Choose the correct **Delimiter** or **Header**, then click **Apply / Reopen**. Save or discard changes first. |
+| The delimiter or header is wrong | Open **Format**, choose the correct delimiter and header, then click **Reopen with Changes**. Save or discard changes first. |
 | Find or Sort is unavailable | Wait for indexing to finish. Sort also needs the temporary-disk estimate. |
 | Cell editing is unavailable | Clear active filters and wait for the current operation to finish. Missing and non-UTF-8 cells cannot be edited. |
 | Filtering is unavailable | Save or discard cell edits, then cancel or finish any active search, filter, export, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |
-| **Auto-fit columns** is unavailable | Hide columns until 64 or fewer are shown. |
+| **Auto-fit columns** is unavailable in **Columns…** | Hide columns until 64 or fewer are shown. |
 | A filter returns no rows | Check the original column number, value, **Match case** setting, and same-column rule logic. |
-| Find and Replace disappeared | A filter is active. Clear it to restore Find and Replace. |
-| Quarry says the source changed | Use **Discard Changes**, then reopen the externally changed file. |
+| Find is disabled | A filter is active. Open **Filters (N)…** and clear it. |
+| **Replace in Cell** is disabled | Use **Find Next** or **Find Previous** to establish the current matching cell first. |
+| Quarry says the source changed | Use **Discard Changes**, then choose **Reload from Disk** from the file menu. |
 | Save As will not use a path | Choose a destination that does not already exist. |
+| A dropped file does not open | Use one local file, and save or discard changes in the current file first. |
+| A long operation is running | Read its progress or phase in the footer. Use the matching Cancel button there if needed. |
 | A long operation appears stuck during sort | Check whether the status says **Merging sorted rows…**. This is a separate merge phase and can take substantial time on very large files. |
 
 Cancelled or failed full-file operations do not publish a partial output file.
