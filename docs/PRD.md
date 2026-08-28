@@ -1,6 +1,6 @@
 # Quarry Product Requirements Document
 
-**Version:** 0.4 Draft
+**Version:** 0.5 Draft
 **Platform:** macOS first
 **Core engine:** Rust
 **Model:** Open source
@@ -61,9 +61,9 @@ sparse unsaved document state, atomic Save with metadata-based conflict
 detection, no-clobber Save As, and repeatable Split and Combine edits applied
 from selected grid columns. Each confirmed operation materializes a private CSV
 and reopens it as the ordinary editable working copy. Explicit selected-column
-Move and Delete use that same workflow while the Columns manager remains
-view-only. Overlay-aware Find Next, Replace in Cell, and bounded Replace All
-complete Phase 5.
+Move Selected Columns and Delete Selected Columns use that same workflow while
+the Columns manager remains view-only. Overlay-aware Find Next, Replace in Cell,
+and bounded Replace All complete Phase 5.
 
 Edit headers and cells directly in the grid. Existing UTF-8 data cells support
 multiline input and use sparse unsaved document state keyed by stable physical
@@ -79,8 +79,9 @@ through the bounded private rewrite worker. A successful replacement reopens as
 the ordinary unsaved working document; no match, cancellation, or failure
 changes nothing. Filters still require unsaved data-cell edits to be saved or
 discarded. After a materialized operation is reindexed, its working CSV becomes
-the ordinary searchable document. Split replaces one selected
-column with the fields found by a
+the ordinary searchable document. Find Previous revisits matches already
+reached through Find Next without scanning the file backward. Split replaces
+one selected column with the fields found by a
 non-empty literal separator. Quarry derives the resulting width from the
 current data plus sparse edits, keeps the original header on the first result,
 and creates blank editable headers for additional results. If the separator is
@@ -178,7 +179,7 @@ stable-tie source-ordinal checks, unchanged source hashes, and prompt
 cancellation without leftovers. Numeric, date, locale-aware, and multi-column
 sorting remain later slices.
 
-## Version 0.4: desktop packaging and installation
+## Version 0.4: desktop packaging and workflow polish (complete)
 
 Phase 7A packages the selected egui application as the customer-facing
 `/Applications/Quarry.app`. Its stable bundle identifier is
@@ -200,6 +201,29 @@ The local alpha uses ad-hoc signing until a Developer ID Application identity
 and notarization credentials are available. Ad-hoc verification is not a claim
 of trusted-publisher or Gatekeeper distribution readiness.
 
+Phase 7B completed owner-reviewed connected-workflow dogfooding and a focused
+interface pass. The accepted toolbar keeps the grid primary, moves status and
+progress into the footer, exposes secondary controls contextually, and preserves
+keyboard and accessibility behavior. The current workflow is documented in the
+[user guide](USER_GUIDE.md).
+
+## Version 0.5: row operations (planned)
+
+The first row-operation slice is **Delete Selected Rows**. Users select one or
+more data rows through the numbered row gutter, then explicitly remove those
+rows from the working document. The header is never a deletable data row.
+
+Deletion must stream the current document and sparse edits into a bounded
+private working CSV, preserve every unselected row, reopen the result as the
+ordinary modified document, and use the existing Save, Save As, Discard Changes,
+and one-level structural Undo and Redo lifecycle. Cancellation, failure, or a
+source conflict must leave both the current document and source unchanged and
+remove unpublished output.
+
+Filtered-view deletion semantics must be chosen before implementation. A visible
+filtered position must not be treated as a physical data row unless Quarry can
+identify that row unambiguously. Row insertion remains a separate later feature.
+
 ## Progressive opening
 1. Open the file and sample a bounded region.
 2. Detect likely encoding/delimiter/quote settings.
@@ -217,7 +241,8 @@ Initial targets:
 - Initial viewing memory: under 500 MB target.
 - No RAM growth proportional to file size during read-only viewing.
 - Responsive UI during indexing, search, filtering, filtered navigation,
-  export, editing, Find/Replace, Split, Combine, Move, and Delete.
+  export, editing, Find/Replace, Split, Combine, Move, Delete Selected Columns,
+  and planned Delete Selected Rows.
 - Streaming Save and Save As with memory bounded by scanner limits and the
   sparse edit set rather than source-file size.
 - Long operations cancellable.

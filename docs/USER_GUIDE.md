@@ -54,8 +54,8 @@ reopening the file with different settings.
 - The numbers on the left identify data rows. The header is not counted as a
   data row.
 - The file menu shows the current filename. A yellow dot marks unsaved changes,
-  and the menu contains Open, Reload from Disk, Save, Save As, and Discard
-  Changes.
+  and the menu contains **Open…**, **Reload from Disk**, **Save**, **Save As…**,
+  and **Discard Changes**.
 - **Format** shows the applied delimiter and header mode. Opening it also shows
   what Quarry originally detected.
 - The footer keeps the visible row range in view, adds file and selection
@@ -65,8 +65,8 @@ reopening the file with different settings.
   completion and informational messages stay in the footer.
 
 Quarry displays the first rows before the complete file index is ready. You can
-start reading and filtering immediately. Find and Sort become available after
-indexing finishes.
+start reading and filtering immediately. Find actions and Sort become available
+after indexing finishes.
 
 ### 4. Make a safe first edit
 
@@ -300,8 +300,8 @@ Click **Columns…** to change the view without changing the CSV structure:
 
 These choices are view-only. They do not create an unsaved file change, and
 they do not alter the order written by Save. Original file-column numbers stay
-attached to their columns after a view reorder. Split, Combine, Move, and Delete
-create a newly numbered working document.
+attached to their columns after a view reorder. Split, Combine, Move Selected
+Columns, and Delete Selected Columns create a newly numbered working document.
 
 Click **Auto-fit columns** at the bottom of the **Columns…** window to fit every
 shown column to its header and the cell values already loaded into the grid.
@@ -322,8 +322,8 @@ header change instead.
 - **Save As…** writes to a new unused path, preserves the previous source, and
   opens the saved copy after success.
 - **Discard Changes** restores the last opened or saved file and removes all
-  unsaved cell, header, Replace All, Split, Combine, Move, Delete, and Sort
-  changes.
+  unsaved cell, header, Replace All, Split, Combine, Move Selected Columns,
+  Delete Selected Columns, and Sort changes.
 - **Undo** and **Redo** move one step between completed whole-file
   working versions. They are not a per-cell edit history, and they are
   unavailable while later cell or header edits remain unsaved.

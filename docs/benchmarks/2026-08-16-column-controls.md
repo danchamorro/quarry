@@ -1,8 +1,9 @@
 # Column controls validation
 
-> **Current behavior:** later Phase 7B polish made every shown column
-> horizontally reachable and raised the bounded render window to 64 columns.
-> The measurements below retain the then-current 32-column behavior.
+> **Current behavior:** every shown column is horizontally reachable, numbered
+> grid headers are selectable for structural actions, and the bounded render
+> window covers 64 columns. The measurements below retain the then-current
+> 32-column, resize-only behavior.
 
 ## Decision
 

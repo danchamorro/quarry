@@ -36,8 +36,8 @@ working memory bounded and does not change the source until you choose
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
 | Find and replace | Literal Find Next and Find Previous, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
 | Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, and Does not equal predicates; same-column alternatives with AND across columns; case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
-| Edit | Direct cell and header editing; multiline values; Undo and Redo; Discard Changes |
-| Reshape columns | Select columns in the grid, then Split, Combine, Move, or Delete; continue editing the result before saving |
+| Edit | Direct cell and header editing; multiline values; one-level structural Undo and Redo; Discard Changes |
+| Reshape columns | Select columns in the grid, then Split, Combine, Move, or delete the selected columns; continue editing the result before saving |
 | Sort | Stable ascending and descending text sort; case-insensitive by default with a per-tool Match case option; fixed header; deterministic order for equal values; cancellation and disk preflight |
 | Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |
 
