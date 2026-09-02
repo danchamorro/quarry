@@ -2,7 +2,7 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress: 2026-08-23
+## Current progress: 2026-08-27
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -11,9 +11,10 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 2 — UI bake-off | Complete | The [egui](benchmarks/2026-08-14-egui-spike.md) and [AppKit](benchmarks/2026-08-14-appkit-spike.md) candidates were measured; [ADR 0003](adr/0003-select-egui-ui.md) selects egui |
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 | Phase 4: Filters and export | Complete | Bounded single and grouped multi-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
-| Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover selected-column Move/Delete, overlay-aware Find Next, and Replace in Cell; production Replace All is measured directly at [12 GB](benchmarks/2026-08-22-12gb-replace-all.md) and [50 GB](benchmarks/2026-08-22-50gb-capability-suite.md) |
+| Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover Move/Delete Selected Columns, overlay-aware Find Next, and Replace in Cell; production Replace All is measured directly at [12 GB](benchmarks/2026-08-22-12gb-replace-all.md) and [50 GB](benchmarks/2026-08-22-50gb-capability-suite.md) |
 | Phase 6: Sorting | Complete | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md); the current engine also passed the optimized [117-million-row `FIRSTNAME` sort](benchmarks/2026-08-23-12gb-sort-performance.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup |
-| Phase 7: Hardening | In progress | Phase 7A packaging and installation are complete in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); Phase 7B workflow polish and feature-gap review are underway |
+| Phase 7: Hardening | Complete | Phase 7A packaging and installation are complete in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); Phase 7B connected-workflow dogfooding and interface polish passed owner review, and the current workflows are documented in the [user guide](USER_GUIDE.md) |
+| Phase 8: Row operations | Planned | **Delete Selected Rows** is the first planned slice; selection and filtered-view semantics must be decided before implementation |
 
 Cross-phase evidence: the [50 GB capability suite](benchmarks/2026-08-22-50gb-capability-suite.md)
 measures progressive open, complete indexing, navigation, Find, filtering,
@@ -64,9 +65,10 @@ pacing becomes measurable with the viewer-alpha grid.
   with regression tests.
 - [x] Record 12 GB continuous-scroll latency, memory, frame-pacing, and final-row
   correctness evidence.
-- [x] Open local files through a native picker, typed or CLI paths, and one-file
-  drag and drop without replacing a valid document on picker cancellation or an
-  open or index-start failure.
+- [x] Open local files through the File menu or empty-state picker, Finder
+  document opening, CLI startup paths, and one-file drag and drop without
+  replacing a valid document on picker cancellation or an open or index-start
+  failure.
 - [x] Apply Auto, comma, tab, pipe, and semicolon delimiter modes plus Auto,
   first-row, and no-header modes to the current file only through an explicit
   reopen.
@@ -75,8 +77,9 @@ pacing becomes measurable with the viewer-alpha grid.
 - [x] Benchmark live-index snapshot latency and indexing throughput together,
   then reduce the default chunk from 8 MiB to 1 MiB based on the measured
   [live-index latency result](benchmarks/2026-08-15-live-index-latency.md).
-- [x] Expose file size, column count, delimiter/header mode, indexed rows,
-  first-row time, and viewport latency in the viewer status area.
+- [x] Expose applied and detected delimiter/header modes in the Format menu.
+  Keep the visible row range, conditional file metadata, status, progress, and
+  cancellation in the footer.
 - [x] Add literal Find Next over decoded cells with case-insensitive matching by
   default, a per-tool **Match case** option, background progress, cancellation,
   same-query resume, and direct row-and-column reveal.
@@ -94,32 +97,21 @@ pacing becomes measurable with the viewer-alpha grid.
   [12 GB reference file](benchmarks/2026-08-16-bounded-copy.md).
 - [x] Add direct manual access to every known column plus view-only hide/show
   and arbitrary reorder controls inside the Columns manager, while preserving
-  resize-only grid headers with stable one-based file-column numbers, bounded
+  selectable grid headers with stable one-based file-column numbers, bounded
   64-column rendering with horizontal access to every shown column, search
-  reveal, reset behavior, and accessibility.
+  reveal, reset behavior, structural context actions, and accessibility.
 - [x] Cover the column controls with deterministic wide-file regressions and a
   [12 GB viewer check](benchmarks/2026-08-16-column-controls.md).
 - [x] Make the default grid dynamically fit compact rows to the available
-  height. The maximized reference window keeps at least 40 data rows visible
-  instead of 23, using EmEditor only as a density reference while preserving
-  legibility, accessibility, and bounded virtualization in the
+  viewport height. The maximized reference window measured at least 40 data
+  rows instead of 23 without hardcoding a visible-row count, using EmEditor only
+  as a density reference while preserving legibility, accessibility, and
+  bounded virtualization in the
   [row-density validation](benchmarks/2026-08-16-row-density.md).
 
 **Phase 3 exit met:** the viewer combines bounded continuous navigation, native
 opening, format controls, literal search, copy, column controls, diagnostics,
-and an adaptive grid that keeps at least 40 rows visible in the maximized
-reference window.
-Phase 4 filtering and streaming filtered export are complete. Phase 5 has
-direct in-grid header and data-cell editing, sparse streaming persistence, and
-repeatable selected-column Split and Combine commands in the ordinary editable
-grid. Explicit Move and Delete use the same selected numbered columns and
-working-copy lifecycle while the Columns manager remains view-only. Find Next,
-Replace in Cell, and bounded Replace All use effective unsaved cell values.
-Cosmetic redesign remains outside the current scope.
-Phase 6 is complete. Stable, selected-column text sorting works in the ordinary
-editable grid and passed the deterministic 1 GB and 12 GB release gate.
-Phase 7A is complete with one repeatable macOS package command, one canonical
-installed application, and a clean committed release install.
+and an adaptive grid whose visible-row count follows the viewport.
 
 ## Phase 0 — Foundation
 Rust workspace, CI, lint/test policy, deterministic large-file generator, benchmark harness, 1 GB/10 GB profiles, CLI experiments, ADR process, and license decision.
@@ -191,9 +183,6 @@ edits or transformations without building a file-sized in-memory model.
 One-level structural Undo and Redo reopen the preceding or subsequent document
 version.
 
-**Next:** begin Phase 7B with workflow polish, refinement, and a feature-gap
-review after the current interactions are coherent.
-
 ### Phase 5 checklist
 
 - [x] Rename an existing header directly in the grid while preserving its
@@ -258,8 +247,9 @@ review after the current interactions are coherent.
   limits, cancellation, cleanup, accessibility, and change history.
 
 The Columns manager remains view-only and does not mark the document changed.
-Move and Delete are explicit and separate from that view arrangement. Hidden
-columns remain in output; to delete one, show it and select it explicitly.
+Move Selected Columns and Delete Selected Columns are explicit and separate from
+that view arrangement. Hidden columns remain in output; to delete one, show it
+and select it explicitly.
 
 **Phase 5 exit met:** direct edits, explicit output reorder/drop, overlay-aware
 Find Next, Replace in Cell, bounded Replace All, and structural transformations
@@ -310,9 +300,9 @@ reduced the 117,168,829-row `FIRSTNAME` sort from 335.837 seconds to 142.211
 seconds while preserving byte-identical output and millisecond cancellation.
 
 ## Phase 7 — Hardening
-Persistent indexes, invalidation, malformed-data UX, encoding strategy,
-packaging/signing/notarization, accessibility audit, controlled cold-cache
-performance runs, benchmark dashboard.
+Repeatable packaging and installation, connected desktop workflow dogfooding,
+compact interface polish, terminology review, focused keyboard and accessibility
+checks, appearance and window-size checks, and feature-gap prioritization.
 
 ### Phase 7A checklist: desktop packaging and installation
 
@@ -344,21 +334,56 @@ match in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md).
 
 - [x] Add data-cell context actions to copy a value, filter to its exact value,
   or exclude it from its source column through the bounded filter path.
-- [ ] Dogfood opening, navigation, column selection, filters, transformations,
+- [x] Dogfood opening, navigation, column selection, filters, transformations,
   editing, sorting, Save, Save As, discard, Undo, and Redo as connected desktop
   workflows.
-- [ ] Refine discoverability, feedback, terminology, and interaction details in
+- [x] Refine discoverability, feedback, terminology, and interaction details in
   existing features before adding new workflows.
-- [ ] Complete focused keyboard, accessibility, appearance, and window-size
+- [x] Complete focused keyboard, accessibility, appearance, and window-size
   checks across the current interface.
-- [ ] Inventory missing editor features after the polish pass and prioritize
+- [x] Inventory missing editor features after the polish pass and prioritize
   them by user value, implementation risk, and large-file constraints.
 
-**Phase 7B exit:** current core workflows feel coherent and usable, and the
-remaining feature gaps are documented in priority order.
+**Phase 7B exit met:** the owner completed the connected-workflow, keyboard,
+accessibility, appearance, and window-size review. The accepted toolbar redesign
+keeps the grid primary, moves progress and status into the footer, and exposes
+secondary controls contextually. The next prioritized gap is row deletion.
+
+## Phase 8: Row operations
+
+Start with **Delete Selected Rows**. Row insertion remains a separate later
+slice.
+
+### Phase 8A checklist: delete selected rows
+
+- [ ] Add explicit selection for one or more data rows through the numbered row
+  gutter, including range and additive selection, visible feedback, and
+  accessible state.
+- [ ] Add **Delete Selected Rows** as a distinct action from the existing
+  **Delete Selected Columns** command.
+- [ ] Preserve the header and every unselected data row while streaming the
+  current document and sparse edits into a bounded private working CSV.
+- [ ] Reopen the completed result as the ordinary modified document and retain
+  Save, Save As, Discard Changes, and one-level structural Undo and Redo.
+- [ ] Preserve both the current document and its source on cancellation,
+  failure, or source conflict, while removing unpublished temporary output.
+- [ ] Decide filtered-view behavior before implementation. A visible filtered
+  position must not silently stand in for an unidentified physical data row.
+- [ ] Cover quoted and multiline records, selection changes, header preservation,
+  sparse edits, cancellation, cleanup, accessibility, and history with exact
+  regressions, then record bounded 1 GB and 12 GB validation.
+
+**Phase 8A exit:** selected data rows can be removed safely from the working
+document without loading the file into memory or changing the source before
+Save.
 
 ## Later possibilities
-Cross-platform front ends, plugin/API surface, schema inference, SQL-like querying, compressed files, CLI recipes, multi-file operations.
+Persistent indexes and invalidation, broader encoding and malformed-data UX,
+numeric/date/locale-aware and multi-column sorting, controlled cold-cache
+performance dashboards, Developer ID signing and notarization for distribution,
+cross-platform front ends, plugin/API surface, schema inference, SQL-like
+querying, compressed files, CLI recipes, multi-file operations, and row
+insertion.
 
 ## Performance ladder
 1. 1 GB — development baseline

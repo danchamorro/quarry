@@ -80,14 +80,16 @@ UI work; it does not project fields out of the parsed rows.
 ## Column views
 The viewer keeps source column indexes as the canonical identity for search,
 selection, and copy. A UI-only column view stores display order, hidden state,
-the horizontal position, and the complete shown-column list. Search,
-hide/show, manager-only drag, and reset actions update this metadata without
-changing parsed rows or output order. Main-grid headers remain resize-only. A
-search match automatically shows and centers its source column, while row copy
-continues to serialize every source field in file order.
+and the complete shown-column list. Search, hide/show, manager-only drag, and
+reset actions update this metadata without changing parsed rows or output order.
+Main-grid headers select columns and expose structural actions; resizing is
+available when 64 or fewer columns are shown. A search match automatically shows
+and centers its source column, while row copy continues to serialize every
+source field in file order.
 
-View order and hidden state remain non-dirty UI metadata. They affect saved
-output only through an explicit transformed-output choice.
+View order and hidden state remain non-dirty UI metadata and never affect saved
+output. Move Selected Columns and Delete Selected Columns are separate document
+operations and do not consult the view metadata.
 
 Header columns are known immediately. If a later ragged row contains more
 fields, the viewer appends those newly known source columns without resetting
@@ -108,17 +110,18 @@ growing without bound.
 Core defaults to 1 MiB read chunks, with a 64 MiB bootstrap and record limit and
 fixed budgets for the adaptive structural and filter indexes. The UI retains
 the bounded bootstrap rows, one source viewport buffer, one filtered viewport
-buffer when filtering is active, compact metadata per known column, one search
-match, and at most a 64 MiB clipboard payload.
+buffer when filtering is active, compact metadata per known column, the
+user-driven Find navigation history, and at most a 64 MiB clipboard payload.
 [ADR 0002](adr/0002-defer-viewport-cache.md) records why an application viewport
 cache remains deferred.
 
 Before a materialized operation, unsaved cell and header values remain a sparse
-overlay on the active indexed CSV. A confirmed Split, Combine, Move, Delete, or
-Replace All does not stay as a lazy operation. A bounded worker materializes the
-operation and sparse overlay into a private working CSV, then Quarry reopens
-that file as the ordinary indexed document. Split first makes a cancellable
-analysis pass that retains only the current bounded record and width counters.
+overlay on the active indexed CSV. A confirmed Split, Combine, Move Selected
+Columns, Delete Selected Columns, or Replace All does not stay as a lazy
+operation. A bounded worker materializes the operation and sparse overlay into
+a private working CSV, then Quarry reopens that file as the ordinary indexed
+document. Split first makes a cancellable analysis pass that retains only the
+current bounded record and width counters.
 The materialization pass retains a fixed read chunk, one bounded decoded
 record, and its output fields. Replace All additionally retains only its two
 literal inputs and a replacement counter, not every match.
@@ -165,6 +168,12 @@ therefore depends on the query, fixed chunk, 64 MiB maximum record and decoded
 fields, sparse cell overlay, one match, and bounded structural index, not on
 file size or match count.
 
+Find Previous does not start a reverse file scan. The desktop retains matches
+already visited for the current query and case setting, then moves backward or
+forward through that history until Find Next must resume the bounded worker.
+The history grows with explicit user navigation, not the file's total match
+count.
+
 **Replace in Cell** operates only on the revealed current Find match. It
 replaces every non-overlapping literal occurrence in that cell's effective
 value under the same Find/Replace case setting, records the result in the
@@ -179,7 +188,7 @@ regressions cover these semantics and the accessible controls.
 Filtering still scans the active indexed CSV without the sparse data-cell
 overlay, so the viewer requires those edits to be saved or discarded before a
 new filter begins. An active filter must be cleared before editing or using
-Find/Replace. Overlay-aware filtering is not part of Phase 5.
+Find/Replace. Overlay-aware filtering remains deferred.
 
 A `FilterQuery` owns the Filters tool's case setting and one or more
 `FilterPredicate` values. Each predicate stores a source column, a contains,
@@ -220,20 +229,21 @@ flushes and syncs it before publishing the destination without overwriting an
 existing path. Cancellation or failure removes the temporary file and never
 publishes the destination. The source path itself is rejected as a destination.
 
-## Phase 6 sorting
+## Sorting
 
-Phase 6A sorts data rows by exactly one selected numbered column using stable,
+Quarry sorts data rows by exactly one selected numbered column using stable,
 ASCII case-insensitive text ordering by default. The Sort tool's **Match case**
 setting switches key comparison to raw bytes. The header remains fixed, missing
 ragged fields compare as empty values, and keys equal under the selected mode
 keep their current row order.
 
-The core worker generates 8 MiB in-memory runs, spills owner-only framed run
+The core worker generates 16 MiB in-memory runs, spills owner-only framed run
 files, and uses multipass merging into a private sorted working CSV. Merge
-fan-in reserves one pending key and one pending record before admitting heap
-keys against a 256 MiB payload budget. The default 64 MiB record cap therefore
-uses fan-in two. Heap entries retain keys and record lengths; only the selected
-record body is loaded during each merge step.
+fan-in is capped at 32 and derived from the observed maximum key width while
+reserving one pending key and one pending record within a 256 MiB payload budget.
+It falls to two only when the observed key reaches the default 64 MiB record cap.
+Heap entries retain keys and record lengths; only the selected record body is
+loaded during each merge step.
 The worker applies sparse edits before key comparison and output, keeps a UTF-8
 BOM at the file boundary, preserves the header, and treats an absent ragged key
 as empty. Before publication, a bounded dual fingerprint verifies the effective
@@ -275,12 +285,13 @@ entry. A confirmed structural operation consumes the active CSV plus those
 sparse edits into a new private working CSV. Quarry then reopens the result,
 rebuilds offset-dependent indexes, clears the absorbed sparse overlay, and uses
 the new schema as the ordinary editable document. View-only hide and reorder
-actions do not alter that document schema. Explicit Move and Delete actions do.
+actions do not alter that document schema. Explicit Move and Delete Selected
+Columns actions do.
 
 The first data-cell slice edits only existing valid UTF-8 fields. It accepts
 multiline input, but does not create a missing field in a ragged row or replace
-invalid UTF-8 with lossy text. Row insertion and deletion remain separate
-features.
+invalid UTF-8 with lossy text. Delete Selected Rows is planned for Phase 8;
+row insertion remains a separate later feature.
 
 A document is dirty while effective cell or header edits exist, or while its
 active CSV is a materialized working copy that differs from the last opened or
@@ -360,13 +371,14 @@ columns and selects the nearest survivor after materialization. Hidden state
 and view order are never consulted by either operation.
 
 Confirmation starts the bounded background operation. Split performs its
-analysis pass, then Split, Combine, Move, or Delete streams the current document
-into a newly reserved private working CSV. Only that one operation is evaluated
-during the stream. After the worker succeeds, Quarry opens and indexes the
-result as the normal editable grid. The user can edit the result or apply
-another structural command, which repeats the same process from the current
-working CSV. Every shown working-document column is horizontally reachable;
-the viewport paints at most 64 at a time, and the desktop uses the core
+analysis pass, then Split, Combine, Move Selected Columns, or Delete Selected
+Columns streams the current document into a newly reserved private working CSV.
+Only that one operation is evaluated during the stream. After the worker
+succeeds, Quarry opens and indexes the result as the normal editable grid. The
+user can edit the result or apply another structural command, which repeats the
+same process from the current working CSV. Every shown working-document column
+is horizontally reachable; the viewport paints at most 64 at a time, and the
+desktop uses the core
 65,536-column structural trust limit.
 
 The grid exposes column selection state and context actions through AccessKit.
@@ -445,17 +457,18 @@ Track time-to-first-rows, memory, index/search/filter/export/save throughput,
 scroll frame time, cache behavior, cancellation latency, and exact edited-output
 validation.
 
-Move and Delete use the same bounded structural materialization worker measured
-for Split and Join. Replace All reuses its private rewrite, progress,
-cancellation, guarded-publication, and working-copy paths. Exact core and
+Move Selected Columns and Delete Selected Columns use the same bounded
+structural materialization worker measured for Split and Join. Replace All
+reuses its private rewrite, progress, cancellation, guarded-publication, and
+working-copy paths. Exact core and
 desktop regressions validate Arrange ordering and deletion plus replacement
 overlay precedence, non-overlapping matches, no-match behavior, record limits,
 accessibility, Undo, source preservation, cancellation, and temporary-file
 cleanup. The [12 GB Replace All benchmark](benchmarks/2026-08-22-12gb-replace-all.md)
 and [50 GB capability suite](benchmarks/2026-08-22-50gb-capability-suite.md)
-measure the production Replace All path directly. Separate large-file Move and
-Delete timings are not claimed because those operations add no new worker-path
-evidence.
+measure the production Replace All path directly. Separate large-file Move
+Selected Columns and Delete Selected Columns timings are not claimed because
+those operations add no new worker-path evidence.
 
 ## Architecture rule
 **If a feature only works because the entire file fits in RAM, it is not a finished Quarry feature.**

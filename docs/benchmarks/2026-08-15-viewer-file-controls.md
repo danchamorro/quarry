@@ -1,5 +1,9 @@
 # Viewer file controls validation — 2026-08-15
 
+> Historical interface note: this report records the August 15 build. See the
+> [current user guide](../USER_GUIDE.md) for the current file-opening workflow
+> and control labels.
+
 ## Scope
 
 This Phase 3 slice adds native macOS file picking, one-file drag and drop,

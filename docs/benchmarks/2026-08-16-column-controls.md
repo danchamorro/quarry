@@ -1,15 +1,15 @@
 # Column controls validation
 
-> **Current behavior:** later Phase 7B polish made every shown column
-> horizontally reachable and raised the bounded render window to 64 columns.
-> The measurements below retain the then-current 32-column behavior.
+> **Current behavior:** every shown column is horizontally reachable, numbered
+> grid headers are selectable for structural actions, and the bounded render
+> window covers 64 columns. The measurements below document the August 16, 2026
+> build and should not be read as current interface behavior.
 
-## Decision
+## Historical decision (August 16, 2026)
 
-Ship direct access to every known source column with view-only hide/show,
-arbitrary move-to-position, manager-only drag reorder, first-columns, and reset
-actions. Main-grid headers remain resize-only. The grid still renders at most
-32 data columns, search reveals hidden matches, and row copy preserves the
+This slice shipped direct access to every known source column with view-only
+hide/show, arbitrary move-to-position, manager-only drag reorder, first-columns,
+and reset actions. Search revealed hidden matches, and row copy preserved the
 original file order.
 
 Column layout metadata scales with known column count, not file size. Header
