@@ -365,8 +365,8 @@ slice.
   current document and sparse edits into a bounded private working CSV.
 - [ ] Reopen the completed result as the ordinary modified document and retain
   Save, Save As, Discard Changes, and one-level structural Undo and Redo.
-- [ ] Preserve the source on cancellation, failure, or source conflict, and
-  remove unpublished temporary output.
+- [ ] Preserve both the current document and its source on cancellation,
+  failure, or source conflict, while removing unpublished temporary output.
 - [ ] Decide filtered-view behavior before implementation. A visible filtered
   position must not silently stand in for an unidentified physical data row.
 - [ ] Cover quoted and multiline records, selection changes, header preservation,

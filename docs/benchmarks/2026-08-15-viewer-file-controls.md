@@ -1,8 +1,8 @@
 # Viewer file controls validation — 2026-08-15
 
 > Historical interface note: this report records the August 15 build. See the
-> [current user guide](../USER_GUIDE.md) for today's file-opening workflow and
-> control labels.
+> [current user guide](../USER_GUIDE.md) for the current file-opening workflow
+> and control labels.
 
 ## Scope
 
