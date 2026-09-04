@@ -9,6 +9,7 @@ delimited files in the Quarry macOS app.
 - [How to](#how-to)
   - [Navigate the grid](#navigate-the-grid)
   - [Select and copy data](#select-and-copy-data)
+  - [Delete rows](#delete-rows)
   - [Edit cells and headers](#edit-cells-and-headers)
   - [Find and replace text](#find-and-replace-text)
   - [Filter rows](#filter-rows)
@@ -102,6 +103,22 @@ rather than a continuous source-row range.
 
 A copied row is serialized as tab-separated text in the underlying file-column
 order, including columns hidden in the current view. Copy is limited to 64 MiB.
+
+### Delete rows
+
+1. Click a numbered row gutter to select one data row.
+2. Shift-click another row number to select a range.
+3. Command-click on macOS, or Ctrl-click on other platforms, to add or remove
+   separate rows.
+4. Right-click a selected row number and choose **Delete Selected Rows**.
+
+The row selection remains active while you scroll. Deletion starts immediately
+and creates an unsaved working version; it does not change the source until you
+use **Save**. Use **Undo** to restore the previous working version, or
+**Discard Changes** to return to the last opened or saved file.
+
+Filtering clears the row selection. Clear an active filter before selecting or
+deleting rows so every selected number identifies a physical data row.
 
 ### Edit cells and headers
 
@@ -323,7 +340,7 @@ header change instead.
   opens the saved copy after success.
 - **Discard Changes** restores the last opened or saved file and removes all
   unsaved cell, header, Replace All, Split, Combine, Move Selected Columns,
-  Delete Selected Columns, and Sort changes.
+  Delete Selected Columns, Delete Selected Rows, and Sort changes.
 - **Undo** and **Redo** move one step between completed whole-file
   working versions. They are not a per-cell edit history, and they are
   unavailable while later cell or header edits remain unsaved.
@@ -367,6 +384,9 @@ setting.
 | Return to a prior match | Shift+Enter in Find, or **Find Previous** |
 | Close Find | **Close find**, or Escape while a Find field has focus |
 | Move by one page | **Page Up**, **Page Down**, or the matching key |
+| Select a row range | Shift-click numbered rows |
+| Add or remove selected rows | Command-click or Ctrl-click numbered rows |
+| Delete selected rows | Right-click a selected row number, then choose **Delete Selected Rows** |
 | Select a column range | Shift-click numbered columns |
 | Add or remove selected columns | Command-click or Ctrl-click numbered columns |
 | Open a focused context menu | Shift+F10 |
@@ -380,6 +400,7 @@ setting.
 | Cell editing is unavailable | Clear active filters and wait for the current operation to finish. Missing and non-UTF-8 cells cannot be edited. |
 | Filtering is unavailable | Save or discard cell edits, then cancel or finish any active search, filter, export, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |
+| **Delete Selected Rows** is unavailable | Clear the filter, finish the active operation, and select at least one numbered data row. |
 | **Auto-fit columns** is unavailable in **Columns…** | Hide columns until 64 or fewer are shown. |
 | A filter returns no rows | Check the original column number, value, **Match case** setting, and same-column rule logic. |
 | Find is disabled | A filter is active. Open **Filters (N)…** and clear it. |
