@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -3034,14 +3034,8 @@ fn show_column_manager(
             ui.horizontal(|ui| {
                 ui.label("Drag to reorder · Uncheck to hide");
                 if ui
-                    .add_enabled(
-                        document.columns.shown_count() <= MAX_RENDERED_COLUMNS,
-                        egui::Button::new("Auto-fit columns"),
-                    )
+                    .button("Auto-fit columns")
                     .on_hover_text("Fit every shown column to its header and loaded cell values")
-                    .on_disabled_hover_text(
-                        "Auto-fit is available when 64 or fewer columns are shown. Hide columns first.",
-                    )
                     .clicked()
                 {
                     command = Some(ColumnCommand::AutoFit);
@@ -4041,6 +4035,9 @@ struct Document {
     buffer_start: u64,
     buffered_rows: Vec<Row>,
     auto_fit_columns: bool,
+    fitted_column_widths: BTreeMap<usize, f32>,
+    columns_to_fit: VecDeque<usize>,
+    reset_table_widths: bool,
     visible_rows: usize,
     scroll_points: f32,
     last_viewport_read: Option<Duration>,
@@ -4175,6 +4172,9 @@ impl Document {
             buffer_start: data_start,
             buffered_rows,
             auto_fit_columns: false,
+            fitted_column_widths: BTreeMap::new(),
+            columns_to_fit: VecDeque::new(),
+            reset_table_widths: false,
             visible_rows: BOOTSTRAP_ROWS,
             scroll_points: 0.0,
             last_viewport_read: None,
@@ -6950,21 +6950,21 @@ fn paint_column_selection(ui: &egui::Ui, selected: bool) {
 
 fn rendered_column_range(
     viewport: egui::Rect,
-    total_columns: usize,
-    column_width: f32,
+    column_offsets: &[f32],
     column_spacing: f32,
     focused_column: Option<usize>,
 ) -> std::ops::Range<usize> {
+    let total_columns = column_offsets.len().saturating_sub(1);
     if total_columns <= MAX_RENDERED_COLUMNS {
         return 0..total_columns;
     }
     let maximum_start = total_columns - MAX_RENDERED_COLUMNS;
     let start = focused_column.map_or_else(
         || {
-            let stride = column_width + column_spacing;
-            let first_visible = ((viewport.min.x - ROW_NUMBER_WIDTH - column_spacing).max(0.0)
-                / stride)
-                .floor() as usize;
+            let x = (viewport.min.x - ROW_NUMBER_WIDTH - column_spacing).max(0.0);
+            let first_visible = column_offsets
+                .partition_point(|offset| *offset <= x)
+                .saturating_sub(1);
             first_visible.saturating_sub(1).min(maximum_start)
         },
         |column| {
@@ -7119,6 +7119,49 @@ fn show_table(
     filter_case_sensitivity: CaseSensitivity,
 ) -> GridInteraction {
     let row_count = document.visible_row_count();
+    let auto_fit_columns = std::mem::take(&mut document.auto_fit_columns);
+    let virtualized = document.headers.len() > MAX_RENDERED_COLUMNS;
+    if auto_fit_columns {
+        document.columns_to_fit.clear();
+        if virtualized || !document.fitted_column_widths.is_empty() {
+            document.columns_to_fit.extend(&document.columns.visible);
+        }
+    }
+    // Fit in bounded batches so very wide files do not block the UI.
+    for _ in 0..MAX_RENDERED_COLUMNS {
+        let Some(column) = document.columns_to_fit.pop_front() else {
+            break;
+        };
+        if document.columns.hidden[column] {
+            continue;
+        }
+        let text_width = |text| {
+            ui.painter()
+                .layout_no_wrap(
+                    text,
+                    FontId::new(13.0, FontFamily::Monospace),
+                    ui.visuals().text_color(),
+                )
+                .size()
+                .x
+        };
+        let mut width = (text_width(document.column_name(column)) + 12.0).max(80.0);
+        for index in 0..row_count {
+            if let Some((row, fields)) = document.visible_row(index)
+                && let Some(source) = fields.get(column)
+            {
+                width = width.max(
+                    text_width(field_text(document.cell_value(row, column, source)))
+                        + 2.0 * ui.spacing().button_padding.x,
+                );
+            }
+        }
+        document.fitted_column_widths.insert(column, width.ceil());
+        document.reset_table_widths = true;
+    }
+    if !document.columns_to_fit.is_empty() {
+        ui.ctx().request_repaint();
+    }
     let mut interaction = GridInteraction::default();
     let mut active_header_edit = document.header_edit.take();
     let mut begin_header_edit = None;
@@ -7131,10 +7174,8 @@ fn show_table(
     let mut commit_cell_edit = false;
     let mut cancel_cell_edit = false;
     let mut restore_cell_focus = None;
-    let auto_fit_columns = std::mem::take(&mut document.auto_fit_columns);
     let grid_height = ui.available_height();
     let viewport_width = ui.available_width();
-    let virtualized = document.headers.len() > MAX_RENDERED_COLUMNS;
     let column_spacing = ui.spacing().item_spacing.x;
     let column_width = if virtualized {
         ((viewport_width - ROW_NUMBER_WIDTH) / MAX_RENDERED_COLUMNS.saturating_sub(2).max(1) as f32
@@ -7143,8 +7184,25 @@ fn show_table(
     } else {
         ((viewport_width - 82.0) / document.headers.len().max(1) as f32).clamp(80.0, 160.0)
     };
-    let column_stride = column_width + column_spacing;
-    let content_width = ROW_NUMBER_WIDTH + document.headers.len() as f32 * column_stride;
+    let column_widths = document
+        .columns
+        .visible
+        .iter()
+        .map(|column| {
+            document
+                .fitted_column_widths
+                .get(column)
+                .copied()
+                .unwrap_or(column_width)
+                .max(if virtualized { column_width } else { 80.0 })
+        })
+        .collect::<Vec<_>>();
+    let mut column_offsets = Vec::with_capacity(column_widths.len() + 1);
+    column_offsets.push(0.0);
+    for width in &column_widths {
+        column_offsets.push(column_offsets.last().unwrap() + width + column_spacing);
+    }
+    let content_width = ROW_NUMBER_WIDTH + column_offsets.last().unwrap();
     let body_height =
         (grid_height - HEADER_HEIGHT - ui.spacing().scroll.allocated_width()).max(ROW_HEIGHT);
     let focused_source_column = reveal_cell
@@ -7166,21 +7224,21 @@ fn show_table(
         .auto_shrink([false, false])
         .max_height(grid_height);
     if virtualized && let Some(column) = focused_column {
-        let target_x = ROW_NUMBER_WIDTH + column_spacing + column as f32 * column_stride;
-        horizontal_scroll = horizontal_scroll
-            .horizontal_scroll_offset((target_x - (viewport_width - column_width) / 2.0).max(0.0));
+        let target_x = ROW_NUMBER_WIDTH + column_spacing + column_offsets[column];
+        horizontal_scroll = horizontal_scroll.horizontal_scroll_offset(
+            (target_x - (viewport_width - column_widths[column]) / 2.0).max(0.0),
+        );
     }
 
     horizontal_scroll.show_viewport(ui, |ui, viewport| {
         let rendered_range = rendered_column_range(
             viewport,
-            document.headers.len(),
-            column_width,
+            &column_offsets,
             column_spacing,
             virtualized.then_some(focused_column).flatten(),
         );
         let spacer_width = (rendered_range.start > 0)
-            .then_some(rendered_range.start as f32 * column_stride - column_spacing);
+            .then_some(column_offsets[rendered_range.start] - column_spacing);
         let visible_headers = rendered_range
             .clone()
             .map(|visible_column| {
@@ -7240,16 +7298,16 @@ fn show_table(
                     .resizable(false),
             );
         }
-        for header_min_width in &header_min_widths {
+        for (visible_column, header_min_width) in rendered_range.clone().zip(&header_min_widths) {
             table = if virtualized {
                 table.column(
-                    Column::exact(column_width)
+                    Column::exact(column_widths[visible_column])
                         .clip(true)
                         .resizable(false),
                 )
             } else {
                 table.column(
-                    Column::initial(column_width)
+                    Column::initial(column_widths[visible_column])
                         .at_least(header_min_width.max(80.0))
                         .clip(true)
                         .resizable(true)
@@ -7257,7 +7315,7 @@ fn show_table(
                 )
             };
         }
-        if auto_fit_columns && !virtualized {
+        if !virtualized && (std::mem::take(&mut document.reset_table_widths) || auto_fit_columns) {
             table.reset();
         }
         table
@@ -11344,37 +11402,153 @@ mod tests {
         let column_width = 80.0;
         let column_spacing = 4.0;
         let total_columns = 65_536;
+        let mut column_offsets = (0..=total_columns)
+            .map(|column| column as f32 * (column_width + column_spacing))
+            .collect::<Vec<_>>();
         let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1_200.0, 800.0));
         assert_eq!(
-            rendered_column_range(viewport, total_columns, column_width, column_spacing, None,),
+            rendered_column_range(viewport, &column_offsets, column_spacing, None),
             0..MAX_RENDERED_COLUMNS
         );
 
         let content_width =
             ROW_NUMBER_WIDTH + total_columns as f32 * (column_width + column_spacing);
         let last_viewport = viewport.translate(egui::vec2(content_width - viewport.width(), 0.0));
-        let last = rendered_column_range(
-            last_viewport,
-            total_columns,
-            column_width,
-            column_spacing,
-            None,
-        );
+        let last = rendered_column_range(last_viewport, &column_offsets, column_spacing, None);
         assert_eq!(last.len(), MAX_RENDERED_COLUMNS);
         assert_eq!(last.end, total_columns);
 
-        let focused = rendered_column_range(
-            viewport,
-            total_columns,
-            column_width,
-            column_spacing,
-            Some(40_000),
-        );
+        let focused =
+            rendered_column_range(viewport, &column_offsets, column_spacing, Some(40_000));
         assert!(focused.contains(&40_000));
         assert_eq!(
-            rendered_column_range(viewport, 42, column_width, column_spacing, None),
+            rendered_column_range(viewport, &column_offsets[..=42], column_spacing, None),
             0..42
         );
+
+        // A wide first column must not make scrolling skip narrow columns after it.
+        for offset in &mut column_offsets[1..] {
+            *offset += 4_000.0;
+        }
+        let shifted = viewport.translate(egui::vec2(4_500.0, 0.0));
+        assert_eq!(
+            rendered_column_range(shifted, &column_offsets, column_spacing, None).start,
+            4
+        );
+    }
+
+    #[test]
+    fn auto_fit_expands_wide_files_and_keeps_widths_with_source_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        for total_columns in [64, 65, 100, 664] {
+            let path = directory.path().join(format!("wide-{total_columns}.csv"));
+            let mut headers = vec!["short"; total_columns];
+            headers[total_columns - 1] = "A long header in the last file column";
+            let mut values = vec!["x"; total_columns];
+            values[0] = "A long cell value that needs more than eighty pixels";
+            fs::write(
+                &path,
+                format!("{}\n{}\n", headers.join(","), values.join(",")),
+            )
+            .unwrap();
+            let mut app = QuarryApp::new(None, Instant::now());
+            app.document = Some(
+                Document::prepare(
+                    &path,
+                    OpenOptions {
+                        header_mode: HeaderMode::FirstRow,
+                        ..OpenOptions::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let ctx = egui::Context::default();
+            configure_style(&ctx);
+            ctx.enable_accesskit();
+            let header_width = |output: &egui::FullOutput, column: usize| {
+                let prefix = format!("Select file column {} (", column + 1);
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label().is_some_and(|label| label.starts_with(&prefix)))
+                    .unwrap()
+                    .1
+                    .bounds()
+                    .unwrap()
+                    .width()
+            };
+            if total_columns == 65 {
+                let document = app.document.as_mut().unwrap();
+                document.set_column_shown(64, false).unwrap();
+                let _ = render_grid(&ctx, document);
+                document.set_column_shown(64, true).unwrap();
+            }
+            let before = render_grid(&ctx, app.document.as_mut().unwrap());
+            let initial_width = header_width(&before, 0);
+            let command = click_column_manager_control(
+                egui::accesskit::Role::Button,
+                "Auto-fit columns",
+                app.document.as_ref().unwrap(),
+            );
+            app.apply_column_command(&ctx, command);
+            let document = app.document.as_mut().unwrap();
+            for _ in 0..total_columns.div_ceil(MAX_RENDERED_COLUMNS) + 2 {
+                let _ = render_grid(&ctx, document);
+            }
+            assert!(document.columns_to_fit.is_empty());
+            let after = render_grid(&ctx, document);
+            assert!(header_width(&after, 0) > initial_width + 100.0);
+            if total_columns <= MAX_RENDERED_COLUMNS {
+                continue;
+            }
+            assert_eq!(document.fitted_column_widths.len(), total_columns);
+            let last_width = document.fitted_column_widths[&(total_columns - 1)];
+            assert!(last_width > 200.0);
+            document.reveal_cell = Some((1, total_columns - 1));
+            let _ = render_grid(&ctx, document);
+            let last = render_grid(&ctx, document);
+            assert!(header_width(&last, total_columns - 1) >= f64::from(last_width) - 1.0);
+            let rendered_headers = last
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| {
+                    node.label()
+                        .is_some_and(|label| label.starts_with("Select file column "))
+                })
+                .count();
+            assert!(rendered_headers <= MAX_RENDERED_COLUMNS);
+
+            document.move_column(total_columns - 1, 0).unwrap();
+            document.set_column_shown(0, false).unwrap();
+            document.reveal_cell = Some((1, total_columns - 1));
+            let _ = render_grid(&ctx, document);
+            let reordered = render_grid(&ctx, document);
+            assert!(header_width(&reordered, total_columns - 1) >= f64::from(last_width) - 1.0);
+            assert!(document.cell_edits.is_empty());
+            assert!(document.header_renames.is_empty());
+            if total_columns == 65 {
+                document
+                    .rename_header(total_columns - 1, "short".into())
+                    .unwrap();
+                document.auto_fit_columns = true;
+                let _ = render_grid(&ctx, document);
+                let refitted = render_grid(&ctx, document);
+                assert!(header_width(&refitted, total_columns - 1) < f64::from(last_width) - 100.0);
+                assert_eq!(document.fitted_column_widths[&(total_columns - 1)], 80.0);
+                document.set_column_shown(0, true).unwrap();
+                document.reveal_cell = Some((1, total_columns - 1));
+                let _ = render_grid(&ctx, document);
+                let restored = render_grid(&ctx, document);
+                assert!(header_width(&restored, total_columns - 1) < f64::from(last_width) - 100.0);
+            }
+        }
     }
 
     #[test]
