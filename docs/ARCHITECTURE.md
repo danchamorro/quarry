@@ -117,11 +117,11 @@ cache remains deferred.
 
 Before a materialized operation, unsaved cell and header values remain a sparse
 overlay on the active indexed CSV. A confirmed Split, Combine, Move Selected
-Columns, Delete Selected Columns, or Replace All does not stay as a lazy
-operation. A bounded worker materializes the operation and sparse overlay into
-a private working CSV, then Quarry reopens that file as the ordinary indexed
-document. Split first makes a cancellable analysis pass that retains only the
-current bounded record and width counters.
+Columns, Delete Selected Columns, Delete Selected Rows, or Replace All does not
+stay as a lazy operation. A bounded worker materializes the operation and sparse
+overlay into a private working CSV, then Quarry reopens that file as the ordinary
+indexed document. Split first makes a cancellable analysis pass that retains
+only the current bounded record and width counters.
 The materialization pass retains a fixed read chunk, one bounded decoded
 record, and its output fields. Replace All additionally retains only its two
 literal inputs and a replacement counter, not every match.
@@ -290,8 +290,13 @@ Columns actions do.
 
 The first data-cell slice edits only existing valid UTF-8 fields. It accepts
 multiline input, but does not create a missing field in a ragged row or replace
-invalid UTF-8 with lossy text. Delete Selected Rows is planned for Phase 8;
-row insertion remains a separate later feature.
+invalid UTF-8 with lossy text. The numbered row gutter stores normal, range, and
+additive selection as compact physical-record ranges. **Delete Selected Rows**
+streams those ranges through the private working-copy path, preserves the
+header and unselected records, applies sparse edits to retained records, and
+keeps Save, Save As, Discard, Undo, and Redo behavior. Filtering clears row
+selection, and row selection plus deletion remain unavailable while filtered.
+Row insertion remains a separate later feature.
 
 A document is dirty while effective cell or header edits exist, or while its
 active CSV is a materialized working copy that differs from the last opened or
@@ -469,6 +474,11 @@ and [50 GB capability suite](benchmarks/2026-08-22-50gb-capability-suite.md)
 measure the production Replace All path directly. Separate large-file Move
 Selected Columns and Delete Selected Columns timings are not claimed because
 those operations add no new worker-path evidence.
+
+Delete Selected Rows uses the same guarded private rewrite boundary with direct
+record skipping. Its [Phase 8A release validation](benchmarks/2026-09-04-delete-selected-rows.md)
+records complete 1 GB and 12 GB runs below 4 MiB peak RSS, unchanged source
+hashes, and successful destination reopen checks.
 
 ## Architecture rule
 **If a feature only works because the entire file fits in RAM, it is not a finished Quarry feature.**

@@ -2,7 +2,7 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-## Current progress: 2026-08-27
+## Current progress: 2026-09-04
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -14,7 +14,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover Move/Delete Selected Columns, overlay-aware Find Next, and Replace in Cell; production Replace All is measured directly at [12 GB](benchmarks/2026-08-22-12gb-replace-all.md) and [50 GB](benchmarks/2026-08-22-50gb-capability-suite.md) |
 | Phase 6: Sorting | Complete | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md); the current engine also passed the optimized [117-million-row `FIRSTNAME` sort](benchmarks/2026-08-23-12gb-sort-performance.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup |
 | Phase 7: Hardening | Complete | Phase 7A packaging and installation are complete in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); Phase 7B connected-workflow dogfooding and interface polish passed owner review, and the current workflows are documented in the [user guide](USER_GUIDE.md) |
-| Phase 8: Row operations | Planned | **Delete Selected Rows** is the first planned slice; selection and filtered-view semantics must be decided before implementation |
+| Phase 8: Row operations | Phase 8A complete | **Delete Selected Rows** passed exact regressions, owner review, and the [1 GB and 12 GB release validation](benchmarks/2026-09-04-delete-selected-rows.md) |
 
 Cross-phase evidence: the [50 GB capability suite](benchmarks/2026-08-22-50gb-capability-suite.md)
 measures progressive open, complete indexing, navigation, Find, filtering,
@@ -347,35 +347,38 @@ match in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md).
 **Phase 7B exit met:** the owner completed the connected-workflow, keyboard,
 accessibility, appearance, and window-size review. The accepted toolbar redesign
 keeps the grid primary, moves progress and status into the footer, and exposes
-secondary controls contextually. The next prioritized gap is row deletion.
+secondary controls contextually. That review prioritized row deletion as the
+next gap, which Phase 8A now completes.
 
 ## Phase 8: Row operations
 
-Start with **Delete Selected Rows**. Row insertion remains a separate later
+**Delete Selected Rows** is complete. Row insertion remains a separate later
 slice.
 
 ### Phase 8A checklist: delete selected rows
 
-- [ ] Add explicit selection for one or more data rows through the numbered row
+- [x] Add explicit selection for one or more data rows through the numbered row
   gutter, including range and additive selection, visible feedback, and
   accessible state.
-- [ ] Add **Delete Selected Rows** as a distinct action from the existing
+- [x] Add **Delete Selected Rows** as a distinct action from the existing
   **Delete Selected Columns** command.
-- [ ] Preserve the header and every unselected data row while streaming the
+- [x] Preserve the header and every unselected data row while streaming the
   current document and sparse edits into a bounded private working CSV.
-- [ ] Reopen the completed result as the ordinary modified document and retain
+- [x] Reopen the completed result as the ordinary modified document and retain
   Save, Save As, Discard Changes, and one-level structural Undo and Redo.
-- [ ] Preserve both the current document and its source on cancellation,
+- [x] Preserve both the current document and its source on cancellation,
   failure, or source conflict, while removing unpublished temporary output.
-- [ ] Decide filtered-view behavior before implementation. A visible filtered
-  position must not silently stand in for an unidentified physical data row.
-- [ ] Cover quoted and multiline records, selection changes, header preservation,
+- [x] Clear row selection when filtering starts, and keep row selection plus
+  deletion unavailable while a filter is active so a filtered position never
+  stands in for an unidentified physical data row.
+- [x] Cover quoted and multiline records, selection changes, header preservation,
   sparse edits, cancellation, cleanup, accessibility, and history with exact
   regressions, then record bounded 1 GB and 12 GB validation.
 
-**Phase 8A exit:** selected data rows can be removed safely from the working
+**Phase 8A exit met:** selected data rows can be removed safely from the working
 document without loading the file into memory or changing the source before
-Save.
+Save. The [release validation](benchmarks/2026-09-04-delete-selected-rows.md)
+records complete 1 GB and 12 GB runs below 4 MiB peak RSS.
 
 ## Later possibilities
 Persistent indexes and invalidation, broader encoding and malformed-data UX,

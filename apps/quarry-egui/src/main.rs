@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -361,6 +362,7 @@ enum StructuralRequest {
 enum GridColumnRequest {
     Dialog(StructuralDialog),
     Delete(Vec<usize>),
+    DeleteRows(Vec<RangeInclusive<u64>>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1058,6 +1060,23 @@ impl QuarryApp {
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
             .and_then(|document| document.start_delete_columns(columns));
+        self.notice = result.err();
+        if self.notice.is_none() {
+            self.footer_status = self
+                .document
+                .as_ref()
+                .filter(|document| document.structural_job.is_none())
+                .and_then(|document| document.structural_status.clone())
+                .map(AppMessage::status);
+        }
+    }
+
+    fn apply_delete_rows(&mut self, rows: Vec<RangeInclusive<u64>>) {
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| AppMessage::warning("Open a file before deleting rows."))
+            .and_then(|document| document.start_delete_rows(rows));
         self.notice = result.err();
         if self.notice.is_none() {
             self.footer_status = self
@@ -1810,6 +1829,7 @@ impl eframe::App for QuarryApp {
             match request {
                 GridColumnRequest::Dialog(dialog) => self.open_structural_dialog(dialog),
                 GridColumnRequest::Delete(columns) => self.apply_delete_columns(columns),
+                GridColumnRequest::DeleteRows(rows) => self.apply_delete_rows(rows),
             }
         }
         let structural_dialog_action = self
@@ -2337,10 +2357,21 @@ fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) 
                     ui.separator();
                     ui.label(format!("{shown} shown"));
                 }
-                let selected = document.selected_columns.len();
-                if metadata_width >= 840.0 && selected > 0 {
+                let selected_rows = document.selected_rows.count();
+                let selected_columns = document.selected_columns.len();
+                if metadata_width >= 840.0 && (selected_rows > 0 || selected_columns > 0) {
                     ui.separator();
-                    ui.label(format!("{selected} selected"));
+                    if selected_rows > 0 {
+                        ui.label(format!(
+                            "{selected_rows} row{} selected",
+                            if selected_rows == 1 { "" } else { "s" }
+                        ));
+                    } else {
+                        ui.label(format!(
+                            "{selected_columns} column{} selected",
+                            if selected_columns == 1 { "" } else { "s" }
+                        ));
+                    }
                 }
             },
         );
@@ -3617,6 +3648,7 @@ enum GridSelection {
 #[derive(Default)]
 struct GridInteraction {
     selection: Option<GridSelection>,
+    row_selection: Option<(RowSelection, Option<u64>)>,
     column_request: Option<GridColumnRequest>,
     filter_query: Option<FilterQuery>,
     copy_selection: bool,
@@ -3643,6 +3675,103 @@ impl GridSelection {
                     ..
                 } if selected_row == row && selected_column == column
             )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RowSelection {
+    ranges: Vec<RangeInclusive<u64>>,
+    anchor: Option<u64>,
+}
+
+impl RowSelection {
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn contains(&self, row: u64) -> bool {
+        let index = self.ranges.partition_point(|range| *range.end() < row);
+        self.ranges
+            .get(index)
+            .is_some_and(|range| range.contains(&row))
+    }
+
+    fn count(&self) -> u64 {
+        self.ranges.iter().fold(0_u64, |count, range| {
+            count.saturating_add(range.end().saturating_sub(*range.start()).saturating_add(1))
+        })
+    }
+
+    fn first(&self) -> Option<u64> {
+        self.ranges.first().map(|range| *range.start())
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.anchor = None;
+    }
+
+    fn select(&mut self, row: u64, modifiers: egui::Modifiers) {
+        if modifiers.shift {
+            let anchor = self
+                .anchor
+                .or_else(|| self.ranges.first().map(|range| *range.start()))
+                .unwrap_or(row);
+            self.ranges = vec![anchor.min(row)..=anchor.max(row)];
+            self.anchor = Some(anchor);
+        } else if modifiers.command {
+            self.toggle(row);
+        } else {
+            self.ranges = vec![row..=row];
+            self.anchor = Some(row);
+        }
+    }
+
+    fn toggle(&mut self, row: u64) {
+        let index = self.ranges.partition_point(|range| *range.end() < row);
+        if self
+            .ranges
+            .get(index)
+            .is_some_and(|range| range.contains(&row))
+        {
+            let start = *self.ranges[index].start();
+            let end = *self.ranges[index].end();
+            match (row == start, row == end) {
+                (true, true) => {
+                    self.ranges.remove(index);
+                }
+                (true, false) => self.ranges[index] = row.saturating_add(1)..=end,
+                (false, true) => self.ranges[index] = start..=row.saturating_sub(1),
+                (false, false) => {
+                    self.ranges[index] = start..=row.saturating_sub(1);
+                    self.ranges.insert(index + 1, row.saturating_add(1)..=end);
+                }
+            }
+            if self.anchor == Some(row) {
+                self.anchor = self.ranges.first().map(|range| *range.start());
+            }
+            return;
+        }
+
+        self.ranges.insert(index, row..=row);
+        self.merge_adjacent();
+        self.anchor = Some(row);
+    }
+
+    fn merge_adjacent(&mut self) {
+        let mut merged: Vec<RangeInclusive<u64>> = Vec::with_capacity(self.ranges.len());
+        for range in self.ranges.drain(..) {
+            if let Some(previous) = merged.last_mut()
+                && *range.start() <= previous.end().saturating_add(1)
+            {
+                let start = *previous.start();
+                let end = (*previous.end()).max(*range.end());
+                *previous = start..=end;
+            } else {
+                merged.push(range);
+            }
+        }
+        self.ranges = merged;
     }
 }
 
@@ -3719,6 +3848,12 @@ enum StructuralJob {
         undo: WorkingCopySnapshot,
         column: usize,
         direction: SortDirection,
+    },
+    DeletingRows {
+        job: SaveAsJob,
+        destination: PathBuf,
+        undo: WorkingCopySnapshot,
+        count: u64,
     },
 }
 
@@ -3889,6 +4024,7 @@ struct Document {
     pending_filter_read: Option<FilterReadWindow>,
     reveal_cell: Option<(u64, usize)>,
     selection: Option<GridSelection>,
+    selected_rows: RowSelection,
     selected_columns: BTreeSet<usize>,
     column_selection_anchor: Option<usize>,
     headers: Vec<String>,
@@ -4022,6 +4158,7 @@ impl Document {
             pending_filter_read: None,
             reveal_cell: None,
             selection: None,
+            selected_rows: RowSelection::default(),
             selected_columns: BTreeSet::new(),
             column_selection_anchor: None,
             headers,
@@ -4059,9 +4196,9 @@ impl Document {
 
     fn structural_edit_disabled_reason(&self) -> Option<&'static str> {
         if self.source_changed {
-            Some("Reopen the changed source before editing columns.")
+            Some("Reopen the changed source before editing the document.")
         } else if self.filter_active() {
-            Some("Clear the filter before editing columns.")
+            Some("Clear the filter before editing the document.")
         } else if self.save_job.is_some()
             || self.export_job.is_some()
             || self.structural_job.is_some()
@@ -4208,6 +4345,61 @@ impl Document {
             .expect("validated selection is not empty");
         let nearest = first_deleted.min(output_columns.len() - 1);
         self.start_arrangement(output_columns, BTreeSet::from([nearest]))
+    }
+
+    fn start_delete_rows(&mut self, rows: Vec<RangeInclusive<u64>>) -> Result<(), AppMessage> {
+        if let Some(reason) = self.structural_edit_disabled_reason() {
+            return Err(AppMessage::warning(reason));
+        }
+        if rows.is_empty() {
+            return Err(AppMessage::warning(
+                "Select at least one numbered row first.",
+            ));
+        }
+        let count = rows.iter().fold(0_u64, |count, range| {
+            count.saturating_add(range.end().saturating_sub(*range.start()).saturating_add(1))
+        });
+        self.commit_edits();
+        self.cancel_search();
+        let MaterializationPreparation {
+            undo,
+            destination,
+            renames,
+        } = self.prepare_materialization()?;
+        let job = match self.session.start_create_working_copy_deleting_rows(
+            renames,
+            self.cell_edits.clone(),
+            rows,
+            &destination,
+        ) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+            Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+            Err(error) => {
+                self.cleanup_empty_working_copy();
+                return Err(AppMessage::error(error.to_string()));
+            }
+        };
+        self.structural_job = Some(StructuralJob::DeletingRows {
+            job,
+            destination,
+            undo,
+            count,
+        });
+        self.structural_status = Some(format!(
+            "Deleting {count} selected row{}…",
+            if count == 1 { "" } else { "s" }
+        ));
+        self.structural_cancel_requested = false;
+        Ok(())
     }
 
     fn start_arrangement(
@@ -4521,6 +4713,7 @@ impl Document {
             StructuralJob::Materializing { job, .. } => job.progress().done,
             StructuralJob::Replacing { job, .. } => job.progress().done,
             StructuralJob::Sorting { job, .. } => job.progress().done,
+            StructuralJob::DeletingRows { job, .. } => job.progress().done,
         };
         if !done {
             return Ok(None);
@@ -4609,6 +4802,44 @@ impl Document {
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Column edit failed. The document was not changed.".into());
+                    Err(AppMessage::error(error.to_string()))
+                }
+            },
+            StructuralJob::DeletingRows {
+                job,
+                destination,
+                undo,
+                count,
+            } => match job.wait() {
+                Ok(SaveAsOutcome::Complete(summary)) => {
+                    debug_assert_eq!(summary.destination, destination);
+                    self.accept_materialized_change(undo);
+                    Ok(Some(MaterializedWorkingCopy {
+                        path: summary.destination,
+                        selected_columns: BTreeSet::new(),
+                        notice: format!(
+                            "Deleted {count} row{}. Save to keep it, or discard changes.",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                    }))
+                }
+                Ok(SaveAsOutcome::Cancelled) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Row deletion cancelled. The document was not changed.".into());
+                    Ok(None)
+                }
+                Err(QuarryError::SourceChanged) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.invalidate_changed_source();
+                    Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Row deletion failed. The document was not changed.".into());
                     Err(AppMessage::error(error.to_string()))
                 }
             },
@@ -4711,6 +4942,7 @@ impl Document {
             StructuralJob::Materializing { job, .. } => job.cancel(),
             StructuralJob::Replacing { job, .. } => job.cancel(),
             StructuralJob::Sorting { job, .. } => job.cancel(),
+            StructuralJob::DeletingRows { job, .. } => job.cancel(),
         }
         self.structural_cancel_requested = true;
         self.structural_status = Some("Cancelling change…".into());
@@ -4779,6 +5011,16 @@ impl Document {
                     progress.done,
                     "Sorting rows",
                     true,
+                )
+            }
+            StructuralJob::DeletingRows { job, .. } => {
+                let progress = job.progress();
+                (
+                    progress.bytes_scanned,
+                    progress.total_bytes,
+                    progress.done,
+                    "Deleting selected rows",
+                    false,
                 )
             }
         };
@@ -4997,6 +5239,7 @@ impl Document {
             row: found.row,
             column: found.column,
         });
+        self.selected_rows.clear();
         if let Some(index) = self.search_history_index.take() {
             self.search_history.truncate(index);
         }
@@ -5010,6 +5253,7 @@ impl Document {
         self.center_column(column);
         self.reveal_cell = Some((row, column));
         self.selection = Some(GridSelection::Cell { row, column });
+        self.selected_rows.clear();
         self.selected_columns.clear();
         self.column_selection_anchor = None;
         self.search_status = Some(format!(
@@ -5101,6 +5345,7 @@ impl Document {
         self.filter_buffer_start = 0;
         self.filtered_rows.clear();
         self.selection = None;
+        self.selected_rows.clear();
         self.reveal_cell = None;
         self.scroll_points = 0.0;
         Ok(())
@@ -5422,6 +5667,7 @@ impl Document {
         self.buffered_rows.clear();
         self.filtered_rows.clear();
         self.selection = None;
+        self.selected_rows.clear();
         self.reveal_cell = None;
         self.save_status = Some(SOURCE_CHANGED_NOTICE.into());
     }
@@ -5464,6 +5710,7 @@ impl Document {
         self.filter_buffer_start = 0;
         self.filtered_rows.clear();
         self.selection = None;
+        self.selected_rows.clear();
         self.reveal_cell = None;
         self.scroll_points = 0.0;
         if self.available_data_rows() > 0 {
@@ -5762,6 +6009,7 @@ impl Document {
             .expect("editable cell text was checked as UTF-8")
             .to_owned();
         self.selection = Some(GridSelection::Cell { row, column });
+        self.selected_rows.clear();
         self.cell_edit = Some(CellEdit {
             row,
             column,
@@ -5824,6 +6072,7 @@ impl Document {
         self.cell_edit = None;
         self.cell_edits.clear();
         self.selection = None;
+        self.selected_rows.clear();
         self.reveal_cell = None;
         self.search_query.clear();
         self.last_match = None;
@@ -5926,6 +6175,7 @@ impl Document {
                 StructuralJob::Materializing { job, .. } => job.cancel(),
                 StructuralJob::Replacing { job, .. } => job.cancel(),
                 StructuralJob::Sorting { job, .. } => job.cancel(),
+                StructuralJob::DeletingRows { job, .. } => job.cancel(),
             }
         }
         self.structural_cancel_requested = false;
@@ -6829,7 +7079,16 @@ fn show_grid_with_filter_case(
                 show_table(ui, document, reveal_cell, filter_case_sensitivity)
             })
             .inner;
+        if let Some((row_selection, active_row)) = interaction.row_selection.clone() {
+            document.selection = active_row.map(|row| GridSelection::Row { row });
+            document.selected_rows = row_selection;
+            document.selected_columns.clear();
+            document.column_selection_anchor = None;
+        }
         if let Some(selection) = interaction.selection {
+            if matches!(selection, GridSelection::Cell { .. }) {
+                document.selected_rows.clear();
+            }
             document.selection = Some(selection);
             document.selected_columns.clear();
             document.column_selection_anchor = None;
@@ -7092,6 +7351,7 @@ fn show_table(
                                     document.selected_columns.insert(column);
                                     document.column_selection_anchor = Some(column);
                                     document.selection = None;
+                                    document.selected_rows.clear();
                                 }
                                 if response.clicked() {
                                     let mut modifiers = ui.input(|input| input.modifiers);
@@ -7107,6 +7367,7 @@ fn show_table(
                                         modifiers,
                                     );
                                     document.selection = None;
+                                    document.selected_rows.clear();
                                 }
                                 let popup_command = if open_context_menu {
                                     Some(egui::SetOpenCommand::Bool(true))
@@ -7301,9 +7562,10 @@ fn show_table(
                             ui.scope_builder(
                                 egui::UiBuilder::new().id(("row-selection", record_row)),
                                 |ui| {
-                                let selected = document
-                                    .selection
-                                    .is_some_and(|selection| selection.selects_row(record_row));
+                                let selected = document.selected_rows.contains(record_row)
+                                    || document
+                                        .selection
+                                        .is_some_and(|selection| selection.selects_row(record_row));
                                 let color = if selected {
                                     ui.visuals().selection.stroke.color
                                 } else {
@@ -7328,11 +7590,107 @@ fn show_table(
                                         format!("Select row {display_row}"),
                                     )
                                 });
+                                let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                    node.set_selected(selected);
+                                    node.set_description(
+                                        "Activate to select this row. Shift-click a range. Command/Ctrl-click to add or remove. Open the context menu for row actions.",
+                                    );
+                                    node.add_action(egui::accesskit::Action::ShowContextMenu);
+                                });
+                                let accesskit_context_menu = ui.input_mut(|input| {
+                                    let mut requested = false;
+                                    input.consume_accesskit_action_requests(
+                                        response.id,
+                                        |request| {
+                                            let matches = request.action
+                                                == egui::accesskit::Action::ShowContextMenu;
+                                            requested |= matches;
+                                            matches
+                                        },
+                                    );
+                                    requested
+                                });
+                                let accesskit_click = ui.input(|input| {
+                                    input.has_accesskit_action_request(
+                                        response.id,
+                                        egui::accesskit::Action::Click,
+                                    )
+                                });
+                                let keyboard_context_menu = response.has_focus()
+                                    && ui.input(|input| {
+                                        input.modifiers.shift
+                                            && input.key_pressed(egui::Key::F10)
+                                    });
+                                let open_context_menu = response.secondary_clicked()
+                                    || keyboard_context_menu
+                                    || accesskit_context_menu;
+                                let mut effective_row_selection = None;
+                                if open_context_menu
+                                    && !document.selected_rows.contains(record_row)
+                                {
+                                    let mut selection = document.selected_rows.clone();
+                                    selection.select(record_row, egui::Modifiers::NONE);
+                                    interaction.row_selection = Some((
+                                        selection.clone(),
+                                        Some(record_row),
+                                    ));
+                                    effective_row_selection = Some(selection);
+                                }
                                 if response.clicked() {
                                     response.request_focus();
-                                    interaction.selection =
-                                        Some(GridSelection::Row { row: record_row });
+                                    let mut modifiers = ui.input(|input| input.modifiers);
+                                    if accesskit_click {
+                                        modifiers.shift = false;
+                                        modifiers.command = true;
+                                    }
+                                    let mut selection = document.selected_rows.clone();
+                                    selection.select(record_row, modifiers);
+                                    let active_row = selection
+                                        .contains(record_row)
+                                        .then_some(record_row)
+                                        .or_else(|| selection.first());
+                                    interaction.row_selection =
+                                        Some((selection.clone(), active_row));
+                                    effective_row_selection = Some(selection);
                                 }
+                                let popup_command = if open_context_menu {
+                                    Some(egui::SetOpenCommand::Bool(true))
+                                } else if response.clicked() {
+                                    Some(egui::SetOpenCommand::Bool(false))
+                                } else {
+                                    None
+                                };
+                                let row_selection = effective_row_selection
+                                    .as_ref()
+                                    .unwrap_or(&document.selected_rows);
+                                egui::Popup::menu(&response)
+                                    .open_memory(popup_command)
+                                    .show(|ui| {
+                                        let disabled_reason = document
+                                            .structural_edit_disabled_reason()
+                                            .or_else(|| {
+                                                row_selection.is_empty().then_some(
+                                                    "Select at least one numbered row first.",
+                                                )
+                                            });
+                                        if ui
+                                            .add_enabled(
+                                                disabled_reason.is_none(),
+                                                egui::Button::new("Delete Selected Rows"),
+                                            )
+                                            .on_disabled_hover_text(
+                                                disabled_reason.unwrap_or_default(),
+                                            )
+                                            .clicked()
+                                        {
+                                            interaction.column_request = Some(
+                                                GridColumnRequest::DeleteRows(
+                                                    row_selection.ranges.clone(),
+                                                ),
+                                            );
+                                            ui.close();
+                                        }
+                                    });
                                 },
                             );
                         });
@@ -7404,9 +7762,20 @@ fn show_table(
                                             document.cell_value(record_row, column, source)
                                         });
                                         let text = value.map_or_else(String::new, field_text);
-                                        let selected = document.selection.is_some_and(|selection| {
-                                            selection.selects_cell(record_row, column)
-                                        });
+                                        let active_selection_highlight = document
+                                            .selection
+                                            .is_some_and(|selection| {
+                                                selection.selects_cell(record_row, column)
+                                            });
+                                        let active_cell_selected = matches!(
+                                            document.selection,
+                                            Some(GridSelection::Cell {
+                                                row: selected_row,
+                                                column: selected_column,
+                                            }) if selected_row == record_row && selected_column == column
+                                        );
+                                        let selected = document.selected_rows.contains(record_row)
+                                            || active_selection_highlight;
                                         let response = ui.add_sized(
                                             [ui.available_width(), ROW_HEIGHT],
                                             egui::Button::selectable(
@@ -7428,6 +7797,7 @@ fn show_table(
                                             )
                                         });
                                         let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                            node.set_selected(selected);
                                             node.set_description(
                                                 "Activate to select. Open the context menu to copy or filter by this value.",
                                             );
@@ -7542,7 +7912,7 @@ fn show_table(
                                         if cell_focus_requested == Some((record_row, column)) {
                                             response.request_focus();
                                         }
-                                        let keyboard_activate = selected
+                                        let keyboard_activate = active_cell_selected
                                             && response.has_focus()
                                             && ui.input(|input| {
                                                 input.key_pressed(egui::Key::Enter)
@@ -7804,9 +8174,9 @@ mod tests {
         ColumnView, DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterPredicate,
         FilterProgress, FilterQuery, GridColumnRequest, GridSelection, HeaderMode, IndexConfig,
         MAX_RENDERED_COLUMNS, MessageSeverity, OpenOptions, QuarryApp, REPLACE_INPUT_ID,
-        ROW_NUMBER_WIDTH, Row, SOURCE_CHANGED_NOTICE, SearchMatch, Session, StructuralDialog,
-        StructuralDialogAction, WorkingCopyState, active_job_controls, column_drop_position,
-        column_ruler_divider_stroke, column_selection_fill, configure_style,
+        ROW_NUMBER_WIDTH, Row, RowSelection, SOURCE_CHANGED_NOTICE, SearchMatch, Session,
+        StructuralDialog, StructuralDialogAction, WorkingCopyState, active_job_controls,
+        column_drop_position, column_ruler_divider_stroke, column_selection_fill, configure_style,
         estimate_sort_temporary_bytes, filter_button_label, filtered_export_file_name,
         first_active_job, footer_range_text, logical_viewport_start, max_viewport_start,
         notice_strip, page_controls, parse_data_row, parse_file_column, parse_move_position,
@@ -11319,6 +11689,66 @@ mod tests {
     }
 
     #[test]
+    fn row_selection_modifiers_are_compact_and_match_editor_conventions() {
+        let mut selected = RowSelection::default();
+
+        selected.select(2, egui::Modifiers::NONE);
+        assert_eq!(selected.ranges, vec![2..=2]);
+        assert_eq!(selected.anchor, Some(2));
+
+        selected.select(100_000_000, egui::Modifiers::SHIFT);
+        assert_eq!(selected.ranges, vec![2..=100_000_000]);
+        assert_eq!(selected.count(), 99_999_999);
+        assert_eq!(selected.ranges.len(), 1);
+        assert_eq!(selected.anchor, Some(2));
+
+        selected.select(10, egui::Modifiers::NONE);
+        selected.select(20, egui::Modifiers::COMMAND);
+        assert_eq!(selected.ranges, vec![10..=10, 20..=20]);
+        assert_eq!(selected.anchor, Some(20));
+
+        selected.select(10, egui::Modifiers::COMMAND);
+        assert_eq!(selected.ranges, vec![20..=20]);
+        selected.select(20, egui::Modifiers::COMMAND);
+        assert!(selected.is_empty());
+        assert_eq!(selected.anchor, None);
+    }
+
+    #[test]
+    fn filtering_clears_row_selection_and_blocks_row_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filtered-row-deletion.csv");
+        fs::write(&source, b"name,city\nAda,London\nGrace,Arlington\n").unwrap();
+        let mut document = Document::open(
+            &source,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.selected_rows.select(1, egui::Modifiers::NONE);
+        document.selection = Some(GridSelection::Row { row: 1 });
+
+        document
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"Ada".to_vec(),
+            ))
+            .unwrap();
+        assert!(document.selected_rows.is_empty());
+        assert!(document.selection.is_none());
+        assert_eq!(
+            document.start_delete_rows(vec![1..=1]).unwrap_err(),
+            "Clear the filter before editing the document."
+        );
+        assert!(document.structural_job.is_none());
+        assert!(document.working_copy.is_none());
+    }
+
+    #[test]
     fn shift_selection_uses_shown_display_order_and_hiding_prunes_it() {
         let mut columns = ColumnView::new(6);
         assert!(columns.move_column(5, 1));
@@ -11808,6 +12238,63 @@ mod tests {
     }
 
     #[test]
+    fn delete_selected_rows_uses_working_copy_and_structural_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("delete-rows.csv");
+        let original = b"id,name\n1,Ada\n2,Grace\n3,Linus\n4,Margaret\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        {
+            let document = app.document.as_mut().unwrap();
+            document.cell_edits.insert((3, 1), b"Edited".to_vec());
+            document.selected_rows.ranges = vec![2..=2, 4..=4];
+            document.selected_rows.anchor = Some(2);
+            document.selection = Some(GridSelection::Row { row: 2 });
+        }
+
+        app.apply_delete_rows(vec![2..=2, 4..=4]);
+        assert!(app.notice.is_none());
+        finish_structural_edit(&mut app);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(
+            document.session.first_rows[0].fields,
+            ["id", "name"].map(|field| field.as_bytes().to_vec())
+        );
+        assert_eq!(
+            document.session.first_rows[1].fields,
+            ["1", "Ada"].map(|field| field.as_bytes().to_vec())
+        );
+        assert_eq!(
+            document.session.first_rows[2].fields,
+            ["3", "Edited"].map(|field| field.as_bytes().to_vec())
+        );
+        assert!(document.selected_rows.is_empty());
+        assert!(document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.first_rows.len(), 5);
+        assert_eq!(document.cell_edits.get(&(3, 1)), Some(&b"Edited".to_vec()));
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.first_rows.len(), 3);
+        assert_eq!(document.session.first_rows[2].fields[1], b"Edited");
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.apply(&egui::Context::default(), Action::DiscardChanges);
+        finish_index(app.document.as_mut().unwrap());
+        assert_eq!(app.document.as_ref().unwrap().session.first_rows.len(), 5);
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
     fn sort_merge_progress_stays_active_until_the_worker_finishes() {
         let progress = sort_merge_progress(100, 100, false).unwrap();
         assert_eq!(progress.fraction, 0.9);
@@ -12171,6 +12658,133 @@ mod tests {
             request,
             Some(GridColumnRequest::Dialog(StructuralDialog::sort(0)))
         );
+    }
+
+    #[test]
+    fn numbered_rows_are_accessibly_selectable_and_expose_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("accessible-row-menu.csv");
+        fs::write(&source, b"name,city\nAda,London\nGrace,Arlington\n").unwrap();
+        let mut document = Document::open(
+            &source,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let target = grid_control_id(&ctx, "Select row 1", &mut document);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert_eq!(document.selected_rows.ranges, vec![1..=1]);
+
+        let second_target = grid_control_id(&ctx, "Select row 2", &mut document);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: second_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert_eq!(document.selected_rows.ranges, vec![1..=2]);
+
+        let selected = render_grid(&ctx, &mut document);
+        let selected_tree = selected
+            .platform_output
+            .accesskit_update
+            .expect("the selected row should be accessible");
+        for (row, name) in [(1, "Ada"), (2, "Grace")] {
+            let label = format!("Select row {row}");
+            let (_, row_node) = selected_tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label.as_str()))
+                .expect("each selected row gutter should be present");
+            assert_eq!(row_node.is_selected(), Some(true));
+            assert!(row_node.supports_action(egui::accesskit::Action::ShowContextMenu));
+            assert!(selected_tree.nodes.iter().any(|(_, node)| {
+                node.label() == Some(format!("Select row {row}, column 1 (name): {name}").as_str())
+                    && node.is_selected() == Some(true)
+            }));
+        }
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::ShowContextMenu,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        let menu = render_grid(&ctx, &mut document);
+        let (delete_target, delete_node) = menu
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("the row menu should be accessible")
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Delete Selected Rows"))
+            .expect("Delete Selected Rows should be present");
+        assert!(!delete_node.is_disabled());
+        let delete_target = *delete_target;
+        let mut request = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: delete_target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    request = show_grid(ui, &mut document).unwrap();
+                });
+            },
+        );
+        assert_eq!(request, Some(GridColumnRequest::DeleteRows(vec![1..=2])));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::RangeInclusive;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -903,6 +904,7 @@ struct PreparedSaveEdits {
     cells: BTreeMap<(u64, usize), Vec<u8>>,
     transformation: Option<PreparedColumnTransformation>,
     replacement: Option<LiteralReplacement>,
+    deleted_rows: Vec<RangeInclusive<u64>>,
 }
 
 impl PreparedSaveEdits {
@@ -983,15 +985,19 @@ impl PreparedSaveEdits {
 
 impl SaveEdits {
     fn prepare(
-        self,
+        mut self,
         has_header: bool,
         replacement: Option<LiteralReplacement>,
+        deleted_rows: Vec<RangeInclusive<u64>>,
     ) -> Result<PreparedSaveEdits, QuarryError> {
         if replacement.is_some() && self.transformation.is_some() {
             return Err(QuarryError::InvalidOption(
                 "replacement and column transformation cannot run together",
             ));
         }
+        validate_deleted_rows(&deleted_rows, u64::from(has_header))?;
+        self.cells
+            .retain(|(row, _), _| !row_in_deleted_ranges(&deleted_rows, *row));
         Ok(PreparedSaveEdits {
             headers: self.headers,
             cells: self.cells,
@@ -1000,8 +1006,44 @@ impl SaveEdits {
                 .map(|transformation| PreparedColumnTransformation::new(transformation, has_header))
                 .transpose()?,
             replacement,
+            deleted_rows,
         })
     }
+}
+
+fn validate_deleted_rows(
+    deleted_rows: &[RangeInclusive<u64>],
+    data_start: u64,
+) -> Result<(), QuarryError> {
+    let mut previous_end = None;
+    for range in deleted_rows {
+        let start = *range.start();
+        let end = *range.end();
+        if start > end {
+            return Err(QuarryError::InvalidOption(
+                "deleted row ranges must not be empty",
+            ));
+        }
+        if start < data_start {
+            return Err(QuarryError::InvalidOption(
+                "deleted rows must target data rows",
+            ));
+        }
+        if previous_end.is_some_and(|previous| start <= previous) {
+            return Err(QuarryError::InvalidOption(
+                "deleted row ranges must be sorted and non-overlapping",
+            ));
+        }
+        previous_end = Some(end);
+    }
+    Ok(())
+}
+
+fn row_in_deleted_ranges(deleted_rows: &[RangeInclusive<u64>], row: u64) -> bool {
+    let index = deleted_rows.partition_point(|range| *range.end() < row);
+    deleted_rows
+        .get(index)
+        .is_some_and(|range| range.contains(&row))
 }
 
 impl SaveAsJob {
@@ -1014,13 +1056,14 @@ impl SaveAsJob {
         target: SaveTarget,
         config: ExportConfig,
     ) -> Result<Self, QuarryError> {
-        Self::start_worker(
+        Self::start_worker_with_deleted_rows(
             source_path,
             file_size,
             delimiter,
             has_header,
             edits,
             None,
+            Vec::new(),
             target,
             config,
         )
@@ -1034,6 +1077,31 @@ impl SaveAsJob {
         has_header: bool,
         edits: SaveEdits,
         replacement: Option<LiteralReplacement>,
+        target: SaveTarget,
+        config: ExportConfig,
+    ) -> Result<Self, QuarryError> {
+        Self::start_worker_with_deleted_rows(
+            source_path,
+            file_size,
+            delimiter,
+            has_header,
+            edits,
+            replacement,
+            Vec::new(),
+            target,
+            config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_worker_with_deleted_rows(
+        source_path: PathBuf,
+        file_size: u64,
+        delimiter: u8,
+        has_header: bool,
+        edits: SaveEdits,
+        replacement: Option<LiteralReplacement>,
+        deleted_rows: Vec<RangeInclusive<u64>>,
         target: SaveTarget,
         config: ExportConfig,
     ) -> Result<Self, QuarryError> {
@@ -1069,7 +1137,7 @@ impl SaveAsJob {
                 "cell edits must target data rows",
             ));
         }
-        let edits = edits.prepare(has_header, replacement)?;
+        let edits = edits.prepare(has_header, replacement, deleted_rows)?;
         edits.validate_size_lower_bounds(config.max_record_bytes)?;
         let source = File::open(&source_path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -1354,6 +1422,38 @@ impl Session {
         )
     }
 
+    pub fn start_create_working_copy_deleting_rows(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        deleted_rows: Vec<RangeInclusive<u64>>,
+        destination: impl AsRef<Path>,
+    ) -> Result<SaveAsJob, QuarryError> {
+        if deleted_rows.is_empty() {
+            return Err(QuarryError::InvalidOption(
+                "select at least one row to delete",
+            ));
+        }
+        SaveAsJob::start_worker_with_deleted_rows(
+            self.path.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.dialect.has_header,
+            SaveEdits {
+                headers: header_renames,
+                cells: cell_edits,
+                transformation: None,
+            },
+            None,
+            deleted_rows,
+            SaveTarget::WorkingCopy(
+                destination.as_ref().to_path_buf(),
+                self.source_stamp.clone(),
+            ),
+            DEFAULT_EXPORT_CONFIG,
+        )
+    }
+
     pub fn start_create_replaced_working_copy(
         &self,
         header_renames: BTreeMap<usize, Vec<u8>>,
@@ -1494,11 +1594,24 @@ enum Publication {
     },
 }
 
+enum FirstRecordBomGuard {
+    Inactive,
+    Probing {
+        source_had_bom: bool,
+        prefix: Vec<u8>,
+    },
+    Passthrough {
+        inserted_bytes: u64,
+    },
+    Complete,
+}
+
 pub(crate) struct ExportTarget {
     writer: Option<BufWriter<File>>,
     temporary: PathBuf,
     destination: PathBuf,
     publication: Publication,
+    first_record_bom_guard: FirstRecordBomGuard,
 }
 
 impl ExportTarget {
@@ -1679,6 +1792,7 @@ impl ExportTarget {
                         temporary,
                         destination,
                         publication,
+                        first_record_bom_guard: FirstRecordBomGuard::Inactive,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -1693,11 +1807,86 @@ impl ExportTarget {
     }
 
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), QuarryError> {
-        self.writer
-            .as_mut()
-            .expect("export writer is present")
-            .write_all(bytes)?;
+        let writer = self.writer.as_mut().expect("export writer is present");
+        match &mut self.first_record_bom_guard {
+            FirstRecordBomGuard::Inactive | FirstRecordBomGuard::Complete => {
+                writer.write_all(bytes)?;
+            }
+            FirstRecordBomGuard::Probing {
+                source_had_bom: true,
+                ..
+            } if !bytes.is_empty() => {
+                writer.write_all(UTF8_BOM)?;
+                writer.write_all(bytes)?;
+                self.first_record_bom_guard = FirstRecordBomGuard::Passthrough {
+                    inserted_bytes: UTF8_BOM.len() as u64,
+                };
+            }
+            FirstRecordBomGuard::Probing {
+                source_had_bom: true,
+                ..
+            } => {}
+            FirstRecordBomGuard::Probing {
+                source_had_bom: false,
+                prefix,
+            } => {
+                let mut consumed = 0_usize;
+                while consumed < bytes.len() && prefix.len() < UTF8_BOM.len() {
+                    prefix.push(bytes[consumed]);
+                    consumed += 1;
+                    if !UTF8_BOM.starts_with(prefix) {
+                        writer.write_all(prefix)?;
+                        writer.write_all(&bytes[consumed..])?;
+                        self.first_record_bom_guard =
+                            FirstRecordBomGuard::Passthrough { inserted_bytes: 0 };
+                        return Ok(());
+                    }
+                }
+                if prefix.len() == UTF8_BOM.len() {
+                    writer.write_all(UTF8_BOM)?;
+                    writer.write_all(prefix)?;
+                    writer.write_all(&bytes[consumed..])?;
+                    self.first_record_bom_guard = FirstRecordBomGuard::Passthrough {
+                        inserted_bytes: UTF8_BOM.len() as u64,
+                    };
+                }
+            }
+            FirstRecordBomGuard::Passthrough { .. } => writer.write_all(bytes)?,
+        }
         Ok(())
+    }
+
+    fn begin_first_record_bom_guard(&mut self, source_had_bom: bool) {
+        debug_assert!(matches!(
+            self.first_record_bom_guard,
+            FirstRecordBomGuard::Inactive
+        ));
+        self.first_record_bom_guard = FirstRecordBomGuard::Probing {
+            source_had_bom,
+            prefix: Vec::with_capacity(UTF8_BOM.len()),
+        };
+    }
+
+    fn finish_first_record_bom_guard(&mut self) -> Result<u64, QuarryError> {
+        let guard = std::mem::replace(
+            &mut self.first_record_bom_guard,
+            FirstRecordBomGuard::Complete,
+        );
+        match guard {
+            FirstRecordBomGuard::Probing { prefix, .. } => {
+                self.writer
+                    .as_mut()
+                    .expect("export writer is present")
+                    .write_all(&prefix)?;
+                Ok(0)
+            }
+            FirstRecordBomGuard::Passthrough { inserted_bytes } => Ok(inserted_bytes),
+            FirstRecordBomGuard::Inactive => {
+                self.first_record_bom_guard = FirstRecordBomGuard::Inactive;
+                Ok(0)
+            }
+            FirstRecordBomGuard::Complete => Ok(0),
+        }
     }
 
     fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
@@ -2010,6 +2199,7 @@ fn run_save_as(
     let copied = if edits.cells.is_empty()
         && edits.transformation.is_none()
         && edits.replacement.is_none()
+        && edits.deleted_rows.is_empty()
         && has_header
     {
         copy_with_rewritten_header(
@@ -2302,6 +2492,14 @@ fn copy_with_rewritten_records(
     let mut bytes_written = 0_u64;
     let mut replacements = 0_u64;
     let mut next_cell_edit_row = edits.cells.first_key_value().map(|((row, _), _)| *row);
+    let mut deleted_range_index = 0_usize;
+    let guard_first_retained_record = !has_header && row_in_deleted_ranges(&edits.deleted_rows, 0);
+    let source_had_bom = if guard_first_retained_record {
+        source_starts_with_utf8_bom(source)?
+    } else {
+        false
+    };
+    let mut first_retained_record_pending = guard_first_retained_record;
     let rewrites_every_record = edits.transformation.is_some() || edits.replacement.is_some();
 
     loop {
@@ -2315,11 +2513,19 @@ fn copy_with_rewritten_records(
             let finish_result = scanner.finish(absolute_start, |_| {
                 if shared.cancel_requested.load(Ordering::Acquire) {
                     cancelled = true;
+                } else if deleted_row(&edits.deleted_rows, &mut deleted_range_index, row_number) {
+                    // The scanner still validates the record boundary, but selected rows
+                    // never enter the output or the bounded rewrite buffer.
                 } else if rewrites_every_record
                     || row_number == 0 && !edits.headers.is_empty()
                     || next_cell_edit_row == Some(row_number)
                 {
                     let has_cell_edits = next_cell_edit_row == Some(row_number);
+                    begin_first_retained_record_bom_guard(
+                        output,
+                        &mut first_retained_record_pending,
+                        source_had_bom,
+                    );
                     match write_saved_record(
                         output,
                         &record,
@@ -2329,10 +2535,15 @@ fn copy_with_rewritten_records(
                         edits,
                         config.max_record_bytes,
                     ) {
-                        Ok(written) => {
-                            bytes_written = bytes_written.saturating_add(written.bytes_written);
-                            replacements = replacements.saturating_add(written.replacements);
-                        }
+                        Ok(written) => match output.finish_first_record_bom_guard() {
+                            Ok(marker_bytes) => {
+                                bytes_written = bytes_written
+                                    .saturating_add(marker_bytes)
+                                    .saturating_add(written.bytes_written);
+                                replacements = replacements.saturating_add(written.replacements);
+                            }
+                            Err(error) => deferred_error = Some(error),
+                        },
                         Err(error) => deferred_error = Some(error),
                     }
                     if has_cell_edits {
@@ -2343,6 +2554,18 @@ fn copy_with_rewritten_records(
                                 .next()
                                 .map(|((row, _), _)| *row)
                         });
+                    }
+                } else {
+                    begin_first_retained_record_bom_guard(
+                        output,
+                        &mut first_retained_record_pending,
+                        source_had_bom,
+                    );
+                    match output.finish_first_record_bom_guard() {
+                        Ok(marker_bytes) => {
+                            bytes_written = bytes_written.saturating_add(marker_bytes)
+                        }
+                        Err(error) => deferred_error = Some(error),
                     }
                 }
                 row_number += 1;
@@ -2363,6 +2586,13 @@ fn copy_with_rewritten_records(
             if next_cell_edit_row.is_some() {
                 return Err(QuarryError::InvalidOption("cell edit row is out of range"));
             }
+            if edits
+                .deleted_rows
+                .last()
+                .is_some_and(|range| *range.end() >= row_number)
+            {
+                return Err(QuarryError::InvalidOption("deleted row is out of range"));
+            }
             return Ok(Some(SaveCopySummary {
                 bytes_written,
                 replacements,
@@ -2379,11 +2609,17 @@ fn copy_with_rewritten_records(
                     cancelled = true;
                 } else {
                     let has_cell_edits = next_cell_edit_row == Some(row_number);
-                    if rewrites_every_record
+                    if deleted_row(&edits.deleted_rows, &mut deleted_range_index, row_number) {
+                    } else if rewrites_every_record
                         || row_number == 0 && !edits.headers.is_empty()
                         || has_cell_edits
                     {
                         record.extend_from_slice(&chunk[segment_start..local_end]);
+                        begin_first_retained_record_bom_guard(
+                            output,
+                            &mut first_retained_record_pending,
+                            source_had_bom,
+                        );
                         match write_saved_record(
                             output,
                             &record,
@@ -2393,17 +2629,33 @@ fn copy_with_rewritten_records(
                             edits,
                             config.max_record_bytes,
                         ) {
-                            Ok(written) => {
-                                bytes_written = bytes_written.saturating_add(written.bytes_written);
-                                replacements = replacements.saturating_add(written.replacements);
-                            }
+                            Ok(written) => match output.finish_first_record_bom_guard() {
+                                Ok(marker_bytes) => {
+                                    bytes_written = bytes_written
+                                        .saturating_add(marker_bytes)
+                                        .saturating_add(written.bytes_written);
+                                    replacements =
+                                        replacements.saturating_add(written.replacements);
+                                }
+                                Err(error) => deferred_error = Some(error),
+                            },
                             Err(error) => deferred_error = Some(error),
                         }
                     } else {
                         let raw = &chunk[segment_start..local_end];
-                        match output.write_all(raw) {
-                            Ok(()) => {
-                                bytes_written = bytes_written.saturating_add(raw.len() as u64)
+                        begin_first_retained_record_bom_guard(
+                            output,
+                            &mut first_retained_record_pending,
+                            source_had_bom,
+                        );
+                        match output
+                            .write_all(raw)
+                            .and_then(|()| output.finish_first_record_bom_guard())
+                        {
+                            Ok(marker_bytes) => {
+                                bytes_written = bytes_written
+                                    .saturating_add(raw.len() as u64)
+                                    .saturating_add(marker_bytes)
                             }
                             Err(error) => deferred_error = Some(error),
                         }
@@ -2436,7 +2688,8 @@ fn copy_with_rewritten_records(
         }
         scan_result?;
         let trailing = &chunk[segment_start..read];
-        if rewrites_every_record
+        if deleted_row(&edits.deleted_rows, &mut deleted_range_index, row_number) {
+        } else if rewrites_every_record
             || row_number == 0 && !edits.headers.is_empty()
             || next_cell_edit_row == Some(row_number)
         {
@@ -2447,10 +2700,53 @@ fn copy_with_rewritten_records(
                 });
             }
         } else {
+            begin_first_retained_record_bom_guard(
+                output,
+                &mut first_retained_record_pending,
+                source_had_bom,
+            );
             output.write_all(trailing)?;
             bytes_written = bytes_written.saturating_add(trailing.len() as u64);
         }
         shared.bytes_written.store(bytes_written, Ordering::Release);
+    }
+}
+
+fn deleted_row(deleted_rows: &[RangeInclusive<u64>], range_index: &mut usize, row: u64) -> bool {
+    while deleted_rows
+        .get(*range_index)
+        .is_some_and(|range| *range.end() < row)
+    {
+        *range_index += 1;
+    }
+    deleted_rows
+        .get(*range_index)
+        .is_some_and(|range| range.contains(&row))
+}
+
+fn source_starts_with_utf8_bom(source: &mut File) -> Result<bool, QuarryError> {
+    let position = source.stream_position()?;
+    let mut prefix = [0_u8; UTF8_BOM.len()];
+    let mut read = 0_usize;
+    while read < prefix.len() {
+        let count = source.read(&mut prefix[read..])?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    source.seek(SeekFrom::Start(position))?;
+    Ok(read == UTF8_BOM.len() && prefix == UTF8_BOM)
+}
+
+fn begin_first_retained_record_bom_guard(
+    output: &mut ExportTarget,
+    pending: &mut bool,
+    source_had_bom: bool,
+) {
+    if *pending {
+        output.begin_first_record_bom_guard(source_had_bom);
+        *pending = false;
     }
 }
 
@@ -3490,6 +3786,368 @@ mod tests {
                 Err(QuarryError::InvalidOption(_))
             ));
         }
+    }
+
+    #[test]
+    fn row_deletion_preserves_csv_fidelity_and_sparse_edits() {
+        let source_bytes = b"\xEF\xBB\xBFid,note\r\n1,keep\r\n2,\"delete\nme\"\r\n3,edit\r\n4,last";
+        let source = fixture(source_bytes);
+        let source_session = session(&source, b',', HeaderMode::FirstRow);
+        let working_path = destination(&source, "rows-deleted.csv");
+        let job = source_session
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::from([((2, 1), b"ignored".to_vec()), ((3, 1), b"edited".to_vec())]),
+                vec![2..=2, 4..=4],
+                &working_path,
+            )
+            .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(
+            fs::read(&working_path).unwrap(),
+            b"\xEF\xBB\xBFid,note\r\n1,keep\r\n3,edited\r\n"
+        );
+        assert!(temporary_exports(&working_path).is_empty());
+        let reopened = session(&working_path, b',', HeaderMode::FirstRow);
+        assert_eq!(reopened.first_rows.len(), 3);
+
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(working_path).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn row_deletion_handles_headerless_bom_and_rejects_invalid_rows() {
+        let source_bytes = b"\xEF\xBB\xBFdrop,first\r\nkeep,second\r\n";
+        let source = fixture(source_bytes);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "first-row-deleted.csv");
+        let job = source_session
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec![0..=0],
+                &working_path,
+            )
+            .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(
+            fs::read(&working_path).unwrap(),
+            b"\xEF\xBB\xBFkeep,second\r\n"
+        );
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        fs::remove_file(working_path).unwrap();
+
+        let headered = session(&source, b',', HeaderMode::FirstRow);
+        let invalid_path = destination(&source, "invalid-row.csv");
+        assert!(matches!(
+            headered.start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec![0..=0],
+                &invalid_path,
+            ),
+            Err(QuarryError::InvalidOption(_))
+        ));
+        assert!(!invalid_path.exists());
+
+        let out_of_range_path = destination(&source, "out-of-range-row.csv");
+        let job = source_session
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec![9..=9],
+                &out_of_range_path,
+            )
+            .unwrap();
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait(), Err(QuarryError::InvalidOption(_))));
+        assert!(!out_of_range_path.exists());
+        assert!(temporary_exports(&out_of_range_path).is_empty());
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn row_deletion_defers_and_disambiguates_headerless_bom() {
+        let bom_only_record = b"\xEF\xBB\xBFonly\n";
+        let source = fixture(bom_only_record);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "all-rows-deleted.csv");
+        let job = source_session
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec![0..=0],
+                &working_path,
+            )
+            .unwrap();
+
+        wait_until_save_done(&job);
+        let SaveAsOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("row deletion unexpectedly cancelled");
+        };
+        assert_eq!(summary.bytes_written, 0);
+        assert!(fs::read(&working_path).unwrap().is_empty());
+        assert_eq!(fs::read(&source).unwrap(), bom_only_record);
+        fs::remove_file(working_path).unwrap();
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+
+        let source_bytes = b"drop\n\xEF\xBB\xBFkeep,value\n";
+        let source = fixture(source_bytes);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "leading-bom-data.csv");
+        let job = SaveAsJob::start_worker_with_deleted_rows(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            None,
+            vec![0..=0],
+            SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: 64,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        let SaveAsOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("row deletion unexpectedly cancelled");
+        };
+        assert_eq!(
+            fs::read(&working_path).unwrap(),
+            b"\xEF\xBB\xBF\xEF\xBB\xBFkeep,value\n"
+        );
+        assert_eq!(
+            summary.bytes_written,
+            fs::metadata(&working_path).unwrap().len()
+        );
+        let reopened = session(&working_path, b',', HeaderMode::NoHeader);
+        assert_eq!(reopened.first_rows[0].fields[0], b"\xEF\xBB\xBFkeep");
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(working_path).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn row_deletion_bom_guard_covers_rewritten_and_partial_prefixes() {
+        let source_bytes = b"drop\nplain,value\n";
+        let source = fixture(source_bytes);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "rewritten-leading-bom.csv");
+        let job = SaveAsJob::start_worker_with_deleted_rows(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::from([((1, 0), b"\xEF\xBB\xBFedited".to_vec())]),
+                transformation: None,
+            },
+            None,
+            vec![0..=0],
+            SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: 64,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        let SaveAsOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("row deletion unexpectedly cancelled");
+        };
+        assert_eq!(
+            fs::read(&working_path).unwrap(),
+            b"\xEF\xBB\xBF\xEF\xBB\xBFedited,value\n"
+        );
+        assert_eq!(
+            summary.bytes_written,
+            fs::metadata(&working_path).unwrap().len()
+        );
+        let reopened = session(&working_path, b',', HeaderMode::NoHeader);
+        assert_eq!(reopened.first_rows[0].fields[0], b"\xEF\xBB\xBFedited");
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(working_path).unwrap();
+        remove_case(&source);
+
+        let partial_prefix = b"drop\n\xEF\xBB";
+        let source = fixture(partial_prefix);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "partial-bom-prefix.csv");
+        let job = SaveAsJob::start_worker_with_deleted_rows(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            None,
+            vec![0..=0],
+            SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: 64,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        let SaveAsOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("row deletion unexpectedly cancelled");
+        };
+        assert_eq!(fs::read(&working_path).unwrap(), b"\xEF\xBB");
+        assert_eq!(summary.bytes_written, 2);
+        assert_eq!(fs::read(&source).unwrap(), partial_prefix);
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(working_path).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn row_deletion_skips_large_selected_records_without_buffering() {
+        let mut source_bytes = vec![b'x'; 1024];
+        source_bytes.extend_from_slice(b"\nkeep\n");
+        let source = fixture(&source_bytes);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "large-row-deleted.csv");
+        let job = SaveAsJob::start_worker_with_deleted_rows(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            None,
+            vec![0..=0],
+            SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 3,
+                max_record_bytes: 16,
+            },
+        )
+        .unwrap();
+
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(fs::read(&working_path).unwrap(), b"keep\n");
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(temporary_exports(&working_path).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(working_path).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn cancelling_row_deletion_preserves_source_and_removes_private_output() {
+        let source_bytes = vec![b'a'; 4 * 1024 * 1024];
+        let source = fixture(&source_bytes);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "cancelled-row-deletion.csv");
+        let job = SaveAsJob::start_worker_with_deleted_rows(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            None,
+            vec![0..=0],
+            SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: 16,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(temporary_exports(&working_path).len(), 1);
+        job.cancel();
+        wait_until_save_done(&job);
+        assert_eq!(job.wait().unwrap(), SaveAsOutcome::Cancelled);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!working_path.exists());
+        assert!(temporary_exports(&working_path).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn row_deletion_does_not_publish_when_source_changes_during_copy() {
+        let source_bytes = vec![b'a'; 4 * 1024 * 1024];
+        let source = fixture(&source_bytes);
+        let source_session = session(&source, b',', HeaderMode::NoHeader);
+        let working_path = destination(&source, "conflicted-row-deletion.csv");
+        let job = SaveAsJob::start_worker_with_deleted_rows(
+            source.clone(),
+            source_session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            None,
+            vec![0..=0],
+            SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: 16,
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while job.progress().bytes_scanned < 100 {
+            assert!(
+                !job.progress().done,
+                "row deletion completed before source change"
+            );
+            assert!(Instant::now() < deadline, "row deletion made no progress");
+            thread::yield_now();
+        }
+
+        let external = b"external,change\n";
+        fs::write(&source, external).unwrap();
+        wait_until_save_done(&job);
+        assert!(matches!(job.wait(), Err(QuarryError::SourceChanged)));
+        assert_eq!(fs::read(&source).unwrap(), external);
+        assert!(!working_path.exists());
+        assert!(temporary_exports(&working_path).is_empty());
+
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
     }
 
     #[test]
