@@ -11,6 +11,7 @@ delimited files in the Quarry macOS app.
   - [Select and copy data](#select-and-copy-data)
   - [Delete rows](#delete-rows)
   - [Edit cells and headers](#edit-cells-and-headers)
+  - [Undo and redo changes](#undo-and-redo-changes)
   - [Find and replace text](#find-and-replace-text)
   - [Filter rows](#filter-rows)
   - [Export filtered rows](#export-filtered-rows)
@@ -139,6 +140,38 @@ until you choose **Save** from the file menu or press Command+S.
 
 Header editing is available only when the file has a real, text-decodable
 header row.
+
+### Undo and redo changes
+
+Use the toolbar's **Undo** and **Redo** buttons to reverse and reapply committed
+cell values and header names one at a time, including **Replace in Cell**.
+Repeated changes to the same cell remain separate steps. Keeping an unchanged
+value or cancelling an editor does not create a step or clear Redo.
+
+On macOS, press Command+Z to undo and Command+Shift+Z to redo. Other platforms
+use Ctrl+Z and Ctrl+Shift+Z, with Ctrl+Y also available for Redo. While typing
+in a text field, these shortcuts act on that field's text. Commit or cancel an
+inline cell or header editor before using document Undo or Redo. The commands
+are unavailable while a filter or conflicting operation is active, or after a
+source-file conflict.
+
+Whole-file operations retain one adjacent working version. For example, after
+editing a cell, sorting, and renaming a header, Undo restores the header, then
+undoes the sort, then undoes the earlier cell edit. Redo follows the opposite
+order. A new effective edit clears Redo. A second whole-file operation replaces
+the older adjacent version, so this is not unlimited structural history.
+
+Each retained document version has a limit of 1,000 combined Undo and Redo
+entries and 16 MiB of before-and-after text. The oldest entries are dropped
+when either limit would be exceeded. If one edit's before-and-after payload
+exceeds 16 MiB, it clears that version's history and cannot be undone. History
+limits can leave older unsaved values that block structural Undo. Save to keep
+those changes or Discard Changes to restore the source; both reset history.
+Individual edits store only the changed values, without copying the CSV.
+
+Successful Save or Save As followed by reopening the saved file, Discard
+Changes, and opening or reopening a document reset history. Cancellation or
+failure keeps the current history while the current document remains open.
 
 ### Find and replace text
 
@@ -281,8 +314,8 @@ values directly next to each other. The completed result is an unsaved change.
 
 Delete begins immediately after validation and does not show another
 confirmation dialog. At least one column must remain. The source is still
-unchanged until you save. **Undo** can restore the previous layout unless
-later cell or header edits are unsaved; **Discard Changes** restores the source
+unchanged until you save. **Undo** first reverses later cell or header edits,
+then restores the previous layout. **Discard Changes** restores the source
 layout and removes every unsaved change.
 
 For view-only reordering or hiding, use the **Columns…** window instead.
@@ -374,9 +407,9 @@ header change instead.
 - **Discard Changes** restores the last opened or saved file and removes all
   unsaved cell, header, Replace All, Split, Combine, Move Selected Columns,
   Delete Selected Columns, Delete Selected Rows, and Sort changes.
-- **Undo** and **Redo** move one step between completed whole-file
-  working versions. They are not a per-cell edit history, and they are
-  unavailable while later cell or header edits remain unsaved.
+- **Undo** and **Redo** reverse individual committed edits and move between
+  adjacent whole-file working versions. See [Undo and redo changes](#undo-and-redo-changes)
+  for history limits and reset behavior.
 
 If you close a modified file, Quarry offers **Keep Editing**, **Save and
 Close**, **Save As and Close…**, and **Discard Changes and Close**.
@@ -410,6 +443,8 @@ setting.
 | Add a newline inside a cell | Shift+Enter |
 | Cancel a cell or header edit | Escape |
 | Rename a header | Click the header name |
+| Undo a committed change | **Undo**, Command+Z on macOS, or Ctrl+Z elsewhere |
+| Redo a committed change | **Redo**, Command+Shift+Z on macOS, or Ctrl+Shift+Z / Ctrl+Y elsewhere |
 | Copy the selected cell or row | Command+C, or cell context-menu **Copy** |
 | Save | Command+S, or file menu **Save** |
 | Open Find | Command+F, or **Find** |
@@ -431,6 +466,7 @@ setting.
 | The delimiter or header is wrong | Open **Format**, choose the correct delimiter and header, then click **Reopen with Changes**. Save or discard changes first. |
 | Find or Sort is unavailable | Wait for indexing to finish. To open Sort, select exactly one numbered column and right-click its number. Sort also needs the temporary-disk estimate. |
 | Cell editing is unavailable | Clear active filters and wait for the current operation to finish. Missing and non-UTF-8 cells cannot be edited. |
+| Undo or Redo is unavailable | Commit or cancel the inline editor, clear the filter, and wait for conflicting operations to finish. There may be no retained history in that direction. |
 | Filtering is unavailable | Save or discard cell edits, then cancel or finish any active search, filter, export, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |
 | **Delete Selected Rows** is unavailable | Clear the filter, finish the active operation, and select at least one numbered data row. |

@@ -49,6 +49,8 @@ const MAX_RENDERED_COLUMNS: usize = 64;
 const SCROLLBAR_WIDTH: f32 = 18.0;
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EDIT_HISTORY_ENTRIES: usize = 1_000;
+const MAX_EDIT_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 const APP_ID: &str = "io.github.danchamorro.quarry";
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TOOLBAR_HEIGHT: f32 = 38.0;
@@ -826,12 +828,12 @@ impl QuarryApp {
                 self.columns_open = true;
                 return;
             }
-            Action::UndoStructuralEdit => {
-                self.notice = self.swap_structural_history(false).err();
+            Action::Undo => {
+                self.notice = self.swap_edit_history(false).err();
                 return;
             }
-            Action::RedoStructuralEdit => {
-                self.notice = self.swap_structural_history(true).err();
+            Action::Redo => {
+                self.notice = self.swap_edit_history(true).err();
                 return;
             }
             Action::OpenFilters => {
@@ -856,8 +858,8 @@ impl QuarryApp {
             | Action::ChooseFilteredExport
             | Action::DiscardChanges
             | Action::OpenColumns
-            | Action::UndoStructuralEdit
-            | Action::RedoStructuralEdit
+            | Action::Undo
+            | Action::Redo
             | Action::OpenFilters => {
                 unreachable!()
             }
@@ -1132,6 +1134,56 @@ impl QuarryApp {
         Ok(())
     }
 
+    fn swap_edit_history(&mut self, redo: bool) -> Result<(), AppMessage> {
+        let current = self
+            .document
+            .as_mut()
+            .ok_or_else(|| AppMessage::warning("Open a file before undoing a change."))?;
+        if !current.history_ready() {
+            return Err(AppMessage::warning(if current.source_changed {
+                SOURCE_CHANGED_NOTICE
+            } else {
+                "Finish editing, clear filters, and wait for active operations before Undo or Redo."
+            }));
+        }
+        match current.session.ensure_source_unchanged() {
+            Ok(()) => {}
+            Err(QuarryError::SourceChanged) => {
+                current.invalidate_changed_source();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+            Err(error) => return Err(AppMessage::error(error.to_string())),
+        }
+        let edit = if redo {
+            current.edit_history.redo.pop()
+        } else {
+            current.edit_history.undo.pop_back()
+        };
+        let Some(edit) = edit else {
+            return self.swap_structural_history(redo);
+        };
+        current.set_edit_value(
+            edit.target,
+            if redo {
+                edit.after.clone()
+            } else {
+                edit.before.clone()
+            },
+        );
+        current.clear_edit_search();
+        if redo {
+            current.edit_history.undo.push_back(edit);
+        } else {
+            current.edit_history.redo.push(edit);
+        }
+        self.footer_status = Some(AppMessage::status(if redo {
+            "Edit restored."
+        } else {
+            "Edit undone."
+        }));
+        Ok(())
+    }
+
     fn swap_structural_history(&mut self, redo: bool) -> Result<(), AppMessage> {
         let Some(current) = self.document.as_mut() else {
             return Err(AppMessage::warning("Open a file before undoing a change."));
@@ -1189,11 +1241,13 @@ impl QuarryApp {
                 header_renames: current.header_renames.clone(),
                 cell_edits: current.cell_edits.clone(),
             },
+            edit_history: current.edit_history.clone(),
         };
         let mut replacement =
             Document::prepare(&target.path, options).map_err(AppMessage::error)?;
         replacement.header_renames = target.overlay.header_renames.clone();
         replacement.cell_edits = target.overlay.cell_edits.clone();
+        replacement.edit_history = target.edit_history;
         replacement.refresh_column_headers();
         replacement.start_indexing().map_err(AppMessage::error)?;
 
@@ -1593,12 +1647,13 @@ impl eframe::App for QuarryApp {
                         action = Some(page_action);
                     }
 
-                    let can_undo = document.is_some_and(Document::can_undo_structural);
+                    let can_undo = document.is_some_and(Document::can_undo);
                     let undo = ui
                         .add_enabled(can_undo, egui::Button::new("Undo"))
                         .on_disabled_hover_text(
-                            "Save or discard later cell and header edits before undoing the change.",
-                        );
+                            "No retained change to undo. Finish editing and clear filters before using history. Edits beyond the history limit can block whole-file Undo. Save to keep changes or discard to restore the source; both reset history.",
+                        )
+                        .on_hover_text("Undo the last edit or whole-file change (Command/Ctrl+Z).");
                     undo.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
@@ -1607,11 +1662,12 @@ impl eframe::App for QuarryApp {
                         )
                     });
                     if undo.clicked() {
-                        action = Some(Action::UndoStructuralEdit);
+                        action = Some(Action::Undo);
                     }
 
-                    let can_redo = document.is_some_and(Document::can_redo_structural);
-                    let redo = ui.add_enabled(can_redo, egui::Button::new("Redo"));
+                    let can_redo = document.is_some_and(Document::can_redo);
+                    let redo = ui.add_enabled(can_redo, egui::Button::new("Redo"))
+                        .on_hover_text("Redo the last undone change (Command/Ctrl+Shift+Z).");
                     redo.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
@@ -1620,7 +1676,7 @@ impl eframe::App for QuarryApp {
                         )
                     });
                     if redo.clicked() {
-                        action = Some(Action::RedoStructuralEdit);
+                        action = Some(Action::Redo);
                     }
 
                     if ui
@@ -1768,6 +1824,14 @@ impl eframe::App for QuarryApp {
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
         {
             action = Some(Action::Save);
+        }
+        if action.is_none()
+            && !self.close_confirmation_open
+            && self.structural_dialog.is_none()
+            && self.format_draft.is_none()
+            && let Some(document) = self.document.as_ref()
+        {
+            action = edit_history_shortcut(ctx, document);
         }
         if action.is_none() && self.document.is_some() {
             action = ctx.input(|input| {
@@ -2023,8 +2087,8 @@ enum Action {
     PageDown,
     AutoFitColumns,
     OpenColumns,
-    UndoStructuralEdit,
-    RedoStructuralEdit,
+    Undo,
+    Redo,
     OpenFilters,
     ChooseSaveAs,
     CancelSave,
@@ -2794,6 +2858,41 @@ fn surrender_find_controls_focus(ctx: &egui::Context) {
     let focused = ctx.memory(|memory| memory.focused());
     if let Some(focused) = focused.filter(|_| find_controls_have_focus(ctx)) {
         ctx.memory_mut(|memory| memory.surrender_focus(focused));
+    }
+}
+
+fn edit_history_shortcut(ctx: &egui::Context, document: &Document) -> Option<Action> {
+    // Text inputs own their typing history; a focused grid button still allows document Undo.
+    if ctx
+        .memory(|memory| memory.focused())
+        .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+    {
+        return None;
+    }
+    ctx.input_mut(|input| {
+        if document.can_redo()
+            && (input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            ) || (!cfg!(target_os = "macos")
+                && input.consume_key(egui::Modifiers::CTRL, egui::Key::Y)))
+        {
+            Some(Action::Redo)
+        } else if document.can_undo()
+            && !input.modifiers.shift
+            && input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
+        {
+            Some(Action::Undo)
+        } else {
+            None
+        }
+    })
+}
+
+fn reset_editor_undo(ctx: &egui::Context, id: egui::Id) {
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        state.clear_undoer();
+        state.store(ctx, id);
     }
 }
 
@@ -3828,6 +3927,57 @@ struct StructuralOverlay {
 struct WorkingCopySnapshot {
     path: PathBuf,
     overlay: StructuralOverlay,
+    edit_history: EditHistory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditTarget {
+    Header(usize),
+    Cell(u64, usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValueEdit {
+    target: EditTarget,
+    before: Option<Vec<u8>>,
+    after: Option<Vec<u8>>,
+}
+
+impl ValueEdit {
+    fn bytes(&self) -> usize {
+        self.before.as_ref().map_or(0, Vec::len) + self.after.as_ref().map_or(0, Vec::len)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EditHistory {
+    undo: VecDeque<ValueEdit>,
+    redo: Vec<ValueEdit>,
+    bytes: usize,
+}
+
+impl EditHistory {
+    fn clear_redo(&mut self) {
+        for obsolete in self.redo.drain(..) {
+            self.bytes -= obsolete.bytes();
+        }
+    }
+
+    fn record(&mut self, edit: ValueEdit) {
+        self.clear_redo();
+        let bytes = edit.bytes();
+        while self.undo.len() >= MAX_EDIT_HISTORY_ENTRIES
+            || self.bytes.saturating_add(bytes) > MAX_EDIT_HISTORY_BYTES
+        {
+            let Some(obsolete) = self.undo.pop_front() else {
+                // An untracked edit is a history boundary, never jump over it.
+                return;
+            };
+            self.bytes -= obsolete.bytes();
+        }
+        self.bytes += bytes;
+        self.undo.push_back(edit);
+    }
 }
 
 struct MaterializationPreparation {
@@ -4004,6 +4154,7 @@ struct Document {
     logical_path: PathBuf,
     original_session: Option<Session>,
     working_copy: Option<WorkingCopyState>,
+    edit_history: EditHistory,
     job: Option<IndexJob>,
     index: Option<StructuralIndex>,
     progress: IndexProgress,
@@ -4141,6 +4292,7 @@ impl Document {
             logical_path: path.to_path_buf(),
             original_session: None,
             working_copy: None,
+            edit_history: EditHistory::default(),
             job: None,
             index: None,
             progress,
@@ -4592,6 +4744,7 @@ impl Document {
                 header_renames: self.header_renames.clone(),
                 cell_edits: self.cell_edits.clone(),
             },
+            edit_history: self.edit_history.clone(),
         };
         let state = self
             .working_copy
@@ -4722,7 +4875,8 @@ impl Document {
         Ok(())
     }
 
-    fn accept_materialized_change(&mut self, undo: WorkingCopySnapshot) {
+    fn accept_materialized_change(&mut self, mut undo: WorkingCopySnapshot) {
+        undo.edit_history.clear_redo();
         let state = self
             .working_copy
             .as_mut()
@@ -5269,12 +5423,10 @@ impl Document {
         let next = replace_literal_all_with_case(effective, query, replacement, case_sensitivity)
             .expect("replaceable match contains the query");
         if next.as_slice() != effective {
-            self.invalidate_structural_redo();
-            if next == source {
-                self.cell_edits.remove(&key);
-            } else {
-                self.cell_edits.insert(key, next);
-            }
+            self.record_value_edit(
+                EditTarget::Cell(found.row, found.column),
+                (next != source).then_some(next),
+            );
         }
         self.selection = Some(GridSelection::Cell {
             row: found.row,
@@ -5985,16 +6137,7 @@ impl Document {
             .expect("editable header has source text");
         let next = (name.as_bytes() != source_name.as_bytes()).then_some(name);
         if self.header_renames.get(&column) != next.as_ref() {
-            self.invalidate_structural_redo();
-            match next {
-                Some(name) => {
-                    self.header_renames.insert(column, name);
-                }
-                None => {
-                    self.header_renames.remove(&column);
-                }
-            }
-            self.refresh_column_headers();
+            self.record_value_edit(EditTarget::Header(column), next.map(String::into_bytes));
         }
         Ok(())
     }
@@ -6074,21 +6217,61 @@ impl Document {
         if self.cell_edits.get(&key) == next.as_ref() {
             return;
         }
-        self.invalidate_structural_redo();
-        match next {
-            Some(value) => {
-                self.cell_edits.insert(key, value);
-            }
-            None => {
-                self.cell_edits.remove(&key);
-            }
-        }
+        self.record_value_edit(EditTarget::Cell(edit.row, edit.column), next);
+        self.clear_edit_search();
+    }
+
+    fn clear_edit_search(&mut self) {
         self.search_query.clear();
         self.last_match = None;
         self.search_history.clear();
         self.search_history_index = None;
         self.search_status = None;
         self.reveal_cell = None;
+    }
+
+    fn record_value_edit(&mut self, target: EditTarget, after: Option<Vec<u8>>) {
+        let after = after.map(|value| value.into_boxed_slice().into_vec());
+        let before = match target {
+            EditTarget::Header(column) => self
+                .header_renames
+                .get(&column)
+                .map(|name| name.as_bytes().to_vec()),
+            EditTarget::Cell(row, column) => self.cell_edits.get(&(row, column)).cloned(),
+        };
+        if before == after {
+            return;
+        }
+        self.invalidate_structural_redo();
+        self.set_edit_value(target, after.clone());
+        self.edit_history.record(ValueEdit {
+            target,
+            before,
+            after,
+        });
+    }
+
+    fn set_edit_value(&mut self, target: EditTarget, value: Option<Vec<u8>>) {
+        match target {
+            EditTarget::Header(column) => {
+                if let Some(value) = value {
+                    self.header_renames.insert(
+                        column,
+                        String::from_utf8(value).expect("header history contains valid UTF-8"),
+                    );
+                } else {
+                    self.header_renames.remove(&column);
+                }
+                self.refresh_column_headers();
+            }
+            EditTarget::Cell(row, column) => {
+                if let Some(value) = value {
+                    self.cell_edits.insert((row, column), value);
+                } else {
+                    self.cell_edits.remove(&(row, column));
+                }
+            }
+        }
     }
 
     fn commit_edits(&mut self) {
@@ -6112,6 +6295,7 @@ impl Document {
         self.discard_header_edits();
         self.cell_edit = None;
         self.cell_edits.clear();
+        self.edit_history = EditHistory::default();
         self.selection = None;
         self.selected_rows.clear();
         self.reveal_cell = None;
@@ -6155,6 +6339,26 @@ impl Document {
 
     fn has_structural_edits(&self) -> bool {
         self.session.path() != self.logical_path
+    }
+
+    fn history_ready(&self) -> bool {
+        !self.source_changed
+            && !self.filter_active()
+            && self.header_edit.is_none()
+            && self.cell_edit.is_none()
+            && self.search_job.is_none()
+            && self.filter_job.is_none()
+            && self.save_job.is_none()
+            && self.export_job.is_none()
+            && self.structural_job.is_none()
+    }
+
+    fn can_undo(&self) -> bool {
+        self.history_ready() && (!self.edit_history.undo.is_empty() || self.can_undo_structural())
+    }
+
+    fn can_redo(&self) -> bool {
+        self.history_ready() && (!self.edit_history.redo.is_empty() || self.can_redo_structural())
     }
 
     fn can_undo_structural(&self) -> bool {
@@ -7584,6 +7788,9 @@ fn show_table(
                                     .as_mut()
                                     .filter(|edit| edit.column == column)
                                 {
+                                    if edit.focus_requested {
+                                        reset_editor_undo(ui.ctx(), header_edit_id(column));
+                                    }
                                     let response = ui.add_sized(
                                         [width, 17.0],
                                         egui::TextEdit::singleline(&mut edit.draft)
@@ -7814,6 +8021,9 @@ fn show_table(
                                     if let Some(edit) = active_cell_edit.as_mut().filter(|edit| {
                                         edit.row == record_row && edit.column == column
                                     }) {
+                                        if edit.focus_requested {
+                                            reset_editor_undo(ui.ctx(), cell_edit_id(record_row, column));
+                                        }
                                         let response = ui.add_sized(
                                             [ui.available_width(), ROW_HEIGHT],
                                             egui::TextEdit::multiline(&mut edit.draft)
@@ -8264,6 +8474,569 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn individual_edit_app(path: &Path) -> QuarryApp {
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(path.to_path_buf()).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        app
+    }
+
+    fn commit_test_cell(document: &mut Document, row: u64, column: usize, value: &str) {
+        let source = document.source_cell(row, column).unwrap().to_vec();
+        document.begin_cell_edit(row, column, source).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = value.into();
+        document.commit_cell_edit();
+    }
+
+    #[test]
+    fn individual_edits_undo_repeated_cells_headers_and_multiline_values_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("individual.csv");
+        let original = b"\xef\xbb\xbfname,value\r\nfirst,1\r\n";
+        fs::write(&source, original).unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.document.as_mut().unwrap();
+        commit_test_cell(document, 1, 1, "line one\r\nline two,\"quoted\"");
+        document.rename_header(1, "amount".into()).unwrap();
+        commit_test_cell(document, 1, 1, "last");
+        commit_test_cell(document, 1, 1, "1");
+        assert!(document.cell_edits.is_empty());
+
+        for expected in [Some("last"), Some("line one\r\nline two,\"quoted\"")] {
+            app.swap_edit_history(false).unwrap();
+            assert_eq!(
+                app.document
+                    .as_ref()
+                    .unwrap()
+                    .cell_edits
+                    .get(&(1, 1))
+                    .map(Vec::as_slice),
+                expected.map(str::as_bytes),
+            );
+        }
+        app.swap_edit_history(false).unwrap();
+        assert_eq!(app.document.as_ref().unwrap().column_name(1), "value");
+        app.swap_edit_history(false).unwrap();
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.document.as_ref().unwrap().can_undo());
+
+        for _ in 0..4 {
+            app.swap_edit_history(true).unwrap();
+        }
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(document.column_name(1), "amount");
+        assert!(document.cell_edits.is_empty());
+        assert!(!document.can_redo());
+        document.rename_header(1, "value".into()).unwrap();
+        assert!(!document.is_dirty());
+        app.swap_edit_history(false).unwrap();
+        assert_eq!(app.document.as_ref().unwrap().column_name(1), "amount");
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn individual_edit_noops_and_cancel_preserve_redo_but_new_edits_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("branch.csv");
+        fs::write(&source, b"name,value\nfirst,1\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "renamed".into())
+            .unwrap();
+        app.swap_edit_history(false).unwrap();
+        let document = app.document.as_mut().unwrap();
+        let retained_bytes = document.edit_history.bytes;
+        document.rename_header(0, "name".into()).unwrap();
+        commit_test_cell(document, 1, 1, "2");
+        let ctx = egui::Context::default();
+        let _ = render_grid(&ctx, document);
+        document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "cancelled".into();
+        let _ = render_grid(&ctx, document);
+        press_grid_key(&ctx, document, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(document.cell_edit.is_none());
+        assert!(document.can_redo());
+        assert_eq!(document.edit_history.bytes, retained_bytes);
+
+        commit_test_cell(document, 1, 1, "branch");
+        assert!(!document.can_redo());
+        app.swap_edit_history(false).unwrap();
+        assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 1)], b"2");
+        app.swap_edit_history(false).unwrap();
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+
+        let document = app.document.as_mut().unwrap();
+        document.start_find_next(b"first").unwrap();
+        finish_search(document);
+        document
+            .replace_current_match(b"first", b"replacement")
+            .unwrap();
+        finish_search(document);
+        assert!(!document.can_redo());
+        assert_eq!(document.cell_edits[&(1, 0)], b"replacement");
+        app.swap_edit_history(false).unwrap();
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+    }
+
+    #[test]
+    fn individual_edit_history_crosses_the_adjacent_structural_boundary_in_both_directions() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("structural.csv");
+        let original = b"email,city\na@b,x\n";
+        fs::write(&source, original).unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.document.as_mut().unwrap();
+        document.rename_header(1, "town".into()).unwrap();
+        commit_test_cell(document, 1, 0, "alpha@beta");
+        document.start_split(0, b"@".to_vec()).unwrap();
+        finish_structural_edit(&mut app);
+        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "changed\npart");
+
+        app.swap_edit_history(false).unwrap();
+        assert!(app.document.as_ref().unwrap().cell_edits.is_empty());
+        app.swap_edit_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.total_columns, 2);
+        assert_eq!(document.column_name(1), "town");
+        assert_eq!(document.cell_edits[&(1, 0)], b"alpha@beta");
+        app.swap_edit_history(false).unwrap();
+        app.swap_edit_history(false).unwrap();
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+
+        app.swap_edit_history(true).unwrap();
+        app.swap_edit_history(true).unwrap();
+        app.swap_edit_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        assert_eq!(app.document.as_ref().unwrap().total_columns, 3);
+        app.swap_edit_history(true).unwrap();
+        assert_eq!(
+            app.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            b"changed\npart"
+        );
+        assert!(!app.document.as_ref().unwrap().can_redo());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.swap_edit_history(false).unwrap();
+        app.swap_edit_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(1, "new branch".into())
+            .unwrap();
+        assert!(!app.document.as_ref().unwrap().can_redo());
+        assert!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .working_copy
+                .as_ref()
+                .unwrap()
+                .redo
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn individual_edit_redo_branch_stays_obsolete_after_a_new_structural_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("structural-branch.csv");
+        fs::write(&source, b"email,city\na@b,x\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        commit_test_cell(app.document.as_mut().unwrap(), 1, 0, "alpha@beta");
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(1, "obsolete".into())
+            .unwrap();
+        app.swap_edit_history(false).unwrap();
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_split(0, b"@".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+        app.swap_edit_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        assert!(app.document.as_ref().unwrap().edit_history.redo.is_empty());
+        assert_eq!(app.document.as_ref().unwrap().column_name(1), "city");
+        app.swap_edit_history(false).unwrap();
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        app.swap_edit_history(true).unwrap();
+        assert_eq!(
+            app.document.as_ref().unwrap().cell_edits[&(1, 0)],
+            b"alpha@beta"
+        );
+        app.swap_edit_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        assert_eq!(app.document.as_ref().unwrap().column_name(2), "city");
+        assert!(!app.document.as_ref().unwrap().can_redo());
+    }
+
+    #[test]
+    fn individual_edit_history_limits_entries_and_bytes_without_skipping_untracked_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("limits.csv");
+        fs::write(&source, b"name\nvalue\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        for edit in 0..=super::MAX_EDIT_HISTORY_ENTRIES {
+            app.document
+                .as_mut()
+                .unwrap()
+                .rename_header(0, format!("name {edit}"))
+                .unwrap();
+        }
+        assert_eq!(
+            app.document.as_ref().unwrap().edit_history.undo.len(),
+            super::MAX_EDIT_HISTORY_ENTRIES
+        );
+        for _ in 0..super::MAX_EDIT_HISTORY_ENTRIES {
+            app.swap_edit_history(false).unwrap();
+        }
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.column_name(0), "name 0");
+        assert!(!document.can_undo());
+        assert_eq!(
+            document.edit_history.redo.len(),
+            super::MAX_EDIT_HISTORY_ENTRIES
+        );
+
+        app.apply(&egui::Context::default(), Action::DiscardChanges);
+        let value_bytes = 6 * 1024 * 1024;
+        let document = app.document.as_mut().unwrap();
+        document.rename_header(0, "a".repeat(value_bytes)).unwrap();
+        document.rename_header(0, "b".repeat(value_bytes)).unwrap();
+        assert_eq!(document.edit_history.undo.len(), 1);
+        assert_eq!(document.edit_history.bytes, 2 * value_bytes);
+        assert!(document.edit_history.bytes <= super::MAX_EDIT_HISTORY_BYTES);
+        app.swap_edit_history(false).unwrap();
+        assert!(!app.document.as_ref().unwrap().can_undo());
+        assert_eq!(
+            app.document.as_ref().unwrap().edit_history.bytes,
+            2 * value_bytes
+        );
+        app.swap_edit_history(true).unwrap();
+        let document = app.document.as_mut().unwrap();
+        document
+            .rename_header(0, "x".repeat(super::MAX_EDIT_HISTORY_BYTES + 1))
+            .unwrap();
+        assert!(!document.can_undo());
+        assert!(!document.can_redo());
+        assert_eq!(document.edit_history.bytes, 0);
+        assert!(document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), b"name\nvalue\n");
+
+        app.apply(&egui::Context::default(), Action::DiscardChanges);
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_split(0, b"a".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "x".repeat(super::MAX_EDIT_HISTORY_BYTES + 1))
+            .unwrap();
+        assert!(
+            !app.document.as_ref().unwrap().can_undo(),
+            "structural Undo must not jump over an untracked edit"
+        );
+        assert!(app.swap_edit_history(false).is_err());
+    }
+
+    #[test]
+    fn individual_edit_history_resets_only_after_successful_document_lifecycle_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lifecycle.csv");
+        let saved_copy = directory.path().join("saved.csv");
+        let other = directory.path().join("other.csv");
+        fs::write(&source, b"name,value\nfirst,1\n").unwrap();
+        fs::write(&other, b"other,value\nsecond,2\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
+        assert!(app.open_path(other.clone()).is_err());
+        assert!(app.document.as_ref().unwrap().can_undo());
+        app.save_as_picker_result(None);
+        assert!(app.document.as_ref().unwrap().can_undo());
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        if app
+            .document
+            .as_mut()
+            .unwrap()
+            .start_save_as(directory.path().join("missing/output.csv"))
+            .is_ok()
+        {
+            let _ = finish_app_save(&mut app, &ctx, &mut frame);
+        }
+        assert_eq!(app.document.as_ref().unwrap().logical_path, source);
+        assert!(app.document.as_ref().unwrap().can_undo());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_save_as(saved_copy.clone())
+            .unwrap();
+        assert!(!app.document.as_ref().unwrap().can_undo());
+        let _ = finish_app_save(&mut app, &ctx, &mut frame);
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(document.logical_path, saved_copy);
+        assert!(!document.can_undo());
+        assert!(!document.can_redo());
+        assert_eq!(fs::read(&source).unwrap(), b"name,value\nfirst,1\n");
+        assert_eq!(fs::read(&saved_copy).unwrap(), b"name,value\nfirst,2\n");
+
+        commit_test_cell(document, 1, 1, "3");
+        document.start_save().unwrap();
+        let _ = finish_app_save(&mut app, &ctx, &mut frame);
+        assert!(!app.document.as_ref().unwrap().can_undo());
+        assert_eq!(fs::read(&saved_copy).unwrap(), b"name,value\nfirst,3\n");
+        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "4");
+        app.apply(&ctx, Action::DiscardChanges);
+        assert!(!app.document.as_ref().unwrap().can_undo());
+        assert!(!app.document.as_ref().unwrap().can_redo());
+
+        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "5");
+        app.swap_edit_history(false).unwrap();
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(app.open_path(directory.path().join("missing.csv")).is_err());
+        assert!(app.document.as_ref().unwrap().can_redo());
+        app.open_path(other.clone()).unwrap();
+        assert_eq!(app.document.as_ref().unwrap().logical_path, other);
+        assert!(!app.document.as_ref().unwrap().can_undo());
+        assert!(!app.document.as_ref().unwrap().can_redo());
+    }
+
+    #[test]
+    fn individual_edit_history_freezes_after_a_source_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("conflict.csv");
+        for action in ["undo", "redo", "save"] {
+            fs::write(&source, b"name,value\nfirst,1\n").unwrap();
+            let mut app = individual_edit_app(&source);
+            commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
+            if action == "redo" {
+                app.swap_edit_history(false).unwrap();
+            }
+            let before = app.document.as_ref().unwrap().cell_edits.clone();
+            fs::write(&source, b"name,value\nexternal,changed\n").unwrap();
+            if action == "save" {
+                assert!(app.document.as_mut().unwrap().start_save().is_err());
+            } else {
+                assert!(app.swap_edit_history(action == "redo").is_err());
+            }
+            assert!(app.document.as_ref().unwrap().source_changed);
+            assert!(!app.document.as_ref().unwrap().can_undo());
+            assert!(!app.document.as_ref().unwrap().can_redo());
+            assert_eq!(app.document.as_ref().unwrap().cell_edits, before);
+            assert_eq!(
+                fs::read(&source).unwrap(),
+                b"name,value\nexternal,changed\n"
+            );
+        }
+    }
+
+    fn individual_edit_key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn individual_edit_frame(
+        app: &mut QuarryApp,
+        ctx: &egui::Context,
+        time: &mut f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        *time += 2.0;
+        let modifiers = events
+            .iter()
+            .find_map(|event| match event {
+                egui::Event::Key { modifiers, .. } => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or_default();
+        ctx.run(
+            egui::RawInput {
+                time: Some(*time),
+                events,
+                modifiers,
+                ..grid_input()
+            },
+            |ctx| {
+                eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest());
+            },
+        )
+    }
+
+    #[test]
+    fn individual_edit_buttons_and_shortcuts_leave_typing_undo_inside_each_editor_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("keyboard.csv");
+        fs::write(&source, b"name,value\nfirst,1\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut time = 0.0;
+        let command = egui::Modifiers::COMMAND;
+        let redo = egui::Modifiers {
+            shift: true,
+            ..command
+        };
+        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
+        let output = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
+        let (undo_id, undo_node) = accessible_button(&output, "Undo Change");
+        assert!(!undo_node.is_disabled());
+        let _ = individual_edit_frame(
+            &mut app,
+            &ctx,
+            &mut time,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: undo_id,
+                    data: None,
+                },
+            )],
+        );
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        let output = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
+        let (redo_id, redo_node) = accessible_button(&output, "Redo Change");
+        assert!(!redo_node.is_disabled());
+        let _ = individual_edit_frame(
+            &mut app,
+            &ctx,
+            &mut time,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: redo_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 1)], b"2");
+        let _ = individual_edit_frame(
+            &mut app,
+            &ctx,
+            &mut time,
+            vec![individual_edit_key(egui::Key::Z, command)],
+        );
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        let _ = individual_edit_frame(
+            &mut app,
+            &ctx,
+            &mut time,
+            vec![individual_edit_key(egui::Key::Z, redo)],
+        );
+        assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 1)], b"2");
+
+        for header in [false, true] {
+            let before = if header { "name" } else { "2" };
+            let document = app.document.as_mut().unwrap();
+            let history_len = document.edit_history.undo.len();
+            if header {
+                document.begin_header_edit(0);
+            } else {
+                document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+            }
+            let _ = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
+            let _ = individual_edit_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                vec![
+                    individual_edit_key(egui::Key::A, command),
+                    egui::Event::Text("typed value".into()),
+                ],
+            );
+            let _ = individual_edit_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                vec![individual_edit_key(egui::Key::Z, command)],
+            );
+            let document = app.document.as_ref().unwrap();
+            let draft = if header {
+                &document.header_edit.as_ref().unwrap().draft
+            } else {
+                &document.cell_edit.as_ref().unwrap().draft
+            };
+            assert_eq!(draft, before);
+            assert_eq!(document.edit_history.undo.len(), history_len);
+            let _ = individual_edit_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                vec![individual_edit_key(egui::Key::Z, redo)],
+            );
+            let _ = individual_edit_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                vec![individual_edit_key(egui::Key::Enter, egui::Modifiers::NONE)],
+            );
+            let document = app.document.as_mut().unwrap();
+            assert_eq!(document.edit_history.undo.len(), history_len + 1);
+            if header {
+                document.begin_header_edit(0);
+            } else {
+                document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+            }
+            let _ = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
+            let _ = individual_edit_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                vec![individual_edit_key(egui::Key::Z, command)],
+            );
+            let document = app.document.as_ref().unwrap();
+            let draft = if header {
+                &document.header_edit.as_ref().unwrap().draft
+            } else {
+                &document.cell_edit.as_ref().unwrap().draft
+            };
+            assert_eq!(
+                draft, "typed value",
+                "typing history must reset when an editor reopens"
+            );
+            assert_eq!(document.edit_history.undo.len(), history_len + 1);
+            let _ = individual_edit_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                vec![individual_edit_key(
+                    egui::Key::Escape,
+                    egui::Modifiers::NONE,
+                )],
+            );
+            let _ = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
+            let _ = individual_edit_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                vec![individual_edit_key(egui::Key::Z, command)],
+            );
+            let document = app.document.as_ref().unwrap();
+            assert_eq!(document.edit_history.undo.len(), history_len);
+            if header {
+                assert_eq!(document.column_name(0), before);
+            } else {
+                assert_eq!(document.cell_edits[&(1, 1)], before.as_bytes());
+            }
+        }
+        assert_eq!(fs::read(&source).unwrap(), b"name,value\nfirst,1\n");
+    }
     use std::collections::BTreeSet;
     use std::fs::{self, File};
     use std::io::Write;

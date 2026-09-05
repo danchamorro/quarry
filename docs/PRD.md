@@ -114,6 +114,22 @@ the renderer paints at most 64 columns at once. Quarry applies the core
 65,536-column structural safety limit. Bounded display work does not otherwise
 limit Save or Save As.
 
+Committed cell values, header names, and Replace in Cell support individual
+Undo and Redo, including repeated edits to the same target. Toolbar controls and
+standard shortcuts share the document history; focused text fields keep their
+own typing history. Adjacent structural snapshots retain earlier individual
+history, so later edits are undone before crossing the structural boundary.
+Each retained indexed version limits individual history to 1,000 combined
+Undo/Redo entries and 16 MiB of before-and-after payload, without copying the
+CSV for each edit. Oldest entries are dropped; an oversized edit clears that
+version's history and is not undoable. A new effective change clears Redo;
+unchanged or cancelled edits do not. Successful Save or Save As reopening,
+Discard, and document replacement reset history. The
+[user guide](USER_GUIDE.md#undo-and-redo-changes) defines the resource cutoff
+and command availability, and the
+[priority 1 validation](benchmarks/2026-09-04-individual-edit-undo.md) records
+regression and installed-app evidence.
+
 Users start **Move Selected Columns…** or **Delete Selected Columns** from the
 same numbered-header context menu. Move uses a compact modal with the selected
 columns and a labelled one-based destination field, plus Move and Cancel.
