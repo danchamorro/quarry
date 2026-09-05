@@ -322,7 +322,7 @@ Columns, and Delete Selected Columns create a newly numbered working document.
 
 Click **Auto-fit columns** at the bottom of the **Columns…** window to fit every
 shown column to its header and the cell values already loaded into the grid.
-Auto-fit is available when 64 or fewer columns are shown.
+Auto-fit works with any number of shown columns.
 
 ### Save, Save As, and discard
 
@@ -401,7 +401,6 @@ setting.
 | Filtering is unavailable | Save or discard cell edits, then cancel or finish any active search, filter, export, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |
 | **Delete Selected Rows** is unavailable | Clear the filter, finish the active operation, and select at least one numbered data row. |
-| **Auto-fit columns** is unavailable in **Columns…** | Hide columns until 64 or fewer are shown. |
 | A filter returns no rows | Check the original column number, value, **Match case** setting, and same-column rule logic. |
 | Find is disabled | A filter is active. Open **Filters (N)…** and clear it. |
 | **Replace in Cell** is disabled | Use **Find Next** or **Find Previous** to establish the current matching cell first. |
