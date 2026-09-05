@@ -151,7 +151,7 @@ workers so temporary-output cleanup is guaranteed.
 
 ## Search and filtering
 
-Find/Replace, Filters, and Sort each carry an independent case-sensitivity
+Find/Replace, Filters, and Text sorting each carry an independent case-sensitivity
 setting with their operation input. The unchecked default folds ASCII letters
 for comparison while leaving all other bytes unchanged. **Match case** selects
 raw byte comparison. This preserves byte offsets and invalid UTF-8 handling
@@ -233,15 +233,34 @@ publishes the destination. The source path itself is rejected as a destination.
 
 Quarry sorts data rows by exactly one selected numbered column using stable,
 ASCII case-insensitive text ordering by default. The Sort tool's **Match case**
-setting switches key comparison to raw bytes. The header remains fixed, missing
-ragged fields compare as empty values, and keys equal under the selected mode
-keep their current row order.
+setting switches key comparison to raw bytes. **Number** instead builds exact,
+canonical decimal byte keys once per row. The key encodes sign, decimal order,
+and significant digits so the same lexicographic run sort and merge compare
+numbers without floating-point rounding or expanding scientific exponents.
+Equivalent values share a key, including signed zero. Numeric keys add at most
+10 bytes to the decoded field. The parser accepts signed dot decimals and
+scientific notation with exponents from -1,000,000 to 1,000,000, trims ASCII
+whitespace, and reports invalid nonblank values with their data row and column.
+The header remains fixed, missing ragged fields compare as empty values, and
+keys equal under the selected mode keep their current row order. Blank numeric
+keys sort before numbers ascending and after numbers descending.
+
+Character count and Word count validate UTF-8 and encode their counts as
+fixed-width big-endian keys. Characters are Unicode scalar values; words use
+Unicode whitespace boundaries. Shuffle hashes a seed and each current data-row
+ordinal into a fixed-width key using the standard library's DefaultHasher.
+The desktop obtains a fresh seed for each operation from RandomState; the
+validation CLI can supply a seed to repeat a shuffle within the same build.
+Reverse keys use the complemented data-row ordinal. These two modes ignore
+column values and only accept ascending key order internally, so the ordinary
+merge machinery shuffles or reverses whole rows while keeping the header fixed.
 
 The core worker generates 16 MiB in-memory runs, spills owner-only framed run
 files, and uses multipass merging into a private sorted working CSV. Merge
 fan-in is capped at 32 and derived from the observed maximum key width while
-reserving one pending key and one pending record within a 256 MiB payload budget.
-It falls to two only when the observed key reaches the default 64 MiB record cap.
+reserving one pending key and one pending record within a 256 MiB payload
+budget plus 30 bytes for numeric key overhead. Fan-in can fall to two for
+very wide keys.
 Heap entries retain keys and record lengths; only the selected record body is
 loaded during each merge step.
 The worker applies sparse edits before key comparison and output, keeps a UTF-8
@@ -253,10 +272,10 @@ ordinals for every stable tie.
 The desktop waits for structural indexing to finish so the data-row count is
 known. It combines the current file size, a two-byte-per-row fidelity cushion,
 and conservative upper bounds for committed and active sparse edits. The
-allowance is four times the effective byte bound plus 48 bytes per data row.
-This covers two generations of framed runs, duplicated keys, and the guarded
-output. Scan progress switches to an active merge phase instead of displaying
-100 percent before the worker is done.
+allowance is four times the effective byte bound plus 68 bytes per data row.
+This covers two generations of framed runs, duplicated keys (including numeric
+encoding overhead), and the guarded output. Scan progress switches to an active
+merge phase instead of displaying 100 percent before the worker is done.
 
 Run directories are owner-only, run files and the working CSV are owner-only,
 and guarded publication checks the source before exposing the result. The
@@ -274,6 +293,12 @@ conservative preflight estimate. Complete order and preservation scans passed,
 the prepublication multiset and stable-tie checks passed, source hashes remained
 unchanged, and both cancellation runs finished within 4 ms without leaving a
 destination or temporary run.
+
+The [numeric validation](benchmarks/2026-09-04-numeric-sort.md) and
+[additional-mode validation](benchmarks/2026-09-04-additional-sort-modes.md)
+cover the newer modes on a deterministic 1 GB workload, including complete
+order and row-preservation checks, cancellation, and bounded memory and disk.
+They do not extend the older 12 GB and 50 GB Text results to the new modes.
 
 ## Document editing and persistence
 
