@@ -81,6 +81,10 @@ pub enum QuarryError {
         data_row: u64,
         column: usize,
     },
+    InvalidFilter {
+        rule: usize,
+        reason: &'static str,
+    },
     InvalidOption(&'static str),
     ExportDestinationIsSource,
     ExportDestinationExists,
@@ -122,6 +126,9 @@ impl fmt::Display for QuarryError {
                 f,
                 "Cannot count text at data row {data_row}, column {column}: expected valid UTF-8 text."
             ),
+            Self::InvalidFilter { rule, reason } => {
+                write!(f, "invalid filter rule {rule}: {reason}")
+            }
             Self::InvalidOption(option) => write!(f, "invalid option: {option}"),
             Self::ExportDestinationIsSource => {
                 write!(f, "export destination must differ from the source file")

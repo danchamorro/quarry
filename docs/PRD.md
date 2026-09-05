@@ -35,8 +35,8 @@ Data operations professionals, data engineers, ETL developers, analysts, databas
 Required: local file opening; delimiter detection/override; header selection;
 virtualized grid; navigation; jump-to-row; view-only column
 resize/hide/show/reorder; streaming search; bounded copy of one cell or row;
-one or more literal filter predicates with same-column alternatives and AND
-across filtered columns; background structural
+one or more text or exact numeric filter predicates with same-column
+alternatives and AND across filtered columns; background structural
 indexing; safe streaming filtered export to a new file;
 progress/cancellation; parsing metadata; diagnostics and benchmarks.
 
@@ -49,6 +49,19 @@ Each option is off by default, so its tool compares ASCII letters without
 regard to case. Turning it on uses exact case-sensitive text matching. The
 Filter to This Value and Filter Out This Value cell actions inherit the current
 Filters setting.
+
+Numeric filters provide Greater than, Greater than or equal, Less than, Less
+than or equal, and inclusive Between using the same exact decimal and
+scientific notation rules as Number sorting. They do not round through
+floating point. Blank, missing, and invalid data do not match a numeric rule;
+invalid or blank bounds and reversed Between bounds fail before scanning.
+Numeric rules join the existing same-column inclusion alternatives, while
+both bounds inside a Between rule must match. Different filtered columns all
+apply, and same-column Does not equal exclusions all apply. Text semantics and
+their Match case setting remain unchanged. Numeric rules use the existing
+bounded filter index, navigation, cancellation, and source-preserving filtered
+export path. The [priority 2 validation](benchmarks/2026-09-05-numeric-filters.md)
+records exact regressions and the deterministic 1 GB workload.
 
 Not required: general-purpose text-editor behavior, formulas, charts, database
 connectivity, plugins, cloud sync, collaboration, direct in-place byte

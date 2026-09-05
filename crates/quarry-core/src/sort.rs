@@ -106,7 +106,7 @@ impl SortSpec {
     }
 }
 
-fn numeric_key(value: &[u8]) -> Result<Vec<u8>, QuarryError> {
+pub(crate) fn numeric_key(value: &[u8]) -> Result<Vec<u8>, QuarryError> {
     let value = value.trim_ascii();
     if value.is_empty() {
         return Ok(Vec::new());

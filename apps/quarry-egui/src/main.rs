@@ -350,6 +350,7 @@ struct FilterRuleDraft {
     column_input: String,
     operator: FilterOperator,
     value_input: String,
+    upper_bound_input: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,6 +433,7 @@ impl Default for FilterRuleDraft {
             column_input: "1".into(),
             operator: FilterOperator::Contains,
             value_input: String::new(),
+            upper_bound_input: String::new(),
         }
     }
 }
@@ -900,32 +902,13 @@ impl QuarryApp {
                 document.cancel_search();
                 Ok(())
             }
-            Action::ApplyFilter => {
-                let predicates = self
-                    .filter_rules
-                    .iter()
-                    .enumerate()
-                    .map(|(index, rule)| {
-                        parse_file_column(&rule.column_input, document.total_columns)
-                            .map_err(|error| format!("Rule {}: {error}", index + 1))
-                            .map(|column| FilterPredicate {
-                                column,
-                                operator: rule.operator,
-                                value: rule.value_input.as_bytes().to_vec(),
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>();
-                predicates
-                    .map_err(AppMessage::warning)
-                    .and_then(|predicates| {
-                        document
-                            .start_filter(FilterQuery {
-                                predicates,
-                                case_sensitivity: case_sensitivity(self.filter_match_case),
-                            })
-                            .map_err(AppMessage::warning)
-                    })
-            }
+            Action::ApplyFilter => filter_query_from_rules(
+                &self.filter_rules,
+                self.filter_match_case,
+                document.total_columns,
+            )
+            .map_err(AppMessage::warning)
+            .and_then(|query| document.start_filter(query).map_err(AppMessage::warning)),
             Action::CancelFilter => {
                 document.cancel_filter();
                 Ok(())
@@ -2831,9 +2814,15 @@ fn filter_value_input_id(rule_index: usize) -> egui::Id {
     egui::Id::new((FILTER_VALUE_INPUT_ID, rule_index))
 }
 
+fn filter_upper_bound_input_id(rule_index: usize) -> egui::Id {
+    egui::Id::new(("quarry-filter-upper-bound", rule_index))
+}
+
 fn is_filter_text_input(focused: egui::Id, filter_rule_count: usize) -> bool {
     (0..filter_rule_count).any(|index| {
-        focused == filter_column_input_id(index) || focused == filter_value_input_id(index)
+        focused == filter_column_input_id(index)
+            || focused == filter_value_input_id(index)
+            || focused == filter_upper_bound_input_id(index)
     })
 }
 
@@ -3361,6 +3350,34 @@ fn show_structural_dialog(
     action
 }
 
+fn filter_query_from_rules(
+    rules: &[FilterRuleDraft],
+    match_case: bool,
+    total_columns: usize,
+) -> Result<FilterQuery, String> {
+    let predicates = rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            parse_file_column(&rule.column_input, total_columns)
+                .map_err(|error| format!("Rule {}: {error}", index + 1))
+                .map(|column| FilterPredicate {
+                    column,
+                    operator: rule.operator,
+                    value: rule.value_input.as_bytes().to_vec(),
+                    upper_bound: (rule.operator == FilterOperator::Between)
+                        .then(|| rule.upper_bound_input.as_bytes().to_vec()),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let query = FilterQuery {
+        predicates,
+        case_sensitivity: case_sensitivity(match_case),
+    };
+    query.validate().map_err(|error| error.to_string())?;
+    Ok(query)
+}
+
 fn show_filter_manager(
     ctx: &egui::Context,
     open: &mut bool,
@@ -3378,9 +3395,9 @@ fn show_filter_manager(
         .resizable(false)
         .show(ctx, |ui| {
             ui.label(
-                "Rows must match every filtered column. Equals and Contains values in the same column are alternatives.",
+                "Rows must match every filtered column. Text and numeric inclusion rules in the same column are alternatives. Does not equal rules exclude matches.",
             );
-            ui.checkbox(match_case, "Match case");
+            ui.checkbox(match_case, "Match case").on_hover_text("Applies to text rules only.");
             ui.add_space(6.0);
             let rule_count = rules.len();
             let sole_rule = rule_count == 1;
@@ -3440,20 +3457,56 @@ fn show_filter_manager(
                                 FilterOperator::NotEquals,
                                 "Does not equal",
                             );
+                            ui.separator();
+                            for operator in [
+                                FilterOperator::GreaterThan,
+                                FilterOperator::GreaterThanOrEqual,
+                                FilterOperator::LessThan,
+                                FilterOperator::LessThanOrEqual,
+                                FilterOperator::Between,
+                            ] {
+                                ui.selectable_value(
+                                    &mut rule.operator,
+                                    operator,
+                                    filter_operator_label(operator),
+                                );
+                            }
                         })
                         .response
                         .labelled_by(label.id);
                     });
-                    let label = ui.label(format!("Rule {} value", index + 1));
-                    let _ = ui
-                        .add_sized(
-                            [ui.available_width(), 48.0],
-                            egui::TextEdit::multiline(&mut rule.value_input)
-                                .desired_rows(2)
+                    if rule.operator.is_numeric() {
+                        let between = rule.operator == FilterOperator::Between;
+                        let label = ui.label(format!(
+                            "Rule {} {}", index + 1, if between { "lower bound" } else { "number" }
+                        ));
+                        let _ = ui.add(
+                            egui::TextEdit::singleline(&mut rule.value_input)
                                 .id(filter_value_input_id(index))
-                                .hint_text("Literal text"),
-                        )
-                        .labelled_by(label.id);
+                                .hint_text("e.g. 500 or 5e2"),
+                        ).labelled_by(label.id);
+                        if between {
+                            let label = ui.label(format!("Rule {} upper bound", index + 1));
+                            let _ = ui.add(
+                                egui::TextEdit::singleline(&mut rule.upper_bound_input)
+                                    .id(filter_upper_bound_input_id(index))
+                                    .hint_text("e.g. 1000"),
+                            ).labelled_by(label.id);
+                            ui.small("Both bounds must match. Endpoints are included.");
+                        }
+                        ui.small("Numbers use the same format as Number sorting. Blank, missing and invalid numbers do not match this rule.");
+                    } else {
+                        let label = ui.label(format!("Rule {} value", index + 1));
+                        let _ = ui
+                            .add_sized(
+                                [ui.available_width(), 48.0],
+                                egui::TextEdit::multiline(&mut rule.value_input)
+                                    .desired_rows(2)
+                                    .id(filter_value_input_id(index))
+                                    .hint_text("Literal text"),
+                            )
+                            .labelled_by(label.id);
+                    }
                 });
                 ui.add_space(4.0);
             }
@@ -3465,24 +3518,23 @@ fn show_filter_manager(
                 rules.push(FilterRuleDraft::default());
             }
 
+            let validation_error = filter_query_from_rules(rules, *match_case, document.total_columns).err();
             let can_apply = document.is_filter_ready()
                 && !document.has_cell_edits()
                 && document.search_job.is_none()
                 && document.filter_job.is_none()
                 && document.export_job.is_none()
-                && !rules.is_empty()
-                && rules.iter().all(|rule| {
-                    parse_file_column(&rule.column_input, document.total_columns).is_ok()
-                        && (rule.operator != FilterOperator::Contains
-                            || !rule.value_input.is_empty())
-                });
+                && validation_error.is_none();
             if ui
                 .add_enabled(can_apply, egui::Button::new("Apply filters"))
                 .clicked()
             {
                 action = Some(Action::ApplyFilter);
             }
-            ui.small("Contains requires a value. Equals and Does not equal can compare with an empty cell. Values are literal.");
+            if let Some(error) = validation_error {
+                ui.small(error);
+            }
+            ui.small("Contains requires text. Equals and Does not equal compare literal text, including empty cells.");
             if document.has_cell_edits() {
                 ui.small("Save or discard cell edits before filtering the source file.");
             }
@@ -3497,8 +3549,13 @@ fn show_filter_manager(
                 ));
                 for (index, predicate) in query.predicates.iter().enumerate() {
                     let value = field_text(&predicate.value);
+                    let value = if let Some(upper) = &predicate.upper_bound {
+                        format!("{value:?} and {:?}", field_text(upper))
+                    } else {
+                        format!("{value:?}")
+                    };
                     ui.label(format!(
-                        "{}. file column {} ({}) {} {:?}",
+                        "{}. file column {} ({}) {} {}",
                         index + 1,
                         predicate.column.saturating_add(1),
                         document.column_name(predicate.column),
@@ -3549,6 +3606,11 @@ fn filter_operator_label(operator: FilterOperator) -> &'static str {
         FilterOperator::Contains => "Contains",
         FilterOperator::Equals => "Equals",
         FilterOperator::NotEquals => "Does not equal",
+        FilterOperator::GreaterThan => "Greater than (>)",
+        FilterOperator::GreaterThanOrEqual => "Greater than or equal (>=)",
+        FilterOperator::LessThan => "Less than (<)",
+        FilterOperator::LessThanOrEqual => "Less than or equal (<=)",
+        FilterOperator::Between => "Between (inclusive)",
     }
 }
 
@@ -5519,6 +5581,7 @@ impl Document {
                 ));
             }
         }
+        query.validate().map_err(|error| error.to_string())?;
 
         self.commit_edits();
         let job = self
@@ -8177,6 +8240,7 @@ fn show_table(
                                                         predicates: vec![FilterPredicate {
                                                             column,
                                                             operator: FilterOperator::Equals,
+                                                            upper_bound: None,
                                                             value: value
                                                                 .expect(
                                                                     "enabled filtering has a cell value",
@@ -8201,6 +8265,7 @@ fn show_table(
                                                         predicates: vec![FilterPredicate {
                                                             column,
                                                             operator: FilterOperator::NotEquals,
+                                                            upper_bound: None,
                                                             value: value
                                                                 .expect(
                                                                     "enabled filtering has a cell value",
@@ -9602,6 +9667,7 @@ mod tests {
                     column: 0,
                     operator: FilterOperator::Equals,
                     value: b"first".to_vec(),
+                    upper_bound: None,
                 })
                 .collect(),
             case_sensitivity: CaseSensitivity::Insensitive,
@@ -10234,6 +10300,188 @@ mod tests {
     }
 
     #[test]
+    fn numeric_filter_controls_validate_bounds_and_export_exact_rows() {
+        fn render(
+            app: &mut QuarryApp,
+            ctx: &egui::Context,
+            events: Vec<egui::Event>,
+        ) -> (Option<Action>, egui::FullOutput) {
+            let mut action = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..grid_input()
+                },
+                |ctx| {
+                    action = show_filter_manager(
+                        ctx,
+                        &mut app.filters_open,
+                        &mut app.filter_rules,
+                        &mut app.filter_match_case,
+                        app.document.as_ref().unwrap(),
+                    );
+                },
+            );
+            (action, output)
+        }
+        fn click(target: egui::accesskit::NodeId) -> Vec<egui::Event> {
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target,
+                    data: None,
+                },
+            )]
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("numeric-filter.csv");
+        let destination = directory.path().join("numeric-filter-export.csv");
+        let original = b"amount,note\r\n99.999,below\r\n100,lower\r\n1e3,upper\r\n1000.0001,above\r\n,blank\r\nbad,invalid\r\n 1.00e2 ,\"line one\nline two\"\r\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.header_mode = HeaderMode::FirstRow;
+        app.open_path(source.clone()).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        app.filters_open = true;
+        app.filter_match_case = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (_, output) = render(&mut app, &ctx, vec![]);
+        let combo = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == egui::accesskit::Role::ComboBox)
+            .map(|(id, _)| *id)
+            .unwrap();
+        let (_, output) = render(&mut app, &ctx, click(combo));
+        let tree = output.platform_output.accesskit_update.unwrap();
+        for operator in [
+            FilterOperator::GreaterThan,
+            FilterOperator::GreaterThanOrEqual,
+            FilterOperator::LessThan,
+            FilterOperator::LessThanOrEqual,
+            FilterOperator::Between,
+        ] {
+            assert!(tree.nodes.iter().any(|(_, node)| {
+                node.label() == Some(super::filter_operator_label(operator))
+                    && node.supports_action(egui::accesskit::Action::Click)
+            }));
+        }
+        let between = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Between (inclusive)"))
+            .map(|(id, _)| *id)
+            .unwrap();
+        let _ = render(&mut app, &ctx, click(between));
+        assert_eq!(app.filter_rules[0].operator, FilterOperator::Between);
+        let (_, output) = render(&mut app, &ctx, vec![]);
+        assert!(accessible_button(&output, "Apply filters").1.is_disabled());
+        assert_eq!(
+            output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == egui::accesskit::Role::TextInput
+                    && !node.labelled_by().is_empty())
+                .count(),
+            3
+        );
+
+        ctx.memory_mut(|memory| memory.request_focus(super::filter_value_input_id(0)));
+        let _ = render(&mut app, &ctx, vec![egui::Event::Text("100".into())]);
+        ctx.memory_mut(|memory| memory.request_focus(super::filter_upper_bound_input_id(0)));
+        let (_, output) = render(&mut app, &ctx, vec![egui::Event::Text("1e3".into())]);
+        assert!(super::is_filter_text_input(
+            super::filter_upper_bound_input_id(0),
+            1
+        ));
+        let (apply, node) = accessible_button(&output, "Apply filters");
+        assert!(!node.is_disabled());
+        let (action, _) = render(&mut app, &ctx, click(apply));
+        assert_eq!(action, Some(Action::ApplyFilter));
+        app.apply(&ctx, action.unwrap());
+        assert!(app.notice.is_none());
+        let document = app.document.as_mut().unwrap();
+        finish_filter(document);
+        assert_eq!(document.available_filter_rows(), 3);
+        let active_query = document.filter_query.clone();
+        let active_rows = document
+            .visible_filter_rows()
+            .iter()
+            .map(|row| row.row)
+            .collect::<Vec<_>>();
+        assert_eq!(active_rows, vec![2, 3, 7]);
+
+        for invalid in ["", "99", "NaN", "1,000"] {
+            app.filter_rules[0].upper_bound_input = invalid.into();
+            let (_, output) = render(&mut app, &ctx, vec![]);
+            assert!(accessible_button(&output, "Apply filters").1.is_disabled());
+            app.apply(&ctx, Action::ApplyFilter);
+            assert!(app.notice.is_some());
+            let document = app.document.as_ref().unwrap();
+            assert_eq!(document.filter_query, active_query);
+            assert_eq!(
+                document
+                    .visible_filter_rows()
+                    .iter()
+                    .map(|row| row.row)
+                    .collect::<Vec<_>>(),
+                active_rows
+            );
+        }
+        let document = app.document.as_mut().unwrap();
+        document.start_filtered_export(destination.clone()).unwrap();
+        finish_filtered_export(document);
+        assert_eq!(
+            fs::read(destination).unwrap(),
+            b"amount,note\r\n100,lower\r\n1e3,upper\r\n 1.00e2 ,\"line one\nline two\"\r\n"
+        );
+        assert_eq!(fs::read(source).unwrap(), original);
+        document.shutdown();
+    }
+
+    #[test]
+    fn switching_numeric_filter_operators_keeps_text_and_case_preferences() {
+        let mut rule = super::FilterRuleDraft {
+            column_input: "1".into(),
+            operator: FilterOperator::Between,
+            value_input: "1".into(),
+            upper_bound_input: "2".into(),
+        };
+        let query = super::filter_query_from_rules(&[rule.clone()], true, 1).unwrap();
+        assert_eq!(
+            query.predicates[0].upper_bound.as_deref(),
+            Some(b"2".as_slice())
+        );
+        for operator in [
+            FilterOperator::GreaterThan,
+            FilterOperator::Equals,
+            FilterOperator::Contains,
+        ] {
+            rule.operator = operator;
+            let query = super::filter_query_from_rules(&[rule.clone()], true, 1).unwrap();
+            assert_eq!(query.predicates[0].upper_bound, None);
+            assert_eq!(query.case_sensitivity, CaseSensitivity::Sensitive);
+        }
+        rule.operator = FilterOperator::Between;
+        assert_eq!(
+            super::filter_query_from_rules(&[rule], false, 1)
+                .unwrap()
+                .predicates[0]
+                .upper_bound
+                .as_deref(),
+            Some(b"2".as_slice())
+        );
+    }
+
+    #[test]
     fn filter_manager_applies_a_labelled_multiline_equals_value_by_button() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10596,16 +10844,19 @@ mod tests {
                 column_input: "2".into(),
                 operator: FilterOperator::Equals,
                 value_input: "tx".into(),
+                upper_bound_input: String::new(),
             },
             super::FilterRuleDraft {
                 column_input: "2".into(),
                 operator: FilterOperator::Equals,
                 value_input: "fL".into(),
+                upper_bound_input: String::new(),
             },
             super::FilterRuleDraft {
                 column_input: "3".into(),
                 operator: FilterOperator::NotEquals,
                 value_input: "INACTIVE".into(),
+                upper_bound_input: String::new(),
             },
         ];
         assert_eq!(
@@ -14261,6 +14512,7 @@ mod tests {
                     column: 1,
                     operator: FilterOperator::Equals,
                     value: b"line one\nline two".to_vec(),
+                    upper_bound: None,
                 }],
                 case_sensitivity: CaseSensitivity::Insensitive,
             })
@@ -14278,6 +14530,7 @@ mod tests {
                     column: 1,
                     operator: FilterOperator::NotEquals,
                     value: b"line one\nline two".to_vec(),
+                    upper_bound: None,
                 }],
                 case_sensitivity: CaseSensitivity::Sensitive,
             })

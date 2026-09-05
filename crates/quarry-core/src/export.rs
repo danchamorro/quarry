@@ -16,7 +16,10 @@ use quarry_delimited::{
 };
 
 use crate::case::ByteMatcher;
-use crate::filter::{FilterQuery, matching_fields, predicate_groups, validate_query};
+use crate::filter::{
+    FilterQuery, PredicateMatcher, compile_matchers, matching_fields, predicate_groups,
+    validate_query,
+};
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
     SourceStamp,
@@ -3359,11 +3362,7 @@ fn scan_export(
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<ScanOutcome, QuarryError> {
-    let matchers: Vec<_> = query
-        .predicates
-        .iter()
-        .map(|predicate| ByteMatcher::new(&predicate.value, query.case_sensitivity))
-        .collect();
+    let matchers = compile_matchers(query)?;
     let groups = predicate_groups(query);
     let mut scanner = RecordScanner::new(delimiter)?;
     let mut chunk = vec![0; config.chunk_bytes];
@@ -3486,7 +3485,7 @@ fn process_record(
     data_start: u64,
     delimiter: u8,
     query: &FilterQuery,
-    matchers: &[ByteMatcher<'_>],
+    matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
     max_record_bytes: usize,
     output: &mut ExportTarget,
@@ -5972,39 +5971,65 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_removes_the_temporary_output() {
-        let source = fixture(&b"miss,value,drop\n".repeat(500_000));
-        let destination = destination(&source, "cancelled.csv");
-        let session = session(&source, b',', HeaderMode::NoHeader);
-        let job = FilterExportJob::start(
-            source.clone(),
-            session.file_size,
-            b',',
-            false,
-            query(),
-            destination.clone(),
-            ExportConfig {
-                chunk_bytes: 1,
-                max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
-            },
-        )
-        .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while job.progress().bytes_scanned < 100 {
-            assert!(!job.progress().done, "export completed before cancellation");
-            assert!(Instant::now() < deadline, "export did not make progress");
-            thread::yield_now();
+    fn invalid_numeric_bounds_are_rejected_before_export_output_is_created() {
+        let source = fixture(b"value\n1\n");
+        let destination = destination(&source, "invalid.csv");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        for (lower, upper) in [("", "1"), ("1", "NaN"), ("2", "1")] {
+            let mut query =
+                FilterQuery::single(0, FilterOperator::Between, lower.as_bytes().to_vec());
+            query.predicates[0].upper_bound = Some(upper.as_bytes().to_vec());
+            assert!(matches!(
+                session.start_filtered_export(query, &destination),
+                Err(QuarryError::InvalidFilter { rule: 1, .. })
+            ));
+            assert!(!destination.exists());
+            assert!(temporary_exports(&destination).is_empty());
         }
-        assert_eq!(temporary_exports(&destination).len(), 1);
-
-        job.cancel();
-        wait_until_done(&job);
-        assert!(job.progress().cancelled);
-        assert_eq!(job.wait().unwrap(), FilterExportOutcome::Cancelled);
-        assert!(!destination.exists());
-        assert!(temporary_exports(&destination).is_empty());
+        assert_eq!(fs::read(&source).unwrap(), b"value\n1\n");
         fs::remove_file(&source).unwrap();
         remove_case(&source);
+    }
+
+    #[test]
+    fn cancellation_removes_the_temporary_output() {
+        for query in [
+            query(),
+            FilterQuery::single(0, FilterOperator::GreaterThanOrEqual, b"0".to_vec()),
+        ] {
+            let source = fixture(&b"1,value,drop\n".repeat(500_000));
+            let destination = destination(&source, "cancelled.csv");
+            let session = session(&source, b',', HeaderMode::NoHeader);
+            let job = FilterExportJob::start(
+                source.clone(),
+                session.file_size,
+                b',',
+                false,
+                query,
+                destination.clone(),
+                ExportConfig {
+                    chunk_bytes: 1,
+                    max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                },
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while job.progress().bytes_scanned < 100 {
+                assert!(!job.progress().done, "export completed before cancellation");
+                assert!(Instant::now() < deadline, "export did not make progress");
+                thread::yield_now();
+            }
+            assert_eq!(temporary_exports(&destination).len(), 1);
+
+            job.cancel();
+            wait_until_done(&job);
+            assert!(job.progress().cancelled);
+            assert_eq!(job.wait().unwrap(), FilterExportOutcome::Cancelled);
+            assert!(!destination.exists());
+            assert!(temporary_exports(&destination).is_empty());
+            fs::remove_file(&source).unwrap();
+            remove_case(&source);
+        }
     }
 
     #[test]
