@@ -289,15 +289,48 @@ For view-only reordering or hiding, use the **Columns…** window instead.
 
 ### Sort rows
 
-1. Select exactly one numbered column.
-2. Right-click its number and choose **Sort Rows…**.
-3. Choose **Ascending** or **Descending**.
-4. Leave **Match case** off to sort ASCII letters without separating uppercase
-   and lowercase values, or turn it on for exact case ordering.
-5. Review the temporary-disk allowance, then click **Sort**.
+Only Text, Number, Character count, and Word count use the selected column's
+values. Shuffle and Reverse reorder all data rows and ignore the selected
+column. The current **Sort Rows…** menu still requires one selected column to
+open the window, including when choosing Shuffle or Reverse.
 
-Sort keeps the header fixed and is stable, so equal values retain their
-original order. Missing fields sort as empty cells. Large sorts can take time
+1. Select exactly one numbered column: the column to sort by for Text, Number,
+   Character count, or Word count, or any column for Shuffle or Reverse.
+2. Right-click its number and choose **Sort Rows…**.
+3. Choose a sorting type:
+   - **Text** (the default): alphabetical text order, such as `1, 10, 2`.
+   - **Number**: exact numeric order, such as `1, 2, 10`.
+   - **Character count**: shortest or longest values first, including spaces
+     and embedded newlines. Counts Unicode scalar values, so a combining mark
+     counts separately from its base letter. It does not count UTF-8 bytes.
+   - **Word count**: fewest or most words first. A word is a nonempty group
+     separated by Unicode whitespace, including tabs and newlines.
+   - **Shuffle**: randomly reorder all data rows. Each use generates a fresh
+     shuffle; equal-looking or duplicate rows remain separate records.
+   - **Reverse**: put the last data row first and the first data row last.
+4. Choose a direction for Text, Number, Character count, or Word count.
+   Shuffle and Reverse operate on the current whole-row order and ignore the
+   selected column, so they have no direction control.
+5. For Text, leave **Match case** off to ignore ASCII letter case, or turn it
+   on for exact case ordering. This option applies only to Text.
+6. Review the temporary-disk allowance, then click **Sort**.
+
+Character count and Word count require valid UTF-8 in the selected column.
+Invalid text stops the operation with the data row and column identified.
+Empty and missing cells count as zero; whitespace-only cells have zero words
+but still have characters. Equal counts keep their current row order.
+
+Number compares signed integers and dot decimals exactly, including values too
+large for floating-point arithmetic. Scientific notation such as `1.25e3` is
+accepted with exponents from -1,000,000 to 1,000,000. Surrounding ASCII whitespace
+is ignored when comparing; original cell text is preserved. Empty, whitespace-only,
+and missing values sort first ascending and last descending. Other text,
+currency symbols, grouping commas, NaN, and infinity stop the sort with an error
+identifying the data row and column, leaving the current document unchanged.
+
+Every mode keeps the header fixed. Text, Number, Character count, and Word
+count keep equal keys in their original order, including equivalent numbers
+such as `2`, `02`, and `2.00`. Missing fields sort as empty cells. Large sorts can take time
 and require substantial temporary disk space. During the merge phase,
 **Merging sorted rows…** is a phase indicator rather than an exact completion
 percentage.
@@ -354,7 +387,7 @@ reopen it instead of overwriting the external update.
 
 ## Case matching
 
-Find and Replace, Filters, and Sort each have an independent **Match case**
+Find and Replace, Filters, and Text sorting each have an independent **Match case**
 setting:
 
 - Off, the default: ASCII uppercase and lowercase letters are treated as
@@ -396,7 +429,7 @@ setting.
 | Problem | What to do |
 |---|---|
 | The delimiter or header is wrong | Open **Format**, choose the correct delimiter and header, then click **Reopen with Changes**. Save or discard changes first. |
-| Find or Sort is unavailable | Wait for indexing to finish. Sort also needs the temporary-disk estimate. |
+| Find or Sort is unavailable | Wait for indexing to finish. To open Sort, select exactly one numbered column and right-click its number. Sort also needs the temporary-disk estimate. |
 | Cell editing is unavailable | Clear active filters and wait for the current operation to finish. Missing and non-UTF-8 cells cannot be edited. |
 | Filtering is unavailable | Save or discard cell edits, then cancel or finish any active search, filter, export, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |

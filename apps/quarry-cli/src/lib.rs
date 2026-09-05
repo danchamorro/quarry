@@ -13,7 +13,7 @@ use quarry_core::{
     FilterProgress, FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress,
     LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome,
     SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition,
-    SearchProgress, Session, SortDirection, SortJob, SortOutcome, SortProgress, SortSpec,
+    SearchProgress, Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
     SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex,
     estimate_sort_temporary_bytes,
 };
@@ -86,11 +86,14 @@ fn print_help() {
          --join COLUMNS SEPARATOR) \
          [--output-header NAME]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
-           quarry sort-save-as <SOURCE> <DESTINATION> --column N \
-         --order asc|desc [--delimiter ,] [--header auto|first-row|none] \
+           quarry sort-save-as <SOURCE> <DESTINATION> [--column N] \
+         [--order asc|desc] [--mode text|number|characters|words|shuffle|reverse] \
+         [--seed N] [--delimiter ,] [--header auto|first-row|none] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
-         --output FILE [--seed 1]"
+         --output FILE [--seed 1]\n\n\
+         Sort: --column and --order are required for text, number, characters, and words.\n\
+         Shuffle and reverse reorder all data rows; --seed repeats a shuffle within the same build."
     );
 }
 
@@ -975,6 +978,8 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut destination = None;
     let mut column = None;
     let mut direction = None;
+    let mut mode = SortMode::Text;
+    let mut shuffle_seed = None;
     let mut delimiter = None;
     let mut header_mode = HeaderMode::Auto;
     let mut cancel_after_bytes = None;
@@ -987,6 +992,22 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             "--order" => {
                 direction = Some(parse_sort_direction(value(&args, &mut cursor, "--order")?)?)
             }
+            "--mode" => {
+                mode =
+                    match value(&args, &mut cursor, "--mode")? {
+                        "text" => SortMode::Text,
+                        "number" => SortMode::Number,
+                        "characters" => SortMode::CharacterCount,
+                        "words" => SortMode::WordCount,
+                        "shuffle" => SortMode::Shuffle { seed: 0 },
+                        "reverse" => SortMode::Reverse,
+                        _ => return Err(
+                            "--mode must be text, number, characters, words, shuffle, or reverse"
+                                .into(),
+                        ),
+                    };
+            }
+            "--seed" => shuffle_seed = Some(value(&args, &mut cursor, "--seed")?.parse::<u64>()?),
             "--delimiter" => {
                 delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
             }
@@ -1013,11 +1034,27 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
 
     let source = source.ok_or("sort-save-as requires a source file path")?;
     let destination = destination.ok_or("sort-save-as requires a destination file path")?;
-    let column = column.ok_or("sort-save-as requires --column")?;
+    let column = if mode.uses_column() {
+        column.ok_or("sort-save-as requires --column")?
+    } else {
+        column.unwrap_or(1)
+    };
     if column == 0 {
         return Err("sort column must be at least 1".into());
     }
-    let direction = direction.ok_or("sort-save-as requires --order")?;
+    let direction = if mode.uses_column() {
+        direction.ok_or("sort-save-as requires --order")?
+    } else {
+        if direction == Some(SortDirection::Descending) {
+            return Err("shuffle and reverse do not accept descending order".into());
+        }
+        SortDirection::Ascending
+    };
+    if matches!(mode, SortMode::Shuffle { .. }) {
+        mode = shuffle_seed.map_or_else(SortMode::shuffle, |seed| SortMode::Shuffle { seed });
+    } else if shuffle_seed.is_some() {
+        return Err("--seed is only supported with --mode shuffle".into());
+    }
     if cancel_after_bytes == Some(0) {
         return Err("cancel-after-bytes must be non-zero".into());
     }
@@ -1037,6 +1074,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let spec = SortSpec {
         column: column - 1,
         direction,
+        mode,
         case_sensitivity: CaseSensitivity::Sensitive,
     };
     let source_size_before = session.file_size;
@@ -1129,14 +1167,32 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Cache state: {cache_state}");
-    println!("Sort column: {column}");
+    if mode.uses_column() {
+        println!("Sort column: {column}");
+    }
     println!(
-        "Sort order: {}",
-        match direction {
-            SortDirection::Ascending => "ascending",
-            SortDirection::Descending => "descending",
+        "Sort mode: {}",
+        match mode {
+            SortMode::Text => "text",
+            SortMode::Number => "number",
+            SortMode::CharacterCount => "characters",
+            SortMode::WordCount => "words",
+            SortMode::Shuffle { .. } => "shuffle",
+            SortMode::Reverse => "reverse",
         }
     );
+    if mode.uses_column() {
+        println!(
+            "Sort order: {}",
+            match direction {
+                SortDirection::Ascending => "ascending",
+                SortDirection::Descending => "descending",
+            }
+        );
+    }
+    if let SortMode::Shuffle { seed } = mode {
+        println!("Shuffle seed: {seed}");
+    }
     println!(
         "Estimated temporary disk: {} ({} bytes)",
         human_bytes(estimated_temporary_bytes),
@@ -1366,8 +1422,30 @@ fn validate_sorted_output(
         if rows.is_empty() {
             return Err("sorted output validation row is missing".into());
         }
+        if spec.mode == SortMode::Reverse {
+            let source_start =
+                source_index.indexed_rows() - (next_row - data_start) - rows.len() as u64;
+            let original = source.read_rows(source_index, source_start, rows.len())?;
+            if original.len() != rows.len()
+                || rows
+                    .iter()
+                    .zip(original.iter().rev())
+                    .any(|(left, right)| left.fields != right.fields)
+            {
+                return Err("reversed output does not match source row order".into());
+            }
+        }
         for row in &rows {
-            let key = row.fields.get(spec.column).cloned().unwrap_or_default();
+            if !spec.mode.uses_column() {
+                continue;
+            }
+            let key = spec.key(
+                row.fields
+                    .get(spec.column)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                0,
+            )?;
             if previous_key
                 .as_ref()
                 .is_some_and(|previous| match spec.direction {
@@ -3913,6 +3991,10 @@ mod tests {
         for (args, expected) in [
             (vec![], "sort-save-as requires a source file path"),
             (
+                vec!["source.csv", "sorted.csv", "--mode", "numeric"],
+                "--mode must be text, number, characters, words, shuffle, or reverse",
+            ),
+            (
                 vec!["source.csv"],
                 "sort-save-as requires a destination file path",
             ),
@@ -4140,6 +4222,155 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn numeric_sort_command_preserves_precision_ties_and_source() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-numeric-sort-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let original =
+            b"amount,id\n10,a\n2,b\n02.00,c\n-1.5,d\n,e\n9007199254740993,f\n9007199254740992,g\n";
+        fs::write(&source, original).unwrap();
+        for (order, expected) in [
+            (
+                "asc",
+                "amount,id\n,e\n-1.5,d\n2,b\n02.00,c\n10,a\n9007199254740992,g\n9007199254740993,f\n",
+            ),
+            (
+                "desc",
+                "amount,id\n9007199254740993,f\n9007199254740992,g\n10,a\n2,b\n02.00,c\n-1.5,d\n,e\n",
+            ),
+        ] {
+            let destination = directory.join(format!("{order}.csv"));
+            sort_save_as_command(vec![
+                source.to_string_lossy().into_owned(),
+                destination.to_string_lossy().into_owned(),
+                "--column".into(),
+                "1".into(),
+                "--order".into(),
+                order.into(),
+                "--mode".into(),
+                "number".into(),
+                "--header".into(),
+                "first-row".into(),
+            ])
+            .unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), expected.as_bytes());
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn extra_sort_modes_validate_counts_reverse_and_seeded_shuffle() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-extra-sort-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let original = "key,id\nz,1\ntwo words,2\né,3\n,4\nbb,5\n\"x\ny z\",6\nlongtext,7\n";
+        fs::write(&source, original).unwrap();
+        for (mode, ids) in [
+            ("characters", "4135672"),
+            ("words", "4135726"),
+            ("reverse", "7654321"),
+        ] {
+            let destination = directory.join(format!("{mode}.csv"));
+            let mut args = vec![
+                source.to_string_lossy().into_owned(),
+                destination.to_string_lossy().into_owned(),
+                "--mode".into(),
+                mode.into(),
+                "--header".into(),
+                "first-row".into(),
+            ];
+            if mode != "reverse" {
+                args.extend([
+                    "--column".into(),
+                    "1".into(),
+                    "--order".into(),
+                    "asc".into(),
+                ]);
+            }
+            sort_save_as_command(args).unwrap();
+            let result = Session::open(
+                &destination,
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            let actual = result
+                .first_rows
+                .iter()
+                .skip(1)
+                .flat_map(|row| row.fields[1].iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, ids.as_bytes(), "{mode}");
+        }
+        let mut shuffled = Vec::new();
+        for (index, seed) in [7, 7, 19].into_iter().enumerate() {
+            let destination = directory.join(format!("shuffle-{index}.csv"));
+            sort_save_as_command(vec![
+                source.to_string_lossy().into_owned(),
+                destination.to_string_lossy().into_owned(),
+                "--mode".into(),
+                "shuffle".into(),
+                "--seed".into(),
+                seed.to_string(),
+                "--header".into(),
+                "first-row".into(),
+            ])
+            .unwrap();
+            let result = Session::open(
+                &destination,
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            let mut ids = result
+                .first_rows
+                .iter()
+                .skip(1)
+                .flat_map(|row| row.fields[1].iter().copied())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(ids, b"1234567");
+            shuffled.push(fs::read(destination).unwrap());
+        }
+        assert_eq!(shuffled[0], shuffled[1]);
+        assert_ne!(shuffled[0], shuffled[2]);
+        for args in [
+            vec!["--mode", "reverse", "--order", "desc"],
+            vec!["--mode", "reverse", "--seed", "7"],
+        ] {
+            let destination = directory.join("invalid.csv");
+            let mut command = vec![
+                source.to_string_lossy().into_owned(),
+                destination.to_string_lossy().into_owned(),
+            ];
+            command.extend(args.into_iter().map(str::to_owned));
+            assert!(sort_save_as_command(command).is_err());
+            assert!(!destination.exists());
+        }
+        assert_eq!(fs::read(&source).unwrap(), original.as_bytes());
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -12,7 +12,7 @@ The roadmap is ordered by technical risk rather than feature excitement.
 | Phase 3: Viewer alpha | Complete | Continuous bounded scrolling is measured on the [12 GB reference file](benchmarks/2026-08-15-continuous-scroll.md); native opening and format controls are covered by the [viewer file-controls validation](benchmarks/2026-08-15-viewer-file-controls.md); bounded Find Next is covered by the [streaming-search benchmark](benchmarks/2026-08-15-streaming-search.md); cell and row copying are covered by the [bounded-copy validation](benchmarks/2026-08-16-bounded-copy.md); direct column access is covered by the [column-controls validation](benchmarks/2026-08-16-column-controls.md); the maximized layout is covered by the [row-density validation](benchmarks/2026-08-16-row-density.md) |
 | Phase 4: Filters and export | Complete | Bounded single and grouped multi-predicate filtering is tracked in the [streaming-filter](benchmarks/2026-08-16-streaming-filter.md) and [multiple-predicate filter](benchmarks/2026-08-16-multiple-predicate-filter.md) validations; safe streaming export passed its [1 GB and 12 GB validation](benchmarks/2026-08-16-filtered-export.md) |
 | Phase 5: Direct editing and transformations | Complete | Inline editing, atomic Save with metadata-based conflict detection, and no-clobber Save As passed the deterministic [direct-edit validation](benchmarks/2026-08-18-direct-cell-editing.md); the Split/Join persistence engine passed the deterministic [1 GB and 12 GB transformation validation](benchmarks/2026-08-19-split-join-transformations.md); exact core and desktop regressions cover Move/Delete Selected Columns, overlay-aware Find Next, and Replace in Cell; production Replace All is measured directly at [12 GB](benchmarks/2026-08-22-12gb-replace-all.md) and [50 GB](benchmarks/2026-08-22-50gb-capability-suite.md) |
-| Phase 6: Sorting | Complete | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md); the current engine also passed the optimized [117-million-row `FIRSTNAME` sort](benchmarks/2026-08-23-12gb-sort-performance.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup |
+| Phase 6: Sorting | 6A–6C complete; 6D planned | Stable single-column text sorting passed exact regressions plus the deterministic [1 GB and 12 GB Phase 6A validation](benchmarks/2026-08-21-stable-text-sort.md); the current engine also passed the optimized [117-million-row `FIRSTNAME` sort](benchmarks/2026-08-23-12gb-sort-performance.md), including bounded RSS, measured temporary disk, complete order and preservation scans, and cancellation cleanup; Phase 6B adds exact numeric sorting with [1 GB validation](benchmarks/2026-09-04-numeric-sort.md); Phase 6C adds Character count, Word count, Shuffle, and Reverse with [1 GB validation](benchmarks/2026-09-04-additional-sort-modes.md); date/time sorting is planned in Phase 6D |
 | Phase 7: Hardening | Complete | Phase 7A packaging and installation are complete in the [packaged-app validation](benchmarks/2026-08-21-packaged-app.md); Phase 7B connected-workflow dogfooding and interface polish passed owner review, and the current workflows are documented in the [user guide](USER_GUIDE.md) |
 | Phase 8: Row operations | Phase 8A complete | **Delete Selected Rows** passed exact regressions, owner review, and the [1 GB and 12 GB release validation](benchmarks/2026-09-04-delete-selected-rows.md) |
 
@@ -259,7 +259,9 @@ and Save As never expose a partial or corrupted file.
 
 ## Phase 6 — Sorting
 
-Phase 6 is complete. Phase 6A lets users select exactly one numbered
+Phases 6A through 6C are complete; date/time sorting is planned in Phase 6D.
+Phase 6B adds exact numeric sorting with an
+explicit Text / Number choice. Phase 6A lets users select exactly one numbered
 column and apply a stable ascending or descending text sort to data rows. Sort
 is case-insensitive by default and exposes its own **Match case** option. The
 header stays fixed, missing ragged fields compare as empty values, and keys
@@ -298,6 +300,51 @@ source hashes remain unchanged, and cancellation leaves no output or run files.
 The later [12 GB sort optimization](benchmarks/2026-08-23-12gb-sort-performance.md)
 reduced the 117,168,829-row `FIRSTNAME` sort from 335.837 seconds to 142.211
 seconds while preserving byte-identical output and millisecond cancellation.
+
+### Phase 6B: Numeric sorting
+
+- [x] Add **Text / Number** to the existing Sort dialog, keep Text as the
+  default, and show **Match case** only for Text.
+- [x] Compare signed decimals and scientific notation exactly, preserve stable
+  numeric ties, and define blank and invalid-value handling explicitly.
+- [x] Reuse bounded runs and merging, include encoded numeric keys in memory
+  and disk limits, and retain cancellation, source safety, and working history.
+- [x] Cover numeric ordering, precision, sparse edits, forced multipass merging,
+  invalid-input cleanup, and the desktop interaction with focused regressions.
+- [x] Measure a deterministic 1 GB numeric workload and compare Text against
+  the previous implementation; update the user guide and validation report.
+
+**Phase 6B exit met:** Number sorting works through the existing workflow, preserves
+exact decimal order and source data, and passes correctness plus bounded-memory
+validation. The [1 GB numeric report](benchmarks/2026-09-04-numeric-sort.md)
+records exact order, stable ties, source preservation, cancellation, and Text
+compatibility. Date, locale-aware, and multi-column sorting remain later work.
+
+### Phase 6C: Additional sorting and row order
+
+- [x] Add Character count and Word count to the existing Sort window, with
+  shortest/longest and fewest/most directions and stable equal counts.
+- [x] Define Unicode character and whitespace-separated word counting, handle
+  blanks and missing fields, and reject invalid UTF-8 without changing data.
+- [x] Add whole-row Shuffle and Reverse with a fixed header, no column-based
+  direction controls, and existing Undo, Save, and source-safety behavior.
+- [x] Reuse bounded sort runs and merging; verify seeded shuffle preservation,
+  exact reversal, cancellation, sparse edits, and desktop interaction.
+- [x] Record 1 GB measurements and update the user guide and architecture docs.
+
+**Phase 6C exit met:** all four modes preserve rows and source data, reuse
+bounded merging and working-copy history, and pass exact regressions plus the
+[1 GB mode validation](benchmarks/2026-09-04-additional-sort-modes.md).
+
+### Phase 6D: Date and time sorting (planned)
+
+- [ ] Add oldest/newest ordering to the existing Sort window.
+- [ ] Require an explicit date/time format so ambiguous dates such as
+  `03/04/2026` are never guessed silently.
+- [ ] Define date-only values, timestamps, timezone handling, blanks, invalid
+  values, and stable equal timestamps before implementation.
+- [ ] Preserve source data, Undo, Save, cancellation, and bounded external
+  sorting; validate exact chronology and a large-file workload.
 
 ## Phase 7 — Hardening
 Repeatable packaging and installation, connected desktop workflow dogfooding,
@@ -382,7 +429,7 @@ records complete 1 GB and 12 GB runs below 4 MiB peak RSS.
 
 ## Later possibilities
 Persistent indexes and invalidation, broader encoding and malformed-data UX,
-numeric/date/locale-aware and multi-column sorting, controlled cold-cache
+date/locale-aware and multi-column sorting, controlled cold-cache
 performance dashboards, Developer ID signing and notarization for distribution,
 cross-platform front ends, plugin/API surface, schema inference, SQL-like
 querying, compressed files, CLI recipes, multi-file operations, and row

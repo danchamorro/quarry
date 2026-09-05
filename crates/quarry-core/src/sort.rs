@@ -1,8 +1,8 @@
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File, OpenOptions};
-use std::hash::Hasher;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -23,7 +23,11 @@ use crate::{
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 const DEFAULT_RUN_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MERGE_FAN_IN: usize = 32;
-const MERGE_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+// A numeric key adds a sign, an eight-byte decimal order, and a terminator.
+const NUMERIC_KEY_OVERHEAD: usize = 10;
+const MAX_NUMERIC_EXPONENT: i64 = 1_000_000;
+// At minimum fan-in, retain two heap keys, a pending key, and one record.
+const MERGE_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024 + 3 * NUMERIC_KEY_OVERHEAD;
 static NEXT_SORT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,10 +37,152 @@ pub enum SortDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    Text,
+    Number,
+    CharacterCount,
+    WordCount,
+    Shuffle { seed: u64 },
+    Reverse,
+}
+
+impl SortMode {
+    pub fn shuffle() -> Self {
+        Self::Shuffle {
+            seed: RandomState::new().hash_one(()),
+        }
+    }
+
+    pub const fn uses_column(self) -> bool {
+        !matches!(self, Self::Shuffle { .. } | Self::Reverse)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortSpec {
     pub column: usize,
+    pub mode: SortMode,
     pub direction: SortDirection,
     pub case_sensitivity: CaseSensitivity,
+}
+
+impl SortSpec {
+    /// Return an ascending comparison key. Numeric values use exact decimal order;
+    /// equal values share a key, and blank numeric fields have an empty key.
+    /// Numbers accept ASCII whitespace, a sign, a decimal point, and an optional
+    /// exponent from -1,000,000 to 1,000,000. Other nonblank values return an error.
+    /// Character counts use Unicode scalar values, including combining marks;
+    /// word counts split at Unicode whitespace. `ordinal` is the zero-based source
+    /// data-row position and determines Shuffle and Reverse keys.
+    pub fn key(&self, value: &[u8], ordinal: u64) -> Result<Vec<u8>, QuarryError> {
+        match self.mode {
+            SortMode::Text => {
+                let mut key = value.to_vec();
+                if self.case_sensitivity == CaseSensitivity::Insensitive {
+                    key.make_ascii_lowercase();
+                }
+                Ok(key)
+            }
+            SortMode::Number => numeric_key(value),
+            SortMode::CharacterCount | SortMode::WordCount => {
+                let value = std::str::from_utf8(value)
+                    .map_err(|_| invalid_sort_output("expected valid UTF-8 text"))?;
+                let count = if self.mode == SortMode::CharacterCount {
+                    // ponytail: count Unicode scalars, add grapheme segmentation if visual character counts are needed.
+                    value.chars().count()
+                } else {
+                    value.split_whitespace().count()
+                };
+                Ok((count as u64).to_be_bytes().to_vec())
+            }
+            SortMode::Shuffle { seed } => {
+                let mut hasher = DefaultHasher::new();
+                hasher.write_u64(seed);
+                hasher.write_u64(ordinal);
+                Ok(hasher.finish().to_be_bytes().to_vec())
+            }
+            SortMode::Reverse => Ok((!ordinal).to_be_bytes().to_vec()),
+        }
+    }
+}
+
+fn numeric_key(value: &[u8]) -> Result<Vec<u8>, QuarryError> {
+    let value = value.trim_ascii();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (negative, value) = match value[0] {
+        b'-' => (true, &value[1..]),
+        b'+' => (false, &value[1..]),
+        _ => (false, value),
+    };
+    let (mantissa, exponent) = match value.iter().position(|byte| matches!(byte, b'e' | b'E')) {
+        Some(index) => {
+            let exponent = std::str::from_utf8(&value[index + 1..])
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|value| (-MAX_NUMERIC_EXPONENT..=MAX_NUMERIC_EXPONENT).contains(value))
+                .ok_or_else(|| {
+                    invalid_sort_output(
+                        "numeric exponent must be an integer from -1000000 to 1000000",
+                    )
+                })?;
+            (&value[..index], exponent)
+        }
+        None => (value, 0),
+    };
+    let mut digits = 0_usize;
+    let mut integer_digits = None;
+    let mut leading_zeros = 0_usize;
+    let mut first_nonzero = None;
+    let mut last_nonzero = 0;
+    for (index, &byte) in mantissa.iter().enumerate() {
+        match byte {
+            b'0'..=b'9' => {
+                digits += 1;
+                if byte != b'0' {
+                    first_nonzero.get_or_insert(index);
+                    last_nonzero = index;
+                } else if first_nonzero.is_none() {
+                    leading_zeros += 1;
+                }
+            }
+            b'.' if integer_digits.is_none() => integer_digits = Some(digits),
+            _ => {
+                return Err(invalid_sort_output(
+                    "expected a number with an optional sign, decimal point, and exponent",
+                ));
+            }
+        }
+    }
+    if digits == 0 {
+        return Err(invalid_sort_output("expected at least one numeric digit"));
+    }
+    let Some(first_nonzero) = first_nonzero else {
+        return Ok(vec![2]);
+    };
+    let order = i64::try_from(integer_digits.unwrap_or(digits))
+        .ok()
+        .and_then(|value| value.checked_sub(i64::try_from(leading_zeros).ok()?))
+        .and_then(|value| value.checked_add(exponent))
+        .ok_or_else(|| invalid_sort_output("numeric value is too long"))?;
+    let significant = &mantissa[first_nonzero..=last_nonzero];
+    let capacity = significant
+        .len()
+        .checked_add(NUMERIC_KEY_OVERHEAD)
+        .ok_or_else(|| invalid_sort_output("numeric value is too long"))?;
+    let mut key = Vec::with_capacity(capacity);
+    key.push(if negative { 1 } else { 3 });
+    key.extend_from_slice(&((order as u64) ^ (1 << 63)).to_be_bytes());
+    key.extend(significant.iter().copied().filter(|byte| *byte != b'.'));
+    // The terminator makes complementing negative keys reverse prefix order too.
+    key.push(0);
+    if negative {
+        for byte in &mut key[1..] {
+            *byte = !*byte;
+        }
+    }
+    Ok(key)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,7 +227,7 @@ pub const fn estimate_sort_temporary_bytes(
 ) -> u64 {
     effective_bytes_upper_bound
         .saturating_mul(4)
-        .saturating_add(data_rows.saturating_mul(48))
+        .saturating_add(data_rows.saturating_mul(48 + 2 * NUMERIC_KEY_OVERHEAD as u64))
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +403,11 @@ impl SortJob {
         config: SortConfig,
     ) -> Result<Self, QuarryError> {
         validate_config(config)?;
+        if !spec.mode.uses_column() && spec.direction != SortDirection::Ascending {
+            return Err(QuarryError::InvalidOption(
+                "Shuffle and Reverse do not accept a sort direction",
+            ));
+        }
         if !has_header && !header_renames.is_empty() {
             return Err(QuarryError::InvalidOption(
                 "header renames require a header row",
@@ -418,7 +569,12 @@ fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
             "sort merge fan-in must be at least two",
         ));
     }
-    if config.max_record_bytes.saturating_mul(4) > MERGE_MEMORY_BUDGET_BYTES {
+    if config
+        .max_record_bytes
+        .saturating_mul(4)
+        .saturating_add(3 * NUMERIC_KEY_OVERHEAD)
+        > MERGE_MEMORY_BUDGET_BYTES
+    {
         return Err(QuarryError::InvalidOption(
             "sort record limit exceeds the merge memory budget",
         ));
@@ -811,15 +967,32 @@ impl<'a> InitialRunBuilder<'a> {
                 "cell edit column is out of range",
             ));
         }
-        let mut key = row_edits
-            .iter()
-            .find(|(column, _)| *column == self.spec.column)
-            .map(|(_, value)| (*value).to_vec())
-            .or_else(|| fields.get(self.spec.column).map(|field| field.to_vec()))
-            .unwrap_or_default();
-        if self.spec.case_sensitivity == CaseSensitivity::Insensitive {
-            key.make_ascii_lowercase();
-        }
+        let value = if self.spec.mode.uses_column() {
+            row_edits
+                .iter()
+                .find(|(column, _)| *column == self.spec.column)
+                .map(|(_, value)| *value)
+                .or_else(|| fields.get(self.spec.column).map(|field| field.as_ref()))
+                .unwrap_or_default()
+        } else {
+            &[]
+        };
+        let key = self
+            .spec
+            .key(value, self.rows)
+            .map_err(|error| match self.spec.mode {
+                SortMode::Number => QuarryError::InvalidNumericSortValue {
+                    data_row: self.rows.saturating_add(1),
+                    column: self.spec.column.saturating_add(1),
+                },
+                SortMode::CharacterCount | SortMode::WordCount => {
+                    QuarryError::InvalidUtf8SortValue {
+                        data_row: self.rows.saturating_add(1),
+                        column: self.spec.column.saturating_add(1),
+                    }
+                }
+                _ => error,
+            })?;
         self.max_key_bytes = self.max_key_bytes.max(key.len());
         let effective_record =
             if row_edits.is_empty() && !(physical_row > 0 && body.starts_with(UTF8_BOM)) {
@@ -1226,7 +1399,7 @@ fn read_head(
     let ordinal = u64::from_le_bytes(header[16..24].try_into().unwrap());
     let key_len = usize::try_from(key_len)
         .ok()
-        .filter(|length| *length <= max_record_bytes)
+        .filter(|length| *length <= max_record_bytes.saturating_add(NUMERIC_KEY_OVERHEAD))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid sort key length"))?;
     let record_len = usize::try_from(record_len)
         .ok()
@@ -1599,6 +1772,526 @@ mod tests {
         }
     }
 
+    fn number_spec(direction: SortDirection) -> SortSpec {
+        SortSpec {
+            column: 1,
+            mode: SortMode::Number,
+            direction,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        }
+    }
+
+    #[test]
+    fn count_sorts_use_unicode_decoded_text_edits_and_stable_ties() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let rows = [
+            "a,é\n",
+            "b,😀\n",
+            "c,e\u{301}\n",
+            "d,a b\n",
+            "e,\n",
+            "f\n",
+            "g,  \t\n",
+            "h,\"one\n two\"\n",
+            "i,z\u{2003}y\n",
+            "j,old\n",
+        ];
+        let source_bytes = format!("id,value\n{}", rows.concat());
+        fs::write(&source, &source_bytes).unwrap();
+        let source_session = session(&source, HeaderMode::FirstRow);
+        for (mode, direction, expected_order) in [
+            (
+                SortMode::CharacterCount,
+                SortDirection::Ascending,
+                "efabcdgijh",
+            ),
+            (
+                SortMode::CharacterCount,
+                SortDirection::Descending,
+                "hjdgicabef",
+            ),
+            (SortMode::WordCount, SortDirection::Ascending, "efgabcdhij"),
+            (SortMode::WordCount, SortDirection::Descending, "dhijabcefg"),
+        ] {
+            let destination = directory.join(format!("{mode:?}-{direction:?}.csv"));
+            let job = start_custom(
+                &source_session,
+                BTreeMap::new(),
+                BTreeMap::from([((10, 1), "猫 dog".as_bytes().to_vec())]),
+                SortSpec {
+                    mode,
+                    ..number_spec(direction)
+                },
+                &destination,
+                SortConfig {
+                    run_memory_bytes: 1,
+                    ..tiny_config()
+                },
+            );
+            wait_done(&job);
+            let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("sort unexpectedly cancelled");
+            };
+            let expected = format!(
+                "id,value\n{}",
+                expected_order
+                    .bytes()
+                    .map(|id| {
+                        if id == b'j' {
+                            "j,猫 dog\n"
+                        } else {
+                            rows[(id - b'a') as usize]
+                        }
+                    })
+                    .collect::<String>()
+            );
+            assert_eq!(
+                fs::read(&destination).unwrap(),
+                expected.as_bytes(),
+                "{mode:?} {direction:?}"
+            );
+            assert!(summary.merge_passes > 2);
+            assert!(summary.stable_ties_verified && summary.record_multiset_verified);
+            assert!(sort_artifacts(&directory).is_empty());
+        }
+        assert_eq!(fs::read(&source).unwrap(), source_bytes.as_bytes());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn count_sorts_reject_invalid_utf8_with_data_coordinates_and_cleanup() {
+        for mode in [SortMode::CharacterCount, SortMode::WordCount] {
+            let directory = case();
+            let source = directory.join("source.csv");
+            let destination = directory.join("sorted.csv");
+            let source_bytes = b"id,value,other\na,word,\xff\nb,words,\xff\nc,\xff,x\n";
+            fs::write(&source, source_bytes).unwrap();
+            let source_session = session(&source, HeaderMode::FirstRow);
+            let job = start_custom(
+                &source_session,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SortSpec {
+                    mode,
+                    ..number_spec(SortDirection::Ascending)
+                },
+                &destination,
+                SortConfig {
+                    run_memory_bytes: 1,
+                    ..tiny_config()
+                },
+            );
+            wait_done(&job);
+            assert!(job.progress().runs_created > 0);
+            assert_eq!(
+                job.error().unwrap(),
+                "Cannot count text at data row 3, column 2: expected valid UTF-8 text."
+            );
+            assert!(matches!(
+                job.wait(),
+                Err(QuarryError::InvalidUtf8SortValue {
+                    data_row: 3,
+                    column: 2
+                })
+            ));
+            assert!(!destination.exists());
+            assert!(sort_artifacts(&directory).is_empty());
+            assert_eq!(fs::read(&source).unwrap(), source_bytes);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn reverse_multipass_preserves_bom_header_edits_and_record_boundaries() {
+        for header_mode in [HeaderMode::FirstRow, HeaderMode::NoHeader] {
+            let directory = case();
+            let source = directory.join("source.csv");
+            let destination = directory.join("reversed.csv");
+            let has_header = header_mode == HeaderMode::FirstRow;
+            let mut source_bytes = UTF8_BOM.to_vec();
+            if has_header {
+                source_bytes.extend_from_slice(b"id,value\r\n");
+            }
+            source_bytes.extend_from_slice(b"a,\xff\r\nb,\"two\r\nlines\"\r\nc,same\r\nd,same");
+            fs::write(&source, &source_bytes).unwrap();
+            let source_session = session(&source, header_mode);
+            let job = start_custom(
+                &source_session,
+                if has_header {
+                    BTreeMap::from([(0, b"ID".to_vec())])
+                } else {
+                    BTreeMap::new()
+                },
+                BTreeMap::from([((1 + u64::from(has_header), 0), b"B".to_vec())]),
+                SortSpec {
+                    mode: SortMode::Reverse,
+                    column: usize::MAX,
+                    ..number_spec(SortDirection::Ascending)
+                },
+                &destination,
+                SortConfig {
+                    run_memory_bytes: 1,
+                    ..tiny_config()
+                },
+            );
+            wait_done(&job);
+            let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("sort unexpectedly cancelled");
+            };
+            let mut expected = UTF8_BOM.to_vec();
+            if has_header {
+                expected.extend_from_slice(b"ID,value\r\n");
+            }
+            expected.extend_from_slice(b"d,same\r\nc,same\r\nB,\"two\r\nlines\"\r\na,\xff\r\n");
+            assert_eq!(fs::read(&destination).unwrap(), expected);
+            assert_eq!(fs::read(&source).unwrap(), source_bytes);
+            assert_eq!(summary.rows_sorted, 4);
+            assert_eq!(summary.header_rows, u64::from(has_header));
+            assert!(summary.merge_passes > 1);
+            assert!(summary.stable_ties_verified && summary.record_multiset_verified);
+            assert!(sort_artifacts(&directory).is_empty());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn seeded_shuffle_is_a_repeatable_multipass_permutation() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let rows = (0..64).map(|id| format!("{id},same\n")).collect::<Vec<_>>();
+        let source_bytes = format!("id,value\n{}", rows.concat());
+        fs::write(&source, &source_bytes).unwrap();
+        let source_session = session(&source, HeaderMode::FirstRow);
+        let mut outputs = Vec::new();
+        for (attempt, seed) in [17, 17, 18].into_iter().enumerate() {
+            let destination = directory.join(format!("shuffle-{attempt}.csv"));
+            let job = start_custom(
+                &source_session,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SortSpec {
+                    mode: SortMode::Shuffle { seed },
+                    column: usize::MAX,
+                    ..number_spec(SortDirection::Ascending)
+                },
+                &destination,
+                SortConfig {
+                    run_memory_bytes: 1,
+                    ..tiny_config()
+                },
+            );
+            wait_done(&job);
+            let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("sort unexpectedly cancelled");
+            };
+            let output = fs::read_to_string(&destination).unwrap();
+            let mut actual_rows = output.lines().skip(1).collect::<Vec<_>>();
+            actual_rows.sort_unstable();
+            let mut expected_rows = rows.iter().map(|row| row.trim_end()).collect::<Vec<_>>();
+            expected_rows.sort_unstable();
+            assert_eq!(actual_rows, expected_rows);
+            assert!(output.starts_with("id,value\n"));
+            assert!(summary.merge_passes > 2);
+            assert!(summary.stable_ties_verified && summary.record_multiset_verified);
+            assert!(
+                summary.peak_temporary_bytes
+                    <= estimate_sort_temporary_bytes(source_bytes.len() as u64, rows.len() as u64)
+            );
+            assert!(sort_artifacts(&directory).is_empty());
+            outputs.push(output);
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert_ne!(outputs[0], outputs[2]);
+        assert_ne!(outputs[0], source_bytes);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes.as_bytes());
+        for mode in [SortMode::shuffle(), SortMode::Reverse] {
+            assert!(!mode.uses_column());
+            let destination = directory.join("invalid-direction.csv");
+            let result = source_session.start_create_sorted_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SortSpec {
+                    mode,
+                    ..number_spec(SortDirection::Descending)
+                },
+                &destination,
+            );
+            assert!(matches!(
+                result,
+                Err(QuarryError::InvalidOption(
+                    "Shuffle and Reverse do not accept a sort direction"
+                ))
+            ));
+            assert!(!destination.exists());
+            assert!(sort_artifacts(&directory).is_empty());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn numeric_keys_are_exact_canonical_and_bounded() {
+        let spec = number_spec(SortDirection::Ascending);
+        for equivalents in [
+            ["2", "02", "2.0", "+2e0", "  200e-2\t"],
+            ["0", "-0", "+0.00", "0e1000000", "0e-1000000"],
+            ["-0.01", "-.01", "-1e-2", "-0.0100", "-00001E-2"],
+        ] {
+            let expected = spec.key(equivalents[0].as_bytes(), 0).unwrap();
+            for value in equivalents {
+                assert_eq!(spec.key(value.as_bytes(), 0).unwrap(), expected, "{value}");
+            }
+        }
+        let ascending = [
+            "",
+            "-1e1000000",
+            "-9007199254740993",
+            "-9007199254740992",
+            "-10",
+            "-1.01",
+            "-1",
+            "-.01",
+            "-1e-1000000",
+            "0",
+            "1e-1000000",
+            ".01",
+            "1.",
+            "1.00000000000000000001",
+            "1.00000000000000000002",
+            "2",
+            "10",
+            "9007199254740992",
+            "9007199254740993",
+            "1e1000000",
+        ];
+        for pair in ascending.windows(2) {
+            assert!(
+                spec.key(pair[0].as_bytes(), 0).unwrap() < spec.key(pair[1].as_bytes(), 0).unwrap(),
+                "{pair:?}"
+            );
+        }
+        assert!(spec.key(b" \t\r\n", 0).unwrap().is_empty());
+        assert_eq!(spec.key(b"1e1000000", 0).unwrap().len(), 11);
+        for invalid in [
+            "+",
+            "-",
+            ".",
+            "1..2",
+            "1 2",
+            "1,000",
+            "$2",
+            "NaN",
+            "inf",
+            "-Infinity",
+            "1e",
+            "1e+",
+            "1ee2",
+            "1e1.5",
+            "1e1000001",
+            "1e-1000001",
+            "1e999999999999999999999",
+            "0e1000001",
+            "\u{a0}2",
+        ] {
+            assert!(spec.key(invalid.as_bytes(), 0).is_err(), "{invalid}");
+        }
+        assert!(spec.key(b"\xff", 0).is_err());
+        let long_number = vec![b'1'; 1024 * 1024];
+        assert_eq!(
+            spec.key(&long_number, 0).unwrap().len(),
+            long_number.len() + NUMERIC_KEY_OVERHEAD
+        );
+    }
+
+    #[test]
+    fn numeric_multipass_sort_is_exact_stable_and_applies_sparse_edits() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let rows = [
+            "a,10\n",
+            "b,2\n",
+            "c,02\n",
+            "d,2.0\n",
+            "e,+2e0\n",
+            "f,-0\n",
+            "g,+0.00\n",
+            "h,0e1000000\n",
+            "i,9007199254740993\n",
+            "j,9007199254740992\n",
+            "k,-1.01\n",
+            "l,-1\n",
+            "m,-.01\n",
+            "n,.01\n",
+            "o,\n",
+            "p, \t \n",
+            "q\n",
+            "r,replace me\n",
+            "s,1e1000000\n",
+            "t,1e-1000000\n",
+            "u,-1e1000000\n",
+            "v,-1e-1000000\n",
+            "w,1.00000000000000000001\n",
+            "x,1.00000000000000000002\n",
+            "y,1.0\n",
+        ];
+        let source_bytes = format!("\u{feff}id,key\n{}", rows.concat());
+        fs::write(&source, &source_bytes).unwrap();
+        let source_session = session(&source, HeaderMode::FirstRow);
+        for (direction, expected_order) in [
+            (SortDirection::Ascending, "opqurklmvfghtnywxbcdeajis"),
+            (SortDirection::Descending, "sijabcdexwyntfghvmlkruopq"),
+        ] {
+            let destination = directory.join(format!("{direction:?}.csv"));
+            let job = start_custom(
+                &source_session,
+                BTreeMap::from([(0, b"ID".to_vec())]),
+                BTreeMap::from([((18, 1), b"-2.5".to_vec())]),
+                number_spec(direction),
+                &destination,
+                SortConfig {
+                    run_memory_bytes: 1,
+                    ..tiny_config()
+                },
+            );
+            wait_done(&job);
+            let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("sort unexpectedly cancelled");
+            };
+            let expected = format!(
+                "\u{feff}ID,key\n{}",
+                expected_order
+                    .bytes()
+                    .map(|id| {
+                        if id == b'r' {
+                            "r,-2.5\n"
+                        } else {
+                            rows[(id - b'a') as usize]
+                        }
+                    })
+                    .collect::<String>()
+            );
+            assert_eq!(
+                fs::read(&destination).unwrap(),
+                expected.as_bytes(),
+                "{direction:?}"
+            );
+            assert_eq!(summary.rows_sorted, rows.len() as u64);
+            assert!(summary.merge_passes > 2);
+            assert!(summary.stable_ties_verified);
+            assert!(summary.record_multiset_verified);
+            assert!(
+                summary.peak_temporary_bytes
+                    <= estimate_sort_temporary_bytes(source_bytes.len() as u64, rows.len() as u64)
+            );
+            assert!(sort_artifacts(&directory).is_empty());
+        }
+        assert_eq!(fs::read(&source).unwrap(), source_bytes.as_bytes());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_numeric_edits_report_data_coordinates_and_remove_sort_artifacts() {
+        for header_mode in [HeaderMode::FirstRow, HeaderMode::NoHeader] {
+            let directory = case();
+            let source = directory.join("source.csv");
+            let destination = directory.join("sorted.csv");
+            let header = if header_mode == HeaderMode::FirstRow {
+                "id,key\n"
+            } else {
+                ""
+            };
+            let source_bytes = format!("{header}a,3\nb,2\nc,1\n");
+            fs::write(&source, &source_bytes).unwrap();
+            let source_session = session(&source, header_mode);
+            let job = start_custom(
+                &source_session,
+                BTreeMap::new(),
+                BTreeMap::from([((2 + u64::from(!header.is_empty()), 1), b"ten".to_vec())]),
+                number_spec(SortDirection::Ascending),
+                &destination,
+                SortConfig {
+                    run_memory_bytes: 1,
+                    ..tiny_config()
+                },
+            );
+            wait_done(&job);
+            assert!(job.progress().runs_created > 0);
+            assert_eq!(
+                job.error().unwrap(),
+                "Cannot sort as Number at data row 3, column 2: expected a number (for example -12.5 or 1e3)."
+            );
+            assert!(matches!(
+                job.wait(),
+                Err(QuarryError::InvalidNumericSortValue {
+                    data_row: 3,
+                    column: 2
+                })
+            ));
+            assert!(!destination.exists());
+            assert!(sort_artifacts(&directory).is_empty());
+            assert_eq!(fs::read(&source).unwrap(), source_bytes.as_bytes());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn numeric_merge_accepts_expanded_keys_and_rejects_oversized_run_keys() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        fs::write(&source, b"9\n1\n8\n2\n").unwrap();
+        let source_session = session(&source, HeaderMode::NoHeader);
+        let config = SortConfig {
+            max_record_bytes: 2,
+            run_memory_bytes: 1,
+            ..tiny_config()
+        };
+        let job = start_custom(
+            &source_session,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            SortSpec {
+                column: 0,
+                ..number_spec(SortDirection::Ascending)
+            },
+            &destination,
+            config,
+        );
+        wait_done(&job);
+        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("sort unexpectedly cancelled");
+        };
+        assert_eq!(fs::read(&destination).unwrap(), b"1\n2\n8\n9\n");
+        assert!(summary.merge_passes > 1);
+        assert!(summary.peak_temporary_bytes <= estimate_sort_temporary_bytes(8, 4));
+        let workspace = RunWorkspace::create(&destination).unwrap();
+        let (path, mut writer) = workspace.create_run().unwrap();
+        write_entry_parts(
+            &mut writer,
+            &vec![0; config.max_record_bytes + NUMERIC_KEY_OVERHEAD + 1],
+            b"1\n",
+            0,
+        )
+        .unwrap();
+        writer.flush().unwrap();
+        let error = read_head(
+            &mut BufReader::new(File::open(path).unwrap()),
+            config.max_record_bytes,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid sort key length"));
+        workspace.cleanup().unwrap();
+        assert!(sort_artifacts(&directory).is_empty());
+        assert!(
+            validate_config(SortConfig {
+                max_record_bytes: DEFAULT_MAX_RECORD_BYTES + 1,
+                ..tiny_config()
+            })
+            .is_err()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn case_insensitive_multipass_sort_keeps_equal_case_variants_stable() {
         let directory = case();
@@ -1613,6 +2306,7 @@ mod tests {
             BTreeMap::from([(0, b"ID".to_vec())]),
             BTreeMap::from([((1, 2), b"a".to_vec()), ((2, 1), b"changed,comma".to_vec())]),
             SortSpec {
+                mode: SortMode::Text,
                 column: 2,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Insensitive,
@@ -1665,6 +2359,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
             SortSpec {
+                mode: SortMode::Text,
                 column: 1,
                 direction: SortDirection::Descending,
                 case_sensitivity: CaseSensitivity::Sensitive,
@@ -1695,6 +2390,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
             SortSpec {
+                mode: SortMode::Text,
                 column: 1,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
@@ -1795,6 +2491,7 @@ mod tests {
             &header_renames,
             &cell_edits,
             SortSpec {
+                mode: SortMode::Text,
                 column: 0,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
@@ -1834,6 +2531,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             SortSpec {
+                mode: SortMode::Text,
                 column: 1,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
@@ -1869,7 +2567,8 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
             SortSpec {
-                column: 1,
+                mode: SortMode::shuffle(),
+                column: usize::MAX,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
             },
@@ -1908,6 +2607,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
             SortSpec {
+                mode: SortMode::Text,
                 column: 0,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
@@ -1962,6 +2662,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             SortSpec {
+                mode: SortMode::Text,
                 column: 1,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
@@ -2007,6 +2708,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
             SortSpec {
+                mode: SortMode::Text,
                 column: 1,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
@@ -2028,7 +2730,7 @@ mod tests {
 
     #[test]
     fn temporary_disk_estimate_covers_two_generations_of_framed_keyed_runs() {
-        assert_eq!(estimate_sort_temporary_bytes(123, 7), 828);
+        assert_eq!(estimate_sort_temporary_bytes(123, 7), 968);
         assert_eq!(estimate_sort_temporary_bytes(u64::MAX, 1), u64::MAX);
         assert_eq!(estimate_sort_temporary_bytes(1, u64::MAX), u64::MAX);
     }
@@ -2045,6 +2747,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
             SortSpec {
+                mode: SortMode::Text,
                 column: 1,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
@@ -2078,10 +2781,12 @@ mod tests {
             effective_merge_fan_in(DEFAULT_SORT_CONFIG, 32),
             DEFAULT_MERGE_FAN_IN
         );
-        let fan_in =
-            effective_merge_fan_in(DEFAULT_SORT_CONFIG, DEFAULT_SORT_CONFIG.max_record_bytes);
+        let fan_in = effective_merge_fan_in(
+            DEFAULT_SORT_CONFIG,
+            DEFAULT_SORT_CONFIG.max_record_bytes + NUMERIC_KEY_OVERHEAD,
+        );
         assert_eq!(fan_in, 2);
-        let max_key_bytes = DEFAULT_SORT_CONFIG.max_record_bytes;
+        let max_key_bytes = DEFAULT_SORT_CONFIG.max_record_bytes + NUMERIC_KEY_OVERHEAD;
         let heap_keys = fan_in.saturating_mul(max_key_bytes);
         let pending_key = max_key_bytes;
         let pending_record = DEFAULT_SORT_CONFIG.max_record_bytes;

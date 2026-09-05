@@ -44,7 +44,7 @@ Column controls operate on stable source-column identities. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
 
-Find/Replace, Filters, and Sort each expose their own **Match case** option.
+Find/Replace, Filters, and Text sorting each expose their own **Match case** option.
 Each option is off by default, so its tool compares ASCII letters without
 regard to case. Turning it on uses exact case-sensitive text matching. The
 Filter to This Value and Filter Out This Value cell actions inherit the current
@@ -176,8 +176,29 @@ current document unchanged. Exact regressions and deterministic 1 GB and 12 GB
 release runs pass with peak RSS below 20 MiB, measured temporary storage below
 the conservative estimate, bounded effective-record multiset evidence, exact
 stable-tie source-ordinal checks, unchanged source hashes, and prompt
-cancellation without leftovers. Numeric, date, locale-aware, and multi-column
-sorting remain later slices.
+cancellation without leftovers.
+
+Phase 6B adds an explicit **Text / Number** choice to the same Sort dialog.
+Number compares signed decimal values exactly, without floating-point rounding,
+and accepts dot decimals, scientific notation with exponents between -1,000,000
+and 1,000,000, and surrounding ASCII whitespace. Empty or missing values sort
+first ascending and last descending; equivalent numbers retain source order.
+Invalid nonblank values abort with a data-row and column error before publication.
+The existing bounded runs, guarded working copy, cancellation, and history apply
+to both modes. Text remains the default. The [1 GB numeric validation](benchmarks/2026-09-04-numeric-sort.md)
+records exact output, Text compatibility, memory, temporary disk, and
+cancellation. Date, locale-aware, and multi-column sorting remain later slices.
+
+Phase 6C extends the same Sort window with Character count, Word count,
+Shuffle, and Reverse. Character count measures Unicode scalar values, including
+spaces and combining marks; Word count splits on Unicode whitespace. Invalid
+UTF-8 in the selected count column aborts with row/column context. Equal counts
+remain stable. Shuffle and Reverse ignore the selected column and reorder
+whole data rows with the header fixed. They reuse guarded working copies,
+bounded merging, cancellation, and structural history. The [1 GB mode validation](benchmarks/2026-09-04-additional-sort-modes.md)
+records complete count, Shuffle, and Reverse runs. Date and time sorting
+is planned separately in Phase 6D, with explicit input formats and timezone
+semantics rather than silent date guessing.
 
 ## Version 0.4: desktop packaging and workflow polish (complete)
 

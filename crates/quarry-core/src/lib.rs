@@ -31,7 +31,7 @@ pub use index::{Checkpoint, IndexConfig, IndexJob, IndexProgress, StructuralInde
 use quarry_delimited::{ParseError, RecordScanner, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
 pub use sort::{
-    SortDirection, SortJob, SortOutcome, SortProgress, SortSpec, SortSummary,
+    SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec, SortSummary,
     estimate_sort_temporary_bytes,
 };
 
@@ -73,6 +73,14 @@ pub enum QuarryError {
         requested: u64,
         indexed_matches: u64,
     },
+    InvalidNumericSortValue {
+        data_row: u64,
+        column: usize,
+    },
+    InvalidUtf8SortValue {
+        data_row: u64,
+        column: usize,
+    },
     InvalidOption(&'static str),
     ExportDestinationIsSource,
     ExportDestinationExists,
@@ -105,6 +113,14 @@ impl fmt::Display for QuarryError {
             } => write!(
                 f,
                 "match {requested} is not indexed yet ({indexed_matches} matches available)"
+            ),
+            Self::InvalidNumericSortValue { data_row, column } => write!(
+                f,
+                "Cannot sort as Number at data row {data_row}, column {column}: expected a number (for example -12.5 or 1e3)."
+            ),
+            Self::InvalidUtf8SortValue { data_row, column } => write!(
+                f,
+                "Cannot count text at data row {data_row}, column {column}: expected valid UTF-8 text."
             ),
             Self::InvalidOption(option) => write!(f, "invalid option: {option}"),
             Self::ExportDestinationIsSource => {

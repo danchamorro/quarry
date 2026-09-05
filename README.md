@@ -38,7 +38,7 @@ working memory bounded and does not change the source until you choose
 | Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, and Does not equal predicates; same-column alternatives with AND across columns; case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
 | Edit | Direct cell and header editing; multiline values; one-level structural Undo and Redo; Discard Changes |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or delete the selected columns; continue editing the result before saving |
-| Sort | Stable ascending and descending text sort; case-insensitive by default with a per-tool Match case option; fixed header; deterministic order for equal values; cancellation and disk preflight |
+| Sort | Text, exact Number, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
 | Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |
 
 ## Install Quarry
@@ -117,6 +117,9 @@ were not purged, so no result is presented as a controlled cold-cache claim.
 The 50 GB sort still proves completion and correctness, but its timing predates
 the adaptive merge optimization and is not a current throughput estimate.
 
+The sorting results above measure Text mode. Number, Character count, Word
+count, Shuffle, and Reverse have separate 1 GB validations linked below.
+
 <details>
 <summary><strong>Benchmark reports and methodology</strong></summary>
 
@@ -130,6 +133,8 @@ the adaptive merge optimization and is not a current throughput estimate.
 - [12 GB Split and Combine](docs/benchmarks/2026-08-19-split-join-transformations.md)
 - [Original deterministic stable Sort validation](docs/benchmarks/2026-08-21-stable-text-sort.md)
 - [Current 12 GB `FIRSTNAME` sort optimization](docs/benchmarks/2026-08-23-12gb-sort-performance.md)
+- [1 GB exact numeric sorting validation](docs/benchmarks/2026-09-04-numeric-sort.md)
+- [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)
 - [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
 
 </details>
