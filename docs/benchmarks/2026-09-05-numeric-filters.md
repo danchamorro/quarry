@@ -61,7 +61,11 @@ this follow-up. The extracted validator's exponent-limit assertions and
 additional syntax checks passed; all 24 generated amount values retained their
 previous classifications, so the recorded benchmark results remain unchanged.
 These follow-up changes were checked separately and are outside the original
-CodeRabbit CLI review's scope. The desktop and core filter code are unchanged.
+CodeRabbit CLI review's scope. Further review fixes preserve the rule index in
+empty Contains errors and assert the documented export count, size, and hash.
+All 264 workspace tests, formatting, and strict workspace Clippy passed. The
+updated verifier passed on the retained 1 GB workload, and each new constant
+assertion rejected a deliberately incorrect value. The desktop code is unchanged.
 
 ## Environment and scope
 
@@ -368,7 +372,9 @@ for build in ['baseline', 'candidate']:
         actual = int(re.search(r'^Matches found: (\d+)$', log, re.M).group(1))
         assert actual == counts['text'], (build, actual, counts['text'])
 export = (root / 'numeric-export.log').read_text()
-assert int(re.search(r'^Published rows: (\d+)$', export, re.M).group(1)) == counts['between']
+assert int(re.search(r'^Published rows: (\d+)$', export, re.M).group(1)) == counts['between'] == 1_724_748
+assert output_bytes == 334_036_832
+assert output_hash.hexdigest() == '15ae1c8da605746863e3e3982c4ab6266355e64d4dd8c81c0cc21ff63595ccc9'
 for name in ['numeric-cancel', 'numeric-export-cancel']:
     log = (root / f'{name}.log').read_text()
     assert 'Outcome: cancelled' in log

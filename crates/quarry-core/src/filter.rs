@@ -592,9 +592,7 @@ pub(crate) fn compile_matchers(
             }
             if !predicate.operator.is_numeric() {
                 if predicate.operator == FilterOperator::Contains && predicate.value.is_empty() {
-                    return Err(QuarryError::InvalidOption(
-                        "contains filter value must not be empty",
-                    ));
+                    return Err(invalid("contains filter value must not be empty"));
                 }
                 return Ok(PredicateMatcher::Text(ByteMatcher::new(
                     &predicate.value,
@@ -1254,7 +1252,10 @@ mod tests {
                 ],
                 case_sensitivity: CaseSensitivity::Sensitive,
             }),
-            Err(QuarryError::InvalidOption(_))
+            Err(QuarryError::InvalidFilter {
+                rule: 2,
+                reason: "contains filter value must not be empty",
+            })
         ));
         assert!(matches!(
             session.start_filter(FilterQuery {
