@@ -34,9 +34,10 @@ cargo test --workspace --locked
 cargo build --workspace --release --locked
 ```
 
-All 263 workspace tests passed: 125 core, 103 egui, 25 CLI, nine delimited, and
-one AppKit test. Seven new tests plus numeric variants of existing cancellation
-and record-cap tests cover exact boundaries and precision, invalid bounds and
+The initial feature validation passed all 263 workspace tests: 125 core, 103
+egui, 25 CLI, nine delimited, and one AppKit test. Seven new tests plus numeric
+variants of existing cancellation and record-cap tests cover exact boundaries
+and precision, invalid bounds and
 data, grouped numeric/text rules, indexed navigation, and byte-exact export.
 The desktop interaction test selects the accessible Between control, fills
 labelled bounds, applies the filter, verifies rejected drafts preserve the
@@ -50,8 +51,17 @@ CodeRabbit CLI 0.7.5 completed `coderabbit review --agent --uncommitted
 --include-untracked` on 2026-09-05 with exit status 0, `review_completed`,
 and zero findings across all 14 changed files. File hashes were unchanged
 throughout the review. There were no findings to classify as real problems
-or optional suggestions. Only review and PR delivery documentation was
-updated afterward; application code remained unchanged.
+or optional suggestions in that CLI review.
+
+A later follow-up rejects a following CLI option as a missing `--and between`
+upper bound while preserving valid negative bounds. It also enforces the
+documented exponent limits in the independent Python validator. All 26 CLI
+tests, formatting, strict CLI Clippy, and the CLI release build passed after
+this follow-up. The extracted validator's exponent-limit assertions and
+additional syntax checks passed; all 24 generated amount values retained their
+previous classifications, so the recorded benchmark results remain unchanged.
+These follow-up changes were checked separately and are outside the original
+CodeRabbit CLI review's scope. The desktop and core filter code are unchanged.
 
 ## Environment and scope
 
@@ -266,6 +276,9 @@ assert not list(root.glob('.quarry-export-*')), 'Export temporary file remains'
 
 ### verify.py
 
+The validator also checks exponent limits in memory without changing the
+recorded benchmark dataset.
+
 ```python
 from pathlib import Path
 from decimal import Decimal
@@ -276,13 +289,21 @@ import re
 
 root = Path(__file__).parent
 # CSV decoding and exact Decimal comparisons are independent of Quarry's parser.
-number = re.compile(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z')
+number = re.compile(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE]([+-]?[0-9]+))?\Z')
 cache = {}
 def numeric(value):
     value = value.strip(' \t\r\n\v\f')
     if value not in cache:
-        cache[value] = Decimal(value) if number.fullmatch(value) else None
+        match = number.fullmatch(value)
+        valid = match is not None and -1_000_000 <= int(match.group(1) or '0') <= 1_000_000
+        cache[value] = Decimal(value) if valid else None
     return cache[value]
+for exponent in [-1_000_000, 1_000_000]:
+    value = f'1e{exponent}'
+    assert numeric(value) == Decimal(value), value
+for exponent in [-1_000_001, 1_000_001]:
+    value = f'1e{exponent}'
+    assert numeric(value) is None, value
 class RecordingLines:
     def __init__(self, stream):
         self.stream = stream

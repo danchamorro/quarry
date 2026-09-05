@@ -133,6 +133,7 @@ fn parse_and_filter(args: &[String], cursor: &mut usize) -> CliResult<FilterPred
     let upper_bound = if operator == FilterOperator::Between {
         Some(
             args.get(*cursor + 1)
+                .filter(|candidate| !candidate.starts_with("--"))
                 .ok_or("--and between requires an upper bound")?
                 .as_bytes()
                 .to_vec(),
@@ -3803,6 +3804,41 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), original);
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn and_between_reports_missing_upper_bound_before_an_option() {
+        let args: Vec<String> = [
+            "source.csv",
+            "--column",
+            "1",
+            "--operator",
+            "gt",
+            "--value",
+            "0",
+            "--and",
+            "2",
+            "between",
+            "-2",
+            "--cache-state",
+            "warm",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let expected = "--and between requires an upper bound";
+        assert_eq!(
+            filter_command(args.clone()).unwrap_err().to_string(),
+            expected
+        );
+        assert_eq!(export_command(args).unwrap_err().to_string(), expected);
+
+        let args =
+            ["--and", "2", "between", "-2", "-1", "--cache-state", "warm"].map(str::to_owned);
+        let mut cursor = 0;
+        let predicate = super::parse_and_filter(&args, &mut cursor).unwrap();
+        assert_eq!(predicate.upper_bound.as_deref(), Some(b"-1".as_slice()));
+        assert_eq!(cursor, 4);
     }
 
     #[test]
