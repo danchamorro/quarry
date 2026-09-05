@@ -7226,7 +7226,7 @@ fn show_table(
     if virtualized && let Some(column) = focused_column {
         let target_x = ROW_NUMBER_WIDTH + column_spacing + column_offsets[column];
         horizontal_scroll = horizontal_scroll.horizontal_scroll_offset(
-            (target_x - (viewport_width - column_widths[column]) / 2.0).max(0.0),
+            (target_x - (viewport_width - column_widths[column]).max(0.0) / 2.0).max(0.0),
         );
     }
 
@@ -11548,6 +11548,60 @@ mod tests {
                 let restored = render_grid(&ctx, document);
                 assert!(header_width(&restored, total_columns - 1) < f64::from(last_width) - 100.0);
             }
+        }
+    }
+
+    #[test]
+    fn revealing_an_oversized_fitted_column_keeps_its_start_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized-column.csv");
+        let headers = vec!["column"; 65];
+        let mut values = vec!["x".to_owned(); 65];
+        values[64] = "wide value ".repeat(10);
+        fs::write(
+            &path,
+            format!("{}\n{}\n", headers.join(","), values.join(",")),
+        )
+        .unwrap();
+        let mut document = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        ctx.enable_accesskit();
+        let render = |document: &mut Document| {
+            ctx.run(grid_input_with_width(600.0), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, document).unwrap();
+                });
+            })
+        };
+        document.auto_fit_columns = true;
+        for _ in 0..3 {
+            let _ = render(&mut document);
+        }
+        document.view_column(64).unwrap();
+        for _ in 0..3 {
+            let output = render(&mut document);
+            let tree = output.platform_output.accesskit_update.unwrap();
+            let bounds = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Select file column 65 (column)"))
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap();
+            assert!(bounds.width() > 600.0);
+            assert!(
+                bounds.x0 >= 0.0 && bounds.x0 < 100.0,
+                "column start is off-screen: {bounds:?}"
+            );
         }
     }
 
