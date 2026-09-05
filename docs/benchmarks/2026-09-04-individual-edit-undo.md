@@ -3,8 +3,10 @@
 Priority 1 is implemented and locally validated on
 `codex/individual-edit-undo`, based on
 `73976e2aa827adf052ff9bcb95cfdf237e892369`. Initial validation used the
-uncommitted feature build. See the [priority checklist](../PRE_BETA_CHECKLIST.md)
-for delivery status. Priorities 2 through 4 remain planned.
+uncommitted feature build. Implementation commit `55ad8df` is submitted in
+[PR #35](https://github.com/danchamorro/quarry/pull/35). See the
+[priority checklist](../PRE_BETA_CHECKLIST.md) for delivery status.
+Priorities 2 through 4 remain planned.
 
 ## Behavior and resource bounds
 

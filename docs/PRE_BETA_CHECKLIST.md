@@ -34,8 +34,8 @@ tests, strict Clippy, formatting, release build, and installed-app validation
 passed. Mixed/repeated edits, typing focus, structural Undo/Redo, history limits,
 lifecycle resets, and exact source/output bytes were checked. The local installed
 feature build records dirty source. CodeRabbit CLI 0.7.5 completed its review
-with zero findings on 2026-09-05. The feature branch is awaiting PR submission
-and has not been merged. Controls
+with zero findings on 2026-09-05. Implementation commit `55ad8df` is submitted in
+[PR #35](https://github.com/danchamorro/quarry/pull/35), awaiting merge. Controls
 and limits are documented in the [user guide](USER_GUIDE.md#undo-and-redo-changes)
 and [architecture](ARCHITECTURE.md#document-editing-and-persistence).
 

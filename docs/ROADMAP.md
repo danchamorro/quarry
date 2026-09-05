@@ -10,8 +10,9 @@ cleanup, and temporary-disk handling. It contains completion criteria and space
 for validation evidence. Priority 1 is implemented and
 [locally validated](benchmarks/2026-09-04-individual-edit-undo.md), including the
 installed app. CodeRabbit CLI review completed with zero findings on 2026-09-05;
-the feature branch has not been merged. Priorities 2 through 4
-remain planned; completed alpha phases below retain their existing scope.
+[PR #35](https://github.com/danchamorro/quarry/pull/35) is awaiting merge.
+Priorities 2 through 4 remain planned; completed alpha phases below retain their
+existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.
 
 ## Current progress: 2026-09-04
