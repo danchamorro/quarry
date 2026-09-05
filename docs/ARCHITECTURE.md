@@ -110,8 +110,9 @@ growing without bound.
 Core defaults to 1 MiB read chunks, with a 64 MiB bootstrap and record limit and
 fixed budgets for the adaptive structural and filter indexes. The UI retains
 the bounded bootstrap rows, one source viewport buffer, one filtered viewport
-buffer when filtering is active, compact metadata per known column, the
-user-driven Find navigation history, and at most a 64 MiB clipboard payload.
+buffer when filtering is active, compact metadata per known column, bounded
+individual-edit history, the user-driven Find navigation history, and at most a
+64 MiB clipboard payload.
 [ADR 0002](adr/0002-defer-viewport-cache.md) records why an application viewport
 cache remains deferred.
 
@@ -130,8 +131,13 @@ than file size.
 
 The materialized working copy necessarily uses disk proportional to the current
 document. Quarry retains the current private CSV and may retain one adjacent
-private CSV for one-level structural Undo or Redo. Its private directory is
-owner-only, and each materialized CSV is created with owner-only permissions.
+private CSV for one-level structural Undo or Redo. Each retained version keeps
+its individual-edit history, limited to 1,000 combined Undo and Redo entries and
+16 MiB of before-and-after text payload. There are at most two retained versions;
+background preparation and history switching may temporarily clone this state.
+These limits cover history payload, not the sparse overlay or allocator
+overhead. Its private directory is owner-only, and each materialized CSV is
+created with owner-only permissions.
 Quarry removes private working files on Discard, successful publication,
 document replacement, and shutdown.
 
@@ -176,8 +182,9 @@ count.
 
 **Replace in Cell** operates only on the revealed current Find match. It
 replaces every non-overlapping literal occurrence in that cell's effective
-value under the same Find/Replace case setting, records the result in the
-existing sparse edit map, and starts the next search. **Replace All** also uses
+value under the same Find/Replace case setting, records the result through the
+same sparse-edit and individual-history path as inline editing, and starts the
+next search. **Replace All** also uses
 that setting, applies sparse data-cell edits first, skips the header, and
 streams every data record through the existing private rewrite worker. A
 successful run publishes and reindexes a private working CSV, then participates
@@ -327,10 +334,34 @@ A document is dirty while effective cell or header edits exist, or while its
 active CSV is a materialized working copy that differs from the last opened or
 saved file. Open, reopen, format changes, and application close must not
 silently discard dirty state. Every write path must consume the complete
-working copy or remain unavailable while the document is dirty. One-level
-structural Undo and Redo move between adjacent indexed CSV versions and reopen
-the chosen version as the current indexed grid. Discard removes all sparse edits
-and private working copies, then restores the last opened or saved file.
+working copy or remain unavailable while the document is dirty. Discard removes
+all sparse edits and private working copies, then restores the last opened or
+saved file.
+
+Committed cell and header edits retain their target identity and before/after
+values in the active indexed version's delta history. Repeated changes to one
+target are separate entries. Undo and Redo replay through the same sparse
+overlay update path without recording a new edit. Committing the effective
+value again is a no-op, while restoring the underlying CSV value removes the
+sparse entry and remains undoable. A new effective edit clears Redo; cancelled
+or unchanged edits do not. Oldest entries are evicted to enforce the count and
+payload limits. An individual edit exceeding the payload budget clears that
+version's history and is not retained. Structural Undo remains blocked if
+untracked later sparse edits remain after reaching this history boundary.
+
+One-level structural Undo and Redo move between adjacent indexed CSV versions
+and reopen the chosen version as the current indexed grid. Snapshots retain
+their sparse overlay and delta history. Undo consumes later individual edits,
+then crosses the structural boundary, then exposes earlier individual edits.
+Redo restores those earlier individual edits before crossing the boundary.
+The toolbar and Command/Ctrl shortcuts share these commands. Focused text
+fields keep native text Undo/Redo, and committed-history commands are disabled
+during inline editing, filters, conflicting jobs, or source conflict.
+
+Successful Save or Save As reopening, Discard, and opening or reopening a
+document reset both histories. Failed or cancelled operations preserve history
+while the current document remains usable. This does not change the existing
+post-publication Save reload-failure behavior described below.
 
 Save and Save As use a streaming rewrite rather than in-place record mutation.
 Save As publishes a selected destination and leaves the previous source

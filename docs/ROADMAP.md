@@ -2,6 +2,19 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
+## Focus before the first public beta
+
+The [Priority Checklist Before Beta](PRE_BETA_CHECKLIST.md) tracks the next
+product work in order: individual cell/header Undo, numeric filters, duplicate
+cleanup, and temporary-disk handling. It contains completion criteria and space
+for validation evidence. Priority 1 is implemented and
+[locally validated](benchmarks/2026-09-04-individual-edit-undo.md), including the
+installed app. CodeRabbit CLI review completed with zero findings on 2026-09-05;
+[PR #35](https://github.com/danchamorro/quarry/pull/35) is awaiting merge.
+Priorities 2 through 4 remain planned; completed alpha phases below retain their
+existing scope.
+Date/time sorting remains planned in Phase 6D and does not block this checklist.
+
 ## Current progress: 2026-09-04
 
 | Phase | Status | Evidence |
@@ -181,7 +194,9 @@ Each confirmed operation streams the current document into a bounded private
 working CSV, reopens it as the ordinary indexed document, and supports more
 edits or transformations without building a file-sized in-memory model.
 One-level structural Undo and Redo reopen the preceding or subsequent document
-version.
+version. The pre-beta priority 1 work adds individual committed cell/header
+Undo and Redo on either side of that boundary; see the
+[user guide](USER_GUIDE.md#undo-and-redo-changes) for controls and history limits.
 
 ### Phase 5 checklist
 
