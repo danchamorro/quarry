@@ -70,7 +70,8 @@ invalid-value handling, and combined rules. The installed feature build passed
 Between with a text rule, invalid-bound rejection while preserving the active
 filter, exact exported bytes, and source preservation. It records dirty source;
 CodeRabbit CLI 0.7.5 completed review with zero findings across all 14 changed
-files on 2026-09-05. PR submission follows this validation.
+files on 2026-09-05. Implementation commit `d9f47dd` is submitted in
+[PR #36](https://github.com/danchamorro/quarry/pull/36), awaiting merge.
 
 ## 3. Find and remove duplicates
 

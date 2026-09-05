@@ -14,7 +14,8 @@ the clean installed app. CodeRabbit CLI review completed with zero findings on
 2026-09-05. Priority 2 adds exact numeric comparisons and inclusive Between to
 the existing bounded filter and export path, with
 [263 passing tests, 1 GB measurements, and installed-app validation](benchmarks/2026-09-05-numeric-filters.md).
-It is implemented locally and has not yet been submitted as a PR.
+Implementation commit `d9f47dd` is submitted in
+[PR #36](https://github.com/danchamorro/quarry/pull/36), awaiting merge.
 Priorities 3 and 4 remain planned; completed alpha phases below retain their
 existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.
