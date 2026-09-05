@@ -198,15 +198,27 @@ new filter begins. An active filter must be cleared before editing or using
 Find/Replace. Overlay-aware filtering remains deferred.
 
 A `FilterQuery` owns the Filters tool's case setting and one or more
-`FilterPredicate` values. Each predicate stores a source column, a contains,
-equality, or inequality operator, and its literal value. Equals and Contains
-predicates within one source column are alternatives. Does not equal predicates
-within that column all apply, and every filtered source column must match. The
-scanner parses each bounded record once, then evaluates the grouped predicates
-using the query's ASCII-folded or exact comparison mode. A missing filtered
-column rejects that row. `FilterQuery::single` keeps single-predicate callers
-compatible with the same path. Filter to This Value and Filter Out This Value
-construct their query with the current Filters setting.
+`FilterPredicate` values. Each predicate stores a source column, operator,
+value, and optional upper bound for inclusive Between. Text operators are
+Contains, Equals, and Does not equal. Numeric operators are Greater than,
+Greater than or equal, Less than, Less than or equal, and Between. Numeric
+bounds are validated before starting a worker. Each worker compiles them using
+the exact canonical decimal key parser shared with Number sorting before
+scanning rows. Blank or invalid bounds and reversed Between bounds reject the
+query before scanning.
+
+All inclusion predicates within one source column are alternatives, including
+numeric rules. Does not equal predicates within that column all apply, and
+every filtered source column must match. The two bounds inside one Between
+predicate both apply. The scanner parses each bounded record once, then
+evaluates the grouped predicates. Text keeps the query's ASCII-folded or exact
+comparison mode; numeric rules ignore case mode and compare exact decimal keys
+without floating-point rounding. Blank, missing, and invalid numeric data do
+not match a numeric predicate. Invalid numeric data does not fail the scan,
+and another text inclusion on the same column can still match it. A missing
+filtered column rejects that row. `FilterQuery::single` keeps single-predicate
+callers compatible with the same path. Filter to This Value and Filter Out
+This Value construct text queries with the current Filters setting.
 
 The sequential worker counts every matching row while retaining only adaptive
 match checkpoints under a fixed budget. When the budget fills, the checkpoint
@@ -221,6 +233,10 @@ index owns its query so a caller cannot accidentally read its checkpoints with
 different filter semantics. Memory therefore depends on the predicate values,
 fixed chunk and index budgets, the 64 MiB maximum record and its decoded fields,
 and the requested row count, not on file size or match count.
+
+The [numeric filter validation](benchmarks/2026-09-05-numeric-filters.md)
+records exact five-operator counts, byte-preserving export, cancellation, and
+bounded index memory on a 1 GB fixture, with a paired text-filter baseline.
 
 ## Filtered export
 Filtered export scans the active indexed CSV once with the same decoded-cell

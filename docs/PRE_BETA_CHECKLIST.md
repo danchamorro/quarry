@@ -2,8 +2,9 @@
 
 This is the focused product checklist to complete before Quarry's first public
 beta. Work in priority order: individual edit Undo, numeric filters, duplicate
-cleanup, then temporary-disk handling. Priority 1 is implemented and locally
-validated; priorities 2 through 4 remain planned.
+cleanup, then temporary-disk handling. Priority 1 is merged and locally
+validated. Priority 2 is implemented and locally validated; priorities 3 and 4
+remain planned.
 
 Mark an item complete only after its behavior is implemented and validated.
 Record the PR and validation evidence under each priority, and update the
@@ -32,32 +33,44 @@ adjacent whole-file working version.
 on `codex/individual-edit-undo`: eight focused regressions, all 256 workspace
 tests, strict Clippy, formatting, release build, and installed-app validation
 passed. Mixed/repeated edits, typing focus, structural Undo/Redo, history limits,
-lifecycle resets, and exact source/output bytes were checked. The local installed
-feature build records dirty source. CodeRabbit CLI 0.7.5 completed its review
-with zero findings on 2026-09-05. Implementation commit `55ad8df` is submitted in
-[PR #35](https://github.com/danchamorro/quarry/pull/35), awaiting merge. Controls
+lifecycle resets, and exact source/output bytes were checked. CodeRabbit CLI
+0.7.5 completed its review with zero findings on 2026-09-05. Implementation
+commit `55ad8df` merged in
+[PR #35](https://github.com/danchamorro/quarry/pull/35) as `cd05013`.
+The installed app was updated and verified from that clean merged commit;
+cell and header Undo/Redo passed again in the reopened app. Controls
 and limits are documented in the [user guide](USER_GUIDE.md#undo-and-redo-changes)
 and [architecture](ARCHITECTURE.md#document-editing-and-persistence).
 
 ## 2. Numeric filters
 
 **Goal:** answer questions such as "Balance greater than 500" and "Amount
-between 100 and 1,000." Current filters support Contains, Equals, and Does not
-equal.
+between 100 and 1000." Extend Contains, Equals, and Does not equal with exact
+numeric comparisons and inclusive Between.
 
-- [ ] Add numeric greater-than, greater-than-or-equal, less-than,
+- [x] Add numeric greater-than, greater-than-or-equal, less-than,
   less-than-or-equal, and inclusive Between filters.
-- [ ] Reuse the exact number interpretation used by Number sorting, including
+- [x] Reuse the exact number interpretation used by Number sorting, including
   decimals and scientific notation, without floating-point rounding.
-- [ ] Define blank, missing, and invalid-value handling and reject invalid
+- [x] Define blank, missing, and invalid-value handling and reject invalid
   filter bounds clearly. Between must require both bounds to match.
-- [ ] Integrate numeric rules with existing grouped filters and filtered
+- [x] Integrate numeric rules with existing grouped filters and filtered
   export while preserving current text-filter behavior.
-- [ ] Validate numeric boundaries, precision, combined rules, export results,
+- [x] Validate numeric boundaries, precision, combined rules, export results,
   cancellation, and bounded memory on a large-file workload. Verify the
   installed-app workflow and update the user guide.
 
-**Evidence:** pending.
+**Evidence:** [2026-09-05 validation](benchmarks/2026-09-05-numeric-filters.md)
+on `codex/numeric-filters`: all 263 workspace tests, strict Clippy, formatting,
+release build, and 1 GB engine validation passed. All five numeric match counts
+and every raw exported record matched an independent exact-decimal oracle;
+source hashes, cancellation, and bounded index memory passed. The
+[user guide](USER_GUIDE.md#numeric-values-and-bounds) documents number syntax,
+invalid-value handling, and combined rules. The installed feature build passed
+Between with a text rule, invalid-bound rejection while preserving the active
+filter, exact exported bytes, and source preservation. It records dirty source;
+CodeRabbit CLI 0.7.5 completed review with zero findings across all 14 changed
+files on 2026-09-05. PR submission follows this validation.
 
 ## 3. Find and remove duplicates
 

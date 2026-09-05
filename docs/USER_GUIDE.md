@@ -220,17 +220,23 @@ active filter. Use **Filters…** when you need multiple rules.
 
 1. Click **Filters…**.
 2. Enter the original one-based file-column number for the rule.
-3. Choose **Contains**, **Equals**, or **Does not equal**.
-4. Enter the literal value.
+3. Choose a text rule (**Contains**, **Equals**, or **Does not equal**) or a
+   numeric rule (**Greater than (>)**, **Greater than or equal (>=)**,
+   **Less than (<)**, **Less than or equal (<=)**, or **Between (inclusive)**).
+4. Enter the text value or numeric bound. **Between** requires a lower and an
+   upper bound and includes both endpoints.
 5. Use **Add rule** for another condition.
-6. Set **Match case** as needed, then click **Apply filters**.
+6. Set **Match case** for text rules as needed, then click **Apply filters**.
 
 Filter rules work as follows:
 
 - Every filtered column must match.
-- Multiple **Equals** or **Contains** rules for the same column are
-  alternatives. For example, State Equals `TX` and State Equals `FL` shows
-  both states.
+- Multiple inclusion rules for the same column are alternatives. This includes
+  **Equals**, **Contains**, and all numeric rules. For example, State Equals
+  `TX` and State Equals `FL` shows both states.
+- Use one **Between** rule for a numeric range. Its lower and upper bounds must
+  both match. Two separate same-column numeric rules are alternatives, so
+  Greater than `100` plus Less than `1000` does not restrict rows to that range.
 - Multiple **Does not equal** rules for the same column all apply. For example,
   State Does not equal `TX` and State Does not equal `FL` excludes both states.
 - When inclusion and exclusion rules share a column, the value must match an
@@ -238,13 +244,34 @@ Filter rules work as follows:
 - **Contains** requires a value. **Equals** and **Does not equal** can compare
   against an empty cell.
 
-Filtering is case-insensitive by default. After applying rules, the toolbar
+Text filtering is case-insensitive by default. After applying rules, the toolbar
 button changes to **Filters (N)…**, where N is the number of active rules. Open
 it to inspect the rules, use **Clear filter** to return to all rows, or use the
 footer's **Cancel filter** button while a scan is running.
 
 Unsaved cell edits must be saved or discarded before filtering. Column
 transformations that have already produced a working file can be filtered.
+
+#### Numeric values and bounds
+
+Numeric rules use the same exact interpretation as **Number** sorting, without
+floating-point rounding. For example, `9007199254740993` is greater than
+`9007199254740992`, and `2`, `02`, `2.00`, and `2e0` are equal numbers. Enter
+`1000`, rather than `1,000`, for a thousand.
+
+Signed dot decimals and scientific notation are accepted, with exponents from
+`-1000000` through `1000000`. Leading and trailing ASCII whitespace is ignored.
+Currency symbols, grouping separators, locale decimal commas, NaN, infinity,
+and other nonnumeric text are not numbers.
+
+Blank, missing, and invalid data values do not match a numeric rule; they do
+not stop the scan. A text alternative on the same column can still match a
+present blank or invalid value. Filter bounds must be valid, nonblank numbers,
+and **Between** requires its lower bound to be no greater than its upper bound.
+Quarry reports invalid bounds and disables **Apply filters** until they are
+corrected. Editing a draft does not replace an active filter. **Match case** does
+not affect numeric rules. Text **Equals** continues comparing literal text,
+so use **Between** with equal bounds to match numerically equivalent values.
 
 ### Export filtered rows
 
@@ -420,8 +447,8 @@ reopen it instead of overwriting the external update.
 
 ## Case matching
 
-Find and Replace, Filters, and Text sorting each have an independent **Match case**
-setting:
+Find and Replace, text filters, and Text sorting each have an independent
+**Match case** setting:
 
 - Off, the default: ASCII uppercase and lowercase letters are treated as
   equivalent.
@@ -470,7 +497,8 @@ setting.
 | Filtering is unavailable | Save or discard cell edits, then cancel or finish any active search, filter, export, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |
 | **Delete Selected Rows** is unavailable | Clear the filter, finish the active operation, and select at least one numbered data row. |
-| A filter returns no rows | Check the original column number, value, **Match case** setting, and same-column rule logic. |
+| A filter returns no rows | Check the original column number, value or numeric bounds, **Match case** for text rules, and same-column rule logic. Numeric rules skip blank, missing, and invalid values. |
+| A numeric filter bound is rejected | Enter a nonblank dot decimal or scientific number without currency or grouping separators. Between needs two valid bounds in ascending order. |
 | Find is disabled | A filter is active. Open **Filters (N)…** and clear it. |
 | **Replace in Cell** is disabled | Use **Find Next** or **Find Previous** to establish the current matching cell first. |
 | Quarry says the source changed | Use **Discard Changes**, then choose **Reload from Disk** from the file menu. |

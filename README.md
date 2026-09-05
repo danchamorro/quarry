@@ -35,7 +35,7 @@ working memory bounded and does not change the source until you choose
 | Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
 | Find and replace | Literal Find Next and Find Previous, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
-| Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, and Does not equal predicates; same-column alternatives with AND across columns; case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
+| Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, Does not equal, exact numeric comparisons, and inclusive Between; same-column alternatives with AND across columns; text is case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
 | Edit | Direct cell and header editing; multiline values; individual edit Undo and Redo; one-level structural history; Discard Changes |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or delete the selected columns; continue editing the result before saving |
 | Sort | Text, exact Number, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
@@ -119,6 +119,7 @@ the adaptive merge optimization and is not a current throughput estimate.
 
 The sorting results above measure Text mode. Number, Character count, Word
 count, Shuffle, and Reverse have separate 1 GB validations linked below.
+Numeric filters and their exported results also have a separate 1 GB validation.
 
 <details>
 <summary><strong>Benchmark reports and methodology</strong></summary>
@@ -134,6 +135,7 @@ count, Shuffle, and Reverse have separate 1 GB validations linked below.
 - [Original deterministic stable Sort validation](docs/benchmarks/2026-08-21-stable-text-sort.md)
 - [Current 12 GB `FIRSTNAME` sort optimization](docs/benchmarks/2026-08-23-12gb-sort-performance.md)
 - [1 GB exact numeric sorting validation](docs/benchmarks/2026-09-04-numeric-sort.md)
+- [1 GB exact numeric filtering and export validation](docs/benchmarks/2026-09-05-numeric-filters.md)
 - [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)
 - [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
 

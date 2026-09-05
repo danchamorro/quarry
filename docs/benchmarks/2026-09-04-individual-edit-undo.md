@@ -3,10 +3,10 @@
 Priority 1 is implemented and locally validated on
 `codex/individual-edit-undo`, based on
 `73976e2aa827adf052ff9bcb95cfdf237e892369`. Initial validation used the
-uncommitted feature build. Implementation commit `55ad8df` is submitted in
-[PR #35](https://github.com/danchamorro/quarry/pull/35). See the
+uncommitted feature build. Implementation commit `55ad8df` merged in
+[PR #35](https://github.com/danchamorro/quarry/pull/35) as
+`cd0501384d350e54850711ab7659fb2079f2cbce` on 2026-09-05. See the
 [priority checklist](../PRE_BETA_CHECKLIST.md) for delivery status.
-Priorities 2 through 4 remain planned.
 
 ## Behavior and resource bounds
 
@@ -119,3 +119,13 @@ with SHA-256 `6c3f49fb3d43c99c2e692ad8e40c065922b5bcecebcd56c2fd87d6a088f3991f`.
 This validates behavior and deterministic history bounds. It does not claim a
 new large-file throughput or process-RSS benchmark. History payload limits do
 not include the sparse overlay, allocator overhead, or temporary snapshot clones.
+
+## Merged installation: 2026-09-05
+
+After PR #35 merged, the local `main` checkout was updated to
+`cd0501384d350e54850711ab7659fb2079f2cbce` and confirmed clean. The installer
+updated `/Applications/Quarry.app` and preserved its verified rollback backup.
+`./scripts/macos-app.sh verify` passed; the installed `QuarryGitRevision`
+matched that merged commit and `QuarrySourceStatus` was `clean`. Cell and
+header Undo/Redo passed again in the reopened installed app. This clean merged
+installation supersedes the earlier dirty feature build for delivery status.

@@ -67,13 +67,13 @@ fn print_help() {
            quarry search <FILE> --query LITERAL [--start-row 1] \
          [--start-column 1] [--cancel-after-bytes N] \
          [--cache-state unknown|warm]\n  \
-           quarry filter <FILE> --column N --operator contains|equals|not-equals \
-         --value LITERAL [--and N contains|equals|not-equals LITERAL]... \
+           quarry filter <FILE> --column N --operator contains|equals|not-equals|gt|gte|lt|lte|between \
+         --value VALUE [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... \
          [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry export <FILE> --output FILE --column N \
-         --operator contains|equals|not-equals --value LITERAL \
-         [--and N contains|equals|not-equals LITERAL]... [--cancel-after-bytes N] \
+         --operator contains|equals|not-equals|gt|gte|lt|lte|between --value VALUE \
+         [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry edit-save-as <FILE> --output FILE \
          --edit DATA_ROW COLUMN VALUE [--edit DATA_ROW COLUMN VALUE]... \
@@ -92,6 +92,8 @@ fn print_help() {
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]\n\n\
+         Filters: between includes both bounds and requires --upper-bound (or UPPER after --and).\n\
+         Numeric values accept signed decimals and scientific notation; blank or invalid cells do not match.\n\
          Sort: --column and --order are required for text, number, characters, and words.\n\
          Shuffle and reverse reorder all data rows; --seed repeats a shuffle within the same build."
     );
@@ -102,8 +104,51 @@ fn parse_filter_operator(value: &str, option: &str) -> CliResult<FilterOperator>
         "contains" => Ok(FilterOperator::Contains),
         "equals" => Ok(FilterOperator::Equals),
         "not-equals" => Ok(FilterOperator::NotEquals),
-        _ => Err(format!("{option} must be contains, equals, or not-equals").into()),
+        "gt" => Ok(FilterOperator::GreaterThan),
+        "gte" => Ok(FilterOperator::GreaterThanOrEqual),
+        "lt" => Ok(FilterOperator::LessThan),
+        "lte" => Ok(FilterOperator::LessThanOrEqual),
+        "between" => Ok(FilterOperator::Between),
+        _ => Err(format!(
+            "{option} must be contains, equals, not-equals, gt, gte, lt, lte, or between"
+        )
+        .into()),
     }
+}
+
+fn parse_and_filter(args: &[String], cursor: &mut usize) -> CliResult<FilterPredicate> {
+    let operands = args
+        .get(*cursor + 1..*cursor + 4)
+        .ok_or("--and requires COLUMN OPERATOR VALUE [UPPER]")?;
+    let column = operands[0].parse::<usize>()?;
+    let operator = parse_filter_operator(&operands[1], "--and operator")?;
+    let value = operands[2].as_bytes().to_vec();
+    if column == 0 {
+        return Err("AND filter column must be at least 1".into());
+    }
+    if operator == FilterOperator::Contains && value.is_empty() {
+        return Err("AND contains filter value must not be empty".into());
+    }
+    *cursor += 3;
+    let upper_bound = if operator == FilterOperator::Between {
+        Some(
+            args.get(*cursor + 1)
+                .ok_or("--and between requires an upper bound")?
+                .as_bytes()
+                .to_vec(),
+        )
+    } else {
+        None
+    };
+    if upper_bound.is_some() {
+        *cursor += 1;
+    }
+    Ok(FilterPredicate {
+        column: column - 1,
+        operator,
+        value,
+        upper_bound,
+    })
 }
 
 fn filter_command(args: Vec<String>) -> CliResult<()> {
@@ -111,6 +156,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     let mut column = None;
     let mut operator = None;
     let mut filter_value = None;
+    let mut upper_bound = None;
     let mut and_predicates = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
@@ -128,26 +174,14 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
             "--value" => {
                 filter_value = Some(value(&args, &mut cursor, "--value")?.as_bytes().to_vec())
             }
-            "--and" => {
-                let operands = args
-                    .get(cursor + 1..cursor + 4)
-                    .ok_or("--and requires COLUMN contains|equals|not-equals VALUE")?;
-                let column = operands[0].parse::<usize>()?;
-                let operator = parse_filter_operator(&operands[1], "--and operator")?;
-                let value = operands[2].as_bytes().to_vec();
-                if column == 0 {
-                    return Err("AND filter column must be at least 1".into());
-                }
-                if operator == FilterOperator::Contains && value.is_empty() {
-                    return Err("AND contains filter value must not be empty".into());
-                }
-                and_predicates.push(FilterPredicate {
-                    column: column - 1,
-                    operator,
-                    value,
-                });
-                cursor += 3;
+            "--upper-bound" => {
+                upper_bound = Some(
+                    value(&args, &mut cursor, "--upper-bound")?
+                        .as_bytes()
+                        .to_vec(),
+                )
             }
+            "--and" => and_predicates.push(parse_and_filter(&args, &mut cursor)?),
             "--cancel-after-bytes" => {
                 cancel_after_bytes =
                     Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
@@ -181,12 +215,14 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
+    let mut query = FilterQuery::single(column - 1, operator, filter_value);
+    query.predicates[0].upper_bound = upper_bound;
+    query.predicates.extend(and_predicates);
+    query.validate()?;
     let session = Session::open(&path, OpenOptions::default())?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
-    let mut query = FilterQuery::single(column - 1, operator, filter_value);
-    query.predicates.extend(and_predicates);
     let job = session.start_filter(query)?;
     let (index, progress, cancellation) =
         wait_for_filter(job, cancel_after_bytes, Duration::from_millis(1))?;
@@ -218,9 +254,17 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
                 FilterOperator::Contains => "contains",
                 FilterOperator::Equals => "equals",
                 FilterOperator::NotEquals => "not-equals",
+                FilterOperator::GreaterThan => "gt",
+                FilterOperator::GreaterThanOrEqual => "gte",
+                FilterOperator::LessThan => "lt",
+                FilterOperator::LessThanOrEqual => "lte",
+                FilterOperator::Between => "between",
             },
             render_field(&predicate.value)
         );
+        if let Some(upper) = &predicate.upper_bound {
+            println!("  Upper bound: {}", render_field(upper));
+        }
     }
     println!(
         "Outcome: {}",
@@ -336,6 +380,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     let mut column = None;
     let mut operator = None;
     let mut filter_value = None;
+    let mut upper_bound = None;
     let mut and_predicates = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
@@ -354,26 +399,14 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
             "--value" => {
                 filter_value = Some(value(&args, &mut cursor, "--value")?.as_bytes().to_vec())
             }
-            "--and" => {
-                let operands = args
-                    .get(cursor + 1..cursor + 4)
-                    .ok_or("--and requires COLUMN contains|equals|not-equals VALUE")?;
-                let column = operands[0].parse::<usize>()?;
-                let operator = parse_filter_operator(&operands[1], "--and operator")?;
-                let value = operands[2].as_bytes().to_vec();
-                if column == 0 {
-                    return Err("AND filter column must be at least 1".into());
-                }
-                if operator == FilterOperator::Contains && value.is_empty() {
-                    return Err("AND contains filter value must not be empty".into());
-                }
-                and_predicates.push(FilterPredicate {
-                    column: column - 1,
-                    operator,
-                    value,
-                });
-                cursor += 3;
+            "--upper-bound" => {
+                upper_bound = Some(
+                    value(&args, &mut cursor, "--upper-bound")?
+                        .as_bytes()
+                        .to_vec(),
+                )
             }
+            "--and" => and_predicates.push(parse_and_filter(&args, &mut cursor)?),
             "--cancel-after-bytes" => {
                 cancel_after_bytes =
                     Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
@@ -408,12 +441,14 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
+    let mut query = FilterQuery::single(column - 1, operator, filter_value);
+    query.predicates[0].upper_bound = upper_bound;
+    query.predicates.extend(and_predicates);
+    query.validate()?;
     let session = Session::open(&path, OpenOptions::default())?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
-    let mut query = FilterQuery::single(column - 1, operator, filter_value);
-    query.predicates.extend(and_predicates);
     let source_size_before = session.file_size;
     let job = session.start_filtered_export(query.clone(), &destination)?;
     let (outcome, progress, cancellation) =
@@ -469,9 +504,17 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
                 FilterOperator::Contains => "contains",
                 FilterOperator::Equals => "equals",
                 FilterOperator::NotEquals => "not-equals",
+                FilterOperator::GreaterThan => "gt",
+                FilterOperator::GreaterThanOrEqual => "gte",
+                FilterOperator::LessThan => "lt",
+                FilterOperator::LessThanOrEqual => "lte",
+                FilterOperator::Between => "between",
             },
             render_field(&predicate.value)
         );
+        if let Some(upper) = &predicate.upper_bound {
+            println!("  Upper bound: {}", render_field(upper));
+        }
     }
     println!("Outcome: {outcome_label}");
     println!(
@@ -3402,7 +3445,7 @@ mod tests {
                     "--value",
                     "x",
                 ],
-                "--operator must be contains, equals, or not-equals",
+                "--operator must be contains, equals, not-equals, gt, gte, lt, lte, or between",
             ),
             (
                 vec![
@@ -3445,7 +3488,7 @@ mod tests {
                     "2",
                     "equals",
                 ],
-                "--and requires COLUMN contains|equals|not-equals VALUE",
+                "--and requires COLUMN OPERATOR VALUE [UPPER]",
             ),
             (
                 vec![
@@ -3493,7 +3536,7 @@ mod tests {
                     "regex",
                     "x",
                 ],
-                "--and operator must be contains, equals, or not-equals",
+                "--and operator must be contains, equals, not-equals, gt, gte, lt, lte, or between",
             ),
         ] {
             let error = filter_command(args.into_iter().map(str::to_owned).collect()).unwrap_err();
@@ -3616,6 +3659,150 @@ mod tests {
         filter_command(and_args).unwrap();
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn numeric_filter_and_export_commands_validate_bounds_and_preserve_records() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-numeric-filter-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("filtered.csv");
+        let original = b"amount,state\r\n-1,keep\r\n0,keep\r\n1,keep\r\n1.00000000000000000001,keep\r\n2,skip\r\nNaN,keep\r\n,keep\r\nmissing\r\n";
+        fs::write(&source, original).unwrap();
+
+        for (operator, bound, upper, expected) in [
+            ("gt", "1", None, "1.00000000000000000001,keep\r\n2,skip\r\n"),
+            (
+                "gte",
+                "1",
+                None,
+                "1,keep\r\n1.00000000000000000001,keep\r\n2,skip\r\n",
+            ),
+            ("lt", "0", None, "-1,keep\r\n"),
+            ("lte", "0", None, "-1,keep\r\n0,keep\r\n"),
+            ("between", "0", Some("1"), "0,keep\r\n1,keep\r\n"),
+        ] {
+            let mut args = vec![
+                source.to_string_lossy().into_owned(),
+                "--column".into(),
+                "1".into(),
+                "--operator".into(),
+                operator.into(),
+                "--value".into(),
+                bound.into(),
+            ];
+            if let Some(upper) = upper {
+                args.extend(["--upper-bound".into(), upper.into()]);
+            }
+            filter_command(args.clone()).unwrap();
+            args.extend([
+                "--output".into(),
+                destination.to_string_lossy().into_owned(),
+            ]);
+            export_command(args).unwrap();
+            assert_eq!(
+                fs::read(&destination).unwrap(),
+                format!("amount,state\r\n{expected}").as_bytes()
+            );
+            fs::remove_file(&destination).unwrap();
+        }
+
+        let mut args = vec![
+            source.to_string_lossy().into_owned(),
+            "--column".into(),
+            "2".into(),
+            "--operator".into(),
+            "equals".into(),
+            "--value".into(),
+            "keep".into(),
+            "--and".into(),
+            "1".into(),
+            "between".into(),
+            "0".into(),
+            "1".into(),
+        ];
+        filter_command(args.clone()).unwrap();
+        args.extend([
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+        ]);
+        export_command(args).unwrap();
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"amount,state\r\n0,keep\r\n1,keep\r\n"
+        );
+        fs::remove_file(&destination).unwrap();
+
+        for options in [
+            vec!["--operator", "gt", "--value", ""],
+            vec!["--operator", "gte", "--value", "NaN"],
+            vec!["--operator", "lt", "--value", "1,000"],
+            vec!["--operator", "lte", "--value", "no"],
+            vec!["--operator", "between", "--value", "0"],
+            vec!["--operator", "between", "--value", "0", "--upper-bound", ""],
+            vec![
+                "--operator",
+                "between",
+                "--value",
+                "0",
+                "--upper-bound",
+                "inf",
+            ],
+            vec![
+                "--operator",
+                "between",
+                "--value",
+                "2",
+                "--upper-bound",
+                "1",
+            ],
+            vec!["--operator", "equals", "--value", "1", "--upper-bound", "2"],
+            vec![
+                "--operator",
+                "gt",
+                "--value",
+                "1",
+                "--and",
+                "2",
+                "between",
+                "0",
+            ],
+            vec![
+                "--operator",
+                "gt",
+                "--value",
+                "1",
+                "--and",
+                "2",
+                "between",
+                "2",
+                "1",
+            ],
+        ] {
+            let mut args = vec![
+                source.to_string_lossy().into_owned(),
+                "--column".into(),
+                "1".into(),
+            ];
+            args.extend(options.into_iter().map(str::to_owned));
+            assert!(filter_command(args.clone()).is_err());
+            args.extend([
+                "--output".into(),
+                destination.to_string_lossy().into_owned(),
+            ]);
+            assert!(export_command(args).is_err());
+            assert!(!destination.exists());
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

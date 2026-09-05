@@ -7,15 +7,19 @@ The roadmap is ordered by technical risk rather than feature excitement.
 The [Priority Checklist Before Beta](PRE_BETA_CHECKLIST.md) tracks the next
 product work in order: individual cell/header Undo, numeric filters, duplicate
 cleanup, and temporary-disk handling. It contains completion criteria and space
-for validation evidence. Priority 1 is implemented and
-[locally validated](benchmarks/2026-09-04-individual-edit-undo.md), including the
-installed app. CodeRabbit CLI review completed with zero findings on 2026-09-05;
-[PR #35](https://github.com/danchamorro/quarry/pull/35) is awaiting merge.
-Priorities 2 through 4 remain planned; completed alpha phases below retain their
+for validation evidence. Priority 1 is merged in
+[PR #35](https://github.com/danchamorro/quarry/pull/35) as `cd05013` and
+[locally validated](benchmarks/2026-09-04-individual-edit-undo.md), including
+the clean installed app. CodeRabbit CLI review completed with zero findings on
+2026-09-05. Priority 2 adds exact numeric comparisons and inclusive Between to
+the existing bounded filter and export path, with
+[263 passing tests, 1 GB measurements, and installed-app validation](benchmarks/2026-09-05-numeric-filters.md).
+It is implemented locally and has not yet been submitted as a PR.
+Priorities 3 and 4 remain planned; completed alpha phases below retain their
 existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.
 
-## Current progress: 2026-09-04
+## Current progress: 2026-09-05
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -152,6 +156,12 @@ Contains, equality, and inequality filters, same-column alternatives, AND
 across filtered columns, case-insensitive matching by default with a per-tool
 **Match case** option, incremental results, filtered navigation, streaming
 export, progress/cancellation.
+
+Pre-beta priority 2 extends this path with exact numeric greater-than,
+greater-than-or-equal, less-than, less-than-or-equal, and inclusive Between
+rules. It retains same-column inclusion alternatives, exclusions, and AND
+across columns. The [pre-beta checklist](PRE_BETA_CHECKLIST.md#2-numeric-filters)
+tracks its separate validation and delivery status.
 
 ### Phase 4 checklist
 
