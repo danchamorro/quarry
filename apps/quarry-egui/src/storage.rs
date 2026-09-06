@@ -482,6 +482,163 @@ impl WorkingCopyState {
 mod tests {
     use super::*;
 
+    fn update_review_until(
+        app: &mut QuarryApp,
+        ctx: &egui::Context,
+        ready: impl Fn(&QuarryApp) -> bool,
+    ) -> egui::FullOutput {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(app.storage_review.is_some());
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest());
+            });
+            if ready(app) {
+                return output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background job stalled behind storage review"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn storage_review_keeps_background_jobs_advancing_and_blocks_document_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let other = directory.path().join("other.csv");
+        let output = directory.path().join("filtered.csv");
+        let original = b"name,value\nAda Lovelace,1\nGrace Hopper,2\n";
+        std::fs::write(&source, original).unwrap();
+        std::fs::write(&other, b"other\nfile\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        assert!(app.document.as_ref().unwrap().index.is_none());
+        app.open_storage_settings();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        input.dropped_files.push(egui::DroppedFile {
+            path: Some(other),
+            ..Default::default()
+        });
+        let close_output = ctx.run(input, |ctx| {
+            eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+        });
+        assert!(
+            close_output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
+        );
+        assert!(!app.close_confirmation_open);
+        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
+        let frame = update_review_until(&mut app, &ctx, |app| {
+            app.document.as_ref().unwrap().index.is_some()
+                && app.storage_review.as_ref().unwrap().worker.is_none()
+        });
+        assert!(
+            frame
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Use folder"))
+        );
+
+        app.storage_review = None;
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_find_next(b"Grace")
+            .unwrap();
+        app.open_storage_settings();
+        update_review_until(&mut app, &ctx, |app| {
+            app.document.as_ref().unwrap().search_job.is_none()
+        });
+        assert_eq!(app.document.as_ref().unwrap().last_match.unwrap().row, 2);
+
+        app.storage_review = None;
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"1".to_vec(),
+            ))
+            .unwrap();
+        app.open_storage_settings();
+        update_review_until(&mut app, &ctx, |app| {
+            let document = app.document.as_ref().unwrap();
+            document.filter_job.is_none() && document.visible_filter_rows().len() == 1
+        });
+        assert!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .filter_progress()
+                .unwrap()
+                .done
+        );
+
+        app.storage_review = None;
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_filtered_export(output.clone())
+            .unwrap();
+        app.open_storage_settings();
+        update_review_until(&mut app, &ctx, |app| {
+            app.document.as_ref().unwrap().export_job.is_none()
+        });
+        assert_eq!(
+            std::fs::read(output).unwrap(),
+            b"name,value\nAda Lovelace,1\n"
+        );
+
+        app.storage_review = None;
+        let document = app.document.as_mut().unwrap();
+        document.clear_filter().unwrap();
+        document.start_split(0, b" ".to_vec()).unwrap();
+        // Exercise the large-operation gate without allocating a large fixture.
+        document.session.file_size = STORAGE_REVIEW_BYTES;
+        app.open_storage_settings();
+        update_review_until(&mut app, &ctx, |app| {
+            app.document
+                .as_ref()
+                .unwrap()
+                .pending_materialization
+                .is_some()
+        });
+        assert!(app.document.as_ref().unwrap().structural_job.is_none());
+        assert!(app.storage_review.as_ref().unwrap().operation.is_none());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        app.storage_review = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+        });
+        assert!(matches!(
+            app.storage_review.as_ref().unwrap().operation,
+            Some(PendingStorageOperation::Materialize(..))
+        ));
+        assert!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .pending_materialization
+                .is_none()
+        );
+    }
+
     fn finish(app: &mut QuarryApp) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -650,17 +807,16 @@ mod tests {
         document.cell_edits.insert((1, 0), b"edited".to_vec());
         // Simulate large metadata without writing a large fixture. No worker starts here.
         document.session.file_size = STORAGE_REVIEW_BYTES;
+        app.close_after_save = true;
         assert!(app.save_current());
         assert!(app.storage_review.is_some());
         assert!(app.document.as_ref().unwrap().save_job.is_none());
         assert_eq!(std::fs::read(&source).unwrap(), b"key\na\n");
-        let review = app.storage_review.as_mut().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while review.worker.is_some() {
-            review.poll();
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
+        update_review_until(&mut app, &egui::Context::default(), |app| {
+            app.storage_review.as_ref().unwrap().worker.is_none()
+        });
+        assert!(app.close_after_save);
+        assert!(!app.close_confirmation_open);
         app.storage_review = None;
         assert_eq!(
             app.document.as_ref().unwrap().cell_edits[&(1, 0)],

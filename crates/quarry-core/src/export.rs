@@ -5802,43 +5802,27 @@ mod tests {
 
     #[test]
     fn insufficient_space_cleans_staging_and_preserves_source_and_retained_version() {
-        // A sparse source creates a deterministic capacity shortfall without
-        // allocating or filling the test machine's free disk space.
         let original = b"id,name\n1,Ada\n";
         let source = fixture(original);
         let directory = source.parent().unwrap();
         let retained = directory.join("undo.csv");
         fs::write(&retained, b"retained version").unwrap();
-        let available = crate::inspect_storage(directory).unwrap().available_bytes;
-        let logical_len = available.saturating_add(1024 * 1024 * 1024);
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&source)
-            .unwrap()
-            .set_len(logical_len)
-            .unwrap();
-        let session = Session::open(
-            &source,
-            OpenOptions {
-                rows: 1,
-                delimiter: Some(b','),
-                header_mode: HeaderMode::FirstRow,
-                ..OpenOptions::default()
-            },
-        )
-        .unwrap();
+        let mut session = session(&source, b',', HeaderMode::FirstRow);
+        // Control the estimate through the normal Save worker without resizing
+        // a file or depending on filesystem support for huge sparse files.
+        session.file_size = u64::MAX;
         let result = session
             .start_save_with_edits(BTreeMap::new(), BTreeMap::new())
             .unwrap()
             .wait();
         assert!(matches!(
             result,
-            Err(QuarryError::InsufficientStorage { .. })
+            Err(QuarryError::InsufficientStorage {
+                required_bytes: u64::MAX,
+                ..
+            })
         ));
-        assert_eq!(fs::metadata(&source).unwrap().len(), logical_len);
-        let mut prefix = vec![0; original.len()];
-        std::io::Read::read_exact(&mut File::open(&source).unwrap(), &mut prefix).unwrap();
-        assert_eq!(prefix, original);
+        assert_eq!(fs::read(&source).unwrap(), original);
         assert_eq!(fs::read(&retained).unwrap(), b"retained version");
         assert!(temporary_exports(&source).is_empty());
         fs::remove_dir_all(directory).unwrap();

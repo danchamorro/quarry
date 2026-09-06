@@ -1440,17 +1440,12 @@ impl eframe::App for QuarryApp {
             self.logged_first_update = true;
         }
 
-        if self.storage_review.is_some() {
-            if ctx.input(|input| input.viewport().close_requested()) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            }
-            self.show_storage_review(ctx);
-            return;
-        }
-        self.intercept_dirty_close(ctx);
+        if self.storage_review.is_none() {
+            self.intercept_dirty_close(ctx);
 
-        #[cfg(target_os = "macos")]
-        self.poll_open_documents();
+            #[cfg(target_os = "macos")]
+            self.poll_open_documents();
+        }
 
         let local_file_hovered = self.document.is_none()
             && ctx.input(|input| {
@@ -1468,7 +1463,7 @@ impl eframe::App for QuarryApp {
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>()
         });
-        if !dropped_paths.is_empty() {
+        if self.storage_review.is_none() && !dropped_paths.is_empty() {
             self.handle_dropped_paths(dropped_paths);
         }
 
@@ -1564,18 +1559,17 @@ impl eframe::App for QuarryApp {
                 self.notice = Some(error);
             }
         }
-        if let Some((transformation, selected_columns, records)) = self
-            .document
-            .as_mut()
-            .and_then(|document| document.pending_materialization.take())
+        if self.storage_review.is_none()
+            && let Some((transformation, selected_columns, records)) = self
+                .document
+                .as_mut()
+                .and_then(|document| document.pending_materialization.take())
         {
             self.begin_storage_review(PendingStorageOperation::Materialize(
                 transformation,
                 selected_columns,
                 records,
             ));
-            self.show_storage_review(ctx);
-            return;
         }
         let save_was_active = self
             .document
@@ -1660,6 +1654,7 @@ impl eframe::App for QuarryApp {
                         .map(AppMessage::status);
                 }
                 if self.close_after_save
+                    && self.storage_review.is_none()
                     && self
                         .document
                         .as_ref()
@@ -1677,6 +1672,15 @@ impl eframe::App for QuarryApp {
                     self.close_confirmation_open = true;
                 }
             }
+        }
+
+        // Modal input stays isolated, but background jobs must keep advancing.
+        if self.storage_review.is_some() {
+            if ctx.input(|input| input.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            self.show_storage_review(ctx);
+            return;
         }
 
         let find_available = self

@@ -146,7 +146,7 @@ the test mount lifecycle; the CLI checks did not detach it.
 
 ## Automated and installed-app checks
 
-All 290 workspace tests passed on the final code: 142 core, 109 egui, 29 CLI, nine delimited,
+Implementation commit `6e91c39` passed all 290 workspace tests: 142 core, 109 egui, 29 CLI, nine delimited,
 and one AppKit. Formatting, strict all-targets/all-features Clippy, and the
 locked release workspace build passed.
 
@@ -157,6 +157,17 @@ cancellation, publication, and staging permissions. Existing GUI and CLI
 regressions passed against the same code. The recorded 1 GB measurements,
 cross-volume checks, and installed-app checks below predate that change and
 were not repeated afterward; their binary hashes identify the earlier build.
+
+The 2026-09-06 review follow-up passed all 291 workspace tests, formatting,
+strict Clippy, and the locked release build. Its update-loop regression verifies
+that indexing, search, filtering, export, and Split analysis advance while the
+storage dialog stays open, with close and dropped-file input blocked. Deferred
+Split review and close-after-Save intent are preserved. The insufficient-space
+test now controls the in-memory size estimate through the normal Save worker,
+without resizing the source or requiring sparse-file support; exact source,
+Undo, and staging-cleanup assertions remain. Native checks were not repeated.
+CodeRabbit `review --agent --uncommitted` completed on the three changed Rust
+files with zero findings.
 
 The CLI checks include a new combined regression for selected-folder
 sort, duplicate output, count-only cleanup, unavailable locations, and a file
