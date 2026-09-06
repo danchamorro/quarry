@@ -35,7 +35,8 @@ cleanup that preserves required working/Undo files. Save/export staging remains
 on the destination volume. All 290 tests passed. The
 [1 GB, cross-volume, and installed-app checks](benchmarks/2026-09-05-temporary-disk-handling.md)
 passed before the final private-output handoff fix, which is covered by current
-automated checks. The implementation is ready for PR review. See [ADR 0005](adr/0005-temporary-storage.md)
+automated checks. Implementation commit `6e91c39` is submitted in
+[PR #38](https://github.com/danchamorro/quarry/pull/38), awaiting review. See [ADR 0005](adr/0005-temporary-storage.md)
 and the [user guide](USER_GUIDE.md#temporary-storage-and-free-space). Completed alpha
 phases below retain their existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.

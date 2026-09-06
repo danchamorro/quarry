@@ -4,7 +4,8 @@ This is the focused product checklist to complete before Quarry's first public
 beta. Work in priority order: individual edit Undo, numeric filters, duplicate
 cleanup, then temporary-disk handling. Priorities 1 through 3 are merged and locally
 validated. Priority 4 is implemented and locally validated on
-`codex/temporary-disk-handling`, ready for PR review.
+`codex/temporary-disk-handling`, submitted in
+[PR #38](https://github.com/danchamorro/quarry/pull/38) and awaiting review.
 
 Mark an item complete only after its behavior is implemented and validated.
 Record the PR and validation evidence under each priority, and update the
@@ -126,7 +127,8 @@ sort/duplicate runs, Save, and export while retaining atomic publication.
   storage requirements and cleanup behavior.
 
 **Evidence:** [2026-09-05 validation](benchmarks/2026-09-05-temporary-disk-handling.md)
-on `codex/temporary-disk-handling`: all 290 workspace tests, strict Clippy,
+for implementation commit `6e91c39` in
+[PR #38](https://github.com/danchamorro/quarry/pull/38): all 290 workspace tests, strict Clippy,
 formatting, locked release build, and deterministic 1 GB before/after checks
 passed. Sort and duplicate outputs were byte-identical; cancellation removed
 unpublished output. A separate 64 MiB HFS+ test volume verified actual

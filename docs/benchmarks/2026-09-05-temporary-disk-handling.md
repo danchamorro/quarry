@@ -6,6 +6,10 @@ checking writable capacity and allowing a selected working directory. The
 The [priority checklist](../PRE_BETA_CHECKLIST.md#4-temporary-disk-handling)
 tracks integrated checks and installed-app validation.
 
+Implementation commit `6e91c39` is submitted in
+[PR #38](https://github.com/danchamorro/quarry/pull/38). The final automated
+checks below cover that code; recorded binary checks retain their earlier scope.
+
 ## Environment and scope
 
 - Apple M3 Max, Mac15,9, 137,438,953,472 bytes RAM (128 GiB).
