@@ -20,6 +20,12 @@ use crate::{
     QuarryError, Session, SourceStamp,
 };
 
+#[path = "duplicate.rs"]
+mod duplicate;
+pub use duplicate::{
+    DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
+};
+
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 const DEFAULT_RUN_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MERGE_FAN_IN: usize = 32;
@@ -408,29 +414,7 @@ impl SortJob {
                 "Shuffle and Reverse do not accept a sort direction",
             ));
         }
-        if !has_header && !header_renames.is_empty() {
-            return Err(QuarryError::InvalidOption(
-                "header renames require a header row",
-            ));
-        }
-        let data_start = u64::from(has_header);
-        if cell_edits
-            .first_key_value()
-            .is_some_and(|((row, _), _)| *row < data_start)
-        {
-            return Err(QuarryError::InvalidOption(
-                "cell edits must target data rows",
-            ));
-        }
-        if header_renames
-            .values()
-            .chain(cell_edits.values())
-            .any(|value| value.len() > config.max_record_bytes)
-        {
-            return Err(QuarryError::RecordTooLarge {
-                limit: config.max_record_bytes,
-            });
-        }
+        validate_overlays(has_header, &header_renames, &cell_edits, config)?;
 
         let mut source = File::open(&source_path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -556,6 +540,39 @@ impl Session {
             DEFAULT_SORT_CONFIG,
         )
     }
+}
+
+fn validate_overlays(
+    has_header: bool,
+    header_renames: &BTreeMap<usize, Vec<u8>>,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    config: SortConfig,
+) -> Result<(), QuarryError> {
+    if !has_header && !header_renames.is_empty() {
+        return Err(QuarryError::InvalidOption(
+            "header renames require a header row",
+        ));
+    }
+    let data_start = u64::from(has_header);
+    if cell_edits
+        .first_key_value()
+        .is_some_and(|((row, _), _)| *row < data_start)
+    {
+        return Err(QuarryError::InvalidOption(
+            "cell edits must target data rows",
+        ));
+    }
+    if header_renames
+        .values()
+        .chain(cell_edits.values())
+        .any(|value| value.len() > config.max_record_bytes)
+    {
+        return Err(QuarryError::RecordTooLarge {
+            limit: config.max_record_bytes,
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
@@ -845,12 +862,39 @@ enum BuilderStep {
     Cancelled,
 }
 
+#[derive(Clone, Copy)]
+enum RunOrder<'a> {
+    Sort(SortSpec),
+    Duplicates(&'a DuplicateSpec),
+}
+
+impl From<SortSpec> for RunOrder<'_> {
+    fn from(spec: SortSpec) -> Self {
+        Self::Sort(spec)
+    }
+}
+
+impl<'a> From<&'a DuplicateSpec> for RunOrder<'a> {
+    fn from(spec: &'a DuplicateSpec) -> Self {
+        Self::Duplicates(spec)
+    }
+}
+
+impl RunOrder<'_> {
+    fn direction(self) -> SortDirection {
+        match self {
+            Self::Sort(spec) => spec.direction,
+            Self::Duplicates(_) => SortDirection::Ascending,
+        }
+    }
+}
+
 struct InitialRunBuilder<'a> {
     delimiter: u8,
     has_header: bool,
     header_renames: &'a BTreeMap<usize, Vec<u8>>,
     cell_edits: &'a BTreeMap<(u64, usize), Vec<u8>>,
-    spec: SortSpec,
+    order: RunOrder<'a>,
     bom_present: bool,
     config: SortConfig,
     workspace: &'a RunWorkspace,
@@ -873,7 +917,7 @@ impl<'a> InitialRunBuilder<'a> {
         has_header: bool,
         header_renames: &'a BTreeMap<usize, Vec<u8>>,
         cell_edits: &'a BTreeMap<(u64, usize), Vec<u8>>,
-        spec: SortSpec,
+        order: impl Into<RunOrder<'a>>,
         bom_present: bool,
         config: SortConfig,
         workspace: &'a RunWorkspace,
@@ -884,7 +928,7 @@ impl<'a> InitialRunBuilder<'a> {
             has_header,
             header_renames,
             cell_edits,
-            spec,
+            order: order.into(),
             bom_present,
             config,
             workspace,
@@ -967,48 +1011,57 @@ impl<'a> InitialRunBuilder<'a> {
                 "cell edit column is out of range",
             ));
         }
-        let value = if self.spec.mode.uses_column() {
+        let value_at = |column| {
             row_edits
                 .iter()
-                .find(|(column, _)| *column == self.spec.column)
+                .find(|(edited_column, _)| *edited_column == column)
                 .map(|(_, value)| *value)
-                .or_else(|| fields.get(self.spec.column).map(|field| field.as_ref()))
+                .or_else(|| fields.get(column).map(|field| field.as_ref()))
                 .unwrap_or_default()
-        } else {
-            &[]
         };
-        let key = self
-            .spec
-            .key(value, self.rows)
-            .map_err(|error| match self.spec.mode {
-                SortMode::Number => QuarryError::InvalidNumericSortValue {
-                    data_row: self.rows.saturating_add(1),
-                    column: self.spec.column.saturating_add(1),
-                },
-                SortMode::CharacterCount | SortMode::WordCount => {
-                    QuarryError::InvalidUtf8SortValue {
-                        data_row: self.rows.saturating_add(1),
-                        column: self.spec.column.saturating_add(1),
-                    }
-                }
-                _ => error,
-            })?;
+        let key = match self.order {
+            RunOrder::Duplicates(spec) => spec.key(value_at, self.config.max_record_bytes)?,
+            RunOrder::Sort(spec) => {
+                let value = if spec.mode.uses_column() {
+                    value_at(spec.column)
+                } else {
+                    &[]
+                };
+                spec.key(value, self.rows)
+                    .map_err(|error| match spec.mode {
+                        SortMode::Number => QuarryError::InvalidNumericSortValue {
+                            data_row: self.rows.saturating_add(1),
+                            column: spec.column.saturating_add(1),
+                        },
+                        SortMode::CharacterCount | SortMode::WordCount => {
+                            QuarryError::InvalidUtf8SortValue {
+                                data_row: self.rows.saturating_add(1),
+                                column: spec.column.saturating_add(1),
+                            }
+                        }
+                        _ => error,
+                    })?
+            }
+        };
         self.max_key_bytes = self.max_key_bytes.max(key.len());
-        let effective_record =
-            if row_edits.is_empty() && !(physical_row > 0 && body.starts_with(UTF8_BOM)) {
-                body.to_vec()
-            } else {
-                let mut values: Vec<Vec<u8>> = fields.iter().map(|field| field.to_vec()).collect();
-                for (column, value) in row_edits {
-                    values[column] = value.to_vec();
-                }
-                serialize_fields(
-                    &values,
-                    self.delimiter,
-                    ending,
-                    self.config.max_record_bytes,
-                )?
-            };
+        let effective_record = if row_edits.is_empty()
+            && !(matches!(self.order, RunOrder::Sort(_))
+                && physical_row > 0
+                && body.starts_with(UTF8_BOM))
+        {
+            body.to_vec()
+        } else {
+            let mut values: Vec<Vec<u8>> = fields.iter().map(|field| field.to_vec()).collect();
+            for (column, value) in row_edits {
+                values[column] = value.to_vec();
+            }
+            serialize_fields(
+                &values,
+                self.delimiter,
+                ending,
+                self.config.max_record_bytes,
+            )?
+        };
         if physical_row == 0
             && self.bom_present
             && effective_record.len().saturating_add(UTF8_BOM.len()) > self.config.max_record_bytes
@@ -1028,7 +1081,9 @@ impl<'a> InitialRunBuilder<'a> {
         {
             return Ok(BuilderStep::Cancelled);
         }
-        self.records.observe(&effective_record);
+        if matches!(self.order, RunOrder::Sort(_)) {
+            self.records.observe(&effective_record);
+        }
         self.entries.push(RunEntry {
             key,
             record: effective_record,
@@ -1045,7 +1100,7 @@ impl<'a> InitialRunBuilder<'a> {
             return Ok(BuilderStep::Complete);
         }
         self.entries
-            .sort_by(|left, right| compare_entries(left, right, self.spec.direction));
+            .sort_by(|left, right| compare_entries(left, right, self.order.direction()));
         let (path, mut writer) = self.workspace.create_run()?;
         for entry in self.entries.drain(..) {
             if self.shared.cancel_requested.load(Ordering::Acquire) {
@@ -1094,17 +1149,17 @@ enum ScanOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn create_initial_runs(
+fn create_initial_runs<'a>(
     source: &mut File,
     delimiter: u8,
     has_header: bool,
-    header_renames: &BTreeMap<usize, Vec<u8>>,
-    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
-    spec: SortSpec,
+    header_renames: &'a BTreeMap<usize, Vec<u8>>,
+    cell_edits: &'a BTreeMap<(u64, usize), Vec<u8>>,
+    order: impl Into<RunOrder<'a>>,
     bom_present: bool,
     config: SortConfig,
-    workspace: &RunWorkspace,
-    shared: &SharedState,
+    workspace: &'a RunWorkspace,
+    shared: &'a SharedState,
 ) -> Result<ScanOutcome, QuarryError> {
     source.seek(SeekFrom::Start(0))?;
     let mut scanner = RecordScanner::new(delimiter)?;
@@ -1117,7 +1172,7 @@ fn create_initial_runs(
         has_header,
         header_renames,
         cell_edits,
-        spec,
+        order,
         bom_present,
         config,
         workspace,
@@ -1298,33 +1353,15 @@ fn run_sort_inner(
         return Ok(None);
     }
 
-    let merge_fan_in = effective_merge_fan_in(config, scan.max_key_bytes);
-    while scan.runs.len() > merge_fan_in {
-        let mut next = Vec::with_capacity(scan.runs.len().div_ceil(merge_fan_in));
-        for group in scan.runs.chunks(merge_fan_in) {
-            if shared.cancel_requested.load(Ordering::Acquire) {
-                return Ok(None);
-            }
-            let (path, writer) = workspace.create_run()?;
-            if !merge_runs_to_run(
-                group,
-                writer,
-                spec.direction,
-                config.max_record_bytes,
-                shared,
-            )? {
-                return Ok(None);
-            }
-            for old in group {
-                let bytes = fs::metadata(old)?.len();
-                fs::remove_file(old)?;
-                shared.remove_temporary_bytes(bytes);
-            }
-            next.push(path);
-            shared.runs_created.fetch_add(1, Ordering::AcqRel);
-        }
-        scan.runs = next;
-        shared.merge_passes.fetch_add(1, Ordering::AcqRel);
+    if !reduce_runs(
+        &mut scan.runs,
+        spec.direction,
+        scan.max_key_bytes,
+        config,
+        workspace,
+        shared,
+    )? {
+        return Ok(None);
     }
 
     let mut bytes_written = 0_u64;
@@ -1362,6 +1399,40 @@ fn run_sort_inner(
     bytes_written = bytes_written.saturating_add(data_bytes);
     shared.bytes_written.store(bytes_written, Ordering::Release);
     Ok(Some((scan.rows, bytes_written, verification)))
+}
+
+fn reduce_runs(
+    runs: &mut Vec<PathBuf>,
+    direction: SortDirection,
+    max_key_bytes: usize,
+    config: SortConfig,
+    workspace: &RunWorkspace,
+    shared: &SharedState,
+) -> Result<bool, QuarryError> {
+    let merge_fan_in = effective_merge_fan_in(config, max_key_bytes);
+    while runs.len() > merge_fan_in {
+        let mut next = Vec::with_capacity(runs.len().div_ceil(merge_fan_in));
+        for group in runs.chunks(merge_fan_in) {
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let (path, writer) = workspace.create_run()?;
+            if !merge_runs_to_run(group, writer, direction, config.max_record_bytes, shared)? {
+                return Ok(false);
+            }
+            for old in group {
+                let bytes = fs::metadata(old)?.len();
+                fs::remove_file(old)?;
+                shared.remove_temporary_bytes(bytes);
+            }
+            next.push(path);
+            shared.runs_created.fetch_add(1, Ordering::AcqRel);
+        }
+        *runs = next;
+        shared.merge_passes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    Ok(true)
 }
 
 fn write_entry(writer: &mut BufWriter<File>, entry: &RunEntry) -> Result<u64, QuarryError> {

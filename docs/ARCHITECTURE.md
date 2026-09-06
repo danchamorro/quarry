@@ -323,6 +323,34 @@ cover the newer modes on a deterministic 1 GB workload, including complete
 order and row-preservation checks, cancellation, and bounded memory and disk.
 They do not extend the older 12 GB and 50 GB Text results to the new modes.
 
+## Duplicate analysis and removal
+
+`DuplicateSpec` defines a tuple of selected decoded fields. Each field is
+length-framed to distinguish concatenation and embedded-byte ambiguities.
+ASCII-insensitive matching folds ASCII letters only; sensitive matching keeps
+the original bytes. Missing fields use the same empty key as blank fields.
+Whitespace and numeric spelling are significant. The combined framed key is
+limited to 64 MiB, including eight length bytes per selected column.
+
+Duplicate analysis reuses the external-sort run writer, scanner, merge heap,
+source guards, cancellation, and owner-only workspace. It sorts matching keys
+with current row ordinals as stable ties, retains the first record per key,
+then externally sorts survivors by ordinal to restore their relative order.
+Unedited retained records keep their raw bytes; sparse edits are materialized
+before matching and output. The UTF-8 BOM and header remain at the file boundary.
+No hash set of every key or list of every duplicate row is retained in RAM.
+
+The completed private candidate is a preview, not the active document. The
+desktop holds it as a structural operation and shows its extra-row count,
+blocking edits and replacement until explicit removal or cancellation. Removal
+prepares and indexes the candidate and rechecks both active and original source
+stamps before consuming history. It then enters the existing working-copy,
+Undo/Redo, Save, Save As, and Discard path. A dismissed or abandoned candidate,
+no duplicates, or failure cleans up unpublished output and preserves the prior
+document. [ADR 0004](adr/0004-bounded-duplicate-removal.md) records this choice;
+the [validation report](benchmarks/2026-09-05-find-remove-duplicates.md) records
+the exact-output and large-file checks.
+
 ## Document editing and persistence
 
 Editing occurs directly in the grid. The last opened or saved file remains

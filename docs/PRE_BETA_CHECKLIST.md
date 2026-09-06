@@ -2,9 +2,8 @@
 
 This is the focused product checklist to complete before Quarry's first public
 beta. Work in priority order: individual edit Undo, numeric filters, duplicate
-cleanup, then temporary-disk handling. Priority 1 is merged and locally
-validated. Priority 2 is implemented and locally validated; priorities 3 and 4
-remain planned.
+cleanup, then temporary-disk handling. Priorities 1 and 2 are merged and locally
+validated. Priority 3 is implemented and locally validated; priority 4 remains planned.
 
 Mark an item complete only after its behavior is implemented and validated.
 Record the PR and validation evidence under each priority, and update the
@@ -70,28 +69,38 @@ invalid-value handling, and combined rules. The installed feature build passed
 Between with a text rule, invalid-bound rejection while preserving the active
 filter, exact exported bytes, and source preservation. It records dirty source;
 CodeRabbit CLI 0.7.5 completed review with zero findings across all 14 changed
-files on 2026-09-05. Implementation commit `d9f47dd` is submitted in
-[PR #36](https://github.com/danchamorro/quarry/pull/36), awaiting merge.
+files on 2026-09-05. Implementation commit `d9f47dd` and review follow-ups merged
+in [PR #36](https://github.com/danchamorro/quarry/pull/36) as `8ab5185`. All checks
+passed. The installed app was updated from the clean merge commit and inclusive
+Between returned the expected rows again in the reopened app.
 
 ## 3. Find and remove duplicates
 
 **Goal:** identify repeated records using selected columns, review the count,
 and explicitly remove extra occurrences while keeping the first row.
 
-- [ ] Let users choose the columns that determine whether records match.
+- [x] Let users choose the columns that determine whether records match.
   Define case sensitivity and how blank or missing fields compare.
-- [ ] Show the duplicate count before removal and explain that the first
+- [x] Show the duplicate count before removal and explain that the first
   occurrence in the current row order will be kept.
-- [ ] Keep every retained row intact and preserve its relative order. Keep
+- [x] Keep every retained row intact and preserve its relative order. Keep
   the header fixed and account for current unsaved values.
-- [ ] Reuse the working-copy, Undo/Redo, Save, Save As, and Discard workflow.
+- [x] Reuse the working-copy, Undo/Redo, Save, Save As, and Discard workflow.
   Cancellation or failure must preserve the current document and source.
-- [ ] Validate selected-column matching, repeated identical rows, quoted and
+- [x] Validate selected-column matching, repeated identical rows, quoted and
   multiline values, exact retained rows, cancellation, temporary-file cleanup,
   and bounded memory on a large-file workload. Verify the installed-app
   workflow and update the user guide.
 
-**Evidence:** pending.
+**Evidence:** [2026-09-05 validation](benchmarks/2026-09-05-find-remove-duplicates.md)
+on `codex/find-remove-duplicates`: all 276 workspace tests, strict Clippy,
+formatting, release build, and 1 GB exact-output validation passed. The installed
+feature build passed selected-column matching with an unsaved edit, reviewed
+counts, Cancel, explicit removal, Undo/Redo, and exact Save As output with an
+unchanged source. It records dirty source; commit and PR are pending.
+Matching and workflow details are in the
+[user guide](USER_GUIDE.md#find-and-remove-duplicates) and
+[architecture decision](adr/0004-bounded-duplicate-removal.md).
 
 ## 4. Temporary-disk handling
 

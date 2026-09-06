@@ -4,9 +4,12 @@ Pre-beta priority 2 adds exact numeric filters on `codex/numeric-filters`, based
 on `cd0501384d350e54850711ab7659fb2079f2cbce`. Validation used the uncommitted
 feature build. Automated checks, 1 GB validation, and installed-app interaction
 checks passed. Implementation commit `d9f47dd` is submitted in
-[PR #36](https://github.com/danchamorro/quarry/pull/36), awaiting merge. See the
+[PR #36](https://github.com/danchamorro/quarry/pull/36), merged as `8ab5185`.
+All checks passed, and the clean installed merge build passed inclusive Between
+again. See the
 [priority checklist](../PRE_BETA_CHECKLIST.md#2-numeric-filters) for delivery
-status. Priorities 3 and 4 remain planned.
+status. Priority 3 is implemented and locally validated; only priority 4 remains
+planned.
 
 ## Behavior
 

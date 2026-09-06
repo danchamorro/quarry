@@ -44,7 +44,7 @@ Column controls operate on stable source-column identities. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
 
-Find/Replace, Filters, and Text sorting each expose their own **Match case** option.
+Find/Replace, Filters, Text sorting, and Find Duplicates each expose their own **Match case** option.
 Each option is off by default, so its tool compares ASCII letters without
 regard to case. Turning it on uses exact case-sensitive text matching. The
 Filter to This Value and Filter Out This Value cell actions inherit the current
@@ -62,6 +62,17 @@ their Match case setting remain unchanged. Numeric rules use the existing
 bounded filter index, navigation, cancellation, and source-preserving filtered
 export path. The [priority 2 validation](benchmarks/2026-09-05-numeric-filters.md)
 records exact regressions and the deterministic 1 GB workload.
+
+Pre-beta priority 3 adds **Find Duplicates…** to selected numbered columns.
+Matching uses decoded selected-field tuples, ASCII-insensitive by default with
+an explicit Match case setting. Blank and missing fields match; whitespace and
+numeric spelling remain significant. A cancellable bounded external-sort pass
+prepares a private candidate and shows the extra-row count before explicit
+removal. It keeps the first occurrence in current document order, preserves
+retained rows and the fixed header, and includes unsaved values. The preview
+blocks edits until accepted or cancelled. Removal reuses working-copy history,
+Save, Save As, and Discard; cancellation and failure preserve the current
+document and source. See the [validation report](benchmarks/2026-09-05-find-remove-duplicates.md).
 
 Not required: general-purpose text-editor behavior, formulas, charts, database
 connectivity, plugins, cloud sync, collaboration, direct in-place byte
