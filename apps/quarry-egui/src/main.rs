@@ -39,6 +39,9 @@ use quarry_core::{
 };
 use tempfile::TempDir;
 
+mod storage;
+use storage::{PendingStorageOperation, STORAGE_REVIEW_BYTES, StorageReview};
+
 const BOOTSTRAP_ROWS: usize = 40;
 const OVERSCAN_ROWS: usize = 16;
 const ROW_HEIGHT: f32 = 17.0;
@@ -264,6 +267,9 @@ fn main() -> eframe::Result<()> {
 }
 
 struct QuarryApp {
+    working_directory: PathBuf,
+    storage_review: Option<StorageReview>,
+    storage_approved: bool,
     jump_input: String,
     find_input: String,
     replace_input: String,
@@ -455,6 +461,9 @@ impl Default for FilterRuleDraft {
 impl QuarryApp {
     fn new(initial_path: Option<PathBuf>, started: Instant) -> Self {
         let mut app = Self {
+            working_directory: std::env::temp_dir(),
+            storage_review: None,
+            storage_approved: false,
             jump_input: "1".into(),
             find_input: String::new(),
             replace_input: String::new(),
@@ -550,6 +559,7 @@ impl QuarryApp {
         options: OpenOptions,
     ) -> Result<(), AppMessage> {
         let mut document = Document::prepare(&path, options).map_err(AppMessage::error)?;
+        document.working_directory = self.working_directory.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.document.as_mut() {
             current.shutdown();
@@ -665,6 +675,9 @@ impl QuarryApp {
     }
 
     fn save_current(&mut self) -> bool {
+        if self.defer_storage(PendingStorageOperation::Save(None)) {
+            return self.storage_review.is_some();
+        }
         let result = self
             .document
             .as_mut()
@@ -681,6 +694,9 @@ impl QuarryApp {
         let Some(destination) = destination else {
             return false;
         };
+        if self.defer_storage(PendingStorageOperation::Save(Some(destination.clone()))) {
+            return self.storage_review.is_some();
+        }
         let result = self
             .document
             .as_mut()
@@ -697,6 +713,9 @@ impl QuarryApp {
         let Some(destination) = destination else {
             return;
         };
+        if self.defer_storage(PendingStorageOperation::Export(destination.clone())) {
+            return;
+        }
         let result = self
             .document
             .as_mut()
@@ -786,6 +805,19 @@ impl QuarryApp {
             document.commit_edits();
         }
         match action {
+            Action::TemporaryStorage => {
+                self.open_storage_settings();
+                return;
+            }
+            Action::ReplaceAll if !self.storage_approved => {
+                if self.defer_storage(PendingStorageOperation::ReplaceAll {
+                    query: self.find_input.as_bytes().to_vec(),
+                    replacement: self.replace_input.as_bytes().to_vec(),
+                    case_sensitivity: case_sensitivity(self.find_match_case),
+                }) {
+                    return;
+                }
+            }
             Action::Choose => return self.choose_file(),
             Action::ReopenWithFormat(delimiter, header) => {
                 return self.reopen_document(delimiter, header);
@@ -867,6 +899,7 @@ impl QuarryApp {
         }
         let result = match action {
             Action::Choose
+            | Action::TemporaryStorage
             | Action::ReopenWithFormat(_, _)
             | Action::ReloadFromDisk
             | Action::Save
@@ -1020,6 +1053,10 @@ impl QuarryApp {
         let Some(dialog) = self.structural_dialog.clone() else {
             return;
         };
+        if self.defer_storage(PendingStorageOperation::Structural(dialog.clone())) {
+            self.structural_dialog = None;
+            return;
+        }
         let result =
             self.document
                 .as_mut()
@@ -1062,6 +1099,9 @@ impl QuarryApp {
     }
 
     fn apply_delete_columns(&mut self, columns: Vec<usize>) {
+        if self.defer_storage(PendingStorageOperation::DeleteColumns(columns.clone())) {
+            return;
+        }
         let result = self
             .document
             .as_mut()
@@ -1079,6 +1119,9 @@ impl QuarryApp {
     }
 
     fn apply_delete_rows(&mut self, rows: Vec<RangeInclusive<u64>>) {
+        if self.defer_storage(PendingStorageOperation::DeleteRows(rows.clone())) {
+            return;
+        }
         let result = self
             .document
             .as_mut()
@@ -1121,6 +1164,7 @@ impl QuarryApp {
         replacement.logical_path = current.logical_path.clone();
         replacement.original_session = current.original_session.take();
         replacement.working_copy = current.working_copy.take();
+        replacement.working_directory = self.working_directory.clone();
         replacement.selected_columns = ready.selected_columns;
         let first_selected = replacement.selected_columns.iter().next().copied();
         replacement.column_selection_anchor = first_selected;
@@ -1323,6 +1367,7 @@ impl QuarryApp {
         replacement.logical_path = logical_path.clone();
         replacement.original_session = current.original_session.take();
         replacement.working_copy = Some(state);
+        replacement.working_directory = self.working_directory.clone();
         current.shutdown();
         self.document = Some(replacement);
         self.structural_dialog = None;
@@ -1395,6 +1440,13 @@ impl eframe::App for QuarryApp {
             self.logged_first_update = true;
         }
 
+        if self.storage_review.is_some() {
+            if ctx.input(|input| input.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            self.show_storage_review(ctx);
+            return;
+        }
         self.intercept_dirty_close(ctx);
 
         #[cfg(target_os = "macos")]
@@ -1511,6 +1563,19 @@ impl eframe::App for QuarryApp {
                 self.footer_status = None;
                 self.notice = Some(error);
             }
+        }
+        if let Some((transformation, selected_columns, records)) = self
+            .document
+            .as_mut()
+            .and_then(|document| document.pending_materialization.take())
+        {
+            self.begin_storage_review(PendingStorageOperation::Materialize(
+                transformation,
+                selected_columns,
+                records,
+            ));
+            self.show_storage_review(ctx);
+            return;
         }
         let save_was_active = self
             .document
@@ -2149,6 +2214,7 @@ fn detected_delimiter_label(delimiter: u8) -> &'static str {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Choose,
+    TemporaryStorage,
     ReopenWithFormat(DelimiterMode, HeaderMode),
     ReloadFromDisk,
     Save,
@@ -2816,6 +2882,16 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             });
         if discard.clicked() {
             action = Some(Action::DiscardChanges);
+        }
+        ui.separator();
+        if ui
+            .add_enabled(
+                !file_operation_active,
+                egui::Button::new("Temporary storage…"),
+            )
+            .clicked()
+        {
+            action = Some(Action::TemporaryStorage);
         }
         action
     });
@@ -4078,18 +4154,25 @@ impl RowSelection {
 
 struct WorkingCopyState {
     directory: TempDir,
+    previous_directories: Vec<TempDir>,
     next_generation: u64,
     undo: Option<WorkingCopySnapshot>,
     redo: Option<WorkingCopySnapshot>,
 }
 
 impl WorkingCopyState {
+    #[cfg(test)]
     fn new() -> Result<Self, String> {
+        Self::new_in(&std::env::temp_dir())
+    }
+
+    fn new_in(parent: &Path) -> Result<Self, String> {
         Ok(Self {
             directory: tempfile::Builder::new()
                 .prefix("quarry-working-")
-                .tempdir()
-                .map_err(|error| error.to_string())?,
+                .tempdir_in(parent)
+                .map_err(|error| format!("Cannot create working files in {}: {error}. Choose another folder in File > Temporary storage.", parent.display()))?,
+            previous_directories: Vec::new(),
             next_generation: 1,
             undo: None,
             redo: None,
@@ -4350,6 +4433,8 @@ impl ColumnView {
 }
 
 struct Document {
+    working_directory: PathBuf,
+    pending_materialization: Option<(ColumnTransformation, BTreeSet<usize>, u64)>,
     session: Session,
     logical_path: PathBuf,
     original_session: Option<Session>,
@@ -4490,6 +4575,8 @@ impl Document {
         Ok(Self {
             session,
             logical_path: path.to_path_buf(),
+            working_directory: std::env::temp_dir(),
+            pending_materialization: None,
             original_session: None,
             working_copy: None,
             edit_history: EditHistory::default(),
@@ -4930,40 +5017,29 @@ impl Document {
     }
 
     fn sort_temporary_disk_estimate(&self) -> Option<u64> {
-        let data_rows = self
-            .index
-            .as_ref()?
-            .indexed_rows()
-            .saturating_sub(self.data_start);
-        let effective_bytes_upper_bound = self.header_renames.values().fold(
-            self.session
-                .file_size
-                .saturating_add(data_rows.saturating_mul(2)),
-            |bytes, value| bytes.saturating_add(serialized_field_upper_bound(value.as_bytes())),
-        );
-        let effective_bytes_upper_bound = self
-            .cell_edits
-            .values()
-            .fold(effective_bytes_upper_bound, |bytes, value| {
-                bytes.saturating_add(serialized_field_upper_bound(value))
-            });
-        let effective_bytes_upper_bound =
-            self.header_edit
-                .as_ref()
-                .map_or(effective_bytes_upper_bound, |edit| {
-                    effective_bytes_upper_bound
-                        .saturating_add(serialized_field_upper_bound(edit.draft.as_bytes()))
-                });
-        let effective_bytes_upper_bound =
-            self.cell_edit
-                .as_ref()
-                .map_or(effective_bytes_upper_bound, |edit| {
-                    effective_bytes_upper_bound
-                        .saturating_add(serialized_field_upper_bound(edit.draft.as_bytes()))
-                });
+        let records = self.index.as_ref()?.indexed_rows();
+        let mut headers: BTreeMap<_, _> = self
+            .header_renames
+            .iter()
+            .map(|(column, value)| (*column, value.as_bytes().to_vec()))
+            .collect();
+        let mut cells = self.cell_edits.clone();
+        if let Some(edit) = &self.header_edit {
+            headers.insert(edit.column, edit.draft.as_bytes().to_vec());
+        }
+        if let Some(edit) = &self.cell_edit {
+            cells.insert((edit.row, edit.column), edit.draft.as_bytes().to_vec());
+        }
         Some(estimate_sort_temporary_bytes(
-            effective_bytes_upper_bound,
-            data_rows,
+            quarry_core::estimate_edited_output_bytes(
+                self.session.file_size,
+                records,
+                &headers,
+                &cells,
+                None,
+                None,
+            ),
+            records.saturating_sub(self.data_start),
         ))
     }
 
@@ -4992,7 +5068,8 @@ impl Document {
             self.original_session = Some(original);
         }
         if self.working_copy.is_none() {
-            self.working_copy = Some(WorkingCopyState::new().map_err(AppMessage::error)?);
+            self.working_copy =
+                Some(WorkingCopyState::new_in(&self.working_directory).map_err(AppMessage::error)?);
         }
         let undo = WorkingCopySnapshot {
             path: self.session.path().to_path_buf(),
@@ -5006,6 +5083,9 @@ impl Document {
             .working_copy
             .as_mut()
             .expect("the working-copy state was created");
+        state
+            .use_directory(&self.working_directory)
+            .map_err(AppMessage::error)?;
         let destination = state.next_path();
         let renames = self
             .header_renames
@@ -5139,13 +5219,14 @@ impl Document {
             .expect("materialization owns a working-copy directory");
         let current_path = self.session.path().to_path_buf();
         for obsolete in [state.undo.take(), state.redo.take()].into_iter().flatten() {
-            if obsolete.path != current_path && obsolete.path.starts_with(state.directory.path()) {
+            if obsolete.path != current_path && state.owns(&obsolete.path) {
                 let _ = std::fs::remove_file(obsolete.path);
             }
         }
         debug_assert_eq!(undo.path, current_path);
         state.undo = Some(undo);
         state.redo = None;
+        state.prune_directories(&current_path);
         self.structural_status = None;
     }
 
@@ -5243,7 +5324,18 @@ impl Document {
                     .map_err(|error| AppMessage::error(error.to_string()))?;
                     let selected_columns =
                         (source_column..source_column.saturating_add(summary.max_pieces)).collect();
-                    self.begin_materialization(transformation, selected_columns)?;
+                    let records = summary.rows_scanned.saturating_add(self.data_start);
+                    if self.materialization_storage_estimate_for_records(
+                        Some(&transformation),
+                        None,
+                        records,
+                    ) >= STORAGE_REVIEW_BYTES
+                    {
+                        self.pending_materialization =
+                            Some((transformation, selected_columns, records));
+                    } else {
+                        self.begin_materialization(transformation, selected_columns)?;
+                    }
                     Ok(None)
                 }
                 Ok(SplitAnalysisOutcome::Complete(_)) => {
@@ -5487,9 +5579,10 @@ impl Document {
         let Some(redo) = state.redo.take() else {
             return;
         };
-        if redo.path != self.session.path() && redo.path.starts_with(state.directory.path()) {
+        if redo.path != self.session.path() && state.owns(&redo.path) {
             let _ = std::fs::remove_file(redo.path);
         }
+        state.prune_directories(self.session.path());
     }
 
     fn structural_progress(&self) -> Option<StructuralProgressDisplay> {
@@ -8824,13 +8917,6 @@ fn sort_direction_label(mode: SortMode, direction: SortDirection) -> &'static st
         (_, SortDirection::Ascending) => "Ascending",
         (_, SortDirection::Descending) => "Descending",
     }
-}
-
-fn serialized_field_upper_bound(value: &[u8]) -> u64 {
-    u64::try_from(value.len())
-        .unwrap_or(u64::MAX)
-        .saturating_mul(2)
-        .saturating_add(2)
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -14165,7 +14251,12 @@ mod tests {
         assert_eq!(
             document.sort_temporary_disk_estimate(),
             Some(estimate_sort_temporary_bytes(
-                document.session.file_size.saturating_add(10),
+                document
+                    .session
+                    .file_size
+                    .saturating_add(12)
+                    .saturating_mul(2)
+                    .saturating_add(3),
                 5,
             ))
         );

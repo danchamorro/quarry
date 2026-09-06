@@ -22,6 +22,7 @@ delimited files in the Quarry macOS app.
   - [Move or delete columns](#move-or-delete-columns)
   - [Sort rows](#sort-rows)
   - [Manage the visible columns](#manage-the-visible-columns)
+  - [Temporary storage and free space](#temporary-storage-and-free-space)
   - [Save, Save As, and discard](#save-save-as-and-discard)
 - [Case matching](#case-matching)
 - [Mouse and keyboard reference](#mouse-and-keyboard-reference)
@@ -455,6 +456,48 @@ Click **Auto-fit columns** at the bottom of the **Columns…** window to fit eve
 shown column to its header and the cell values already loaded into the grid.
 Auto-fit works with any number of shown columns.
 
+### Temporary storage and free space
+
+Choose **File → Temporary storage…** to select a working folder on a drive
+with enough free space. Use **Choose folder…**, or enter an existing folder
+and click **Check space**. **Use folder** applies the choice for this app
+session. **Use system temporary folder** restores the default. Quarry checks
+that the folder is available and can create, write, and remove a private file.
+
+New working versions, sort runs, and duplicate-search runs use the chosen
+folder. Changing the folder does not move or delete the current working version
+or its Undo/Redo files. Keep their original drive connected. Quarry removes
+versions when they become obsolete, and cleans up remaining private working
+files on Save, Save As, Discard, document replacement, or normal shutdown.
+
+Before an operation whose conservative storage allowance is at least 256 MiB,
+**Review storage requirements** shows the required additional space, available
+space, and retained working/Undo files. Large operations wait for indexing so
+the estimate uses the actual row count. Split first checks the resulting column
+width without writing a working version. **Continue** starts the operation;
+**Cancel** preserves the document. Insufficient space disables Continue. Choose
+another working folder or free space, then check again.
+
+The allowance covers new output, expanded fields, and simultaneous sort or
+duplicate spill files. Retained versions already consume space on their own
+volumes, so their sizes are shown separately rather than added twice to the
+additional requirement. Estimates are conservative, not reservations. Other
+applications can consume space after a check. Every output operation checks
+again before writing, including operations below the review threshold.
+
+**Save**, **Save As**, and filtered export stage their output beside the
+destination, even when a different working folder is selected. This keeps
+publication atomic. To use another destination volume, cancel and choose a
+new **Save As** or export path. The original file and required Undo versions
+remain available if a capacity check or a later write fails. Cancelled or failed
+operations remove unpublished output; they never publish a partial file.
+
+The CLI supports `--temp-dir DIRECTORY` for `sort-save-as` and `duplicates`.
+This places scratch runs in the selected existing folder; count-only duplicates
+also puts its private candidate there. Explicit output stays on its destination
+volume. CLI edit, transformation, Save As, and export commands also check the
+destination folder's capacity. The developer fixture generator is excluded.
+
 ### Save, Save As, and discard
 
 The leftmost toolbar control reads **File** before a file is open and shows the
@@ -544,6 +587,7 @@ setting.
 | **Replace in Cell** is disabled | Use **Find Next** or **Find Previous** to establish the current matching cell first. |
 | Quarry says the source changed | Use **Discard Changes**, then choose **Reload from Disk** from the file menu. |
 | Save As will not use a path | Choose a destination that does not already exist. |
+| A storage check fails | Reconnect the drive, choose an existing writable folder in File → Temporary storage, or free space and click Check space. For Save/export, choose another destination. |
 | A dropped file does not open | Use one local file, and save or discard changes in the current file first. |
 | A long operation is running | Read its progress or phase in the footer. Use the matching Cancel button there if needed. |
 | A long operation appears stuck during sort | Check whether the status says **Merging sorted rows…**. This is a separate merge phase and can take substantial time on very large files. |

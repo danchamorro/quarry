@@ -153,6 +153,9 @@ Numeric filters and their exported results also have a separate 1 GB validation.
   flushed and synchronized. It also detects metadata-visible source changes.
 - Save As refuses to overwrite an existing destination. Cancellation or
   failure removes unpublished temporary artifacts.
+- Choose a temporary working folder and review required and available storage
+  before large operations. Document edits, Save, and export check capacity and keep
+  atomic staging on the destination volume. See [temporary storage](docs/USER_GUIDE.md#temporary-storage-and-free-space).
 - Sort checks a conservative temporary-disk allowance and verifies ordering,
   row preservation, and stable ties before publication.
 

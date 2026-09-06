@@ -2,8 +2,9 @@
 
 This is the focused product checklist to complete before Quarry's first public
 beta. Work in priority order: individual edit Undo, numeric filters, duplicate
-cleanup, then temporary-disk handling. Priorities 1 and 2 are merged and locally
-validated. Priority 3 is implemented and locally validated; priority 4 remains planned.
+cleanup, then temporary-disk handling. Priorities 1 through 3 are merged and locally
+validated. Priority 4 is implemented and locally validated on
+`codex/temporary-disk-handling`, ready for PR review.
 
 Mark an item complete only after its behavior is implemented and validated.
 Record the PR and validation evidence under each priority, and update the
@@ -97,9 +98,10 @@ on `codex/find-remove-duplicates`: all 276 workspace tests, strict Clippy,
 formatting, release build, and 1 GB exact-output validation passed. The installed
 feature build passed selected-column matching with an unsaved edit, reviewed
 counts, Cancel, explicit removal, Undo/Redo, and exact Save As output with an
-unchanged source. The validated app records dirty source. Implementation commit
-`6f0eeb4` is submitted in [PR #37](https://github.com/danchamorro/quarry/pull/37),
-awaiting merge.
+unchanged source. Implementation commit `6f0eeb4` and documentation follow-up merged in
+[PR #37](https://github.com/danchamorro/quarry/pull/37) as `9210369`. All checks
+passed. The clean merged app was installed and verified; duplicate removal and
+Undo passed again, with the source unchanged.
 Matching and workflow details are in the
 [user guide](USER_GUIDE.md#find-and-remove-duplicates) and
 [architecture decision](adr/0004-bounded-duplicate-removal.md).
@@ -107,24 +109,39 @@ Matching and workflow details are in the
 ## 4. Temporary-disk handling
 
 **Goal:** explain storage requirements before a large operation and let users
-use a drive with enough space. Sorting currently estimates required space;
-working copies use the system temporary directory without an available-space
-check.
+use a drive with enough space. Apply shared capacity checks to working copies,
+sort/duplicate runs, Save, and export while retaining atomic publication.
 
-- [ ] Allow users to choose a temporary working location for large operations.
-- [ ] Check available space on the relevant volume before starting, accounting
+- [x] Allow users to choose a temporary working location for large operations.
+- [x] Check available space on the relevant volume before starting, accounting
   for temporary output and retained working versions. Keep atomic Save staging
   on the destination volume.
-- [ ] Show required and available space clearly. Handle an unavailable,
+- [x] Show required and available space clearly. Handle an unavailable,
   unwritable, or insufficient-space location with an actionable message.
-- [ ] Handle space running out after the check without publishing partial
+- [x] Handle space running out after the check without publishing partial
   output or losing the current document. Preserve required Undo files and
   remove unpublished temporary output on cancellation or failure.
-- [ ] Validate insufficient space, write failure, cancellation, and a selected
+- [x] Validate insufficient space, write failure, cancellation, and a selected
   alternate working location. Verify the installed-app workflow and document
   storage requirements and cleanup behavior.
 
-**Evidence:** pending.
+**Evidence:** [2026-09-05 validation](benchmarks/2026-09-05-temporary-disk-handling.md)
+on `codex/temporary-disk-handling`: all 290 workspace tests, strict Clippy,
+formatting, locked release build, and deterministic 1 GB before/after checks
+passed. Sort and duplicate outputs were byte-identical; cancellation removed
+unpublished output. A separate 64 MiB HFS+ test volume verified actual
+insufficient capacity independently on scratch and output volumes. Automated
+late-write failures preserved the source and required Undo files.
+
+The installed feature build passed folder selection, actionable failure,
+required/available space, low-space blocking, Cancel/Continue, exact 1 GB sort,
+working versions and Undo/Redo across volumes, atomic Save, and cleanup. Its
+metadata records dirty source from validation before commit. The recorded
+1 GB, cross-volume, and installed-app checks precede the final private-output
+handoff fix. Current automated checks cover that fix, including GUI and CLI
+callers; the native checks were not repeated afterward. Controls and limits
+are documented in the [user guide](USER_GUIDE.md#temporary-storage-and-free-space)
+and [ADR 0005](adr/0005-temporary-storage.md).
 
 ## Completion and release handoff
 

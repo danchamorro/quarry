@@ -74,6 +74,16 @@ blocks edits until accepted or cancelled. Removal reuses working-copy history,
 Save, Save As, and Discard; cancellation and failure preserve the current
 document and source. See the [validation report](benchmarks/2026-09-05-find-remove-duplicates.md).
 
+Pre-beta priority 4 adds a session-level temporary working-folder choice,
+capacity checks for all output operations, and a storage review for allowances
+of at least 256 MiB. The review shows additional required bytes, available
+space, and retained versions. Folder changes preserve the active document and
+its Undo/Redo files. Save and export retain atomic staging on the destination
+volume. Failed checks, later write errors, and cancellation preserve the current
+document and remove unpublished output. The
+[user guide](USER_GUIDE.md#temporary-storage-and-free-space) documents the
+controls and cleanup contract.
+
 Not required: general-purpose text-editor behavior, formulas, charts, database
 connectivity, plugins, cloud sync, collaboration, direct in-place byte
 mutation, or EmEditor feature parity.

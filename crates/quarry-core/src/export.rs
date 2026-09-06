@@ -6,7 +6,7 @@ use std::ops::RangeInclusive;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,10 +16,12 @@ use quarry_delimited::{
 };
 
 use crate::case::ByteMatcher;
+use crate::estimate_edited_output_bytes;
 use crate::filter::{
     FilterQuery, PredicateMatcher, compile_matchers, matching_fields, predicate_groups,
     validate_query,
 };
+use crate::storage::{check_storage, count_records, output_parent, storage_error};
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
     SourceStamp,
@@ -82,6 +84,8 @@ pub struct SaveAsProgress {
     pub bytes_written: u64,
     pub total_bytes: u64,
     pub elapsed: Duration,
+    /// Ready to consume with wait(). Private outputs are not published until then;
+    /// publication can still fail. Public Save/Save As are already finished.
     pub done: bool,
     pub cancelled: bool,
 }
@@ -877,6 +881,7 @@ enum SaveWorkerOutcome {
 }
 
 pub struct SaveAsJob {
+    publication: Option<Arc<PrivatePublication>>,
     shared: Arc<SharedState>,
     handle: Option<JoinHandle<Result<SaveWorkerOutcome, QuarryError>>>,
 }
@@ -1149,7 +1154,7 @@ impl SaveAsJob {
                 error.into()
             }
         })?;
-        let output = match target {
+        let mut output = match target {
             SaveTarget::New(destination, expected) => {
                 ExportTarget::new_guarded(&source_path, destination, &source, expected)?
             }
@@ -1171,6 +1176,7 @@ impl SaveAsJob {
                 destination_expected,
             )?,
         };
+        let publication = output.defer_private_publication();
         let shared = Arc::new(SharedState::new(file_size));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -1198,13 +1204,18 @@ impl SaveAsJob {
                 result
             })?;
         Ok(Self {
+            publication,
             shared,
             handle: Some(handle),
         })
     }
 
     pub fn progress(&self) -> SaveAsProgress {
-        let done = self.shared.done.load(Ordering::Acquire);
+        let done = self.shared.done.load(Ordering::Acquire)
+            || self
+                .publication
+                .as_ref()
+                .is_some_and(|publication| publication.is_ready());
         let finished_nanos = self.shared.finished_nanos.load(Ordering::Acquire);
         SaveAsProgress {
             bytes_scanned: self.shared.bytes_scanned.load(Ordering::Acquire),
@@ -1228,9 +1239,15 @@ impl SaveAsJob {
         if !self.shared.done.load(Ordering::Acquire) {
             self.shared.cancel_requested.store(true, Ordering::Release);
         }
+        if let Some(publication) = &self.publication {
+            publication.decide(false);
+        }
     }
 
     fn wait_worker(mut self) -> Result<SaveWorkerOutcome, QuarryError> {
+        if let Some(publication) = &self.publication {
+            publication.decide(true);
+        }
         self.handle
             .take()
             .expect("save-as handle is present")
@@ -1238,6 +1255,8 @@ impl SaveAsJob {
             .map_err(|_| QuarryError::WorkerPanicked)?
     }
 
+    /// Accept a private working copy, if any, and join its worker. Publication
+    /// stays on the worker and rechecks the source and destination at handoff.
     pub fn wait(self) -> Result<SaveAsOutcome, QuarryError> {
         match self.wait_worker()? {
             SaveWorkerOutcome::Complete { summary, .. } => Ok(SaveAsOutcome::Complete(summary)),
@@ -1269,6 +1288,8 @@ impl ReplaceAllJob {
         self.inner.cancel();
     }
 
+    /// Accept the private replacement output and join its worker. Until this
+    /// call, cancellation or drop discards only job-owned staging.
     pub fn wait(self) -> Result<ReplaceAllOutcome, QuarryError> {
         match self.inner.wait_worker()? {
             SaveWorkerOutcome::Complete {
@@ -1609,8 +1630,49 @@ enum FirstRecordBomGuard {
     Complete,
 }
 
+/// Private jobs stop after flush/sync until wait() accepts the result. Drop and
+/// cancellation reject it, so cleanup never needs to unlink a caller's destination.
+#[derive(Default)]
+pub(crate) struct PrivatePublication {
+    ready: AtomicBool,
+    accepted: Mutex<Option<bool>>,
+    wake: Condvar,
+}
+
+impl PrivatePublication {
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn decide(&self, accepted: bool) {
+        let mut decision = self.accepted.lock().unwrap();
+        if decision.is_none() {
+            *decision = Some(accepted);
+            if !accepted {
+                self.ready.store(false, Ordering::Release);
+            }
+            self.wake.notify_one();
+        }
+    }
+
+    fn wait(&self) -> bool {
+        let decision = self.accepted.lock().unwrap();
+        if decision.is_none() {
+            self.ready.store(true, Ordering::Release);
+        }
+        *self
+            .wake
+            .wait_while(decision, |value| value.is_none())
+            .unwrap()
+            == Some(true)
+    }
+}
+
 pub(crate) struct ExportTarget {
     writer: Option<BufWriter<File>>,
+    // Keeps private staging owned until publication or cleanup, on the destination volume.
+    _private_directory: Option<tempfile::TempDir>,
+    private_publication: Option<Arc<PrivatePublication>>,
     temporary: PathBuf,
     destination: PathBuf,
     publication: Publication,
@@ -1736,6 +1798,19 @@ impl ExportTarget {
         )
     }
 
+    pub(crate) fn defer_private_publication(&mut self) -> Option<Arc<PrivatePublication>> {
+        if matches!(
+            self.publication,
+            Publication::GuardedCreateWorkingCopy { .. }
+        ) {
+            let publication = Arc::new(PrivatePublication::default());
+            self.private_publication = Some(Arc::clone(&publication));
+            Some(publication)
+        } else {
+            None
+        }
+    }
+
     fn create(destination: PathBuf, publication: Publication) -> Result<Self, QuarryError> {
         let parent = destination
             .parent()
@@ -1757,9 +1832,27 @@ impl ExportTarget {
             }
             Publication::CreateNew | Publication::GuardedCreateNew { .. } => {}
         }
+        let private_directory =
+            if matches!(publication, Publication::GuardedCreateWorkingCopy { .. }) {
+                let mut builder = tempfile::Builder::new();
+                #[cfg(unix)]
+                builder.permissions(fs::Permissions::from_mode(0o700));
+                Some(
+                    builder
+                        .prefix(&format!(".quarry-export-{}-", std::process::id()))
+                        .tempdir_in(parent)
+                        .map_err(|error| storage_error(parent, error))?,
+                )
+            } else {
+                None
+            };
+        let staging_parent = private_directory
+            .as_ref()
+            .map_or(parent, |directory| directory.path());
         for _ in 0..100 {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let temporary = parent.join(format!(".quarry-export-{}-{id}.tmp", std::process::id()));
+            let temporary =
+                staging_parent.join(format!(".quarry-export-{}-{id}.tmp", std::process::id()));
             match options.open(&temporary) {
                 Ok(file) => {
                     #[cfg(unix)]
@@ -1788,10 +1881,12 @@ impl ExportTarget {
                     {
                         drop(file);
                         let _ = fs::remove_file(&temporary);
-                        return Err(error.into());
+                        return Err(storage_error(parent, error));
                     }
                     return Ok(Self {
                         writer: Some(BufWriter::new(file)),
+                        _private_directory: private_directory,
+                        private_publication: None,
                         temporary,
                         destination,
                         publication,
@@ -1799,7 +1894,7 @@ impl ExportTarget {
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(storage_error(parent, error)),
             }
         }
         Err(io::Error::new(
@@ -1810,6 +1905,13 @@ impl ExportTarget {
     }
 
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), QuarryError> {
+        self.write_all_inner(bytes).map_err(|error| match error {
+            QuarryError::Io(error) => storage_error(output_parent(&self.destination), error),
+            error => error,
+        })
+    }
+
+    fn write_all_inner(&mut self, bytes: &[u8]) -> Result<(), QuarryError> {
         let writer = self.writer.as_mut().expect("export writer is present");
         match &mut self.first_record_bom_guard {
             FirstRecordBomGuard::Inactive | FirstRecordBomGuard::Complete => {
@@ -1880,7 +1982,8 @@ impl ExportTarget {
                 self.writer
                     .as_mut()
                     .expect("export writer is present")
-                    .write_all(&prefix)?;
+                    .write_all(&prefix)
+                    .map_err(|error| storage_error(output_parent(&self.destination), error))?;
                 Ok(0)
             }
             FirstRecordBomGuard::Passthrough { inserted_bytes } => Ok(inserted_bytes),
@@ -1933,23 +2036,36 @@ impl ExportTarget {
             return Ok(FilterExportOutcome::Cancelled);
         }
         let mut writer = self.writer.take().expect("export writer is present");
-        writer.flush()?;
-        let file = writer.into_inner().map_err(|error| error.into_error())?;
+        let parent = output_parent(&self.destination);
+        writer
+            .flush()
+            .map_err(|error| storage_error(parent, error))?;
+        let file = writer
+            .into_inner()
+            .map_err(|error| storage_error(parent, error.into_error()))?;
         match &self.publication {
             Publication::ReplaceSource { permissions, .. }
             | Publication::GuardedReplaceExisting { permissions, .. } => {
-                file.set_permissions(permissions.clone())?;
+                file.set_permissions(permissions.clone())
+                    .map_err(|error| storage_error(parent, error))?;
             }
             #[cfg(unix)]
             Publication::GuardedCreateWorkingCopy { .. } => {
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|error| storage_error(parent, error))?;
             }
             Publication::CreateNew | Publication::GuardedCreateNew { .. } => {}
             #[cfg(not(unix))]
             Publication::GuardedCreateWorkingCopy { .. } => {}
         }
-        file.sync_all()?;
+        file.sync_all()
+            .map_err(|error| storage_error(parent, error))?;
         drop(file);
+        if let Some(publication) = &self.private_publication
+            && !publication.wait()
+        {
+            return Ok(FilterExportOutcome::Cancelled);
+        }
         if cancel_requested.load(Ordering::Acquire) {
             self.remove_temporary()?;
             return Ok(FilterExportOutcome::Cancelled);
@@ -2005,7 +2121,7 @@ impl ExportTarget {
             return Err(if error.kind() == io::ErrorKind::AlreadyExists {
                 QuarryError::ExportDestinationExists
             } else {
-                error.into()
+                storage_error(output_parent(&self.destination), error)
             });
         }
         let _ = self.remove_temporary();
@@ -2161,6 +2277,13 @@ fn run_export(
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<FilterExportOutcome, QuarryError> {
+    if shared.cancel_requested.load(Ordering::Acquire) {
+        return Ok(FilterExportOutcome::Cancelled);
+    }
+    check_storage(
+        output_parent(&output.destination),
+        shared.total_bytes.saturating_add(3),
+    )?;
     match scan_export(
         &mut source,
         &mut output,
@@ -2199,6 +2322,29 @@ fn run_save_as(
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<SaveWorkerOutcome, QuarryError> {
+    if shared.cancel_requested.load(Ordering::Acquire) {
+        return Ok(SaveWorkerOutcome::Cancelled);
+    }
+    let records = if edits.transformation.is_some() || edits.replacement.is_some() {
+        let Some(records) = count_records(&mut source, delimiter, &shared.cancel_requested)? else {
+            return Ok(SaveWorkerOutcome::Cancelled);
+        };
+        records
+    } else {
+        0
+    };
+    let required = estimate_edited_output_bytes(
+        shared.total_bytes,
+        records,
+        &edits.headers,
+        &edits.cells,
+        edits
+            .transformation
+            .as_ref()
+            .map(|value| &value.transformation),
+        edits.replacement.as_ref(),
+    );
+    check_storage(output_parent(&output.destination), required)?;
     let copied = if edits.cells.is_empty()
         && edits.transformation.is_none()
         && edits.replacement.is_none()
@@ -4727,11 +4873,24 @@ mod tests {
 
         let temporary = temporary_exports(&working_path);
         assert_eq!(temporary.len(), 1);
+        assert!(temporary[0].is_dir());
         #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(&temporary[0]).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        {
+            assert_eq!(
+                fs::metadata(&temporary[0]).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let staging = fs::read_dir(&temporary[0])
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert_eq!(
+                fs::metadata(staging).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         job.cancel();
         wait_until_save_done(&job);
         assert_eq!(job.wait().unwrap(), SaveAsOutcome::Cancelled);
@@ -5510,6 +5669,217 @@ mod tests {
         assert!(temporary_exports(&source).is_empty());
         fs::remove_file(&source).unwrap();
         remove_case(&source);
+    }
+
+    #[test]
+    fn abandoning_ready_private_jobs_preserves_other_files_and_public_outputs() {
+        let source = fixture(b"id,name\n1,Ada\n");
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        let candidate = destination(&source, "working.csv");
+        let job = session
+            .start_create_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                ColumnTransformation::Arrange {
+                    source_width: 2,
+                    output_columns: vec![1, 0],
+                },
+                &candidate,
+            )
+            .unwrap();
+        wait_until_save_done(&job);
+        assert!(!candidate.exists());
+        assert_eq!(temporary_exports(&source).len(), 1);
+        fs::write(&candidate, b"unrelated replacement").unwrap();
+        drop(job);
+        assert_eq!(fs::read(&candidate).unwrap(), b"unrelated replacement");
+        assert!(temporary_exports(&source).is_empty());
+        let sorted = destination(&source, "sorted.csv");
+        let job = session
+            .start_create_sorted_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                crate::SortSpec {
+                    column: 0,
+                    mode: crate::SortMode::Text,
+                    direction: crate::SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &sorted,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !job.progress().done {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(!sorted.exists());
+        assert_eq!(temporary_exports(&source).len(), 1);
+        fs::write(&sorted, b"unrelated replacement").unwrap();
+        drop(job);
+        assert_eq!(fs::read(&sorted).unwrap(), b"unrelated replacement");
+        assert!(temporary_exports(&source).is_empty());
+        let public = destination(&source, "saved.csv");
+        let job = session
+            .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &public)
+            .unwrap();
+        wait_until_save_done(&job);
+        drop(job);
+        assert_eq!(fs::read(&public).unwrap(), b"id,name\n1,Ada\n");
+        assert_eq!(fs::read(&source).unwrap(), b"id,name\n1,Ada\n");
+        assert!(temporary_exports(&source).is_empty());
+        fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn private_handoff_rechecks_destination_source_and_cancellation() {
+        for action in ["conflict", "source-change", "cancel", "accept", "drop"] {
+            let original = b"id,name\n1,Ada\n";
+            let source = fixture(original);
+            let session = session(&source, b',', HeaderMode::FirstRow);
+            let candidate = destination(&source, "working.csv");
+            let job = session
+                .start_create_working_copy(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    ColumnTransformation::Arrange {
+                        source_width: 2,
+                        output_columns: vec![1, 0],
+                    },
+                    &candidate,
+                )
+                .unwrap();
+            wait_until_save_done(&job);
+            assert!(!candidate.exists());
+            assert_eq!(temporary_exports(&source).len(), 1);
+            match action {
+                "conflict" => {
+                    fs::write(&candidate, b"unrelated replacement").unwrap();
+                    assert!(matches!(
+                        job.wait(),
+                        Err(QuarryError::ExportDestinationExists)
+                    ));
+                    assert_eq!(fs::read(&candidate).unwrap(), b"unrelated replacement");
+                }
+                "source-change" => {
+                    fs::write(&source, b"external edit").unwrap();
+                    assert!(matches!(job.wait(), Err(QuarryError::SourceChanged)));
+                    assert!(!candidate.exists());
+                }
+                "cancel" => {
+                    job.cancel();
+                    // Cancellation wakes the parked worker without requiring wait().
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !job.shared.done.load(Ordering::Acquire) {
+                        assert!(Instant::now() < deadline);
+                        thread::yield_now();
+                    }
+                    assert_eq!(job.wait().unwrap(), SaveAsOutcome::Cancelled);
+                    assert!(!candidate.exists());
+                }
+                "accept" => {
+                    assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+                    assert_eq!(fs::read(&candidate).unwrap(), b"name,id\nAda,1\n");
+                }
+                "drop" => {
+                    drop(job);
+                    assert!(!candidate.exists());
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                fs::read(&source).unwrap(),
+                if action == "source-change" {
+                    b"external edit".as_slice()
+                } else {
+                    original
+                }
+            );
+            assert!(temporary_exports(&source).is_empty());
+            fs::remove_dir_all(source.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn insufficient_space_cleans_staging_and_preserves_source_and_retained_version() {
+        // A sparse source creates a deterministic capacity shortfall without
+        // allocating or filling the test machine's free disk space.
+        let original = b"id,name\n1,Ada\n";
+        let source = fixture(original);
+        let directory = source.parent().unwrap();
+        let retained = directory.join("undo.csv");
+        fs::write(&retained, b"retained version").unwrap();
+        let available = crate::inspect_storage(directory).unwrap().available_bytes;
+        let logical_len = available.saturating_add(1024 * 1024 * 1024);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(logical_len)
+            .unwrap();
+        let session = Session::open(
+            &source,
+            OpenOptions {
+                rows: 1,
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let result = session
+            .start_save_with_edits(BTreeMap::new(), BTreeMap::new())
+            .unwrap()
+            .wait();
+        assert!(matches!(
+            result,
+            Err(QuarryError::InsufficientStorage { .. })
+        ));
+        assert_eq!(fs::metadata(&source).unwrap().len(), logical_len);
+        let mut prefix = vec![0; original.len()];
+        std::io::Read::read_exact(&mut File::open(&source).unwrap(), &mut prefix).unwrap();
+        assert_eq!(prefix, original);
+        assert_eq!(fs::read(&retained).unwrap(), b"retained version");
+        assert!(temporary_exports(&source).is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn late_write_failure_preserves_source_and_removes_atomic_staging() {
+        let original = b"id,name\n1,Ada\n";
+        let source = fixture(original);
+        let directory = source.parent().unwrap();
+        crate::check_storage(directory, 1024).unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        let stamp = crate::SourceStamp::from_metadata(&metadata);
+        let mut output = ExportTarget::replace_source(&source, metadata, stamp).unwrap();
+        // Inject a writer that fails on flush after a successful capacity check.
+        output.writer = Some(std::io::BufWriter::new(
+            File::open(&output.temporary).unwrap(),
+        ));
+        output.write_all(b"replacement bytes").unwrap();
+        let result = output.publish(1, 17, &AtomicBool::new(false));
+        assert!(
+            matches!(result, Err(QuarryError::Storage { directory: ref path, .. }) if path == directory)
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(temporary_exports(&source).is_empty());
+
+        let destination = directory.join("candidate.csv");
+        let mut output = ExportTarget::new(&source, destination.clone()).unwrap();
+        output.writer = Some(std::io::BufWriter::new(
+            File::open(&output.temporary).unwrap(),
+        ));
+        // A write larger than the buffer fails before publication as well.
+        assert!(matches!(
+            output.write_all(&[b'x'; 16 * 1024]),
+            Err(QuarryError::Storage { .. })
+        ));
+        drop(output);
+        assert!(!destination.exists());
+        assert!(temporary_exports(&destination).is_empty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

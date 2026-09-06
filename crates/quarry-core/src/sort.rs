@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use quarry_delimited::{RecordScanner, parse_record};
 
-use crate::export::{ExportTarget, source_matches_stamp};
+use crate::estimate_edited_output_bytes;
+use crate::export::{ExportTarget, PrivatePublication, source_matches_stamp};
+use crate::storage::{check_operation_storage, count_records, output_parent, storage_error};
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, FilterExportOutcome,
     QuarryError, Session, SourceStamp,
@@ -203,6 +205,8 @@ pub struct SortProgress {
     pub header_rows: u64,
     pub elapsed: Duration,
     pub cancellation_latency: Option<Duration>,
+    /// Ready to consume with wait(), not proof of publication. The destination
+    /// remains unpublished until wait() accepts it and the final guards pass.
     pub done: bool,
     pub cancelled: bool,
 }
@@ -390,6 +394,7 @@ impl Drop for WorkerCompletion<'_> {
 }
 
 pub struct SortJob {
+    publication: Arc<PrivatePublication>,
     shared: Arc<SharedState>,
     handle: Option<JoinHandle<Result<SortOutcome, QuarryError>>>,
 }
@@ -407,6 +412,35 @@ impl SortJob {
         destination: PathBuf,
         source_stamp: SourceStamp,
         config: SortConfig,
+    ) -> Result<Self, QuarryError> {
+        Self::start_with_temp_directory(
+            source_path,
+            file_size,
+            delimiter,
+            has_header,
+            header_renames,
+            cell_edits,
+            spec,
+            destination,
+            source_stamp,
+            config,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_temp_directory(
+        source_path: PathBuf,
+        file_size: u64,
+        delimiter: u8,
+        has_header: bool,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        spec: SortSpec,
+        destination: PathBuf,
+        source_stamp: SourceStamp,
+        config: SortConfig,
+        temporary_directory: Option<PathBuf>,
     ) -> Result<Self, QuarryError> {
         validate_config(config)?;
         if !spec.mode.uses_column() && spec.direction != SortDirection::Ascending {
@@ -427,13 +461,15 @@ impl SortJob {
             return Err(QuarryError::SourceChanged);
         }
         let bom_present = source_has_bom(&mut source)?;
-        let output = ExportTarget::new_private_guarded(
+        let mut output = ExportTarget::new_private_guarded(
             &source_path,
             destination.clone(),
             &source,
             source_stamp.clone(),
         )?;
-
+        let publication = output
+            .defer_private_publication()
+            .expect("sort output is private");
         let shared = Arc::new(SharedState::new(file_size));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -454,6 +490,7 @@ impl SortJob {
                     bom_present,
                     config,
                     &worker_state,
+                    temporary_directory.as_deref(),
                 );
                 match &result {
                     Ok(SortOutcome::Cancelled) => {
@@ -471,6 +508,7 @@ impl SortJob {
                 result
             })?;
         Ok(Self {
+            publication,
             shared,
             handle: Some(handle),
         })
@@ -488,7 +526,7 @@ impl SortJob {
             header_rows: self.shared.header_rows.load(Ordering::Acquire),
             elapsed: self.shared.elapsed(),
             cancellation_latency: self.shared.cancellation_latency(),
-            done: self.shared.done.load(Ordering::Acquire),
+            done: self.shared.done.load(Ordering::Acquire) || self.publication.is_ready(),
             cancelled: self.shared.cancelled.load(Ordering::Acquire),
         }
     }
@@ -499,9 +537,13 @@ impl SortJob {
 
     pub fn cancel(&self) {
         self.shared.request_cancel();
+        self.publication.decide(false);
     }
 
+    /// Accept the staged result and join the worker, which publishes without
+    /// replacing an existing destination. Drop never deletes that destination.
     pub fn wait(mut self) -> Result<SortOutcome, QuarryError> {
+        self.publication.decide(true);
         self.handle
             .take()
             .expect("sort handle is present")
@@ -513,7 +555,7 @@ impl SortJob {
 impl Drop for SortJob {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            self.shared.request_cancel();
+            self.cancel();
             let _ = handle.join();
         }
     }
@@ -538,6 +580,29 @@ impl Session {
             destination.as_ref().to_path_buf(),
             self.source_stamp.clone(),
             DEFAULT_SORT_CONFIG,
+        )
+    }
+
+    pub fn start_create_sorted_working_copy_with_temp_directory(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        spec: SortSpec,
+        destination: impl AsRef<Path>,
+        temporary_directory: impl AsRef<Path>,
+    ) -> Result<SortJob, QuarryError> {
+        SortJob::start_with_temp_directory(
+            self.path.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.dialect.has_header,
+            header_renames,
+            cell_edits,
+            spec,
+            destination.as_ref().to_path_buf(),
+            self.source_stamp.clone(),
+            DEFAULT_SORT_CONFIG,
+            Some(temporary_directory.as_ref().to_path_buf()),
         )
     }
 }
@@ -626,11 +691,12 @@ struct RunWorkspace {
 }
 
 impl RunWorkspace {
+    #[cfg(test)]
     fn create(destination: &Path) -> Result<Self, QuarryError> {
-        let parent = destination
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        Self::create_in(output_parent(destination))
+    }
+
+    fn create_in(parent: &Path) -> Result<Self, QuarryError> {
         for _ in 0..100 {
             let id = NEXT_SORT_ID.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!(".quarry-sort-{}-{id}", std::process::id()));
@@ -646,7 +712,7 @@ impl RunWorkspace {
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(storage_error(parent, error)),
             }
         }
         Err(io::Error::new(
@@ -663,7 +729,9 @@ impl RunWorkspace {
         options.write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
-        let file = options.open(&path)?;
+        let file = options
+            .open(&path)
+            .map_err(|error| storage_error(&self.path, error))?;
         Ok((path, BufWriter::new(file)))
     }
 
@@ -1275,8 +1343,27 @@ fn run_sort(
     bom_present: bool,
     config: SortConfig,
     shared: &SharedState,
+    temporary_directory: Option<&Path>,
 ) -> Result<SortOutcome, QuarryError> {
-    let workspace = RunWorkspace::create(&destination)?;
+    let Some(records) = count_records(source, delimiter, &shared.cancel_requested)? else {
+        return Ok(SortOutcome::Cancelled);
+    };
+    let output_bytes = estimate_edited_output_bytes(
+        shared.total_bytes,
+        records,
+        header_renames,
+        cell_edits,
+        None,
+        None,
+    );
+    let temporary_directory = temporary_directory.unwrap_or_else(|| output_parent(&destination));
+    check_operation_storage(
+        temporary_directory,
+        &destination,
+        estimate_sort_temporary_bytes(output_bytes, records.saturating_sub(u64::from(has_header))),
+        output_bytes,
+    )?;
+    let workspace = RunWorkspace::create_in(temporary_directory)?;
     let built = run_sort_inner(
         source,
         source_path,
@@ -1293,7 +1380,10 @@ fn run_sort(
         shared,
     );
     let cleanup = workspace.cleanup();
-    let built = built?;
+    let built = built.map_err(|error| match error {
+        QuarryError::Io(error) => storage_error(temporary_directory, error),
+        error => error,
+    })?;
     cleanup?;
     let Some((rows, bytes_written, verification)) = built else {
         return Ok(SortOutcome::Cancelled);
@@ -1818,6 +1908,46 @@ mod tests {
         while !job.progress().done {
             assert!(Instant::now() < deadline, "sort did not finish");
             thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn ready_sort_handoff_rejects_conflicts_and_cancellation() {
+        for cancel in [false, true] {
+            let directory = case();
+            let source = directory.join("source.csv");
+            let destination = directory.join("sorted.csv");
+            fs::write(&source, b"key\nb\na\n").unwrap();
+            let job = session(&source, HeaderMode::FirstRow)
+                .start_create_sorted_working_copy(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    SortSpec {
+                        column: 0,
+                        mode: SortMode::Text,
+                        direction: SortDirection::Ascending,
+                        case_sensitivity: CaseSensitivity::Sensitive,
+                    },
+                    &destination,
+                )
+                .unwrap();
+            wait_done(&job);
+            assert!(!destination.exists());
+            if cancel {
+                job.cancel();
+                assert_eq!(job.wait().unwrap(), SortOutcome::Cancelled);
+                assert!(!destination.exists());
+            } else {
+                fs::write(&destination, b"unrelated replacement").unwrap();
+                assert!(matches!(
+                    job.wait(),
+                    Err(QuarryError::ExportDestinationExists)
+                ));
+                assert_eq!(fs::read(&destination).unwrap(), b"unrelated replacement");
+            }
+            assert_eq!(fs::read(&source).unwrap(), b"key\nb\na\n");
+            assert!(sort_artifacts(&directory).is_empty());
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -2405,7 +2535,7 @@ mod tests {
         assert_eq!(progress.merge_passes, summary.merge_passes);
         assert_eq!(progress.peak_temporary_bytes, summary.peak_temporary_bytes);
         assert!(summary.peak_temporary_bytes > summary.bytes_written);
-        assert_eq!(progress.elapsed, summary.elapsed);
+        assert!(summary.elapsed >= progress.elapsed);
         assert!(progress.cancellation_latency.is_none());
         assert!(summary.record_multiset_verified);
         assert!(summary.stable_ties_verified);
@@ -2743,6 +2873,7 @@ mod tests {
             false,
             tiny_config(),
             &shared,
+            None,
         );
 
         assert!(matches!(result, Err(QuarryError::SourceChanged)));
