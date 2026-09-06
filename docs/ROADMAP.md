@@ -23,8 +23,9 @@ selected-column matching, reviewed extra-row counts, explicit keep-first
 removal, and existing working-copy history. Its
 [validation report](benchmarks/2026-09-05-find-remove-duplicates.md) records all
 276 workspace tests, exact 1 GB retained records, cancellation and cleanup, and
-the installed-app count/removal/history/Save As workflow. Commit and PR are
-pending. Priority 4 remains planned; completed alpha
+the installed-app count/removal/history/Save As workflow. Implementation commit
+`6f0eeb4` is submitted in [PR #37](https://github.com/danchamorro/quarry/pull/37),
+awaiting merge. Priority 4 remains planned; completed alpha
 phases below retain their existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.
 

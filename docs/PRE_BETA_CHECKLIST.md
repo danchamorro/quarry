@@ -97,7 +97,9 @@ on `codex/find-remove-duplicates`: all 276 workspace tests, strict Clippy,
 formatting, release build, and 1 GB exact-output validation passed. The installed
 feature build passed selected-column matching with an unsaved edit, reviewed
 counts, Cancel, explicit removal, Undo/Redo, and exact Save As output with an
-unchanged source. It records dirty source; commit and PR are pending.
+unchanged source. The validated app records dirty source. Implementation commit
+`6f0eeb4` is submitted in [PR #37](https://github.com/danchamorro/quarry/pull/37),
+awaiting merge.
 Matching and workflow details are in the
 [user guide](USER_GUIDE.md#find-and-remove-duplicates) and
 [architecture decision](adr/0004-bounded-duplicate-removal.md).

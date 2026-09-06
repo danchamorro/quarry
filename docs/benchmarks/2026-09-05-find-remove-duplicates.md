@@ -155,7 +155,9 @@ Saved output SHA-256:
 An independent agent reviewed the actual GUI lifecycle and shared core sort
 changes. The shared Save guard was added after a regression exposed it; no
 additional concrete issue was found. This was source review, not a CodeRabbit
-CLI run. The feature has not been committed, pushed, or submitted as a PR.
+CLI run. Implementation commit `6f0eeb4` is pushed and submitted in
+[PR #37](https://github.com/danchamorro/quarry/pull/37), awaiting merge.
+The installed-app evidence above remains from the earlier dirty feature build.
 
 ## Reproduction
 
