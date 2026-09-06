@@ -4,6 +4,7 @@ mod filter;
 mod index;
 mod search;
 mod sort;
+mod storage;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -35,6 +36,10 @@ pub use sort::{
     SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec, SortSummary,
     estimate_sort_temporary_bytes,
 };
+pub use storage::{
+    StorageSpace, check_storage, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
+    inspect_storage,
+};
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
 const DEFAULT_BOOTSTRAP_LIMIT: usize = 64 * 1024 * 1024;
@@ -58,6 +63,15 @@ pub(crate) fn parse_source_record(
 #[derive(Debug)]
 pub enum QuarryError {
     Io(io::Error),
+    Storage {
+        directory: PathBuf,
+        error: io::Error,
+    },
+    InsufficientStorage {
+        directory: PathBuf,
+        required_bytes: u64,
+        available_bytes: u64,
+    },
     Parse(ParseError),
     BootstrapLimitExceeded {
         limit: usize,
@@ -97,6 +111,20 @@ impl fmt::Display for QuarryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "I/O error: {error}"),
+            Self::Storage { directory, error } => write!(
+                f,
+                "Cannot use storage at {}: {error}. Check that the drive is connected, writable, and has free space, or choose another location. The current document is preserved.",
+                directory.display()
+            ),
+            Self::InsufficientStorage {
+                directory,
+                required_bytes,
+                available_bytes,
+            } => write!(
+                f,
+                "Not enough space at {}: {required_bytes} additional bytes required, {available_bytes} bytes available. Free space or choose another location. Existing working and Undo files are preserved.",
+                directory.display()
+            ),
             Self::Parse(error) => error.fmt(f),
             Self::BootstrapLimitExceeded { limit, rows_found } => write!(
                 f,
@@ -145,6 +173,7 @@ impl Error for QuarryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Storage { error, .. } => Some(error),
             Self::Parse(error) => Some(error),
             _ => None,
         }

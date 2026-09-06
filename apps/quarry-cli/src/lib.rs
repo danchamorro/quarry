@@ -15,7 +15,8 @@ use quarry_core::{
     OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob, SaveAsOutcome, SaveAsProgress,
     SearchJob, SearchOutcome, SearchPosition, SearchProgress, Session, SortDirection, SortJob,
     SortMode, SortOutcome, SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
-    SplitAnalysisProgress, StructuralIndex, estimate_sort_temporary_bytes,
+    SplitAnalysisProgress, StructuralIndex, check_storage, estimate_edited_output_bytes,
+    estimate_sort_temporary_bytes, inspect_storage,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -90,8 +91,10 @@ fn print_help() {
            quarry sort-save-as <SOURCE> <DESTINATION> [--column N] \
          [--order asc|desc] [--mode text|number|characters|words|shuffle|reverse] \
          [--seed N] [--delimiter ,] [--header auto|first-row|none] \
+         [--temp-dir DIRECTORY] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry duplicates <FILE> --columns 1,2 [--match-case] [--output FILE] \
+         [--temp-dir DIRECTORY] \
          [--delimiter ,] [--header auto|first-row|none] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
@@ -99,6 +102,7 @@ fn print_help() {
          Duplicates: count only by default; --output explicitly removes extra occurrences.\n\
          The first row is kept. Matching ignores ASCII case unless --match-case is set.\n\
          Blank and missing selected fields match; whitespace is significant.\n\
+         Temporary runs use --temp-dir when set; final output staging stays beside its destination.\n\
          Filters: between includes both bounds and requires --upper-bound (or UPPER after --and).\n\
          Numeric values accept signed decimals and scientific notation; blank or invalid cells do not match.\n\
          Sort: --column and --order are required for text, number, characters, and words.\n\
@@ -1027,6 +1031,7 @@ enum RequestedColumnTransformation {
 fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     let mut source = None;
     let mut destination = None;
+    let mut temporary_directory = None;
     let mut columns = None;
     let mut case_sensitivity = CaseSensitivity::Insensitive;
     let mut delimiter = None;
@@ -1051,6 +1056,9 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
             }
             "--match-case" => case_sensitivity = CaseSensitivity::Sensitive,
             "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
+            "--temp-dir" => {
+                temporary_directory = Some(PathBuf::from(value(&args, &mut cursor, "--temp-dir")?))
+            }
             "--delimiter" => {
                 delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
             }
@@ -1095,8 +1103,11 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("quarry-duplicates-{}-{suffix}", std::process::id()));
+        let root = temporary_directory
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        check_storage(&root, 0)?;
+        let directory = root.join(format!("quarry-duplicates-{}-{suffix}", std::process::id()));
         let builder = &mut std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -1111,16 +1122,34 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     let output = destination
         .clone()
         .unwrap_or_else(|| analysis_directory.as_ref().unwrap().join("candidate.csv"));
+    let temporary_directory = temporary_directory.unwrap_or_else(|| {
+        output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
     let result = (|| -> CliResult<()> {
         let spec = DuplicateSpec {
             columns,
             case_sensitivity,
         };
-        let job = session.start_find_duplicates(
+        println!(
+            "Temporary working location: {}",
+            temporary_directory.display()
+        );
+        let space = inspect_storage(&temporary_directory)?;
+        println!(
+            "Available space before operation: {} ({} bytes)",
+            human_bytes(space.available_bytes),
+            space.available_bytes
+        );
+        let job = session.start_find_duplicates_with_temp_directory(
             BTreeMap::new(),
             BTreeMap::new(),
             spec.clone(),
             &output,
+            &temporary_directory,
         )?;
         let (outcome, progress, cancellation) = wait_for_duplicates(job, cancel_after_bytes)?;
         let source_size_after = std::fs::metadata(session.path())?.len();
@@ -1207,10 +1236,11 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
         );
         println!("Sorted runs created: {}", progress.runs_created);
         println!("Merge passes: {}", progress.merge_passes);
-        println!(
-            "Duplicate wall time: {:.3} s",
-            progress.elapsed.as_secs_f64()
-        );
+        let elapsed = match &outcome {
+            DuplicateOutcome::Complete(summary) => summary.elapsed,
+            DuplicateOutcome::Cancelled => progress.elapsed,
+        };
+        println!("Duplicate wall time: {:.3} s", elapsed.as_secs_f64());
         println!("Source size unchanged: yes ({source_size_after} bytes)");
         println!(
             "Destination published: {}",
@@ -1293,6 +1323,7 @@ fn wait_for_duplicates(
 fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut source = None;
     let mut destination = None;
+    let mut temporary_directory = None;
     let mut column = None;
     let mut direction = None;
     let mut mode = SortMode::Text;
@@ -1329,6 +1360,9 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
                 delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
             }
             "--header" => header_mode = parse_header_mode(value(&args, &mut cursor, "--header")?)?,
+            "--temp-dir" => {
+                temporary_directory = Some(PathBuf::from(value(&args, &mut cursor, "--temp-dir")?))
+            }
             "--cancel-after-bytes" => {
                 cancel_after_bytes =
                     Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
@@ -1399,14 +1433,41 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         .indexed_rows()
         .saturating_sub(u64::from(session.dialect.has_header));
     let estimated_temporary_bytes = estimate_sort_temporary_bytes(
-        source_size_before.saturating_add(data_rows.saturating_mul(2)),
+        estimate_edited_output_bytes(
+            source_size_before,
+            source_index.indexed_rows(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            None,
+        ),
         data_rows,
     );
-    let job = session.start_create_sorted_working_copy(
+    let temporary_directory = temporary_directory.unwrap_or_else(|| {
+        destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    println!(
+        "Temporary working location: {}",
+        temporary_directory.display()
+    );
+    let space = inspect_storage(&temporary_directory)?;
+    println!(
+        "Estimated temporary disk: {} ({} bytes); available before operation: {} ({} bytes)",
+        human_bytes(estimated_temporary_bytes),
+        estimated_temporary_bytes,
+        human_bytes(space.available_bytes),
+        space.available_bytes
+    );
+    let job = session.start_create_sorted_working_copy_with_temp_directory(
         BTreeMap::new(),
         BTreeMap::new(),
         spec,
         &destination,
+        &temporary_directory,
     )?;
     let (outcome, progress, cancellation_requested_at) =
         wait_for_sort(job, cancel_after_bytes, Duration::from_millis(1))?;
@@ -1428,7 +1489,8 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
                 || summary.peak_temporary_bytes != progress.peak_temporary_bytes
                 || summary.merge_passes != progress.merge_passes
                 || summary.header_rows != progress.header_rows
-                || summary.elapsed != progress.elapsed
+                // Final time also includes publication after the ready-progress sample.
+                || summary.elapsed < progress.elapsed
                 || output_size != summary.bytes_written
             {
                 return Err("published output does not match sort progress".into());
@@ -1537,7 +1599,11 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         human_bytes(progress.bytes_written),
         progress.bytes_written
     );
-    println!("Sort wall time: {:.3} s", progress.elapsed.as_secs_f64());
+    let elapsed = match &outcome {
+        SortOutcome::Complete(summary) => summary.elapsed,
+        SortOutcome::Cancelled => progress.elapsed,
+    };
+    println!("Sort wall time: {:.3} s", elapsed.as_secs_f64());
     println!("Source size unchanged: yes ({source_size_after} bytes)");
     println!("Source FNV-1a 64: {source_hash:016x}");
     println!(
@@ -3661,6 +3727,8 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let source = directory.join("source.csv");
         let destination = directory.join("retained.csv");
+        let scratch = directory.join("scratch");
+        fs::create_dir(&scratch).unwrap();
         generate_file(&source, 64 * 1024 * 1024, 11, b',', 7).unwrap();
         let source_hash = fnv1a64_file(&source).unwrap();
         duplicates_command(vec![
@@ -3669,13 +3737,86 @@ mod tests {
             "1".into(),
             "--output".into(),
             destination.to_string_lossy().into_owned(),
+            "--temp-dir".into(),
+            scratch.to_string_lossy().into_owned(),
             "--cancel-after-bytes".into(),
             "1".into(),
         ])
         .unwrap();
         assert!(!destination.exists());
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
         assert_eq!(fnv1a64_file(&source).unwrap(), source_hash);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn temporary_directory_commands_preserve_source_and_clean_selected_location() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-temporary-directory-cli-{}-{suffix}",
+            std::process::id()
+        ));
+        let scratch = directory.join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let source = directory.join("source.csv");
+        let retained = directory.join("retained.csv");
+        let sorted = directory.join("sorted.csv");
+        let source_bytes = b"key,note\r\nb,first\r\na,second\r\nb,last\r\n";
+        fs::write(&source, source_bytes).unwrap();
+        let duplicate_args = vec![
+            source.to_string_lossy().into_owned(),
+            "--columns".into(),
+            "1".into(),
+            "--header".into(),
+            "first-row".into(),
+            "--temp-dir".into(),
+            scratch.to_string_lossy().into_owned(),
+        ];
+        duplicates_command(duplicate_args.clone()).unwrap();
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        let mut duplicate_output_args = duplicate_args.clone();
+        duplicate_output_args.extend(["--output".into(), retained.to_string_lossy().into_owned()]);
+        duplicates_command(duplicate_output_args).unwrap();
+        assert_eq!(
+            fs::read(&retained).unwrap(),
+            b"key,note\r\nb,first\r\na,second\r\n"
+        );
+        let sort_args = vec![
+            source.to_string_lossy().into_owned(),
+            sorted.to_string_lossy().into_owned(),
+            "--column".into(),
+            "1".into(),
+            "--order".into(),
+            "asc".into(),
+            "--header".into(),
+            "first-row".into(),
+            "--temp-dir".into(),
+            scratch.to_string_lossy().into_owned(),
+        ];
+        sort_save_as_command(sort_args.clone()).unwrap();
+        assert_eq!(
+            fs::read(&sorted).unwrap(),
+            b"key,note\r\na,second\r\nb,first\r\nb,last\r\n"
+        );
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        fs::remove_file(&sorted).unwrap();
+
+        for invalid in [directory.join("missing"), source.clone()] {
+            let mut duplicate_invalid = duplicate_args.clone();
+            *duplicate_invalid.last_mut().unwrap() = invalid.to_string_lossy().into_owned();
+            assert!(duplicates_command(duplicate_invalid).is_err());
+            let mut sort_invalid = sort_args.clone();
+            *sort_invalid.last_mut().unwrap() = invalid.to_string_lossy().into_owned();
+            assert!(sort_save_as_command(sort_invalid).is_err());
+            assert!(!sorted.exists());
+            assert!(!invalid.is_dir());
+        }
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
         fs::remove_dir_all(directory).unwrap();
     }
 

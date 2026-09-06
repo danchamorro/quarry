@@ -73,6 +73,8 @@ pub struct DuplicateProgress {
     pub header_rows: u64,
     pub elapsed: Duration,
     pub cancellation_latency: Option<Duration>,
+    /// Ready to consume with wait(), not proof of publication. The candidate
+    /// remains staged until wait() accepts it and the final guards pass.
     pub done: bool,
     pub cancelled: bool,
 }
@@ -106,6 +108,7 @@ struct DuplicateState {
 }
 
 pub struct DuplicateJob {
+    publication: Arc<PrivatePublication>,
     shared: Arc<DuplicateState>,
     handle: Option<JoinHandle<Result<DuplicateOutcome, QuarryError>>>,
 }
@@ -119,6 +122,27 @@ impl DuplicateJob {
         spec: DuplicateSpec,
         destination: PathBuf,
         config: SortConfig,
+    ) -> Result<Self, QuarryError> {
+        Self::start_with_temp_directory(
+            session,
+            header_renames,
+            cell_edits,
+            spec,
+            destination,
+            config,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_temp_directory(
+        session: &Session,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        spec: DuplicateSpec,
+        destination: PathBuf,
+        config: SortConfig,
+        temporary_directory: Option<PathBuf>,
     ) -> Result<Self, QuarryError> {
         validate_config(config)?;
         validate_overlays(
@@ -143,12 +167,15 @@ impl DuplicateJob {
             return Err(QuarryError::SourceChanged);
         }
         let bom_present = source_has_bom(&mut source)?;
-        let output = ExportTarget::new_private_guarded(
+        let mut output = ExportTarget::new_private_guarded(
             &source_path,
             destination.clone(),
             &source,
             source_stamp.clone(),
         )?;
+        let publication = output
+            .defer_private_publication()
+            .expect("duplicate output is private");
         let shared = Arc::new(DuplicateState {
             sort: SharedState::new(session.file_size),
             duplicate_rows: AtomicU64::new(0),
@@ -173,6 +200,7 @@ impl DuplicateJob {
                     bom_present,
                     config,
                     &worker_state,
+                    temporary_directory.as_deref(),
                 );
                 match &result {
                     Ok(DuplicateOutcome::Cancelled) => {
@@ -190,6 +218,7 @@ impl DuplicateJob {
                 result
             })?;
         Ok(Self {
+            publication,
             shared,
             handle: Some(handle),
         })
@@ -210,7 +239,7 @@ impl DuplicateJob {
             header_rows: shared.header_rows.load(Ordering::Acquire),
             elapsed: shared.elapsed(),
             cancellation_latency: shared.cancellation_latency(),
-            done: shared.done.load(Ordering::Acquire),
+            done: shared.done.load(Ordering::Acquire) || self.publication.is_ready(),
             cancelled: shared.cancelled.load(Ordering::Acquire),
         }
     }
@@ -221,9 +250,13 @@ impl DuplicateJob {
 
     pub fn cancel(&self) {
         self.shared.sort.request_cancel();
+        self.publication.decide(false);
     }
 
+    /// Publish the candidate on the worker and transfer its lifetime to the
+    /// caller. Before this call, drop discards only job-owned staging.
     pub fn wait(mut self) -> Result<DuplicateOutcome, QuarryError> {
+        self.publication.decide(true);
         self.handle
             .take()
             .expect("duplicate handle is present")
@@ -235,12 +268,8 @@ impl DuplicateJob {
 impl Drop for DuplicateJob {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            self.shared.sort.request_cancel();
-            // A worker can finish just before cancellation. Never strand its
-            // completed candidate when the caller abandons the job.
-            if let Ok(Ok(DuplicateOutcome::Complete(summary))) = handle.join() {
-                let _ = fs::remove_file(summary.destination);
-            }
+            self.cancel();
+            let _ = handle.join();
         }
     }
 }
@@ -265,6 +294,25 @@ impl Session {
             DEFAULT_SORT_CONFIG,
         )
     }
+
+    pub fn start_find_duplicates_with_temp_directory(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        spec: DuplicateSpec,
+        destination: impl AsRef<Path>,
+        temporary_directory: impl AsRef<Path>,
+    ) -> Result<DuplicateJob, QuarryError> {
+        DuplicateJob::start_with_temp_directory(
+            self,
+            header_renames,
+            cell_edits,
+            spec,
+            destination.as_ref().to_path_buf(),
+            DEFAULT_SORT_CONFIG,
+            Some(temporary_directory.as_ref().to_path_buf()),
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -282,9 +330,32 @@ fn run_duplicates(
     bom_present: bool,
     config: SortConfig,
     state: &DuplicateState,
+    temporary_directory: Option<&Path>,
 ) -> Result<DuplicateOutcome, QuarryError> {
     let shared = &state.sort;
-    let workspace = RunWorkspace::create(&destination)?;
+    let Some(records) = count_records(source, delimiter, &shared.cancel_requested)? else {
+        return Ok(DuplicateOutcome::Cancelled);
+    };
+    let output_bytes = estimate_edited_output_bytes(
+        shared.total_bytes,
+        records,
+        header_renames,
+        cell_edits,
+        None,
+        None,
+    );
+    let temporary_directory = temporary_directory.unwrap_or_else(|| output_parent(&destination));
+    check_operation_storage(
+        temporary_directory,
+        &destination,
+        crate::estimate_duplicate_temporary_bytes(
+            output_bytes,
+            records.saturating_sub(u64::from(has_header)),
+            spec.columns.len(),
+        ),
+        output_bytes,
+    )?;
+    let workspace = RunWorkspace::create_in(temporary_directory)?;
     let built = (|| {
         let ScanOutcome::Complete(mut scan) = create_initial_runs(
             source,
@@ -369,7 +440,10 @@ fn run_duplicates(
         Ok(Some((scan.rows, retained, bytes_written)))
     })();
     let cleanup = workspace.cleanup();
-    let built = built?;
+    let built = built.map_err(|error| match error {
+        QuarryError::Io(error) => storage_error(temporary_directory, error),
+        error => error,
+    })?;
     cleanup?;
     let Some((rows_scanned, retained_rows, bytes_written)) = built else {
         return Ok(DuplicateOutcome::Cancelled);
@@ -644,7 +718,7 @@ mod tests {
             assert_eq!(progress.retained_rows, summary.retained_rows);
             assert_eq!(progress.bytes_scanned, bytes.len() as u64);
             assert_eq!(progress.bytes_written, summary.bytes_written);
-            assert_eq!(progress.elapsed, summary.elapsed);
+            assert!(summary.elapsed >= progress.elapsed);
             assert!(summary.merge_passes >= 3);
             assert_eq!(summary.header_rows, 1);
             assert!(fixture.artifacts().is_empty());
@@ -885,10 +959,49 @@ mod tests {
             )
             .unwrap();
         wait_done(&job);
-        assert!(small.destination.exists());
-        drop(job);
         assert!(!small.destination.exists());
+        fs::write(&small.destination, b"unrelated replacement").unwrap();
+        drop(job);
+        assert_eq!(
+            fs::read(&small.destination).unwrap(),
+            b"unrelated replacement"
+        );
         assert!(small.artifacts().is_empty());
+    }
+
+    #[test]
+    fn ready_duplicate_handoff_rejects_conflicts_and_cancellation() {
+        for cancel in [false, true] {
+            let fixture = Case::new(b"key\na\na\n");
+            let job = fixture
+                .session(HeaderMode::FirstRow)
+                .start_find_duplicates(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    spec(&[0], CaseSensitivity::Sensitive),
+                    &fixture.destination,
+                )
+                .unwrap();
+            wait_done(&job);
+            assert!(!fixture.destination.exists());
+            if cancel {
+                job.cancel();
+                assert_eq!(job.wait().unwrap(), DuplicateOutcome::Cancelled);
+                assert!(!fixture.destination.exists());
+            } else {
+                fs::write(&fixture.destination, b"unrelated replacement").unwrap();
+                assert!(matches!(
+                    job.wait(),
+                    Err(QuarryError::ExportDestinationExists)
+                ));
+                assert_eq!(
+                    fs::read(&fixture.destination).unwrap(),
+                    b"unrelated replacement"
+                );
+            }
+            assert_eq!(fs::read(&fixture.source).unwrap(), b"key\na\na\n");
+            assert!(fixture.artifacts().is_empty());
+        }
     }
 
     #[test]
@@ -926,6 +1039,7 @@ mod tests {
             false,
             tiny_config(),
             &state,
+            None,
         );
         assert!(matches!(result, Err(QuarryError::SourceChanged)));
         assert!(!fixture.destination.exists());

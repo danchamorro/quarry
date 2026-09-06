@@ -141,6 +141,53 @@ created with owner-only permissions.
 Quarry removes private working files on Discard, successful publication,
 document replacement, and shutdown.
 
+## Temporary storage and capacity checks
+
+The shared core storage inspector checks the target volume's available bytes
+and probes private-file creation, writing, and removal. Unix uses `statvfs` via
+rustix; Windows uses `GetDiskFreeSpaceExW`. Unavailable, unwritable, and
+insufficient locations report a path-specific storage error, separate from
+source-conflict errors. Checks are advisory: existing RAII targets still remove
+unpublished files after later write, flush, sync, or cancellation failures.
+
+Private working-copy, sort, and duplicate jobs keep their output in a job-owned
+staging directory on the destination volume. On Unix that directory is created
+with mode `0700` and its file with mode `0600`. After flush and sync, progress
+reports `done` so the caller can consume `wait()`. The worker then rechecks the
+source and publishes without replacing an existing destination. Cancellation
+or drop wakes a waiting worker and removes only its staging, never the requested
+destination. Public Save, Save As, and filtered export still publish without
+waiting for result consumption. Private-job elapsed time can include the wait
+for the caller's handoff; final publication errors still come from `wait()`.
+
+The GUI's working-folder choice lasts for the app session. Each generation is
+created in an owner-only directory under that folder. A folder change retains
+previous directories needed by the active document and adjacent Undo/Redo
+snapshot. History lookup and cleanup recognize all owned directories. Existing
+versions already reduce available space on their volumes; they are displayed
+separately and never counted twice as new allocation.
+
+Output estimates include serialized sparse edits, transformation padding and
+quote growth, replacement expansion, and spill generations. Sort and duplicate
+workers count logical records in a bounded cancellable pass before estimating
+capacity; expanding rewrites also obtain the real row count. This avoids
+assuming each source byte is a row. Raw exports and sparse saves do not need
+that counting pass. Checks precede data writes and run on workers.
+
+The GUI reviews allowances of at least 256 MiB before starting writes. It uses
+the completed index and, for Split, the existing read-only width analysis.
+Folder inspection runs off the render thread. A checked folder can only be
+accepted while its path is unchanged and its available space covers the
+allowance. The engine repeats the check when the job starts. Smaller jobs use
+the same engine checks without an extra confirmation.
+
+Save and export staging always remains on the destination volume. Sort and
+duplicates can use a separate scratch folder through additive Session APIs and
+CLI `--temp-dir`. Their preflight checks both scratch and destination, combining
+the allowance when both share a volume. See
+[ADR 0005](adr/0005-temporary-storage.md) and the
+[priority 4 validation](benchmarks/2026-09-05-temporary-disk-handling.md).
+
 ## Concurrency
 Rust workers currently handle indexing, overlay-aware literal search,
 filtering, filtered viewport reads, filtered export, Split analysis, structural

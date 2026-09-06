@@ -2078,6 +2078,9 @@ version = "0.1.0"
 dependencies = [
  "memchr",
  "quarry-delimited",
+ "rustix 1.1.4",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
