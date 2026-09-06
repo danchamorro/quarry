@@ -80,7 +80,8 @@ These are disposable local artifacts. No application bundle was published.
 
 Save the following snippets as `generate.py` and `verify.py` in a fresh
 directory, using Python 3.11 or later. Run `python3 generate.py`, then follow
-the installed-app steps above. Run the verifier at the matching stage:
+the installed-app steps above. The verifier rejects Python optimization (`-O`,
+`-OO`, or `PYTHONOPTIMIZE`) so its assertions always run. Run it at the matching stage:
 
 ```sh
 python3 verify.py checkpoint
@@ -135,6 +136,9 @@ import hashlib
 import io
 import json
 import sys
+
+if not __debug__:
+    raise SystemExit('Verification requires assertions: remove -O/-OO and unset PYTHONOPTIMIZE')
 
 ROOT = Path(__file__).resolve().parent
 EXPECTED = {
