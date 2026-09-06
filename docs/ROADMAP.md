@@ -14,10 +14,19 @@ the clean installed app. CodeRabbit CLI review completed with zero findings on
 2026-09-05. Priority 2 adds exact numeric comparisons and inclusive Between to
 the existing bounded filter and export path, with
 [263 passing tests, 1 GB measurements, and installed-app validation](benchmarks/2026-09-05-numeric-filters.md).
-Implementation commit `d9f47dd` is submitted in
-[PR #36](https://github.com/danchamorro/quarry/pull/36), awaiting merge.
-Priorities 3 and 4 remain planned; completed alpha phases below retain their
-existing scope.
+Implementation and review follow-ups merged in
+[PR #36](https://github.com/danchamorro/quarry/pull/36) as `8ab5185`; all checks
+passed and the clean merge build installed at that point passed numeric-filter
+validation again.
+Priority 3 is implemented and locally validated on `codex/find-remove-duplicates`:
+selected-column matching, reviewed extra-row counts, explicit keep-first
+removal, and existing working-copy history. Its
+[validation report](benchmarks/2026-09-05-find-remove-duplicates.md) records all
+276 workspace tests, exact 1 GB retained records, cancellation and cleanup, and
+the installed-app count/removal/history/Save As workflow. Implementation commit
+`6f0eeb4` is submitted in [PR #37](https://github.com/danchamorro/quarry/pull/37),
+awaiting merge. Priority 4 remains planned; completed alpha
+phases below retain their existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.
 
 ## Current progress: 2026-09-05

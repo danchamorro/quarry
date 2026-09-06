@@ -10,6 +10,7 @@ delimited files in the Quarry macOS app.
   - [Navigate the grid](#navigate-the-grid)
   - [Select and copy data](#select-and-copy-data)
   - [Delete rows](#delete-rows)
+  - [Find and remove duplicates](#find-and-remove-duplicates)
   - [Edit cells and headers](#edit-cells-and-headers)
   - [Undo and redo changes](#undo-and-redo-changes)
   - [Find and replace text](#find-and-replace-text)
@@ -347,6 +348,43 @@ layout and removes every unsaved change.
 
 For view-only reordering or hiding, use the **Columns…** window instead.
 
+### Find and remove duplicates
+
+1. Select the numbered columns that define a duplicate. Use Command-click to
+   add columns or Shift-click for a range. Select every column to compare entire
+   records.
+2. Right-click a selected number and choose **Find Duplicates…**.
+3. Choose **Match case** if uppercase and lowercase must match separately,
+   then click **Find duplicates**.
+4. Review **Extra duplicate rows** and **Rows to keep**. The extra count excludes
+   the first occurrence of each matching group.
+5. Click **Remove extra rows** to apply the result, or **Cancel** to keep the
+   document unchanged.
+
+Every selected column must match. Values are compared as decoded text bytes,
+so quoted and unquoted forms of the same value match. Blank and missing fields
+match each other. Spaces are significant and numeric-looking values remain
+text, so `1`, `1.0`, and `␠1` differ. Here, `␠` represents one leading space.
+Matching ignores ASCII letter case by default; non-ASCII bytes always compare
+exactly.
+
+Removal keeps the first occurrence in the current row order, including any
+previous Sort, Reverse, or Shuffle. Retained rows keep all their cells and their
+relative order. The header stays fixed. Current unsaved cell and header values
+are included; duplicates do not require saving first. Clear any active filter
+before starting.
+
+Finding duplicates uses temporary disk files and prepares the result before
+showing the count. Memory stays bounded as the file grows. Use **Cancel Change**
+in the footer during the search. The review blocks editing until you remove or
+cancel, so its count cannot become stale. Cancel, no duplicates, and failure
+leave the document unchanged and clean up unpublished temporary files.
+
+The applied result is an unsaved working version. **Undo** restores the previous
+version and its edits; **Redo** reapplies removal. **Save**, **Save As…**, and
+**Discard Changes** follow the usual document workflow. The source file is
+unchanged until **Save**.
+
 ### Sort rows
 
 Only Text, Number, Character count, and Word count use the selected column's
@@ -433,7 +471,7 @@ header change instead.
   opens the saved copy after success.
 - **Discard Changes** restores the last opened or saved file and removes all
   unsaved cell, header, Replace All, Split, Combine, Move Selected Columns,
-  Delete Selected Columns, Delete Selected Rows, and Sort changes.
+  Delete Selected Columns, Delete Selected Rows, duplicate removal, and Sort changes.
 - **Undo** and **Redo** reverse individual committed edits and move between
   adjacent whole-file working versions. See [Undo and redo changes](#undo-and-redo-changes)
   for history limits and reset behavior.
@@ -447,14 +485,15 @@ reopen it instead of overwriting the external update.
 
 ## Case matching
 
-Find and Replace, text filters, and Text sorting each have an independent
-**Match case** setting:
+Find and Replace, text filters, Text sorting, and Find Duplicates each have an
+independent **Match case** setting:
 
 - Off, the default: ASCII uppercase and lowercase letters are treated as
   equivalent.
 - On: ASCII letter case is compared exactly.
 
-Cell context-menu filters inherit the Filters setting. Search inside the
+Cell context-menu filters inherit the Filters setting. The duplicate dialog
+starts with **Match case** off each time. Search inside the
 **Columns…** window is always case-insensitive. Split matches its separator
 exactly, while Combine inserts its separator literally. Neither has a case
 setting.
@@ -482,6 +521,7 @@ setting.
 | Select a row range | Shift-click numbered rows |
 | Add or remove selected rows | Command-click or Ctrl-click numbered rows |
 | Delete selected rows | Right-click a selected row number, then choose **Delete Selected Rows** |
+| Find duplicate rows | Select numbered columns, right-click a selected number, then choose **Find Duplicates…** |
 | Select a column range | Shift-click numbered columns |
 | Add or remove selected columns | Command-click or Ctrl-click numbered columns |
 | Open a focused context menu | Shift+F10 |
@@ -497,6 +537,7 @@ setting.
 | Filtering is unavailable | Save or discard cell edits, then cancel or finish any active search, filter, export, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |
 | **Delete Selected Rows** is unavailable | Clear the filter, finish the active operation, and select at least one numbered data row. |
+| **Find Duplicates…** is unavailable | Clear the filter, finish the active operation, and select the numbered columns to compare. Accept or cancel an existing duplicate preview before editing. |
 | A filter returns no rows | Check the original column number, value or numeric bounds, **Match case** for text rules, and same-column rule logic. Numeric rules skip blank, missing, and invalid values. |
 | A numeric filter bound is rejected | Enter a nonblank dot decimal or scientific number without currency or grouping separators. Between needs two valid bounds in ascending order. |
 | Find is disabled | A filter is active. Open **Filters (N)…** and clear it. |

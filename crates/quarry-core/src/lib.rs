@@ -31,6 +31,7 @@ pub use index::{Checkpoint, IndexConfig, IndexJob, IndexProgress, StructuralInde
 use quarry_delimited::{ParseError, RecordScanner, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
 pub use sort::{
+    DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
     SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec, SortSummary,
     estimate_sort_temporary_bytes,
 };

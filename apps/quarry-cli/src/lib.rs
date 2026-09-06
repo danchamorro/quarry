@@ -8,14 +8,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, Dialect, FilterExportJob, FilterExportOutcome,
-    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
-    FilterProgress, FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress,
-    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome,
-    SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition,
-    SearchProgress, Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
-    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex,
-    estimate_sort_temporary_bytes,
+    CaseSensitivity, ColumnTransformation, Dialect, DuplicateJob, DuplicateOutcome, DuplicateSpec,
+    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
+    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, HeaderMode,
+    IndexConfig, IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS,
+    OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob, SaveAsOutcome, SaveAsProgress,
+    SearchJob, SearchOutcome, SearchPosition, SearchProgress, Session, SortDirection, SortJob,
+    SortMode, SortOutcome, SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
+    SplitAnalysisProgress, StructuralIndex, estimate_sort_temporary_bytes,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -46,6 +46,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("replace-all-save-as") => replace_all_save_as_command(args.collect()),
         Some("transform-save-as") => transform_save_as_command(args.collect()),
         Some("sort-save-as") => sort_save_as_command(args.collect()),
+        Some("duplicates") => duplicates_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -90,8 +91,14 @@ fn print_help() {
          [--order asc|desc] [--mode text|number|characters|words|shuffle|reverse] \
          [--seed N] [--delimiter ,] [--header auto|first-row|none] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
+           quarry duplicates <FILE> --columns 1,2 [--match-case] [--output FILE] \
+         [--delimiter ,] [--header auto|first-row|none] \
+         [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]\n\n\
+         Duplicates: count only by default; --output explicitly removes extra occurrences.\n\
+         The first row is kept. Matching ignores ASCII case unless --match-case is set.\n\
+         Blank and missing selected fields match; whitespace is significant.\n\
          Filters: between includes both bounds and requires --upper-bound (or UPPER after --and).\n\
          Numeric values accept signed decimals and scientific notation; blank or invalid cells do not match.\n\
          Sort: --column and --order are required for text, number, characters, and words.\n\
@@ -1015,6 +1022,272 @@ enum RequestedColumnTransformation {
         source_columns: Vec<usize>,
         separator: Vec<u8>,
     },
+}
+
+fn duplicates_command(args: Vec<String>) -> CliResult<()> {
+    let mut source = None;
+    let mut destination = None;
+    let mut columns = None;
+    let mut case_sensitivity = CaseSensitivity::Insensitive;
+    let mut delimiter = None;
+    let mut header_mode = HeaderMode::Auto;
+    let mut cancel_after_bytes = None;
+    let mut cache_state = "unknown".to_owned();
+    let mut cursor = 0;
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--columns" => {
+                let selected = value(&args, &mut cursor, "--columns")?
+                    .split(',')
+                    .map(str::parse::<usize>)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if selected.contains(&0) {
+                    return Err("duplicate columns must be at least 1".into());
+                }
+                if selected.iter().collect::<BTreeSet<_>>().len() != selected.len() {
+                    return Err("duplicate columns must be unique".into());
+                }
+                columns = Some(selected.into_iter().map(|column| column - 1).collect());
+            }
+            "--match-case" => case_sensitivity = CaseSensitivity::Sensitive,
+            "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
+            "--delimiter" => {
+                delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
+            }
+            "--header" => header_mode = parse_header_mode(value(&args, &mut cursor, "--header")?)?,
+            "--cancel-after-bytes" => {
+                cancel_after_bytes =
+                    Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
+            }
+            "--cache-state" => {
+                cache_state = value(&args, &mut cursor, "--cache-state")?.to_owned();
+                if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
+                    return Err("--cache-state must be unknown, cold, or warm".into());
+                }
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            argument if source.is_none() => source = Some(PathBuf::from(argument)),
+            argument => return Err(format!("unexpected argument {argument:?}").into()),
+        }
+        cursor += 1;
+    }
+    let source = source.ok_or("duplicates requires a file path")?;
+    let columns = columns.ok_or("duplicates requires --columns")?;
+    if cancel_after_bytes == Some(0) {
+        return Err("cancel-after-bytes must be non-zero".into());
+    }
+    let session = Session::open(
+        &source,
+        OpenOptions {
+            delimiter,
+            header_mode,
+            ..OpenOptions::default()
+        },
+    )?;
+    if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
+        return Err("cancel-after-bytes must be less than file size".into());
+    }
+
+    // Analysis needs a private candidate, which is removed on both success and error.
+    let analysis_directory = if destination.is_none() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("quarry-duplicates-{}-{suffix}", std::process::id()));
+        let builder = &mut std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&directory)?;
+        Some(directory)
+    } else {
+        None
+    };
+    let output = destination
+        .clone()
+        .unwrap_or_else(|| analysis_directory.as_ref().unwrap().join("candidate.csv"));
+    let result = (|| -> CliResult<()> {
+        let spec = DuplicateSpec {
+            columns,
+            case_sensitivity,
+        };
+        let job = session.start_find_duplicates(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            spec.clone(),
+            &output,
+        )?;
+        let (outcome, progress, cancellation) = wait_for_duplicates(job, cancel_after_bytes)?;
+        let source_size_after = std::fs::metadata(session.path())?.len();
+        if source_size_after != session.file_size {
+            return Err("source file size changed during duplicate analysis".into());
+        }
+        let output_bytes = match &outcome {
+            DuplicateOutcome::Complete(summary) => {
+                let bytes = std::fs::metadata(&summary.destination)?.len();
+                if summary.destination != output
+                    || summary.rows_scanned != summary.retained_rows + summary.duplicate_rows
+                    || summary.rows_scanned != progress.rows_scanned
+                    || summary.duplicate_rows != progress.duplicate_rows
+                    || summary.retained_rows != progress.retained_rows
+                    || summary.bytes_written != progress.bytes_written
+                    || bytes != summary.bytes_written
+                    || summary.header_rows != u64::from(session.dialect.has_header)
+                {
+                    return Err("duplicate output does not match completed progress".into());
+                }
+                Some(bytes)
+            }
+            DuplicateOutcome::Cancelled => {
+                if output.exists() {
+                    return Err("cancelled duplicate analysis published a candidate file".into());
+                }
+                None
+            }
+        };
+        println!("Quarry duplicate analysis\n");
+        println!("Source: {}", session.path().display());
+        println!(
+            "Source size: {} ({} bytes)",
+            human_bytes(session.file_size),
+            session.file_size
+        );
+        println!(
+            "Columns: {}",
+            spec.columns
+                .iter()
+                .map(|column| (column + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        println!(
+            "Match case: {}",
+            if case_sensitivity == CaseSensitivity::Sensitive {
+                "yes"
+            } else {
+                "no (ASCII)"
+            }
+        );
+        println!("Blank and missing selected fields match; whitespace is significant.");
+        println!("First occurrence in source row order is kept.");
+        println!("Cache state: {cache_state}");
+        println!(
+            "Outcome: {}",
+            if output_bytes.is_some() {
+                "complete"
+            } else {
+                "cancelled"
+            }
+        );
+        println!("Rows scanned: {}", progress.rows_scanned);
+        println!("Duplicate rows: {}", progress.duplicate_rows);
+        println!("Retained rows: {}", progress.retained_rows);
+        println!("Header rows: {}", progress.header_rows);
+        println!(
+            "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
+            human_bytes(progress.bytes_scanned),
+            progress.bytes_scanned,
+            human_bytes(progress.total_bytes),
+            progress.total_bytes
+        );
+        println!(
+            "Output bytes written: {} ({} bytes)",
+            human_bytes(progress.bytes_written),
+            progress.bytes_written
+        );
+        println!(
+            "Peak temporary disk: {} ({} bytes)",
+            human_bytes(progress.peak_temporary_bytes),
+            progress.peak_temporary_bytes
+        );
+        println!("Sorted runs created: {}", progress.runs_created);
+        println!("Merge passes: {}", progress.merge_passes);
+        println!(
+            "Duplicate wall time: {:.3} s",
+            progress.elapsed.as_secs_f64()
+        );
+        println!("Source size unchanged: yes ({source_size_after} bytes)");
+        println!(
+            "Destination published: {}",
+            if destination.is_some() && output_bytes.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        if let (Some(destination), Some(bytes)) = (&destination, output_bytes) {
+            println!("Destination: {}", destination.display());
+            println!("Published size: {} ({bytes} bytes)", human_bytes(bytes));
+        }
+        if let Some(bytes) = cancellation {
+            println!(
+                "Cancellation requested after: {} ({bytes} bytes)",
+                human_bytes(bytes)
+            );
+        }
+        if let Some(latency) = progress.cancellation_latency {
+            println!(
+                "Cancellation latency: {:.3} ms",
+                latency.as_secs_f64() * 1000.0
+            );
+        }
+        println!(
+            "Current process memory after duplicates: {}",
+            optional_bytes(current_rss_bytes())
+        );
+        println!(
+            "Peak process RSS through duplicates: {}",
+            optional_bytes(peak_rss_bytes())
+        );
+        Ok(())
+    })();
+    if let Some(directory) = analysis_directory {
+        std::fs::remove_dir_all(&directory)?;
+        println!("Analysis candidate cleaned: yes ({})", directory.display());
+    }
+    result
+}
+
+fn wait_for_duplicates(
+    job: DuplicateJob,
+    cancel_after_bytes: Option<u64>,
+) -> CliResult<(
+    DuplicateOutcome,
+    quarry_core::DuplicateProgress,
+    Option<u64>,
+)> {
+    let mut cancellation = None;
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if cancellation.is_none()
+            && cancel_after_bytes.is_some_and(|bytes| progress.bytes_scanned >= bytes)
+        {
+            job.cancel();
+            cancellation = Some(progress.bytes_scanned);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let progress = job.progress();
+    let outcome = job.wait()?;
+    if cancel_after_bytes.is_some() && cancellation.is_none() {
+        return Err("duplicate analysis finished before cancellation threshold".into());
+    }
+    if cancel_after_bytes.is_some()
+        && (!matches!(outcome, DuplicateOutcome::Cancelled)
+            || !progress.cancelled
+            || progress.cancellation_latency.is_none())
+    {
+        return Err("duplicate analysis completed before cancellation took effect".into());
+    }
+    Ok((outcome, progress, cancellation))
 }
 
 fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
@@ -3246,17 +3519,165 @@ mod tests {
 
     use super::{
         FilterSamples, RAW_HEADER_COMPARE_BUFFER_BYTES, compare_raw_headers, data_search_position,
-        edit_save_as_command, export_command, filter_command, fnv1a64_file, generate_file,
-        latency_stats, parse_header_mode, parse_size, parse_sort_direction, physical_to_data_row,
-        record_filter_sample, replace_all_save_as_command, sample_filtered_rows, search_command,
-        sort_artifact_permissions, sort_save_as_command, transform_save_as_command,
-        validate_saved_transformation, validate_sort_completion_evidence, viewport_command,
-        wait_for_save_as,
+        duplicates_command, edit_save_as_command, export_command, filter_command, fnv1a64_file,
+        generate_file, latency_stats, parse_header_mode, parse_size, parse_sort_direction,
+        physical_to_data_row, record_filter_sample, replace_all_save_as_command,
+        sample_filtered_rows, search_command, sort_artifact_permissions, sort_save_as_command,
+        transform_save_as_command, validate_saved_transformation,
+        validate_sort_completion_evidence, viewport_command, wait_for_save_as,
     };
     use quarry_core::{
         ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, IndexConfig, OpenOptions,
         Session, SortDirection,
     };
+
+    #[test]
+    fn duplicates_command_counts_and_keeps_exact_first_rows_without_clobbering() {
+        for (args, message) in [
+            (vec![], "duplicates requires a file path"),
+            (vec!["missing.csv"], "duplicates requires --columns"),
+            (
+                vec!["missing.csv", "--columns", "0"],
+                "duplicate columns must be at least 1",
+            ),
+            (
+                vec!["missing.csv", "--columns", "1,1"],
+                "duplicate columns must be unique",
+            ),
+            (
+                vec!["missing.csv", "--columns", "1", "--cancel-after-bytes", "0"],
+                "cancel-after-bytes must be non-zero",
+            ),
+            (
+                vec!["missing.csv", "--columns", "1", "--cache-state", "other"],
+                "--cache-state must be unknown, cold, or warm",
+            ),
+        ] {
+            assert_eq!(
+                duplicates_command(args.into_iter().map(str::to_owned).collect())
+                    .unwrap_err()
+                    .to_string(),
+                message
+            );
+        }
+        for columns in ["", "1,", "-1", "a", "184467440737095516160"] {
+            assert!(
+                duplicates_command(vec![
+                    "missing.csv".into(),
+                    "--columns".into(),
+                    columns.into()
+                ])
+                .is_err()
+            );
+        }
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-duplicates-cli-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let insensitive = directory.join("insensitive.csv");
+        let sensitive = directory.join("sensitive.csv");
+        let source_bytes = b"\xEF\xBB\xBFkey,payload,group\r\nA,\"first,\nline\",x\r\na,later,X\r\nB,first\r\nb,later,\"\"\r\nB,last,\r\nA,\"first,\nline\",x";
+        fs::write(&source, source_bytes).unwrap();
+        let args = vec![
+            source.to_string_lossy().into_owned(),
+            "--columns".into(),
+            "1,3".into(),
+            "--header".into(),
+            "first-row".into(),
+        ];
+        let candidate_directories = || {
+            let prefix = format!("quarry-duplicates-{}-", std::process::id());
+            fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().starts_with(&prefix))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = candidate_directories();
+        duplicates_command(args.clone()).unwrap();
+        assert_eq!(candidate_directories(), before);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        let mut with_output = args.clone();
+        with_output.extend([
+            "--output".into(),
+            insensitive.to_string_lossy().into_owned(),
+        ]);
+        duplicates_command(with_output.clone()).unwrap();
+        let expected = b"\xEF\xBB\xBFkey,payload,group\r\nA,\"first,\nline\",x\r\nB,first\r\n";
+        assert_eq!(fs::read(&insensitive).unwrap(), expected);
+        assert!(duplicates_command(with_output).is_err());
+        assert_eq!(fs::read(&insensitive).unwrap(), expected);
+
+        let mut with_case = args.clone();
+        with_case.extend([
+            "--match-case".into(),
+            "--output".into(),
+            sensitive.to_string_lossy().into_owned(),
+        ]);
+        duplicates_command(with_case).unwrap();
+        assert_eq!(fs::read(&sensitive).unwrap(), b"\xEF\xBB\xBFkey,payload,group\r\nA,\"first,\nline\",x\r\na,later,X\r\nB,first\r\nb,later,\"\"\r\n");
+
+        let mut same_source = args;
+        same_source.extend(["--output".into(), source.to_string_lossy().into_owned()]);
+        assert!(duplicates_command(same_source).is_err());
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+
+        let headerless = directory.join("headerless.tsv");
+        let headerless_output = directory.join("retained.tsv");
+        fs::write(&headerless, b"1\tfirst\n1\tsecond\n2\tlast").unwrap();
+        duplicates_command(vec![
+            headerless.to_string_lossy().into_owned(),
+            "--columns".into(),
+            "1".into(),
+            "--header".into(),
+            "none".into(),
+            "--delimiter".into(),
+            "\\t".into(),
+            "--output".into(),
+            headerless_output.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert_eq!(fs::read(&headerless_output).unwrap(), b"1\tfirst\n2\tlast");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn duplicates_command_cancellation_preserves_source_and_cleans_output() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-duplicates-cancel-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("retained.csv");
+        generate_file(&source, 64 * 1024 * 1024, 11, b',', 7).unwrap();
+        let source_hash = fnv1a64_file(&source).unwrap();
+        duplicates_command(vec![
+            source.to_string_lossy().into_owned(),
+            "--columns".into(),
+            "1".into(),
+            "--output".into(),
+            destination.to_string_lossy().into_owned(),
+            "--cancel-after-bytes".into(),
+            "1".into(),
+        ])
+        .unwrap();
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(fnv1a64_file(&source).unwrap(), source_hash);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn summarizes_viewport_latency_and_rejects_empty_workloads() {

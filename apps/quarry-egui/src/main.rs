@@ -28,14 +28,14 @@ use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 #[cfg(test)]
 use quarry_core::SearchProgress;
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, FilterExportJob, FilterExportOutcome,
-    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
-    FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
-    IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
-    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob,
-    SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection, SortJob, SortMode,
-    SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
-    estimate_sort_temporary_bytes,
+    CaseSensitivity, ColumnTransformation, DuplicateJob, DuplicateOutcome, DuplicateSpec,
+    DuplicateSummary, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex,
+    FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery,
+    FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress,
+    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob,
+    ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch, SearchOutcome,
+    SearchPosition, Session, SortDirection, SortJob, SortMode, SortOutcome, SortSpec,
+    SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex, estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
 
@@ -359,6 +359,7 @@ enum StructuralRequest {
     Combine,
     Move,
     Sort,
+    Duplicates,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +377,7 @@ struct StructuralDialog {
     position: String,
     sort_direction: SortDirection,
     sort_mode: SortMode,
+    match_case: bool,
 }
 
 impl StructuralDialog {
@@ -387,6 +389,7 @@ impl StructuralDialog {
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
+            match_case: false,
         }
     }
 
@@ -398,6 +401,7 @@ impl StructuralDialog {
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
+            match_case: false,
         }
     }
 
@@ -412,6 +416,7 @@ impl StructuralDialog {
             position,
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
+            match_case: false,
         }
     }
 
@@ -423,6 +428,15 @@ impl StructuralDialog {
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
+            match_case: false,
+        }
+    }
+
+    fn duplicates(columns: Vec<usize>) -> Self {
+        Self {
+            request: StructuralRequest::Duplicates,
+            columns,
+            ..Self::sort(0)
         }
     }
 }
@@ -1029,6 +1043,8 @@ impl QuarryApp {
                         dialog.sort_mode,
                         case_sensitivity(self.sort_match_case),
                     ),
+                    StructuralRequest::Duplicates => document
+                        .start_find_duplicates(dialog.columns, case_sensitivity(dialog.match_case)),
                 });
         match result {
             Ok(()) => {
@@ -1087,15 +1103,22 @@ impl QuarryApp {
             return Err("The document closed before the change finished.".into());
         };
         let options = current.current_open_options();
-        let logical_path = current.logical_path.clone();
         let mut replacement = Document::prepare(&ready.path, options)?;
         replacement.start_indexing()?;
+        self.install_prepared_working_copy(replacement, ready);
+        Ok(())
+    }
 
+    fn install_prepared_working_copy(
+        &mut self,
+        mut replacement: Document,
+        ready: MaterializedWorkingCopy,
+    ) {
         let current = self
             .document
             .as_mut()
             .expect("the materialized document is still open");
-        replacement.logical_path = logical_path.clone();
+        replacement.logical_path = current.logical_path.clone();
         replacement.original_session = current.original_session.take();
         replacement.working_copy = current.working_copy.take();
         replacement.selected_columns = ready.selected_columns;
@@ -1114,6 +1137,54 @@ impl QuarryApp {
         self.structural_dialog = None;
         self.notice = None;
         self.footer_status = Some(AppMessage::status(ready.notice));
+    }
+
+    fn confirm_duplicate_removal(&mut self) -> Result<(), AppMessage> {
+        let Some(document) = self.document.as_ref() else {
+            return Ok(());
+        };
+        let Some(StructuralJob::DuplicatePreview { summary, .. }) = &document.structural_job else {
+            return Ok(());
+        };
+        // Prepare the candidate before consuming history so a reopen failure is harmless.
+        let mut replacement =
+            Document::prepare(&summary.destination, document.current_open_options())
+                .map_err(AppMessage::error)?;
+        replacement.start_indexing().map_err(AppMessage::error)?;
+        let document = self
+            .document
+            .as_mut()
+            .expect("the preview document is open");
+        if document.session.ensure_source_unchanged().is_err()
+            || document
+                .original_session
+                .as_ref()
+                .is_some_and(|source| source.ensure_source_unchanged().is_err())
+        {
+            document.cancel_structural_edit();
+            document.invalidate_changed_source();
+            return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+        }
+        let Some(StructuralJob::DuplicatePreview {
+            summary,
+            selected_columns,
+            undo,
+        }) = document.structural_job.take()
+        else {
+            unreachable!("the duplicate preview remains present");
+        };
+        document.accept_materialized_change(undo);
+        self.install_prepared_working_copy(
+            replacement,
+            MaterializedWorkingCopy {
+                path: summary.destination,
+                selected_columns,
+                notice: format!(
+                    "Removed {} extra duplicate rows. Save to keep the change, or discard changes.",
+                    summary.duplicate_rows
+                ),
+            },
+        );
         Ok(())
     }
 
@@ -1894,6 +1965,21 @@ impl eframe::App for QuarryApp {
             });
         if let Some(action) = structural_dialog_action {
             self.apply_structural_dialog_action(action);
+        }
+        let duplicate_action = self.document.as_ref().and_then(|document| {
+            let StructuralJob::DuplicatePreview { summary, .. } =
+                document.structural_job.as_ref()?
+            else {
+                return None;
+            };
+            show_duplicate_preview(ctx, summary)
+        });
+        match duplicate_action {
+            Some(StructuralDialogAction::Apply) => {
+                self.notice = self.confirm_duplicate_removal().err();
+            }
+            Some(StructuralDialogAction::Cancel) => self.apply(ctx, Action::CancelStructuralEdit),
+            None => {}
         }
         let copy_event_targets_selection = self.document.as_ref().is_some_and(|document| {
             document.selection.is_some()
@@ -3176,6 +3262,7 @@ fn show_structural_dialog(
         StructuralRequest::Combine => "Combine Columns",
         StructuralRequest::Move => "Move Columns",
         StructuralRequest::Sort => "Sort Rows",
+        StructuralRequest::Duplicates => "Find Duplicates",
     };
     let modal = egui::Modal::new(egui::Id::new("quarry-structural-dialog")).show(ctx, |ui| {
         ui.set_min_width(360.0);
@@ -3203,6 +3290,18 @@ fn show_structural_dialog(
         ));
         ui.add_space(6.0);
         let (valid, field_has_focus, disabled_reason) = match dialog.request {
+            StructuralRequest::Duplicates => {
+                ui.checkbox(&mut dialog.match_case, "Match case");
+                ui.small("Compare the values in every selected column. Blank and missing fields match; spaces are significant.");
+                ui.small(if dialog.match_case {
+                    "Uppercase and lowercase letters match separately."
+                } else {
+                    "ASCII uppercase and lowercase letters match together. Other bytes match exactly."
+                });
+                ui.small("Review the count before removing extra rows. The first occurrence in the current row order will be kept, with the header fixed and unsaved values included.");
+                let reason = dialog.columns.is_empty().then(|| "Select at least one numbered column first.".to_owned());
+                (reason.is_none(), false, reason)
+            }
             StructuralRequest::Split | StructuralRequest::Combine => {
                 let label = ui.label("Separator");
                 let separator = ui
@@ -3324,6 +3423,7 @@ fn show_structural_dialog(
             let submit_label = match dialog.request {
                 StructuralRequest::Move => "Move",
                 StructuralRequest::Sort => "Sort",
+                StructuralRequest::Duplicates => "Find duplicates",
                 StructuralRequest::Split | StructuralRequest::Combine => "OK",
             };
             let mut apply = ui.add_enabled(valid, egui::Button::new(submit_label));
@@ -3340,6 +3440,33 @@ fn show_structural_dialog(
                     && field_has_focus
                     && ui.input(|input| input.key_pressed(egui::Key::Enter)))
             {
+                action = Some(StructuralDialogAction::Apply);
+            }
+        });
+    });
+    if modal.should_close() {
+        action = Some(StructuralDialogAction::Cancel);
+    }
+    action
+}
+
+fn show_duplicate_preview(
+    ctx: &egui::Context,
+    summary: &DuplicateSummary,
+) -> Option<StructuralDialogAction> {
+    let mut action = None;
+    let modal = egui::Modal::new(egui::Id::new("quarry-duplicate-preview")).show(ctx, |ui| {
+        ui.set_min_width(360.0);
+        ui.heading("Review Duplicates");
+        ui.label(format!("Extra duplicate rows: {}", summary.duplicate_rows));
+        ui.label(format!("Rows to keep: {}", summary.retained_rows));
+        ui.label("Keep the first occurrence in the current row order. Retained rows stay intact and in the same relative order. The header stays fixed.");
+        ui.small("The document has not changed. Removal creates an unsaved working version and can be undone.");
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                action = Some(StructuralDialogAction::Cancel);
+            }
+            if ui.button("Remove extra rows").clicked() {
                 action = Some(StructuralDialogAction::Apply);
             }
         });
@@ -4049,6 +4176,17 @@ struct MaterializationPreparation {
 }
 
 enum StructuralJob {
+    FindingDuplicates {
+        job: DuplicateJob,
+        destination: PathBuf,
+        selected_columns: BTreeSet<usize>,
+        undo: WorkingCopySnapshot,
+    },
+    DuplicatePreview {
+        summary: DuplicateSummary,
+        selected_columns: BTreeSet<usize>,
+        undo: WorkingCopySnapshot,
+    },
     AnalyzingSplit {
         job: SplitAnalysisJob,
         source_column: usize,
@@ -4735,6 +4873,62 @@ impl Document {
         Ok(())
     }
 
+    fn start_find_duplicates(
+        &mut self,
+        columns: Vec<usize>,
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<(), AppMessage> {
+        if let Some(reason) = self.structural_edit_disabled_reason() {
+            return Err(AppMessage::warning(reason));
+        }
+        if columns.is_empty() {
+            return Err(AppMessage::warning(
+                "Select at least one numbered column first.",
+            ));
+        }
+        for &column in &columns {
+            self.validate_column(column).map_err(AppMessage::warning)?;
+        }
+        self.commit_edits();
+        self.cancel_search();
+        let MaterializationPreparation {
+            undo,
+            destination,
+            renames,
+        } = self.prepare_materialization()?;
+        let selected_columns = columns.iter().copied().collect();
+        let job = match self.session.start_find_duplicates(
+            renames,
+            self.cell_edits.clone(),
+            DuplicateSpec {
+                columns,
+                case_sensitivity,
+            },
+            &destination,
+        ) {
+            Ok(job) => job,
+            Err(error) => {
+                self.cleanup_empty_working_copy();
+                if matches!(error, QuarryError::SourceChanged)
+                    || matches!(&error, QuarryError::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    self.invalidate_changed_source();
+                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                }
+                return Err(AppMessage::error(error.to_string()));
+            }
+        };
+        self.structural_job = Some(StructuralJob::FindingDuplicates {
+            job,
+            destination,
+            selected_columns,
+            undo,
+        });
+        self.structural_status = Some("Finding duplicate rows…".into());
+        self.structural_cancel_requested = false;
+        Ok(())
+    }
+
     fn sort_temporary_disk_estimate(&self) -> Option<u64> {
         let data_rows = self
             .index
@@ -4960,6 +5154,8 @@ impl Document {
             return Ok(None);
         };
         let done = match job {
+            StructuralJob::FindingDuplicates { job, .. } => job.progress().done,
+            StructuralJob::DuplicatePreview { .. } => false,
             StructuralJob::AnalyzingSplit { job, .. } => job.progress().done,
             StructuralJob::Materializing { job, .. } => job.progress().done,
             StructuralJob::Replacing { job, .. } => job.progress().done,
@@ -4974,8 +5170,58 @@ impl Document {
             .structural_job
             .take()
             .expect("the completed structural job is present");
+        let cancel_requested = self.structural_cancel_requested;
         self.structural_cancel_requested = false;
         match job {
+            StructuralJob::FindingDuplicates {
+                job,
+                destination,
+                selected_columns,
+                undo,
+            } => {
+                match job.wait() {
+                    Ok(DuplicateOutcome::Complete(summary))
+                        if !cancel_requested && summary.duplicate_rows > 0 =>
+                    {
+                        self.structural_status = Some(format!(
+                            "Review {} extra duplicate rows before removal.",
+                            summary.duplicate_rows
+                        ));
+                        self.structural_job = Some(StructuralJob::DuplicatePreview {
+                            summary,
+                            selected_columns,
+                            undo,
+                        });
+                    }
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(destination);
+                        self.cleanup_empty_working_copy();
+                        self.structural_status = Some(
+                            if cancel_requested {
+                                "Duplicate search cancelled. The document was not changed."
+                            } else {
+                                "No duplicates found. The document was not changed."
+                            }
+                            .into(),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(destination);
+                        self.cleanup_empty_working_copy();
+                        self.structural_status =
+                            Some("Duplicate search failed. The document was not changed.".into());
+                        if matches!(error, QuarryError::SourceChanged) {
+                            self.invalidate_changed_source();
+                            return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                        }
+                        return Err(AppMessage::error(error.to_string()));
+                    }
+                }
+                Ok(None)
+            }
+            StructuralJob::DuplicatePreview { .. } => {
+                unreachable!("a preview waits for explicit removal")
+            }
             StructuralJob::AnalyzingSplit {
                 job,
                 source_column,
@@ -5191,10 +5437,29 @@ impl Document {
     }
 
     fn cancel_structural_edit(&mut self) {
+        if matches!(
+            self.structural_job,
+            Some(StructuralJob::DuplicatePreview { .. })
+        ) {
+            if let Some(StructuralJob::DuplicatePreview { summary, .. }) =
+                self.structural_job.take()
+            {
+                let _ = std::fs::remove_file(summary.destination);
+            }
+            self.cleanup_empty_working_copy();
+            self.structural_cancel_requested = false;
+            self.structural_status =
+                Some("Duplicate removal cancelled. The document was not changed.".into());
+            return;
+        }
         let Some(job) = self.structural_job.as_ref() else {
             return;
         };
         match job {
+            StructuralJob::FindingDuplicates { job, .. } => job.cancel(),
+            StructuralJob::DuplicatePreview { .. } => {
+                unreachable!("preview cancellation handled above")
+            }
             StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
             StructuralJob::Materializing { job, .. } => job.cancel(),
             StructuralJob::Replacing { job, .. } => job.cancel(),
@@ -5230,6 +5495,30 @@ impl Document {
     fn structural_progress(&self) -> Option<StructuralProgressDisplay> {
         let job = self.structural_job.as_ref()?;
         let (bytes_scanned, total_bytes, done, operation, sorting) = match job {
+            StructuralJob::FindingDuplicates { job, .. } => {
+                let progress = job.progress();
+                if !progress.done && progress.bytes_scanned >= progress.total_bytes {
+                    return Some(StructuralProgressDisplay {
+                        fraction: 0.9,
+                        label: "Finding duplicates · merging records…".into(),
+                        animate: true,
+                    });
+                }
+                (
+                    progress.bytes_scanned,
+                    progress.total_bytes,
+                    progress.done,
+                    "Finding duplicates",
+                    false,
+                )
+            }
+            StructuralJob::DuplicatePreview { .. } => {
+                return Some(StructuralProgressDisplay {
+                    fraction: 1.0,
+                    label: "Review duplicates before removal".into(),
+                    animate: false,
+                });
+            }
             StructuralJob::AnalyzingSplit { job, .. } => {
                 let progress = job.progress();
                 (
@@ -5825,6 +6114,11 @@ impl Document {
     fn start_save_operation(&mut self, destination: Option<PathBuf>) -> Result<(), AppMessage> {
         if self.source_changed {
             return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+        }
+        if self.structural_job.is_some() {
+            return Err(AppMessage::warning(
+                "Finish or cancel the active change before saving.",
+            ));
         }
         if self.save_job.is_some() {
             return Err(AppMessage::warning("A save operation is already running."));
@@ -6479,6 +6773,10 @@ impl Document {
         self.stop_filter_read();
         if let Some(job) = self.structural_job.take() {
             match job {
+                StructuralJob::FindingDuplicates { job, .. } => job.cancel(),
+                StructuralJob::DuplicatePreview { summary, .. } => {
+                    let _ = std::fs::remove_file(summary.destination);
+                }
                 StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
                 StructuralJob::Materializing { job, .. } => job.cancel(),
                 StructuralJob::Replacing { job, .. } => job.cancel(),
@@ -7822,11 +8120,20 @@ fn show_table(
                                         .clicked()
                                     {
                                         interaction.column_request = Some(
-                                            GridColumnRequest::Delete(combine_columns),
+                                            GridColumnRequest::Delete(combine_columns.clone()),
                                         );
                                         ui.close();
                                     }
                                     ui.separator();
+                                    if ui.add_enabled(
+                                        !combine_columns.is_empty(),
+                                        egui::Button::new("Find Duplicates…"),
+                                    ).clicked() {
+                                        interaction.column_request = Some(GridColumnRequest::Dialog(
+                                            StructuralDialog::duplicates(combine_columns.clone()),
+                                        ));
+                                        ui.close();
+                                    }
                                     if ui
                                         .add_enabled(
                                             split_column.is_some(),
@@ -13532,6 +13839,248 @@ mod tests {
             app.document.as_ref().unwrap().session.first_rows[0].fields,
             ["d", "c"].map(|field| field.as_bytes().to_vec())
         );
+    }
+
+    fn finish_duplicate_search(app: &mut QuarryApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let document = app.document.as_mut().unwrap();
+            assert!(document.poll_structural_edit().unwrap().is_none());
+            if !matches!(
+                document.structural_job,
+                Some(super::StructuralJob::FindingDuplicates { .. })
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "duplicate search timed out");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn duplicates_preview_effective_values_and_remove_with_history_and_save_as() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("duplicates.csv");
+        let original = b"\xEF\xBB\xBFkey,status,note\r\na,keep,\"first\nline\"\r\nA,keep,second\r\nb,keep,last\r\na,skip,other\r\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path_with_options(
+            source.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        document.rename_header(2, "memo".into()).unwrap();
+        document.begin_cell_edit(3, 0, b"b".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "a".into();
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut dialog = StructuralDialog::duplicates(vec![0, 1]);
+        let (action, _) = click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Find duplicates");
+        assert_eq!(action, Some(StructuralDialogAction::Apply));
+        app.open_structural_dialog(dialog);
+        app.apply_structural_dialog_action(action.unwrap());
+        assert!(app.notice.is_none());
+        finish_duplicate_search(&mut app);
+        let document = app.document.as_mut().unwrap();
+        let Some(super::StructuralJob::DuplicatePreview { summary, .. }) = &document.structural_job
+        else {
+            panic!("expected duplicate preview");
+        };
+        assert_eq!((summary.duplicate_rows, summary.retained_rows), (2, 2));
+        let output = ctx.run(grid_input(), |ctx| {
+            super::show_duplicate_preview(ctx, summary);
+        });
+        for label in [
+            "Extra duplicate rows: 2",
+            "Rows to keep: 2",
+            "Remove extra rows",
+            "Cancel",
+        ] {
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(label) || node.value() == Some(label)),
+                "missing accessible preview label {label}"
+            );
+        }
+        assert_eq!(document.session.path(), source);
+        assert_eq!(document.cell_edits[&(3, 0)], b"a");
+        assert!(!document.can_undo());
+        assert!(document.begin_cell_edit(1, 0, b"a".to_vec()).is_err());
+        assert!(document.start_save().is_err());
+        let history_len = document.edit_history.undo.len();
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.confirm_duplicate_removal().unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_ref().unwrap();
+        let expected = b"\xEF\xBB\xBFkey,status,memo\r\na,keep,\"first\nline\"\r\na,skip,other\r\n";
+        assert_eq!(fs::read(document.session.path()).unwrap(), expected);
+        assert!(document.is_dirty());
+        assert_eq!(document.selected_columns, BTreeSet::from([0, 1]));
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.session.path(), source);
+        assert_eq!(document.cell_edits[&(3, 0)], b"a");
+        assert_eq!(document.column_name(2), "memo");
+        assert_eq!(document.edit_history.undo.len(), history_len);
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let saved = directory.path().join("saved.csv");
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_save_as(saved.clone())
+            .unwrap();
+        finish_app_save(&mut app, &ctx, &mut eframe::Frame::_new_kittest());
+        assert_eq!(fs::read(saved).unwrap(), expected);
+        assert_eq!(fs::read(source).unwrap(), original);
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+    }
+
+    #[test]
+    fn duplicates_cancel_no_match_and_discard_preserve_document_and_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("duplicates.csv");
+        let original = b"key,value\na,first\nA,second\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path_with_options(
+            source.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_find_duplicates(vec![0], CaseSensitivity::Sensitive)
+            .unwrap();
+        finish_duplicate_search(&mut app);
+        let document = app.document.as_ref().unwrap();
+        assert!(document.structural_job.is_none());
+        assert!(document.working_copy.is_none());
+        assert!(!document.is_dirty());
+        assert!(
+            document
+                .structural_status
+                .as_ref()
+                .unwrap()
+                .starts_with("No duplicates")
+        );
+
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
+            .unwrap();
+        finish_duplicate_search(&mut app);
+        let document = app.document.as_mut().unwrap();
+        let temp = document
+            .working_copy
+            .as_ref()
+            .unwrap()
+            .directory
+            .path()
+            .to_path_buf();
+        document.cancel_structural_edit();
+        assert!(!temp.exists());
+        assert!(document.structural_job.is_none());
+        assert!(!document.is_dirty());
+
+        document
+            .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
+            .unwrap();
+        document.cancel_structural_edit();
+        finish_duplicate_search(&mut app);
+        assert!(app.document.as_ref().unwrap().working_copy.is_none());
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
+            .unwrap();
+        finish_duplicate_search(&mut app);
+        app.confirm_duplicate_removal().unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        let working = app.document.as_ref().unwrap().session.path().to_path_buf();
+        app.apply(&egui::Context::default(), Action::DiscardChanges);
+        finish_index(app.document.as_mut().unwrap());
+        assert!(!working.exists());
+        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicates_preview_source_conflict_and_reopen_failure_do_not_consume_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("duplicates.csv");
+        fs::write(&source, b"key,value\na,first\na,second\n").unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path_with_options(
+            source.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(1, "memo".into())
+            .unwrap();
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
+            .unwrap();
+        finish_duplicate_search(&mut app);
+        let document = app.document.as_ref().unwrap();
+        let Some(super::StructuralJob::DuplicatePreview { summary, .. }) = &document.structural_job
+        else {
+            panic!("expected preview");
+        };
+        let candidate = summary.destination.clone();
+        let candidate_bytes = fs::read(&candidate).unwrap();
+        fs::remove_file(&candidate).unwrap();
+        let history_len = document.edit_history.undo.len();
+        assert!(app.confirm_duplicate_removal().is_err());
+        assert_eq!(
+            app.document.as_ref().unwrap().edit_history.undo.len(),
+            history_len
+        );
+        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
+        fs::write(&candidate, candidate_bytes).unwrap();
+        fs::write(&source, b"key,value\nexternal,changed\n").unwrap();
+        assert_eq!(
+            app.confirm_duplicate_removal().unwrap_err(),
+            SOURCE_CHANGED_NOTICE
+        );
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.edit_history.undo.len(), history_len);
+        assert_eq!(document.column_name(1), "memo");
+        assert!(!candidate.exists());
+        assert!(document.source_changed);
+        assert_eq!(fs::read(source).unwrap(), b"key,value\nexternal,changed\n");
     }
 
     #[test]

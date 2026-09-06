@@ -37,6 +37,7 @@ working memory bounded and does not change the source until you choose
 | Find and replace | Literal Find Next and Find Previous, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
 | Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, Does not equal, exact numeric comparisons, and inclusive Between; same-column alternatives with AND across columns; text is case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
 | Edit | Direct cell and header editing; multiline values; individual edit Undo and Redo; one-level structural history; Discard Changes |
+| Duplicates | Match selected columns, review the extra-row count, then explicitly remove later occurrences; keep the first row in current order; include unsaved values; bounded memory and cancellation |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or delete the selected columns; continue editing the result before saving |
 | Sort | Text, exact Number, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
 | Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |
@@ -136,6 +137,7 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - [Current 12 GB `FIRSTNAME` sort optimization](docs/benchmarks/2026-08-23-12gb-sort-performance.md)
 - [1 GB exact numeric sorting validation](docs/benchmarks/2026-09-04-numeric-sort.md)
 - [1 GB exact numeric filtering and export validation](docs/benchmarks/2026-09-05-numeric-filters.md)
+- [1 GB duplicate matching and removal validation](docs/benchmarks/2026-09-05-find-remove-duplicates.md)
 - [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)
 - [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
 
