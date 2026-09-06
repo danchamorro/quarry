@@ -6,9 +6,12 @@ checking writable capacity and allowing a selected working directory. The
 The [priority checklist](../PRE_BETA_CHECKLIST.md#4-temporary-disk-handling)
 tracks integrated checks and installed-app validation.
 
-Implementation commit `6e91c39` is submitted in
-[PR #38](https://github.com/danchamorro/quarry/pull/38). The final automated
-checks below cover that code; recorded binary checks retain their earlier scope.
+Implementation commit `6e91c39` and review fix `01c1503` merged in
+[PR #38](https://github.com/danchamorro/quarry/pull/38) as `f5efee2`. Recorded
+binary checks retain their earlier scope. The later
+[clean installed-app closeout](2026-09-06-pre-beta-closeout.md) verifies the
+merged build and the connected editing, filtering, export, duplicate-removal,
+and Save workflow.
 
 ## Environment and scope
 
@@ -165,7 +168,8 @@ storage dialog stays open, with close and dropped-file input blocked. Deferred
 Split review and close-after-Save intent are preserved. The insufficient-space
 test now controls the in-memory size estimate through the normal Save worker,
 without resizing the source or requiring sparse-file support; exact source,
-Undo, and staging-cleanup assertions remain. Native checks were not repeated.
+Undo, and staging-cleanup assertions remain. Native checks were not repeated
+during that review follow-up; the merged-app closeout linked above followed it.
 CodeRabbit `review --agent --uncommitted` completed on the three changed Rust
 files with zero findings.
 

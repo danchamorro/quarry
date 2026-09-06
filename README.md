@@ -62,8 +62,10 @@ and package-only instructions.
 1. Install Quarry, then open a CSV, TSV, pipe-delimited, or semicolon-delimited
    file from Finder, through **Open…** in Quarry's file menu, or by dropping it
    onto the Quarry window.
-2. Edit the grid directly. Use **Filters…** to narrow or export rows, and use
-   the numbered column rulers to select columns for reshaping or sorting.
+2. Edit the grid directly. Save or discard cell edits before using **Filters…**
+   to narrow or export rows. Use **Save As…** for a checkpoint that preserves the
+   original. Use the numbered column rulers to select columns for reshaping or
+   sorting.
 3. Use **Save** to update the source or **Save As…** to create a separate file.
 
 See the [User guide](docs/USER_GUIDE.md) for navigation, editing, case matching,

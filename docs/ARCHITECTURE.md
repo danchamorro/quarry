@@ -498,8 +498,9 @@ Combine accepts an optional literal separator. The dialog asks only for the
 separator and confirmation. Cancel closes it without changing the document.
 The same context menu offers **Move Selected Columns…** and **Delete Selected
 Columns**. Move opens a compact modal with a labelled one-based destination
-field and Move/Cancel buttons. Delete starts directly after checking that at
-least one known column will remain.
+field and Move/Cancel buttons. Delete checks that at least one known column
+will remain, then starts after any required storage review (for allowances of
+at least 256 MiB).
 
 Split first scans the current data plus sparse edits to derive the maximum
 number of separated parts, then replaces the selected column using that derived
@@ -522,9 +523,10 @@ history is unchanged. Delete removes only the explicitly selected known
 columns and selects the nearest survivor after materialization. Hidden state
 and view order are never consulted by either operation.
 
-Confirmation starts the bounded background operation. Split performs its
-analysis pass, then Split, Combine, Move Selected Columns, or Delete Selected
-Columns streams the current document into a newly reserved private working CSV.
+Storage review precedes materialization when the allowance is at least 256 MiB.
+Split performs its analysis pass first. Each Split, Combine, Move Selected
+Columns, or Delete Selected Columns operation then streams the current document
+into a newly reserved private working CSV.
 Only that one operation is evaluated during the stream. After the worker
 succeeds, Quarry opens and indexes the result as the normal editable grid. The
 user can edit the result or apply another structural command, which repeats the

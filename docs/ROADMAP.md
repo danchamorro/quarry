@@ -4,10 +4,10 @@ The roadmap is ordered by technical risk rather than feature excitement.
 
 ## Focus before the first public beta
 
-The [Priority Checklist Before Beta](PRE_BETA_CHECKLIST.md) tracks the next
-product work in order: individual cell/header Undo, numeric filters, duplicate
-cleanup, and temporary-disk handling. It contains completion criteria and space
-for validation evidence. Priority 1 is merged in
+The [Priority Checklist Before Beta](PRE_BETA_CHECKLIST.md) records four completed
+feature priorities: individual cell/header Undo, numeric filters, duplicate
+cleanup, and temporary-disk handling. It contains completion criteria and linked
+validation evidence. Priority 1 is merged in
 [PR #35](https://github.com/danchamorro/quarry/pull/35) as `cd05013` and
 [locally validated](benchmarks/2026-09-04-individual-edit-undo.md), including
 the clean installed app. CodeRabbit CLI review completed with zero findings on
@@ -28,20 +28,29 @@ the installed-app count/removal/history/Save As workflow. Implementation commit
 [PR #37](https://github.com/danchamorro/quarry/pull/37) as `9210369`. All checks
 passed, and the clean installed app passed duplicate removal and Undo again.
 
-Priority 4 is implemented and locally validated on
-`codex/temporary-disk-handling`: a selected working
-folder, advisory capacity checks, storage review before large operations, and
-cleanup that preserves required working/Undo files. Save/export staging remains
-on the destination volume. All 290 tests passed. The
+Priority 4 adds a selected working folder, advisory capacity checks, storage
+review before large operations, and cleanup that preserves required working/Undo
+files. Save/export staging remains on the destination volume. Initial validation
+passed all 290 tests. The
 [1 GB, cross-volume, and installed-app checks](benchmarks/2026-09-05-temporary-disk-handling.md)
-passed before the final private-output handoff fix, which is covered by current
-automated checks. Implementation commit `6e91c39` is submitted in
-[PR #38](https://github.com/danchamorro/quarry/pull/38), awaiting review. See [ADR 0005](adr/0005-temporary-storage.md)
-and the [user guide](USER_GUIDE.md#temporary-storage-and-free-space). Completed alpha
-phases below retain their existing scope.
+passed before the final private-output handoff fix. That fix and the
+storage-review polling fix (`01c1503`) passed all 291 workspace tests.
+Implementation commit `6e91c39` and follow-ups merged in
+[PR #38](https://github.com/danchamorro/quarry/pull/38) as `f5efee2`. The clean
+merged app was installed and verified; native editing, sort, Undo/Redo, and
+exact Save As output passed with the original source unchanged. The original
+1 GB and cross-volume measurements were not repeated on this merge. See
+[ADR 0005](adr/0005-temporary-storage.md) and the
+[user guide](USER_GUIDE.md#temporary-storage-and-free-space).
+
+The [2026-09-06 connected-workflow validation](benchmarks/2026-09-06-pre-beta-closeout.md)
+passed in the clean installed app at `f5efee2`, covering cell/header Undo/Redo,
+Save As, numeric filtering, exact export, duplicate removal and Undo/Redo,
+final Save, source preservation, and working-file cleanup. Owner review remains
+pending in the checklist. Completed alpha phases below retain their existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.
 
-## Current progress: 2026-09-05
+## Current progress: 2026-09-06
 
 | Phase | Status | Evidence |
 |---|---|---|
