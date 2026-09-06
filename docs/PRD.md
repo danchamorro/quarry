@@ -138,9 +138,10 @@ data.
 
 Users start **Split Columns…** or **Combine Columns…** from the context menu of
 the numbered column headers. A compact modal uses the current selection and
-asks only for the operation's separator. **OK** starts a bounded background
-stream into a private working CSV, and **Cancel** does nothing. Quarry opens and
-indexes the completed working file as the normal editable grid. Users may edit
+asks only for the operation's separator. **OK** starts the operation, with any
+required storage review before writing a private working CSV. **Cancel** does
+nothing. Quarry opens and indexes the completed working file as the normal
+editable grid. Users may edit
 the resulting cells and headers or repeat any structural column command before
 writing a file. One-level structural Undo and Redo move between adjacent
 document versions. Every shown document column is horizontally reachable while
@@ -167,9 +168,9 @@ regression and installed-app evidence.
 Users start **Move Selected Columns…** or **Delete Selected Columns** from the
 same numbered-header context menu. Move uses a compact modal with the selected
 columns and a labelled one-based destination field, plus Move and Cancel.
-Delete starts immediately after validating that at least one known column will
-survive. Both operations stream into a private working CSV and return to the
-ordinary editable grid.
+Delete validates that at least one known column will survive, then starts after
+any required storage review (for allowances of at least 256 MiB). Both operations
+stream into a private working CSV and return to the ordinary editable grid.
 
 Numbered column headers expose their selected state and **Split Columns…**,
 **Combine Columns…**, **Move Selected Columns…**, and **Delete Selected

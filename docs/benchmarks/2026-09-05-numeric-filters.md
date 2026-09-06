@@ -8,8 +8,7 @@ checks passed. Implementation commit `d9f47dd` is submitted in
 All checks passed, and the clean installed merge build passed inclusive Between
 again. See the
 [priority checklist](../PRE_BETA_CHECKLIST.md#2-numeric-filters) for delivery
-status. Priority 3 is implemented and locally validated; only priority 4 remains
-planned.
+status for all four priorities.
 
 ## Behavior
 

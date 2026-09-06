@@ -115,9 +115,10 @@ order, including columns hidden in the current view. Copy is limited to 64 MiB.
    separate rows.
 4. Right-click a selected row number and choose **Delete Selected Rows**.
 
-The row selection remains active while you scroll. Deletion starts immediately
-and creates an unsaved working version; it does not change the source until you
-use **Save**. Use **Undo** to restore the previous working version, or
+The row selection remains active while you scroll. Deletion creates an unsaved
+working version; it does not change the source until you use **Save**. If the
+storage allowance is at least 256 MiB, **Review storage requirements** appears
+before deletion starts. Use **Undo** to restore the previous working version, or
 **Discard Changes** to return to the last opened or saved file.
 
 Filtering clears the row selection. Clear an active filter before selecting or
@@ -341,9 +342,10 @@ values directly next to each other. The completed result is an unsaved change.
 1. Select one or more numbered columns.
 2. Right-click a selected number and choose **Delete Selected Columns**.
 
-Delete begins immediately after validation and does not show another
-confirmation dialog. At least one column must remain. The source is still
-unchanged until you save. **Undo** first reverses later cell or header edits,
+Delete has no separate deletion confirmation. If the storage allowance is at
+least 256 MiB, **Review storage requirements** appears before it starts. At
+least one column must remain. The source is still unchanged until you save.
+**Undo** first reverses later cell or header edits,
 then restores the previous layout. **Discard Changes** restores the source
 layout and removes every unsaved change.
 

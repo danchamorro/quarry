@@ -2,10 +2,9 @@
 
 This is the focused product checklist to complete before Quarry's first public
 beta. Work in priority order: individual edit Undo, numeric filters, duplicate
-cleanup, then temporary-disk handling. Priorities 1 through 3 are merged and locally
-validated. Priority 4 is implemented and locally validated on
-`codex/temporary-disk-handling`, submitted in
-[PR #38](https://github.com/danchamorro/quarry/pull/38) and awaiting review.
+cleanup, then temporary-disk handling. All four feature priorities are complete,
+merged, and locally validated. The final connected workflow passed in the clean
+merged app; owner review remains pending below.
 
 Mark an item complete only after its behavior is implemented and validated.
 Record the PR and validation evidence under each priority, and update the
@@ -140,19 +139,32 @@ required/available space, low-space blocking, Cancel/Continue, exact 1 GB sort,
 working versions and Undo/Redo across volumes, atomic Save, and cleanup. Its
 metadata records dirty source from validation before commit. The recorded
 1 GB, cross-volume, and installed-app checks precede the final private-output
-handoff fix. Current automated checks cover that fix, including GUI and CLI
-callers; the native checks were not repeated afterward. Controls and limits
-are documented in the [user guide](USER_GUIDE.md#temporary-storage-and-free-space)
-and [ADR 0005](adr/0005-temporary-storage.md).
+handoff fix. The handoff fix and storage-review polling fix (`01c1503`) passed
+all 291 workspace tests and merged in PR #38 as `f5efee2`. The clean merged app
+was installed and verified; a native smoke check passed editing, sort,
+Undo/Redo, and exact Save As output with the original source unchanged. This
+smoke check does not repeat the earlier 1 GB or cross-volume measurements.
+Controls and limits are documented in the
+[user guide](USER_GUIDE.md#temporary-storage-and-free-space) and
+[ADR 0005](adr/0005-temporary-storage.md).
 
 ## Completion and release handoff
 
-- [ ] All four priorities have linked implementation and validation evidence.
-- [ ] Review a connected workflow in the installed app: edit, Undo/Redo,
+- [x] All four priorities have linked implementation and validation evidence.
+- [x] Review a connected workflow in the installed app: edit, Undo/Redo,
   filter, export, remove duplicates, and save. Confirm exact output and source
   preservation before Save.
-- [ ] Complete owner review and reconcile the user guide, roadmap, and this
-  checklist with the shipped behavior.
+- [x] Reconcile the user guide, roadmap, and this checklist with the merged
+  behavior.
+- [ ] Complete owner review of the final pre-beta results.
+
+**Connected-workflow evidence:** the
+[2026-09-06 closeout validation](benchmarks/2026-09-06-pre-beta-closeout.md)
+passed in the clean installed app at `f5efee2`: cell/header editing and
+Undo/Redo, Save As, numeric Between filtering, exact filtered export, reviewed
+duplicate removal and Undo/Redo, and final Save. Independent byte comparisons
+confirmed every output, the unchanged original source, and preservation of the
+Save As checkpoint until explicit Save. Private working files were cleaned up.
 
 Finishing this checklist means the priority product work is complete. A public
 download still needs release preparation, including supported-system testing,
