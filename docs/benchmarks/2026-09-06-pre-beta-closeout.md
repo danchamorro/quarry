@@ -62,6 +62,9 @@ checkpoint, export, pre-Save, and final stages separately, including proof that
 Save had not modified the checkpoint early. The app was returned to an empty,
 clean session after validation.
 
+The recorded run checked the private working file separately from the stage
+log. The reproduction verifier below includes that comparison in `pre-save`.
+
 | Artifact / stage | Data rows | Bytes | SHA-256 |
 | --- | ---: | ---: | --- |
 | Original source, unchanged throughout | 7 | 200 | `41e1f7a2628657aa4429639df5f21e272e14e10e79e2c4b090347e3f0cf6ff40` |
@@ -82,13 +85,15 @@ the installed-app steps above. Run the verifier at the matching stage:
 ```sh
 python3 verify.py checkpoint
 python3 verify.py export
-python3 verify.py pre-save
+python3 verify.py pre-save "/absolute/path/to/quarry-working-.../generation-1.csv"
 python3 verify.py final
 ```
 
 Run each command at its corresponding point in the GUI sequence, not all at
 once after Save. The final verification requires the earlier checkpoint and
-export evidence. The fixture is small by design and does not exercise the
+export evidence plus a successful pre-Save working-file comparison. Replace
+the example path with the active private working CSV's absolute path, captured
+before Save removes it. The fixture is small by design and does not exercise the
 256 MiB storage-review threshold or substitute for the linked large-file tests.
 
 ### generate.py
@@ -188,8 +193,11 @@ for name, data in computed.items():
     oracle_name = 'source.csv' if name == 'source' else f'expected-{name}.csv'
     assert (ROOT / oracle_name).read_bytes() == data, (name, 'stored oracle mismatch')
 
-stage = sys.argv[1] if len(sys.argv) == 2 else 'source'
+stage = sys.argv[1] if len(sys.argv) >= 2 else 'source'
 assert stage in ['source', 'checkpoint', 'export', 'pre-save', 'final'], 'Use source, checkpoint, export, pre-save, or final'
+assert len(sys.argv) == 3 if stage == 'pre-save' else len(sys.argv) in [1, 2], 'Only pre-save requires an additional working CSV path'
+if stage == 'pre-save':
+    assert Path(sys.argv[2]).is_absolute(), 'Use the absolute path to the active private working CSV'
 checked = {'source.csv': {'bytes': len(source), 'sha256': EXPECTED['source'][1], 'data_rows': 7}}
 
 def check_file(filename, expected, count):
@@ -205,12 +213,15 @@ elif stage in ['checkpoint', 'export', 'pre-save']:
     check_file('checkpoint.csv', checkpoint, 7)
     if stage in ['export', 'pre-save']:
         check_file('filtered.csv', export, 4)
+    if stage == 'pre-save':
+        check_file(sys.argv[2], final, 5)
 else:
     check_file('checkpoint.csv', final, 5)
     check_file('filtered.csv', export, 4)
     evidence = [json.loads(line) for line in (ROOT / 'verification.jsonl').read_text().splitlines()]
     assert any(item['stage'] == 'checkpoint' and item['files']['checkpoint.csv']['sha256'] == EXPECTED['checkpoint'][1] for item in evidence), 'Missing earlier edit-only checkpoint verification'
     assert any(item['stage'] in ['export', 'pre-save'] and item['files']['checkpoint.csv']['sha256'] == EXPECTED['checkpoint'][1] for item in evidence), 'Missing earlier export/edit-only checkpoint verification'
+    assert any(item['stage'] == 'pre-save' and any(file['sha256'] == EXPECTED['final'][1] for file in item['files'].values()) for item in evidence), 'Missing pre-Save working-file verification'
 
 result = {'stage': stage, 'verified_at_utc': datetime.now(timezone.utc).isoformat(), 'files': checked, 'filter_matches': [1, 2, 5, 6], 'duplicates_removed': 2, 'retained_rows': [1, 2, 4, 5, 7]}
 with (ROOT / 'verification.jsonl').open('a') as log:
