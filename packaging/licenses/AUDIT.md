@@ -28,7 +28,9 @@ No global installation is required.
 `--check` requires only Python 3 and repository files. It checks content hashes
 for the artifact and its inputs, including the lockfile, workspace manifests,
 generator, configuration, supplemental notices, and this audit. Success means
-freshness and integrity only. It does not review license obligations. Normal local
+repository freshness and integrity only. It does not inspect the local Cargo
+cache or re-read dependency files; regeneration performs those source checks.
+It does not review license obligations. Normal local
 packaging may include this draft. `--release-check` additionally fails because
 the manual review gates below remain unresolved. Neither command publishes files.
 Pass `--target <triple>` to assert the package target; targets other than
@@ -38,11 +40,12 @@ The generator uses genuine source files selected by cargo-about. It omits
 source-less fallback text and the detected MIT placeholder from the HTML, listing
 the affected packages explicitly instead. The four original bundled font notices
 are preserved in `supplemental.json` and the HTML, including the Hack notice that
-contains Source Foundry, DejaVu, and Bitstream terms. Font byte hashes are recorded
+contains Source Foundry, DejaVu, and Bitstream terms. Font byte lengths and hashes are recorded
 and verified against the locked crate on regeneration. Checked-in upstream
 supplements cite exact repository commits and retain the provided text unchanged.
-Regeneration verifies their recorded hashes; changes to those supplements require
-a new source audit. HTML escaping changes markup representation, not rendered text.
+Both regeneration and `--check` verify every stored notice's text hash, including
+URL-backed records. Neither fetches those URLs again; changes to the supplements
+require a new source audit. HTML escaping changes markup representation, not rendered text.
 
 ## Open release gates
 

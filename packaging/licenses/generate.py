@@ -69,8 +69,11 @@ def render(raw):
         path = record.get("crate_file", record.get("path"))
         if path:
             source = Path(packages[ids[0]]["manifest_path"]).parent / path
-            if digest(source.read_bytes()) != record["sha256"]:
+            content = source.read_bytes()
+            if digest(content) != record["sha256"]:
                 raise ValueError("Locked crate supplement changed: " + str(source))
+            if "bytes" in record and len(content) != record["bytes"]:
+                raise ValueError("Locked crate supplement size mismatch: " + str(source))
 
     sections, gaps = [], []
     for license in raw["licenses"]:

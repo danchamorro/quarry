@@ -184,7 +184,19 @@ git worktree remove ../quarry-rollback
 
 For an immediate local rollback, quit Quarry, expand `Quarry-previous.zip`,
 replace `/Applications/Quarry.app` with the archived `Quarry.app` in Finder,
-then run `./scripts/macos-app.sh verify`.
+then check its signature and recorded identity:
+
+```bash
+codesign --verify --deep --strict --verbose=2 /Applications/Quarry.app
+plutil -p /Applications/Quarry.app/Contents/Info.plist
+```
+
+Confirm `CFBundleIdentifier` is `io.github.danchamorro.quarry`,
+`CFBundleExecutable` is `Quarry`, and the recorded revision and source status
+match the intended backup. These checks also work for older bundles without
+license resources. Run `./scripts/macos-app.sh verify` as an additional check
+only when the restored bundle includes the three required license resources;
+its stricter current-package contract still applies to new builds.
 
 ## Signing limitation
 

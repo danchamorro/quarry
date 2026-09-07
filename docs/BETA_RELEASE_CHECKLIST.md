@@ -26,7 +26,7 @@ minimum supported operating-system version.
 |---|---|---|
 | macOS, Apple Silicon | Clean installed `69d5f15` validated on macOS 26.6.2, ARM64; local preparation checks and packaging passed | Choose and test the supported macOS versions on the final candidate; complete signing and notarization |
 | macOS, Intel | No release acceptance recorded | Decide whether this architecture is in the first beta; if included, build and test it on Intel hardware |
-| Linux, core and CLI | Debian 12 container, ARM64, Rust 1.88.0: 180 tests and locked release build passed | The new Linux CI job has not run remotely; this does not claim Linux GUI support |
+| Linux, core and CLI | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI, Rust 1.88.0: 180 tests and locked release builds passed | Validate the final candidate; this does not claim Linux GUI support |
 | Linux, desktop | Current check fails because the native-dialog dependency requires a Linux backend | Select and validate the file-dialog backend, then check windowing, keyboard, accessibility, packaging, and native workflows before claiming support |
 | Windows | No release acceptance recorded | Plan engine, filesystem, desktop, and packaging validation before claiming support |
 
@@ -194,8 +194,10 @@ Linux core/CLI validation uses the following bounded package scope, without the
 desktop crates. A Debian 12 Docker container on `aarch64-unknown-linux-gnu` with
 Rust 1.88.0 passed all 180 tests (core 142, CLI 29, delimited 9) and the locked
 release build. The same commands are configured in
-[Linux CI](../.github/workflows/ci.yml), which has not run remotely for these
-preparation changes yet. A separate Linux desktop check fails in `rfd` 0.17.2
+[Linux CI](../.github/workflows/ci.yml). At `5a24874`, the
+[PR validation run](https://github.com/danchamorro/quarry/actions/runs/34153433796)
+also passed all 180 tests and the release build on Ubuntu 24.04 x86_64; its
+macOS 26 ARM64 job passed workspace checks and packaging. A separate Linux desktop check fails in `rfd` 0.17.2
 because neither the `gtk3` nor `xdg-portal` backend is selected. Fixing that build
 gate will still require native GUI validation.
 
@@ -212,7 +214,7 @@ Complete this record for the exact candidate before closing the release gates:
 | Build toolchain, SDK, deployment target, architecture | Pending |
 | Supported OS/hardware acceptance runs | Pending |
 | CI and locked validation results | Pending |
-| Linux core/CLI evidence, separate from desktop support | Debian 12 ARM64 container, Rust 1.88.0: 180 tests and release build passed; remote CI pending |
+| Linux core/CLI evidence, separate from desktop support | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI at `5a24874`, Rust 1.88.0: 180 tests and release builds passed; repeat for the final candidate |
 | Connected workflow and large-file results | Pending |
 | Install/update/rollback and installed revision | Pending |
 | Project/dependency notice audit | Draft inventory and three bundled resources verified; freshness passed; release clearance remains unresolved in [AUDIT.md](../packaging/licenses/AUDIT.md) |
