@@ -222,14 +222,27 @@ active filter. Use **Filters…** when you need multiple rules.
 #### Build one or more rules
 
 1. Click **Filters…**.
-2. Enter the original one-based file-column number for the rule.
+2. Open the rule's **Column** picker. Search by name or original one-based
+   file-column number, then choose a column. Each result shows its number and
+   name, including columns hidden or reordered in the grid.
 3. Choose a text rule (**Contains**, **Equals**, or **Does not equal**) or a
    numeric rule (**Greater than (>)**, **Greater than or equal (>=)**,
    **Less than (<)**, **Less than or equal (<=)**, or **Between (inclusive)**).
-4. Enter the text value or numeric bound. **Between** requires a lower and an
-   upper bound and includes both endpoints.
+4. Enter the text value or numeric bound. Text values preserve spaces and line
+   breaks. **Between** places its lower and upper bounds side by side and
+   includes both endpoints.
 5. Use **Add rule** for another condition.
 6. Set **Match case** for text rules as needed, then click **Apply filters**.
+
+Validation appears inside each rule. An empty **Contains** rule shows
+**Enter text to match.** and keeps **Apply filters** disabled until text is
+entered. Invalid numeric bounds also keep Apply disabled.
+
+The rules scroll within the movable Filters window, keeping the bottom actions
+in view. Expand **Details** for a summary of matching behavior and any applied
+rules. **Close** preserves the draft and active filter. **Esc** first closes an
+open picker; press it again to close Filters without applying or losing the
+draft.
 
 Filter rules work as follows:
 
@@ -357,12 +370,18 @@ For view-only reordering or hiding, use the **Columns…** window instead.
    add columns or Shift-click for a range. Select every column to compare entire
    records.
 2. Right-click a selected number and choose **Find Duplicates…**.
-3. Choose **Match case** if uppercase and lowercase must match separately,
-   then click **Find duplicates**.
+3. Check the selected-column summary. Choose **Match case** if uppercase and
+   lowercase must match separately, then click **Find duplicates**.
 4. Review **Extra duplicate rows** and **Rows to keep**. The extra count excludes
    the first occurrence of each matching group.
 5. Click **Remove extra rows** to apply the result, or **Cancel** to keep the
    document unchanged.
+
+The first-occurrence rule is shown while choosing options and reviewing the
+result. Expand **Details** for matching and retained-row semantics. The review
+also explains that removal creates an unsaved working version and can be undone.
+Finding duplicates and removing them are separate actions; the review requires
+an explicit **Remove extra rows** before the document changes.
 
 Every selected column must match. Values are compared as decoded text bytes,
 so quoted and unquoted forms of the same value match. Blank and missing fields
@@ -398,7 +417,7 @@ open the window, including when choosing Shuffle or Reverse.
 1. Select exactly one numbered column: the column to sort by for Text, Number,
    Character count, or Word count, or any column for Shuffle or Reverse.
 2. Right-click its number and choose **Sort Rows…**.
-3. Choose a sorting type:
+3. Choose a type from **Sort as**:
    - **Text** (the default): alphabetical text order, such as `1, 10, 2`.
    - **Number**: exact numeric order, such as `1, 2, 10`.
    - **Character count**: shortest or longest values first, including spaces
@@ -409,12 +428,18 @@ open the window, including when choosing Shuffle or Reverse.
    - **Shuffle**: randomly reorder all data rows. Each use generates a fresh
      shuffle; equal-looking or duplicate rows remain separate records.
    - **Reverse**: put the last data row first and the first data row last.
-4. Choose a direction for Text, Number, Character count, or Word count.
+4. Use the **Direction** buttons for Text, Number, Character count, or Word count.
    Shuffle and Reverse operate on the current whole-row order and ignore the
    selected column, so they have no direction control.
 5. For Text, leave **Match case** off to ignore ASCII letter case, or turn it
    on for exact case ordering. This option applies only to Text.
 6. Review the temporary-disk allowance, then click **Sort**.
+
+The summary identifies the selected column by number and name. Hover a truncated
+summary to read it in full. Expand **Details** for the selected mode's value
+interpretation and ordering rules. The temporary-disk allowance stays above the
+footer while the options scroll. **Cancel** closes the dialog without starting
+a sort.
 
 Character count and Word count require valid UTF-8 in the selected column.
 Invalid text stops the operation with the data row and column identified.
@@ -445,9 +470,14 @@ Click **Columns…** to change the view without changing the CSV structure:
 
 - Use **Search columns** to find a column by name or original number.
 - Uncheck a column to hide it, or check it to show it.
-- Click and drag a column row to change its displayed position.
-- Click **Reset columns** to restore the default visibility and order.
-- Click **Done** to close the window.
+- Drag a column row using its handle or name to change its displayed position.
+- Click **Reset** to restore the default visibility and order.
+- Click **Done** or **Close**, or press **Esc**, to close the window.
+
+The movable window keeps the search and footer actions visible while the
+column list scrolls. Each row aligns its checkbox, original column number,
+and name, including long names. Hover a truncated name to read it in full.
+Closing preserves the search text and the current view settings.
 
 These choices are view-only. They do not create an unsaved file change, and
 they do not alter the order written by Save. Original file-column numbers stay
