@@ -1,0 +1,52 @@
+name: Bug or beta feedback
+description: Report a reproducible problem with Quarry.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Quarry. Issues are public. Use synthetic examples and redact private paths, screenshots, and logs. Do not upload production CSVs, personal data, credentials, or confidential files.
+  - type: input
+    id: build
+    attributes:
+      label: Quarry version and revision
+      description: Include the version and Git revision from your build or bundle verification, if known.
+      placeholder: Version, commit, source build or local app bundle
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and hardware
+      description: Include OS version and architecture. For performance reports, include RAM and available disk space.
+      placeholder: macOS version, Apple Silicon or Intel; or Linux distribution/Windows version for source builds
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the menu or tool used, settings, and whether indexing or another operation was running.
+      placeholder: |
+        1. Open a synthetic file...
+        2. Choose...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual behavior
+      description: Describe what should happen, what happened, and whether the source file or unsaved work changed unexpectedly.
+    validations:
+      required: true
+  - type: textarea
+    id: file_shape
+    attributes:
+      label: File characteristics
+      description: No original CSV is required. Give approximate bytes, rows/columns, delimiter, header mode, encoding if known, and relevant quoting or newline details. Add only a small synthetic example if useful.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Additional evidence
+      description: Optional redacted error text or screenshots. For performance issues, include elapsed time and the visible operation phase. Do not paste private data.

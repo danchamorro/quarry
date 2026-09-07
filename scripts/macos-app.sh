@@ -34,7 +34,7 @@ fail() {
 require_macos() {
     [[ "$(uname -s)" == "Darwin" ]] || fail "macOS packaging must run on macOS."
     [[ -x "$LSREGISTER" ]] || fail "LaunchServices registration tool is unavailable."
-    for command in cargo codesign git lipo lockf plutil rustc sips unzip; do
+    for command in cargo codesign git lipo lockf plutil python3 rustc sips unzip; do
         command -v "$command" >/dev/null || fail "required command is unavailable: $command"
     done
 }
@@ -84,6 +84,7 @@ verify_app() {
     local plist="$app/Contents/Info.plist"
 
     verify_app_identity "$app" || return 1
+    verify_app_licenses "$app" || return 1
     [[ "$(plist_value CFBundleDocumentTypes.0.CFBundleTypeRole "$plist")" == Editor ]] || {
         printf 'error: CSV editor role is missing from %s\n' "$app" >&2
         return 1
@@ -92,6 +93,18 @@ verify_app() {
         printf 'error: CSV document support is missing from %s\n' "$app" >&2
         return 1
     }
+}
+
+verify_app_licenses() {
+    local app="$1"
+    local notice
+
+    for notice in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html; do
+        [[ -s "$app/Contents/Resources/Licenses/$notice" ]] || {
+            printf 'error: license notice is missing or empty: %s\n' "$notice" >&2
+            return 1
+        }
+    done
 }
 
 register_app() {
@@ -185,6 +198,7 @@ package_app() {
     [[ -z "$source_changes" ]] || source_status=dirty
     host_target="$(rustc -vV | /usr/bin/sed -n 's/^host: //p')"
     [[ -n "$host_target" ]] || fail "could not determine the native Rust target."
+    "$ROOT/scripts/generate-notices.sh" --check --target "$host_target"
     (
         cd "$ROOT"
         cargo build --release --locked --target "$host_target" --target-dir "$ROOT/target" -p quarry-egui
@@ -204,6 +218,9 @@ package_app() {
     plist="$app/Contents/Info.plist"
 
     /bin/mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+    /bin/mkdir -p "$app/Contents/Resources/Licenses"
+    /bin/cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" \
+        "$ROOT/packaging/licenses/THIRD_PARTY_NOTICES.html" "$app/Contents/Resources/Licenses/"
     /usr/bin/install -m 0755 "$binary" "$app/Contents/MacOS/$EXECUTABLE"
     /bin/cp "$PLIST_TEMPLATE" "$plist"
     /usr/bin/plutil -replace CFBundleShortVersionString -string "$version" "$plist"
@@ -355,6 +372,30 @@ self_test_rollback() {
     printf 'Rollback self-test passed.\n'
 }
 
+self_test_licenses() {
+    local test_root notice
+
+    test_root="$(mktemp -d /private/tmp/quarry-license-test.XXXXXX)"
+    /bin/mkdir -p "$test_root/Contents/Resources/Licenses"
+    for notice in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html; do
+        printf 'test notice\n' > "$test_root/Contents/Resources/Licenses/$notice"
+    done
+    verify_app_licenses "$test_root" || fail "complete license notices were rejected."
+    for notice in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html; do
+        : > "$test_root/Contents/Resources/Licenses/$notice"
+        if verify_app_licenses "$test_root" 2>/dev/null; then
+            fail "empty license notice was accepted: $notice"
+        fi
+        /bin/rm "$test_root/Contents/Resources/Licenses/$notice"
+        if verify_app_licenses "$test_root" 2>/dev/null; then
+            fail "missing license notice was accepted: $notice"
+        fi
+        printf 'test notice\n' > "$test_root/Contents/Resources/Licenses/$notice"
+    done
+    /bin/rm -rf "$test_root"
+    printf 'License notice self-test passed.\n'
+}
+
 usage() {
     printf 'Usage: %s package|install|verify [app-path] | self-test\n' "$0"
 }
@@ -384,6 +425,8 @@ case "${1:-package}" in
     self-test)
         [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
         self_test_rollback
+        self_test_licenses
+        python3 "$ROOT/packaging/licenses/test_generate.py"
         ;;
     *)
         usage >&2

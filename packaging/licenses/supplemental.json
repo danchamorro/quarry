@@ -1,0 +1,169 @@
+{
+  "notices": [
+    {
+      "packages": [
+        "accesskit@0.21.1"
+      ],
+      "source": "https://raw.githubusercontent.com/AccessKit/accesskit/0b6901a8c8e6fb1cb5a2dc7c19dc7bee1cc5ad09/LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+      "text": "Permission is hereby granted, free of charge, to any\nperson obtaining a copy of this software and associated\ndocumentation files (the \"Software\"), to deal in the\nSoftware without restriction, including without\nlimitation the rights to use, copy, modify, merge,\npublish, distribute, sublicense, and/or sell copies of\nthe Software, and to permit persons to whom the Software\nis furnished to do so, subject to the following\nconditions:\n\nThe above copyright notice and this permission notice\nshall be included in all copies or substantial portions\nof the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF\nANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED\nTO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A\nPARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT\nSHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY\nCLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\nOF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR\nIN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER\nDEALINGS IN THE SOFTWARE.\n"
+    },
+    {
+      "packages": [
+        "accesskit_consumer@0.31.0",
+        "accesskit_macos@0.22.2"
+      ],
+      "source": "https://raw.githubusercontent.com/AccessKit/accesskit/5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3/LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+      "text": "Permission is hereby granted, free of charge, to any\nperson obtaining a copy of this software and associated\ndocumentation files (the \"Software\"), to deal in the\nSoftware without restriction, including without\nlimitation the rights to use, copy, modify, merge,\npublish, distribute, sublicense, and/or sell copies of\nthe Software, and to permit persons to whom the Software\nis furnished to do so, subject to the following\nconditions:\n\nThe above copyright notice and this permission notice\nshall be included in all copies or substantial portions\nof the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF\nANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED\nTO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A\nPARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT\nSHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY\nCLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\nOF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR\nIN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER\nDEALINGS IN THE SOFTWARE.\n"
+    },
+    {
+      "packages": [
+        "block2@0.6.2"
+      ],
+      "source": "https://raw.githubusercontent.com/madsmtm/objc2/b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md",
+      "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+      "text": "# License\n\nThe licensing of these crates is a bit complicated:\n- The crates `objc2`, `block2`, `objc2-foundation` and `objc2-encode` are\n  [currently][#23] licensed under [the MIT license][MIT].\n- All other crates are trio-licensed under the [Zlib], [Apache-2.0] or [MIT]\n  license, at your option.\n\nFurthermore, the crates are (usually automatically) derived from Apple SDKs,\nand that may have implications for licensing, see below for details.\n\n[#23]: https://github.com/madsmtm/objc2/issues/23\n[MIT]: https://opensource.org/license/MIT\n[Zlib]: https://zlib.net/zlib_license.html\n[Apache-2.0]: https://www.apache.org/licenses/LICENSE-2.0\n\n\n## Apple SDKs\n\nThese crates are derived from Apple SDKs shipped with Xcode. You can obtain a\ncopy of the Xcode license at:\n\nhttps://www.apple.com/legal/sla/docs/xcode.pdf\n\nOr by typing `xcodebuild -license` in your terminal.\n\nFrom reading the license, it is unclear whether distributing derived works\nsuch as these crates are allowed?\n\nBut in any case, to practically use these crates, you will have to link, and\nthat only works when you have the correct Xcode SDK available to provide the\nrequired `.tbd` files, which is why we choose to still use the normal SPDX\nidentifiers in the crates (Xcode is required to use the crates, and when using\nXcode you have already agreed to the Xcode license).\n"
+    },
+    {
+      "packages": [
+        "dispatch2@0.3.1",
+        "objc2@0.6.4"
+      ],
+      "source": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md",
+      "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+      "text": "# License\n\nThe licensing of these crates is a bit complicated:\n- The crates `objc2`, `block2`, `objc2-foundation` and `objc2-encode` are\n  [currently][#23] licensed under [the MIT license][MIT].\n- All other crates are trio-licensed under the [Zlib], [Apache-2.0] or [MIT]\n  license, at your option.\n\nFurthermore, the crates are (usually automatically) derived from Apple SDKs,\nand that may have implications for licensing, see below for details.\n\n[#23]: https://github.com/madsmtm/objc2/issues/23\n[MIT]: https://opensource.org/license/MIT\n[Zlib]: https://zlib.net/zlib_license.html\n[Apache-2.0]: https://www.apache.org/licenses/LICENSE-2.0\n\n\n## Apple SDKs\n\nThese crates are derived from Apple SDKs shipped with Xcode. You can obtain a\ncopy of the Xcode license at:\n\nhttps://www.apple.com/legal/sla/docs/xcode.pdf\n\nOr by typing `xcodebuild -license` in your terminal.\n\nFrom reading the license, it is unclear whether distributing derived works\nsuch as these crates are allowed?\n\nBut in any case, to practically use these crates, you will have to link, and\nthat only works when you have the correct Xcode SDK available to provide the\nrequired `.tbd` files, which is why we choose to still use the normal SPDX\nidentifiers in the crates (Xcode is required to use the crates, and when using\nXcode you have already agreed to the Xcode license).\n"
+    },
+    {
+      "packages": [
+        "ecolor@0.33.3",
+        "eframe@0.33.3",
+        "egui@0.33.3",
+        "egui-winit@0.33.3",
+        "egui_extras@0.33.3",
+        "egui_glow@0.33.3",
+        "emath@0.33.3",
+        "epaint@0.33.3"
+      ],
+      "source": "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/LICENSE-MIT",
+      "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c",
+      "text": "Copyright (c) 2018-2021 Emil Ernerfeldt <emil.ernerfeldt@gmail.com>\n\nPermission is hereby granted, free of charge, to any\nperson obtaining a copy of this software and associated\ndocumentation files (the \"Software\"), to deal in the\nSoftware without restriction, including without\nlimitation the rights to use, copy, modify, merge,\npublish, distribute, sublicense, and/or sell copies of\nthe Software, and to permit persons to whom the Software\nis furnished to do so, subject to the following\nconditions:\n\nThe above copyright notice and this permission notice\nshall be included in all copies or substantial portions\nof the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF\nANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED\nTO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A\nPARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT\nSHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY\nCLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\nOF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR\nIN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER\nDEALINGS IN THE SOFTWARE.\n"
+    },
+    {
+      "packages": [
+        "objc2-app-kit@0.3.2",
+        "objc2-core-foundation@0.3.2",
+        "objc2-core-graphics@0.3.2",
+        "objc2-foundation@0.3.2"
+      ],
+      "source": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+      "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+      "text": "# License\n\nThe licensing of these crates is a bit complicated:\n- The crates `objc2`, `block2`, `objc2-foundation` and `objc2-encode` are\n  [currently][#23] licensed under [the MIT license][MIT].\n- All other crates are trio-licensed under the [Zlib], [Apache-2.0] or [MIT]\n  license, at your option.\n\nFurthermore, the crates are (usually automatically) derived from Apple SDKs,\nand that may have implications for licensing, see below for details.\n\n[#23]: https://github.com/madsmtm/objc2/issues/23\n[MIT]: https://opensource.org/license/MIT\n[Zlib]: https://zlib.net/zlib_license.html\n[Apache-2.0]: https://www.apache.org/licenses/LICENSE-2.0\n\n\n## Apple SDKs\n\nThese crates are derived from Apple SDKs shipped with Xcode. You can obtain a\ncopy of the Xcode license at:\n\nhttps://www.apple.com/legal/sla/docs/xcode.pdf\n\nOr by typing `xcodebuild -license` in your terminal.\n\nFrom reading the license, it is unclear whether distributing derived works\nsuch as these crates are allowed?\n\nBut in any case, to practically use these crates, you will have to link, and\nthat only works when you have the correct Xcode SDK available to provide the\nrequired `.tbd` files, which is why we choose to still use the normal SPDX\nidentifiers in the crates (Xcode is required to use the crates, and when using\nXcode you have already agreed to the Xcode license).\n"
+    },
+    {
+      "packages": [
+        "objc2-encode@4.1.0"
+      ],
+      "source": "https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md",
+      "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+      "text": "# License\n\nThe licensing of these crates is a bit complicated:\n- The crates `objc2`, `block2`, `objc2-foundation` and `objc2-encode` are\n  [currently][#23] licensed under [the MIT license][MIT].\n- All other crates are trio-licensed under the [Zlib], [Apache-2.0] or [MIT]\n  license, at your option.\n\nFurthermore, the crates are (usually automatically) derived from Apple SDKs,\nand that may have implications for licensing, see below for details.\n\n[#23]: https://github.com/madsmtm/objc2/issues/23\n[MIT]: https://opensource.org/license/MIT\n[Zlib]: https://zlib.net/zlib_license.html\n[Apache-2.0]: https://www.apache.org/licenses/LICENSE-2.0\n\n\n## Apple SDKs\n\nThese crates are derived from Apple SDKs shipped with Xcode. You can obtain a\ncopy of the Xcode license at:\n\nhttps://www.apple.com/legal/sla/docs/xcode.pdf\n\nOr by typing `xcodebuild -license` in your terminal.\n\nFrom reading the license, it is unclear whether distributing derived works\nsuch as these crates are allowed?\n\nBut in any case, to practically use these crates, you will have to link, and\nthat only works when you have the correct Xcode SDK available to provide the\nrequired `.tbd` files, which is why we choose to still use the normal SPDX\nidentifiers in the crates (Xcode is required to use the crates, and when using\nXcode you have already agreed to the Xcode license).\n"
+    },
+    {
+      "packages": [
+        "profiling@1.0.18"
+      ],
+      "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+      "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333",
+      "text": "MIT License\n\nCopyright (c) 2020 Philip Degarmo and other contributors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
+    },
+    {
+      "packages": [
+        "epaint_default_fonts@0.33.3"
+      ],
+      "source": "epaint_default_fonts@0.33.3/fonts/Hack-Regular.txt",
+      "crate_file": "fonts/Hack-Regular.txt",
+      "sha256": "47c0cccbeec7e8614548cc485588b28149e7874188df5f41b36efebcee285c87",
+      "text": "The work in the Hack project is Copyright 2018 Source Foundry Authors and licensed under the MIT License\n\nThe work in the DejaVu project was committed to the public domain.\n\nBitstream Vera Sans Mono Copyright 2003 Bitstream Inc. and licensed under the Bitstream Vera License with Reserved Font Names \"Bitstream\" and \"Vera\"\nMIT License\n\nCopyright (c) 2018 Source Foundry Authors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\nBITSTREAM VERA LICENSE\n\nCopyright (c) 2003 by Bitstream, Inc. All Rights Reserved. Bitstream Vera is a trademark of Bitstream, Inc.\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of the fonts accompanying this license (\"Fonts\") and associated documentation files (the \"Font Software\"), to reproduce and distribute the Font Software, including without limitation the rights to use, copy, merge, publish, distribute, and/or sell copies of the Font Software, and to permit persons to whom the Font Software is furnished to do so, subject to the following conditions:\n\nThe above copyright and trademark notices and this permission notice shall be included in all copies of one or more of the Font Software typefaces.\n\nThe Font Software may be modified, altered, or added to, and in particular the designs of glyphs or characters in the Fonts may be modified and additional glyphs or characters may be added to the Fonts, only if the fonts are renamed to names not containing either the words \"Bitstream\" or the word \"Vera\".\n\nThis License becomes null and void to the extent applicable to Fonts or Font Software that has been modified and is distributed under the \"Bitstream Vera\" names.\n\nThe Font Software may be sold as part of a larger software package but no copy of one or more of the Font Software typefaces may be sold by itself.\n\nTHE FONT SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL BITSTREAM OR THE GNOME FOUNDATION BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.\n\nExcept as contained in this notice, the names of Gnome, the Gnome Foundation, and Bitstream Inc., shall not be used in advertising or otherwise to promote the sale, use or other dealings in this Font Software without prior written authorization from the Gnome Foundation or Bitstream Inc., respectively. For further information, contact: fonts at gnome dot org.\n"
+    },
+    {
+      "packages": [
+        "epaint_default_fonts@0.33.3"
+      ],
+      "source": "epaint_default_fonts@0.33.3/fonts/emoji-icon-font-mit-license.txt",
+      "crate_file": "fonts/emoji-icon-font-mit-license.txt",
+      "sha256": "b9d2c1d909aa149996fd4c91dcb92b2362a04431640c1d200959da94caf8cde1",
+      "text": "MIT License\n\nCopyright (c) 2014 John Slegers\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n"
+    },
+    {
+      "packages": [
+        "epaint_default_fonts@0.33.3"
+      ],
+      "source": "epaint_default_fonts@0.33.3/fonts/OFL.txt",
+      "crate_file": "fonts/OFL.txt",
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+      "text": "This Font Software is licensed under the SIL Open Font License,\nVersion 1.1.\n\nThis license is copied below, and is also available with a FAQ at:\nhttp://scripts.sil.org/OFL\n\n-----------------------------------------------------------\nSIL OPEN FONT LICENSE Version 1.1 - 26 February 2007\n-----------------------------------------------------------\n\nPREAMBLE\nThe goals of the Open Font License (OFL) are to stimulate worldwide\ndevelopment of collaborative font projects, to support the font\ncreation efforts of academic and linguistic communities, and to\nprovide a free and open framework in which fonts may be shared and\nimproved in partnership with others.\n\nThe OFL allows the licensed fonts to be used, studied, modified and\nredistributed freely as long as they are not sold by themselves. The\nfonts, including any derivative works, can be bundled, embedded,\nredistributed and/or sold with any software provided that any reserved\nnames are not used by derivative works. The fonts and derivatives,\nhowever, cannot be released under any other type of license. The\nrequirement for fonts to remain under this license does not apply to\nany document created using the fonts or their derivatives.\n\nDEFINITIONS\n\"Font Software\" refers to the set of files released by the Copyright\nHolder(s) under this license and clearly marked as such. This may\ninclude source files, build scripts and documentation.\n\n\"Reserved Font Name\" refers to any names specified as such after the\ncopyright statement(s).\n\n\"Original Version\" refers to the collection of Font Software\ncomponents as distributed by the Copyright Holder(s).\n\n\"Modified Version\" refers to any derivative made by adding to,\ndeleting, or substituting -- in part or in whole -- any of the\ncomponents of the Original Version, by changing formats or by porting\nthe Font Software to a new environment.\n\n\"Author\" refers to any designer, engineer, programmer, technical\nwriter or other person who contributed to the Font Software.\n\nPERMISSION & CONDITIONS\nPermission is hereby granted, free of charge, to any person obtaining\na copy of the Font Software, to use, study, copy, merge, embed,\nmodify, redistribute, and sell modified and unmodified copies of the\nFont Software, subject to the following conditions:\n\n1) Neither the Font Software nor any of its individual components, in\nOriginal or Modified Versions, may be sold by itself.\n\n2) Original or Modified Versions of the Font Software may be bundled,\nredistributed and/or sold with any software, provided that each copy\ncontains the above copyright notice and this license. These can be\nincluded either as stand-alone text files, human-readable headers or\nin the appropriate machine-readable metadata fields within text or\nbinary files as long as those fields can be easily viewed by the user.\n\n3) No Modified Version of the Font Software may use the Reserved Font\nName(s) unless explicit written permission is granted by the\ncorresponding Copyright Holder. This restriction only applies to the\nprimary font name as presented to the users.\n\n4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font\nSoftware shall not be used to promote, endorse or advertise any\nModified Version, except to acknowledge the contribution(s) of the\nCopyright Holder(s) and the Author(s) or with their explicit written\npermission.\n\n5) The Font Software, modified or unmodified, in part or in whole,\nmust be distributed entirely under this license, and must not be\ndistributed under any other license. The requirement for fonts to\nremain under this license does not apply to any document created using\nthe Font Software.\n\nTERMINATION\nThis license becomes null and void if any of the above conditions are\nnot met.\n\nDISCLAIMER\nTHE FONT SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\nEXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF\nMERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT\nOF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE\nCOPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,\nINCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL\nDAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING\nFROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM\nOTHER DEALINGS IN THE FONT SOFTWARE.\n"
+    },
+    {
+      "packages": [
+        "epaint_default_fonts@0.33.3"
+      ],
+      "source": "epaint_default_fonts@0.33.3/fonts/UFL.txt",
+      "crate_file": "fonts/UFL.txt",
+      "sha256": "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002",
+      "text": "-------------------------------\nUBUNTU FONT LICENCE Version 1.0\n-------------------------------\n\nPREAMBLE\nThis licence allows the licensed fonts to be used, studied, modified and\nredistributed freely. The fonts, including any derivative works, can be\nbundled, embedded, and redistributed provided the terms of this licence\nare met. The fonts and derivatives, however, cannot be released under\nany other licence. The requirement for fonts to remain under this\nlicence does not require any document created using the fonts or their\nderivatives to be published under this licence, as long as the primary\npurpose of the document is not to be a vehicle for the distribution of\nthe fonts.\n\nDEFINITIONS\n\"Font Software\" refers to the set of files released by the Copyright\nHolder(s) under this licence and clearly marked as such. This may\ninclude source files, build scripts and documentation.\n\n\"Original Version\" refers to the collection of Font Software components\nas received under this licence.\n\n\"Modified Version\" refers to any derivative made by adding to, deleting,\nor substituting -- in part or in whole -- any of the components of the\nOriginal Version, by changing formats or by porting the Font Software to\na new environment.\n\n\"Copyright Holder(s)\" refers to all individuals and companies who have a\ncopyright ownership of the Font Software.\n\n\"Substantially Changed\" refers to Modified Versions which can be easily\nidentified as dissimilar to the Font Software by users of the Font\nSoftware comparing the Original Version with the Modified Version.\n\nTo \"Propagate\" a work means to do anything with it that, without\npermission, would make you directly or secondarily liable for\ninfringement under applicable copyright law, except executing it on a\ncomputer or modifying a private copy. Propagation includes copying,\ndistribution (with or without modification and with or without charging\na redistribution fee), making available to the public, and in some\ncountries other activities as well.\n\nPERMISSION & CONDITIONS\nThis licence does not grant any rights under trademark law and all such\nrights are reserved.\n\nPermission is hereby granted, free of charge, to any person obtaining a\ncopy of the Font Software, to propagate the Font Software, subject to\nthe below conditions:\n\n1) Each copy of the Font Software must contain the above copyright\nnotice and this licence. These can be included either as stand-alone\ntext files, human-readable headers or in the appropriate machine-\nreadable metadata fields within text or binary files as long as those\nfields can be easily viewed by the user.\n\n2) The font name complies with the following:\n(a) The Original Version must retain its name, unmodified.\n(b) Modified Versions which are Substantially Changed must be renamed to\navoid use of the name of the Original Version or similar names entirely.\n(c) Modified Versions which are not Substantially Changed must be\nrenamed to both (i) retain the name of the Original Version and (ii) add\nadditional naming elements to distinguish the Modified Version from the\nOriginal Version. The name of such Modified Versions must be the name of\nthe Original Version, with \"derivative X\" where X represents the name of\nthe new work, appended to that name.\n\n3) The name(s) of the Copyright Holder(s) and any contributor to the\nFont Software shall not be used to promote, endorse or advertise any\nModified Version, except (i) as required by this licence, (ii) to\nacknowledge the contribution(s) of the Copyright Holder(s) or (iii) with\ntheir explicit written permission.\n\n4) The Font Software, modified or unmodified, in part or in whole, must\nbe distributed entirely under this licence, and must not be distributed\nunder any other licence. The requirement for fonts to remain under this\nlicence does not affect any document created using the Font Software,\nexcept any version of the Font Software extracted from a document\ncreated using the Font Software may only be distributed under this\nlicence.\n\nTERMINATION\nThis licence becomes null and void if any of the above conditions are\nnot met.\n\nDISCLAIMER\nTHE FONT SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\nEXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF\nMERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF\nCOPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE\nCOPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,\nINCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL\nDAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING\nFROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER\nDEALINGS IN THE FONT SOFTWARE.\n"
+    },
+    {
+      "packages": [
+        "dpi@0.1.2"
+      ],
+      "source": "dpi@0.1.2/LICENSE-LIBM-MIT",
+      "crate_file": "LICENSE-LIBM-MIT",
+      "sha256": "9eff396a99bafd208e7126602420d6864f6066c08b84485a5b032320a9c01997",
+      "text": "rust-lang/libm as a whole is available for use under the MIT license:\n\n------------------------------------------------------------------------------\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n------------------------------------------------------------------------------\n\nThis Rust library contains the following copyrights:\n\n    Copyright (c) 2018 Jorge Aparicio\n\nPortions of this software are derived from third-party works licensed under\nterms compatible with the above MIT license:\n\n* musl libc https://www.musl-libc.org/. This library contains the following\n  copyright:\n\n      Copyright © 2005-2020 Rich Felker, et al.\n\n* The CORE-MATH project https://core-math.gitlabpages.inria.fr/. CORE-MATH\n  routines are available under the MIT license on a per-file basis.\n\nThe musl libc COPYRIGHT file also includes the following notice relevant to\nmath portions of the library:\n\n------------------------------------------------------------------------------\nMuch of the math library code (src/math/* and src/complex/*) is\nCopyright © 1993,2004 Sun Microsystems or\nCopyright © 2003-2011 David Schultz or\nCopyright © 2003-2009 Steven G. Kargl or\nCopyright © 2003-2009 Bruce D. Evans or\nCopyright © 2008 Stephen L. Moshier or\nCopyright © 2017-2018 Arm Limited\nand labelled as such in comments in the individual source files. All\nhave been licensed under extremely permissive terms.\n------------------------------------------------------------------------------\n"
+    },
+    {
+      "packages": [
+        "rustix@1.1.4"
+      ],
+      "source": "rustix@1.1.4/COPYRIGHT",
+      "crate_file": "COPYRIGHT",
+      "sha256": "377c2e7c53250cc5905c0b0532d35973392af16ffb9596a41d99d202cf3617c9",
+      "text": "Short version for non-lawyers:\n\n`rustix` is triple-licensed under Apache 2.0 with the LLVM Exception,\nApache 2.0, and MIT terms.\n\n\nLonger version:\n\nCopyrights in the `rustix` project are retained by their contributors.\nNo copyright assignment is required to contribute to the `rustix`\nproject.\n\nSome files include code derived from Rust's `libstd`; see the comments in\nthe code for details.\n\nExcept as otherwise noted (below and/or in individual files), `rustix`\nis licensed under:\n\n - the Apache License, Version 2.0, with the LLVM Exception\n   <LICENSE-Apache-2.0_WITH_LLVM-exception> or\n   <http://llvm.org/foundation/relicensing/LICENSE.txt>\n - the Apache License, Version 2.0\n   <LICENSE-APACHE> or\n   <http://www.apache.org/licenses/LICENSE-2.0>,\n - or the MIT license\n   <LICENSE-MIT> or\n   <http://opensource.org/licenses/MIT>,\n\nat your option.\n"
+    },
+    {
+      "packages": [
+        "unicode-segmentation@1.13.3"
+      ],
+      "source": "unicode-segmentation@1.13.3/COPYRIGHT",
+      "crate_file": "COPYRIGHT",
+      "sha256": "23860c2a7b5d96b21569afedf033469bab9fe14a1b24a35068b8641c578ce24d",
+      "text": "Licensed under the Apache License, Version 2.0\n<LICENSE-APACHE or\nhttp://www.apache.org/licenses/LICENSE-2.0> or the MIT\nlicense <LICENSE-MIT or http://opensource.org/licenses/MIT>,\nat your option. All files in the project carrying such\nnotice may not be copied, modified, or distributed except\naccording to those terms.\n"
+    }
+  ],
+  "assets": [
+    {
+      "package": "epaint_default_fonts@0.33.3",
+      "path": "fonts/Hack-Regular.ttf",
+      "sha256": "15f55cc0c85a2988d2b4b3a8cdb5d77fdfbaf319e1bb5309d725db9818fb7125",
+      "bytes": 309408
+    },
+    {
+      "package": "epaint_default_fonts@0.33.3",
+      "path": "fonts/NotoEmoji-Regular.ttf",
+      "sha256": "415dc6290378574135b64c808dc640c1df7531973290c4970c51fdeb849cb0c5",
+      "bytes": 418804
+    },
+    {
+      "package": "epaint_default_fonts@0.33.3",
+      "path": "fonts/Ubuntu-Light.ttf",
+      "sha256": "80307b8da7649aa4ee4d484b232140e3ce1ec0ca093073d3c53c8f5a5ced7a70",
+      "bytes": 361676
+    },
+    {
+      "package": "epaint_default_fonts@0.33.3",
+      "path": "fonts/emoji-icon-font.ttf",
+      "sha256": "3a706840d2f888b83c184f7d41900dbaa0151a806c4d130cc88539d53fedef0a",
+      "bytes": 317864
+    }
+  ]
+}

@@ -20,3 +20,11 @@ jobs:
       - run: cargo build --workspace --release --locked
       - run: ./scripts/macos-app.sh self-test
       - run: ./scripts/macos-app.sh package
+
+  linux-core-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
+      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
