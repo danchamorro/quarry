@@ -36,6 +36,9 @@ If Quarry is not installed, follow [Install Quarry](../README.md#install-quarry)
 in the README. The [macOS packaging guide](MACOS_PACKAGING.md) covers updates,
 rollback, and package-only builds.
 
+For prerelease testing, see the [beta checklist](BETA_RELEASE_CHECKLIST.md) for
+platform status, the acceptance workflow, current limits, and the feedback form.
+
 ### 2. Open a file
 
 Quarry supports comma, tab, pipe, and semicolon-delimited files. Open a file in

@@ -50,7 +50,15 @@ final Save, source preservation, and working-file cleanup. Owner review remains
 pending in the checklist. Completed alpha phases below retain their existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.
 
-## Current progress: 2026-09-06
+The dialog polish follow-up merged in
+[PR #40](https://github.com/danchamorro/quarry/pull/40) as `69d5f15`; its clean
+installed build passed native checks. Filters, Columns, Sort, and duplicate
+review use the existing egui framework. The next milestone is
+[beta release preparation](BETA_RELEASE_CHECKLIST.md), with explicit supported
+platforms, candidate validation, license notices, signing, notarization, and
+owner acceptance. A public beta has not been released.
+
+## Current progress: 2026-09-07
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -483,13 +491,38 @@ document without loading the file into memory or changing the source before
 Save. The [release validation](benchmarks/2026-09-04-delete-selected-rows.md)
 records complete 1 GB and 12 GB runs below 4 MiB peak RSS.
 
+## Post-beta sequence
+
+The next feature milestones are ordered below. They are planned work, not
+requirements for the first beta, and each needs its own bounded-memory and
+source-preservation validation before completion.
+
+1. **Append CSV files.** Add rows from compatible delimited files to one working
+   document, with explicit column/header compatibility, progress, cancellation,
+   and Save/Undo behavior. Appending stacks rows; key-based joins that match
+   records and combine fields are a separate feature.
+2. **Document tabs.** Switch among independent open documents while preserving
+   each document's edits, jobs, and save state. Tabs do not imply simultaneous
+   side-by-side panes, comparison, or synchronized scrolling.
+3. **Terminal frontend.** Build a TUI alongside the desktop app on the same
+   engine. Scope keyboard and mouse interaction, editing, filtering, structural
+   operations, cancellation, and history explicitly. The existing benchmark CLI
+   is not a full terminal editor.
+
+Linux is the priority for platform expansion, followed by the remaining
+platform work. Core/CLI validation can proceed independently of desktop or TUI
+delivery. The [beta platform matrix](BETA_RELEASE_CHECKLIST.md#platform-matrix)
+tracks what has actually been validated. Windows remains planned; no desktop
+support is implied by a portable engine or a source-build check.
+
 ## Later possibilities
 Persistent indexes and invalidation, broader encoding and malformed-data UX,
 date/locale-aware and multi-column sorting, controlled cold-cache
-performance dashboards, Developer ID signing and notarization for distribution,
-cross-platform front ends, plugin/API surface, schema inference, SQL-like
-querying, compressed files, CLI recipes, multi-file operations, and row
-insertion.
+performance dashboards, plugin/API surface, schema inference, SQL-like
+querying, compressed files, CLI recipes, key-based joins, side-by-side document
+views, and row insertion. Developer ID signing and notarization are tracked as
+release gates in the [beta checklist](BETA_RELEASE_CHECKLIST.md), rather than
+optional feature work.
 
 ## Performance ladder
 1. 1 GB — development baseline

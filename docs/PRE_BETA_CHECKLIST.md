@@ -168,14 +168,17 @@ Save As checkpoint until explicit Save. Private working files were cleaned up.
 
 Finishing this checklist means the priority product work is complete. A public
 download still needs release preparation, including supported-system testing,
-Developer ID signing, notarization, and license notices. Track packaging work
-through the [macOS packaging guide](MACOS_PACKAGING.md).
+Developer ID signing, notarization, and license notices. Track the remaining
+gates and final owner acceptance in the [beta release checklist](BETA_RELEASE_CHECKLIST.md),
+with packaging procedures in the [macOS packaging guide](MACOS_PACKAGING.md).
 
 ## Interface polish follow-up
 
-The four functional priorities above remain complete. Interface polish uses the
-existing egui desktop on `codex/filter-dialog-polish`. Columns and Filters remain
-movable tool windows; Sort and Find Duplicates remain modal dialogs. The shared
+The four functional priorities above remain complete. Interface polish merged
+in [PR #40](https://github.com/danchamorro/quarry/pull/40) as `69d5f15` using the
+existing egui desktop. The clean merged build was installed and verified with
+native checks. Columns and Filters remain movable tool windows; Sort and Find
+Duplicates remain modal dialogs. The shared
 visual treatment uses consistent spacing, neutral surfaces, clear headers and
 footer actions, and the existing accent color for primary actions.
 
@@ -186,8 +189,9 @@ details. Closing the tool window preserves draft rules and the active filter.
 - [x] Validate the redesigned Filters window in the native app. Checked name
   and source-number search, adjacent range bounds, Tab navigation, numeric
   filtering and Clear, menu dismissal, contrast, and moving the window.
-- [x] Pass formatting, workspace Clippy, all 294 workspace tests, the release
-  build, and local bundle validation. Interaction regressions cover multiline
+- [x] Pass the initial Filters checks: formatting, workspace Clippy, all 294
+  workspace tests, the release build, and local bundle validation. Interaction
+  regressions cover multiline
   values, hidden/reordered source columns beyond 64, Escape and draft
   preservation, picker height after searching and reopening, and footer bounds
   at 860 by 540 with active and blocked states.

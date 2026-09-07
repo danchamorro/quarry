@@ -1,0 +1,22 @@
+{
+  "artifact_sha256": "e4db8e990d4eead07ec724e58221dcad997260f8e3b806b59b661fafadb5ee43",
+  "cargo_about_version": "0.9.2",
+  "inputs": {
+    "Cargo.lock": "1db53032b5cff52baf788f8c05590a715707226342651c8b48f88c3e669564d4",
+    "Cargo.toml": "cd1ceb8c8d62aa94156224342ef530180387d0b0024013330662f6ca0bea9f57",
+    "LICENSE-APACHE": "e7092afa91dcebd506f0f1174ab4ab938df63f906df74df2aa2e1ea66e7e0f52",
+    "LICENSE-MIT": "3641f379cac8e0f6903292982d0617f3cb6193271fdf74b06f2e01f25e23d70f",
+    "apps/quarry-appkit/Cargo.toml": "9a123247711d0e7f97da51fae0bb44d1be9bd33b183b980558eb57c89dbd418c",
+    "apps/quarry-cli/Cargo.toml": "8ff3fef2627aae02fef6fd6d6c4911c20688d1107b7fc738a781117c5dc38336",
+    "apps/quarry-egui/Cargo.toml": "e176d5db92692bd1b572b4ae8e2306b95065f164140eebe460859b4b22e55558",
+    "crates/quarry-core/Cargo.toml": "632f8c8855a32f9c7dce1dabd01b3dcf0451ab22bb3d42cd429fab83512c5301",
+    "crates/quarry-delimited/Cargo.toml": "b0a79530d15e05119b569db3fbb163ae8e087914c011cd643a18527b50b8bf38",
+    "packaging/licenses/AUDIT.md": "cf2429181c80ed7f0fb1abfd3f83cc4291ab9693cfb393ef5cefa6363c2b6912",
+    "packaging/licenses/about.toml": "5f923b487f7189351ecbcc97c27bef86df4abfcb2c65cda7ca4acc61f040df68",
+    "packaging/licenses/generate.py": "4ec6b576b63b4bc48eac47e904ddd743b8f5d81de6bc136310f80c4f55cd7c8f",
+    "packaging/licenses/supplemental.json": "a5a5c0921709c90b6718680d7f7d1b53909d5311c9178e7cbce052a06218e6e7",
+    "scripts/generate-notices.sh": "88eba763ed0172649e8bd4a6c8ab828929acc80095027eff89983acd76395028"
+  },
+  "status": "draft-unresolved",
+  "target": "aarch64-apple-darwin"
+}

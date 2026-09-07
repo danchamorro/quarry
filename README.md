@@ -18,6 +18,8 @@ working memory bounded and does not change the source until you choose
 
 > **Current status:** installable macOS alpha. Core viewing, editing,
 > transformation, filtering, sorting, and file-safety workflows are complete.
+> Beta preparation is tracked in the [beta release checklist](docs/BETA_RELEASE_CHECKLIST.md).
+> A public beta has not been released.
 
 ## Why Quarry
 
@@ -210,6 +212,7 @@ rules, cache declarations, resource measurements, and limitations.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Priority checklist before beta](docs/PRE_BETA_CHECKLIST.md)
+- [Beta release checklist and testing guidance](docs/BETA_RELEASE_CHECKLIST.md)
 - [Engineering principles](docs/ENGINEERING_PRINCIPLES.md)
 - [Benchmark archive](docs/benchmarks/)
 - [Contributing](docs/CONTRIBUTING.md)

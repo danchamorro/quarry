@@ -25,6 +25,9 @@ the source tree was clean. A release candidate is acceptable only when
 `QuarrySourceStatus` is `clean` and `QuarryGitRevision` equals the intended
 commit.
 
+The [beta release checklist](BETA_RELEASE_CHECKLIST.md) separates local package
+validation from the acceptance and distribution gates for a public candidate.
+
 The plist declares macOS 11.0 as its minimum. The packaging command does not pin
 or verify the Mach-O deployment target, and the current acceptance run exercises
 only the documented Apple Silicon host.
@@ -33,6 +36,7 @@ only the documented Apple Silicon host.
 
 - macOS with the Xcode command line tools.
 - The Rust toolchain selected by `rust-toolchain.toml`.
+- Python 3 for the offline notice freshness check.
 - A non-shallow Quarry checkout with complete Git history and `Cargo.lock`
   present.
 - Quarry, including a Cargo-launched development copy, must be closed before
@@ -48,7 +52,8 @@ From the repository root:
 
 The command performs a locked release build, creates
 `target/package/Quarry.app`, adds versioned plist metadata and the checked-in
-icon, applies an ad-hoc signature without a timestamp, and verifies the bundle.
+icon and license notices, applies an ad-hoc signature without a timestamp, and
+verifies the bundle.
 It rechecks the Git revision and working state after compilation and stops if
 either changed during the build.
 Two consecutive runs from the same checkout, pinned Rust 1.88.0 toolchain, and
@@ -112,10 +117,41 @@ open /Applications/Quarry.app
 ```
 
 The verify command checks the strict code signature, canonical bundle identifier
-and executable, nonempty version and source metadata, and packaged icon. Release
+and executable, nonempty version and source metadata, packaged icon, and
+nonempty license-notice resources. Release
 acceptance additionally requires the printed source status to be `clean` and
 the printed app revision to equal `git rev-parse HEAD`; those two comparisons
 remain explicit manual gates.
+
+## License resources
+
+Local packages include these files in `Contents/Resources/Licenses/`:
+
+- `LICENSE-MIT` and `LICENSE-APACHE`, copied unchanged from the repository.
+- `THIRD_PARTY_NOTICES.html`, generated from the locked macOS dependencies and
+  the additional font notices recorded in the license audit.
+
+Before packaging, the notice freshness check must pass:
+
+```bash
+./scripts/generate-notices.sh --check
+```
+
+This check establishes that the checked-in notice artifact matches its recorded
+inputs. It does not establish that every attribution question has been resolved.
+The current third-party artifact is a draft; its unresolved audit items remain
+a beta release gate. Follow the audit and regeneration instructions in
+[the license audit](../packaging/licenses/AUDIT.md) when dependencies or bundled
+assets change. Do not replace missing upstream copyright information with
+invented attribution or silently accept generic template text as complete.
+
+Normal packaging uses the checked-in artifact and does not install a license
+tool or download notice text. The installer still verifies older applications
+as rollback sources using their identity and signature; older packages may lack
+these new resources and will not pass the expanded current `verify` command.
+The draft inventory currently covers `aarch64-apple-darwin`. Packaging checks
+that it matches the native build target; other architectures need their own
+reviewed inventory before packaging can proceed.
 
 ## Packaged-app smoke test
 
@@ -148,7 +184,19 @@ git worktree remove ../quarry-rollback
 
 For an immediate local rollback, quit Quarry, expand `Quarry-previous.zip`,
 replace `/Applications/Quarry.app` with the archived `Quarry.app` in Finder,
-then run `./scripts/macos-app.sh verify`.
+then check its signature and recorded identity:
+
+```bash
+codesign --verify --deep --strict --verbose=2 /Applications/Quarry.app
+plutil -p /Applications/Quarry.app/Contents/Info.plist
+```
+
+Confirm `CFBundleIdentifier` is `io.github.danchamorro.quarry`,
+`CFBundleExecutable` is `Quarry`, and the recorded revision and source status
+match the intended backup. These checks also work for older bundles without
+license resources. Run `./scripts/macos-app.sh verify` as an additional check
+only when the restored bundle includes the three required license resources;
+its stricter current-package contract still applies to new builds.
 
 ## Signing limitation
 
@@ -162,3 +210,17 @@ Public distribution requires a Developer ID Application certificate, stable
 entitlements, hardened runtime, timestamping, notarization, stapling, and a
 Gatekeeper assessment. Those steps remain deferred until the required Apple
 Developer identity and credentials are available.
+
+On 2026-09-07 the local host reported zero valid code-signing identities, while
+`notarytool` was available. The clean installed application at `69d5f15` was
+validated on macOS 26.6.2, Apple Silicon. Its Mach-O build command declares a
+minimum of macOS 11.0 and SDK 26.5; this does not prove runtime compatibility
+with macOS 11.0. Select supported systems and test the exact release candidate
+before promising a minimum OS version.
+
+Apple's current [notarization guidance](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+requires the appropriate Developer ID signature and hardened runtime for that
+distribution workflow. Signing, notarization submission, stapling, and
+Gatekeeper acceptance have not been validated for a beta candidate. Keep those
+gates open until the signing identity is available and the exact candidate has
+passed them.
