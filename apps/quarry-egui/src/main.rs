@@ -354,6 +354,7 @@ impl PartialEq<&str> for AppMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FilterRuleDraft {
     column_input: String,
+    column_search: String,
     operator: FilterOperator,
     value_input: String,
     upper_bound_input: String,
@@ -451,6 +452,7 @@ impl Default for FilterRuleDraft {
     fn default() -> Self {
         Self {
             column_input: "1".into(),
+            column_search: String::new(),
             operator: FilterOperator::Contains,
             value_input: String::new(),
             upper_bound_input: String::new(),
@@ -1956,7 +1958,14 @@ impl eframe::App for QuarryApp {
         {
             action = edit_history_shortcut(ctx, document);
         }
-        if action.is_none() && self.document.is_some() {
+        let filter_owns_keys = self.filters_open
+            && (egui::Popup::is_any_open(ctx)
+                || ctx.memory(|memory| {
+                    memory
+                        .focused()
+                        .is_some_and(|id| is_filter_text_input(id, self.filter_rules.len()))
+                }));
+        if action.is_none() && self.document.is_some() && !filter_owns_keys {
             action = ctx.input(|input| {
                 if input.key_pressed(egui::Key::PageDown) {
                     Some(Action::PageDown)
@@ -3103,41 +3112,55 @@ struct ColumnDrag {
     column: usize,
 }
 
+fn tool_dialog_escape_requested(ctx: &egui::Context, window_id: &str) -> bool {
+    let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(window_id));
+    !egui::Popup::is_any_open(ctx)
+        && ctx.memory(|memory| {
+            memory.allows_interaction(layer)
+                && memory
+                    .areas()
+                    .top_layer_id(egui::Order::Middle)
+                    .filter(|top| memory.areas().is_visible(top))
+                    .is_none_or(|top| top == layer)
+        })
+        && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+}
+
 fn show_column_manager(
     ctx: &egui::Context,
     open: &mut bool,
     search: &mut String,
     document: &Document,
 ) -> Option<ColumnCommand> {
+    if !*open {
+        return None;
+    }
+    if tool_dialog_escape_requested(ctx, "quarry-column-manager") {
+        ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new(COLUMN_SEARCH_INPUT_ID)));
+        *open = false;
+        return None;
+    }
     let mut command = None;
     let mut close_requested = false;
-    let query = search.trim().to_lowercase();
-    let filtered_positions = document
-        .columns
-        .order
-        .iter()
-        .enumerate()
-        .filter(|(_, column)| {
-            query.is_empty()
-                || document
-                    .column_name(**column)
-                    .to_lowercase()
-                    .contains(&query)
-                || column.saturating_add(1).to_string().contains(&query)
-        })
-        .map(|(position, _)| position)
-        .collect::<Vec<_>>();
     egui::Window::new("Columns")
         .id(egui::Id::new("quarry-column-manager"))
-        .open(open)
-        .fixed_size(egui::vec2(520.0, 520.0))
+        .title_bar(false)
+        .default_width(560.0)
         .resizable(false)
+        .frame(tool_dialog_frame(ctx))
         .show(ctx, |ui| {
-            ui.label("Choose which file columns appear and their left-to-right order.");
-            ui.add_space(8.0);
+            tool_dialog_style(ui.style_mut());
             ui.horizontal(|ui| {
+                ui.heading("Columns");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close_requested = ui.button("Close").clicked();
+                });
+            });
+            ui.weak("Choose which columns appear and their left-to-right order.");
+            ui.horizontal(|ui| {
+                let search_width = (ui.available_width() - 210.0).max(180.0);
                 let search_response = ui.add_sized(
-                    [220.0, 30.0],
+                    [search_width, 30.0],
                     egui::TextEdit::singleline(search)
                         .id(egui::Id::new(COLUMN_SEARCH_INPUT_ID))
                         .hint_text("Search columns"),
@@ -3145,154 +3168,204 @@ fn show_column_manager(
                 let _ = ui.ctx().accesskit_node_builder(search_response.id, |node| {
                     node.set_label("Search columns");
                 });
-                ui.label(format!(
+                ui.weak(format!(
                     "{} shown of {}",
                     document.columns.shown_count(),
                     document.total_columns
                 ));
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if column_action_button(ui, "Reset", true, "Reset columns".into()) {
                         command = Some(ColumnCommand::Reset);
                     }
                 });
             });
-            ui.add_space(8.0);
             ui.separator();
-            if document.total_columns == 0 {
-                ui.label("No columns");
-                return;
-            }
-            let row_height = 36.0;
-            egui::ScrollArea::vertical()
-                .id_salt("quarry-column-manager-list")
-                .auto_shrink([false, false])
-                .max_height(370.0)
-                .show_rows(ui, row_height, filtered_positions.len(), |ui, rows| {
-                    for filtered_position in rows {
-                        let position = filtered_positions[filtered_position];
-                        let column = document.columns.order[position];
-                        ui.push_id(("managed-column", column), |ui| {
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                            let selected = ui.ctx().data_mut(|data| {
-                                data.get_persisted::<usize>(egui::Id::new(
-                                    "quarry-selected-managed-column",
-                                )) == Some(column)
+            let query = search.trim().to_lowercase();
+            let filtered_positions = document
+                .columns
+                .order
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| {
+                    query.is_empty()
+                        || document
+                            .column_name(**column)
+                            .to_lowercase()
+                            .contains(&query)
+                        || column.saturating_add(1).to_string().contains(&query)
+                })
+                .map(|(position, _)| position)
+                .collect::<Vec<_>>();
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let row_height = 36.0;
+                egui::ScrollArea::vertical()
+                    .id_salt("quarry-column-manager-list")
+                    .auto_shrink([false, false])
+                    .max_height((ctx.content_rect().height() - 260.0).clamp(96.0, 400.0))
+                    .show_rows(ui, row_height, filtered_positions.len(), |ui, rows| {
+                        if filtered_positions.is_empty() {
+                            ui.weak(if document.total_columns == 0 {
+                                "No columns"
+                            } else {
+                                "No matching columns"
                             });
-                            let mut checkbox_right = 0.0;
-                            let row = egui::Frame::new()
-                                .fill(if selected {
-                                    ui.visuals().selection.bg_fill
-                                } else {
-                                    ui.visuals().faint_bg_color
-                                })
-                                .inner_margin(egui::Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    ui.set_min_height(row_height - 8.0);
-                                    ui.horizontal(|ui| {
-                                        let name = document.column_name(column);
-                                        let mut shown = !document.columns.hidden[column];
-                                        let checkbox = ui
-                                            .add(egui::Checkbox::without_text(&mut shown))
-                                            .on_hover_text(if shown {
-                                                "Hide column"
-                                            } else {
-                                                "Show column"
-                                            });
-                                        let _ =
-                                            ui.ctx().accesskit_node_builder(checkbox.id, |node| {
-                                                node.set_label(format!(
-                                                    "{}  {name}",
-                                                    column.saturating_add(1)
-                                                ));
-                                            });
-                                        checkbox_right = checkbox.rect.right();
-                                        if checkbox.changed() {
-                                            command =
-                                                Some(ColumnCommand::SetShown { column, shown });
-                                        }
-                                        egui::Frame::new()
-                                            .fill(ui.visuals().extreme_bg_color)
-                                            .corner_radius(4.0)
-                                            .inner_margin(egui::Margin::symmetric(8, 2))
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(
+                        }
+                        for filtered_position in rows {
+                            let position = filtered_positions[filtered_position];
+                            let column = document.columns.order[position];
+                            ui.push_id(("managed-column", column), |ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                                let selected = ui.ctx().data_mut(|data| {
+                                    data.get_persisted::<usize>(egui::Id::new(
+                                        "quarry-selected-managed-column",
+                                    )) == Some(column)
+                                });
+                                let name = document.column_name(column);
+                                let mut checkbox_right = 0.0;
+                                let row = egui::Frame::new()
+                                    .fill(if selected {
+                                        ui.visuals().selection.bg_fill
+                                    } else if filtered_position % 2 == 0 {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(239, 243, 245)
+                                    })
+                                    .corner_radius(5)
+                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            let mut shown = !document.columns.hidden[column];
+                                            let checkbox = ui
+                                                .add(egui::Checkbox::without_text(&mut shown))
+                                                .on_hover_text(if shown {
+                                                    "Hide column"
+                                                } else {
+                                                    "Show column"
+                                                });
+                                            let _ = ui.ctx().accesskit_node_builder(
+                                                checkbox.id,
+                                                |node| {
+                                                    node.set_label(format!(
+                                                        "{}  {name}",
+                                                        column.saturating_add(1)
+                                                    ));
+                                                },
+                                            );
+                                            checkbox_right = checkbox.rect.right();
+                                            if checkbox.changed() {
+                                                command =
+                                                    Some(ColumnCommand::SetShown { column, shown });
+                                            }
+                                            let (handle, _) = ui.allocate_exact_size(
+                                                egui::vec2(14.0, 30.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            for x in [-2.5, 2.5] {
+                                                for y in [-5.0, 0.0, 5.0] {
+                                                    ui.painter().circle_filled(
+                                                        handle.center() + egui::vec2(x, y),
+                                                        1.0,
+                                                        ui.visuals().weak_text_color(),
+                                                    );
+                                                }
+                                            }
+                                            ui.add_sized(
+                                                [42.0, 30.0],
+                                                egui::Label::new(
+                                                    RichText::new(
                                                         column.saturating_add(1).to_string(),
                                                     )
-                                                    .monospace(),
-                                                );
-                                            });
-                                        ui.add(egui::Label::new(name.clone()).truncate());
+                                                    .monospace()
+                                                    .weak(),
+                                                ),
+                                            );
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(ui.available_width(), 30.0),
+                                                Layout::left_to_right(Align::Center),
+                                                |ui| {
+                                                    ui.add(egui::Label::new(&name).truncate())
+                                                        .on_hover_text(&name);
+                                                },
+                                            );
+                                        });
                                     })
-                                })
-                                .response;
-                            let drag_target = ui.interact(
-                                egui::Rect::from_min_max(
-                                    egui::pos2(checkbox_right, row.rect.top()),
-                                    row.rect.max,
-                                ),
-                                ui.id().with("column-drag-target"),
-                                egui::Sense::click_and_drag(),
-                            );
-                            if drag_target.clicked() || drag_target.drag_started() {
-                                ui.ctx().data_mut(|data| {
-                                    data.insert_persisted(
-                                        egui::Id::new("quarry-selected-managed-column"),
-                                        column,
-                                    );
-                                });
-                            }
-                            drag_target.dnd_set_drag_payload(ColumnDrag { column });
-                            drag_target.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    true,
-                                    format!("Select and drag column {} to reorder", column + 1),
-                                )
-                            });
-                            if ui.rect_contains_pointer(row.rect)
-                                && let (Some(pointer), Some(dragged)) = (
-                                    ui.input(|input| input.pointer.interact_pos()),
-                                    egui::DragAndDrop::payload::<ColumnDrag>(ui.ctx()),
-                                )
-                            {
-                                let (line_y, insertion) = if dragged.column == column {
-                                    (row.rect.center().y, position)
-                                } else if pointer.y < row.rect.center().y {
-                                    (row.rect.top(), position)
-                                } else {
-                                    (row.rect.bottom(), position.saturating_add(1))
-                                };
-                                ui.painter().hline(
-                                    row.rect.x_range(),
-                                    line_y,
-                                    egui::Stroke::new(2.0_f32, ui.visuals().selection.stroke.color),
-                                );
-                                if ui.input(|input| input.pointer.any_released())
-                                    && let Some(dropped) =
-                                        egui::DragAndDrop::take_payload::<ColumnDrag>(ui.ctx())
-                                    && let Some(source_position) = document
-                                        .columns
-                                        .order
-                                        .iter()
-                                        .position(|source| *source == dropped.column)
-                                {
-                                    command = Some(ColumnCommand::Move {
-                                        column: dropped.column,
-                                        position: column_drop_position(
-                                            source_position,
-                                            insertion,
-                                            document.columns.order.len(),
+                                    .response;
+                                let drag_target = ui
+                                    .interact(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(checkbox_right, row.rect.top()),
+                                            row.rect.max,
                                         ),
+                                        ui.id().with("column-drag-target"),
+                                        egui::Sense::click_and_drag(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::Grab)
+                                    .on_hover_text(&name);
+                                if drag_target.clicked() || drag_target.drag_started() {
+                                    ui.ctx().data_mut(|data| {
+                                        data.insert_persisted(
+                                            egui::Id::new("quarry-selected-managed-column"),
+                                            column,
+                                        );
                                     });
                                 }
-                            }
-                        });
-                    }
-                });
+                                drag_target.dnd_set_drag_payload(ColumnDrag { column });
+                                drag_target.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        true,
+                                        format!("Select and drag column {} to reorder", column + 1),
+                                    )
+                                });
+                                if ui.rect_contains_pointer(row.rect)
+                                    && let (Some(pointer), Some(dragged)) = (
+                                        ui.input(|input| input.pointer.interact_pos()),
+                                        egui::DragAndDrop::payload::<ColumnDrag>(ui.ctx()),
+                                    )
+                                {
+                                    let (line_y, insertion) = if dragged.column == column {
+                                        (row.rect.center().y, position)
+                                    } else if pointer.y < row.rect.center().y {
+                                        (row.rect.top(), position)
+                                    } else {
+                                        (row.rect.bottom(), position.saturating_add(1))
+                                    };
+                                    ui.painter().hline(
+                                        row.rect.x_range(),
+                                        line_y,
+                                        egui::Stroke::new(
+                                            2.0_f32,
+                                            ui.visuals().selection.stroke.color,
+                                        ),
+                                    );
+                                    if ui.input(|input| input.pointer.any_released())
+                                        && let Some(dropped) =
+                                            egui::DragAndDrop::take_payload::<ColumnDrag>(ui.ctx())
+                                        && let Some(source_position) = document
+                                            .columns
+                                            .order
+                                            .iter()
+                                            .position(|source| *source == dropped.column)
+                                    {
+                                        command = Some(ColumnCommand::Move {
+                                            column: dropped.column,
+                                            position: column_drop_position(
+                                                source_position,
+                                                insertion,
+                                                document.columns.order.len(),
+                                            ),
+                                        });
+                                    }
+                                }
+                            });
+                        }
+                    });
+            });
+            ui.weak("Drag to reorder · Uncheck to hide");
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label("Drag to reorder · Uncheck to hide");
                 if ui
                     .button("Auto-fit columns")
                     .on_hover_text("Fit every shown column to its header and loaded cell values")
@@ -3300,19 +3373,25 @@ fn show_column_manager(
                 {
                     command = Some(ColumnCommand::AutoFit);
                 }
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Done").clicked() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Done").color(QUARRY_SELECTED_TEXT))
+                                .fill(QUARRY_YELLOW),
+                        )
+                        .clicked()
+                    {
                         close_requested = true;
                     }
                 });
             });
         });
     if close_requested {
+        ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new(COLUMN_SEARCH_INPUT_ID)));
         *open = false;
     }
     command
 }
-
 fn filter_button_label(filter_query: Option<&FilterQuery>) -> String {
     filter_query.map_or_else(
         || "Filters…".to_owned(),
@@ -3326,6 +3405,17 @@ enum StructuralDialogAction {
     Cancel,
 }
 
+fn sort_mode_label(mode: SortMode) -> &'static str {
+    match mode {
+        SortMode::Text => "Text",
+        SortMode::Number => "Number",
+        SortMode::CharacterCount => "Character count",
+        SortMode::WordCount => "Word count",
+        SortMode::Shuffle { .. } => "Shuffle",
+        SortMode::Reverse => "Reverse",
+    }
+}
+
 fn show_structural_dialog(
     ctx: &egui::Context,
     dialog: &mut StructuralDialog,
@@ -3337,6 +3427,7 @@ fn show_structural_dialog(
         .then(|| document.sort_temporary_disk_estimate())
         .flatten();
     let mut sort_description = None;
+    let mut disk_description = None;
     let title = match dialog.request {
         StructuralRequest::Split => "Split Columns",
         StructuralRequest::Combine => "Combine Columns",
@@ -3344,18 +3435,22 @@ fn show_structural_dialog(
         StructuralRequest::Sort => "Sort Rows",
         StructuralRequest::Duplicates => "Find Duplicates",
     };
-    let modal = egui::Modal::new(egui::Id::new("quarry-structural-dialog")).show(ctx, |ui| {
-        ui.set_min_width(360.0);
+    let modal = egui::Modal::new(egui::Id::new("quarry-structural-dialog"))
+        .frame(tool_dialog_frame(ctx))
+        .show(ctx, |ui| {
+        tool_dialog_style(ui.style_mut());
+        ui.set_width(480.0);
         ui.heading(title);
+        ui.separator();
+        let (valid, field_has_focus, disabled_reason) = egui::ScrollArea::vertical()
+            .id_salt("quarry-structural-dialog-body")
+            .max_height((ctx.content_rect().height() - 220.0).clamp(96.0, 360.0))
+            .show(ui, |ui| {
         let columns = dialog
             .columns
             .iter()
             .map(|column| {
-                let name = document
-                    .current_header_fields()
-                    .get(*column)
-                    .map(|name| field_text(name))
-                    .unwrap_or_default();
+                let name = document.column_name(*column);
                 if name.is_empty() {
                     (column.saturating_add(1)).to_string()
                 } else {
@@ -3364,22 +3459,28 @@ fn show_structural_dialog(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        ui.label(format!(
+        let selected = format!(
             "Selected column{}: {columns}",
             if dialog.columns.len() == 1 { "" } else { "s" }
-        ));
+        );
+        ui.add(egui::Label::new(&selected).truncate()).on_hover_text(&selected);
         ui.add_space(6.0);
-        let (valid, field_has_focus, disabled_reason) = match dialog.request {
+        match dialog.request {
             StructuralRequest::Duplicates => {
+                ui.label("Find rows with matching values in the selected columns.");
                 ui.checkbox(&mut dialog.match_case, "Match case");
-                ui.small("Compare the values in every selected column. Blank and missing fields match; spaces are significant.");
-                ui.small(if dialog.match_case {
-                    "Uppercase and lowercase letters match separately."
-                } else {
-                    "ASCII uppercase and lowercase letters match together. Other bytes match exactly."
+                ui.label("Review the count first. Removal keeps the first occurrence in the current row order.");
+                egui::CollapsingHeader::new("Details").id_salt("duplicate-details").show(ui, |ui| {
+                    ui.label("Compare the values in every selected column. Blank and missing fields match; spaces are significant.");
+                    ui.label(if dialog.match_case {
+                        "Uppercase and lowercase letters match separately."
+                    } else {
+                        "ASCII uppercase and lowercase letters match together. Other bytes match exactly."
+                    });
+                    ui.label("The header stays fixed. Unsaved cell values are included in the comparison.");
                 });
-                ui.small("Review the count before removing extra rows. The first occurrence in the current row order will be kept, with the header fixed and unsaved values included.");
                 let reason = dialog.columns.is_empty().then(|| "Select at least one numbered column first.".to_owned());
+                if let Some(reason) = &reason { ui.colored_label(ERROR_TEXT, reason); }
                 (reason.is_none(), false, reason)
             }
             StructuralRequest::Split | StructuralRequest::Combine => {
@@ -3428,30 +3529,30 @@ fn show_structural_dialog(
                 (reason.is_none(), position.has_focus(), reason)
             }
             StructuralRequest::Sort => {
-                ui.label("Sort as");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut dialog.sort_mode, SortMode::Text, "Text");
-                    ui.radio_value(&mut dialog.sort_mode, SortMode::Number, "Number");
-                    ui.radio_value(&mut dialog.sort_mode, SortMode::CharacterCount, "Character count");
-                    ui.radio_value(&mut dialog.sort_mode, SortMode::WordCount, "Word count");
-                });
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut dialog.sort_mode, SortMode::Shuffle { seed: 0 }, "Shuffle");
-                    ui.radio_value(&mut dialog.sort_mode, SortMode::Reverse, "Reverse");
-                });
+                let label = ui.weak("Sort as");
+                let response = egui::ComboBox::from_id_salt("quarry-sort-mode")
+                    .width(ui.available_width())
+                    .selected_text(sort_mode_label(dialog.sort_mode))
+                    .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
+                    .show_ui(ui, |ui| {
+                        for mode in [SortMode::Text, SortMode::Number, SortMode::CharacterCount,
+                            SortMode::WordCount, SortMode::Shuffle { seed: 0 }, SortMode::Reverse] {
+                            if ui.selectable_value(&mut dialog.sort_mode, mode, sort_mode_label(mode)).clicked() {
+                                ui.close();
+                            }
+                        }
+                    }).response.labelled_by(label.id);
+                let _ = ui.ctx().accesskit_node_builder(response.id, |node| node.set_label("Sort as"));
                 if dialog.sort_mode.uses_column() {
-                    ui.label("Direction");
+                    ui.weak("Direction");
+                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
                     ui.horizontal(|ui| {
-                        ui.radio_value(
-                            &mut dialog.sort_direction,
-                            SortDirection::Ascending,
-                            sort_direction_label(dialog.sort_mode, SortDirection::Ascending),
-                        );
-                        ui.radio_value(
-                            &mut dialog.sort_direction,
-                            SortDirection::Descending,
-                            sort_direction_label(dialog.sort_mode, SortDirection::Descending),
-                        );
+                        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                            if ui.add_sized([width, 30.0], egui::Button::selectable(dialog.sort_direction == direction,
+                                sort_direction_label(dialog.sort_mode, direction))).clicked() {
+                                dialog.sort_direction = direction;
+                            }
+                        }
                     });
                 }
                 let values = match dialog.sort_mode {
@@ -3469,14 +3570,20 @@ fn show_structural_dialog(
                     SortMode::Shuffle { .. } => "Randomize the entire data row order. The selected column is ignored.",
                     SortMode::Reverse => "Reverse the entire current data row order. The selected column is ignored.",
                 };
-                ui.small(values);
                 let ordering = if dialog.sort_mode.uses_column() {
                     "Equal values keep their original order (stable sort). Missing values sort as empty cells."
                 } else {
                     "All cells stay with their row."
                 };
-                ui.small(ordering);
-                ui.small("The header stays fixed.");
+                ui.weak(if dialog.sort_mode.uses_column() {
+                    "Equal values keep their order. The header stays fixed."
+                } else {
+                    "All cells stay with their row. The header stays fixed."
+                });
+                egui::CollapsingHeader::new("Details").id_salt("sort-details").show(ui, |ui| {
+                    ui.label(values);
+                    ui.label(ordering);
+                });
                 let reason = sort_disk.is_none().then(|| {
                     "Wait for indexing to finish so Quarry can calculate temporary disk space."
                         .to_owned()
@@ -3488,14 +3595,16 @@ fn show_structural_dialog(
                         format_bytes(bytes)
                     ),
                 );
-                ui.small(&disk);
+                disk_description = Some(disk.clone());
                 sort_description = Some(format!(
                     "{values} {ordering} The header stays fixed. {disk}"
                 ));
                 (reason.is_none(), false, reason)
             }
-        };
-        ui.add_space(8.0);
+        }
+        }).inner;
+        if let Some(disk) = disk_description { ui.label(disk); }
+        ui.separator();
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
                 action = Some(StructuralDialogAction::Cancel);
@@ -3506,7 +3615,8 @@ fn show_structural_dialog(
                 StructuralRequest::Duplicates => "Find duplicates",
                 StructuralRequest::Split | StructuralRequest::Combine => "OK",
             };
-            let mut apply = ui.add_enabled(valid, egui::Button::new(submit_label));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let mut apply = ui.add_enabled(valid, egui::Button::new(RichText::new(submit_label).color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW));
             if let Some(reason) = disabled_reason {
                 apply = apply.on_disabled_hover_text(reason);
             }
@@ -3522,6 +3632,7 @@ fn show_structural_dialog(
             {
                 action = Some(StructuralDialogAction::Apply);
             }
+            });
         });
     });
     if modal.should_close() {
@@ -3535,26 +3646,53 @@ fn show_duplicate_preview(
     summary: &DuplicateSummary,
 ) -> Option<StructuralDialogAction> {
     let mut action = None;
-    let modal = egui::Modal::new(egui::Id::new("quarry-duplicate-preview")).show(ctx, |ui| {
-        ui.set_min_width(360.0);
+    let modal = egui::Modal::new(egui::Id::new("quarry-duplicate-preview"))
+        .frame(tool_dialog_frame(ctx))
+        .show(ctx, |ui| {
+        tool_dialog_style(ui.style_mut());
+        ui.set_width(480.0);
         ui.heading("Review Duplicates");
-        ui.label(format!("Extra duplicate rows: {}", summary.duplicate_rows));
-        ui.label(format!("Rows to keep: {}", summary.retained_rows));
-        ui.label("Keep the first occurrence in the current row order. Retained rows stay intact and in the same relative order. The header stays fixed.");
-        ui.small("The document has not changed. Removal creates an unsaved working version and can be undone.");
+        ui.weak("Review the result before changing your document.");
+        ui.separator();
+        egui::Frame::new().fill(Color32::WHITE).corner_radius(8).inner_margin(12).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.strong(format!("Extra duplicate rows: {}", summary.duplicate_rows));
+            ui.label(format!("Rows to keep: {}", summary.retained_rows));
+        });
+        ui.label("Keep the first occurrence in the current row order. The header stays fixed.");
+        ui.weak("Removal creates an unsaved working version and can be undone.");
+        egui::CollapsingHeader::new("Details").id_salt("duplicate-review-details").show(ui, |ui| {
+            ui.label("The document has not changed. Retained rows stay intact and in the same relative order.");
+        });
+        ui.separator();
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
                 action = Some(StructuralDialogAction::Cancel);
             }
-            if ui.button("Remove extra rows").clicked() {
-                action = Some(StructuralDialogAction::Apply);
-            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(egui::Button::new(RichText::new("Remove extra rows").color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW)).clicked() {
+                    action = Some(StructuralDialogAction::Apply);
+                }
+            });
         });
     });
     if modal.should_close() {
         action = Some(StructuralDialogAction::Cancel);
     }
     action
+}
+
+fn filter_predicate_from_rule(
+    rule: &FilterRuleDraft,
+    total_columns: usize,
+) -> Result<FilterPredicate, String> {
+    Ok(FilterPredicate {
+        column: parse_file_column(&rule.column_input, total_columns)?,
+        operator: rule.operator,
+        value: rule.value_input.as_bytes().to_vec(),
+        upper_bound: (rule.operator == FilterOperator::Between)
+            .then(|| rule.upper_bound_input.as_bytes().to_vec()),
+    })
 }
 
 fn filter_query_from_rules(
@@ -3566,15 +3704,8 @@ fn filter_query_from_rules(
         .iter()
         .enumerate()
         .map(|(index, rule)| {
-            parse_file_column(&rule.column_input, total_columns)
+            filter_predicate_from_rule(rule, total_columns)
                 .map_err(|error| format!("Rule {}: {error}", index + 1))
-                .map(|column| FilterPredicate {
-                    column,
-                    operator: rule.operator,
-                    value: rule.value_input.as_bytes().to_vec(),
-                    upper_bound: (rule.operator == FilterOperator::Between)
-                        .then(|| rule.upper_bound_input.as_bytes().to_vec()),
-                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let query = FilterQuery {
@@ -3585,6 +3716,106 @@ fn filter_query_from_rules(
     Ok(query)
 }
 
+fn tool_dialog_frame(ctx: &egui::Context) -> egui::Frame {
+    egui::Frame::window(&ctx.style())
+        .fill(Color32::from_rgb(247, 249, 250))
+        .inner_margin(18)
+        .corner_radius(12)
+        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(211, 219, 224)))
+}
+
+fn tool_dialog_style(style: &mut egui::Style) {
+    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.interact_size.y = 30.0;
+    let visuals = &mut style.visuals;
+    visuals.override_text_color = Some(Color32::from_rgb(24, 35, 42));
+    visuals.weak_text_color = Some(Color32::from_rgb(92, 105, 114));
+    visuals.text_edit_bg_color = Some(Color32::WHITE);
+    visuals.selection.bg_fill = QUARRY_YELLOW;
+    visuals.selection.stroke = egui::Stroke::new(1.0, QUARRY_SELECTED_TEXT);
+    visuals.widgets.inactive.bg_fill = Color32::WHITE;
+    visuals.widgets.inactive.weak_bg_fill = Color32::WHITE;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(191, 203, 211));
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(237, 242, 245);
+    visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
+}
+
+fn filter_column_picker(
+    ui: &mut egui::Ui,
+    index: usize,
+    rule: &mut FilterRuleDraft,
+    document: &Document,
+) {
+    let label = ui.weak("Column");
+    let selected = parse_file_column(&rule.column_input, document.total_columns)
+        .map(|column| format!("{}: {}", column + 1, document.column_name(column)))
+        .unwrap_or_else(|_| "Choose a column".into());
+    let picker = egui::ComboBox::from_id_salt(("quarry-filter-column", index))
+        .selected_text(selected)
+        .width(ui.available_width())
+        .wrap_mode(egui::TextWrapMode::Truncate)
+        .height(280.0)
+        .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut rule.column_search)
+                    .id(filter_column_input_id(index))
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Search name or column number"),
+            );
+            let _ = ui.ctx().accesskit_node_builder(search.id, |node| {
+                node.set_label(format!("Search columns for rule {}", index + 1));
+            });
+            ui.separator();
+            let query = rule.column_search.trim().to_lowercase();
+            let source_number = query.parse::<usize>().ok();
+            let columns: Vec<_> = (0..document.total_columns)
+                .filter(|column| {
+                    query.is_empty()
+                        || source_number == Some(column + 1)
+                        || document
+                            .column_name(*column)
+                            .to_lowercase()
+                            .contains(&query)
+                })
+                .collect();
+            if columns.is_empty() {
+                ui.weak("No matching columns");
+            }
+            // Keep searches from shrinking the height remembered by the ComboBox popup.
+            egui::ScrollArea::vertical()
+                .max_height(216.0)
+                .auto_shrink([true, false])
+                .show_rows(ui, 30.0, columns.len(), |ui, rows| {
+                    for row in rows {
+                        let column = columns[row];
+                        let label = format!("{}: {}", column + 1, document.column_name(column));
+                        let selected = rule.column_input == (column + 1).to_string();
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 30.0],
+                                egui::Button::selectable(selected, label).truncate(),
+                            )
+                            .clicked()
+                        {
+                            rule.column_input = (column + 1).to_string();
+                            ui.close();
+                        }
+                    }
+                });
+        });
+    let response = picker.response.labelled_by(label.id);
+    let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label(format!("Rule {} column", index + 1));
+    });
+    if response.clicked() {
+        rule.column_search.clear();
+        ui.memory_mut(|memory| memory.request_focus(filter_column_input_id(index)));
+    }
+}
+
 fn show_filter_manager(
     ctx: &egui::Context,
     open: &mut bool,
@@ -3592,219 +3823,196 @@ fn show_filter_manager(
     match_case: &mut bool,
     document: &Document,
 ) -> Option<Action> {
+    if !*open {
+        return None;
+    }
+    if tool_dialog_escape_requested(ctx, "quarry-filter-manager") {
+        surrender_filter_text_focus(ctx, rules.len());
+        *open = false;
+        return None;
+    }
     let mut action = None;
+    let mut close = false;
     egui::Window::new("Filters")
         .id(egui::Id::new("quarry-filter-manager"))
-        .open(open)
-        .default_width(520.0)
-        .min_width(420.0)
-        .vscroll(true)
+        .title_bar(false)
+        .default_width(620.0)
         .resizable(false)
+        .frame(tool_dialog_frame(ctx))
         .show(ctx, |ui| {
-            ui.label(
-                "Rows must match every filtered column. Text and numeric inclusion rules in the same column are alternatives. Does not equal rules exclude matches.",
-            );
-            ui.checkbox(match_case, "Match case").on_hover_text("Applies to text rules only.");
-            ui.add_space(6.0);
-            let rule_count = rules.len();
-            let sole_rule = rule_count == 1;
-            let mut remove_index = None;
-            for (index, rule) in rules.iter_mut().enumerate() {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong(format!("Rule {}", index + 1));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let response =
-                                ui.add_enabled(!sole_rule, egui::Button::new("Remove"));
-                            let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-                                node.set_label(format!("Remove rule {}", index + 1));
-                            });
-                            if response.clicked() {
-                                surrender_filter_text_focus(ui.ctx(), rule_count);
-                                remove_index = Some(index);
-                            }
-                        });
-                    });
-                    ui.horizontal(|ui| {
-                        let label = ui.label(format!("Rule {} file column (1-based)", index + 1));
-                        let _ = ui
-                            .add_sized(
-                                [96.0, 26.0],
-                                egui::TextEdit::singleline(&mut rule.column_input)
-                                    .id(filter_column_input_id(index))
-                                    .horizontal_align(Align::RIGHT),
-                            )
-                            .labelled_by(label.id);
-                        if let Ok(column) =
-                            parse_file_column(&rule.column_input, document.total_columns)
-                        {
-                            ui.label(document.column_name(column));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let label = ui.label(format!("Rule {} match", index + 1));
-                        let _ = egui::ComboBox::from_id_salt((
-                            "quarry-filter-operator",
-                            index,
-                        ))
-                        .selected_text(filter_operator_label(rule.operator))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut rule.operator,
-                                FilterOperator::Contains,
-                                "Contains",
-                            );
-                            ui.selectable_value(
-                                &mut rule.operator,
-                                FilterOperator::Equals,
-                                "Equals",
-                            );
-                            ui.selectable_value(
-                                &mut rule.operator,
-                                FilterOperator::NotEquals,
-                                "Does not equal",
-                            );
-                            ui.separator();
-                            for operator in [
-                                FilterOperator::GreaterThan,
-                                FilterOperator::GreaterThanOrEqual,
-                                FilterOperator::LessThan,
-                                FilterOperator::LessThanOrEqual,
-                                FilterOperator::Between,
-                            ] {
-                                ui.selectable_value(
-                                    &mut rule.operator,
-                                    operator,
-                                    filter_operator_label(operator),
-                                );
-                            }
-                        })
-                        .response
-                        .labelled_by(label.id);
-                    });
-                    if rule.operator.is_numeric() {
-                        let between = rule.operator == FilterOperator::Between;
-                        let label = ui.label(format!(
-                            "Rule {} {}", index + 1, if between { "lower bound" } else { "number" }
-                        ));
-                        let _ = ui.add(
-                            egui::TextEdit::singleline(&mut rule.value_input)
-                                .id(filter_value_input_id(index))
-                                .hint_text("e.g. 500 or 5e2"),
-                        ).labelled_by(label.id);
-                        if between {
-                            let label = ui.label(format!("Rule {} upper bound", index + 1));
-                            let _ = ui.add(
-                                egui::TextEdit::singleline(&mut rule.upper_bound_input)
-                                    .id(filter_upper_bound_input_id(index))
-                                    .hint_text("e.g. 1000"),
-                            ).labelled_by(label.id);
-                            ui.small("Both bounds must match. Endpoints are included.");
-                        }
-                        ui.small("Numbers use the same format as Number sorting. Blank, missing and invalid numbers do not match this rule.");
-                    } else {
-                        let label = ui.label(format!("Rule {} value", index + 1));
-                        let _ = ui
-                            .add_sized(
-                                [ui.available_width(), 48.0],
-                                egui::TextEdit::multiline(&mut rule.value_input)
-                                    .desired_rows(2)
-                                    .id(filter_value_input_id(index))
-                                    .hint_text("Literal text"),
-                            )
-                            .labelled_by(label.id);
-                    }
+            tool_dialog_style(ui.style_mut());
+            ui.horizontal(|ui| {
+                ui.heading("Filters");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = ui.button("Close").clicked();
                 });
-                ui.add_space(4.0);
-            }
+            });
+            ui.weak("Choose which rows stay in view.");
+            ui.separator();
+            let rule_count = rules.len();
+            let mut remove_index = None;
+            egui::ScrollArea::vertical()
+                .id_salt("quarry-filter-rules")
+                .max_height((ctx.content_rect().height() - 260.0).clamp(96.0, 420.0))
+                .show(ui, |ui| {
+                    for (index, rule) in rules.iter_mut().enumerate() {
+                        egui::Frame::new()
+                            .fill(Color32::WHITE)
+                            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(220, 226, 230)))
+                            .corner_radius(8)
+                            .inner_margin(12)
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.strong(format!("Rule {}", index + 1));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let response = ui.add_enabled(rule_count > 1, egui::Button::new("Remove").frame(false));
+                                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                            node.set_label(format!("Remove rule {}", index + 1));
+                                        });
+                                        if response.clicked() {
+                                            surrender_filter_text_focus(ui.ctx(), rule_count);
+                                            remove_index = Some(index);
+                                        }
+                                    });
+                                });
+                                ui.horizontal_top(|ui| {
+                                    let column_width = (ui.available_width() - 198.0).max(160.0);
+                                    ui.allocate_ui_with_layout(egui::vec2(column_width, 0.0), Layout::top_down(Align::Min), |ui| {
+                                        filter_column_picker(ui, index, rule, document);
+                                    });
+                                    ui.vertical(|ui| {
+                                        let label = ui.weak("Condition");
+                                        let response = egui::ComboBox::from_id_salt(("quarry-filter-operator", index))
+                                            .width(188.0)
+                                            .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
+                                            .selected_text(filter_operator_label(rule.operator))
+                                            .show_ui(ui, |ui| {
+                                                for operator in [FilterOperator::Contains, FilterOperator::Equals, FilterOperator::NotEquals] {
+                                                    if ui.selectable_value(&mut rule.operator, operator, filter_operator_label(operator)).clicked() {
+                                                        ui.close();
+                                                    }
+                                                }
+                                                ui.separator();
+                                                for operator in [FilterOperator::GreaterThan, FilterOperator::GreaterThanOrEqual, FilterOperator::LessThan, FilterOperator::LessThanOrEqual, FilterOperator::Between] {
+                                                    if ui.selectable_value(&mut rule.operator, operator, filter_operator_label(operator)).clicked() {
+                                                        ui.close();
+                                                    }
+                                                }
+                                            }).response.labelled_by(label.id);
+                                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                            node.set_label(format!("Rule {} match", index + 1));
+                                        });
+                                    });
+                                });
+                                if rule.operator.is_numeric() {
+                                    let between = rule.operator == FilterOperator::Between;
+                                    ui.columns(if between { 2 } else { 1 }, |columns| {
+                                        let label = columns[0].label(format!("Rule {} {}", index + 1, if between { "lower bound" } else { "number" }));
+                                        let _ = columns[0].add(egui::TextEdit::singleline(&mut rule.value_input)
+                                            .desired_width(f32::INFINITY)
+                                            .id(filter_value_input_id(index)).hint_text("e.g. 500 or 5e2")).labelled_by(label.id);
+                                        if between {
+                                            let label = columns[1].label(format!("Rule {} upper bound", index + 1));
+                                            let _ = columns[1].add(egui::TextEdit::singleline(&mut rule.upper_bound_input)
+                                                .desired_width(f32::INFINITY)
+                                                .id(filter_upper_bound_input_id(index)).hint_text("e.g. 1000")).labelled_by(label.id);
+                                        }
+                                    });
+                                } else {
+                                    let label = ui.label(format!("Rule {} value", index + 1));
+                                    let _ = ui.add_sized([ui.available_width(), 48.0],
+                                        egui::TextEdit::multiline(&mut rule.value_input).desired_rows(2)
+                                            .id(filter_value_input_id(index)).hint_text("Literal text, including line breaks"))
+                                        .labelled_by(label.id);
+                                }
+                                let error = filter_predicate_from_rule(rule, document.total_columns).and_then(|predicate| {
+                                    FilterQuery { predicates: vec![predicate], case_sensitivity: case_sensitivity(*match_case) }
+                                        .validate().map_err(|error| match error {
+                                            QuarryError::InvalidFilter { reason, .. } => reason.to_owned(),
+                                            error => error.to_string(),
+                                        })
+                                }).err();
+                                if rule.operator == FilterOperator::Contains && rule.value_input.is_empty() {
+                                    ui.weak("Enter text to match.");
+                                } else if let Some(error) = error {
+                                    ui.colored_label(ERROR_TEXT, error);
+                                } else if rule.operator == FilterOperator::Between {
+                                    ui.weak("Includes both endpoints.");
+                                }
+                            });
+                    }
+                    egui::CollapsingHeader::new("Details").show(ui, |ui| {
+                        ui.label("Rows must match every filtered column. Inclusion rules in the same column are alternatives. Does not equal rules exclude matches.");
+                        ui.label("Use Between for a numeric range. Blank, missing and invalid numbers do not match numeric rules.");
+                        ui.label("Text values are literal, including spaces and line breaks. Equals and Does not equal can compare empty cells. Match case applies to text only.");
+                        if let Some(query) = &document.filter_query {
+                            ui.separator();
+                            ui.strong("Applied rules");
+                            for predicate in &query.predicates {
+                                let mut value = format!("{:?}", field_text(&predicate.value));
+                                if let Some(upper) = &predicate.upper_bound {
+                                    value.push_str(&format!(" and {:?}", field_text(upper)));
+                                }
+                                ui.label(format!("{}: {} · {} {}", predicate.column + 1, document.column_name(predicate.column), filter_operator_label(predicate.operator), value));
+                            }
+                        }
+                    });
+                });
             if let Some(index) = remove_index {
                 rules.remove(index);
             }
-            if ui.button("Add rule").clicked() {
-                surrender_filter_text_focus(ui.ctx(), rules.len());
-                rules.push(FilterRuleDraft::default());
+            ui.horizontal(|ui| {
+                if ui.button("Add rule").clicked() {
+                    surrender_filter_text_focus(ctx, rules.len());
+                    rules.push(FilterRuleDraft::default());
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.checkbox(match_case, "Match case").on_hover_text("Applies to text rules only.");
+                });
+            });
+            ui.separator();
+            if document.has_cell_edits() {
+                ui.label("Save or discard cell edits before filtering the source file.");
+            } else if document.search_job.is_some() {
+                ui.label("Cancel the active search before filtering.");
+            } else if document.total_columns == 0 {
+                ui.label("Open a file with at least one column to filter rows.");
             }
-
-            let validation_error = filter_query_from_rules(rules, *match_case, document.total_columns).err();
+            if let Some(query) = &document.filter_query {
+                ui.weak(format!("{} matching rows · {} active rule{} · {}{}",
+                    document.available_filter_rows(), query.predicates.len(),
+                    if query.predicates.len() == 1 { "" } else { "s" },
+                    case_sensitivity_label(query.case_sensitivity),
+                    if document.filter_job.is_some() { " · Filtering…" } else { "" }));
+            }
             let can_apply = document.is_filter_ready()
                 && !document.has_cell_edits()
                 && document.search_job.is_none()
                 && document.filter_job.is_none()
                 && document.export_job.is_none()
-                && validation_error.is_none();
-            if ui
-                .add_enabled(can_apply, egui::Button::new("Apply filters"))
-                .clicked()
-            {
-                action = Some(Action::ApplyFilter);
-            }
-            if let Some(error) = validation_error {
-                ui.small(error);
-            }
-            ui.small("Contains requires text. Equals and Does not equal compare literal text, including empty cells.");
-            if document.has_cell_edits() {
-                ui.small("Save or discard cell edits before filtering the source file.");
-            }
-
-            if let Some(query) = document.filter_query.as_ref() {
-                ui.add_space(6.0);
-                ui.label(format!(
-                    "Active: {} rule{} ({})",
-                    query.predicates.len(),
-                    if query.predicates.len() == 1 { "" } else { "s" },
-                    case_sensitivity_label(query.case_sensitivity),
-                ));
-                for (index, predicate) in query.predicates.iter().enumerate() {
-                    let value = field_text(&predicate.value);
-                    let value = if let Some(upper) = &predicate.upper_bound {
-                        format!("{value:?} and {:?}", field_text(upper))
-                    } else {
-                        format!("{value:?}")
-                    };
-                    ui.label(format!(
-                        "{}. file column {} ({}) {} {}",
-                        index + 1,
-                        predicate.column.saturating_add(1),
-                        document.column_name(predicate.column),
-                        filter_operator_label(predicate.operator).to_lowercase(),
-                        value
-                    ));
-                }
-            }
-            if document.search_job.is_some() {
-                ui.label("Cancel the active search before filtering.");
-            } else if document.total_columns == 0 {
-                ui.label("Open a file with at least one column to filter rows.");
-            }
-
-            ui.add_space(8.0);
+                && filter_query_from_rules(rules, *match_case, document.total_columns).is_ok();
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        document.filter_active() && document.export_job.is_none(),
-                        egui::Button::new("Clear filter"),
-                    )
-                    .clicked()
-                {
+                if ui.add_enabled(document.filter_active() && document.export_job.is_none(), egui::Button::new("Clear filter")).clicked() {
                     action = Some(Action::ClearFilter);
                 }
                 if document.filter_active()
-                    && ui
-                        .add_enabled(
-                            document.is_filtered_export_ready() && !document.is_dirty(),
-                            egui::Button::new("Export Filtered Rows…"),
-                        )
-                        .on_hover_text(if document.is_dirty() {
-                            "Save or discard your changes before exporting filtered rows."
-                        } else {
-                            "Export all matching rows to a new file"
-                        })
-                        .clicked()
+                    && ui.add_enabled(document.is_filtered_export_ready() && !document.is_dirty(), egui::Button::new("Export Filtered Rows…"))
+                        .on_hover_text(if document.is_dirty() { "Save or discard your changes before exporting filtered rows." } else { "Export all matching rows to a new file" }).clicked()
                 {
                     action = Some(Action::ChooseFilteredExport);
                 }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add_enabled(can_apply, egui::Button::new(RichText::new("Apply filters").color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW)).clicked() {
+                        action = Some(Action::ApplyFilter);
+                    }
+                });
             });
         });
+    if close {
+        surrender_filter_text_focus(ctx, rules.len());
+        *open = false;
+    }
     action
 }
 
@@ -10696,6 +10904,367 @@ mod tests {
         }
     }
 
+    fn filter_manager_frame(
+        app: &mut QuarryApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
+    ) -> (Option<Action>, egui::FullOutput) {
+        let mut action = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                action = show_filter_manager(
+                    ctx,
+                    &mut app.filters_open,
+                    &mut app.filter_rules,
+                    &mut app.filter_match_case,
+                    app.document.as_ref().unwrap(),
+                );
+            },
+        );
+        (action, output)
+    }
+
+    fn filter_control_click(output: &egui::FullOutput, label: &str) -> Vec<egui::Event> {
+        let target = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label() == Some(label) && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .map(|(id, _)| *id)
+            .unwrap_or_else(|| panic!("missing clickable filter control {label}"));
+        vec![egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target,
+                data: None,
+            },
+        )]
+    }
+
+    #[test]
+    fn filter_column_picker_restores_visible_choices_after_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("picker.csv");
+        fs::write(
+            &source,
+            b"First name,Last name,Amount,Status,Note\nAvery,Chen,100,Active,sample\n",
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&source);
+        app.filters_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        super::configure_style(&ctx);
+        let size = egui::vec2(1280.0, 780.0);
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "Rule 1 column"),
+            size,
+        );
+        let (_, output) =
+            filter_manager_frame(&mut app, &ctx, vec![egui::Event::Text("Note".into())], size);
+        assert_eq!(app.filter_rules[0].column_search, "Note");
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "5: Note"),
+            size,
+        );
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "Rule 1 column"),
+            size,
+        );
+        for _ in 0..3 {
+            let _ = filter_manager_frame(&mut app, &ctx, vec![], size);
+        }
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        assert!(app.filter_rules[0].column_search.is_empty());
+        let check_visible = |output: &egui::FullOutput| {
+            for label in [
+                "1: First name",
+                "2: Last name",
+                "3: Amount",
+                "4: Status",
+                "5: Note",
+            ] {
+                assert!(
+                    output.shapes.iter().any(|shape| match &shape.shape {
+                        egui::Shape::Text(text) =>
+                            text.galley.text() == label
+                                && shape.clip_rect.contains_rect(text.visual_bounding_rect()),
+                        _ => false,
+                    }),
+                    "{label} must be fully visible after reopening the picker"
+                );
+            }
+        };
+        check_visible(&output);
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "1: First name"),
+            size,
+        );
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "Add rule"),
+            size,
+        );
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "Rule 2 column"),
+            size,
+        );
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        check_visible(&output);
+        app.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn filter_column_picker_preserves_source_identity_search_copy_and_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("wide-filter.csv");
+        let mut headers = (1..=100)
+            .map(|column| format!("c{column}"))
+            .collect::<Vec<_>>();
+        headers[2] = "Repeated".into();
+        headers[96] = "Repeated".into();
+        let mut first = vec!["skip"; 100];
+        first[96] = "keep";
+        let mut second = vec!["skip"; 100];
+        second[2] = "keep";
+        let original = format!(
+            "{}\n{}\n{}\n",
+            headers.join(","),
+            first.join(","),
+            second.join(",")
+        );
+        fs::write(&source, &original).unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.document.as_mut().unwrap();
+        document.move_column(96, 0).unwrap();
+        document.set_column_shown(96, false).unwrap();
+        app.filters_open = true;
+        app.filter_rules[0].operator = FilterOperator::Equals;
+        app.filter_rules[0].value_input = "keep".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let size = egui::vec2(1280.0, 780.0);
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "Rule 1 column"),
+            size,
+        );
+        ctx.memory_mut(|memory| memory.request_focus(super::filter_column_input_id(0)));
+        let (_, output) = filter_manager_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Text("Repeated".into())],
+            size,
+        );
+        assert_eq!(app.filter_rules[0].column_search, "Repeated");
+        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::TextInput
+                && node.label() == Some("Search columns for rule 1")
+        }));
+        for label in ["3: Repeated", "97: Repeated"] {
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(label))
+            );
+        }
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![egui::Event::Copy], size);
+        assert!(!super::selection_copy_requested(&ctx, 1, None, None));
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "97: Repeated"),
+            size,
+        );
+        assert_eq!(app.filter_rules[0].column_input, "97");
+        let query = super::filter_query_from_rules(&app.filter_rules, false, 100).unwrap();
+        assert_eq!(query.predicates[0].column, 96);
+        app.apply(&ctx, Action::ApplyFilter);
+        let document = app.document.as_mut().unwrap();
+        finish_filter(document);
+        assert_eq!(document.available_filter_rows(), 1);
+        assert_eq!(document.visible_filter_rows()[0].row, 1);
+
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        assert!(
+            !output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| { node.label() == Some("Search columns for rule 1") }),
+            "selecting a column must close its picker"
+        );
+        let _ = filter_manager_frame(
+            &mut app,
+            &ctx,
+            filter_control_click(&output, "Rule 1 column"),
+            size,
+        );
+        let draft = super::filter_query_from_rules(&app.filter_rules, false, 100).unwrap();
+        let escape = || {
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        let (action, _) = filter_manager_frame(&mut app, &ctx, escape(), size);
+        assert!(action.is_none());
+        assert!(
+            app.filters_open,
+            "Escape must close the picker before Filters"
+        );
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        assert!(
+            !output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| { node.label() == Some("Search columns for rule 1") })
+        );
+        let (action, _) = filter_manager_frame(&mut app, &ctx, escape(), size);
+        assert!(action.is_none());
+        assert!(!app.filters_open);
+        assert_eq!(
+            super::filter_query_from_rules(&app.filter_rules, false, 100).unwrap(),
+            draft
+        );
+        assert_eq!(
+            app.document.as_ref().unwrap().filter_query.as_ref(),
+            Some(&query)
+        );
+        app.document.as_mut().unwrap().shutdown();
+        assert_eq!(fs::read_to_string(source).unwrap(), original);
+    }
+
+    #[test]
+    fn filter_footer_stays_visible_with_many_rules_in_a_small_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-layout.csv");
+        fs::write(&source, b"name\nfirst\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        app.filters_open = true;
+        app.filter_rules = vec![super::FilterRuleDraft::default(); 12];
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        super::configure_style(&ctx);
+        let size = egui::vec2(860.0, 540.0);
+        let check_footer = |output: &egui::FullOutput, controls: &[(&str, bool)]| {
+            for (label, disabled) in controls {
+                let (_, button) = accessible_button(output, label);
+                let bounds = button.bounds().unwrap();
+                assert!(bounds.x0 >= 0.0 && bounds.y0 >= 0.0);
+                assert!(
+                    bounds.x1 <= f64::from(size.x) && bounds.y1 <= f64::from(size.y),
+                    "{label} must remain visible in the footer: {bounds:?}"
+                );
+                assert_eq!(button.is_disabled(), *disabled, "{label}");
+            }
+        };
+        let _ = filter_manager_frame(&mut app, &ctx, vec![], size);
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        check_footer(&output, &[("Apply filters", true), ("Clear filter", true)]);
+        let tree = output.platform_output.accesskit_update.unwrap();
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|(_, node)| node.value() == Some("Enter text to match."))
+        );
+        assert!(!tree.nodes.iter().any(|(_, node)| {
+            node.value()
+                .is_some_and(|label| label.contains("invalid filter rule"))
+        }));
+        let document = app.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"first".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        let _ = filter_manager_frame(&mut app, &ctx, vec![], size);
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        check_footer(
+            &output,
+            &[
+                ("Apply filters", true),
+                ("Clear filter", false),
+                ("Export Filtered Rows…", false),
+            ],
+        );
+        app.document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "customer".into())
+            .unwrap();
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        check_footer(
+            &output,
+            &[
+                ("Apply filters", true),
+                ("Clear filter", false),
+                ("Export Filtered Rows…", true),
+            ],
+        );
+
+        let document = app.document.as_mut().unwrap();
+        document.clear_filter().unwrap();
+        commit_test_cell(document, 1, 0, "edited");
+        let _ = filter_manager_frame(&mut app, &ctx, vec![], size);
+        let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
+        check_footer(&output, &[("Apply filters", true), ("Clear filter", true)]);
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.value()
+                        == Some("Save or discard cell edits before filtering the source file.")
+                })
+        );
+        app.document.as_mut().unwrap().shutdown();
+    }
+
     #[test]
     fn numeric_filter_controls_validate_bounds_and_export_exact_rows() {
         fn render(
@@ -10751,7 +11320,10 @@ mod tests {
             .unwrap()
             .nodes
             .iter()
-            .find(|(_, node)| node.role() == egui::accesskit::Role::ComboBox)
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::ComboBox
+                    && node.label() == Some("Rule 1 match")
+            })
             .map(|(id, _)| *id)
             .unwrap();
         let (_, output) = render(&mut app, &ctx, click(combo));
@@ -10778,6 +11350,31 @@ mod tests {
         assert_eq!(app.filter_rules[0].operator, FilterOperator::Between);
         let (_, output) = render(&mut app, &ctx, vec![]);
         assert!(accessible_button(&output, "Apply filters").1.is_disabled());
+        for operator in [
+            FilterOperator::Contains,
+            FilterOperator::Equals,
+            FilterOperator::NotEquals,
+            FilterOperator::GreaterThan,
+            FilterOperator::GreaterThanOrEqual,
+            FilterOperator::LessThan,
+            FilterOperator::LessThanOrEqual,
+            FilterOperator::Between,
+        ] {
+            assert!(
+                !output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| {
+                        node.label() == Some(super::filter_operator_label(operator))
+                            && node.supports_action(egui::accesskit::Action::Click)
+                    }),
+                "operator choices must close after selecting Between"
+            );
+        }
         assert_eq!(
             output
                 .platform_output
@@ -10788,7 +11385,7 @@ mod tests {
                 .filter(|(_, node)| node.role() == egui::accesskit::Role::TextInput
                     && !node.labelled_by().is_empty())
                 .count(),
-            3
+            2
         );
 
         ctx.memory_mut(|memory| memory.request_focus(super::filter_value_input_id(0)));
@@ -10848,6 +11445,7 @@ mod tests {
     fn switching_numeric_filter_operators_keeps_text_and_case_preferences() {
         let mut rule = super::FilterRuleDraft {
             column_input: "1".into(),
+            column_search: String::new(),
             operator: FilterOperator::Between,
             value_input: "1".into(),
             upper_bound_input: "2".into(),
@@ -10925,7 +11523,7 @@ mod tests {
                     ) && !node.labelled_by().is_empty()
                 })
                 .count(),
-            2
+            1
         );
         assert!(tree.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::MultilineTextInput
@@ -11153,7 +11751,7 @@ mod tests {
                     ) && !node.labelled_by().is_empty()
                 })
                 .count(),
-            4
+            2
         );
         assert_eq!(
             tree.nodes
@@ -11162,7 +11760,7 @@ mod tests {
                     node.role() == egui::accesskit::Role::ComboBox && !node.labelled_by().is_empty()
                 })
                 .count(),
-            2
+            4
         );
         let remove_target = tree
             .nodes
@@ -11239,18 +11837,21 @@ mod tests {
         app.filter_rules = vec![
             super::FilterRuleDraft {
                 column_input: "2".into(),
+                column_search: String::new(),
                 operator: FilterOperator::Equals,
                 value_input: "tx".into(),
                 upper_bound_input: String::new(),
             },
             super::FilterRuleDraft {
                 column_input: "2".into(),
+                column_search: String::new(),
                 operator: FilterOperator::Equals,
                 value_input: "fL".into(),
                 upper_bound_input: String::new(),
             },
             super::FilterRuleDraft {
                 column_input: "3".into(),
+                column_search: String::new(),
                 operator: FilterOperator::NotEquals,
                 value_input: "INACTIVE".into(),
                 upper_bound_input: String::new(),
@@ -13183,6 +13784,102 @@ mod tests {
     }
 
     #[test]
+    fn tool_dialog_escape_only_closes_the_front_window() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), "name,amount\nAvery,20\n").unwrap();
+        let mut document = Document::open(file.path(), OpenOptions::default()).unwrap();
+        finish_index(&mut document);
+        let ctx = egui::Context::default();
+        let mut columns_open = true;
+        let mut filters_open = true;
+        let mut search = String::new();
+        let mut rules = vec![super::FilterRuleDraft::default()];
+        let mut match_case = false;
+        let escape_input = || egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..grid_input()
+        };
+        for _ in 0..2 {
+            let _ = ctx.run(grid_input(), |ctx| {
+                show_column_manager(ctx, &mut columns_open, &mut search, &document);
+                show_filter_manager(
+                    ctx,
+                    &mut filters_open,
+                    &mut rules,
+                    &mut match_case,
+                    &document,
+                );
+                ctx.move_to_top(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("quarry-filter-manager"),
+                ));
+            });
+        }
+        let _ = ctx.run(escape_input(), |ctx| {
+            show_column_manager(ctx, &mut columns_open, &mut search, &document);
+            show_filter_manager(
+                ctx,
+                &mut filters_open,
+                &mut rules,
+                &mut match_case,
+                &document,
+            );
+        });
+        assert!(columns_open);
+        assert!(!filters_open);
+
+        // A closed window's retained layer must not block the remaining tool window.
+        let _ = ctx.run(grid_input(), |ctx| {
+            show_column_manager(ctx, &mut columns_open, &mut search, &document);
+        });
+        let _ = ctx.run(escape_input(), |ctx| {
+            show_column_manager(ctx, &mut columns_open, &mut search, &document);
+        });
+        assert!(!columns_open);
+
+        columns_open = true;
+        filters_open = true;
+        let modal_id = egui::Id::new("column-tool-test-modal");
+        let _ = ctx.run(grid_input(), |ctx| {
+            show_column_manager(ctx, &mut columns_open, &mut search, &document);
+            show_filter_manager(
+                ctx,
+                &mut filters_open,
+                &mut rules,
+                &mut match_case,
+                &document,
+            );
+            egui::Modal::new(modal_id).show(ctx, |ui| {
+                ui.label("Confirmation");
+            });
+        });
+        let mut close_modal = false;
+        let _ = ctx.run(escape_input(), |ctx| {
+            show_column_manager(ctx, &mut columns_open, &mut search, &document);
+            show_filter_manager(
+                ctx,
+                &mut filters_open,
+                &mut rules,
+                &mut match_case,
+                &document,
+            );
+            close_modal = egui::Modal::new(modal_id)
+                .show(ctx, |ui| {
+                    ui.label("Confirmation");
+                })
+                .should_close();
+        });
+        assert!(columns_open && filters_open);
+        assert!(close_modal);
+    }
+
+    #[test]
     fn column_manager_exposes_clear_list_controls() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -13190,7 +13887,13 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("quarry-column-a11y-{name}.csv"));
         let headers = (1..=40)
-            .map(|column| format!("c{column}"))
+            .map(|column| {
+                if column == 2 {
+                    format!("c2_{}", "long_column_name_".repeat(12))
+                } else {
+                    format!("c{column}")
+                }
+            })
             .collect::<Vec<_>>()
             .join(",");
         fs::write(&path, format!("{headers}\n{}\n", vec!["x"; 40].join(","))).unwrap();
@@ -13212,6 +13915,11 @@ mod tests {
         let mut open = true;
         let mut search = String::new();
         let mut command = None;
+        for _ in 0..2 {
+            let _ = ctx.run(grid_input(), |ctx| {
+                show_column_manager(ctx, &mut open, &mut search, app.document.as_ref().unwrap());
+            });
+        }
         let output = ctx.run(grid_input(), |ctx| {
             command =
                 show_column_manager(ctx, &mut open, &mut search, app.document.as_ref().unwrap());
@@ -13242,10 +13950,61 @@ mod tests {
         let row_height = drag_bounds[0].y1 - drag_bounds[0].y0;
         let row_stride = drag_bounds[1].y0 - drag_bounds[0].y0;
         assert!((row_height - 36.0).abs() < f64::EPSILON);
-        assert!(
-            (row_stride - (36.0 + f64::from(ctx.style().spacing.item_spacing.y))).abs()
-                < f64::EPSILON
+        assert!((row_stride - 40.0).abs() < f64::EPSILON);
+        assert_eq!(drag_bounds[0].x0, drag_bounds[1].x0);
+        assert_eq!(drag_bounds[0].x1, drag_bounds[1].x1);
+        assert!(drag_bounds[0].x1 - drag_bounds[0].x0 > 450.0);
+        let name_left = [0, 1].map(|column| {
+            let name = app.document.as_ref().unwrap().column_name(column);
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == name => {
+                        Some(text.pos.x + text.galley.rect.left())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} should be rendered"))
+        });
+        assert_eq!(
+            name_left[0], name_left[1],
+            "Short and truncated names should align left"
         );
+
+        for _ in 0..2 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(860.0, 540.0),
+                    )),
+                    ..grid_input()
+                },
+                |ctx| {
+                    show_column_manager(
+                        ctx,
+                        &mut open,
+                        &mut search,
+                        app.document.as_ref().unwrap(),
+                    );
+                },
+            );
+            let tree = output.platform_output.accesskit_update.unwrap();
+            for label in ["Search columns", "Auto-fit columns", "Done", "Close"] {
+                let node = tree
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .unwrap_or_else(|| panic!("{label} should remain present"));
+                let bounds = node.1.bounds().unwrap();
+                assert!(!node.1.is_hidden());
+                assert!(
+                    bounds.y0 >= 0.0 && bounds.y1 <= 540.0,
+                    "{label}: {bounds:?}"
+                );
+            }
+        }
 
         ctx.data_mut(|data| {
             data.insert_persisted(egui::Id::new("quarry-selected-managed-column"), 1_usize);
@@ -13315,6 +14074,28 @@ mod tests {
         assert_eq!(
             &app.document.as_ref().unwrap().columns.order[..3],
             &[39, 0, 1]
+        );
+
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(super::COLUMN_SEARCH_INPUT_ID)));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..grid_input()
+            },
+            |ctx| {
+                show_column_manager(ctx, &mut open, &mut search, app.document.as_ref().unwrap());
+            },
+        );
+        assert!(!open);
+        assert_eq!(search, "c40");
+        assert!(
+            !ctx.memory(|memory| memory.has_focus(egui::Id::new(super::COLUMN_SEARCH_INPUT_ID)))
         );
 
         fs::remove_file(path).unwrap();
@@ -14004,6 +14785,22 @@ mod tests {
                 "missing accessible preview label {label}"
             );
         }
+        let (target, _) = accessible_button(&output, "Remove extra rows");
+        let mut preview_action = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| preview_action = super::show_duplicate_preview(ctx, summary),
+        );
+        assert_eq!(preview_action, Some(StructuralDialogAction::Apply));
         assert_eq!(document.session.path(), source);
         assert_eq!(document.cell_edits[&(3, 0)], b"a");
         assert!(!document.can_undo());
@@ -14291,15 +15088,11 @@ mod tests {
             .filter_map(|(_, node)| node.label().map(str::to_owned))
             .collect::<Vec<_>>();
         for label in [
-            "Text",
-            "Number",
-            "Character count",
-            "Word count",
-            "Shuffle",
-            "Reverse",
+            "Sort as",
             "Ascending",
             "Descending",
             "Match case",
+            "Details",
             "Sort",
             "Cancel",
         ] {
@@ -14326,6 +15119,31 @@ mod tests {
                 "missing accessible sort detail {detail}: {sort_description}"
             );
         }
+
+        let (action, output) = click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Sort as");
+        assert_eq!(action, None);
+        let tree = output.platform_output.accesskit_update.unwrap();
+        for label in [
+            "Text",
+            "Number",
+            "Character count",
+            "Word count",
+            "Shuffle",
+            "Reverse",
+        ] {
+            assert!(
+                tree.nodes.iter().any(|(_, node)| {
+                    node.label() == Some(label)
+                        && node.supports_action(egui::accesskit::Action::Click)
+                }),
+                "missing accessible sort choice {label}"
+            );
+        }
+        assert_eq!(
+            click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Text").0,
+            None
+        );
+        assert!(!egui::Popup::is_any_open(&ctx));
 
         app.open_structural_dialog(dialog);
         app.apply_structural_dialog_action(StructuralDialogAction::Apply);
@@ -14384,12 +15202,207 @@ mod tests {
         assert_eq!(redone_names, sorted_names);
     }
 
+    #[test]
+    fn structural_dialog_details_keep_actions_visible_and_escape_closes_popup_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("modal-layout.csv");
+        fs::write(&source, b"name,value\nAvery,1\nAvery,2\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        super::configure_style(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(860.0, 540.0));
+        let mut time = 0.0;
+        let mut render = |dialog: &mut StructuralDialog, events| {
+            time += 0.1;
+            let mut action = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    action = show_structural_dialog(
+                        ctx,
+                        dialog,
+                        &mut app.sort_match_case,
+                        app.document.as_ref().unwrap(),
+                    );
+                },
+            );
+            (action, output)
+        };
+        let visible = |output: &egui::FullOutput, label: &str| {
+            output.shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Text(text) => {
+                    text.galley.text() == label
+                        && shape.clip_rect.contains_rect(text.visual_bounding_rect())
+                        && screen.contains_rect(text.visual_bounding_rect())
+                }
+                _ => false,
+            })
+        };
+        let mut dialog = StructuralDialog::sort(0);
+        let _ = render(&mut dialog, vec![]);
+        let (_, output) = render(&mut dialog, vec![]);
+        let detail = "Equal values keep their original order (stable sort). Missing values sort as empty cells.";
+        assert!(
+            !visible(&output, detail),
+            "advanced details start collapsed"
+        );
+        assert!(
+            output.shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Text(text) =>
+                    text.galley
+                        .text()
+                        .contains("Conservative temporary disk allowance:")
+                        && shape.clip_rect.contains_rect(text.visual_bounding_rect())
+                        && screen.contains_rect(text.visual_bounding_rect()),
+                _ => false,
+            }),
+            "disk allowance stays visible without opening Details"
+        );
+        let _ = render(&mut dialog, filter_control_click(&output, "Details"));
+        let (_, output) = render(&mut dialog, vec![]);
+        assert!(
+            output.shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Text(text) => text.galley.text() == detail,
+                _ => false,
+            }),
+            "opening Details renders the advanced explanation"
+        );
+        for label in ["Sort", "Cancel"] {
+            assert!(
+                visible(&output, label),
+                "{label} remains visible in a small window"
+            );
+        }
+        let _ = render(&mut dialog, filter_control_click(&output, "Sort as"));
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert_eq!(
+            render(
+                &mut dialog,
+                vec![individual_edit_key(
+                    egui::Key::Escape,
+                    egui::Modifiers::NONE
+                )]
+            )
+            .0,
+            None
+        );
+        assert!(!egui::Popup::is_any_open(&ctx));
+        let _ = render(&mut dialog, vec![]);
+        assert_eq!(
+            render(
+                &mut dialog,
+                vec![individual_edit_key(
+                    egui::Key::Escape,
+                    egui::Modifiers::NONE
+                )]
+            )
+            .0,
+            Some(StructuralDialogAction::Cancel)
+        );
+        assert_eq!(dialog.sort_mode, SortMode::Text);
+
+        let mut dialog = StructuralDialog::duplicates(vec![0, 1]);
+        let _ = render(&mut dialog, vec![]);
+        let (_, output) = render(&mut dialog, vec![]);
+        let _ = render(&mut dialog, filter_control_click(&output, "Details"));
+        let (_, output) = render(&mut dialog, vec![]);
+        for label in ["Find duplicates", "Cancel"] {
+            assert!(
+                visible(&output, label),
+                "{label} remains visible in a small window"
+            );
+        }
+        assert_eq!(
+            render(
+                &mut dialog,
+                vec![individual_edit_key(
+                    egui::Key::Escape,
+                    egui::Modifiers::NONE
+                )]
+            )
+            .0,
+            Some(StructuralDialogAction::Cancel)
+        );
+        assert!(app.document.as_ref().unwrap().structural_job.is_none());
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
+            .unwrap();
+        finish_duplicate_search(&mut app);
+        let Some(super::StructuralJob::DuplicatePreview { summary, .. }) =
+            &app.document.as_ref().unwrap().structural_job
+        else {
+            panic!("expected duplicate preview");
+        };
+        let mut render_preview = |events| {
+            time += 0.1;
+            let mut action = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| action = super::show_duplicate_preview(ctx, summary),
+            );
+            (action, output)
+        };
+        let _ = render_preview(vec![]);
+        let (_, output) = render_preview(vec![]);
+        let _ = render_preview(filter_control_click(&output, "Details"));
+        let (_, output) = render_preview(vec![]);
+        for label in [
+            "Extra duplicate rows: 1",
+            "Rows to keep: 1",
+            "The document has not changed. Retained rows stay intact and in the same relative order.",
+            "Remove extra rows",
+            "Cancel",
+        ] {
+            assert!(
+                visible(&output, label),
+                "{label} remains visible in the expanded preview at minimum window size"
+            );
+        }
+        assert_eq!(
+            render_preview(vec![individual_edit_key(
+                egui::Key::Escape,
+                egui::Modifiers::NONE
+            )])
+            .0,
+            Some(StructuralDialogAction::Cancel)
+        );
+        app.document.as_mut().unwrap().cancel_structural_edit();
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert_eq!(fs::read(source).unwrap(), b"name,value\nAvery,1\nAvery,2\n");
+    }
+
     fn click_sort_dialog_control(
         ctx: &egui::Context,
         dialog: &mut StructuralDialog,
         app: &mut QuarryApp,
         label: &str,
     ) -> (Option<StructuralDialogAction>, egui::FullOutput) {
+        if matches!(
+            label,
+            "Text" | "Number" | "Character count" | "Word count" | "Shuffle" | "Reverse"
+        ) && !egui::Popup::is_any_open(ctx)
+        {
+            assert_eq!(
+                click_sort_dialog_control(ctx, dialog, app, "Sort as").0,
+                None
+            );
+        }
         let output = ctx.run(grid_input(), |ctx| {
             show_structural_dialog(
                 ctx,

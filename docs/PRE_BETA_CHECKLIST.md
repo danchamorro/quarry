@@ -171,6 +171,62 @@ download still needs release preparation, including supported-system testing,
 Developer ID signing, notarization, and license notices. Track packaging work
 through the [macOS packaging guide](MACOS_PACKAGING.md).
 
+## Interface polish follow-up
+
+The four functional priorities above remain complete. Interface polish uses the
+existing egui desktop on `codex/filter-dialog-polish`. Columns and Filters remain
+movable tool windows; Sort and Find Duplicates remain modal dialogs. The shared
+visual treatment uses consistent spacing, neutral surfaces, clear headers and
+footer actions, and the existing accent color for primary actions.
+
+Filters adds a searchable source-column picker, adjacent Between bounds, inline
+validation, scrollable rules with visible footer actions, and expandable matching
+details. Closing the tool window preserves draft rules and the active filter.
+
+- [x] Validate the redesigned Filters window in the native app. Checked name
+  and source-number search, adjacent range bounds, Tab navigation, numeric
+  filtering and Clear, menu dismissal, contrast, and moving the window.
+- [x] Pass formatting, workspace Clippy, all 294 workspace tests, the release
+  build, and local bundle validation. Interaction regressions cover multiline
+  values, hidden/reordered source columns beyond 64, Escape and draft
+  preservation, picker height after searching and reopening, and footer bounds
+  at 860 by 540 with active and blocked states.
+- [x] Complete owner review of Filters before extending the design. The owner
+  approved the update and requested the remaining dialog improvements.
+- [x] Validate Columns with aligned full-width rows, drag handles, original
+  source-column numbers, search, visibility, reorder, Reset, and Auto-fit.
+- [x] Validate Sort with a compact mode picker, direction buttons, Text-only
+  Match case, visible selected-column and storage information, and expandable
+  Details. Preserve all six sorting modes and cancellation.
+- [x] Validate Find Duplicates and its review with selected-column and
+  keep-first summaries, matching Details, reviewed counts, explicit removal,
+  cancellation, and Undo/Redo.
+- [x] Pass formatting, strict workspace Clippy, all 296 workspace tests
+  (including 115 GUI tests), the release build, and local bundle verification.
+
+**Remaining-dialog evidence:** automated interaction checks cover all six Sort
+modes, accessible controls, popup-first Escape, expanded Details and footer
+bounds at 860 by 540, and source preservation. Columns checks cover equal row
+widths, left-aligned short and truncated names, search, visibility, Reset,
+Auto-fit, source-column reorder commands, and Escape. Duplicate review checks
+cover visible counts and actions at the same minimum window size, explicit
+removal, cancellation, and retained history.
+
+Native checks passed Columns search, hide, Reset, Auto-fit, Escape, and visual
+name alignment. Dragging the Note column to the top updated both the list and
+grid while retaining source-column number 6; Reset restored source order 1
+through 6. Number sorting produced `100, 500, 500, 1000, 1200`; Undo restored
+the original order.
+Finding duplicates by first name reported one extra row and four rows to keep.
+Expanded Details and Cancel left all five rows intact; explicit removal left
+four rows, Undo restored five, Redo returned to four, and a final Undo restored
+the clean document. The original 274-byte source remained byte-identical.
+This native check exercised Number sorting; the other modes have automated
+coverage.
+
+A terminal UI remains a future, separate frontend. This work does not implement
+it.
+
 ## Follow-ups that do not block this checklist
 
 - Date/time sorting remains planned in [Phase 6D](ROADMAP.md#phase-6d-date-and-time-sorting-planned).
