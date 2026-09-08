@@ -10,8 +10,9 @@ The local clean candidate is now version **0.1.0 (98)** at
 `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`. Its locked checks, notice-resource
 verification, Developer ID signing, notarization, and local native smoke test
 passed. The owner also reported that the final candidate worked in the existing
-Parallels VM. The owner selected a small invited Apple Silicon tester group for
-the first beta. The installed host baseline is unchanged. Fresh-environment acceptance,
+Parallels VM. The owner chose an invitation-only Apple Silicon rollout for the
+first beta; individual testers have not been selected. The installed host
+baseline is unchanged. Fresh-environment acceptance,
 supported macOS versions, final owner acceptance, and public-distribution gates
 remain open; no beta has been published.
 
@@ -333,5 +334,5 @@ Complete this record for the exact candidate before closing the release gates:
 | Install/update/rollback and installed revision | Candidate checks pending; installed host remains clean `b461771` |
 | Project/dependency notice audit | Locked ARM64/Rust 1.88.0 source review recorded in [AUDIT.md](../packaging/licenses/AUDIT.md), 55 supplemental records and ten verified candidate resources; four embedded fonts and system-only native links verified |
 | Signed package hash, signing and notarization results | Stapled ZIP SHA-256 `13d0d467d76e394faa4243d1602d8a0d9d0afea40b78f6da1b8d2d02e75355f2`; submission `a2bd2114-03b8-4221-98bd-a785c2e9c2ae` accepted without issues; signature, staple, local Gatekeeper, and extracted-byte checks passed; fresh-environment acceptance pending |
-| Known issues, feedback triage, and release notes | [Invited tester guide](BETA_TESTER_GUIDE.md) prepared; owner approval and tester selection pending |
+| Known issues, feedback triage, and release notes | [Invited tester guide](BETA_TESTER_GUIDE.md) prepared; guide approval and selection of individual invitees pending |
 | Final owner acceptance and release authorization | Pending |
