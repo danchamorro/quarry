@@ -10,8 +10,9 @@ The local clean candidate is now version **0.1.0 (98)** at
 `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`. Its locked checks, notice-resource
 verification, Developer ID signing, notarization, and local native smoke test
 passed. The owner also reported that the final candidate worked in the existing
-Parallels VM. The installed host baseline is unchanged. Fresh-environment acceptance,
-supported-platform scope, final owner acceptance, and public-distribution gates
+Parallels VM. The owner selected a small invited Apple Silicon tester group for
+the first beta. The installed host baseline is unchanged. Fresh-environment acceptance,
+supported macOS versions, final owner acceptance, and public-distribution gates
 remain open; no beta has been published.
 
 Preparation changes on `codex/beta-preparation` were validated before commit
@@ -21,7 +22,9 @@ verified; its rollback archive preserved the prior clean `69d5f15` app.
 The new `codex/beta-license-audit` work is separate from that installed baseline.
 
 The [pre-beta checklist](PRE_BETA_CHECKLIST.md) holds feature evidence. This
-checklist tracks the exact candidate that may be released. Follow the
+checklist tracks the exact candidate that may be released. The
+[tester guide](BETA_TESTER_GUIDE.md) prepares the invited test round; no download
+provider or public launch has been selected. Follow the
 [packaging guide](MACOS_PACKAGING.md) for build, signing, installation, and
 rollback procedures. Keep app bundles local; do not upload them to GitHub.
 
@@ -57,7 +60,9 @@ OS 11.0 and SDK 26.5; native acceptance has only been recorded on macOS 26.6.2.
   corrupted output, and failed cancellation or recovery before release. Record
   accepted nonblocking issues with their workarounds in candidate release notes.
 - [ ] Confirm the platform and architecture scope for this beta. Leave every
-  untested platform explicitly unsupported in its release notes.
+  untested platform explicitly unsupported in its release notes. The owner
+  selected Apple Silicon Macs for the invited group; only macOS 26.6.2 has
+  acceptance evidence so far, and supported macOS versions remain to be confirmed.
 
 ### Reproducible build and validation
 
@@ -281,6 +286,24 @@ one packaging-preflight issue. The preflight now checks the configured
 The full verification command passed with an absolute compiler path containing
 spaces and no `rustc` on `PATH`; a missing configured compiler was rejected.
 
+A bounded 1 GB CLI/core acceptance run reused the synthetic numeric-filter
+fixture (1,000,000,155 bytes, 5,179,437 records). The CLI was rebuilt at
+`919550b`; CLI/core/delimited source, manifests, lockfile, and toolchain inputs
+matched `cbd9446` before and after the run. All five numeric filter counts matched
+the independent Decimal oracle. The combined Between/TX export contained
+1,724,748 records and 334,036,832 bytes; every raw record matched in source order,
+with SHA-256 `15ae1c8da605746863e3e3982c4ab6266355e64d4dd8c81c0cc21ff63595ccc9`.
+The source SHA-256 stayed
+`b93bdd33d096f195105ced2eb07155d4ac880d7bcb15e2c221d30ace085c2126`.
+Filter and export cancellation both stopped after 101,711,872 bytes; neither a
+cancelled destination nor export temporary artifacts remained. Worker times
+were 1.014 s for filtering and 1.306 s for export; CLI-reported peak RSS was
+28.80 MiB and 4.27 MiB respectively. This warm-cache run validates the shared
+engine, not GUI navigation or larger-than-RAM performance. It used the existing
+[benchmark verifier](benchmarks/2026-09-05-numeric-filters.md), retaining its
+published constants and byte/cancellation assertions. Detailed local evidence
+is in `/private/tmp/quarry-beta-numeric-253tegqy/acceptance-summary.json`.
+
 Linux core/CLI validation uses the following bounded package scope, without the
 desktop crates. A Debian 12 Docker container on `aarch64-unknown-linux-gnu` with
 Rust 1.88.0 passed all 180 tests (core 142, CLI 29, delimited 9) and the locked
@@ -306,9 +329,9 @@ Complete this record for the exact candidate before closing the release gates:
 | Supported OS/hardware acceptance runs | Owner-reported final-candidate retest passed in the existing macOS 26.6.2 ARM64 VM; supported-system scope and fresh-environment acceptance remain open |
 | CI and locked validation results | Local formatting, strict Clippy, 296 workspace tests, locked release build, 12 notice tests, packaging self-tests, and notice release check passed; PR #42 macOS/Linux CI at `5d7fc88` passed; compiler-preflight review fix included in the follow-up |
 | Linux core/CLI evidence, separate from desktop support | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI at `5a24874`, Rust 1.88.0: 180 tests and release builds passed; repeat for the final candidate |
-| Connected workflow and large-file results | Pending |
+| Connected workflow and large-file results | 1 GB shared CLI/core numeric filtering, exact export, source preservation, and cancellation passed with source inputs matching `cbd9446`; full GUI connected-workflow and large-file acceptance remain open |
 | Install/update/rollback and installed revision | Candidate checks pending; installed host remains clean `b461771` |
 | Project/dependency notice audit | Locked ARM64/Rust 1.88.0 source review recorded in [AUDIT.md](../packaging/licenses/AUDIT.md), 55 supplemental records and ten verified candidate resources; four embedded fonts and system-only native links verified |
 | Signed package hash, signing and notarization results | Stapled ZIP SHA-256 `13d0d467d76e394faa4243d1602d8a0d9d0afea40b78f6da1b8d2d02e75355f2`; submission `a2bd2114-03b8-4221-98bd-a785c2e9c2ae` accepted without issues; signature, staple, local Gatekeeper, and extracted-byte checks passed; fresh-environment acceptance pending |
-| Known issues, feedback triage, and release notes | Pending |
+| Known issues, feedback triage, and release notes | [Invited tester guide](BETA_TESTER_GUIDE.md) prepared; owner approval and tester selection pending |
 | Final owner acceptance and release authorization | Pending |
