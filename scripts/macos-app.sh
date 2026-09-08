@@ -25,6 +25,10 @@ INSTALL_REPLACED=false
 INSTALL_COMMITTED=false
 BACKUP_TEMP=""
 BACKUP_VERIFY_DIR=""
+LICENSE_RESOURCES=(LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html
+    Rust/COPYRIGHT-library.html Rust/COPYRIGHT-backtrace.html
+    Rust/LICENSE-MIT Rust/LICENSE-APACHE Rust/Unicode-3.0.txt
+    Rust/compiler-builtins-libm-LICENSE.txt Rust/compiler-rt-CREDITS.TXT)
 
 fail() {
     printf 'error: %s\n' "$*" >&2
@@ -34,7 +38,7 @@ fail() {
 require_macos() {
     [[ "$(uname -s)" == "Darwin" ]] || fail "macOS packaging must run on macOS."
     [[ -x "$LSREGISTER" ]] || fail "LaunchServices registration tool is unavailable."
-    for command in cargo codesign git lipo lockf plutil python3 rustc sips unzip; do
+    for command in cargo codesign git lipo lockf plutil python3 "${RUSTC:-rustc}" sips unzip; do
         command -v "$command" >/dev/null || fail "required command is unavailable: $command"
     done
 }
@@ -99,7 +103,7 @@ verify_app_licenses() {
     local app="$1"
     local notice
 
-    for notice in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html; do
+    for notice in "${LICENSE_RESOURCES[@]}"; do
         [[ -s "$app/Contents/Resources/Licenses/$notice" ]] || {
             printf 'error: license notice is missing or empty: %s\n' "$notice" >&2
             return 1
@@ -174,7 +178,7 @@ backup_app() {
 
 package_app() {
     local package_id version build revision source_status source_changes
-    local architecture host_target binary app plist post_revision post_changes
+    local architecture host_target rust_release rustc_info binary app plist post_revision post_changes
 
     [[ -f "$PLIST_TEMPLATE" ]] || fail "Info.plist template is missing."
     [[ -f "$ICON_SOURCE" ]] || fail "icon source is missing."
@@ -196,9 +200,11 @@ package_app() {
     fi
     source_status=clean
     [[ -z "$source_changes" ]] || source_status=dirty
-    host_target="$(rustc -vV | /usr/bin/sed -n 's/^host: //p')"
+    rustc_info="$(cd "$ROOT" && "${RUSTC:-rustc}" -vV)"
+    host_target="$(/usr/bin/sed -n 's/^host: //p' <<< "$rustc_info")"
+    rust_release="$(/usr/bin/sed -n 's/^release: //p' <<< "$rustc_info")"
     [[ -n "$host_target" ]] || fail "could not determine the native Rust target."
-    "$ROOT/scripts/generate-notices.sh" --check --target "$host_target"
+    "$ROOT/scripts/generate-notices.sh" --check --target "$host_target" --rust-release "$rust_release"
     (
         cd "$ROOT"
         cargo build --release --locked --target "$host_target" --target-dir "$ROOT/target" -p quarry-egui
@@ -221,6 +227,7 @@ package_app() {
     /bin/mkdir -p "$app/Contents/Resources/Licenses"
     /bin/cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" \
         "$ROOT/packaging/licenses/THIRD_PARTY_NOTICES.html" "$app/Contents/Resources/Licenses/"
+    /bin/cp -R "$ROOT/packaging/licenses/rust" "$app/Contents/Resources/Licenses/Rust"
     /usr/bin/install -m 0755 "$binary" "$app/Contents/MacOS/$EXECUTABLE"
     /bin/cp "$PLIST_TEMPLATE" "$plist"
     /usr/bin/plutil -replace CFBundleShortVersionString -string "$version" "$plist"
@@ -376,12 +383,12 @@ self_test_licenses() {
     local test_root notice
 
     test_root="$(mktemp -d /private/tmp/quarry-license-test.XXXXXX)"
-    /bin/mkdir -p "$test_root/Contents/Resources/Licenses"
-    for notice in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html; do
+    /bin/mkdir -p "$test_root/Contents/Resources/Licenses/Rust"
+    for notice in "${LICENSE_RESOURCES[@]}"; do
         printf 'test notice\n' > "$test_root/Contents/Resources/Licenses/$notice"
     done
     verify_app_licenses "$test_root" || fail "complete license notices were rejected."
-    for notice in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html; do
+    for notice in "${LICENSE_RESOURCES[@]}"; do
         : > "$test_root/Contents/Resources/Licenses/$notice"
         if verify_app_licenses "$test_root" 2>/dev/null; then
             fail "empty license notice was accepted: $notice"

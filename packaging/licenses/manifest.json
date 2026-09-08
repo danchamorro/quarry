@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "e4db8e990d4eead07ec724e58221dcad997260f8e3b806b59b661fafadb5ee43",
+  "artifact_sha256": "6a816f8e7da6ec6ff2fed36f8a666c1d6eeab062ed927aaf3915a8da5615a3e3",
   "cargo_about_version": "0.9.2",
   "inputs": {
     "Cargo.lock": "1db53032b5cff52baf788f8c05590a715707226342651c8b48f88c3e669564d4",
@@ -11,12 +11,20 @@
     "apps/quarry-egui/Cargo.toml": "e176d5db92692bd1b572b4ae8e2306b95065f164140eebe460859b4b22e55558",
     "crates/quarry-core/Cargo.toml": "632f8c8855a32f9c7dce1dabd01b3dcf0451ab22bb3d42cd429fab83512c5301",
     "crates/quarry-delimited/Cargo.toml": "b0a79530d15e05119b569db3fbb163ae8e087914c011cd643a18527b50b8bf38",
-    "packaging/licenses/AUDIT.md": "cf2429181c80ed7f0fb1abfd3f83cc4291ab9693cfb393ef5cefa6363c2b6912",
-    "packaging/licenses/about.toml": "5f923b487f7189351ecbcc97c27bef86df4abfcb2c65cda7ca4acc61f040df68",
-    "packaging/licenses/generate.py": "4ec6b576b63b4bc48eac47e904ddd743b8f5d81de6bc136310f80c4f55cd7c8f",
-    "packaging/licenses/supplemental.json": "a5a5c0921709c90b6718680d7f7d1b53909d5311c9178e7cbce052a06218e6e7",
+    "packaging/licenses/AUDIT.md": "181517e0217f3ca461609d588354877eead7194c97b7015c6e3b92f8c367609f",
+    "packaging/licenses/about.toml": "54ab7c30a244deedfa6607019e5244d051914e7fe60e7544601f93e3dc7fd56d",
+    "packaging/licenses/generate.py": "83701b8a0f404685b02e67412b9042cc26a2f9356091311b358e45e0582c5919",
+    "packaging/licenses/rust/COPYRIGHT-backtrace.html": "ed318e350828d1a6eeaa75311513b506d21bd9153a470c8e7c44a4c5bf3c8267",
+    "packaging/licenses/rust/COPYRIGHT-library.html": "3d3f60160f5214efa0a7fd804102d02ce9ea6af04b5249a19eeb243450246ae9",
+    "packaging/licenses/rust/LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    "packaging/licenses/rust/LICENSE-MIT": "b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1",
+    "packaging/licenses/rust/Unicode-3.0.txt": "f5062c9a188d81dfe66b56db4182dcf9e4b17c0d9b0d311a8e20b3a1b075c443",
+    "packaging/licenses/rust/compiler-builtins-libm-LICENSE.txt": "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7",
+    "packaging/licenses/rust/compiler-rt-CREDITS.TXT": "a9901f47a089da41e4690682d00ce4cedaa2baf41fedbe79beee366d43ac2461",
+    "packaging/licenses/supplemental.json": "212a2f00b57c52429d6f1b86be7591f2df735083dbe84ec6c1eb4617c2fb5536",
+    "rust-toolchain.toml": "1492287aa0b458ad3277d11eae2175fb662a33e7d7958ec99a057973f2bac1a2",
     "scripts/generate-notices.sh": "88eba763ed0172649e8bd4a6c8ab828929acc80095027eff89983acd76395028"
   },
-  "status": "draft-unresolved",
+  "status": "collected",
   "target": "aarch64-apple-darwin"
 }
