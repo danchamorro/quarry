@@ -458,13 +458,22 @@ Save and Save As use a streaming rewrite rather than in-place record mutation.
 Save As publishes a selected destination and leaves the previous source
 unchanged. Save creates temporary output beside the current regular file,
 preserves its standard permissions, flushes and syncs the temporary file,
-checks for metadata-visible source changes when Save starts and immediately
+checks for external source changes when Save starts and immediately
 before replacement, then atomically replaces the source. If a change is
 detected, Quarry invalidates offset-backed navigation and requires discarding
 the unsaved edits plus reopening the source. Final-path symbolic links are
 rejected with guidance to use Save As. Cancellation observed before publication
 or a write failure removes temporary output without Quarry replacing the source
 or clobbering an existing destination.
+
+The source guard compares the open file and its current path, retaining checks
+for identity, size, modification time, and read-only state, plus Unix permission
+bits and ownership. On macOS, a valid,
+equal data-generation count allows a change to ctime alone, such as an
+extended-attribute update. The generation count never substitutes for identity,
+size, or modification-time checks. If the count is unavailable, invalid, or
+changed, a ctime change is still rejected conservatively. Other Unix platforms
+retain their ctime checks.
 
 The rewrite scans the active CSV once with the same quote-aware scanner used by
 the other streaming workers and applies any current sparse value edits. It can

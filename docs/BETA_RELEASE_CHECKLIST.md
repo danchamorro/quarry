@@ -11,8 +11,14 @@ The local clean candidate is now version **0.1.0 (98)** at
 verification, Developer ID signing, notarization, and local native smoke test
 passed. The owner also reported that the final candidate worked in the existing
 Parallels VM. The owner chose an invitation-only Apple Silicon rollout for the
-first beta; individual testers have not been selected. The installed host
-baseline is unchanged. Fresh-environment acceptance,
+first beta; individual testers have not been selected. PR #42 has since merged
+as `98c5747`; the clean local app, version 0.1.0 (103), was installed and its
+rollback archive verified. Its connected smoke check found that a harmless
+file-attribute change could trigger the external-source warning. After reload,
+editing, Undo/Redo, exact Save As, quit, and reopening passed with the source
+unchanged. The metadata-warning fix must be included in a new clean candidate
+before invitations; the frozen `cbd9446` ZIP remains historical evidence.
+Fresh-environment acceptance,
 supported macOS versions, final owner acceptance, and public-distribution gates
 remain open; no beta has been published.
 
@@ -20,7 +26,7 @@ Preparation changes on `codex/beta-preparation` were validated before commit
 from a dirty worktree based on `69d5f15`. Their local package passed verification, but it is not a release
 candidate. After PR #41 merged, the clean `b461771` build was installed and
 verified; its rollback archive preserved the prior clean `69d5f15` app.
-The new `codex/beta-license-audit` work is separate from that installed baseline.
+The notice-audit follow-up merged in [PR #42](https://github.com/danchamorro/quarry/pull/42).
 
 The [pre-beta checklist](PRE_BETA_CHECKLIST.md) holds feature evidence. This
 checklist tracks the exact candidate that may be released. The
@@ -37,7 +43,7 @@ minimum supported operating-system version.
 
 | Platform | Current evidence | Beta gate |
 |---|---|---|
-| macOS, Apple Silicon | Clean local `cbd9446` candidate: locked checks, signing, notarization, and native CSV smoke passed; installed `b461771` baseline remains on macOS 26.6.2 ARM64 | Choose and test supported macOS versions; complete fresh-environment and connected-workflow acceptance for `cbd9446` |
+| macOS, Apple Silicon | Historical `cbd9446` candidate passed locked checks, signing, notarization, and native CSV smoke; clean `98c5747` is installed on macOS 26.6.2 ARM64 | Build a new clean candidate with the metadata-warning fix; choose supported macOS versions and complete exact-candidate acceptance |
 | macOS, Intel | No release acceptance recorded | Decide whether this architecture is in the first beta; if included, build and test it on Intel hardware |
 | Linux, core and CLI | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI, Rust 1.88.0: 180 tests and locked release builds passed | Validate the final candidate; this does not claim Linux GUI support |
 | Linux, desktop | Current check fails because the native-dialog dependency requires a Linux backend | Select and validate the file-dialog backend, then check windowing, keyboard, accessibility, packaging, and native workflows before claiming support |
@@ -49,6 +55,29 @@ supported-system tests must agree. The installed baseline reports Mach-O minimum
 OS 11.0 and SDK 26.5; native acceptance has only been recorded on macOS 26.6.2.
 
 ## Candidate gates
+
+### Source metadata follow-up
+
+The `codex/source-metadata-warning` branch fixes metadata-only false alarms in
+the shared source guard used by edit Undo/Redo, Save, and private rewrites. On
+macOS, equal valid file-data generation counts permit ctime-only changes. Real
+rewrites, path replacement, size, modification time, permissions, and ownership
+changes remain guarded; unavailable counters keep conservative ctime checks.
+
+Validation before commit passed 303 macOS workspace tests, strict Clippy,
+formatting, locked release builds, packaging self-tests, and bundle verification.
+A Debian 12 ARM64 container passed 184 core/CLI/parser tests and locked release
+builds. Regressions cover metadata changes before startup and publication,
+same-length external writes with restored mtime, and unsupported/invalid counters.
+The regenerated notice HTML and all dependency versions are unchanged.
+
+The local ad-hoc package (dirty source based on `98c5747`, not an installed release
+candidate) passed a controlled native check: edit, add an xattr without changing
+CSV bytes or mtime, Undo, Redo, exact Save As, quit, and reopen. The original
+CSV was preserved. This test used LaunchServices file opening after a computer-use
+capture error in the native picker; it does not close file-picker acceptance.
+The fixed source still needs a clean candidate build, signing/notarization, and
+the remaining acceptance gates below before invitations.
 
 ### Product acceptance
 

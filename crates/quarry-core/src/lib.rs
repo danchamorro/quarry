@@ -4,6 +4,7 @@ mod filter;
 mod index;
 mod search;
 mod sort;
+mod source_stamp;
 mod storage;
 
 use std::borrow::Cow;
@@ -12,10 +13,10 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
+
+use source_stamp::SourceStamp;
 
 pub use case::CaseSensitivity;
 pub use export::{
@@ -250,39 +251,6 @@ pub struct Session {
     pub metrics: OpenMetrics,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceStamp {
-    len: u64,
-    modified: Option<SystemTime>,
-    readonly: bool,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanos: i64,
-}
-
-impl SourceStamp {
-    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            readonly: metadata.permissions().readonly(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            changed_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            changed_nanos: metadata.ctime_nsec(),
-        }
-    }
-}
-
 impl Session {
     pub fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self, QuarryError> {
         if options.rows == 0 || options.sample_bytes == 0 || options.bootstrap_limit == 0 {
@@ -300,9 +268,8 @@ impl Session {
         let open_started = Instant::now();
         let mut file = File::open(path.as_ref())?;
         let file_open = open_started.elapsed();
-        let metadata = file.metadata()?;
-        let file_size = metadata.len();
-        let source_stamp = SourceStamp::from_metadata(&metadata);
+        let source_stamp = SourceStamp::from_file(&file)?;
+        let file_size = source_stamp.file_size();
 
         let mut sample = vec![0; options.sample_bytes.min(file_size as usize)];
         let sample_len = read_up_to(&mut file, &mut sample)?;

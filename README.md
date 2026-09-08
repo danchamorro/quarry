@@ -154,7 +154,8 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - Cell edits and structural changes remain sparse or use private working files
   until an explicit Save or Save As succeeds.
 - Save publishes only after a complete same-directory temporary file is
-  flushed and synchronized. It also detects metadata-visible source changes.
+  flushed and synchronized. It also checks for external source changes before
+  publication; see the [source guard contract](docs/ARCHITECTURE.md#document-editing-and-persistence).
 - Save As refuses to overwrite an existing destination. Cancellation or
   failure removes unpublished temporary artifacts.
 - Choose a temporary working folder and review required and available storage
