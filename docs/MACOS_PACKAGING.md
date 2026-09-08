@@ -348,12 +348,19 @@ edits. The fixture hash was unchanged. The local `candidate-evidence.json`,
 `build-evidence.json`, and `notarization-log.json` record these checks alongside
 the frozen archives.
 
+The owner subsequently reported "Tested on VM and working" for the requested
+retest of the final clean candidate. This is owner-reported acceptance in the
+existing macOS 26.6.2 ARM64 Parallels VM; no newly created environment or
+independent verification of every workflow operation is claimed.
+
 This clean candidate is separate from the dirty 0.1.0 (97) trial tested in
 Parallels. It still needs fresh-environment acceptance, the final connected
 workflow and large-file checks, supported OS/architecture decisions, and exact
 candidate installation/update/rollback. The installed host app remains clean
-`b461771`. Source push, PR review and merge, release notes, and explicit release
-authorization remain open. No package has been published.
+`b461771`. Source changes are pushed in
+[PR #42](https://github.com/danchamorro/quarry/pull/42), whose macOS/Linux CI at
+`5d7fc88` passed. Review disposition and merge, release notes, and explicit
+release authorization remain open. No package has been published.
 
 This evidence is a documentation follow-up to the frozen build. A subsequent
 documentation commit does not change the candidate's `cbd9446` revision,

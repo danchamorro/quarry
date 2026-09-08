@@ -9,7 +9,8 @@ verification, reopening the preview file, and its six-column picker passed.
 The local clean candidate is now version **0.1.0 (98)** at
 `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`. Its locked checks, notice-resource
 verification, Developer ID signing, notarization, and local native smoke test
-passed. The installed host baseline is unchanged. Fresh-environment acceptance,
+passed. The owner also reported that the final candidate worked in the existing
+Parallels VM. The installed host baseline is unchanged. Fresh-environment acceptance,
 supported-platform scope, final owner acceptance, and public-distribution gates
 remain open; no beta has been published.
 
@@ -268,6 +269,18 @@ They have not replaced `/Applications/Quarry.app` or been published. The clean
 candidate still needs fresh-environment, full connected-workflow, large-file,
 installation/update/rollback, supported-system, and owner acceptance checks.
 
+After downloading the final clean candidate for the requested VM retest, the
+owner reported: "Tested on VM and working." This records a successful
+owner-reported retest in the existing macOS 26.6.2 ARM64 VM. It does not claim
+a newly created test environment or independently verified per-operation output.
+The macOS and Linux CI jobs, CLA, and secret scanning for
+[PR #42](https://github.com/danchamorro/quarry/pull/42) at `5d7fc88` passed.
+CodeRabbit CLI completed with zero findings; its separate GitHub review raised
+one packaging-preflight issue. The preflight now checks the configured
+`${RUSTC:-rustc}` executable, matching the compiler used by the build path.
+The full verification command passed with an absolute compiler path containing
+spaces and no `rustc` on `PATH`; a missing configured compiler was rejected.
+
 Linux core/CLI validation uses the following bounded package scope, without the
 desktop crates. A Debian 12 Docker container on `aarch64-unknown-linux-gnu` with
 Rust 1.88.0 passed all 180 tests (core 142, CLI 29, delimited 9) and the locked
@@ -290,8 +303,8 @@ Complete this record for the exact candidate before closing the release gates:
 |---|---|
 | Version, full commit, clean-source status | 0.1.0 (98), `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`, clean |
 | Build toolchain, SDK, deployment target, architecture | Rust 1.88.0, LLVM 20.1.5, SDK 26.5, Mach-O minimum macOS 11.0, ARM64; minimum declaration is not supported-OS acceptance |
-| Supported OS/hardware acceptance runs | Pending |
-| CI and locked validation results | Local formatting, strict Clippy, 296 workspace tests, locked release build, 12 notice tests, packaging self-tests, and notice release check passed; candidate PR/CI review pending |
+| Supported OS/hardware acceptance runs | Owner-reported final-candidate retest passed in the existing macOS 26.6.2 ARM64 VM; supported-system scope and fresh-environment acceptance remain open |
+| CI and locked validation results | Local formatting, strict Clippy, 296 workspace tests, locked release build, 12 notice tests, packaging self-tests, and notice release check passed; PR #42 macOS/Linux CI at `5d7fc88` passed; compiler-preflight review fix included in the follow-up |
 | Linux core/CLI evidence, separate from desktop support | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI at `5a24874`, Rust 1.88.0: 180 tests and release builds passed; repeat for the final candidate |
 | Connected workflow and large-file results | Pending |
 | Install/update/rollback and installed revision | Candidate checks pending; installed host remains clean `b461771` |

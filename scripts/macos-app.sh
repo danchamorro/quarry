@@ -38,7 +38,7 @@ fail() {
 require_macos() {
     [[ "$(uname -s)" == "Darwin" ]] || fail "macOS packaging must run on macOS."
     [[ -x "$LSREGISTER" ]] || fail "LaunchServices registration tool is unavailable."
-    for command in cargo codesign git lipo lockf plutil python3 rustc sips unzip; do
+    for command in cargo codesign git lipo lockf plutil python3 "${RUSTC:-rustc}" sips unzip; do
         command -v "$command" >/dev/null || fail "required command is unavailable: $command"
     done
 }
