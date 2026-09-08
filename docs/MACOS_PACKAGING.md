@@ -27,6 +27,8 @@ commit.
 
 The [beta release checklist](BETA_RELEASE_CHECKLIST.md) separates local package
 validation from the acceptance and distribution gates for a public candidate.
+The current frozen candidate is [0.1.0 (105), clean `159e149`](#clean-local-candidate-2026-09-08).
+The earlier trial and build 98 records below remain historical evidence.
 
 The plist declares macOS 11.0 as its minimum. The packaging command does not pin
 or verify the Mach-O deployment target, and the current acceptance run exercises
@@ -312,6 +314,9 @@ installed clean `b461771` host app was not replaced.
 
 ### Clean local candidate, 2026-09-07
 
+This historical candidate is superseded by build 105 below. The following
+record preserves the results and outstanding gates at the time it was frozen.
+
 The frozen candidate in `target/quarry-beta-candidate.cbd9446/` is version
 **0.1.0 (98)**, ARM64, from clean commit
 `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5` on `codex/beta-license-audit`.
@@ -366,3 +371,85 @@ This evidence is a documentation follow-up to the frozen build. A subsequent
 documentation commit does not change the candidate's `cbd9446` revision,
 clean-source metadata, build number, or archive hashes. Rebuilding from a
 different commit creates a different candidate requiring its own evidence.
+
+### Clean local candidate, 2026-09-08
+
+After [PR #43](https://github.com/danchamorro/quarry/pull/43) merged, version
+**0.1.0 (105)** was frozen at clean
+`159e14950f6b4694129a810e19299c2f7fb950df`, source tree
+`bace7d5898807191030309959e33852cc1c28750`. Local artifacts are under
+`target/quarry-beta-candidate.159e149.q4a2Kw/`. This tree equals the validated
+PR head `c37b797`: 303 macOS workspace tests, 184 Linux core/CLI/parser tests,
+strict Clippy, formatting, locked releases, and packaging self-tests passed
+before merge. The new clean package and bundle verification passed separately.
+The build used Rust 1.88.0, LLVM 20.1.5, SDK 26.5, and ARM64 on macOS 26.6.2.
+All ten license resources matched the reviewed files; notice HTML is unchanged.
+
+The installer updated `/Applications/Quarry.app` to the same clean revision
+and build and preserved its verified `Quarry-previous.zip` rollback backup.
+The installed ad-hoc executable SHA-256 is
+`de576c9745980dfc1c4bbc711c31d3e5eb65670402fe3e069d7896b7e20c1c37`.
+Native picker opening, a controlled ctime-only xattr change, Undo/Redo without
+reload, exact Save As with source preservation, quit, and native-picker reopen
+passed. This installed-app result is separate from signed-candidate acceptance.
+
+The candidate copy received a Developer ID signature. Apple accepted submission
+`30a565de-89ff-44ed-8ad9-dd74309250d1`, uploaded at
+`2026-09-08T14:19:52.640Z`, without issues. Signature verification, stapling,
+ticket validation, and local Gatekeeper assessment passed. After extraction,
+all bundle files matched, and bundle, ticket, and Gatekeeper checks passed.
+
+| Archive | Bytes | SHA-256 |
+|---|---:|---|
+| Submitted `Quarry-notarization.zip` | 3,609,527 | `269cad89142d176bdfb1d0cec70e39ad7772e143927bd2a61677f538bd70dd21` |
+| Repacked after stapling, `Quarry-notarized.zip` | 3,611,149 | `31e72cb0b8cafb62bca76e7d40b00ffcb6638fc10d5ca3100205e2ce8e7d80fb` |
+
+The candidate directory records `candidate-evidence.json`, `build-evidence.json`,
+`installed-evidence.json`, `installed-ui-evidence.json`, `candidate-ui-evidence.json`, and
+`notarization-log.json`. Its `large-file/acceptance-summary.json` records a new
+1 GB CLI/core numeric filter/export/cancellation run with independent exact-byte
+verification and unchanged source. This is warm-cache engine evidence, not
+packaged GUI or larger-than-RAM acceptance.
+
+The signed app extracted from the final ZIP passed native picker opening,
+a controlled xattr change, cell/header Undo/Redo, and exact Save As. Combined
+numeric/text filtering and exact three-row export, numeric sorting with
+Undo/Redo, and duplicate review Cancel/remove/Undo/Redo passed. Saved sort and
+keep-first duplicate outputs matched exact expected bytes. Quit was confirmed
+by process absence; native-picker reopen retained the edited header, cell,
+and multiline value in a clean four-row/six-column file. Sources stayed intact.
+
+The existing macOS 26.6.2 ARM64 Parallels VM received the ZIP through the local
+guest channel, and its SHA-256 matched. The old clean build 98 was archived and
+verified. Build 105 was installed by filesystem copy; build 98 was then restored
+to `/Applications/Quarry.app`, verified, and replaced again with the exact build
+105. Each version's bundle bytes, signature, and revision matched. Guest `spctl`
+accepted `Notarized Developer ID`, and the stapled ticket was present. The guest
+rollback archive is `/private/tmp/quarry-beta-105/Quarry-build98-rollback.zip`;
+`vm-evidence.json` records the checks. No quarantine attribute was present after
+the local transfer. This was file installation and rollback in an existing VM,
+not browser download, Finder installation, or offline/fresh-environment launch.
+The owner then opened the installed app and fixture. The clean build 105 process
+was verified, and a screenshot independently confirmed five rows, six columns,
+expected values, and completed indexing. A controlled xattr change while the
+file was open changed ctime without altering bytes, mtime, inode, or size.
+The owner reported completing VM edit/Undo/Redo/Save As/quit/reopen. Direct checks
+confirmed the 274-byte source unchanged and the 279-byte saved output exactly
+equal to the original with `Casey` changed to `Casey Beta`, SHA-256
+`0b32a5e9652c0db396afaffa76c38002988dd7ed56bcb3e0d56ac3c8a884464c`.
+`vm-save-verification.json` records this evidence. Undo/Redo and reopening remain
+owner-reported: the final inspection showed Finder with Quarry closed, so the
+reopened grid was not independently observed.
+
+Fresh-environment launch, broader connected-workflow checks, GUI large-file
+checks, supported macOS versions, and normal download/Finder installation
+remain pending. Only macOS 26.6.2 ARM64 has native
+evidence. Broader checks include more than 64 columns, Unicode/missing fields,
+keyboard/accessibility/window size, and selected temporary-folder/insufficient-space
+GUI handling. No fresh-VM or browser-quarantine acceptance is claimed. Individual testers,
+private delivery, and release approval are still
+open; no invitations or package publication have occurred.
+
+This documentation follow-up does not change the frozen `159e149` app, build
+number, clean-source status, or archive hashes. The installed local ad-hoc app
+and the Developer ID signed candidate remain separately identified artifacts.
