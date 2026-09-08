@@ -1,4 +1,4 @@
-# Selection inputs for a draft notice inventory, not a release approval policy.
+# Automated selection inputs. Reviewed alternatives are recorded in supplemental.json.
 accepted = ["MIT", "Apache-2.0", "Unicode-3.0", "OFL-1.1", "Ubuntu-font-1.0", "Zlib", "ISC"]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true

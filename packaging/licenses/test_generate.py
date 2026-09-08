@@ -21,6 +21,7 @@ class NoticeChecks(unittest.TestCase):
         manifest = json.loads((ROOT / "packaging/licenses/manifest.json").read_text())
         files = list(manifest["inputs"]) + [
             "packaging/licenses/manifest.json",
+            "packaging/licenses/reviewed.sha256",
             "packaging/licenses/THIRD_PARTY_NOTICES.html",
         ]
         for relative in files:
@@ -37,7 +38,7 @@ class NoticeChecks(unittest.TestCase):
     def test_current_inventory_passes_offline(self):
         result = self.run_check("--check", "--target", "aarch64-apple-darwin")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Legal completeness remains unresolved", result.stdout)
+        self.assertIn("Review is checked separately", result.stdout)
 
     def test_dependency_input_change_rejects_stale_inventory(self):
         for relative in ("Cargo.lock", "apps/quarry-egui/Cargo.toml"):
@@ -62,10 +63,59 @@ class NoticeChecks(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No notice inventory", result.stderr)
 
-    def test_fresh_inventory_does_not_clear_release_gate(self):
+    def test_other_compiler_cannot_use_runtime_inventory(self):
+        result = self.run_check("--check", "--rust-release", "1.89.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No runtime notice inventory", result.stderr)
+
+    def test_runtime_notice_change_rejects_inventory(self):
+        path = self.root / "packaging/licenses/rust/COPYRIGHT-library.html"
+        path.write_bytes(path.read_bytes() + b"changed runtime notice")
+        result = self.run_check("--check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stale or modified", result.stderr)
+
+    def test_reviewed_inventory_passes_review_check(self):
+        result = self.run_check("--release-check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Reviewed notice inventory matches", result.stdout)
+
+    def test_missing_review_rejects_inventory(self):
+        (self.root / "packaging/licenses/reviewed.sha256").unlink()
         result = self.run_check("--release-check")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Release notice audit is unresolved", result.stderr)
+        self.assertIn("Notice inventory review required", result.stderr)
+
+    def test_refreshed_inventory_does_not_renew_review(self):
+        path = self.root / "Cargo.lock"
+        path.write_bytes(path.read_bytes() + b"\n# new input\n")
+        generator = runpy.run_path(str(self.root / "packaging/licenses/generate.py"))
+        manifest_path = self.root / "packaging/licenses/manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["inputs"] = generator["inputs"]()
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        result = self.run_check("--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_check("--release-check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Notice inventory review required", result.stderr)
+
+    def test_selected_alternative_must_be_offered(self):
+        generator = runpy.run_path(str(self.root / "packaging/licenses/generate.py"))
+        notice = {"packages": ["example@1"], "source": "https://example.invalid/Zlib",
+                  "text": "Zlib terms", "sha256": generator["digest"](b"Zlib terms"),
+                  "selected_license": "Zlib"}
+        (self.root / "packaging/licenses/supplemental.json").write_text(
+            json.dumps({"notices": [notice], "assets": []}))
+        package = {"name": "example", "version": "1", "license": "MIT OR Zlib", "source": "registry"}
+        raw = {"crates": [{"package": package}], "licenses": [
+            {"id": "MIT", "source_path": None, "used_by": [{"crate": package}]}]}
+        rendered = generator["render"](raw)
+        self.assertIn(b"Selected license: Zlib", rendered)
+        self.assertNotIn(b"example@1: MIT", rendered)
+        package["license"] = "MIT"
+        with self.assertRaisesRegex(ValueError, "Selected license is not offered"):
+            generator["render"](raw)
 
     def test_url_notice_text_hash_is_checked_before_rendering_and_offline(self):
         path = self.root / "packaging/licenses/supplemental.json"

@@ -1,15 +1,19 @@
 # Beta release checklist
 
 **Status, 2026-09-07:** beta preparation is in progress. The four pre-beta
-features and dialog polish are merged. The clean installed macOS app at
-`69d5f1513cb3087710ee4053831f96f8f46948a3` passed the recorded native checks.
+features, dialog polish, and initial beta preparation are merged. The installed
+baseline at the start of the notice-audit follow-up is clean commit
+`b461771e6fe8b78be398208a9830d8c3e2c041c7` from
+[PR #41](https://github.com/danchamorro/quarry/pull/41). Installation, bundle
+verification, reopening the preview file, and its six-column picker passed.
 This is a validated local build, not a published beta or a supported-platform
 commitment. Final owner acceptance and public-distribution gates remain open.
 
 Preparation changes on `codex/beta-preparation` were validated before commit
 from a dirty worktree based on `69d5f15`. Their local package passed verification, but it is not a release
-candidate. The installed application remains the clean `69d5f15` baseline;
-the preparation package has not been installed.
+candidate. After PR #41 merged, the clean `b461771` build was installed and
+verified; its rollback archive preserved the prior clean `69d5f15` app.
+The new `codex/beta-license-audit` work is separate from that installed baseline.
 
 The [pre-beta checklist](PRE_BETA_CHECKLIST.md) holds feature evidence. This
 checklist tracks the exact candidate that may be released. Follow the
@@ -24,7 +28,7 @@ minimum supported operating-system version.
 
 | Platform | Current evidence | Beta gate |
 |---|---|---|
-| macOS, Apple Silicon | Clean installed `69d5f15` validated on macOS 26.6.2, ARM64; local preparation checks and packaging passed | Choose and test the supported macOS versions on the final candidate; complete signing and notarization |
+| macOS, Apple Silicon | Clean installed `b461771`, macOS 26.6.2 ARM64; PR checks, bundle verification, and native reopen/picker check passed | Choose and test the supported macOS versions on the final candidate; complete signing and notarization |
 | macOS, Intel | No release acceptance recorded | Decide whether this architecture is in the first beta; if included, build and test it on Intel hardware |
 | Linux, core and CLI | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI, Rust 1.88.0: 180 tests and locked release builds passed | Validate the final candidate; this does not claim Linux GUI support |
 | Linux, desktop | Current check fails because the native-dialog dependency requires a Linux backend | Select and validate the file-dialog backend, then check windowing, keyboard, accessibility, packaging, and native workflows before claiming support |
@@ -81,17 +85,19 @@ OS 11.0 and SDK 26.5; native acceptance has only been recorded on macOS 26.6.2.
 
 - [ ] Audit the locked dependencies and include Quarry's licenses and required
   third-party notices in the final package. Record the notice artifact and audit
-  result without changing the project's licenses or contributor terms. Draft
-  inclusion is complete, but attribution review remains open in the
-  [notice audit](../packaging/licenses/AUDIT.md). Freshness passes with
-  `./scripts/generate-notices.sh --check`; the separate `--release-check`
-  deliberately fails until the documented manual review gates are resolved.
-- [ ] Obtain a usable Developer ID Application identity and notarization
-  credentials. At preparation start no valid signing identity is available;
-  the presence of `notarytool` alone does not satisfy this gate.
+  result without changing the project's licenses or contributor terms. The
+  locked ARM64/Rust 1.88.0 source inventory is reviewed in the
+  [notice audit](../packaging/licenses/AUDIT.md), including the five resolved
+  notice gaps. Freshness uses `./scripts/generate-notices.sh --check`;
+  `--release-check` also requires the recorded review hash to match the exact
+  manifest. Final-package resources and binary contents still need verification.
+- [x] Obtain a usable Developer ID Application identity and notarization
+  credentials. Completed on 2026-09-07: signing succeeded and the validated
+  Keychain profile authenticated an accepted local trial submission.
 - [ ] Sign the exact candidate with the required runtime settings, verify it,
   complete notarization, staple the result, and test Gatekeeper acceptance on
-  a separate supported Mac. An ad-hoc local signature does not close this gate.
+  a fresh supported macOS environment (another Mac or a clean VM). An ad-hoc
+  local signature does not close this gate.
 - [ ] Obtain owner approval for the distribution arrangement and public release
   information. This checklist does not choose an offer, price, store, provider,
   or download channel.
@@ -162,12 +168,12 @@ Current boundaries to include in candidate notes:
 
 ## Release evidence
 
-The current application baseline is PR #40 at `69d5f15`: 296 workspace tests
+The application feature baseline is PR #40 at `69d5f15`: 296 workspace tests
 (115 GUI tests), strict Clippy, formatting, release build, bundle verification,
 and local native checks passed. The earlier Filters and remaining-dialog runs
 are recorded in the [interface polish evidence](PRE_BETA_CHECKLIST.md#interface-polish-follow-up).
-Final owner acceptance is still pending. Signing, notarization, and distribution
-approval are not complete.
+Final owner acceptance is still pending. Final-candidate signing, notarization,
+and distribution approval remain pending.
 
 Preparation validation on the dirty `codex/beta-preparation` worktree passed
 formatting, strict workspace Clippy, all 296 workspace tests, and the locked
@@ -177,18 +183,58 @@ generator regressions. Packaging and verification of
 `target/package/Quarry.app` passed with a local ad-hoc signature. These checks
 establish preparation progress, not final candidate acceptance or installation.
 
-The local package includes Quarry's MIT and Apache licenses and the
+The initial preparation package included Quarry's MIT and Apache licenses and the
 [draft third-party inventory](../packaging/licenses/THIRD_PARTY_NOTICES.html)
-under `Contents/Resources/Licenses/`. All three resources matched their source
+under `Contents/Resources/Licenses/`. Its three resources matched their source
 files exactly: `LICENSE-MIT` (1,076 bytes), `LICENSE-APACHE` (11,349 bytes), and
 `THIRD_PARTY_NOTICES.html` (158,767 bytes). The inventory covers 142 packages for
 the macOS ARM64 dependency selection and includes four font notices.
 
-The [audit](../packaging/licenses/AUDIT.md) records unresolved upstream copyright
-and attribution coverage, including AccessKit, the objc2 family, embedded fonts,
-and separate Rust/toolchain and platform review. The successful freshness check
-does not clear these gaps. The release check currently fails by design, and the
-final license gate above remains open.
+The [audit](../packaging/licenses/AUDIT.md) records source-backed additions
+for AccessKit, older/inherited objc2 notices, other crate attribution, embedded
+font metadata, and the actual Rust runtime. The five previously open gaps are
+resolved by preserving dispatch 0.2.0's explicit MIT declaration and canonical
+permission terms, and selecting the offered Zlib alternative for dispatch2
+0.3.1 and objc2 AppKit/CoreFoundation/CoreGraphics 0.3.2. The inventory contains
+55 supplemental records. Its separate review hash becomes stale when regenerated
+inputs change. The expanded package includes seven Rust resource files and rejects a
+compiler release without matching runtime notices.
+
+Before the final five-gap resolution, the `codex/beta-license-audit` follow-up
+passed formatting, strict Clippy, all
+296 workspace tests, the locked release build, and nine notice regressions.
+Package creation and signature verification passed from the dirty worktree.
+All ten bundled license resources matched their source files exactly: the
+expanded third-party HTML is 219,567 bytes, and seven Rust files total 462,709
+bytes. Missing/empty resource checks cover the full list. A packaging probe
+from another directory confirmed that `RUSTC` is queried inside the build
+checkout and an unsupported compiler is rejected before replacing the package.
+The installed app remains the clean `b461771` baseline during this follow-up;
+these package checks are not final candidate acceptance.
+
+After resolving the five recorded gaps, formatting, strict workspace Clippy,
+all 296 workspace tests, the locked release build, and packaging self-tests
+passed again. The notice suite now has 12 tests, including missing/stale review
+records and rejection of a license alternative the package does not offer.
+All 55 supplemental texts were verified in the generated HTML. The inventory
+review is recorded separately from the clean candidate's package and signing
+evidence. Candidate-specific results belong with the local candidate artifacts;
+the source review does not substitute for final owner acceptance.
+
+The [local notarization trial](MACOS_PACKAGING.md#local-notarization-trial-2026-09-07)
+on 2026-09-07 passed Developer ID signing, hardened runtime, secure timestamping,
+native CSV open/index/render, Apple notarization, ticket stapling/validation,
+and local Gatekeeper assessment. Apple reported no issues. The trial used the
+dirty `b461771` package and remained local; the installed host app was not
+replaced. The owner also confirmed successful first launch in a fresh
+Parallels macOS VM with its network disconnected before opening Quarry.
+Read-only guest checks confirmed macOS 26.6.2 (25G83), ARM64, and the expected
+dirty trial revision. The owner reported all five requested functional checks
+passed: open, combined text/numeric filtering, duplicate removal and undo,
+numeric sorting, and edit/Save As/quit/reopen. These are owner-reported workflow
+results, not a completed computer-use run. Repeat the release gates for the
+final clean candidate, including acceptance in a fresh supported macOS
+environment (another Mac or a clean VM).
 
 Linux core/CLI validation uses the following bounded package scope, without the
 desktop crates. A Debian 12 Docker container on `aarch64-unknown-linux-gnu` with
@@ -217,7 +263,7 @@ Complete this record for the exact candidate before closing the release gates:
 | Linux core/CLI evidence, separate from desktop support | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI at `5a24874`, Rust 1.88.0: 180 tests and release builds passed; repeat for the final candidate |
 | Connected workflow and large-file results | Pending |
 | Install/update/rollback and installed revision | Pending |
-| Project/dependency notice audit | Draft inventory and three bundled resources verified; freshness passed; release clearance remains unresolved in [AUDIT.md](../packaging/licenses/AUDIT.md) |
+| Project/dependency notice audit | Locked ARM64/Rust 1.88.0 source review recorded in [AUDIT.md](../packaging/licenses/AUDIT.md), 55 supplemental records and ten resources; exact clean candidate package verification pending |
 | Signed package hash, signing and notarization results | Pending |
 | Known issues, feedback triage, and release notes | Pending |
 | Final owner acceptance and release authorization | Pending |
