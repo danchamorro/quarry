@@ -232,9 +232,9 @@ before promising a minimum OS version.
 Apple's current [notarization guidance](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
 requires the appropriate Developer ID signature and hardened runtime for that
 distribution workflow. Signing, notarization submission, stapling, and
-Gatekeeper acceptance have now passed for the local trial below. Keep the final
-clean beta candidate and clean-environment acceptance gates open until that exact
-candidate has passed them.
+local Gatekeeper acceptance have now passed for both the trial and the clean
+candidate below. Fresh-environment acceptance remains open for the exact clean
+candidate; the earlier trial's VM results do not substitute for that check.
 
 ## Signing setup and local validation
 
@@ -309,3 +309,53 @@ This proves the signing account and notarization workflow, including the
 reported offline VM launch. The notice audit was reviewed separately afterward.
 The trial does not validate the final clean release candidate or authorize publication. The
 installed clean `b461771` host app was not replaced.
+
+### Clean local candidate, 2026-09-07
+
+The frozen candidate in `target/quarry-beta-candidate.cbd9446/` is version
+**0.1.0 (98)**, ARM64, from clean commit
+`cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5` on `codex/beta-license-audit`.
+Its Cargo and bundle versions agree. It was built with Rust 1.88.0
+(`6b00bc3880198600130e1cf62b8f8a93494488cc`), LLVM 20.1.5, and SDK 26.5.
+The Mach-O minimum is macOS 11.0, which is not a supported-system claim.
+The source executable SHA-256 before Developer ID signing is
+`b8e2414aff6e6b5b0e705b128c98a7148ae152d4a5d4cac8f29ea682ba40bfb6`.
+
+Formatting, strict Clippy, 296 workspace tests, the locked release build,
+12 notice tests, packaging self-tests, and the notice release check passed.
+All ten candidate license resources matched their reviewed files. The
+third-party HTML is 222,830 bytes, SHA-256
+`6a816f8e7da6ec6ff2fed36f8a666c1d6eeab062ed927aaf3915a8da5615a3e3`.
+All four embedded fonts were verified; native links contain only Apple system
+libraries and frameworks.
+
+Developer ID signature and bundle verification passed. Apple accepted
+submission `a2bd2114-03b8-4221-98bd-a785c2e9c2ae`, uploaded at
+`2026-09-08T01:57:51.561Z` (September 7 locally), with no reported issues.
+Staple validation and local Gatekeeper assessment passed, with Gatekeeper
+reporting `Notarized Developer ID`. Files extracted from the final ZIP matched
+the signed, stapled bundle.
+
+| Archive | Bytes | SHA-256 |
+|---|---:|---|
+| Submitted `Quarry-notarization.zip` | 3,606,646 | `bf5a19ca2f16b9277a2a896e7f977997c1aa1767821b46f94b44635921c7212a` |
+| Repacked after stapling, `Quarry-notarized.zip` | 3,608,251 | `13d0d467d76e394faa4243d1602d8a0d9d0afea40b78f6da1b8d2d02e75355f2` |
+
+The signed candidate also passed a local native smoke test: it opened a
+synthetic CSV through the native picker, indexed five records and six columns,
+rendered the expected values including multiline values, and quit without
+edits. The fixture hash was unchanged. The local `candidate-evidence.json`,
+`build-evidence.json`, and `notarization-log.json` record these checks alongside
+the frozen archives.
+
+This clean candidate is separate from the dirty 0.1.0 (97) trial tested in
+Parallels. It still needs fresh-environment acceptance, the final connected
+workflow and large-file checks, supported OS/architecture decisions, and exact
+candidate installation/update/rollback. The installed host app remains clean
+`b461771`. Source push, PR review and merge, release notes, and explicit release
+authorization remain open. No package has been published.
+
+This evidence is a documentation follow-up to the frozen build. A subsequent
+documentation commit does not change the candidate's `cbd9446` revision,
+clean-source metadata, build number, or archive hashes. Rebuilding from a
+different commit creates a different candidate requiring its own evidence.

@@ -6,8 +6,12 @@ baseline at the start of the notice-audit follow-up is clean commit
 `b461771e6fe8b78be398208a9830d8c3e2c041c7` from
 [PR #41](https://github.com/danchamorro/quarry/pull/41). Installation, bundle
 verification, reopening the preview file, and its six-column picker passed.
-This is a validated local build, not a published beta or a supported-platform
-commitment. Final owner acceptance and public-distribution gates remain open.
+The local clean candidate is now version **0.1.0 (98)** at
+`cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`. Its locked checks, notice-resource
+verification, Developer ID signing, notarization, and local native smoke test
+passed. The installed host baseline is unchanged. Fresh-environment acceptance,
+supported-platform scope, final owner acceptance, and public-distribution gates
+remain open; no beta has been published.
 
 Preparation changes on `codex/beta-preparation` were validated before commit
 from a dirty worktree based on `69d5f15`. Their local package passed verification, but it is not a release
@@ -28,7 +32,7 @@ minimum supported operating-system version.
 
 | Platform | Current evidence | Beta gate |
 |---|---|---|
-| macOS, Apple Silicon | Clean installed `b461771`, macOS 26.6.2 ARM64; PR checks, bundle verification, and native reopen/picker check passed | Choose and test the supported macOS versions on the final candidate; complete signing and notarization |
+| macOS, Apple Silicon | Clean local `cbd9446` candidate: locked checks, signing, notarization, and native CSV smoke passed; installed `b461771` baseline remains on macOS 26.6.2 ARM64 | Choose and test supported macOS versions; complete fresh-environment and connected-workflow acceptance for `cbd9446` |
 | macOS, Intel | No release acceptance recorded | Decide whether this architecture is in the first beta; if included, build and test it on Intel hardware |
 | Linux, core and CLI | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI, Rust 1.88.0: 180 tests and locked release builds passed | Validate the final candidate; this does not claim Linux GUI support |
 | Linux, desktop | Current check fails because the native-dialog dependency requires a Linux backend | Select and validate the file-dialog backend, then check windowing, keyboard, accessibility, packaging, and native workflows before claiming support |
@@ -56,9 +60,13 @@ OS 11.0 and SDK 26.5; native acceptance has only been recorded on macOS 26.6.2.
 
 ### Reproducible build and validation
 
-- [ ] Select the candidate version and exact clean commit. Confirm Cargo and
-  bundle version metadata agree, and use that revision for all final evidence.
-- [ ] Pass the required locked checks on the candidate:
+- [x] Select the candidate version and exact clean commit. Cargo and bundle
+  version are 0.1.0, bundle build is 98, and the candidate records clean
+  `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`. Subsequent documentation commits
+  do not change this frozen candidate or its recorded revision.
+- [x] Pass the required locked checks on the candidate. Formatting, strict
+  Clippy, 296 workspace tests, the release build, packaging self-tests, package
+  creation, and bundle verification passed:
 
   ```bash
   cargo fmt --all -- --check
@@ -83,21 +91,25 @@ OS 11.0 and SDK 26.5; native acceptance has only been recorded on macOS 26.6.2.
 
 ### Licenses and trusted distribution
 
-- [ ] Audit the locked dependencies and include Quarry's licenses and required
+- [x] Audit the locked dependencies and include Quarry's licenses and required
   third-party notices in the final package. Record the notice artifact and audit
   result without changing the project's licenses or contributor terms. The
   locked ARM64/Rust 1.88.0 source inventory is reviewed in the
   [notice audit](../packaging/licenses/AUDIT.md), including the five resolved
   notice gaps. Freshness uses `./scripts/generate-notices.sh --check`;
   `--release-check` also requires the recorded review hash to match the exact
-  manifest. Final-package resources and binary contents still need verification.
+  manifest. The clean candidate passed that gate; its ten license resources
+  matched the reviewed files, all four embedded fonts were verified, and native
+  links were confined to Apple system libraries and frameworks.
 - [x] Obtain a usable Developer ID Application identity and notarization
   credentials. Completed on 2026-09-07: signing succeeded and the validated
   Keychain profile authenticated an accepted local trial submission.
-- [ ] Sign the exact candidate with the required runtime settings, verify it,
-  complete notarization, staple the result, and test Gatekeeper acceptance on
-  a fresh supported macOS environment (another Mac or a clean VM). An ad-hoc
-  local signature does not close this gate.
+- [x] Sign the exact candidate with the required runtime settings, verify it,
+  complete notarization, and staple the result. Apple accepted clean `cbd9446`
+  with no issues; signature, staple, and local Gatekeeper checks passed.
+- [ ] Test that exact candidate's Gatekeeper acceptance on a fresh supported
+  macOS environment (another Mac or a clean VM). The earlier dirty trial's
+  successful offline VM launch does not close this gate.
 - [ ] Obtain owner approval for the distribution arrangement and public release
   information. This checklist does not choose an offer, price, store, provider,
   or download channel.
@@ -172,8 +184,8 @@ The application feature baseline is PR #40 at `69d5f15`: 296 workspace tests
 (115 GUI tests), strict Clippy, formatting, release build, bundle verification,
 and local native checks passed. The earlier Filters and remaining-dialog runs
 are recorded in the [interface polish evidence](PRE_BETA_CHECKLIST.md#interface-polish-follow-up).
-Final owner acceptance is still pending. Final-candidate signing, notarization,
-and distribution approval remain pending.
+Final owner acceptance and distribution approval are still pending. The clean
+candidate's signing and notarization results are recorded separately below.
 
 Preparation validation on the dirty `codex/beta-preparation` worktree passed
 formatting, strict workspace Clippy, all 296 workspace tests, and the locked
@@ -236,6 +248,26 @@ results, not a completed computer-use run. Repeat the release gates for the
 final clean candidate, including acceptance in a fresh supported macOS
 environment (another Mac or a clean VM).
 
+The clean local candidate at `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`,
+version 0.1.0 (98), passed the locked validation and reviewed notice gate.
+Its signed app opened a synthetic CSV through the native picker, indexed five
+records and six columns, rendered multiline values, and quit without edits;
+the fixture hash was unchanged. Apple accepted notarization submission
+`a2bd2114-03b8-4221-98bd-a785c2e9c2ae` with no issues. Signature verification,
+staple validation, local Gatekeeper assessment (`Notarized Developer ID`),
+and the comparison after ZIP extraction passed. The final stapled ZIP is
+3,608,251 bytes, SHA-256
+`13d0d467d76e394faa4243d1602d8a0d9d0afea40b78f6da1b8d2d02e75355f2`.
+
+The local directory `target/quarry-beta-candidate.cbd9446/` contains
+`candidate-evidence.json`, `build-evidence.json`, and `notarization-log.json`.
+The [packaging record](MACOS_PACKAGING.md#clean-local-candidate-2026-09-07)
+distinguishes submitted and stapled archives. These frozen artifacts remain
+at `cbd9446` when this evidence is documented in a subsequent source commit.
+They have not replaced `/Applications/Quarry.app` or been published. The clean
+candidate still needs fresh-environment, full connected-workflow, large-file,
+installation/update/rollback, supported-system, and owner acceptance checks.
+
 Linux core/CLI validation uses the following bounded package scope, without the
 desktop crates. A Debian 12 Docker container on `aarch64-unknown-linux-gnu` with
 Rust 1.88.0 passed all 180 tests (core 142, CLI 29, delimited 9) and the locked
@@ -256,14 +288,14 @@ Complete this record for the exact candidate before closing the release gates:
 
 | Evidence | Candidate record |
 |---|---|
-| Version, full commit, clean-source status | Pending |
-| Build toolchain, SDK, deployment target, architecture | Pending |
+| Version, full commit, clean-source status | 0.1.0 (98), `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`, clean |
+| Build toolchain, SDK, deployment target, architecture | Rust 1.88.0, LLVM 20.1.5, SDK 26.5, Mach-O minimum macOS 11.0, ARM64; minimum declaration is not supported-OS acceptance |
 | Supported OS/hardware acceptance runs | Pending |
-| CI and locked validation results | Pending |
+| CI and locked validation results | Local formatting, strict Clippy, 296 workspace tests, locked release build, 12 notice tests, packaging self-tests, and notice release check passed; candidate PR/CI review pending |
 | Linux core/CLI evidence, separate from desktop support | Debian 12 ARM64 container and Ubuntu 24.04 x86_64 CI at `5a24874`, Rust 1.88.0: 180 tests and release builds passed; repeat for the final candidate |
 | Connected workflow and large-file results | Pending |
-| Install/update/rollback and installed revision | Pending |
-| Project/dependency notice audit | Locked ARM64/Rust 1.88.0 source review recorded in [AUDIT.md](../packaging/licenses/AUDIT.md), 55 supplemental records and ten resources; exact clean candidate package verification pending |
-| Signed package hash, signing and notarization results | Pending |
+| Install/update/rollback and installed revision | Candidate checks pending; installed host remains clean `b461771` |
+| Project/dependency notice audit | Locked ARM64/Rust 1.88.0 source review recorded in [AUDIT.md](../packaging/licenses/AUDIT.md), 55 supplemental records and ten verified candidate resources; four embedded fonts and system-only native links verified |
+| Signed package hash, signing and notarization results | Stapled ZIP SHA-256 `13d0d467d76e394faa4243d1602d8a0d9d0afea40b78f6da1b8d2d02e75355f2`; submission `a2bd2114-03b8-4221-98bd-a785c2e9c2ae` accepted without issues; signature, staple, local Gatekeeper, and extracted-byte checks passed; fresh-environment acceptance pending |
 | Known issues, feedback triage, and release notes | Pending |
 | Final owner acceptance and release authorization | Pending |
