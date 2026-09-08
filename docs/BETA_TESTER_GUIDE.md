@@ -1,20 +1,21 @@
 # Quarry invited tester guide
 
-**Preparation draft:** the candidate below is retained as historical evidence.
-The metadata-warning fix needs a new clean signed candidate and updated version,
-hash, and acceptance results before this guide accompanies invitations.
+**Preparation draft:** remaining acceptance and owner approval precede invitations.
+Individual testers and private delivery have not been chosen.
 
-For a small invited group using Apple Silicon Macs. Use the private ZIP
-provided with your invitation.
+Apple Silicon invitees should use the owner-provided private ZIP.
 
 ## Candidate and compatibility
 
-- Candidate: **0.1.0 (98)**, clean revision
-  `cbd9446fb34b3b08d46d9fa85a07d77d4a5256d5`.
+- Candidate: **0.1.0 (105)**, clean revision
+  `159e14950f6b4694129a810e19299c2f7fb950df`.
 - Tested system: **macOS 26.6.2, Apple Silicon (ARM64)** only. Other macOS
   versions, Intel Macs, Linux, and Windows have no acceptance claim for this ZIP.
-- Archive: `Quarry-notarized.zip`, **3,608,251 bytes**, signed and notarized.
-- SHA-256: `13d0d467d76e394faa4243d1602d8a0d9d0afea40b78f6da1b8d2d02e75355f2`.
+- Local signed-ZIP checks passed editing, filtering/export, sort, duplicates,
+  Undo/Redo, and save/reopen. Fresh-environment and broader checks remain open.
+- Existing-VM installation/rollback/launch passed; edit/save workflow owner-reported, saved/source bytes verified.
+- Archive: `Quarry-notarized.zip`, **3,611,149 bytes**, signed and notarized.
+- SHA-256: `31e72cb0b8cafb62bca76e7d40b00ffcb6638fc10d5ca3100205e2ce8e7d80fb`.
 
 ## Install or update
 
