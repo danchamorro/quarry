@@ -2076,6 +2076,7 @@ dependencies = [
 name = "quarry-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memchr",
  "quarry-delimited",
  "rustix 1.1.4",

@@ -1162,7 +1162,7 @@ impl SaveAsJob {
                 ExportTarget::new_private_guarded(&source_path, destination, &source, expected)?
             }
             SaveTarget::Source(expected) => {
-                ExportTarget::replace_source(&source_path, source.metadata()?, expected)?
+                ExportTarget::replace_source(&source_path, &source, expected)?
             }
             SaveTarget::Existing {
                 destination,
@@ -1606,6 +1606,7 @@ enum Publication {
     },
     ReplaceSource {
         permissions: fs::Permissions,
+        source: File,
         source_stamp: SourceStamp,
     },
     GuardedReplaceExisting {
@@ -1727,7 +1728,7 @@ impl ExportTarget {
 
     fn replace_source(
         source: &Path,
-        metadata: fs::Metadata,
+        source_file: &File,
         expected: SourceStamp,
     ) -> Result<Self, QuarryError> {
         let path_metadata = fs::symlink_metadata(source)?;
@@ -1736,15 +1737,15 @@ impl ExportTarget {
                 "saving through a symbolic link is not supported; use Save As instead",
             ));
         }
-        let source_stamp = SourceStamp::from_metadata(&metadata);
-        if SourceStamp::from_metadata(&path_metadata) != expected || source_stamp != expected {
+        if !source_matches_stamp(source_file, source, &expected)? {
             return Err(QuarryError::SourceChanged);
         }
         Self::create(
             source.to_path_buf(),
             Publication::ReplaceSource {
-                permissions: metadata.permissions(),
-                source_stamp,
+                permissions: source_file.metadata()?.permissions(),
+                source: source_file.try_clone()?,
+                source_stamp: expected,
             },
         )
     }
@@ -1780,9 +1781,7 @@ impl ExportTarget {
                 error.into()
             }
         })?;
-        if SourceStamp::from_metadata(&path_metadata) != destination_stamp
-            || SourceStamp::from_metadata(&destination_file.metadata()?) != destination_stamp
-        {
+        if !source_matches_stamp(&destination_file, &destination, &destination_stamp)? {
             return Err(QuarryError::SourceChanged);
         }
         Self::create(
@@ -2014,11 +2013,16 @@ impl ExportTarget {
                 source_stamp,
                 ..
             } => source_matches_stamp(source, source_path, source_stamp)?,
-            Publication::ReplaceSource { source_stamp, .. } => {
+            Publication::ReplaceSource {
+                source,
+                source_stamp,
+                ..
+            } => {
                 fs::symlink_metadata(&self.destination)
                     .ok()
                     .filter(|metadata| !metadata.file_type().is_symlink())
-                    .is_some_and(|metadata| SourceStamp::from_metadata(&metadata) == *source_stamp)
+                    .is_some()
+                    && source_matches_stamp(source, &self.destination, source_stamp)?
             }
         };
         unchanged.then_some(()).ok_or(QuarryError::SourceChanged)
@@ -2100,11 +2104,12 @@ impl ExportTarget {
                 let destination_unchanged = fs::symlink_metadata(&self.destination)
                     .ok()
                     .filter(|metadata| !metadata.file_type().is_symlink())
-                    .is_some_and(|metadata| {
-                        SourceStamp::from_metadata(&metadata) == *destination_stamp
-                    })
-                    && SourceStamp::from_metadata(&destination_file.metadata()?)
-                        == *destination_stamp;
+                    .is_some()
+                    && source_matches_stamp(
+                        destination_file,
+                        &self.destination,
+                        destination_stamp,
+                    )?;
                 if !destination_unchanged {
                     self.remove_temporary()?;
                     return Err(QuarryError::SourceChanged);
@@ -2158,15 +2163,13 @@ pub(crate) fn source_matches_stamp(
     source_path: &Path,
     expected: &SourceStamp,
 ) -> Result<bool, QuarryError> {
-    if SourceStamp::from_metadata(&source.metadata()?) != *expected {
-        return Ok(false);
-    }
     let path_metadata = match fs::metadata(source_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    Ok(SourceStamp::from_metadata(&path_metadata) == *expected)
+    Ok(expected.matches_metadata(&path_metadata)
+        && expected.matches(&SourceStamp::from_file(source)?))
 }
 
 fn validate_destination(source: &Path, destination: &Path) -> Result<(), QuarryError> {
@@ -5612,9 +5615,9 @@ mod tests {
         #[cfg(unix)]
         {
             fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
-            let metadata = File::open(&source).unwrap().metadata().unwrap();
-            let stamp = crate::SourceStamp::from_metadata(&metadata);
-            let output = ExportTarget::replace_source(&source, metadata, stamp).unwrap();
+            let source_file = File::open(&source).unwrap();
+            let stamp = crate::SourceStamp::from_file(&source_file).unwrap();
+            let output = ExportTarget::replace_source(&source, &source_file, stamp).unwrap();
             assert_eq!(
                 fs::metadata(&output.temporary)
                     .unwrap()
@@ -5834,9 +5837,9 @@ mod tests {
         let source = fixture(original);
         let directory = source.parent().unwrap();
         crate::check_storage(directory, 1024).unwrap();
-        let metadata = fs::metadata(&source).unwrap();
-        let stamp = crate::SourceStamp::from_metadata(&metadata);
-        let mut output = ExportTarget::replace_source(&source, metadata, stamp).unwrap();
+        let source_file = File::open(&source).unwrap();
+        let stamp = crate::SourceStamp::from_file(&source_file).unwrap();
+        let mut output = ExportTarget::replace_source(&source, &source_file, stamp).unwrap();
         // Inject a writer that fails on flush after a successful capacity check.
         output.writer = Some(std::io::BufWriter::new(
             File::open(&output.temporary).unwrap(),
@@ -5869,9 +5872,9 @@ mod tests {
     #[test]
     fn cancelled_save_before_publication_preserves_the_source() {
         let source = fixture(b"original");
-        let metadata = File::open(&source).unwrap().metadata().unwrap();
-        let stamp = crate::SourceStamp::from_metadata(&metadata);
-        let mut output = ExportTarget::replace_source(&source, metadata, stamp).unwrap();
+        let source_file = File::open(&source).unwrap();
+        let stamp = crate::SourceStamp::from_file(&source_file).unwrap();
+        let mut output = ExportTarget::replace_source(&source, &source_file, stamp).unwrap();
         assert_eq!(output.temporary.parent(), source.parent());
         output.write_all(b"replacement").unwrap();
 
@@ -5888,9 +5891,9 @@ mod tests {
     #[test]
     fn save_does_not_overwrite_an_external_source_change() {
         let source = fixture(b"original");
-        let metadata = File::open(&source).unwrap().metadata().unwrap();
-        let stamp = crate::SourceStamp::from_metadata(&metadata);
-        let mut output = ExportTarget::replace_source(&source, metadata, stamp).unwrap();
+        let source_file = File::open(&source).unwrap();
+        let stamp = crate::SourceStamp::from_file(&source_file).unwrap();
+        let mut output = ExportTarget::replace_source(&source, &source_file, stamp).unwrap();
         output.write_all(b"quarry replacement").unwrap();
         fs::write(&source, b"external replacement").unwrap();
 
@@ -5921,6 +5924,178 @@ mod tests {
         ));
         fs::remove_file(&source).unwrap();
         remove_case(&source);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metadata_changes_allow_save_and_working_copy_publication() {
+        for mode in ["save", "save-as", "working-copy", "original"] {
+            let source_bytes = b"id,name\n1,Ada\n";
+            let source = fixture(source_bytes);
+            let destination = if mode == "save" {
+                source.clone()
+            } else {
+                destination(&source, "output.csv")
+            };
+            let session = session(&source, b',', HeaderMode::FirstRow);
+            let source_file = File::open(&source).unwrap();
+            if crate::source_stamp::data_generation(&source_file).is_none() {
+                eprintln!("metadata acceptance requires a valid macOS data generation count");
+                fs::remove_dir_all(source.parent().unwrap()).unwrap();
+                return;
+            }
+            let original_stamp = if mode == "original" {
+                fs::write(&destination, source_bytes).unwrap();
+                Some(crate::SourceStamp::from_file(&File::open(&destination).unwrap()).unwrap())
+            } else {
+                None
+            };
+            let touch_metadata = |value: &[u8]| {
+                for path in [&source, &destination] {
+                    if path.exists() {
+                        rustix::fs::setxattr(
+                            path,
+                            "com.quarry.metadata-test",
+                            value,
+                            rustix::fs::XattrFlags::empty(),
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            // Exercise the Undo guard and both startup and final publication checks.
+            touch_metadata(b"before");
+            session.ensure_source_unchanged().unwrap();
+            let mut output = match mode {
+                "save" => ExportTarget::replace_source(
+                    &source,
+                    &source_file,
+                    session.source_stamp.clone(),
+                ),
+                "save-as" => ExportTarget::new_guarded(
+                    &source,
+                    destination.clone(),
+                    &source_file,
+                    session.source_stamp.clone(),
+                ),
+                "working-copy" => ExportTarget::new_private_guarded(
+                    &source,
+                    destination.clone(),
+                    &source_file,
+                    session.source_stamp.clone(),
+                ),
+                "original" => ExportTarget::replace_existing_guarded(
+                    &source,
+                    destination.clone(),
+                    &source_file,
+                    session.source_stamp.clone(),
+                    original_stamp.unwrap(),
+                ),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let expected = b"id,name\n1,Grace\n";
+            output.write_all(expected).unwrap();
+            touch_metadata(b"before-publication");
+            assert!(
+                matches!(
+                    output.publish(2, expected.len() as u64, &AtomicBool::new(false)),
+                    Ok(FilterExportOutcome::Complete(_))
+                ),
+                "{mode}"
+            );
+            assert_eq!(fs::read(&destination).unwrap(), expected);
+            if destination != source {
+                assert_eq!(fs::read(&source).unwrap(), source_bytes);
+            }
+            assert!(temporary_exports(&source).is_empty());
+            fs::remove_dir_all(source.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_mtime_content_changes_never_publish() {
+        for mode in ["save", "working-copy", "original"] {
+            for before_start in [true, false] {
+                let original = b"id,name\n1,Ada\n";
+                let external = b"id,name\n1,Eve\n";
+                assert_eq!(original.len(), external.len());
+                let source = fixture(original);
+                let destination = if mode == "save" {
+                    source.clone()
+                } else {
+                    destination(&source, "output.csv")
+                };
+                let source_file = File::open(&source).unwrap();
+                let stamp = crate::SourceStamp::from_file(&source_file).unwrap();
+                let original_stamp = if mode == "original" {
+                    fs::write(&destination, original).unwrap();
+                    Some(crate::SourceStamp::from_file(&File::open(&destination).unwrap()).unwrap())
+                } else {
+                    None
+                };
+                let changed_path = if mode == "original" {
+                    &destination
+                } else {
+                    &source
+                };
+                let modified = fs::metadata(changed_path).unwrap().modified().unwrap();
+                let rewrite = || {
+                    fs::write(changed_path, external).unwrap();
+                    File::options()
+                        .write(true)
+                        .open(changed_path)
+                        .unwrap()
+                        .set_modified(modified)
+                        .unwrap();
+                    assert_eq!(
+                        fs::metadata(changed_path).unwrap().modified().unwrap(),
+                        modified
+                    );
+                };
+                if before_start {
+                    rewrite();
+                }
+                let result = match mode {
+                    "save" => ExportTarget::replace_source(&source, &source_file, stamp),
+                    "working-copy" => ExportTarget::new_private_guarded(
+                        &source,
+                        destination.clone(),
+                        &source_file,
+                        stamp,
+                    ),
+                    "original" => ExportTarget::replace_existing_guarded(
+                        &source,
+                        destination.clone(),
+                        &source_file,
+                        stamp,
+                        original_stamp.unwrap(),
+                    ),
+                    _ => unreachable!(),
+                };
+                if before_start {
+                    assert!(matches!(result, Err(QuarryError::SourceChanged)), "{mode}");
+                } else {
+                    let mut output = result.unwrap();
+                    output.write_all(b"quarry output").unwrap();
+                    rewrite();
+                    assert!(
+                        matches!(
+                            output.publish(1, 13, &AtomicBool::new(false)),
+                            Err(QuarryError::SourceChanged)
+                        ),
+                        "{mode}"
+                    );
+                }
+                assert_eq!(fs::read(changed_path).unwrap(), external);
+                if mode == "working-copy" {
+                    assert!(!destination.exists());
+                }
+                assert!(temporary_exports(&source).is_empty());
+                fs::remove_dir_all(source.parent().unwrap()).unwrap();
+            }
+        }
     }
 
     #[test]

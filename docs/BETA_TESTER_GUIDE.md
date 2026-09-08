@@ -1,5 +1,9 @@
 # Quarry invited tester guide
 
+**Preparation draft:** the candidate below is retained as historical evidence.
+The metadata-warning fix needs a new clean signed candidate and updated version,
+hash, and acceptance results before this guide accompanies invitations.
+
 For a small invited group using Apple Silicon Macs. Use the private ZIP
 provided with your invitation.
 
