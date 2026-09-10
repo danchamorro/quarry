@@ -441,14 +441,18 @@ equal to the original with `Casey` changed to `Casey Beta`, SHA-256
 owner-reported: the final inspection showed Finder with Quarry closed, so the
 reopened grid was not independently observed.
 
+VM download and Finder installation are also reported successful. That report
+does not identify a build or replace the build 105 guest-channel transfer and
+quarantine evidence above.
+
 Fresh-environment launch, broader connected-workflow checks, GUI large-file
-checks, supported macOS versions, and normal download/Finder installation
-remain pending. Only macOS 26.6.2 ARM64 has native
+checks, supported macOS versions, and browser-download evidence tied to this
+build remain pending. Only macOS 26.6.2 ARM64 has native
 evidence. Broader checks include more than 64 columns, Unicode/missing fields,
 keyboard/accessibility/window size, and selected temporary-folder/insufficient-space
-GUI handling. No fresh-VM or browser-quarantine acceptance is claimed. Individual testers,
-private delivery, and release approval are still
-open; no invitations or package publication have occurred.
+GUI handling. No fresh-VM or browser-quarantine acceptance is claimed. This beta
+targets Apple Silicon Macs; Intel, Linux, and Windows are outside its scope.
+Release approval remains open. Download details are supplied privately to testers.
 
 This documentation follow-up does not change the frozen `159e149` app, build
 number, clean-source status, or archive hashes. The installed local ad-hoc app

@@ -1,6 +1,6 @@
 # Beta release checklist
 
-**Status, 2026-09-08:** the metadata-warning fix merged in
+**Status, 2026-09-10:** the metadata-warning fix merged in
 [PR #43](https://github.com/danchamorro/quarry/pull/43) as
 `159e14950f6b4694129a810e19299c2f7fb950df`. The new frozen clean candidate is
 **0.1.0 (105)**. Developer ID signing, notarization, stapling, local Gatekeeper,
@@ -17,13 +17,13 @@ Its installed build 105 launched and rendered the five-row/six-column fixture.
 The owner reported completing the VM edit/Undo/Redo/Save As/quit/reopen workflow;
 saved output and source preservation were independently verified.
 
-The owner chose a small invited Apple Silicon group; only macOS 26.6.2 ARM64
-has acceptance evidence. Broader connected-workflow checks,
+The invited beta targets Apple Silicon Macs; only macOS 26.6.2 ARM64 has
+acceptance evidence. Other macOS versions remain untested. Intel, Linux, and
+Windows are outside this beta's scope. Broader connected-workflow checks,
 fresh-environment acceptance, supported macOS versions, final owner acceptance,
-and normal download/installation remain open. Individual
-testers and private delivery have not been chosen, no invitations have been
-sent, and no beta has been published. The earlier `cbd9446` candidate is historical;
-subsequent documentation commits do not change either frozen package.
+and browser-download evidence tied to this build remain open. The earlier
+`cbd9446` candidate is historical; subsequent documentation commits do not
+change either frozen package.
 
 Historical preparation changes on `codex/beta-preparation` were validated before
 commit from a dirty worktree based on `69d5f15`. Their local package passed
@@ -34,10 +34,10 @@ The notice-audit follow-up merged in [PR #42](https://github.com/danchamorro/qua
 
 The [pre-beta checklist](PRE_BETA_CHECKLIST.md) holds feature evidence. This
 checklist tracks the exact candidate that may be released. The
-[tester guide](BETA_TESTER_GUIDE.md) prepares the invited test round; no download
-provider or public launch has been selected. Follow the
-[packaging guide](MACOS_PACKAGING.md) for build, signing, installation, and
-rollback procedures. Keep app bundles local; do not upload them to GitHub.
+[tester guide](BETA_TESTER_GUIDE.md) describes installation, test workflows,
+and feedback. Download details are supplied privately to invited testers.
+Follow the [packaging guide](MACOS_PACKAGING.md) for build, signing, installation, and
+rollback procedures. Do not upload app bundles to GitHub.
 
 ## Platform matrix
 
@@ -139,7 +139,8 @@ metadata-change workflow. The remaining acceptance gates below still apply.
   and reinstatement of build 105, with exact bytes and signatures verified.
   VM launch/rendering passed. The owner reported completing edit/Undo/Redo/
   Save As/quit/reopen, with exact saved output and unchanged source independently
-  verified. Normal download/Finder installation remains open.
+  verified. VM download/Finder installation is also reported successful.
+  That report does not identify a build or record browser-quarantine metadata.
 
 ### Licenses and trusted distribution
 
@@ -163,8 +164,8 @@ metadata-change workflow. The remaining acceptance gates below still apply.
   macOS environment (another Mac or a clean VM). The earlier dirty trial's
   successful offline VM launch does not close this gate.
 - [ ] Obtain owner approval for the distribution arrangement and public release
-  information. This checklist does not choose an offer, price, store, provider,
-  or download channel.
+  information. Private download links and tester records are maintained outside
+  this repository.
 - [ ] Approve candidate release notes containing the supported-system matrix,
   known limits, update/rollback guidance, and feedback link. Publish only after
   the preceding release gates and explicit owner authorization are complete.
@@ -457,8 +458,8 @@ Complete this record for the exact candidate before closing the release gates:
 | CI and locked validation results | Merge tree equals validated PR head `c37b797`: formatting, strict Clippy, 303 workspace tests, locked releases, and packaging self-tests passed before merge; new package and extracted-bundle verification passed |
 | Linux core/CLI evidence, separate from desktop support | Matching source tree: Debian 12 ARM64, Rust 1.88.0, 184 tests and locked release build passed |
 | Connected workflow and large-file results | Signed ZIP passed native picker, metadata-only change, cell/header Undo/Redo, exact Save As, combined filter/export, sort, duplicates, and quit/reopen; new 1 GB CLI/core filtering/export/cancellation passed at `159e149`; broader GUI workflow and GUI large-file acceptance remain open |
-| Install/update/rollback and installed revision | Host ad-hoc clean `159e149`, build 105, installed with verified backup; existing VM signed-file installation, actual rollback to 98, restoration of 105, and launch/rendering verified; VM requested workflow owner-reported with verified saved/source bytes; normal download/Finder installation pending |
+| Install/update/rollback and installed revision | Host ad-hoc clean `159e149`, build 105, installed with verified backup; existing VM signed-file installation, actual rollback to 98, restoration of 105, and launch/rendering verified; VM requested workflow owner-reported with verified saved/source bytes; download/Finder installation also reported successful without a build identifier |
 | Project/dependency notice audit | Locked ARM64/Rust 1.88.0 source review recorded in [AUDIT.md](../packaging/licenses/AUDIT.md), 55 supplemental records and ten verified candidate resources; four embedded fonts and system-only native links verified |
 | Signed package hash, signing and notarization results | Stapled ZIP: 3,611,149 bytes, SHA-256 `31e72cb0b8cafb62bca76e7d40b00ffcb6638fc10d5ca3100205e2ce8e7d80fb`; submission `30a565de-89ff-44ed-8ad9-dd74309250d1` accepted without issues; signature, staple, local Gatekeeper, extracted bytes/ticket, and bundle checks passed; fresh-environment acceptance pending |
-| Known issues, feedback triage, and release notes | [Invited tester guide](BETA_TESTER_GUIDE.md) prepared; guide approval and selection of individual invitees pending |
+| Known issues, feedback triage, and release notes | [Invited tester guide](BETA_TESTER_GUIDE.md) prepared; guide approval pending |
 | Final owner acceptance and release authorization | Pending |

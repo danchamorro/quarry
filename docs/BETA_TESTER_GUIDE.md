@@ -1,9 +1,9 @@
 # Quarry invited tester guide
 
 **Preparation draft:** remaining acceptance and owner approval precede invitations.
-Individual testers and private delivery have not been chosen.
 
-Apple Silicon invitees should use the owner-provided private ZIP.
+This beta is for Apple Silicon Macs. Use the signed ZIP supplied privately with
+your invitation. Intel Macs, Linux, and Windows are outside this beta's scope.
 
 ## Candidate and compatibility
 
