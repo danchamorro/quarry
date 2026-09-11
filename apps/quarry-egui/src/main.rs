@@ -4722,7 +4722,7 @@ fn sort_progress(
     if done {
         StructuralProgressDisplay {
             fraction: 1.0,
-            label: "Sorting rows…".into(),
+            label: "Sorting rows · 100.0%".into(),
             animate: false,
         }
     } else if preparing {
@@ -4745,9 +4745,10 @@ fn sort_progress(
             animate: true,
         }
     } else {
+        let read_fraction = progress_fraction(bytes_scanned, total_bytes, false);
         StructuralProgressDisplay {
-            fraction: 0.9 * progress_fraction(bytes_scanned, total_bytes, false),
-            label: "Sorting rows…".into(),
+            fraction: 0.9 * read_fraction,
+            label: format!("Sorting rows · {:.1}% read", read_fraction * 100.0),
             animate: false,
         }
     }
@@ -15534,11 +15535,11 @@ mod tests {
                 "Preparing to sort · counting 100.0%",
                 true,
             ),
-            (false, 0, false, "Sorting rows…", false),
-            (false, 50, false, "Sorting rows…", false),
-            (false, 99, false, "Sorting rows…", false),
+            (false, 0, false, "Sorting rows · 0.0% read", false),
+            (false, 50, false, "Sorting rows · 50.0% read", false),
+            (false, 99, false, "Sorting rows · 99.0% read", false),
             (false, 100, false, "Merging sorted rows…", true),
-            (false, 100, true, "Sorting rows…", false),
+            (false, 100, true, "Sorting rows · 100.0%", false),
         ] {
             let progress = sort_progress(
                 preparing,

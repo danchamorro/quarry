@@ -452,7 +452,8 @@ is available, click **Continue**. The grid remains visible behind the dialog.
 Expand **Storage details** to inspect the allowance or change the working folder.
 
 Once sorting starts, the status bar moves through **Preparing to sort**,
-**Sorting rows**, and **Merging sorted rows**. Quarry reuses the completed
+**Sorting rows**, and **Merging sorted rows**. While reading rows to sort, the
+label shows the percentage of the input file read. Quarry reuses the completed
 index's row count instead of scanning the file again just to count rows. It
 also builds the new row-location index while writing the sorted file, then
 checks that the index still belongs to that file before using it. This lets
