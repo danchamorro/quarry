@@ -425,6 +425,7 @@ fn run_duplicates(
             config.max_record_bytes,
             prefix_bytes,
             shared,
+            None,
         )?
         else {
             return Ok(None);

@@ -120,9 +120,10 @@ order, including columns hidden in the current view. Copy is limited to 64 MiB.
 
 The row selection remains active while you scroll. Deletion creates an unsaved
 working version; it does not change the source until you use **Save**. If the
-storage allowance is at least 256 MiB, **Review storage requirements** appears
-before deletion starts. Use **Undo** to restore the previous working version, or
-**Discard Changes** to return to the last opened or saved file.
+storage allowance is at least 256 MiB, a preparation dialog checks space before
+deletion starts. Click **Continue** once the check passes. Use **Undo** to restore
+the previous working version, or **Discard Changes** to return to the last opened
+or saved file.
 
 Filtering clears the row selection. Clear an active filter before selecting or
 deleting rows so every selected number identifies a physical data row.
@@ -359,8 +360,9 @@ values directly next to each other. The completed result is an unsaved change.
 2. Right-click a selected number and choose **Delete Selected Columns**.
 
 Delete has no separate deletion confirmation. If the storage allowance is at
-least 256 MiB, **Review storage requirements** appears before it starts. At
-least one column must remain. The source is still unchanged until you save.
+least 256 MiB, a preparation dialog checks space before it starts. Click
+**Continue** once the check passes. At least one column must remain. The source
+is still unchanged until you save.
 **Undo** first reverses later cell or header edits,
 then restores the previous layout. **Discard Changes** restores the source
 layout and removes every unsaved change.
@@ -444,6 +446,20 @@ interpretation and ordering rules. The temporary-disk allowance stays above the
 footer while the options scroll. **Cancel** closes the dialog without starting
 a sort.
 
+For a storage allowance of at least 256 MiB, **Preparing to sort…** checks
+space automatically. Once **Ready to sort** confirms that enough disk space
+is available, click **Continue**. The grid remains visible behind the dialog.
+Expand **Storage details** to inspect the allowance or change the working folder.
+
+Once sorting starts, the status bar moves through **Preparing to sort**,
+**Sorting rows**, and **Merging sorted rows**. Quarry reuses the completed
+index's row count instead of scanning the file again just to count rows. It
+also builds the new row-location index while writing the sorted file, then
+checks that the index still belongs to that file before using it. This lets
+the sorted grid become ready without a separate indexing pass. If the filesystem
+cannot provide the identity checks needed for reuse, Quarry falls back to indexing.
+You can cancel during preparation as well as sorting and merging.
+
 Character count and Word count require valid UTF-8 in the selected column.
 Invalid text stops the operation with the data row and column identified.
 Empty and missing cells count as zero; whitespace-only cells have zero words
@@ -494,8 +510,8 @@ Auto-fit works with any number of shown columns.
 ### Temporary storage and free space
 
 Choose **File → Temporary storage…** to select a working folder on a drive
-with enough free space. Use **Choose folder…**, or enter an existing folder
-and click **Check space**. **Use folder** applies the choice for this app
+with enough free space. Use **Choose another folder…**, or enter an existing folder
+and click **Check again**. **Use folder** applies the choice for this app
 session. **Use system temporary folder** restores the default. Quarry checks
 that the folder is available and can create, write, and remove a private file.
 
@@ -506,12 +522,18 @@ versions when they become obsolete, and cleans up remaining private working
 files on Save, Save As, Discard, document replacement, or normal shutdown.
 
 Before an operation whose conservative storage allowance is at least 256 MiB,
-**Review storage requirements** shows the required additional space, available
-space, and retained working/Undo files. Large operations wait for indexing so
-the estimate uses the actual row count. Split first checks the resulting column
-width without writing a working version. **Continue** starts the operation;
-**Cancel** preserves the document. Insufficient space disables Continue. Choose
-another working folder or free space, then check again.
+a small preparation dialog checks space automatically. The grid remains visible
+and lightly dimmed behind it; editing is temporarily blocked. A successful check
+confirms **Enough disk space is available.** Click **Continue** to start the
+operation, or **Cancel** to preserve the document. Expand **Storage details** to
+see the working folder, estimated temporary space, available space, and retained
+working/Undo files, or to choose another folder.
+
+Large operations wait for indexing so the estimate uses the actual row count.
+Split first checks the resulting column width without writing a working version.
+If the check fails, the dialog explains the problem and opens the storage details.
+Continue stays disabled until the check passes. Reconnect the drive, choose
+another working folder, or free space, then check again.
 
 The allowance covers new output, expanded fields, and simultaneous sort or
 duplicate spill files. Retained versions already consume space on their own

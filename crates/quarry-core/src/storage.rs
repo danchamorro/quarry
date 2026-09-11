@@ -271,6 +271,15 @@ pub(crate) fn count_records(
     delimiter: u8,
     cancel: &AtomicBool,
 ) -> Result<Option<u64>, QuarryError> {
+    count_records_with_progress(source, delimiter, cancel, |_| {})
+}
+
+pub(crate) fn count_records_with_progress(
+    source: &mut File,
+    delimiter: u8,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> Result<Option<u64>, QuarryError> {
     source.seek(SeekFrom::Start(0))?;
     let mut scanner = RecordScanner::new(delimiter)?;
     let mut chunk = vec![0; crate::DEFAULT_READ_CHUNK];
@@ -290,6 +299,7 @@ pub(crate) fn count_records(
             records = records.saturating_add(1)
         })?;
         offset += read as u64;
+        progress(offset);
     }
 }
 
@@ -446,6 +456,17 @@ mod tests {
             count_records(&mut file, b',', &AtomicBool::new(true)).unwrap(),
             None
         );
+        let cancel = AtomicBool::new(false);
+        let mut reported_bytes = 0;
+        assert_eq!(
+            count_records_with_progress(&mut file, b',', &cancel, |bytes| {
+                reported_bytes = bytes;
+                cancel.store(true, Ordering::Release);
+            })
+            .unwrap(),
+            None
+        );
+        assert_eq!(reported_bytes, bytes.len() as u64);
         let session = Session::open(
             &source,
             OpenOptions {

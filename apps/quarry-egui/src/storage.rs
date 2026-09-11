@@ -23,6 +23,24 @@ pub(super) enum PendingStorageOperation {
 }
 
 impl PendingStorageOperation {
+    fn action_name(&self) -> &'static str {
+        match self {
+            Self::Structural(dialog) => match dialog.request {
+                StructuralRequest::Sort => "sort",
+                StructuralRequest::Duplicates => "find duplicates",
+                StructuralRequest::Split => "split columns",
+                StructuralRequest::Combine => "combine columns",
+                StructuralRequest::Move => "move columns",
+            },
+            Self::Materialize(..) => "split columns",
+            Self::DeleteColumns(_) => "delete columns",
+            Self::DeleteRows(_) => "delete rows",
+            Self::ReplaceAll { .. } => "replace text",
+            Self::Save(_) => "save",
+            Self::Export(_) => "export",
+        }
+    }
+
     fn uses_working_directory(&self) -> bool {
         !matches!(self, Self::Save(_) | Self::Export(_))
     }
@@ -232,59 +250,133 @@ impl QuarryApp {
             .operation
             .as_ref()
             .is_none_or(PendingStorageOperation::uses_working_directory);
+        let ready = review.ready();
+        let current = review.checked_path == Path::new(&review.path_input);
+        let problem = current && review.result.is_some() && !ready;
         let mut accept = false;
         let mut cancel = false;
         let mut check = false;
-        egui::CentralPanel::default().show(ctx, |_| {});
-        let modal = egui::Modal::new(egui::Id::new("quarry-storage-review")).show(ctx, |ui| {
-            ui.set_width(520.0);
-            ui.heading(if review.operation.is_some() { "Review storage requirements" } else { "Temporary storage" });
-            ui.label(if working { "Working folder" } else { "Save / export staging folder" });
-            let label = ui.label(if working { "Folder" } else { "Destination volume" });
-            ui.add_enabled(working && review.worker.is_none(), egui::TextEdit::singleline(&mut review.path_input).desired_width(f32::INFINITY)).labelled_by(label.id);
-            if working {
-                ui.add_enabled_ui(review.worker.is_none(), |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("Choose folder…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().set_title("Choose temporary working folder").set_directory(&review.path_input).pick_folder() {
-                                review.path_input = path.display().to_string(); check = true;
-                            }
+        let modal = egui::Modal::new(egui::Id::new("quarry-storage-review"))
+            .frame(compact_tool_frame(ctx))
+            .backdrop_color(Color32::from_black_alpha(40))
+            .show(ctx, |ui| {
+                compact_tool_style(ui.style_mut());
+                ui.set_width(440.0);
+                if let Some(operation) = &review.operation {
+                    ui.heading(if problem {
+                        if review.result.as_ref().is_some_and(Result::is_ok) {
+                            "More disk space needed".to_owned()
+                        } else {
+                            "Storage needs attention".to_owned()
                         }
-                        if ui.button("Use system temporary folder").clicked() {
-                            review.path_input = std::env::temp_dir().display().to_string(); check = true;
-                        }
+                    } else if ready {
+                        format!("Ready to {}", operation.action_name())
+                    } else {
+                        format!("Preparing to {}…", operation.action_name())
                     });
-                });
-                ui.small("New operations use this folder for this app session. Existing working and Undo files stay on their current drive until no longer needed. Keep that drive connected.");
-            } else {
-                ui.small("Atomic Save staging stays beside the destination. To use another drive, cancel and choose Save As or another export destination.");
-            }
-            if review.operation.is_some() {
-                ui.label(format!("Required additional space (conservative allowance): {}", format_bytes(review.required_bytes)));
-            }
-            if review.checked_path != Path::new(&review.path_input) {
-                ui.label("Folder changed. Click Check space to refresh its available space.");
-            } else {
-            match &review.result {
-                Some(Ok((space, retained))) => {
-                    ui.label(format!("Available space: {}", format_bytes(space.available_bytes)));
-                    ui.label(format!("Retained working and Undo/Redo files: {}", format_bytes(*retained)));
-                    ui.small("Retained files already reduce the free space on their own volumes; they are not added twice to this allowance.");
-                    if space.available_bytes < review.required_bytes {
-                        ui.colored_label(ERROR_TEXT, "Not enough space. Free space or choose a working folder on another drive.");
+                    ui.add_space(4.0);
+                    ui.label(match operation {
+                        PendingStorageOperation::Structural(dialog)
+                            if dialog.request == StructuralRequest::Sort =>
+                        {
+                            "Quarry uses temporary files to sort large files without loading everything into memory. Your original file stays unchanged until you save."
+                        }
+                        PendingStorageOperation::Save(_) =>
+                            "Quarry uses temporary space to save your changes safely. Continue will save your changes.",
+                        PendingStorageOperation::Export(_) =>
+                            "Quarry uses temporary space to prepare your export. Your open file will stay unchanged.",
+                        _ => "Quarry uses temporary files to prepare this operation safely. Your original file stays unchanged until you save.",
+                    });
+                } else {
+                    ui.heading("Temporary storage");
+                }
+                ui.add_space(6.0);
+                if !current {
+                    ui.label("Folder changed. Check again before continuing.");
+                } else {
+                    match &review.result {
+                        Some(Ok(_)) if ready => {
+                            ui.colored_label(Color32::from_rgb(31, 101, 68), "Enough disk space is available.");
+                        }
+                        Some(Ok(_)) => {
+                            ui.label(if working {
+                                "Free up space or choose a working folder on another drive."
+                            } else {
+                                "Free up space, or cancel and choose another destination."
+                            });
+                        }
+                        Some(Err(_)) => {
+                            ui.label("Check the storage details below to continue.");
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking disk space…");
+                            });
+                        }
                     }
                 }
-                Some(Err(error)) => { ui.colored_label(ERROR_TEXT, error); }
-                None => { ui.label("Checking available space and folder access…"); ui.spinner(); }
-            }
-            }
-            ui.small("Space can change. Quarry checks again before writing and removes unpublished output if a write fails. Your current document and required Undo files are preserved.");
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() { cancel = true; }
-                if ui.add_enabled(review.worker.is_none(), egui::Button::new("Check space")).clicked() { check = true; }
-                if ui.add_enabled(review.ready(), egui::Button::new(if review.operation.is_some() { "Continue" } else { "Use folder" })).clicked() { accept = true; }
+                egui::ScrollArea::vertical()
+                    .id_salt("quarry-storage-details-scroll")
+                    .max_height((ctx.content_rect().height() - 260.0).clamp(80.0, 360.0))
+                    .show(ui, |ui| {
+                        let mut details = |ui: &mut egui::Ui| {
+                            if review.operation.is_some() {
+                                ui.label(format!("Estimated temporary space (conservative): {}", format_bytes(review.required_bytes)));
+                                ui.small("This is a cautious allowance. Actual usage may be lower.");
+                            }
+                            if current {
+                                match &review.result {
+                                    Some(Ok((space, retained))) => {
+                                        ui.label(format!("Available space: {}", format_bytes(space.available_bytes)));
+                                        ui.label(format!("Retained working and Undo/Redo files: {}", format_bytes(*retained)));
+                                        ui.small("Retained files already reduce the free space and are not counted twice.");
+                                    }
+                                    Some(Err(error)) => { ui.colored_label(ERROR_TEXT, error); }
+                                    None => {}
+                                }
+                            }
+                            ui.separator();
+                            let label = ui.label(if working { "Working folder" } else { "Destination volume" });
+                            ui.add_enabled(working && review.worker.is_none(), egui::TextEdit::singleline(&mut review.path_input).desired_width(f32::INFINITY)).labelled_by(label.id);
+                            if working {
+                                ui.add_enabled_ui(review.worker.is_none(), |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("Choose another folder…").clicked() {
+                                            if let Some(path) = rfd::FileDialog::new().set_title("Choose temporary working folder").set_directory(&review.path_input).pick_folder() {
+                                                review.path_input = path.display().to_string(); check = true;
+                                            }
+                                        }
+                                        if ui.button("Use system temporary folder").clicked() {
+                                            review.path_input = std::env::temp_dir().display().to_string(); check = true;
+                                        }
+                                    });
+                                });
+                                ui.small("New operations use this folder for this app session. Existing working and Undo files stay on their current drive until no longer needed. Keep that drive connected.");
+                            } else {
+                                ui.small("Save and export use temporary space beside the destination. To use another drive, cancel and choose Save As or another export destination.");
+                            }
+                            if ready && ui.button("Check again").clicked() { check = true; }
+                            ui.small("Quarry checks again before writing. If a write fails, it removes unfinished output and preserves your current document and required Undo files.");
+                        };
+                        if review.operation.is_none() {
+                            details(ui);
+                        } else {
+                            egui::CollapsingHeader::new("Storage details")
+                                .id_salt("quarry-storage-details")
+                                .open(problem.then_some(true))
+                                .show(ui, details);
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                    if !review.ready() && ui.add_enabled(review.worker.is_none(), egui::Button::new("Check again")).clicked() { check = true; }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add_enabled(review.ready() && !check, egui::Button::new(if review.operation.is_some() { "Continue" } else { "Use folder" }).fill(QUARRY_YELLOW)).clicked() { accept = true; }
+                    });
+                });
             });
-        });
         cancel |= modal.should_close();
         if check {
             review.check();
@@ -761,9 +853,11 @@ mod tests {
                 .any(|(_, node)| node.label() == Some("Continue") && node.is_disabled())
         );
         for expected in [
-            "Required additional space",
+            "More disk space needed",
+            "Estimated temporary space",
             "Available space",
             "Retained working and Undo/Redo files",
+            "Choose another folder",
         ] {
             assert!(
                 nodes.iter().any(|(_, node)| node
@@ -794,6 +888,92 @@ mod tests {
         }
         assert!(review.result.as_ref().unwrap().is_err());
         assert!(!review.ready());
+    }
+
+    #[test]
+    fn ready_sort_keeps_details_optional_and_continues_into_a_working_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let original = b"key,value\nb,2\na,1\n";
+        std::fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish(&mut app);
+        app.begin_storage_review(PendingStorageOperation::Structural(StructuralDialog::sort(
+            0,
+        )));
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let output = update_review_until(&mut app, &ctx, |app| {
+            app.storage_review.as_ref().unwrap().ready()
+        });
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        for expected in [
+            "Ready to sort",
+            "Enough disk space is available",
+            "Storage details",
+        ] {
+            assert!(
+                nodes.iter().any(|(_, node)| node
+                    .label()
+                    .is_some_and(|text| text.contains(expected))
+                    || node.value().is_some_and(|text| text.contains(expected))),
+                "missing {expected}: {:?}",
+                nodes
+                    .iter()
+                    .map(|(_, node)| (node.label(), node.value()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(!nodes.iter().any(
+            |(_, node)| node.label().or(node.value()).is_some_and(|text| {
+                text.contains("Estimated temporary space") || text == "Working folder"
+            })
+        ));
+        assert!(app.document.as_ref().unwrap().structural_job.is_none());
+
+        let target = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Storage details"))
+            .unwrap()
+            .0;
+        let click = |target| egui::RawInput {
+            events: vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target,
+                    data: None,
+                },
+            )],
+            ..Default::default()
+        };
+        let _ = ctx.run(click(target), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+        });
+        let output = update_review_until(&mut app, &ctx, |_| true);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.label()
+                .or(node.value())
+                .is_some_and(|text| text.contains("Estimated temporary space"))
+        }));
+        let (target, button) = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Continue"))
+            .unwrap();
+        assert!(!button.is_disabled());
+        let _ = ctx.run(click(*target), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+        });
+        assert!(app.storage_review.is_none());
+        finish(&mut app);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(
+            std::fs::read(document.session.path()).unwrap(),
+            b"key,value\na,1\nb,2\n"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert!(document.can_undo());
     }
 
     #[test]

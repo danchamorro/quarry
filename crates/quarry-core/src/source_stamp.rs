@@ -91,6 +91,25 @@ impl SourceStamp {
         true
     }
 
+    /// Publication can change ctime. None means that metadata-only change cannot
+    /// be verified here, while false identifies a changed output, not a fallback.
+    pub(crate) fn publication_match(&self, observed: &Self) -> Option<bool> {
+        if self.matches(observed) {
+            return Some(true);
+        }
+        if !self.same_file_metadata(observed) {
+            return Some(false);
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(
+            (self.data_generation, observed.data_generation),
+            (Some(before), Some(after)) if before != 0 && after != 0
+        ) {
+            return Some(false);
+        }
+        None
+    }
+
     /// Check the path's identity and ordinary metadata alongside matching a file
     /// descriptor. This alone does not establish that ctime changes are harmless.
     pub(crate) fn matches_metadata(&self, metadata: &Metadata) -> bool {
@@ -168,6 +187,7 @@ mod tests {
         let mut changed = stamp.clone();
         changed.len += 1;
         assert!(!stamp.matches(&changed));
+        assert_eq!(stamp.publication_match(&changed), Some(false));
         changed = stamp.clone();
         changed.readonly = !changed.readonly;
         assert!(!stamp.matches(&changed));
@@ -214,13 +234,19 @@ mod tests {
         {
             changed.data_generation = None;
             assert!(!stamp.matches(&changed));
+            assert_eq!(stamp.publication_match(&changed), None);
             let stamp = SourceStamp {
                 data_generation: Some(7),
                 ..stamp.clone()
             };
-            for (generation, expected) in [(Some(7), true), (Some(8), false), (Some(0), false)] {
+            for (generation, expected, publication) in [
+                (Some(7), true, Some(true)),
+                (Some(8), false, Some(false)),
+                (Some(0), false, None),
+            ] {
                 changed.data_generation = generation;
                 assert_eq!(stamp.matches(&changed), expected);
+                assert_eq!(stamp.publication_match(&changed), publication);
             }
             changed = stamp.clone();
             changed.data_generation = Some(8);
@@ -230,7 +256,10 @@ mod tests {
             );
         }
         #[cfg(not(target_os = "macos"))]
-        assert!(!stamp.matches(&changed));
+        {
+            assert!(!stamp.matches(&changed));
+            assert_eq!(stamp.publication_match(&changed), None);
+        }
     }
 
     #[cfg(target_os = "macos")]

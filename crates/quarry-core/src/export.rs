@@ -2029,15 +2029,35 @@ impl ExportTarget {
     }
 
     pub(crate) fn publish(
-        mut self,
+        self,
         rows_written: u64,
         bytes_written: u64,
         cancel_requested: &AtomicBool,
     ) -> Result<FilterExportOutcome, QuarryError> {
+        self.publish_inner(rows_written, bytes_written, cancel_requested, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    pub(crate) fn publish_with_stamp(
+        self,
+        rows_written: u64,
+        bytes_written: u64,
+        cancel_requested: &AtomicBool,
+    ) -> Result<(FilterExportOutcome, Option<SourceStamp>), QuarryError> {
+        self.publish_inner(rows_written, bytes_written, cancel_requested, true)
+    }
+
+    fn publish_inner(
+        mut self,
+        rows_written: u64,
+        bytes_written: u64,
+        cancel_requested: &AtomicBool,
+        capture_stamp: bool,
+    ) -> Result<(FilterExportOutcome, Option<SourceStamp>), QuarryError> {
         if cancel_requested.load(Ordering::Acquire) {
             drop(self.writer.take());
             self.remove_temporary()?;
-            return Ok(FilterExportOutcome::Cancelled);
+            return Ok((FilterExportOutcome::Cancelled, None));
         }
         let mut writer = self.writer.take().expect("export writer is present");
         let parent = output_parent(&self.destination);
@@ -2064,15 +2084,21 @@ impl ExportTarget {
         }
         file.sync_all()
             .map_err(|error| storage_error(parent, error))?;
-        drop(file);
+        let observed_output = if capture_stamp {
+            let before = SourceStamp::from_file(&file).ok();
+            Some((file, before))
+        } else {
+            drop(file);
+            None
+        };
         if let Some(publication) = &self.private_publication
             && !publication.wait()
         {
-            return Ok(FilterExportOutcome::Cancelled);
+            return Ok((FilterExportOutcome::Cancelled, None));
         }
         if cancel_requested.load(Ordering::Acquire) {
             self.remove_temporary()?;
-            return Ok(FilterExportOutcome::Cancelled);
+            return Ok((FilterExportOutcome::Cancelled, None));
         }
         if let Err(error) = self.ensure_source_unchanged() {
             self.remove_temporary()?;
@@ -2085,14 +2111,14 @@ impl ExportTarget {
             Publication::GuardedCreateWorkingCopy { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {
                     self.remove_temporary()?;
-                    return Ok(FilterExportOutcome::Cancelled);
+                    return Ok((FilterExportOutcome::Cancelled, None));
                 }
                 publish_no_replace(&self.temporary, &self.destination)
             }
             Publication::ReplaceSource { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {
                     self.remove_temporary()?;
-                    return Ok(FilterExportOutcome::Cancelled);
+                    return Ok((FilterExportOutcome::Cancelled, None));
                 }
                 fs::rename(&self.temporary, &self.destination)
             }
@@ -2116,7 +2142,7 @@ impl ExportTarget {
                 }
                 if cancel_requested.load(Ordering::Acquire) {
                     self.remove_temporary()?;
-                    return Ok(FilterExportOutcome::Cancelled);
+                    return Ok((FilterExportOutcome::Cancelled, None));
                 }
                 fs::rename(&self.temporary, &self.destination)
             }
@@ -2130,11 +2156,33 @@ impl ExportTarget {
             });
         }
         let _ = self.remove_temporary();
-        Ok(FilterExportOutcome::Complete(FilterExportSummary {
-            destination: self.destination.clone(),
-            rows_written,
-            bytes_written,
-        }))
+        // Keep the original output descriptor. A replacement at the destination
+        // must never provide the provenance for an index built from our bytes.
+        // Filesystems without metadata-only change verification safely re-index.
+        let published_stamp = if let Some((file, before_publication)) = observed_output {
+            if let Ok(after) = SourceStamp::from_file(&file) {
+                if !source_matches_stamp(&file, &self.destination, &after)? {
+                    return Err(QuarryError::SourceChanged);
+                }
+                match before_publication.and_then(|before| before.publication_match(&after)) {
+                    Some(true) => Some(after),
+                    Some(false) => return Err(QuarryError::SourceChanged),
+                    None => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok((
+            FilterExportOutcome::Complete(FilterExportSummary {
+                destination: self.destination.clone(),
+                rows_written,
+                bytes_written,
+            }),
+            published_stamp,
+        ))
     }
 
     fn discard(mut self) -> Result<(), QuarryError> {
@@ -3716,6 +3764,48 @@ mod tests {
 
     fn remove_case(source: &std::path::Path) {
         fs::remove_dir(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn publication_stamp_never_blesses_changed_or_replaced_staging_bytes() {
+        for replace_file in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.csv");
+            let destination = directory.path().join("output.csv");
+            fs::write(&source, b"source\n").unwrap();
+            let source_file = File::open(&source).unwrap();
+            let mut output = ExportTarget::new_private_guarded(
+                &source,
+                destination.clone(),
+                &source_file,
+                crate::SourceStamp::from_file(&source_file).unwrap(),
+            )
+            .unwrap();
+            output.write_all(b"indexed\n").unwrap();
+            let temporary = output.temporary.clone();
+            let publication = output.defer_private_publication().unwrap();
+            let worker =
+                thread::spawn(move || output.publish_with_stamp(1, 8, &AtomicBool::new(false)));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !publication.is_ready() {
+                assert!(
+                    Instant::now() < deadline,
+                    "publication did not become ready"
+                );
+                thread::yield_now();
+            }
+            if replace_file {
+                fs::rename(&temporary, directory.path().join("original-output.csv")).unwrap();
+            }
+            fs::write(&temporary, b"changed\n").unwrap();
+            publication.decide(true);
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(QuarryError::SourceChanged)
+            ));
+            assert_eq!(fs::read(&destination).unwrap(), b"changed\n");
+            assert_eq!(fs::read(&source).unwrap(), b"source\n");
+        }
     }
 
     fn session(path: &std::path::Path, delimiter: u8, header_mode: HeaderMode) -> Session {
