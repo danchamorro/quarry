@@ -14,6 +14,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use source_stamp::SourceStamp;
@@ -29,7 +30,9 @@ pub use filter::{
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
     FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
 };
-pub use index::{Checkpoint, IndexConfig, IndexJob, IndexProgress, StructuralIndex};
+pub use index::{
+    Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, StructuralIndex,
+};
 use quarry_delimited::{ParseError, RecordScanner, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
 pub use sort::{
@@ -245,10 +248,18 @@ pub struct Row {
 pub struct Session {
     path: PathBuf,
     source_stamp: SourceStamp,
+    completed_record_count: Arc<Mutex<Option<CompletedRecordCount>>>,
     pub file_size: u64,
     pub dialect: Dialect,
     pub first_rows: Vec<Row>,
     pub metrics: OpenMetrics,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompletedRecordCount {
+    delimiter: u8,
+    file_size: u64,
+    records: u64,
 }
 
 impl Session {
@@ -302,6 +313,7 @@ impl Session {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             source_stamp,
+            completed_record_count: Arc::new(Mutex::new(None)),
             file_size,
             dialect: Dialect {
                 delimiter,
@@ -321,12 +333,17 @@ impl Session {
     }
 
     pub fn start_indexing(&self, config: IndexConfig) -> Result<IndexJob, QuarryError> {
-        IndexJob::start(
-            self.path.clone(),
-            self.file_size,
-            self.dialect.delimiter,
-            config,
-        )
+        IndexJob::start(self, config)
+    }
+
+    fn completed_record_count(&self) -> Option<u64> {
+        self.completed_record_count
+            .lock()
+            .unwrap()
+            .filter(|count| {
+                count.delimiter == self.dialect.delimiter && count.file_size == self.file_size
+            })
+            .map(|count| count.records)
     }
 
     pub fn read_rows(

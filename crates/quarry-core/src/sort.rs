@@ -16,10 +16,13 @@ use quarry_delimited::{RecordScanner, parse_record};
 
 use crate::estimate_edited_output_bytes;
 use crate::export::{ExportTarget, PrivatePublication, source_matches_stamp};
-use crate::storage::{check_operation_storage, count_records, output_parent, storage_error};
+use crate::storage::{
+    check_operation_storage, count_records, count_records_with_progress, output_parent,
+    storage_error,
+};
 use crate::{
-    CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, FilterExportOutcome,
-    QuarryError, Session, SourceStamp,
+    CaseSensitivity, CompletedIndex, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK,
+    FilterExportOutcome, IndexConfig, QuarryError, Session, SourceStamp, StructuralIndex,
 };
 
 #[path = "duplicate.rs"]
@@ -195,6 +198,10 @@ pub(crate) fn numeric_key(value: &[u8]) -> Result<Vec<u8>, QuarryError> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SortProgress {
+    /// Preparing storage and the first run, before normal scan progress is available.
+    pub preparing: bool,
+    /// Bytes read to count records when no validated completed index is available.
+    pub preparation_bytes_scanned: u64,
     pub bytes_scanned: u64,
     pub total_bytes: u64,
     pub rows_sorted: u64,
@@ -214,6 +221,7 @@ pub struct SortProgress {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortSummary {
     pub destination: PathBuf,
+    pub output_index: Option<CompletedIndex>,
     pub rows_sorted: u64,
     pub bytes_written: u64,
     pub runs_created: u64,
@@ -256,6 +264,8 @@ const DEFAULT_SORT_CONFIG: SortConfig = SortConfig {
 };
 
 struct SharedState {
+    preparing: AtomicBool,
+    preparation_bytes_scanned: AtomicU64,
     bytes_scanned: AtomicU64,
     total_bytes: u64,
     rows_sorted: AtomicU64,
@@ -278,6 +288,8 @@ struct SharedState {
 impl SharedState {
     fn new(total_bytes: u64) -> Self {
         Self {
+            preparing: AtomicBool::new(true),
+            preparation_bytes_scanned: AtomicU64::new(0),
             bytes_scanned: AtomicU64::new(0),
             total_bytes,
             rows_sorted: AtomicU64::new(0),
@@ -412,6 +424,7 @@ impl SortJob {
         destination: PathBuf,
         source_stamp: SourceStamp,
         config: SortConfig,
+        completed_record_count: Option<u64>,
     ) -> Result<Self, QuarryError> {
         Self::start_with_temp_directory(
             source_path,
@@ -425,6 +438,7 @@ impl SortJob {
             source_stamp,
             config,
             None,
+            completed_record_count,
         )
     }
 
@@ -441,6 +455,7 @@ impl SortJob {
         source_stamp: SourceStamp,
         config: SortConfig,
         temporary_directory: Option<PathBuf>,
+        completed_record_count: Option<u64>,
     ) -> Result<Self, QuarryError> {
         validate_config(config)?;
         if !spec.mode.uses_column() && spec.direction != SortDirection::Ascending {
@@ -491,6 +506,7 @@ impl SortJob {
                     config,
                     &worker_state,
                     temporary_directory.as_deref(),
+                    completed_record_count,
                 );
                 match &result {
                     Ok(SortOutcome::Cancelled) => {
@@ -516,6 +532,11 @@ impl SortJob {
 
     pub fn progress(&self) -> SortProgress {
         SortProgress {
+            preparing: self.shared.preparing.load(Ordering::Acquire),
+            preparation_bytes_scanned: self
+                .shared
+                .preparation_bytes_scanned
+                .load(Ordering::Acquire),
             bytes_scanned: self.shared.bytes_scanned.load(Ordering::Acquire),
             total_bytes: self.shared.total_bytes,
             rows_sorted: self.shared.rows_sorted.load(Ordering::Acquire),
@@ -580,6 +601,7 @@ impl Session {
             destination.as_ref().to_path_buf(),
             self.source_stamp.clone(),
             DEFAULT_SORT_CONFIG,
+            self.completed_record_count(),
         )
     }
 
@@ -603,6 +625,7 @@ impl Session {
             self.source_stamp.clone(),
             DEFAULT_SORT_CONFIG,
             Some(temporary_directory.as_ref().to_path_buf()),
+            self.completed_record_count(),
         )
     }
 }
@@ -1271,6 +1294,7 @@ fn create_initial_runs<'a>(
             shared
                 .bytes_scanned
                 .store(absolute_start, Ordering::Release);
+            shared.preparing.store(false, Ordering::Release);
             if cancelled {
                 return Ok(ScanOutcome::Cancelled);
             }
@@ -1312,6 +1336,7 @@ fn create_initial_runs<'a>(
         shared
             .bytes_scanned
             .store(absolute_start, Ordering::Release);
+        shared.preparing.store(false, Ordering::Release);
         if cancelled || shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(ScanOutcome::Cancelled);
         }
@@ -1344,9 +1369,29 @@ fn run_sort(
     config: SortConfig,
     shared: &SharedState,
     temporary_directory: Option<&Path>,
+    completed_record_count: Option<u64>,
 ) -> Result<SortOutcome, QuarryError> {
-    let Some(records) = count_records(source, delimiter, &shared.cancel_requested)? else {
+    if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(SortOutcome::Cancelled);
+    }
+    let records = match completed_record_count {
+        Some(records) => records,
+        None => {
+            let Some(records) = count_records_with_progress(
+                source,
+                delimiter,
+                &shared.cancel_requested,
+                |bytes| {
+                    shared
+                        .preparation_bytes_scanned
+                        .store(bytes, Ordering::Release)
+                },
+            )?
+            else {
+                return Ok(SortOutcome::Cancelled);
+            };
+            records
+        }
     };
     let output_bytes = estimate_edited_output_bytes(
         shared.total_bytes,
@@ -1385,12 +1430,16 @@ fn run_sort(
         error => error,
     })?;
     cleanup?;
-    let Some((rows, bytes_written, verification)) = built else {
+    let Some((rows, bytes_written, verification, index)) = built else {
         return Ok(SortOutcome::Cancelled);
     };
-    match output.publish(rows, bytes_written, &shared.cancel_requested)? {
+    let (outcome, output_stamp) =
+        output.publish_with_stamp(rows, bytes_written, &shared.cancel_requested)?;
+    match outcome {
         FilterExportOutcome::Complete(summary) => Ok(SortOutcome::Complete(SortSummary {
             destination: summary.destination,
+            output_index: output_stamp
+                .and_then(|stamp| CompletedIndex::from_output(index, stamp, delimiter)),
             rows_sorted: rows,
             bytes_written: summary.bytes_written,
             runs_created: shared.runs_created.load(Ordering::Acquire),
@@ -1420,7 +1469,7 @@ fn run_sort_inner(
     config: SortConfig,
     workspace: &RunWorkspace,
     shared: &SharedState,
-) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
+) -> Result<Option<(u64, u64, SortVerification, StructuralIndex)>, QuarryError> {
     let ScanOutcome::Complete(mut scan) = create_initial_runs(
         source,
         delimiter,
@@ -1454,6 +1503,7 @@ fn run_sort_inner(
         return Ok(None);
     }
 
+    let mut index = StructuralIndex::new(IndexConfig::default())?;
     let mut bytes_written = 0_u64;
     if bom_present {
         write_output(output, UTF8_BOM, shared)?;
@@ -1462,6 +1512,7 @@ fn run_sort_inner(
     if let Some(header) = &scan.header {
         write_output(output, header, shared)?;
         bytes_written = bytes_written.saturating_add(header.len() as u64);
+        index.record_boundary(bytes_written);
     }
     shared.bytes_written.store(bytes_written, Ordering::Release);
 
@@ -1474,6 +1525,7 @@ fn run_sort_inner(
         config.max_record_bytes,
         bytes_written,
         shared,
+        Some(&mut index),
     )?
     else {
         return Ok(None);
@@ -1487,8 +1539,9 @@ fn run_sort_inner(
         );
     }
     bytes_written = bytes_written.saturating_add(data_bytes);
+    index.finish_output(bytes_written);
     shared.bytes_written.store(bytes_written, Ordering::Release);
-    Ok(Some((scan.rows, bytes_written, verification)))
+    Ok(Some((scan.rows, bytes_written, verification, index)))
 }
 
 fn reduce_runs(
@@ -1665,6 +1718,7 @@ fn merge_runs_to_output(
     max_record_bytes: usize,
     prior_bytes_written: u64,
     shared: &SharedState,
+    mut output_index: Option<&mut StructuralIndex>,
 ) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
     let mut readers = open_run_readers(paths)?;
     let Some(mut heap) = seed_heap(&mut readers, direction, max_record_bytes, shared)? else {
@@ -1703,6 +1757,9 @@ fn merge_runs_to_output(
                 shared,
             )?;
             bytes_written = bytes_written.saturating_add(written);
+            if let Some(index) = &mut output_index {
+                index.record_boundary(prior_bytes_written.saturating_add(bytes_written));
+            }
         }
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(None);
@@ -1730,6 +1787,9 @@ fn merge_runs_to_output(
     if let Some(last) = pending {
         let written = write_verified_output_entry(output, last, b"", &mut verifier, shared)?;
         bytes_written = bytes_written.saturating_add(written);
+        if let Some(index) = output_index {
+            index.record_boundary(prior_bytes_written.saturating_add(bytes_written));
+        }
     }
     let verification = verifier.finish()?;
     Ok(Some((rows, bytes_written, verification)))
@@ -1899,6 +1959,7 @@ mod tests {
             destination.to_path_buf(),
             session.source_stamp.clone(),
             config,
+            session.completed_record_count(),
         )
         .unwrap()
     }
@@ -1912,13 +1973,105 @@ mod tests {
     }
 
     #[test]
+    fn completed_index_skips_preparation_scan_with_source_and_dialect_guards() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let contents = b"key,id\nb,1\n\"a\nx\",2\na,3";
+        fs::write(&source, contents).unwrap();
+        let mut indexed = session(&source, HeaderMode::FirstRow);
+        indexed
+            .start_indexing(crate::IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(indexed.completed_record_count(), Some(4));
+        indexed.dialect.delimiter = b'\t';
+        assert_eq!(indexed.completed_record_count(), None);
+        indexed.dialect.delimiter = b',';
+        indexed.file_size += 1;
+        assert_eq!(indexed.completed_record_count(), None);
+        indexed.file_size -= 1;
+
+        let unindexed = session(&source, HeaderMode::FirstRow);
+        assert_eq!(unindexed.completed_record_count(), None);
+        let spec = SortSpec {
+            column: 0,
+            mode: SortMode::Text,
+            direction: SortDirection::Ascending,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        assert!(
+            SharedState::new(contents.len() as u64)
+                .preparing
+                .load(Ordering::Acquire)
+        );
+        for (name, session, expected_preparation_bytes) in [
+            ("indexed", &indexed, 0),
+            ("unindexed", &unindexed, contents.len() as u64),
+        ] {
+            for separate_temp in [false, true] {
+                let destination = directory.path().join(format!("{name}-{separate_temp}.csv"));
+                let job = if separate_temp {
+                    session.start_create_sorted_working_copy_with_temp_directory(
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                        spec,
+                        &destination,
+                        directory.path(),
+                    )
+                } else {
+                    session.start_create_sorted_working_copy(
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                        spec,
+                        &destination,
+                    )
+                }
+                .unwrap();
+                wait_done(&job);
+                let progress = job.progress();
+                assert!(!progress.preparing);
+                assert_eq!(
+                    progress.preparation_bytes_scanned,
+                    expected_preparation_bytes
+                );
+                assert_eq!(progress.bytes_scanned, contents.len() as u64);
+                assert!(matches!(job.wait().unwrap(), SortOutcome::Complete(_)));
+                assert_eq!(
+                    fs::read(&destination).unwrap(),
+                    b"key,id\na,3\n\"a\nx\",2\nb,1\n"
+                );
+            }
+        }
+        fs::write(&source, b"key,id\nexternal,change\n").unwrap();
+        let destination = directory.path().join("stale.csv");
+        assert!(matches!(
+            indexed.start_create_sorted_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                spec,
+                &destination,
+            ),
+            Err(QuarryError::SourceChanged)
+        ));
+        assert!(!destination.exists());
+        assert!(sort_artifacts(directory.path()).is_empty());
+    }
+
+    #[test]
     fn ready_sort_handoff_rejects_conflicts_and_cancellation() {
         for cancel in [false, true] {
             let directory = case();
             let source = directory.join("source.csv");
             let destination = directory.join("sorted.csv");
             fs::write(&source, b"key\nb\na\n").unwrap();
-            let job = session(&source, HeaderMode::FirstRow)
+            let session = session(&source, HeaderMode::FirstRow);
+            session
+                .start_indexing(crate::IndexConfig::default())
+                .unwrap()
+                .wait()
+                .unwrap();
+            let job = session
                 .start_create_sorted_working_copy(
                     BTreeMap::new(),
                     BTreeMap::new(),
@@ -1932,6 +2085,7 @@ mod tests {
                 )
                 .unwrap();
             wait_done(&job);
+            assert_eq!(job.progress().preparation_bytes_scanned, 0);
             assert!(!destination.exists());
             if cancel {
                 job.cancel();
@@ -1949,6 +2103,136 @@ mod tests {
             assert!(sort_artifacts(&directory).is_empty());
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn output_indexes_match_fresh_scans_for_record_boundaries_and_checkpoints() {
+        let mut cases = vec![
+            (b"".to_vec(), HeaderMode::NoHeader),
+            (UTF8_BOM.to_vec(), HeaderMode::NoHeader),
+            (b"key".to_vec(), HeaderMode::FirstRow),
+            (b"\xEF\xBB\xBFkey\r\n".to_vec(), HeaderMode::FirstRow),
+            (b"\n".to_vec(), HeaderMode::NoHeader),
+            (
+                b"\xEF\xBB\xBF\"b\nline\",2\r\na,1".to_vec(),
+                HeaderMode::NoHeader,
+            ),
+            (b"key,id\r\nb,2\r\na,1".to_vec(), HeaderMode::FirstRow),
+            (b"key,id\nb\rc,2\na,1\n".to_vec(), HeaderMode::FirstRow),
+        ];
+        let mut many_rows = b"key,value\n".to_vec();
+        for row in (0..8_200).rev() {
+            many_rows.extend_from_slice(format!("{row:04},\"line\n{row}\"\n").as_bytes());
+        }
+        cases.push((many_rows, HeaderMode::FirstRow));
+        for (contents, header_mode) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.csv");
+            let destination = directory.path().join("sorted.csv");
+            fs::write(&source, contents).unwrap();
+            let source_session = session(&source, header_mode);
+            let outcome = source_session
+                .start_create_sorted_working_copy(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    SortSpec {
+                        column: 0,
+                        mode: SortMode::Text,
+                        direction: SortDirection::Ascending,
+                        case_sensitivity: CaseSensitivity::Sensitive,
+                    },
+                    &destination,
+                )
+                .unwrap()
+                .wait()
+                .unwrap();
+            let SortOutcome::Complete(summary) = outcome else {
+                panic!("sort cancelled")
+            };
+            let Some(completed) = summary.output_index else {
+                assert!(
+                    !cfg!(target_os = "macos"),
+                    "local macOS publication must retain index provenance"
+                );
+                continue;
+            };
+            let sorted = session(&destination, header_mode);
+            let index = sorted.adopt_completed_index(completed).unwrap();
+            assert_eq!(sorted.completed_record_count(), Some(index.indexed_rows()));
+            assert_eq!(index.indexed_bytes(), sorted.file_size);
+            assert!(index.memory_bytes() <= IndexConfig::default().memory_budget_bytes);
+            let fresh = sorted
+                .start_indexing(IndexConfig::default())
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(index, fresh);
+            if index.indexed_rows() > 0 {
+                for row in [0, index.indexed_rows() / 2, index.indexed_rows() - 1] {
+                    assert_eq!(
+                        sorted.read_rows(&index, row, 1).unwrap(),
+                        sorted.read_rows(&fresh, row, 1).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_index_adoption_rejects_other_files_dialects_and_later_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let destination = directory.path().join("sorted.csv");
+        fs::write(&source, b"key\nb\na\n").unwrap();
+        let job = session(&source, HeaderMode::FirstRow)
+            .start_create_sorted_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SortSpec {
+                    column: 0,
+                    mode: SortMode::Text,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &destination,
+            )
+            .unwrap();
+        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("sort cancelled")
+        };
+        let Some(completed) = summary.output_index else {
+            assert!(!cfg!(target_os = "macos"));
+            return;
+        };
+        let mut sorted = session(&destination, HeaderMode::FirstRow);
+        sorted.dialect.delimiter = b'\t';
+        assert!(matches!(
+            sorted.adopt_completed_index(completed.clone()),
+            Err(QuarryError::InvalidOption(_))
+        ));
+        sorted.dialect.delimiter = b',';
+        sorted.file_size += 1;
+        assert!(matches!(
+            sorted.adopt_completed_index(completed.clone()),
+            Err(QuarryError::SourceChanged)
+        ));
+        sorted.file_size -= 1;
+        let other = directory.path().join("other.csv");
+        fs::copy(&destination, &other).unwrap();
+        assert!(matches!(
+            session(&other, HeaderMode::FirstRow).adopt_completed_index(completed.clone()),
+            Err(QuarryError::SourceChanged)
+        ));
+        fs::write(&destination, b"key\nc\nd\n").unwrap();
+        assert!(matches!(
+            sorted.adopt_completed_index(completed.clone()),
+            Err(QuarryError::SourceChanged)
+        ));
+        assert_eq!(sorted.completed_record_count(), None);
+        assert!(matches!(
+            session(&destination, HeaderMode::FirstRow).adopt_completed_index(completed),
+            Err(QuarryError::SourceChanged)
+        ));
     }
 
     fn sort_artifacts(directory: &Path) -> Vec<PathBuf> {
@@ -2873,6 +3157,7 @@ mod tests {
             false,
             tiny_config(),
             &shared,
+            None,
             None,
         );
 

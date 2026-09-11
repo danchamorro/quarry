@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -8,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use quarry_delimited::RecordScanner;
 
-use crate::QuarryError;
+use crate::export::source_matches_stamp;
+use crate::{CompletedRecordCount, QuarryError, Session, SourceStamp};
 
 const DEFAULT_INDEX_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_CHECKPOINT_EVERY: u64 = 4096;
@@ -37,7 +37,7 @@ pub struct Checkpoint {
     pub offset: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralIndex {
     checkpoints: Vec<Checkpoint>,
     checkpoint_every: u64,
@@ -47,7 +47,7 @@ pub struct StructuralIndex {
 }
 
 impl StructuralIndex {
-    fn new(config: IndexConfig) -> Result<Self, QuarryError> {
+    pub(crate) fn new(config: IndexConfig) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 || config.checkpoint_every == 0 {
             return Err(QuarryError::InvalidOption(
                 "index chunk and checkpoint interval must be non-zero",
@@ -69,7 +69,7 @@ impl StructuralIndex {
         })
     }
 
-    fn record_boundary(&mut self, offset: u64) {
+    pub(crate) fn record_boundary(&mut self, offset: u64) {
         self.indexed_rows += 1;
         self.indexed_bytes = offset;
         if self.indexed_rows.is_multiple_of(self.checkpoint_every) {
@@ -87,6 +87,10 @@ impl StructuralIndex {
                 });
             }
         }
+    }
+
+    pub(crate) fn finish_output(&mut self, bytes_written: u64) {
+        self.indexed_bytes = bytes_written;
     }
 
     pub fn indexed_rows(&self) -> u64 {
@@ -115,6 +119,55 @@ impl StructuralIndex {
             .partition_point(|checkpoint| checkpoint.row <= row)
             .saturating_sub(1);
         self.checkpoints[position]
+    }
+}
+
+/// A completed index tied to the exact file that an operation published.
+/// Its provenance can only be created by the core's guarded output writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedIndex {
+    index: StructuralIndex,
+    source_stamp: Box<SourceStamp>,
+    delimiter: u8,
+}
+
+impl CompletedIndex {
+    pub(crate) fn from_output(
+        index: StructuralIndex,
+        source_stamp: SourceStamp,
+        delimiter: u8,
+    ) -> Option<Self> {
+        (index.indexed_bytes == source_stamp.file_size()).then_some(Self {
+            index,
+            source_stamp: Box::new(source_stamp),
+            delimiter,
+        })
+    }
+}
+
+impl Session {
+    /// Reuse an operation's index only while its published file is still current.
+    pub fn adopt_completed_index(
+        &self,
+        completed: CompletedIndex,
+    ) -> Result<StructuralIndex, QuarryError> {
+        if completed.delimiter != self.dialect.delimiter {
+            return Err(QuarryError::InvalidOption(
+                "completed index delimiter differs from the open document",
+            ));
+        }
+        if completed.index.indexed_bytes != self.file_size
+            || !self.source_stamp.matches(&completed.source_stamp)
+        {
+            return Err(QuarryError::SourceChanged);
+        }
+        self.ensure_source_unchanged()?;
+        *self.completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
+            delimiter: completed.delimiter,
+            file_size: completed.index.indexed_bytes,
+            records: completed.index.indexed_rows,
+        });
+        Ok(completed.index)
     }
 }
 
@@ -158,14 +211,17 @@ pub struct IndexJob {
 }
 
 impl IndexJob {
-    pub(crate) fn start(
-        path: PathBuf,
-        file_size: u64,
-        delimiter: u8,
-        config: IndexConfig,
-    ) -> Result<Self, QuarryError> {
+    pub(crate) fn start(session: &Session, config: IndexConfig) -> Result<Self, QuarryError> {
         let index = StructuralIndex::new(config)?;
-        let file = File::open(path)?;
+        let path = session.path.clone();
+        let file_size = session.file_size;
+        let delimiter = session.dialect.delimiter;
+        let source_stamp = session.source_stamp.clone();
+        let completed_record_count = Arc::clone(&session.completed_record_count);
+        let file = File::open(&path)?;
+        if !source_matches_stamp(&file, &path, &source_stamp)? {
+            return Err(QuarryError::SourceChanged);
+        }
         let shared = Arc::new(SharedState {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
@@ -182,7 +238,22 @@ impl IndexJob {
             .name("quarry-index".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
-                let result = run_indexer(file, delimiter, config, &worker_state);
+                let result = run_indexer(&file, delimiter, config, &worker_state).and_then(|()| {
+                    if !source_matches_stamp(&file, &path, &source_stamp)? {
+                        return Err(QuarryError::SourceChanged);
+                    }
+                    if !worker_state.cancelled.load(Ordering::Acquire)
+                        && worker_state.bytes_scanned.load(Ordering::Acquire)
+                            == source_stamp.file_size()
+                    {
+                        *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
+                            delimiter,
+                            file_size: source_stamp.file_size(),
+                            records: worker_state.index.read().unwrap().indexed_rows,
+                        });
+                    }
+                    Ok(())
+                });
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
                 }
@@ -246,7 +317,7 @@ impl Drop for IndexJob {
 }
 
 fn run_indexer(
-    mut file: File,
+    mut file: &File,
     delimiter: u8,
     config: IndexConfig,
     shared: &SharedState,
@@ -353,13 +424,10 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("quarry-drop-{name}.csv"));
         let contents = b"a,b\n".repeat(250_000);
-        let file_size = contents.len() as u64;
         fs::write(&path, contents).unwrap();
-
+        let session = crate::Session::open(&path, crate::OpenOptions::default()).unwrap();
         let job = IndexJob::start(
-            path.clone(),
-            file_size,
-            b',',
+            &session,
             IndexConfig {
                 chunk_bytes: 1,
                 checkpoint_every: 8,
@@ -378,12 +446,44 @@ mod tests {
             thread::yield_now();
         };
         assert!(!progress.done, "test file indexed before drop");
+        assert!(job.snapshot().indexed_rows() > 0);
+        assert_eq!(session.completed_record_count(), None);
 
         drop(job);
 
         assert!(shared.cancelled.load(Ordering::Acquire));
         assert!(shared.done.load(Ordering::Acquire));
         assert!(shared.finished_nanos.load(Ordering::Acquire) > 0);
+        assert_eq!(session.completed_record_count(), None);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn changed_source_cannot_return_an_index_or_publish_a_record_count() {
+        for change_during_indexing in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.csv");
+            fs::write(&path, b"a,b\n".repeat(50_000)).unwrap();
+            let session = crate::Session::open(&path, crate::OpenOptions::default()).unwrap();
+            let change_source = || {
+                fs::rename(&path, directory.path().join("original.csv")).unwrap();
+                fs::write(&path, b"different,source\n").unwrap();
+            };
+            if !change_during_indexing {
+                change_source();
+            }
+            let job = session.start_indexing(IndexConfig {
+                chunk_bytes: 1,
+                ..IndexConfig::default()
+            });
+            if change_during_indexing {
+                let job = job.unwrap();
+                change_source();
+                assert!(matches!(job.wait(), Err(crate::QuarryError::SourceChanged)));
+            } else {
+                assert!(matches!(job, Err(crate::QuarryError::SourceChanged)));
+            }
+            assert_eq!(session.completed_record_count(), None);
+        }
     }
 }

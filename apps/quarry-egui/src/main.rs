@@ -28,14 +28,15 @@ use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 #[cfg(test)]
 use quarry_core::SearchProgress;
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, DuplicateJob, DuplicateOutcome, DuplicateSpec,
-    DuplicateSummary, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex,
-    FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery,
-    FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob, IndexProgress,
-    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob,
-    ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch, SearchOutcome,
-    SearchPosition, Session, SortDirection, SortJob, SortMode, SortOutcome, SortSpec,
-    SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex, estimate_sort_temporary_bytes,
+    CaseSensitivity, ColumnTransformation, CompletedIndex, DuplicateJob, DuplicateOutcome,
+    DuplicateSpec, DuplicateSummary, FilterExportJob, FilterExportOutcome, FilterExportProgress,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
+    FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob,
+    IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError,
+    ReplaceAllJob, ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch,
+    SearchOutcome, SearchPosition, Session, SortDirection, SortJob, SortMode, SortOutcome,
+    SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
 
@@ -1150,14 +1151,26 @@ impl QuarryApp {
 
     fn install_materialized_working_copy(
         &mut self,
-        ready: MaterializedWorkingCopy,
+        mut ready: MaterializedWorkingCopy,
     ) -> Result<(), String> {
         let Some(current) = self.document.as_ref() else {
             return Err("The document closed before the change finished.".into());
         };
         let options = current.current_open_options();
         let mut replacement = Document::prepare(&ready.path, options)?;
-        replacement.start_indexing()?;
+        if let Some(index) = ready.output_index.take() {
+            let index = replacement
+                .session
+                .adopt_completed_index(index)
+                .map_err(|error| error.to_string())?;
+            replacement.progress.bytes_scanned = index.indexed_bytes();
+            replacement.progress.rows_scanned = index.indexed_rows();
+            replacement.progress.done = true;
+            replacement.index = Some(index);
+            replacement.load_buffer(replacement.viewport_start)?;
+        } else {
+            replacement.start_indexing()?;
+        }
         self.install_prepared_working_copy(replacement, ready);
         Ok(())
     }
@@ -1171,6 +1184,7 @@ impl QuarryApp {
             .document
             .as_mut()
             .expect("the materialized document is still open");
+        current.accept_materialized_change(ready.undo);
         replacement.logical_path = current.logical_path.clone();
         replacement.original_session = current.original_session.take();
         replacement.working_copy = current.working_copy.take();
@@ -1227,11 +1241,12 @@ impl QuarryApp {
         else {
             unreachable!("the duplicate preview remains present");
         };
-        document.accept_materialized_change(undo);
         self.install_prepared_working_copy(
             replacement,
             MaterializedWorkingCopy {
                 path: summary.destination,
+                output_index: None,
+                undo,
                 selected_columns,
                 notice: format!(
                     "Removed {} extra duplicate rows. Save to keep the change, or discard changes.",
@@ -1684,13 +1699,9 @@ impl eframe::App for QuarryApp {
             }
         }
 
-        // Modal input stays isolated, but background jobs must keep advancing.
-        if self.storage_review.is_some() {
-            if ctx.input(|input| input.viewport().close_requested()) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            }
-            self.show_storage_review(ctx);
-            return;
+        let storage_review_open = self.storage_review.is_some();
+        if storage_review_open && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
         let find_available = self
@@ -1698,7 +1709,8 @@ impl eframe::App for QuarryApp {
             .as_ref()
             .is_some_and(|document| !document.filter_active());
         let mut focus_find = false;
-        if find_available
+        if !storage_review_open
+            && find_available
             && !self.close_confirmation_open
             && self.structural_dialog.is_none()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F))
@@ -1723,6 +1735,10 @@ impl eframe::App for QuarryApp {
                     )),
             )
             .show(ctx, |ui| {
+                if storage_review_open {
+                    ui.disable();
+                    ui.set_opacity(1.0);
+                }
                 let document = self.document.as_ref();
                 let document_open = document.is_some();
                 let filter_active = document.is_some_and(Document::filter_active);
@@ -1757,7 +1773,7 @@ impl eframe::App for QuarryApp {
                         action = Some(format_action);
                     }
                     let label = ui.label("Row");
-                    let jump_enabled = document_open && !filter_active;
+                    let jump_enabled = ui.is_enabled() && document_open && !filter_active;
                     let jump = ui
                         .add_enabled(
                             jump_enabled,
@@ -1863,6 +1879,10 @@ impl eframe::App for QuarryApp {
             egui::TopBottomPanel::top("quarry-notice")
                 .frame(panel_frame(fill).inner_margin(egui::Margin::symmetric(10, 5)))
                 .show(ctx, |ui| {
+                    if storage_review_open {
+                        ui.disable();
+                        ui.set_opacity(1.0);
+                    }
                     dismiss = notice_strip(ui, notice);
                 });
             if dismiss {
@@ -1887,6 +1907,10 @@ impl eframe::App for QuarryApp {
                         .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 209, 213))),
                 )
                 .show(ctx, |ui| {
+                    if storage_review_open {
+                        ui.disable();
+                        ui.set_opacity(1.0);
+                    }
                     if focus_find {
                         ui.memory_mut(|memory| {
                             memory.request_focus(egui::Id::new(FIND_INPUT_ID));
@@ -1940,6 +1964,10 @@ impl eframe::App for QuarryApp {
                     .inner_margin(egui::Margin::symmetric(14, 4)),
             )
             .show(ctx, |ui| {
+                if storage_review_open {
+                    ui.disable();
+                    ui.set_opacity(1.0);
+                }
                 if let Some(document) = &self.document {
                     if let Some(footer_action) =
                         status_bar(ui, document, self.footer_status.as_deref())
@@ -1951,14 +1979,16 @@ impl eframe::App for QuarryApp {
                 }
             });
 
-        if action.is_none()
+        if !storage_review_open
+            && action.is_none()
             && !self.close_confirmation_open
             && self.document.as_ref().is_some_and(Document::is_save_ready)
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
         {
             action = Some(Action::Save);
         }
-        if action.is_none()
+        if !storage_review_open
+            && action.is_none()
             && !self.close_confirmation_open
             && self.structural_dialog.is_none()
             && self.format_draft.is_none()
@@ -1973,7 +2003,8 @@ impl eframe::App for QuarryApp {
                         .focused()
                         .is_some_and(|id| is_filter_text_input(id, self.filter_rules.len()))
                 }));
-        if action.is_none() && self.document.is_some() && !filter_owns_keys {
+        if !storage_review_open && action.is_none() && self.document.is_some() && !filter_owns_keys
+        {
             action = ctx.input(|input| {
                 if input.key_pressed(egui::Key::PageDown) {
                     Some(Action::PageDown)
@@ -1984,37 +2015,45 @@ impl eframe::App for QuarryApp {
                 }
             });
         }
-        if let Some(action) = action {
+        if !storage_review_open && let Some(action) = action {
             self.apply(ctx, action);
         }
 
-        if self.format_draft.is_some() {
+        if self.storage_review.is_none() && self.format_draft.is_some() {
             self.columns_open = false;
             self.filters_open = false;
             surrender_filter_text_focus(ctx, self.filter_rules.len());
             ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new(COLUMN_SEARCH_INPUT_ID)));
         }
-        let column_command = self.document.as_ref().and_then(|document| {
-            show_column_manager(
-                ctx,
-                &mut self.columns_open,
-                &mut self.column_search_input,
-                document,
-            )
-        });
+        let column_command = self
+            .document
+            .as_ref()
+            .filter(|_| self.storage_review.is_none())
+            .and_then(|document| {
+                show_column_manager(
+                    ctx,
+                    &mut self.columns_open,
+                    &mut self.column_search_input,
+                    document,
+                )
+            });
         if let Some(command) = column_command {
             self.apply_column_command(ctx, command);
         }
 
-        let filter_action = self.document.as_ref().and_then(|document| {
-            show_filter_manager(
-                ctx,
-                &mut self.filters_open,
-                &mut self.filter_rules,
-                &mut self.filter_match_case,
-                document,
-            )
-        });
+        let filter_action = self
+            .document
+            .as_ref()
+            .filter(|_| self.storage_review.is_none())
+            .and_then(|document| {
+                show_filter_manager(
+                    ctx,
+                    &mut self.filters_open,
+                    &mut self.filter_rules,
+                    &mut self.filter_match_case,
+                    document,
+                )
+            });
         if let Some(action) = filter_action {
             self.apply(ctx, action);
         }
@@ -2025,6 +2064,10 @@ impl eframe::App for QuarryApp {
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
             .show(ctx, |ui| {
+                if self.storage_review.is_some() {
+                    ui.disable();
+                    ui.set_opacity(1.0);
+                }
                 if let Some(document) = self.document.as_mut() {
                     match show_grid_with_filter_case(
                         ui,
@@ -2051,6 +2094,7 @@ impl eframe::App for QuarryApp {
         let structural_dialog_action = self
             .structural_dialog
             .as_mut()
+            .filter(|_| self.storage_review.is_none())
             .zip(self.document.as_ref())
             .and_then(|(dialog, document)| {
                 show_structural_dialog(ctx, dialog, &mut self.sort_match_case, document)
@@ -2058,14 +2102,18 @@ impl eframe::App for QuarryApp {
         if let Some(action) = structural_dialog_action {
             self.apply_structural_dialog_action(action);
         }
-        let duplicate_action = self.document.as_ref().and_then(|document| {
-            let StructuralJob::DuplicatePreview { summary, .. } =
-                document.structural_job.as_ref()?
-            else {
-                return None;
-            };
-            show_duplicate_preview(ctx, summary)
-        });
+        let duplicate_action = self
+            .document
+            .as_ref()
+            .filter(|_| self.storage_review.is_none())
+            .and_then(|document| {
+                let StructuralJob::DuplicatePreview { summary, .. } =
+                    document.structural_job.as_ref()?
+                else {
+                    return None;
+                };
+                show_duplicate_preview(ctx, summary)
+            });
         match duplicate_action {
             Some(StructuralDialogAction::Apply) => {
                 self.notice = self.confirm_duplicate_removal().err();
@@ -2085,14 +2133,14 @@ impl eframe::App for QuarryApp {
                         .map(|edit| (edit.row, edit.column)),
                 )
         });
-        if copy_event_targets_selection {
+        if self.storage_review.is_none() && copy_event_targets_selection {
             self.copy_selection(ctx);
         }
         if grid_error.is_some() {
             self.notice = grid_error.map(AppMessage::error);
         }
 
-        if self.close_confirmation_open {
+        if self.storage_review.is_none() && self.close_confirmation_open {
             let mut discard_and_close = false;
             let mut keep_editing = false;
             let mut save_and_close = false;
@@ -2158,6 +2206,13 @@ impl eframe::App for QuarryApp {
             } else if discard_and_close {
                 self.discard_and_close(ctx);
             }
+        }
+        if self.storage_review.is_some() {
+            // Redraw a newly opened review without its previous dialog or an active grid.
+            if !storage_review_open {
+                ctx.request_discard("storage review opened");
+            }
+            self.show_storage_review(ctx);
         }
         if self.document.as_ref().is_some_and(|document| {
             document.job.is_some()
@@ -2724,6 +2779,9 @@ fn format_menu(
             node.set_description(description);
         });
     }
+    if !ui.is_enabled() {
+        return None;
+    }
     let mut popup_open = draft.is_some();
     if response.clicked() {
         popup_open = !popup_open;
@@ -2894,7 +2952,11 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
         egui::Button::new((marker, RichText::new(filename.clone()).atom_shrink(true))),
         width,
     );
-    let menu = egui::Popup::menu(&response).show(|ui| {
+    let mut popup = egui::Popup::menu(&response);
+    if !ui.is_enabled() {
+        popup = popup.open(false);
+    }
+    let menu = popup.show(|ui| {
         ui.set_min_width(190.0);
         let mut action = None;
         let open = ui
@@ -4213,12 +4275,14 @@ fn search_controls(
                     .desired_width(180.0),
             )
             .labelled_by(label.id);
-        if (input.has_focus() || input.lost_focus() && !input.clicked_elsewhere())
+        if ui.is_enabled()
+            && (input.has_focus() || input.lost_focus() && !input.clicked_elsewhere())
             && ui.input(|input| input.key_pressed(egui::Key::Escape))
         {
             close_requested = true;
         }
-        let can_find = index_ready && !searching && !filter_active && !query.is_empty();
+        let can_find =
+            ui.is_enabled() && index_ready && !searching && !filter_active && !query.is_empty();
         let enter_pressed =
             input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
         let previous_shortcut = enter_pressed && ui.input(|input| input.modifiers.shift);
@@ -4284,12 +4348,13 @@ fn search_controls(
                         .desired_width(180.0),
                 )
                 .labelled_by(label.id);
-            if (input.has_focus() || input.lost_focus() && !input.clicked_elsewhere())
+            if ui.is_enabled()
+                && (input.has_focus() || input.lost_focus() && !input.clicked_elsewhere())
                 && ui.input(|input| input.key_pressed(egui::Key::Escape))
             {
                 close_requested = true;
             }
-            let can_replace = can_replace && !searching && !filter_active;
+            let can_replace = ui.is_enabled() && can_replace && !searching && !filter_active;
             if ui
                 .add_enabled(can_replace, egui::Button::new("Replace in Cell"))
                 .on_disabled_hover_text("Use Find Next or Find Previous to select a match first.")
@@ -4635,6 +4700,8 @@ enum StructuralJob {
 
 struct MaterializedWorkingCopy {
     path: PathBuf,
+    output_index: Option<CompletedIndex>,
+    undo: WorkingCopySnapshot,
     selected_columns: BTreeSet<usize>,
     notice: String,
 }
@@ -4645,18 +4712,46 @@ struct StructuralProgressDisplay {
     animate: bool,
 }
 
-fn sort_merge_progress(
+fn sort_progress(
+    preparing: bool,
+    preparation_bytes_scanned: u64,
     bytes_scanned: u64,
     total_bytes: u64,
     done: bool,
-) -> Option<StructuralProgressDisplay> {
-    (!done && (total_bytes == 0 || bytes_scanned >= total_bytes)).then(|| {
+) -> StructuralProgressDisplay {
+    if done {
+        StructuralProgressDisplay {
+            fraction: 1.0,
+            label: "Sorting rows · 100.0%".into(),
+            animate: false,
+        }
+    } else if preparing {
+        StructuralProgressDisplay {
+            fraction: 0.0,
+            label: if preparation_bytes_scanned == 0 {
+                "Preparing to sort…".into()
+            } else {
+                format!(
+                    "Preparing to sort · counting {:.1}%",
+                    progress_fraction(preparation_bytes_scanned, total_bytes, false) * 100.0
+                )
+            },
+            animate: true,
+        }
+    } else if total_bytes == 0 || bytes_scanned >= total_bytes {
         StructuralProgressDisplay {
             fraction: 0.9,
             label: "Merging sorted rows…".into(),
             animate: true,
         }
-    })
+    } else {
+        let read_fraction = progress_fraction(bytes_scanned, total_bytes, false);
+        StructuralProgressDisplay {
+            fraction: 0.9 * read_fraction,
+            label: format!("Sorting rows · {:.1}% read", read_fraction * 100.0),
+            animate: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5696,9 +5791,10 @@ impl Document {
             } => match job.wait() {
                 Ok(SaveAsOutcome::Complete(summary)) => {
                     debug_assert_eq!(summary.destination, destination);
-                    self.accept_materialized_change(undo);
                     Ok(Some(MaterializedWorkingCopy {
                         path: summary.destination,
+                        output_index: None,
+                        undo,
                         selected_columns,
                         notice: "Column edit applied. Save to keep it, or discard changes.".into(),
                     }))
@@ -5731,9 +5827,10 @@ impl Document {
             } => match job.wait() {
                 Ok(SaveAsOutcome::Complete(summary)) => {
                     debug_assert_eq!(summary.destination, destination);
-                    self.accept_materialized_change(undo);
                     Ok(Some(MaterializedWorkingCopy {
                         path: summary.destination,
+                        output_index: None,
+                        undo,
                         selected_columns: BTreeSet::new(),
                         notice: format!(
                             "Deleted {count} row{}. Save to keep it, or discard changes.",
@@ -5769,10 +5866,11 @@ impl Document {
             } => match job.wait() {
                 Ok(ReplaceAllOutcome::Complete(summary)) => {
                     debug_assert_eq!(summary.destination, destination);
-                    self.accept_materialized_change(undo);
                     let count = summary.replacements;
                     Ok(Some(MaterializedWorkingCopy {
                         path: summary.destination,
+                        output_index: None,
+                        undo,
                         selected_columns,
                         notice: format!(
                             "Replaced {count} occurrence{}. Save to keep it, or discard changes.",
@@ -5818,7 +5916,6 @@ impl Document {
             } => match job.wait() {
                 Ok(SortOutcome::Complete(summary)) => {
                     debug_assert_eq!(summary.destination, destination);
-                    self.accept_materialized_change(undo);
                     let operation = match mode {
                         SortMode::Shuffle { .. } => "Shuffled rows.".to_owned(),
                         SortMode::Reverse => "Reversed row order.".to_owned(),
@@ -5830,24 +5927,23 @@ impl Document {
                     };
                     Ok(Some(MaterializedWorkingCopy {
                         path: summary.destination,
+                        output_index: summary.output_index,
+                        undo,
                         selected_columns,
                         notice: format!("{operation} Save to keep it, or discard changes."),
                     }))
                 }
                 Ok(SortOutcome::Cancelled) => {
-                    let _ = std::fs::remove_file(destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Sort cancelled. The document was not changed.".into());
                     Ok(None)
                 }
                 Err(QuarryError::SourceChanged) => {
-                    let _ = std::fs::remove_file(destination);
                     self.invalidate_changed_source();
                     Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
-                    let _ = std::fs::remove_file(destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Sort failed. The document was not changed.".into());
@@ -5916,7 +6012,7 @@ impl Document {
 
     fn structural_progress(&self) -> Option<StructuralProgressDisplay> {
         let job = self.structural_job.as_ref()?;
-        let (bytes_scanned, total_bytes, done, operation, sorting) = match job {
+        let (bytes_scanned, total_bytes, done, operation) = match job {
             StructuralJob::FindingDuplicates { job, .. } => {
                 let progress = job.progress();
                 if !progress.done && progress.bytes_scanned >= progress.total_bytes {
@@ -5931,7 +6027,6 @@ impl Document {
                     progress.total_bytes,
                     progress.done,
                     "Finding duplicates",
-                    false,
                 )
             }
             StructuralJob::DuplicatePreview { .. } => {
@@ -5948,7 +6043,6 @@ impl Document {
                     progress.total_bytes,
                     progress.done,
                     "Checking split width",
-                    false,
                 )
             }
             StructuralJob::Materializing { job, .. } => {
@@ -5958,7 +6052,6 @@ impl Document {
                     progress.total_bytes,
                     progress.done,
                     "Applying column edit",
-                    false,
                 )
             }
             StructuralJob::Replacing { job, .. } => {
@@ -5968,18 +6061,17 @@ impl Document {
                     progress.total_bytes,
                     progress.done,
                     "Replacing matches",
-                    false,
                 )
             }
             StructuralJob::Sorting { job, .. } => {
                 let progress = job.progress();
-                (
+                return Some(sort_progress(
+                    progress.preparing,
+                    progress.preparation_bytes_scanned,
                     progress.bytes_scanned,
                     progress.total_bytes,
                     progress.done,
-                    "Sorting rows",
-                    true,
-                )
+                ));
             }
             StructuralJob::DeletingRows { job, .. } => {
                 let progress = job.progress();
@@ -5988,13 +6080,9 @@ impl Document {
                     progress.total_bytes,
                     progress.done,
                     "Deleting selected rows",
-                    false,
                 )
             }
         };
-        if sorting && let Some(progress) = sort_merge_progress(bytes_scanned, total_bytes, done) {
-            return Some(progress);
-        }
         let fraction = if total_bytes == 0 {
             if done { 1.0 } else { 0.0 }
         } else {
@@ -8024,7 +8112,7 @@ fn show_grid_with_filter_case(
     let total_rows = document.grid_total_rows();
 
     let grid_rect = ui.available_rect_before_wrap();
-    if total_rows > 0 && ui.rect_contains_pointer(grid_rect) {
+    if ui.is_enabled() && total_rows > 0 && ui.rect_contains_pointer(grid_rect) {
         let delta_y = ui.input_mut(|input| {
             let delta_y = input.smooth_scroll_delta.y;
             input.smooth_scroll_delta.y = 0.0;
@@ -8383,7 +8471,7 @@ fn show_table(
                                     .on_hover_text(
                                         "Click to select. Shift-click a range. Command/Ctrl-click to add or remove. Right-click a selected number for column tools and row sorting.",
                                     );
-                                if column_focus_requested == Some(column) {
+                                if ui.is_enabled() && column_focus_requested == Some(column) {
                                     response.request_focus();
                                 }
                                 response.widget_info(|| {
@@ -8405,7 +8493,7 @@ fn show_table(
                                     );
                                     node.add_action(egui::accesskit::Action::ShowContextMenu);
                                 });
-                                let accesskit_context_menu = ui.input_mut(|input| {
+                                let accesskit_context_menu = ui.is_enabled() && ui.input_mut(|input| {
                                     let mut requested = false;
                                     input.consume_accesskit_action_requests(
                                         response.id,
@@ -8424,7 +8512,7 @@ fn show_table(
                                         egui::accesskit::Action::Click,
                                     )
                                 });
-                                let keyboard_context_menu = response.has_focus()
+                                let keyboard_context_menu = ui.is_enabled() && response.has_focus()
                                     && ui.input(|input| {
                                         input.modifiers.shift
                                             && input.key_pressed(egui::Key::F10)
@@ -8455,7 +8543,9 @@ fn show_table(
                                     document.selection = None;
                                     document.selected_rows.clear();
                                 }
-                                let popup_command = if open_context_menu {
+                                let popup_command = if !ui.is_enabled() {
+                                    Some(egui::SetOpenCommand::Bool(false))
+                                } else if open_context_menu {
                                     Some(egui::SetOpenCommand::Bool(true))
                                 } else if response.clicked() {
                                     Some(egui::SetOpenCommand::Bool(false))
@@ -8580,7 +8670,7 @@ fn show_table(
                                     .as_mut()
                                     .filter(|edit| edit.column == column)
                                 {
-                                    if edit.focus_requested {
+                                    if ui.is_enabled() && edit.focus_requested {
                                         reset_editor_undo(ui.ctx(), header_edit_id(column));
                                     }
                                     let response = ui.add_sized(
@@ -8595,15 +8685,15 @@ fn show_table(
                                             column.saturating_add(1)
                                         ));
                                     });
-                                    if edit.focus_requested {
+                                    if ui.is_enabled() && edit.focus_requested {
                                         response.request_focus();
                                         edit.focus_requested = false;
                                     }
-                                    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                                    if ui.is_enabled() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                                         cancel_header_edit = true;
-                                    } else if (response.has_focus()
+                                    } else if ui.is_enabled() && ((response.has_focus()
                                         && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                                        || response.lost_focus()
+                                        || response.lost_focus())
                                     {
                                         commit_header_edit = true;
                                     }
@@ -8631,11 +8721,11 @@ fn show_table(
                                                 ),
                                             )
                                         });
-                                        let activate = response.clicked()
+                                        let activate = ui.is_enabled() && (response.clicked()
                                             || (response.has_focus()
                                                 && ui.input(|input| {
                                                     input.key_pressed(egui::Key::Enter)
-                                                }));
+                                                })));
                                         response.on_hover_text("Click to rename");
                                         if activate {
                                             begin_header_edit = Some(column);
@@ -8695,7 +8785,7 @@ fn show_table(
                                     );
                                     node.add_action(egui::accesskit::Action::ShowContextMenu);
                                 });
-                                let accesskit_context_menu = ui.input_mut(|input| {
+                                let accesskit_context_menu = ui.is_enabled() && ui.input_mut(|input| {
                                     let mut requested = false;
                                     input.consume_accesskit_action_requests(
                                         response.id,
@@ -8714,7 +8804,7 @@ fn show_table(
                                         egui::accesskit::Action::Click,
                                     )
                                 });
-                                let keyboard_context_menu = response.has_focus()
+                                let keyboard_context_menu = ui.is_enabled() && response.has_focus()
                                     && ui.input(|input| {
                                         input.modifiers.shift
                                             && input.key_pressed(egui::Key::F10)
@@ -8751,7 +8841,9 @@ fn show_table(
                                         Some((selection.clone(), active_row));
                                     effective_row_selection = Some(selection);
                                 }
-                                let popup_command = if open_context_menu {
+                                let popup_command = if !ui.is_enabled() {
+                                    Some(egui::SetOpenCommand::Bool(false))
+                                } else if open_context_menu {
                                     Some(egui::SetOpenCommand::Bool(true))
                                 } else if response.clicked() {
                                     Some(egui::SetOpenCommand::Bool(false))
@@ -8813,7 +8905,7 @@ fn show_table(
                                     if let Some(edit) = active_cell_edit.as_mut().filter(|edit| {
                                         edit.row == record_row && edit.column == column
                                     }) {
-                                        if edit.focus_requested {
+                                        if ui.is_enabled() && edit.focus_requested {
                                             reset_editor_undo(ui.ctx(), cell_edit_id(record_row, column));
                                         }
                                         let response = ui.add_sized(
@@ -8834,14 +8926,14 @@ fn show_table(
                                                 column.saturating_add(1),
                                             ));
                                         });
-                                        if edit.focus_requested {
+                                        if ui.is_enabled() && edit.focus_requested {
                                             response.request_focus();
                                             edit.focus_requested = false;
                                         }
-                                        let escape = ui.input(|input| {
+                                        let escape = ui.is_enabled() && ui.input(|input| {
                                             input.key_pressed(egui::Key::Escape)
                                         });
-                                        let enter = response.has_focus()
+                                        let enter = ui.is_enabled() && response.has_focus()
                                             && ui.input(|input| {
                                                 input.key_pressed(egui::Key::Enter)
                                                     && !input.modifiers.shift
@@ -8852,7 +8944,7 @@ fn show_table(
                                         } else if enter {
                                             commit_cell_edit = true;
                                             restore_cell_focus = Some((record_row, column));
-                                        } else if response.lost_focus() {
+                                        } else if ui.is_enabled() && response.lost_focus() {
                                             commit_cell_edit = true;
                                         }
                                         if reveal_cell == Some((record_row, column)) {
@@ -8906,7 +8998,7 @@ fn show_table(
                                                 egui::accesskit::Action::ShowContextMenu,
                                             );
                                         });
-                                        let accesskit_context_menu = ui.input_mut(|input| {
+                                        let accesskit_context_menu = ui.is_enabled() && ui.input_mut(|input| {
                                             let mut requested = false;
                                             input.consume_accesskit_action_requests(
                                                 response.id,
@@ -8919,7 +9011,7 @@ fn show_table(
                                             );
                                             requested
                                         });
-                                        let keyboard_context_menu = response.has_focus()
+                                        let keyboard_context_menu = ui.is_enabled() && response.has_focus()
                                             && ui.input(|input| {
                                                 input.modifiers.shift
                                                     && input.key_pressed(egui::Key::F10)
@@ -8940,7 +9032,9 @@ fn show_table(
                                                 column,
                                             });
                                         }
-                                        let popup_command = if open_context_menu {
+                                        let popup_command = if !ui.is_enabled() {
+                                            Some(egui::SetOpenCommand::Bool(false))
+                                        } else if open_context_menu {
                                             Some(egui::SetOpenCommand::Bool(true))
                                         } else if response.clicked() {
                                             Some(egui::SetOpenCommand::Bool(false))
@@ -9012,10 +9106,10 @@ fn show_table(
                                                     ui.close();
                                                 }
                                             });
-                                        if cell_focus_requested == Some((record_row, column)) {
+                                        if ui.is_enabled() && cell_focus_requested == Some((record_row, column)) {
                                             response.request_focus();
                                         }
-                                        let keyboard_activate = active_cell_selected
+                                        let keyboard_activate = ui.is_enabled() && active_cell_selected
                                             && response.has_focus()
                                             && ui.input(|input| {
                                                 input.key_pressed(egui::Key::Enter)
@@ -9667,6 +9761,88 @@ mod tests {
     }
 
     #[test]
+    fn storage_review_keeps_grid_visible_without_accepting_background_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("review.csv");
+        let original = format!(
+            "name,value\n{}",
+            (0..100)
+                .map(|row| format!("row_{row},{row}\n"))
+                .collect::<String>()
+        );
+        fs::write(&source, &original).unwrap();
+        let mut app = individual_edit_app(&source);
+        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "edited");
+        app.document.as_mut().unwrap().selection = Some(GridSelection::Cell { row: 1, column: 0 });
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut time = 0.0;
+        let output = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
+        let row_target = accessible_button(&output, "Select row 2").0;
+        let undo_target = accessible_button(&output, "Undo Change").0;
+        let position = app.document.as_ref().unwrap().grid_position();
+        app.begin_storage_review(super::PendingStorageOperation::Structural(
+            super::StructuralDialog::sort(0),
+        ));
+        let output = individual_edit_frame(
+            &mut app,
+            &ctx,
+            &mut time,
+            vec![
+                individual_edit_key(egui::Key::F, egui::Modifiers::COMMAND),
+                individual_edit_key(egui::Key::S, egui::Modifiers::COMMAND),
+                individual_edit_key(egui::Key::Z, egui::Modifiers::COMMAND),
+                individual_edit_key(egui::Key::PageDown, egui::Modifiers::NONE),
+                egui::Event::Copy,
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::ShowContextMenu,
+                    target: row_target,
+                    data: None,
+                }),
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: undo_target,
+                    data: None,
+                }),
+                egui::Event::PointerMoved(egui::pos2(150.0, 300.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -100.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(app.storage_review.is_some());
+        assert!(!app.find_bar_open);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.grid_position(), position);
+        assert_eq!(document.cell_edits[&(1, 1)], b"edited");
+        assert_eq!(
+            document.selection,
+            Some(GridSelection::Cell { row: 1, column: 0 })
+        );
+        assert!(document.selected_rows.is_empty());
+        assert!(document.save_job.is_none());
+        assert!(document.structural_job.is_none());
+        assert!(accessible_button(&output, "Select row 2").1.is_disabled());
+        assert!(
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "row_0")
+            }),
+            "the grid must remain painted behind the storage review"
+        );
+        assert!(
+            !output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| { matches!(command, egui::OutputCommand::CopyText(_)) })
+        );
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
+        app.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
     fn individual_edit_buttons_and_shortcuts_leave_typing_undo_inside_each_editor_session() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("keyboard.csv");
@@ -9846,7 +10022,7 @@ mod tests {
         rendered_column_range, row_for_scroll_fraction, save_as_file_name, scroll_fraction_for_row,
         search_controls, select_column, selected_split_column, selection_text, show_column_manager,
         show_empty_state, show_filter_manager, show_grid, show_grid_with_filter_case,
-        show_structural_dialog, sort_merge_progress,
+        show_structural_dialog, sort_progress,
     };
 
     #[test]
@@ -10906,7 +11082,12 @@ mod tests {
             assert!(Instant::now() < deadline, "column edit timed out");
             std::thread::yield_now();
         }
-        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        if document.job.is_some() {
+            finish_index(document);
+        } else {
+            assert!(document.index.is_some() && document.progress.done);
+        }
     }
 
     fn finish_search(document: &mut Document) {
@@ -15342,12 +15523,218 @@ mod tests {
     }
 
     #[test]
-    fn sort_merge_progress_stays_active_until_the_worker_finishes() {
-        let progress = sort_merge_progress(100, 100, false).unwrap();
-        assert_eq!(progress.fraction, 0.9);
-        assert_eq!(progress.label, "Merging sorted rows…");
-        assert!(progress.animate);
-        assert!(sort_merge_progress(100, 100, true).is_none());
+    fn sort_progress_advances_through_phases_without_resetting() {
+        let mut previous = 0.0;
+        for (preparing, bytes, done, label, animated) in [
+            (true, 0, false, "Preparing to sort…", true),
+            (true, 25, false, "Preparing to sort · counting 25.0%", true),
+            (
+                true,
+                100,
+                false,
+                "Preparing to sort · counting 100.0%",
+                true,
+            ),
+            (false, 0, false, "Sorting rows · 0.0% read", false),
+            (false, 50, false, "Sorting rows · 50.0% read", false),
+            (false, 99, false, "Sorting rows · 99.0% read", false),
+            (false, 100, false, "Merging sorted rows…", true),
+            (false, 100, true, "Sorting rows · 100.0%", false),
+        ] {
+            let progress = sort_progress(
+                preparing,
+                if preparing { bytes } else { 0 },
+                bytes,
+                100,
+                done,
+            );
+            assert!(progress.fraction >= previous);
+            assert_eq!(progress.label, label);
+            assert_eq!(progress.animate, animated);
+            if !done {
+                assert!(progress.fraction <= 0.9);
+            }
+            previous = progress.fraction;
+        }
+        assert_eq!(previous, 1.0);
+        assert_eq!(sort_progress(false, 0, 0, 0, false).fraction, 0.9);
+        assert_eq!(sort_progress(false, 0, 0, 0, true).fraction, 1.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rejected_sort_handoff_preserves_history_and_external_destination() {
+        for retain_redo in [false, true] {
+            for replace_published in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let source = directory.path().join("source.csv");
+                let original = b"key,name\nb,second\na,first\n";
+                let external = b"external,value\nkeep,7\n";
+                fs::write(&source, original).unwrap();
+                let mut app = individual_edit_app(&source);
+                app.document
+                    .as_mut()
+                    .unwrap()
+                    .start_sort_rows(
+                        0,
+                        super::SortDirection::Ascending,
+                        SortMode::Text,
+                        CaseSensitivity::Insensitive,
+                    )
+                    .unwrap();
+                finish_structural_edit(&mut app);
+                if retain_redo {
+                    app.swap_structural_history(false).unwrap();
+                    finish_index(app.document.as_mut().unwrap());
+                }
+                let document = app.document.as_ref().unwrap();
+                let current_path = document.session.path().to_path_buf();
+                let current_bytes = fs::read(&current_path).unwrap();
+                let history = document.working_copy.as_ref().unwrap();
+                let expected_undo = history.undo.clone();
+                let expected_redo = history.redo.clone();
+                let expected_history_buttons = (document.can_undo(), document.can_redo());
+                app.document
+                    .as_mut()
+                    .unwrap()
+                    .start_sort_rows(
+                        0,
+                        super::SortDirection::Descending,
+                        SortMode::Text,
+                        CaseSensitivity::Insensitive,
+                    )
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let destination = loop {
+                    let Some(super::StructuralJob::Sorting {
+                        job, destination, ..
+                    }) = app.document.as_ref().unwrap().structural_job.as_ref()
+                    else {
+                        panic!("expected pending sort");
+                    };
+                    if job.progress().done {
+                        break destination.clone();
+                    }
+                    assert!(Instant::now() < deadline, "sort timed out");
+                    std::thread::yield_now();
+                };
+                if replace_published {
+                    let ready = app
+                        .document
+                        .as_mut()
+                        .unwrap()
+                        .poll_structural_edit()
+                        .unwrap()
+                        .unwrap();
+                    assert!(ready.output_index.is_some());
+                    fs::rename(&destination, directory.path().join("completed.csv")).unwrap();
+                    fs::write(&destination, external).unwrap();
+                    assert!(app.install_materialized_working_copy(ready).is_err());
+                } else {
+                    fs::write(&destination, external).unwrap();
+                    assert!(
+                        app.document
+                            .as_mut()
+                            .unwrap()
+                            .poll_structural_edit()
+                            .is_err()
+                    );
+                }
+                let document = app.document.as_ref().unwrap();
+                assert_eq!(document.session.path(), current_path);
+                assert_eq!(fs::read(&current_path).unwrap(), current_bytes);
+                assert_eq!(fs::read(&source).unwrap(), original);
+                assert_eq!(fs::read(&destination).unwrap(), external);
+                let history = document.working_copy.as_ref().unwrap();
+                assert_eq!(history.undo, expected_undo);
+                assert_eq!(history.redo, expected_redo);
+                assert_eq!(
+                    (document.can_undo(), document.can_redo()),
+                    expected_history_buttons
+                );
+                for retained in [expected_undo, expected_redo].into_iter().flatten() {
+                    assert!(retained.path.exists());
+                }
+                app.document.as_mut().unwrap().shutdown();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sorted_output_is_immediately_indexed_and_reuses_its_count_on_the_next_sort() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("sort-index.csv");
+        let original = format!(
+            "key,name\n{}",
+            (0..9_000)
+                .rev()
+                .map(|row| format!("{row},row-{row}\n"))
+                .collect::<String>()
+        );
+        fs::write(&source, &original).unwrap();
+        let mut app = individual_edit_app(&source);
+        for (direction, last_value) in [
+            (super::SortDirection::Ascending, "8999"),
+            (super::SortDirection::Descending, "0"),
+        ] {
+            app.document
+                .as_mut()
+                .unwrap()
+                .start_sort_rows(0, direction, SortMode::Number, CaseSensitivity::Insensitive)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let Some(super::StructuralJob::Sorting { job, .. }) =
+                    app.document.as_ref().unwrap().structural_job.as_ref()
+                else {
+                    panic!("sort job should remain active until its handoff");
+                };
+                if job.progress().done {
+                    assert_eq!(job.progress().preparation_bytes_scanned, 0);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "sort timed out");
+                std::thread::yield_now();
+            }
+            let ready = app
+                .document
+                .as_mut()
+                .unwrap()
+                .poll_structural_edit()
+                .unwrap()
+                .unwrap();
+            assert!(ready.output_index.is_some());
+            app.install_materialized_working_copy(ready).unwrap();
+            let document = app.document.as_mut().unwrap();
+            assert!(
+                document.job.is_none(),
+                "sort must not launch another index scan"
+            );
+            assert!(document.progress.done);
+            assert_eq!(document.progress.bytes_scanned, document.session.file_size);
+            assert_eq!(document.progress.rows_scanned, 9_001);
+            let index = document.index.as_ref().unwrap();
+            assert_eq!(index.indexed_rows(), 9_001);
+            assert_eq!(index.indexed_bytes(), document.session.file_size);
+            assert!(index.checkpoints().len() >= 3);
+            document.navigate(9_000).unwrap();
+            let (row, fields) = document
+                .visible_row(document.visible_row_count() - 1)
+                .unwrap();
+            assert_eq!(row, 9_000);
+            assert_eq!(fields[0], last_value.as_bytes());
+            assert!(document.can_undo());
+            assert_eq!(fs::read_to_string(&source).unwrap(), original);
+        }
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.document.as_mut().unwrap());
+        assert_eq!(
+            app.document.as_ref().unwrap().session.first_rows[1].fields[0],
+            b"0"
+        );
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
+        app.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
