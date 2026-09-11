@@ -219,7 +219,9 @@ impl IndexJob {
         let source_stamp = session.source_stamp.clone();
         let completed_record_count = Arc::clone(&session.completed_record_count);
         let file = File::open(&path)?;
-        let source_was_current = source_matches_stamp(&file, &path, &source_stamp)?;
+        if !source_matches_stamp(&file, &path, &source_stamp)? {
+            return Err(QuarryError::SourceChanged);
+        }
         let shared = Arc::new(SharedState {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
@@ -237,11 +239,12 @@ impl IndexJob {
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
                 let result = run_indexer(&file, delimiter, config, &worker_state).and_then(|()| {
-                    if source_was_current
-                        && !worker_state.cancelled.load(Ordering::Acquire)
+                    if !source_matches_stamp(&file, &path, &source_stamp)? {
+                        return Err(QuarryError::SourceChanged);
+                    }
+                    if !worker_state.cancelled.load(Ordering::Acquire)
                         && worker_state.bytes_scanned.load(Ordering::Acquire)
                             == source_stamp.file_size()
-                        && source_matches_stamp(&file, &path, &source_stamp)?
                     {
                         *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
                             delimiter,
@@ -456,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_source_cannot_publish_a_completed_record_count() {
+    fn changed_source_cannot_return_an_index_or_publish_a_record_count() {
         for change_during_indexing in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("source.csv");
@@ -469,16 +472,17 @@ mod tests {
             if !change_during_indexing {
                 change_source();
             }
-            let job = session
-                .start_indexing(IndexConfig {
-                    chunk_bytes: 1,
-                    ..IndexConfig::default()
-                })
-                .unwrap();
+            let job = session.start_indexing(IndexConfig {
+                chunk_bytes: 1,
+                ..IndexConfig::default()
+            });
             if change_during_indexing {
+                let job = job.unwrap();
                 change_source();
+                assert!(matches!(job.wait(), Err(crate::QuarryError::SourceChanged)));
+            } else {
+                assert!(matches!(job, Err(crate::QuarryError::SourceChanged)));
             }
-            job.wait().unwrap();
             assert_eq!(session.completed_record_count(), None);
         }
     }

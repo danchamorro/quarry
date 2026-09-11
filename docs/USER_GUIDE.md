@@ -645,7 +645,7 @@ setting.
 | **Replace in Cell** is disabled | Use **Find Next** or **Find Previous** to establish the current matching cell first. |
 | Quarry says the source changed | Use **Discard Changes**, then choose **Reload from Disk** from the file menu. |
 | Save As will not use a path | Choose a destination that does not already exist. |
-| A storage check fails | Reconnect the drive, choose an existing writable folder in File → Temporary storage, or free space and click Check space. For Save/export, choose another destination. |
+| A storage check fails | Reconnect the drive, choose an existing writable folder in File → Temporary storage, or free space and click **Check again**. For Save/export, choose another destination. |
 | A dropped file does not open | Use one local file, and save or discard changes in the current file first. |
 | A long operation is running | Read its progress or phase in the footer. Use the matching Cancel button there if needed. |
 | A long operation appears stuck during sort | Check whether the status says **Merging sorted rows…**. This is a separate merge phase and can take substantial time on very large files. |
