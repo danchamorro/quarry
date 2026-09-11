@@ -1,5 +1,8 @@
 /target/
 /LARGE_FILE.csv
 /LARGE_FILE_*.csv
+/daily_weather_preprocessed_1896_2023.csv
+/hacknernews.csv
+/apps/quarry-gpui/
 /fixtures/generated/
 *.qidx
