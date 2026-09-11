@@ -872,6 +872,9 @@ impl QuarryApp {
                 return;
             }
             Action::OpenColumns => {
+                surrender_filter_text_focus(ctx, self.filter_rules.len());
+                self.filters_open = false;
+                self.format_draft = None;
                 ctx.data_mut(|data| {
                     data.remove::<usize>(egui::Id::new("quarry-selected-managed-column"));
                 });
@@ -887,6 +890,11 @@ impl QuarryApp {
                 return;
             }
             Action::OpenFilters => {
+                ctx.memory_mut(|memory| {
+                    memory.surrender_focus(egui::Id::new(COLUMN_SEARCH_INPUT_ID))
+                });
+                self.columns_open = false;
+                self.format_draft = None;
                 self.filters_open = true;
                 return;
             }
@@ -1804,10 +1812,9 @@ impl eframe::App for QuarryApp {
                         action = Some(Action::Redo);
                     }
 
-                    if ui
-                        .add_enabled(document_open, egui::Button::new("Columns…"))
-                        .clicked()
-                    {
+                    let columns = ui.add_enabled(document_open, egui::Button::new("Columns…"));
+                    ctx.data_mut(|data| data.insert_temp(egui::Id::new(("quarry-column-manager", "anchor")), columns.rect.right_bottom()));
+                    if columns.clicked() {
                         action = Some(Action::OpenColumns);
                     }
                     let filter_label = filter_button_label(
@@ -1821,6 +1828,7 @@ impl eframe::App for QuarryApp {
                             )
                         })
                         .inner;
+                    ctx.data_mut(|data| data.insert_temp(egui::Id::new(("quarry-filter-manager", "anchor")), filters.rect.right_bottom()));
                     if filters.clicked() {
                         action = Some(Action::OpenFilters);
                     }
@@ -1980,6 +1988,12 @@ impl eframe::App for QuarryApp {
             self.apply(ctx, action);
         }
 
+        if self.format_draft.is_some() {
+            self.columns_open = false;
+            self.filters_open = false;
+            surrender_filter_text_focus(ctx, self.filter_rules.len());
+            ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new(COLUMN_SEARCH_INPUT_ID)));
+        }
         let column_command = self.document.as_ref().and_then(|document| {
             show_column_manager(
                 ctx,
@@ -2716,22 +2730,31 @@ fn format_menu(
         *draft = popup_open.then_some((applied_delimiter, applied_header));
     }
 
+    // This panel owns its open state; egui memory tracks its nested choosers.
+    let chooser_was_open = popup_open && egui::Popup::is_any_open(ui.ctx());
     let mut discard_draft = false;
     let menu = egui::Popup::menu(&response)
         .open_bool(&mut popup_open)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .close_behavior(if chooser_was_open {
+            egui::PopupCloseBehavior::IgnoreClicks
+        } else {
+            egui::PopupCloseBehavior::CloseOnClickOutside
+        })
+        .style(egui::style::StyleModifier::new(compact_tool_style))
+        .frame(compact_tool_frame(ui.ctx()))
         .show(|ui| {
-            ui.set_min_width(340.0);
+            ui.set_width(316.0);
+            ui.heading("Format");
             let dialect = document
                 .expect("disabled Format control cannot open")
                 .session
                 .dialect;
-            ui.label(format!(
+            ui.weak(format!(
                 "Applied: {} · {}",
                 applied_delimiter.label(),
                 compact_header_mode_label(applied_header)
             ));
-            ui.label(format!(
+            ui.weak(format!(
                 "Detected: {} · {}",
                 detected_delimiter_label(dialect.delimiter),
                 if dialect.has_header {
@@ -2744,19 +2767,53 @@ fn format_menu(
 
             let (draft_delimiter, draft_header) =
                 draft.get_or_insert((applied_delimiter, applied_header));
-            ui.label("Delimiter");
-            ui.horizontal_wrapped(|ui| {
-                for mode in DelimiterMode::ALL {
-                    ui.radio_value(draft_delimiter, mode, mode.label());
-                }
-            });
-            ui.add_space(4.0);
-            ui.label("Header");
-            ui.horizontal_wrapped(|ui| {
-                for mode in [HeaderMode::Auto, HeaderMode::FirstRow, HeaderMode::NoHeader] {
-                    ui.radio_value(draft_header, mode, header_mode_label(mode));
-                }
-            });
+            egui::Grid::new("quarry-format-fields")
+                .spacing(egui::vec2(14.0, 8.0))
+                .show(ui, |ui| {
+                    let label = ui.label("Delimiter");
+                    egui::ComboBox::from_id_salt("quarry-format-delimiter")
+                        .selected_text(draft_delimiter.label())
+                        .width(238.0)
+                        .popup_style(egui::style::StyleModifier::new(compact_tool_style))
+                        .show_ui(ui, |ui| {
+                            for mode in DelimiterMode::ALL {
+                                if ui
+                                    .selectable_value(draft_delimiter, mode, mode.label())
+                                    .clicked()
+                                {
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(label.id);
+                    ui.end_row();
+                    let label = ui.label("Header");
+                    egui::ComboBox::from_id_salt("quarry-format-header")
+                        .selected_text(header_mode_label(*draft_header))
+                        .width(238.0)
+                        .popup_style(egui::style::StyleModifier::new(compact_tool_style))
+                        .show_ui(ui, |ui| {
+                            for mode in
+                                [HeaderMode::Auto, HeaderMode::FirstRow, HeaderMode::NoHeader]
+                            {
+                                if ui
+                                    .selectable_value(draft_header, mode, header_mode_label(mode))
+                                    .clicked()
+                                {
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(label.id);
+                    ui.end_row();
+                });
+            if chooser_was_open {
+                ui.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                });
+            }
             ui.separator();
 
             let selected = (*draft_delimiter, *draft_header);
@@ -2768,15 +2825,14 @@ fn format_menu(
                     || document.structural_job.is_some()
             });
             let mut action = None;
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    discard_draft = true;
-                    ui.close();
-                }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let reopen = ui
                     .add_enabled(
                         changed && !dirty && !operation_active,
-                        egui::Button::new("Reopen with Changes"),
+                        egui::Button::new(
+                            RichText::new("Reopen with Changes").color(QUARRY_SELECTED_TEXT),
+                        )
+                        .fill(QUARRY_YELLOW),
                     )
                     .on_disabled_hover_text(if !changed {
                         "Choose a different delimiter or header mode first."
@@ -2787,6 +2843,10 @@ fn format_menu(
                     });
                 if reopen.clicked() {
                     action = Some(Action::ReopenWithFormat(selected.0, selected.1));
+                    discard_draft = true;
+                    ui.close();
+                }
+                if ui.button("Cancel").clicked() {
                     discard_draft = true;
                     ui.close();
                 }
@@ -3145,29 +3205,31 @@ fn show_column_manager(
     egui::Window::new("Columns")
         .id(egui::Id::new("quarry-column-manager"))
         .title_bar(false)
-        .default_width(560.0)
+        .pivot(egui::Align2::RIGHT_TOP)
+        .fixed_pos(compact_tool_anchor(ctx, "quarry-column-manager"))
+        .min_width(360.0)
+        .max_width(360.0)
         .resizable(false)
-        .frame(tool_dialog_frame(ctx))
+        .frame(compact_tool_frame(ctx))
         .show(ctx, |ui| {
-            tool_dialog_style(ui.style_mut());
+            compact_tool_style(ui.style_mut());
+            ui.set_width(360.0);
             ui.horizontal(|ui| {
                 ui.heading("Columns");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    close_requested = ui.button("Close").clicked();
+                    close_requested = compact_tool_close(ui);
                 });
             });
-            ui.weak("Choose which columns appear and their left-to-right order.");
+            let search_response = ui.add_sized(
+                [ui.available_width(), 28.0],
+                egui::TextEdit::singleline(search)
+                    .id(egui::Id::new(COLUMN_SEARCH_INPUT_ID))
+                    .hint_text("Search columns"),
+            );
+            let _ = ui.ctx().accesskit_node_builder(search_response.id, |node| {
+                node.set_label("Search columns");
+            });
             ui.horizontal(|ui| {
-                let search_width = (ui.available_width() - 210.0).max(180.0);
-                let search_response = ui.add_sized(
-                    [search_width, 30.0],
-                    egui::TextEdit::singleline(search)
-                        .id(egui::Id::new(COLUMN_SEARCH_INPUT_ID))
-                        .hint_text("Search columns"),
-                );
-                let _ = ui.ctx().accesskit_node_builder(search_response.id, |node| {
-                    node.set_label("Search columns");
-                });
                 ui.weak(format!(
                     "{} shown of {}",
                     document.columns.shown_count(),
@@ -3197,12 +3259,12 @@ fn show_column_manager(
                 .map(|(position, _)| position)
                 .collect::<Vec<_>>();
             ui.scope(|ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                let row_height = 36.0;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let row_height = 28.0;
                 egui::ScrollArea::vertical()
                     .id_salt("quarry-column-manager-list")
                     .auto_shrink([false, false])
-                    .max_height((ctx.content_rect().height() - 260.0).clamp(96.0, 400.0))
+                    .max_height((ctx.content_rect().height() - 260.0).clamp(96.0, 336.0))
                     .show_rows(ui, row_height, filtered_positions.len(), |ui, rows| {
                         if filtered_positions.is_empty() {
                             ui.weak(if document.total_columns == 0 {
@@ -3231,8 +3293,7 @@ fn show_column_manager(
                                     } else {
                                         Color32::from_rgb(239, 243, 245)
                                     })
-                                    .corner_radius(5)
-                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                    .inner_margin(egui::Margin::symmetric(4, 0))
                                     .show(ui, |ui| {
                                         ui.set_min_width(ui.available_width());
                                         ui.horizontal(|ui| {
@@ -3259,7 +3320,7 @@ fn show_column_manager(
                                                     Some(ColumnCommand::SetShown { column, shown });
                                             }
                                             let (handle, _) = ui.allocate_exact_size(
-                                                egui::vec2(14.0, 30.0),
+                                                egui::vec2(12.0, 28.0),
                                                 egui::Sense::hover(),
                                             );
                                             for x in [-2.5, 2.5] {
@@ -3272,7 +3333,7 @@ fn show_column_manager(
                                                 }
                                             }
                                             ui.add_sized(
-                                                [42.0, 30.0],
+                                                [28.0, 28.0],
                                                 egui::Label::new(
                                                     RichText::new(
                                                         column.saturating_add(1).to_string(),
@@ -3282,7 +3343,7 @@ fn show_column_manager(
                                                 ),
                                             );
                                             ui.allocate_ui_with_layout(
-                                                egui::vec2(ui.available_width(), 30.0),
+                                                egui::vec2(ui.available_width(), 28.0),
                                                 Layout::left_to_right(Align::Center),
                                                 |ui| {
                                                     ui.add(egui::Label::new(&name).truncate())
@@ -3374,13 +3435,7 @@ fn show_column_manager(
                     command = Some(ColumnCommand::AutoFit);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Done").color(QUARRY_SELECTED_TEXT))
-                                .fill(QUARRY_YELLOW),
-                        )
-                        .clicked()
-                    {
+                    if ui.button("Done").clicked() {
                         close_requested = true;
                     }
                 });
@@ -3740,25 +3795,66 @@ fn tool_dialog_style(style: &mut egui::Style) {
     visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
 }
 
+fn compact_tool_frame(ctx: &egui::Context) -> egui::Frame {
+    tool_dialog_frame(ctx)
+        .inner_margin(12)
+        .corner_radius(6)
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 3],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(24),
+        })
+}
+
+fn compact_tool_style(style: &mut egui::Style) {
+    tool_dialog_style(style);
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.interact_size.y = 28.0;
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    for text_style in [TextStyle::Body, TextStyle::Button] {
+        style
+            .text_styles
+            .insert(text_style, FontId::proportional(13.0));
+    }
+    style
+        .text_styles
+        .insert(TextStyle::Heading, FontId::proportional(14.0));
+}
+
+fn compact_tool_anchor(ctx: &egui::Context, window_id: &str) -> egui::Pos2 {
+    ctx.data(|data| data.get_temp::<egui::Pos2>(egui::Id::new((window_id, "anchor"))))
+        .unwrap_or_else(|| ctx.content_rect().right_top() + egui::vec2(-16.0, TOOLBAR_HEIGHT))
+        + egui::vec2(0.0, 6.0)
+}
+
+fn compact_tool_close(ui: &mut egui::Ui) -> bool {
+    let response = ui
+        .add(egui::Button::new("×").frame(false))
+        .on_hover_text("Close");
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close"));
+    response.clicked()
+}
+
 fn filter_column_picker(
     ui: &mut egui::Ui,
     index: usize,
     rule: &mut FilterRuleDraft,
     document: &Document,
+    label: egui::Id,
 ) {
-    let label = ui.weak("Column");
     let selected = parse_file_column(&rule.column_input, document.total_columns)
         .map(|column| format!("{}: {}", column + 1, document.column_name(column)))
         .unwrap_or_else(|_| "Choose a column".into());
     let picker = egui::ComboBox::from_id_salt(("quarry-filter-column", index))
-        .selected_text(selected)
+        .selected_text(selected.clone())
         .width(ui.available_width())
         .wrap_mode(egui::TextWrapMode::Truncate)
         .height(280.0)
-        .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
+        .popup_style(egui::style::StyleModifier::new(compact_tool_style))
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
-            ui.set_width(ui.available_width());
+            ui.set_width(300.0);
             let search = ui.add(
                 egui::TextEdit::singleline(&mut rule.column_search)
                     .id(filter_column_input_id(index))
@@ -3806,7 +3902,7 @@ fn filter_column_picker(
                     }
                 });
         });
-    let response = picker.response.labelled_by(label.id);
+    let response = picker.response.labelled_by(label).on_hover_text(selected);
     let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
         node.set_label(format!("Rule {} column", index + 1));
     });
@@ -3836,111 +3932,132 @@ fn show_filter_manager(
     egui::Window::new("Filters")
         .id(egui::Id::new("quarry-filter-manager"))
         .title_bar(false)
-        .default_width(620.0)
+        .pivot(egui::Align2::RIGHT_TOP)
+        .fixed_pos(compact_tool_anchor(ctx, "quarry-filter-manager"))
+        .min_width(600.0)
+        .max_width(600.0)
         .resizable(false)
-        .frame(tool_dialog_frame(ctx))
+        .frame(compact_tool_frame(ctx))
         .show(ctx, |ui| {
-            tool_dialog_style(ui.style_mut());
+            compact_tool_style(ui.style_mut());
+            ui.set_width(600.0);
             ui.horizontal(|ui| {
                 ui.heading("Filters");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    close = ui.button("Close").clicked();
+                    close = compact_tool_close(ui);
                 });
             });
-            ui.weak("Choose which rows stay in view.");
             ui.separator();
             let rule_count = rules.len();
             let mut remove_index = None;
+            let column_width = 188.0;
+            let condition_width = 150.0;
+            let number_width = 20.0;
+            let remove_width = 24.0;
+            let labels = ui.horizontal(|ui| {
+                ui.add_space(number_width + ui.spacing().item_spacing.x);
+                let column = ui.allocate_ui_with_layout(egui::vec2(column_width, 16.0), Layout::top_down(Align::Min), |ui| { ui.set_min_width(column_width); ui.weak("Column") }).inner.id;
+                let condition = ui.allocate_ui_with_layout(egui::vec2(condition_width, 16.0), Layout::top_down(Align::Min), |ui| { ui.set_min_width(condition_width); ui.weak("Condition") }).inner.id;
+                let value = ui.weak("Value").id;
+                (column, condition, value)
+            }).inner;
             egui::ScrollArea::vertical()
                 .id_salt("quarry-filter-rules")
-                .max_height((ctx.content_rect().height() - 260.0).clamp(96.0, 420.0))
+                .max_height((ctx.content_rect().height() - 280.0).clamp(96.0, 360.0))
                 .show(ui, |ui| {
+                    let value_width = ui.available_width() - column_width - condition_width
+                        - number_width - remove_width - 4.0 * ui.spacing().item_spacing.x;
                     for (index, rule) in rules.iter_mut().enumerate() {
-                        egui::Frame::new()
-                            .fill(Color32::WHITE)
-                            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(220, 226, 230)))
-                            .corner_radius(8)
-                            .inner_margin(12)
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.strong(format!("Rule {}", index + 1));
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        let response = ui.add_enabled(rule_count > 1, egui::Button::new("Remove").frame(false));
-                                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-                                            node.set_label(format!("Remove rule {}", index + 1));
-                                        });
-                                        if response.clicked() {
-                                            surrender_filter_text_focus(ui.ctx(), rule_count);
-                                            remove_index = Some(index);
+                        ui.horizontal_top(|ui| {
+                            ui.add_sized([number_width, 28.0], egui::Label::new(RichText::new((index + 1).to_string()).weak()));
+                            ui.allocate_ui_with_layout(egui::vec2(column_width, 28.0), Layout::top_down(Align::Min), |ui| {
+                                filter_column_picker(ui, index, rule, document, labels.0);
+                            });
+                            ui.allocate_ui_with_layout(egui::vec2(condition_width, 28.0), Layout::top_down(Align::Min), |ui| {
+                                let response = egui::ComboBox::from_id_salt(("quarry-filter-operator", index))
+                                    .width(condition_width)
+                                    .wrap_mode(egui::TextWrapMode::Truncate)
+                                    .popup_style(egui::style::StyleModifier::new(compact_tool_style))
+                                    .selected_text(filter_operator_label(rule.operator))
+                                    .show_ui(ui, |ui| {
+                                        for operator in [FilterOperator::Contains, FilterOperator::Equals, FilterOperator::NotEquals] {
+                                            if ui.selectable_value(&mut rule.operator, operator, filter_operator_label(operator)).clicked() {
+                                                ui.close();
+                                            }
                                         }
-                                    });
+                                        ui.separator();
+                                        for operator in [FilterOperator::GreaterThan, FilterOperator::GreaterThanOrEqual, FilterOperator::LessThan, FilterOperator::LessThanOrEqual, FilterOperator::Between] {
+                                            if ui.selectable_value(&mut rule.operator, operator, filter_operator_label(operator)).clicked() {
+                                                ui.close();
+                                            }
+                                        }
+                                    }).response.labelled_by(labels.1)
+                                    .on_hover_text(filter_operator_label(rule.operator));
+                                let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                    node.set_label(format!("Rule {} match", index + 1));
                                 });
-                                ui.horizontal_top(|ui| {
-                                    let column_width = (ui.available_width() - 198.0).max(160.0);
-                                    ui.allocate_ui_with_layout(egui::vec2(column_width, 0.0), Layout::top_down(Align::Min), |ui| {
-                                        filter_column_picker(ui, index, rule, document);
-                                    });
-                                    ui.vertical(|ui| {
-                                        let label = ui.weak("Condition");
-                                        let response = egui::ComboBox::from_id_salt(("quarry-filter-operator", index))
-                                            .width(188.0)
-                                            .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
-                                            .selected_text(filter_operator_label(rule.operator))
-                                            .show_ui(ui, |ui| {
-                                                for operator in [FilterOperator::Contains, FilterOperator::Equals, FilterOperator::NotEquals] {
-                                                    if ui.selectable_value(&mut rule.operator, operator, filter_operator_label(operator)).clicked() {
-                                                        ui.close();
-                                                    }
-                                                }
-                                                ui.separator();
-                                                for operator in [FilterOperator::GreaterThan, FilterOperator::GreaterThanOrEqual, FilterOperator::LessThan, FilterOperator::LessThanOrEqual, FilterOperator::Between] {
-                                                    if ui.selectable_value(&mut rule.operator, operator, filter_operator_label(operator)).clicked() {
-                                                        ui.close();
-                                                    }
-                                                }
-                                            }).response.labelled_by(label.id);
-                                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-                                            node.set_label(format!("Rule {} match", index + 1));
-                                        });
-                                    });
-                                });
+                            });
+                            ui.allocate_ui_with_layout(egui::vec2(value_width, 28.0), Layout::top_down(Align::Min), |ui| {
                                 if rule.operator.is_numeric() {
                                     let between = rule.operator == FilterOperator::Between;
-                                    ui.columns(if between { 2 } else { 1 }, |columns| {
-                                        let label = columns[0].label(format!("Rule {} {}", index + 1, if between { "lower bound" } else { "number" }));
-                                        let _ = columns[0].add(egui::TextEdit::singleline(&mut rule.value_input)
-                                            .desired_width(f32::INFINITY)
-                                            .id(filter_value_input_id(index)).hint_text("e.g. 500 or 5e2")).labelled_by(label.id);
-                                        if between {
-                                            let label = columns[1].label(format!("Rule {} upper bound", index + 1));
-                                            let _ = columns[1].add(egui::TextEdit::singleline(&mut rule.upper_bound_input)
-                                                .desired_width(f32::INFINITY)
-                                                .id(filter_upper_bound_input_id(index)).hint_text("e.g. 1000")).labelled_by(label.id);
-                                        }
+                                    let response = ui.add_sized([value_width, 28.0], egui::TextEdit::singleline(&mut rule.value_input)
+                                        .id(filter_value_input_id(index))
+                                        .hint_text(if between { "Lower bound" } else { "Number" }))
+                                        .labelled_by(labels.2);
+                                    let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                        node.set_label(format!("Rule {} {}", index + 1, if between { "lower bound" } else { "number" }));
                                     });
+                                    if between {
+                                        let response = ui.add_sized([value_width, 28.0], egui::TextEdit::singleline(&mut rule.upper_bound_input)
+                                            .id(filter_upper_bound_input_id(index)).hint_text("Upper bound"))
+                                            .labelled_by(labels.2);
+                                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                            node.set_label(format!("Rule {} upper bound", index + 1));
+                                        });
+                                    }
                                 } else {
-                                    let label = ui.label(format!("Rule {} value", index + 1));
-                                    let _ = ui.add_sized([ui.available_width(), 48.0],
-                                        egui::TextEdit::multiline(&mut rule.value_input).desired_rows(2)
-                                            .id(filter_value_input_id(index)).hint_text("Literal text, including line breaks"))
-                                        .labelled_by(label.id);
-                                }
-                                let error = filter_predicate_from_rule(rule, document.total_columns).and_then(|predicate| {
-                                    FilterQuery { predicates: vec![predicate], case_sensitivity: case_sensitivity(*match_case) }
-                                        .validate().map_err(|error| match error {
-                                            QuarryError::InvalidFilter { reason, .. } => reason.to_owned(),
-                                            error => error.to_string(),
-                                        })
-                                }).err();
-                                if rule.operator == FilterOperator::Contains && rule.value_input.is_empty() {
-                                    ui.weak("Enter text to match.");
-                                } else if let Some(error) = error {
-                                    ui.colored_label(ERROR_TEXT, error);
-                                } else if rule.operator == FilterOperator::Between {
-                                    ui.weak("Includes both endpoints.");
+                                    let response = egui::ScrollArea::vertical()
+                                        .id_salt(("quarry-filter-value-scroll", index))
+                                        .max_height(64.0)
+                                        .show(ui, |ui| {
+                                            ui.add_sized([ui.available_width(), 28.0],
+                                                egui::TextEdit::multiline(&mut rule.value_input).desired_rows(1)
+                                                    .id(filter_value_input_id(index)).hint_text("Value"))
+                                                .labelled_by(labels.2)
+                                                .on_hover_text("Literal text, including spaces and line breaks.")
+                                        }).inner;
+                                    let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                        node.set_label(format!("Rule {} value", index + 1));
+                                    });
                                 }
                             });
+                            let response = ui.add_enabled(rule_count > 1, egui::Button::new("×").frame(false).min_size(egui::vec2(remove_width, 28.0)))
+                                .on_hover_text(format!("Remove rule {}", index + 1));
+                            let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                node.set_label(format!("Remove rule {}", index + 1));
+                            });
+                            if response.clicked() {
+                                surrender_filter_text_focus(ui.ctx(), rule_count);
+                                remove_index = Some(index);
+                            }
+                        });
+                        let error = filter_predicate_from_rule(rule, document.total_columns).and_then(|predicate| {
+                            FilterQuery { predicates: vec![predicate], case_sensitivity: case_sensitivity(*match_case) }
+                                .validate().map_err(|error| match error {
+                                    QuarryError::InvalidFilter { reason, .. } => reason.to_owned(),
+                                    error => error.to_string(),
+                                })
+                        }).err();
+                        if rule.operator == FilterOperator::Contains && rule.value_input.is_empty() {
+                            ui.weak("Enter text to match.");
+                        } else if let Some(error) = error {
+                            ui.colored_label(ERROR_TEXT, error);
+                        } else if rule.operator == FilterOperator::Between {
+                            ui.weak("Includes both endpoints.");
+                        }
+                        if index + 1 < rule_count {
+                            ui.separator();
+                        }
                     }
                     egui::CollapsingHeader::new("Details").show(ui, |ui| {
                         ui.label("Rows must match every filtered column. Inclusion rules in the same column are alternatives. Does not equal rules exclude matches.");
@@ -9892,45 +10009,54 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut frame = eframe::Frame::_new_kittest();
-        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
-            eframe::App::update(&mut app, ctx, &mut frame);
-        });
-        let (_, format) = accessible_button(&output, "Format");
-        assert!(format.is_disabled());
+        let mut render = |app: &mut QuarryApp, events| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    ..grid_input_with_width(860.0)
+                },
+                |ctx| eframe::App::update(app, ctx, &mut frame),
+            )
+        };
+        let click = |target| {
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target,
+                    data: None,
+                },
+            )]
+        };
+        let chooser = |output: &egui::FullOutput, label: &str| {
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            tree.nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::ComboBox
+                        && node.labelled_by().iter().any(|label_id| {
+                            tree.nodes
+                                .iter()
+                                .any(|(id, node)| id == label_id && node.value() == Some(label))
+                        })
+                })
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| panic!("missing accessible {label} chooser"))
+        };
+        let output = render(&mut app, vec![]);
+        assert!(accessible_button(&output, "Format").1.is_disabled());
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("format-menu.csv");
         fs::write(&path, b"name,value\nfirst,1\n").unwrap();
         app.open_new_path(path).unwrap();
 
-        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
-            eframe::App::update(&mut app, ctx, &mut frame);
-        });
+        let output = render(&mut app, vec![]);
         let (format_id, format) = accessible_button(&output, "Format: Auto, Auto");
         assert!(!format.is_disabled());
         let bounds = format.bounds().expect("Format menu should have bounds");
         assert!(bounds.x1 - bounds.x0 <= super::FORMAT_MENU_WIDTH as f64 + 1.0);
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Click,
-                        target: format_id,
-                        data: None,
-                    },
-                )],
-                ..grid_input_with_width(860.0)
-            },
-            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
-        );
-        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
-            eframe::App::update(&mut app, ctx, &mut frame);
-        });
-        let tree = output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .expect("open Format menu should be accessible");
+        let _ = render(&mut app, click(format_id));
+        let output = render(&mut app, vec![]);
         assert_eq!(
             accessible_button(&output, "Format: Auto, Auto")
                 .1
@@ -9942,8 +10068,37 @@ mod tests {
                 .1
                 .is_disabled()
         );
+        let delimiter = chooser(&output, "Delimiter");
+        let _ = chooser(&output, "Header");
+        let _ = render(&mut app, click(delimiter));
+        let _ = render(&mut app, vec![]);
+        let _ = render(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            app.format_draft,
+            Some((DelimiterMode::Auto, HeaderMode::Auto))
+        );
+        assert!(
+            !egui::Popup::is_any_open(&ctx),
+            "Escape closes only the chooser"
+        );
 
-        let tab_position = tree
+        let output = render(&mut app, vec![]);
+        let _ = render(&mut app, click(chooser(&output, "Delimiter")));
+        let output = render(&mut app, vec![]);
+        let tab_position = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
             .nodes
             .iter()
             .find(|(_, node)| {
@@ -9957,94 +10112,71 @@ mod tests {
                 )
             })
             .expect("Tab should be an accessible format choice");
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![
-                    egui::Event::PointerMoved(tab_position),
-                    egui::Event::PointerButton {
-                        pos: tab_position,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                    egui::Event::PointerButton {
-                        pos: tab_position,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..grid_input_with_width(860.0)
-            },
-            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        let _ = render(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(tab_position),
+                egui::Event::PointerButton {
+                    pos: tab_position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: tab_position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
         );
-        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
-            eframe::App::update(&mut app, ctx, &mut frame);
-        });
+        let output = render(&mut app, vec![]);
         assert_eq!(
             app.format_draft,
             Some((DelimiterMode::Tab, HeaderMode::Auto))
         );
         assert!(
-            !accessible_button(&output, "Reopen with Changes")
-                .1
-                .is_disabled()
+            !egui::Popup::is_any_open(&ctx),
+            "selection closes the chooser"
         );
-
-        let reopen = accessible_button(&output, "Reopen with Changes").0;
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Click,
-                        target: reopen,
-                        data: None,
-                    },
-                )],
-                ..grid_input_with_width(860.0)
-            },
-            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
-        );
+        let (reopen, node) = accessible_button(&output, "Reopen with Changes");
+        assert!(!node.is_disabled());
+        let _ = render(&mut app, click(reopen));
         assert_eq!(app.format_draft, None);
         assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
         assert_eq!(app.header_mode, HeaderMode::Auto);
 
-        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
-            eframe::App::update(&mut app, ctx, &mut frame);
-        });
+        let output = render(&mut app, vec![]);
         let (format_id, _) = accessible_button(&output, "Format: Tab, Auto");
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Click,
-                        target: format_id,
-                        data: None,
-                    },
-                )],
-                ..grid_input_with_width(860.0)
-            },
-            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        let _ = render(&mut app, click(format_id));
+        let output = render(&mut app, vec![]);
+        let _ = render(&mut app, click(chooser(&output, "Header")));
+        let output = render(&mut app, vec![]);
+        let no_header = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("No header"))
+            .map(|(id, _)| *id)
+            .unwrap();
+        let _ = render(&mut app, click(no_header));
+        let output = render(&mut app, vec![]);
+        assert_eq!(
+            app.format_draft,
+            Some((DelimiterMode::Tab, HeaderMode::NoHeader))
         );
-        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
-            eframe::App::update(&mut app, ctx, &mut frame);
-        });
+        assert!(
+            !egui::Popup::is_any_open(&ctx),
+            "accessible selection closes the chooser"
+        );
         let cancel = accessible_button(&output, "Cancel").0;
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Click,
-                        target: cancel,
-                        data: None,
-                    },
-                )],
-                ..grid_input_with_width(860.0)
-            },
-            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
-        );
+        let _ = render(&mut app, click(cancel));
         assert_eq!(app.format_draft, None);
         assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
+        assert_eq!(app.header_mode, HeaderMode::Auto);
 
         app.delimiter_mode = DelimiterMode::Semicolon;
         app.header_mode = HeaderMode::FirstRow;
@@ -10056,7 +10188,6 @@ mod tests {
             let bounds = format.bounds().expect("Format menu should have bounds");
             assert!(bounds.x1 - bounds.x0 <= super::FORMAT_MENU_WIDTH as f64 + 1.0);
         }
-
         app.document.as_mut().unwrap().shutdown();
     }
 
@@ -11262,6 +11393,189 @@ mod tests {
                         == Some("Save or discard cell edits before filtering the source file.")
                 })
         );
+        app.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn compact_toolbar_panels_stay_anchored_and_preserve_filter_drafts() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("compact-panels.csv");
+        fs::write(
+            &source,
+            format!("name,{}\nfirst,second\n", "long_column_name_".repeat(24)),
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&source);
+        app.filter_rules = vec![super::FilterRuleDraft::default(); 2];
+        app.filter_rules[0].value_input = "first".into();
+        app.filter_rules[1].value_input = "second".into();
+        app.filter_match_case = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        super::configure_style(&ctx);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut render = |app: &mut QuarryApp, events: Vec<egui::Event>, size| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..grid_input()
+            };
+            let mut output = ctx.run(input, |ctx| eframe::App::update(app, ctx, &mut frame));
+            for _ in 0..2 {
+                output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..grid_input()
+                    },
+                    |ctx| eframe::App::update(app, ctx, &mut frame),
+                );
+            }
+            output
+        };
+        for size in [egui::vec2(860.0, 540.0), egui::vec2(1280.0, 780.0)] {
+            app.columns_open = false;
+            app.filters_open = false;
+            app.filter_rules[0].column_input = "1".into();
+            let mut output = render(&mut app, vec![], size);
+            for (label, id) in [
+                ("Filters…", "quarry-filter-manager"),
+                ("Columns…", "quarry-column-manager"),
+                ("Filters…", "quarry-filter-manager"),
+            ] {
+                let draft = app.filter_rules.clone();
+                let events = filter_control_click(&output, label);
+                output = render(&mut app, events, size);
+                assert_eq!(app.filters_open, label == "Filters…");
+                assert_eq!(app.columns_open, label == "Columns…");
+                assert_eq!(app.filter_rules, draft);
+                assert!(app.filter_match_case);
+                let panel = ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new(id)))
+                    .unwrap();
+                assert!(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(panel),
+                    "{id}: {panel:?}"
+                );
+                let button = accessible_button(&output, label).1.bounds().unwrap();
+                assert!(
+                    (f64::from(panel.right()) - button.x1).abs() <= 1.0,
+                    "{id} must follow its toolbar button"
+                );
+                assert!(
+                    (f64::from(panel.top()) - button.y1 - 6.0).abs() <= 1.0,
+                    "{id} must sit below its toolbar button: panel={panel:?}, button={button:?}, viewport={size:?}"
+                );
+                if !app.filters_open {
+                    continue;
+                }
+                app.filter_rules[0].column_input = "2".into();
+                output = render(&mut app, vec![], size);
+                let long_panel = ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new(id)))
+                    .unwrap();
+                assert!(
+                    (panel.width() - long_panel.width()).abs() < 1.0,
+                    "Long column names must truncate instead of widening Filters"
+                );
+                let nodes = &output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes;
+                for rule in 1..=2 {
+                    let bounds = ["column", "match", "value"].map(|field| {
+                        let label = format!("Rule {rule} {field}");
+                        nodes
+                            .iter()
+                            .find(|(_, node)| node.label() == Some(label.as_str()))
+                            .and_then(|(_, node)| node.bounds())
+                            .unwrap()
+                    });
+                    for pair in bounds.windows(2) {
+                        assert!(
+                            pair[0].x1 <= pair[1].x0,
+                            "Rule {rule} controls must read across"
+                        );
+                        assert!(
+                            (pair[0].y0 - pair[1].y0).abs() <= 1.0,
+                            "Rule {rule} controls must share a row"
+                        );
+                    }
+                    for (label, control) in ["Column", "Condition", "Value"].into_iter().zip(bounds)
+                    {
+                        let left = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text) if text.galley.text() == label => {
+                                    Some(text.pos.x)
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        assert!(
+                            (f64::from(left) - control.x0).abs() <= 1.0,
+                            "{label} must align with its control"
+                        );
+                    }
+                    assert!(bounds[2].x1 <= f64::from(long_panel.right()));
+                }
+            }
+            let long_value = "literal text ".repeat(60);
+            for value in [
+                long_value.clone(),
+                format!(
+                    "{long_value}\nline two\nline three\nline four\nline five\nline six\nline seven"
+                ),
+            ] {
+                app.filter_rules[0].value_input = value.clone();
+                output = render(&mut app, vec![], size);
+                assert_eq!(app.filter_rules[0].value_input, value);
+                let panel = ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new("quarry-filter-manager")))
+                    .unwrap();
+                assert!(
+                    panel.height() <= 350.0,
+                    "Long literals must scroll inside their value field: {panel:?}"
+                );
+                assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(panel));
+                let nodes = &output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes;
+                for label in [
+                    "Rule 2 column",
+                    "Rule 2 match",
+                    "Rule 2 value",
+                    "Add rule",
+                    "Match case",
+                    "Clear filter",
+                    "Apply filters",
+                ] {
+                    let node = &nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label))
+                        .unwrap()
+                        .1;
+                    let bounds = node.bounds().unwrap();
+                    assert!(
+                        !node.is_hidden(),
+                        "{label} must remain visible with a long literal"
+                    );
+                    assert!(
+                        bounds.x0 >= 0.0
+                            && bounds.y0 >= 0.0
+                            && bounds.x1 <= f64::from(size.x)
+                            && bounds.y1 <= f64::from(size.y),
+                        "{label} must remain inside the viewport: {bounds:?}"
+                    );
+                }
+            }
+            app.filter_rules[0].value_input = "first".into();
+        }
         app.document.as_mut().unwrap().shutdown();
     }
 
@@ -13949,11 +14263,11 @@ mod tests {
         });
         let row_height = drag_bounds[0].y1 - drag_bounds[0].y0;
         let row_stride = drag_bounds[1].y0 - drag_bounds[0].y0;
-        assert!((row_height - 36.0).abs() < f64::EPSILON);
-        assert!((row_stride - 40.0).abs() < f64::EPSILON);
+        assert!((row_height - 28.0).abs() < f64::EPSILON);
+        assert!((row_stride - 28.0).abs() < f64::EPSILON);
         assert_eq!(drag_bounds[0].x0, drag_bounds[1].x0);
         assert_eq!(drag_bounds[0].x1, drag_bounds[1].x1);
-        assert!(drag_bounds[0].x1 - drag_bounds[0].x0 > 450.0);
+        assert!(drag_bounds[0].x1 - drag_bounds[0].x0 > 300.0);
         let name_left = [0, 1].map(|column| {
             let name = app.document.as_ref().unwrap().column_name(column);
             output
