@@ -116,8 +116,9 @@ passed for all 28,737,557 rows in order, including the unchanged decoded header,
 as recorded in `hacker-news-save-as-record-verification.json`. Save As passed
 record preservation, while original header quoting was normalized.
 
-Command-Q then terminated the process while the sorted document was unsaved,
-with no confirmation observed. The selected scratch folder was empty afterward.
+During the first completed sort, before the successful rerun, Command-Q
+terminated the process while the sorted document was unsaved, with no
+confirmation observed. The selected scratch folder was empty afterward.
 This exposed the native termination defect described below, rather than passing
 unsaved-work handling or lifecycle acceptance.
 
