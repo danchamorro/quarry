@@ -73,10 +73,34 @@ and package-only instructions.
 See the [User guide](docs/USER_GUIDE.md) for navigation, editing, case matching,
 filter rules, column tools, sorting, and safe save behavior.
 
-## Performance at 12 GB and 50 GB
+## Public benchmark datasets
 
-Quarry uses two complementary benchmark tracks that answer different product
-questions:
+Quarry's official public benchmark inputs are the **Taiwan weather CSV
+(9.10 GiB)** and **Hacker News CSV (11.84 GiB)** from ClickHouse's sample
+datasets. Anyone can download the same files and repeat the measurements.
+
+- [Download, extract, verify, and run the datasets](docs/BENCHMARK_DATASETS.md)
+- [September 11 public dataset results and methodology](docs/benchmarks/2026-09-11-public-datasets.md)
+
+| Measurement | Taiwan weather | Hacker News |
+|---|---:|---:|
+| Data rows | 131,985,329 | 28,737,557 |
+| First 100 parsed rows | 9.541 ms | 2.211 ms |
+| Complete structural index | 34.556 s | 7.947 s |
+| Random 100-row viewport p95 | 4.542 ms | 1.402 ms |
+| Stable Number sort | 141.508 s | 67.258 s |
+| Peak temporary disk during sort | 22.00 GiB | 24.40 GiB |
+
+These are release CLI measurements on an Apple M3 Max with 128 GiB of memory,
+after input checksum reads. Caches were not purged. Sort timings exclude source
+indexing and independent benchmark validation; the report records those
+separately. First-row and viewport times measure engine reads, not GUI rendering.
+
+## Historical performance at 12 GB and 50 GB
+
+Earlier benchmarks used two complementary tracks with different local fixtures.
+These remain evidence for those files and revisions, separate from the public
+dataset suite above:
 
 | Track | What it validates | Dataset |
 |---|---|---|
@@ -111,7 +135,7 @@ separate deterministic 12,000,000,037-byte write fixture with 61,413,211 rows.
 | Stable Sort | 117,168,829 rows by `FIRSTNAME` in 2 min 22.211 s | 225,437,755 rows in 18 min 33.443 s (pre-optimization run) |
 
 Across these full-file operations, the largest reported non-sort peak RSS was
-25.62 MiB at 12 GB and 24.53 MiB at 50 GB. The current 12 GB Stable Sort used
+25.62 MiB at 12 GB and 24.53 MiB at 50 GB. The August 23 12 GB Stable Sort used
 49.89 MiB peak RSS and 25.91 GiB peak temporary disk. The earlier 50 GB sort
 used 19.38 MiB peak RSS and 102.91 GiB peak temporary disk.
 
@@ -122,8 +146,9 @@ were not purged, so no result is presented as a controlled cold-cache claim.
 The 50 GB sort still proves completion and correctness, but its timing predates
 the adaptive merge optimization and is not a current throughput estimate.
 
-The sorting results above measure Text mode. Number, Character count, Word
-count, Shuffle, and Reverse have separate 1 GB validations linked below.
+The historical sorting results in this section measure Text mode. Number,
+Character count, Word count, Shuffle, and Reverse have separate 1 GB validations
+linked below.
 Numeric filters and their exported results also have a separate 1 GB validation.
 
 <details>
@@ -138,7 +163,7 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - [12 GB Replace All](docs/benchmarks/2026-08-22-12gb-replace-all.md)
 - [12 GB Split and Combine](docs/benchmarks/2026-08-19-split-join-transformations.md)
 - [Original deterministic stable Sort validation](docs/benchmarks/2026-08-21-stable-text-sort.md)
-- [Current 12 GB `FIRSTNAME` sort optimization](docs/benchmarks/2026-08-23-12gb-sort-performance.md)
+- [August 23 12 GB `FIRSTNAME` sort optimization](docs/benchmarks/2026-08-23-12gb-sort-performance.md)
 - [1 GB exact numeric sorting validation](docs/benchmarks/2026-09-04-numeric-sort.md)
 - [1 GB exact numeric filtering and export validation](docs/benchmarks/2026-09-05-numeric-filters.md)
 - [1 GB duplicate matching and removal validation](docs/benchmarks/2026-09-05-find-remove-duplicates.md)
@@ -215,6 +240,7 @@ rules, cache declarations, resource measurements, and limitations.
 - [Priority checklist before beta](docs/PRE_BETA_CHECKLIST.md)
 - [Beta release checklist and testing guidance](docs/BETA_RELEASE_CHECKLIST.md)
 - [Engineering principles](docs/ENGINEERING_PRINCIPLES.md)
+- [Official benchmark datasets and downloads](docs/BENCHMARK_DATASETS.md)
 - [Benchmark archive](docs/benchmarks/)
 - [Contributing](docs/CONTRIBUTING.md)
 

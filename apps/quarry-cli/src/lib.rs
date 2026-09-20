@@ -8,15 +8,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, Dialect, DuplicateJob, DuplicateOutcome, DuplicateSpec,
-    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
-    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, HeaderMode,
-    IndexConfig, IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS,
-    OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob, SaveAsOutcome, SaveAsProgress,
-    SearchJob, SearchOutcome, SearchPosition, SearchProgress, Session, SortDirection, SortJob,
-    SortMode, SortOutcome, SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
-    SplitAnalysisProgress, StructuralIndex, check_storage, estimate_edited_output_bytes,
-    estimate_sort_temporary_bytes, inspect_storage,
+    CaseSensitivity, ColumnTransformation, CompletedIndex, Dialect, DuplicateJob, DuplicateOutcome,
+    DuplicateSpec, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex,
+    FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery,
+    HeaderMode, IndexConfig, IndexJob, IndexProgress, LiteralReplacement,
+    MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob,
+    SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
+    Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
+    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex, check_storage,
+    estimate_edited_output_bytes, estimate_sort_temporary_bytes, inspect_storage,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -1421,7 +1421,12 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
+    let source_index_started = Instant::now();
     let source_index = session.start_indexing(IndexConfig::default())?.wait()?;
+    println!(
+        "Source indexing time: {:.3} s (before sort)",
+        source_index_started.elapsed().as_secs_f64()
+    );
     let spec = SortSpec {
         column: column - 1,
         direction,
@@ -1477,8 +1482,6 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     if source_size_after != source_size_before {
         return Err("source file size changed during sort".into());
     }
-    let source_hash = fnv1a64_file(session.path())?;
-
     let (outcome_label, published_bytes, validation, output_hash) = match &outcome {
         SortOutcome::Complete(summary) => {
             let output_size = std::fs::metadata(&summary.destination)?.len();
@@ -1495,8 +1498,13 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             {
                 return Err("published output does not match sort progress".into());
             }
-            let validation =
-                validate_sorted_output(&session, &source_index, &summary.destination, spec)?;
+            let validation = validate_sorted_output(
+                &session,
+                &source_index,
+                &summary.destination,
+                spec,
+                summary.output_index.clone(),
+            )?;
             if validation.data_rows != summary.rows_sorted
                 || summary.header_rows != u64::from(session.dialect.has_header)
             {
@@ -1520,6 +1528,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             ("cancelled", None, None, None)
         }
     };
+    let source_hash = fnv1a64_file(session.path())?;
     let completion_evidence = matches!(&outcome, SortOutcome::Complete(_));
     let artifact_permissions =
         sort_artifact_permissions(published_bytes.map(|_| destination.as_path()))?;
@@ -1583,6 +1592,10 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         progress.peak_temporary_bytes
     );
     println!("Outcome: {outcome_label}");
+    println!(
+        "Sort preparation bytes scanned: {}",
+        progress.preparation_bytes_scanned
+    );
     println!("Rows sorted: {}", progress.rows_sorted);
     println!("Header rows: {}", progress.header_rows);
     println!("Sorted runs created: {}", progress.runs_created);
@@ -1621,6 +1634,23 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         println!("Output FNV-1a 64: {hash:016x}");
     }
     if let Some(validation) = validation {
+        if let Some(elapsed) = validation.index_handoff_elapsed {
+            println!("Completed output index available: yes");
+            println!(
+                "Output open and index adoption: {:.3} ms",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            println!(
+                "Adopted index rows: {} (including header)",
+                source_index.indexed_rows()
+            );
+            println!(
+                "Adopted index first/middle/last samples: {} verified against independent index",
+                validation.index_handoff_sample_rows
+            );
+        } else {
+            println!("Completed output index available: no (independent indexing fallback)");
+        }
         println!(
             "Exact data row count preserved: yes ({})",
             validation.data_rows
@@ -1736,6 +1766,8 @@ struct SortValidation {
     data_rows: u64,
     header_bytes: Option<u64>,
     elapsed: Duration,
+    index_handoff_elapsed: Option<Duration>,
+    index_handoff_sample_rows: usize,
 }
 
 fn sort_artifact_permissions(path: Option<&Path>) -> CliResult<String> {
@@ -1762,10 +1794,11 @@ fn validate_sorted_output(
     source_index: &StructuralIndex,
     destination: &Path,
     spec: SortSpec,
+    completed_index: Option<CompletedIndex>,
 ) -> CliResult<SortValidation> {
     const VALIDATION_ROWS: usize = 1_000;
 
-    let started = Instant::now();
+    let handoff_started = Instant::now();
     let output = Session::open(
         destination,
         OpenOptions {
@@ -1779,6 +1812,11 @@ fn validate_sorted_output(
             ..OpenOptions::default()
         },
     )?;
+    let adopted_index = completed_index
+        .map(|index| output.adopt_completed_index(index))
+        .transpose()?;
+    let index_handoff_elapsed = adopted_index.as_ref().map(|_| handoff_started.elapsed());
+    let started = Instant::now();
     let output_index = output.start_indexing(IndexConfig::default())?.wait()?;
     if output_index.indexed_rows() != source_index.indexed_rows() {
         return Err("sorted output record count changed".into());
@@ -1793,6 +1831,30 @@ fn validate_sorted_output(
     )?;
 
     let data_start = u64::from(source.dialect.has_header);
+    let mut index_handoff_sample_rows = 0;
+    if let Some(index) = adopted_index {
+        if index.indexed_rows() != output_index.indexed_rows()
+            || index.indexed_bytes() != output_index.indexed_bytes()
+        {
+            return Err("adopted output index counts differ from independent index".into());
+        }
+        let data_rows = index.indexed_rows().saturating_sub(data_start);
+        if data_rows > 0 {
+            let positions = BTreeSet::from([
+                data_start,
+                data_start + (data_rows - 1) / 2,
+                data_start + data_rows - 1,
+            ]);
+            for position in positions {
+                let adopted = output.read_rows(&index, position, 1)?;
+                let independent = output.read_rows(&output_index, position, 1)?;
+                if adopted.len() != 1 || adopted != independent {
+                    return Err("adopted output index sample differs from independent index".into());
+                }
+                index_handoff_sample_rows += 1;
+            }
+        }
+    }
     let mut next_row = data_start;
     let mut previous_key: Option<Vec<u8>> = None;
     while next_row < output_index.indexed_rows() {
@@ -1846,6 +1908,8 @@ fn validate_sorted_output(
         data_rows: next_row - data_start,
         header_bytes,
         elapsed: started.elapsed(),
+        index_handoff_elapsed,
+        index_handoff_sample_rows,
     })
 }
 
@@ -3580,6 +3644,7 @@ fn peak_rss_bytes() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -3590,11 +3655,12 @@ mod tests {
         physical_to_data_row, record_filter_sample, replace_all_save_as_command,
         sample_filtered_rows, search_command, sort_artifact_permissions, sort_save_as_command,
         transform_save_as_command, validate_saved_transformation,
-        validate_sort_completion_evidence, viewport_command, wait_for_save_as,
+        validate_sort_completion_evidence, validate_sorted_output, viewport_command,
+        wait_for_save_as,
     };
     use quarry_core::{
-        ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, IndexConfig, OpenOptions,
-        Session, SortDirection,
+        CaseSensitivity, ColumnTransformation, FilterOperator, FilterQuery, HeaderMode,
+        IndexConfig, OpenOptions, Session, SortDirection, SortMode, SortOutcome, SortSpec,
     };
 
     #[test]
@@ -5007,6 +5073,63 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sort_validation_measures_adopted_index_and_supports_fallback() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-sort-index-handoff-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        let mut contents = String::from("key,note\n");
+        for row in (0..8_200).rev() {
+            contents.push_str(&format!("{row:04},\"line\n{row}\"\n"));
+        }
+        fs::write(&source, &contents).unwrap();
+        let source = Session::open(&source, OpenOptions::default()).unwrap();
+        let source_index = source
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let spec = SortSpec {
+            column: 0,
+            direction: SortDirection::Ascending,
+            mode: SortMode::Text,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        let SortOutcome::Complete(summary) = source
+            .start_create_sorted_working_copy(BTreeMap::new(), BTreeMap::new(), spec, &destination)
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("sort cancelled");
+        };
+        let available = summary.output_index.is_some();
+        assert!(available || !cfg!(target_os = "macos"));
+        for completed_index in [summary.output_index, None] {
+            let expected_handoff = completed_index.is_some();
+            let validation =
+                validate_sorted_output(&source, &source_index, &destination, spec, completed_index)
+                    .unwrap();
+            assert_eq!(validation.data_rows, 8_200);
+            assert_eq!(validation.header_bytes, Some(9));
+            assert_eq!(validation.index_handoff_elapsed.is_some(), expected_handoff);
+            assert_eq!(
+                validation.index_handoff_sample_rows,
+                if expected_handoff { 3 } else { 0 }
+            );
+        }
+        assert_eq!(fs::read_to_string(source.path()).unwrap(), contents);
         fs::remove_dir_all(directory).unwrap();
     }
 
