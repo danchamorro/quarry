@@ -39,6 +39,34 @@ and feedback. Download details are supplied privately to invited testers.
 Follow the [packaging guide](MACOS_PACKAGING.md) for build, signing, installation, and
 rollback procedures. Do not upload app bundles to GitHub.
 
+## Separate local build 118 desktop checks, 2026-09-20
+
+The automated/native desktop QA checkpoint is complete for installed
+**0.1.0 (118)**, clean `38692bb31efdab318dcc66d9556b658d77705c71`, on macOS
+27.0 (26A428), ARM64, with a separate clean build 119 used for the native-quit
+regression and final wide-column checks. Manual release checks remain open.
+The [build 118 desktop report](benchmarks/2026-09-20-desktop-build118.md)
+records exact output checks and remaining work. This local app is separate
+from the frozen signed build 105 candidate. The candidate selection, signing,
+notarization, fresh-environment and owner-approval gates below remain unchanged.
+
+| Local check | Current evidence |
+|---|---|
+| Small fixtures | Cell/header Undo/Redo and exact Save As; combined text/numeric filtering, invalid-bound protection, exact export and Clear; numeric sort and duplicate-review/removal Undo/Redo with exact saved outputs passed. Sources remained unchanged. This is bounded coverage, not the entire connected workflow. |
+| Columns and header settings | Hide/reset/auto-fit/persistence/Escape passed. On build 119, moving original column 3 first persisted and Reset restored original order. Hidden column 70 filtering exported exact rows and all 70 columns; wide Reset/Auto-fit/horizontal navigation and exact large-integer bounds passed. Invalid numeric sort reported row 8/column 70 and preserved the document. Auto-detection chose no header for the synthetic wide fixture; explicit override worked. |
+| Hacker News | Progressive open, oracle-checked navigation, exact 128,222-record filtered export, and running-sort cancellation with empty scratch and recovered navigation passed. All 28,737,557 sorted rows, header and stable numeric ties passed independent validation. Save As preserved every decoded record in order; header quote normalization reduced raw bytes by 30. Undo/Redo restored views visually. |
+| Weather | Progressive opening, midpoint/last-row checks and exact 26,505-record filtered export passed. Low-space review disabled Continue and recovered after selecting a sufficient working folder. All 131,985,329 sorted records, header and stable numeric ties passed independent validation; Save As matched the complete sorted snapshot byte-for-byte and cleared scratch. Undo/Redo restored views visually. |
+| Sources and resources | After both workflows, full SHA-256 reads of both originals and both GUI copies matched their baselines. Sampled sort peaks were 208.23-304.97 MiB process RSS and 21.71-24.17 GiB logical scratch across the recorded passes. These are observed samples, not controlled performance measurements. |
+| Lifecycle and accessibility | Command-Q bypassed the viewport unsaved-work guard and terminated an unsaved document in build 118. Fix `f65ebb5` passed 315 workspace tests, strict Clippy and formatting. A separate clean build 119 passed native Command-Q/menu Quit confirmation, Keep Editing, exact Save and Close, process exit and reopened saved-value verification. It has not replaced the installed main build at this checkpoint. Intermittent wide-grid accessibility loss remains unresolved. |
+
+Manual drag-and-drop, VoiceOver/full keyboard coverage and the complete compact-
+window workflow are not marked as passed. Large-file Undo/Redo has visual
+source/sorted-view evidence, without separate full-file hashes of each history
+state. Merge and installation of the native quit fix are separate from this
+local test-bundle evidence.
+These local observations do not select macOS 27 as a supported beta version or
+close the owner's final acceptance gate.
+
 ## Platform matrix
 
 Linux is the priority for platform expansion. Engine or CLI validation does
