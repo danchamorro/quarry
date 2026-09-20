@@ -22,7 +22,7 @@ use objc2::runtime::{AnyObject, Imp, Sel};
 #[cfg(target_os = "macos")]
 use objc2::{ffi, sel};
 #[cfg(target_os = "macos")]
-use objc2_app_kit::NSApplication;
+use objc2_app_kit::{NSApplication, NSApplicationTerminateReply};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 #[cfg(test)]
@@ -130,7 +130,32 @@ unsafe extern "C-unwind" fn application_open_urls(
 }
 
 #[cfg(target_os = "macos")]
-fn install_open_document_handler() -> Receiver<PathBuf> {
+fn native_quit_reply(context: Option<&egui::Context>) -> NSApplicationTerminateReply {
+    let Some(context) = context else {
+        return NSApplicationTerminateReply::TerminateNow;
+    };
+    // Native Quit otherwise skips the viewport's unsaved-change and active-save guards.
+    context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+    NSApplicationTerminateReply::TerminateCancel
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C-unwind" fn application_should_terminate(
+    _delegate: &AnyObject,
+    _selector: Sel,
+    _application: &NSApplication,
+) -> NSApplicationTerminateReply {
+    let context = OPEN_DOCUMENT_TARGET
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("open-document target lock should not be poisoned")
+        .as_ref()
+        .and_then(|target| target.context.clone());
+    native_quit_reply(context.as_ref())
+}
+
+#[cfg(target_os = "macos")]
+fn install_application_handlers() -> Receiver<PathBuf> {
     let (sender, receiver) = mpsc::channel();
     *OPEN_DOCUMENT_TARGET
         .get_or_init(|| Mutex::new(None))
@@ -172,9 +197,33 @@ fn install_open_document_handler() -> Receiver<PathBuf> {
             added.as_bool(),
             "failed to install macOS open-document handler"
         );
-        application.setDelegate(None);
-        application.setDelegate(Some(&delegate));
     }
+    let selector = sel!(applicationShouldTerminate:);
+    if class.instance_method(selector).is_none() {
+        let implementation: Imp = unsafe {
+            std::mem::transmute(
+                application_should_terminate
+                    as unsafe extern "C-unwind" fn(
+                        &AnyObject,
+                        Sel,
+                        &NSApplication,
+                    )
+                        -> NSApplicationTerminateReply,
+            )
+        };
+        let added = unsafe {
+            ffi::class_addMethod(
+                class as *const _ as *mut _,
+                selector,
+                implementation,
+                c"Q@:@".as_ptr(),
+            )
+        };
+        assert!(added.as_bool(), "failed to install macOS quit handler");
+    }
+    // AppKit caches which optional delegate methods are implemented.
+    application.setDelegate(None);
+    application.setDelegate(Some(&delegate));
     receiver
 }
 
@@ -239,7 +288,7 @@ fn main() -> eframe::Result<()> {
     {
         let event_loop =
             winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
-        let open_document_receiver = install_open_document_handler();
+        let open_document_receiver = install_application_handlers();
         let mut app = eframe::create_native(
             "Quarry — Viewer Alpha",
             options,
@@ -18939,6 +18988,96 @@ mod tests {
         for path in [first, second, malformed] {
             fs::remove_file(path).unwrap();
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_quit_preserves_unsaved_sort_and_waits_for_save() {
+        use objc2_app_kit::NSApplicationTerminateReply;
+        use quarry_core::SortDirection;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let destination = directory.path().join("saved.csv");
+        fs::write(&source, b"value\n2\n1\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_sort_rows(
+                0,
+                SortDirection::Ascending,
+                SortMode::Number,
+                CaseSensitivity::Insensitive,
+            )
+            .unwrap();
+        finish_structural_edit(&mut app);
+        let document = app.document.as_mut().unwrap();
+        let working_path = document.session.path().to_path_buf();
+        document.begin_cell_edit(1, 0, b"1".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "3".into();
+
+        let ctx = egui::Context::default();
+        let request_native_quit = |app: &mut QuarryApp| {
+            assert_eq!(
+                super::native_quit_reply(Some(&ctx)),
+                NSApplicationTerminateReply::TerminateCancel
+            );
+            let output = ctx.run(grid_input(), |_| {});
+            let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::Close))
+            );
+
+            // egui-winit translates the queued command into this viewport event.
+            let mut input = grid_input();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let output = ctx.run(input, |ctx| app.intercept_dirty_close(ctx));
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
+            );
+        };
+        request_native_quit(&mut app);
+        assert!(app.close_confirmation_open);
+        assert!(working_path.exists());
+        assert!(app.document.as_ref().unwrap().cell_edit.is_none());
+        assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 0)], b"3");
+        app.keep_editing();
+        assert!(!app.close_confirmation_open);
+        assert!(working_path.exists());
+
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_save_as(destination.clone())
+            .unwrap();
+        request_native_quit(&mut app);
+        assert!(app.close_after_save);
+        assert!(!app.close_confirmation_open);
+        let output = finish_app_save(&mut app, &ctx, &mut eframe::Frame::_new_kittest());
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Close))
+        );
+        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert_eq!(fs::read(&destination).unwrap(), b"value\n3\n2\n");
+        assert_eq!(fs::read(&source).unwrap(), b"value\n2\n1\n");
+        assert_eq!(
+            super::native_quit_reply(None),
+            NSApplicationTerminateReply::TerminateNow
+        );
     }
 
     #[cfg(target_os = "macos")]
