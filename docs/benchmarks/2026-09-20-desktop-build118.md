@@ -237,13 +237,42 @@ Number sort on Amount reported invalid `NaN` at data row 8, column 70, leaving
 the document clean and unchanged. Dismissing the error restored usable controls.
 `edge-wide-results.json` records the exact export and original fixture hash.
 
+## Installed build 122 follow-up
+
+After [PR #49](https://github.com/danchamorro/quarry/pull/49) merged, local
+`main` was clean at `f55655e1328fc2972f217ccf36993798b174ce14`.
+The installer updated `/Applications/Quarry.app` to clean build 122 and
+preserved a verified build 118 rollback archive. Installed-app verification
+passed. Native Command-Q on an edited fixture showed the unsaved-work prompt;
+Save As and Close wrote the exact expected 253 bytes, exited, and reopening
+the saved file displayed `CaseyInstalled`. The input remained unchanged.
+`final-installed-verification.json` records this separate installation check.
+
+Build 122 also passed a bounded keyboard-only workflow: File/Open and the
+native path picker; Columns search and Escape; Filters column search/selection
+and picker-first Escape; cell selection with Space, F2 editing, Escape
+cancellation, Enter commit, and Command-Z/Command-Shift-Z; then File/Save As
+and the native save dialog. Focus was observed at each traversal step.
+
+The saved output was exactly 250 bytes, SHA-256
+`cb7c305647c3f72cfc53c1858577fe9fcdf2ff8c01eb5fa2e5b7ea0dec9e9ded`,
+and the original remained unchanged. `keyboard-check-build122.json` records
+the check. Row accepted 3 and Enter, but all five rows fit in the viewport,
+so this did not demonstrate scrolling.
+
+The first CUA Unicode typing attempt produced `ZoKeyboard`; its cause was
+not established. The final intentional edit used ASCII `KeyboardQA`.
+The native Save dialog retained its existing extension, producing
+`keyboard-checked.csv.csv`; verification used that actual output.
+Neither observation establishes a diagnosed application defect.
+
 ## Remaining manual release checks and observation limits
 
 | Area | Remaining evidence |
 |---|---|
-| Drag-and-drop | Native drag-and-drop opening was not run; picker and Finder opening do not establish it. |
-| Accessibility and keyboard | VoiceOver and a complete keyboard-only workflow remain untested. Observed row-jump, Page Down, Undo/Redo and Escape checks are bounded coverage. Intermittent wide-grid accessibility loss remains an open observation. |
-| Compact window | Earlier resize rendered visible controls, but a later resize attempt did not complete. The full compact-window workflow remains untested. |
+| Drag-and-drop | Finder and empty Quarry were arranged side by side. Cross-window drag attempts were rejected by CUA with `noWindowsAvailable` and `windowNotFoundAtPosition`; Quarry still showed no file. Native drag-and-drop opening remains unverified. Picker and Finder opening do not establish it. |
+| Accessibility and keyboard | The bounded build 122 keyboard workflow above passed. VoiceOver and intermittent wide-grid accessibility loss remain open. |
+| Compact window | Earlier resize rendered visible controls, but later corner and edge resize attempts did not change the captured window. The full compact-window workflow remains untested; capture pixels do not establish logical viewport dimensions. |
 | Broader release acceptance | Other supported-system versions, fresh-environment distribution acceptance and owner approval remain governed by the beta checklist. The run exercised Number sorting; it does not revalidate every other Sort mode. |
 
 Large-file Undo/Redo was verified through observed source/sorted views; separate
