@@ -33,20 +33,26 @@ File size alone does not describe the work involved. Weather has about 4.6 times
 as many records and twice as many columns as Hacker News. These are distinct
 workloads, not a controlled comparison of scaling by bytes.
 
-From the repository root:
+To repeat with the current runner, use a clean checkout from the repository root:
 
 ```bash
-cargo build --release --locked -p quarry-cli --bin quarry-bench
 python3 scripts/benchmark-public-datasets.py \
   /absolute/path/quarry-benchmark-data \
   /absolute/path/new-quarry-benchmark-results
 ```
 
-The results directory must be new. The runner freezes the built executable,
-records every exact command and exit status in `results.json`, and captures one
+The results directory must be new. The current runner requires no tracked or
+untracked changes, builds the release CLI with locked dependencies, verifies
+the checkout remains clean at the same commit, and freezes the built executable.
+Build time is outside the recorded benchmark interval. The runner records every
+exact command and exit status in `results.json`, and captures one
 log per case. It checks input metadata after every case and SHA-256 before and
 after the suite. Successful generated outputs are removed after validation;
 failed cases retain their output directories for inspection.
+
+The September 11 run predates this clean-checkout requirement. Its exact CLI
+patch and executable hash remain in the historical evidence below; the runner
+update does not change those measurements.
 
 ## Environment and timing boundaries
 
@@ -104,7 +110,8 @@ Each file receives the same operation shapes, using these public column values:
 | Duplicate analysis | `StationId,MeasuredDate` (1,2), case-sensitive | `id` (1), case-sensitive |
 | Sort cancellation | Request after at least 64 MiB scanned | Same |
 
-Find, Replace All, and filters use their default case-insensitive matching.
+These CLI runs use case-sensitive matching for Find, Replace All, and text
+filter predicates.
 Sparse Save As writes `QUARRY_BENCH_FIRST` and `QUARRY_BENCH_LATER` into the two
 chosen cells. Combine names the resulting column `Combined`. Sort and duplicate
 analysis explicitly preserve the first record as the header. Cancellation is

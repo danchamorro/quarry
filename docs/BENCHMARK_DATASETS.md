@@ -72,19 +72,22 @@ Matching hashes establish that a repeat run used the same bytes as the report.
 
 ## Repeat the benchmarks
 
-From the Quarry repository root, build the release CLI and run the sequential
-suite against the directory containing both extracted CSVs:
+From a clean Quarry checkout, run the sequential suite against the directory
+containing both extracted CSVs. Commit or set aside tracked and untracked
+changes first. The runner builds the release CLI with locked dependencies and
+verifies that the checkout stays clean at the same commit before recording it:
 
 ```bash
-cargo build --release --locked -p quarry-cli --bin quarry-bench
 python3 scripts/benchmark-public-datasets.py \
   /absolute/path/quarry-benchmark-data \
   /absolute/path/new-quarry-benchmark-results
 ```
 
-The results directory must not already exist. The script records exact commands,
-logs, source hashes, and timings in `results.json`. Successful generated outputs
-are removed after the CLI checks finish; failed cases retain their output
+The results directory must not already exist. Build time is outside the recorded
+benchmark interval. The script writes separate log files and records their
+filenames, exact commands, source hashes, and timings in `results.json`.
+Successful generated outputs are removed after the CLI checks finish; failed
+cases retain their output
 directory for inspection. The input CSVs are preserved. Allow room for sort
 working files and run without competing disk-heavy jobs.
 

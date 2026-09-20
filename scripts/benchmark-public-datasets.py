@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the public CSV capability suite sequentially with the existing Rust CLI."""
+"""Build the Rust CLI from a clean checkout and run the public CSV capability suite."""
 
 import argparse
 from datetime import datetime, timezone
@@ -35,6 +35,12 @@ def stamp(stat):
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
+def clean_revision(repo):
+    if subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all"], cwd=repo):
+        raise RuntimeError("Benchmark requires a clean checkout, including staged and untracked files")
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+
 def workloads(dataset, source, output):
     _, numeric, duplicates, date, join, query, replacement = DATASETS[dataset]
     predicate = (["--column", "5", "--operator", "between", "--value", "70", "--upper-bound", "80"]
@@ -66,11 +72,19 @@ def main():
     parser.add_argument("results_dir", type=Path, help="New directory for logs and evidence; must not exist")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parent.parent
-    binary = repo / "target/release/quarry-bench"
-    if not binary.is_file():
-        parser.error("Build first: cargo build --release --locked -p quarry-cli --bin quarry-bench")
     sources = {name: (args.data_dir / config[0]).resolve(strict=True) for name, config in DATASETS.items()}
     results = args.results_dir.resolve()
+    if results.exists():
+        raise FileExistsError(f"Results directory already exists: {results}")
+    revision = clean_revision(repo)
+    build_command = ["cargo", "build", "--release", "--locked", "-p", "quarry-cli", "--bin", "quarry-bench", "--message-format=json"]
+    build = subprocess.run(build_command, cwd=repo, stdout=subprocess.PIPE, text=True, check=True)
+    if clean_revision(repo) != revision:
+        raise RuntimeError("Checkout revision changed during build")
+    artifacts = [json.loads(line) for line in build.stdout.splitlines()]
+    binary = next(Path(artifact["executable"]) for artifact in artifacts
+                  if artifact.get("reason") == "compiler-artifact"
+                  and artifact["target"]["name"] == "quarry-bench" and artifact.get("executable"))
     results.mkdir(parents=True, exist_ok=False)
     frozen_binary = results / "quarry-bench"
     shutil.copy2(binary, frozen_binary)
@@ -78,7 +92,9 @@ def main():
     source_stamps = {name: stamp(source.stat()) for name, source in sources.items()}
     evidence = {
         "started_utc": datetime.now(timezone.utc).isoformat(),
-        "engine_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
+        "engine_revision": revision,
+        "engine_source_status": "clean",
+        "build_command": build_command,
         "platform": platform.platform(),
         "binary_sha256": identity(frozen_binary)["sha256"],
         "free_bytes_before": shutil.disk_usage(results).free,
@@ -86,7 +102,6 @@ def main():
         "sources_before": before,
         "runs": [],
     }
-    (results / "benchmark-cli.patch").write_bytes(subprocess.check_output(["git", "diff", "HEAD", "--", "apps/quarry-cli/src/lib.rs"], cwd=repo))
     manifest = results / "results.json"
     manifest.write_text(json.dumps(evidence, indent=2) + "\n")
     for dataset, source in sources.items():
