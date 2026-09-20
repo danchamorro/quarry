@@ -58,12 +58,13 @@ notarization, fresh-environment and owner-approval gates below remain unchanged.
 | Weather | Progressive opening, midpoint/last-row checks and exact 26,505-record filtered export passed. Low-space review disabled Continue and recovered after selecting a sufficient working folder. All 131,985,329 sorted records, header and stable numeric ties passed independent validation; Save As matched the complete sorted snapshot byte-for-byte and cleared scratch. Undo/Redo restored views visually. |
 | Sources and resources | After both workflows, full SHA-256 reads of both originals and both GUI copies matched their baselines. Sampled sort peaks were 208.23-304.97 MiB process RSS and 21.71-24.17 GiB logical scratch across the recorded passes. These are observed samples, not controlled performance measurements. |
 | Lifecycle and accessibility | Command-Q bypassed the viewport unsaved-work guard and terminated an unsaved document in build 118. Fix `f65ebb5` passed 315 workspace tests, strict Clippy and formatting. A separate clean build 119 passed native Command-Q/menu Quit confirmation, Keep Editing, exact Save and Close, process exit and reopened saved-value verification. It has not replaced the installed main build at this checkpoint. Intermittent wide-grid accessibility loss remains unresolved. |
+| Installed build 122 follow-up | PR #49 merged at `f55655e`. Installation and verification passed with clean revision metadata and a verified build 118 rollback archive. Native unsaved Command-Q, exact Save As and Close, exit and reopen passed on the installed app. Keyboard-only Open, Columns/Filters search and Escape, cell editing/cancellation, Undo/Redo and Save As passed; the 250-byte output matched exactly and the source stayed unchanged. Row-field input passed without proving scrolling; Unicode input and duplicate-extension caveats are recorded in the report. |
 
-Manual drag-and-drop, VoiceOver/full keyboard coverage and the complete compact-
+Manual drag-and-drop, VoiceOver and the complete compact-
 window workflow are not marked as passed. Large-file Undo/Redo has visual
 source/sorted-view evidence, without separate full-file hashes of each history
-state. Merge and installation of the native quit fix are separate from this
-local test-bundle evidence.
+state. The build 122 follow-up records merge and installation separately from
+the earlier local test-bundle evidence.
 These local observations do not select macOS 27 as a supported beta version or
 close the owner's final acceptance gate.
 
