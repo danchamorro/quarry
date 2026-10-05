@@ -3,8 +3,8 @@
 **Status, 2026-10-05:** clean **0.1.0 (127)** at
 `30fee5d62ff23bb4803f73fbe5b14129162efb43` is the current signed candidate.
 Signing, notarization, stapling, local Gatekeeper, extracted-bundle verification,
-bounded native workflows, and a fresh 12 GB CLI/core run passed. The beta is
-**not published or fully accepted**. Remaining gates are listed below.
+bounded native workflows, and 12 GB GUI and CLI/core checks passed. The beta
+is **not published or fully accepted**. Remaining gates are listed below.
 
 The owner selected **GitHub Releases** for free downloads and **Apple Silicon
 on macOS 26 and 27**, with acceptance on both before publication. This is the
@@ -23,7 +23,7 @@ does not count as an exact-build-127 run.
 
 | Platform | Build 127 evidence | Remaining acceptance |
 |---|---|---|
-| macOS 27, Apple Silicon | Host 27.0.1 (26A434): signed ZIP verified, native small workflows and CLI/core large-file checks passed | Wide-grid accessibility, complete compact-window and Finder/drag-and-drop workflows, GUI large files, fresh-environment first launch |
+| macOS 27, Apple Silicon | Host 27.0.1 (26A434): signed ZIP verified, native small workflows, 12 GB GUI open/filter/export/cancellation and CLI/core checks passed | Wide-grid accessibility, complete compact-window and Finder/drag-and-drop workflows, temporary-storage recovery, fresh-environment first launch |
 | macOS 26, Apple Silicon | 26.6.2 (25G83): signature, staple, Gatekeeper, file installation/rollback and native launch passed | Complete connected native workflow and fresh-environment first launch |
 | Intel Mac, Linux desktop, Windows | No release acceptance | Outside this beta's scope |
 | Linux core/CLI | CI checks pass for the packaging-fix source revision | Engineering evidence only; not desktop support |
@@ -53,8 +53,11 @@ major version from a single run.
 - [ ] Complete the connected native workflow on both target macOS versions,
   including wide files, accessibility, smaller windows, Finder opening,
   drag-and-drop, and temporary-storage recovery.
-- [ ] Validate GUI progressive open/navigation, a full-file operation,
-  cancellation, memory and scratch use on representative large files.
+- [x] Validate GUI progressive open/navigation, full-file filtering/export,
+  cancellation and sampled memory on the 12 GB public fixture; verify every
+  exported record and unchanged source hash.
+- [ ] Complete GUI temporary-storage checks, including peak disk use,
+  selected-folder sort/Undo retention and insufficient-space recovery.
 - [x] Verify file installation, update and rollback for this exact signed candidate
   in the macOS 26 VM; native Finder installation/download remains separate.
 - [ ] Verify browser-downloaded, quarantined first launch on a fresh supported
