@@ -37,7 +37,7 @@ major version from a single run.
 - [x] Complete pre-beta feature priorities; see the [feature checklist](PRE_BETA_CHECKLIST.md).
 - [x] Freeze version, clean source revision, build identity, toolchain and archive hash.
 - [x] Pass formatting, strict Clippy, 315 workspace tests, locked release build,
-  15 notice tests, installer self-tests, packaging and bundle verification.
+  16 notice tests, installer self-tests, packaging and bundle verification.
 - [x] Regenerate/review notices. The packaging fix changes workspace discovery;
   dependency versions and notice HTML are unchanged.
 - [x] Sign with Developer ID and hardened runtime, notarize, staple, assess local

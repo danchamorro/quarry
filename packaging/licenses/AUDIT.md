@@ -34,14 +34,17 @@ and verify the release checksum before using it. The audit used the official
 `ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e`.
 No global installation is required.
 
-`--check` requires only Python 3.11 or newer and repository files. It checks
+`--check` requires Python 3, the pinned Cargo toolchain, and repository files. It checks
 content hashes for the artifact and its inputs, including the lockfile, workspace manifests,
 `rust-toolchain.toml`, generator, configuration, supplemental notices, Rust
 resources, and this audit. Success means
 repository freshness and integrity only. It does not inspect the local Cargo
 cache or re-read dependency files; regeneration performs those source checks.
-Workspace manifests come from the root `Cargo.toml` member patterns and
-exclusions. Unrelated local app directories do not affect the inventory.
+Workspace manifests come from Cargo metadata (`--no-deps --offline --locked`),
+including implicit local path members and honoring member patterns/exclusions.
+This reads package metadata without compiling or downloading dependencies and
+works with an empty registry cache. Unrelated local app directories do not
+affect the inventory.
 It does not review license obligations. Normal local packaging requires this
 freshness check. `--release-check` additionally requires `reviewed.sha256` to
 match the SHA-256 of the exact `manifest.json` bytes. That file records this
@@ -73,12 +76,16 @@ require a new source audit. HTML escaping changes markup representation, not ren
 ## Collected source coverage
 
 The 2026-10-05 packaging follow-up limits manifest discovery to declared
-workspace members and exclusions. An unrelated local app had caused a false
+Cargo workspace membership. An unrelated local app had caused a false
 stale-inventory failure. Regeneration with the verified cargo-about 0.9.2
 binary produced byte-identical notice HTML; the dependency lockfile, member
 manifests, supplemental notices, and runtime resources were unchanged. Only
 the generator and this audit changed in the recorded inputs. Regressions cover
-unrelated app directories, member globs/exclusions, and missing member manifests.
+unrelated app directories, member globs/exclusions, missing member manifests,
+and license-only changes in implicit path members. The latter uses an empty
+Cargo cache and verifies that both freshness and release checks reject stale
+reviewed inputs. Cargo provides membership semantics directly, so a separate
+Python TOML parser and Python 3.11 requirement are unnecessary.
 
 The HTML's **Tool fallback inventory** records cargo-about's original missing
 file/template selections. It is not the list of still-missing notices. The

@@ -9,10 +9,6 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-try:
-    import tomllib
-except ModuleNotFoundError:
-    sys.exit("Notice checks require Python 3.11 or newer.")
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = ROOT / "packaging/licenses"
@@ -29,24 +25,18 @@ def digest(data):
 
 
 def workspace_manifests():
-    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]
-    excluded = {
-        path.resolve()
-        for pattern in workspace.get("exclude", [])
-        for path in ROOT.glob(pattern)
+    result = subprocess.run([
+        "cargo", "metadata", "--no-deps", "--format-version", "1",
+        "--offline", "--locked", "--manifest-path", str(ROOT / "Cargo.toml"),
+    ], cwd=ROOT, text=True, capture_output=True)
+    if result.returncode:
+        raise ValueError("Cannot read Cargo workspace: " + result.stderr.strip())
+    metadata = json.loads(result.stdout)
+    members = set(metadata["workspace_members"])
+    return {
+        Path(package["manifest_path"])
+        for package in metadata["packages"] if package["id"] in members
     }
-    manifests = set()
-    for pattern in workspace["members"]:
-        members = list(ROOT.glob(pattern))
-        if not members:
-            raise ValueError("Workspace member not found: " + pattern)
-        for member in members:
-            if member.resolve() not in excluded:
-                manifest = member / "Cargo.toml"
-                if not manifest.is_file():
-                    raise ValueError("Workspace manifest not found: " + str(manifest))
-                manifests.add(manifest)
-    return manifests
 
 
 def inputs():

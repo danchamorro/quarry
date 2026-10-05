@@ -1,6 +1,7 @@
 """Offline packaging guard regressions. Run with python3 packaging/licenses/test_generate.py."""
 
 import json
+import os
 from pathlib import Path
 import runpy
 import shutil
@@ -14,6 +15,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NoticeChecks(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        metadata = json.loads(subprocess.check_output([
+            "cargo", "metadata", "--no-deps", "--format-version", "1",
+            "--offline", "--locked",
+        ], cwd=ROOT, text=True))
+        cls.target_sources = [
+            Path(target["src_path"]).relative_to(ROOT)
+            for package in metadata["packages"] for target in package["targets"]
+        ]
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="quarry-notice-test-")
         self.addCleanup(temporary.cleanup)
@@ -28,15 +40,20 @@ class NoticeChecks(unittest.TestCase):
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / relative, destination)
+        for relative in self.target_sources:
+            destination = self.root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("// Metadata-only fixture target.\n")
 
-    def run_check(self, *args):
+    def run_check(self, *args, env=None):
         return subprocess.run(
             [sys.executable, str(self.root / "packaging/licenses/generate.py"), *args],
-            text=True, capture_output=True, check=False,
+            text=True, capture_output=True, check=False, env=env,
         )
 
     def test_current_inventory_passes_offline(self):
-        result = self.run_check("--check", "--target", "aarch64-apple-darwin")
+        env = dict(os.environ, CARGO_HOME=str(self.root / "empty-cargo-cache"))
+        result = self.run_check("--check", "--target", "aarch64-apple-darwin", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Review is checked separately", result.stdout)
 
@@ -68,15 +85,47 @@ class NoticeChecks(unittest.TestCase):
     def test_member_globs_and_exclusions_select_only_declared_manifests(self):
         generator = runpy.run_path(str(self.root / "packaging/licenses/generate.py"))
         (self.root / "Cargo.toml").write_text(
-            '[workspace]\nmembers = ["apps/*"]\nexclude = ["apps/quarry-appkit"]\n')
+            '[workspace]\nmembers = ["fixtures/*"]\nexclude = ["fixtures/excluded"]\n')
+        for name in ["included", "excluded"]:
+            self.make_package("fixtures/" + name, name)
         selected = {str(p.relative_to(self.root.resolve())) for p in generator["workspace_manifests"]()}
-        self.assertEqual(selected, {"apps/quarry-cli/Cargo.toml", "apps/quarry-egui/Cargo.toml"})
+        self.assertEqual(selected, {"fixtures/included/Cargo.toml"})
+
+    def make_package(self, relative, name, extra=""):
+        directory = self.root / relative
+        (directory / "src").mkdir(parents=True)
+        (directory / "src/lib.rs").write_text("// Metadata-only fixture target.\n")
+        manifest = directory / "Cargo.toml"
+        manifest.write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\n' + extra)
+        return manifest
+
+    def test_implicit_path_member_change_invalidates_review_offline(self):
+        (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["fixtures/app"]\n')
+        self.make_package("fixtures/app", "app",
+                          '[dependencies]\nhelper = { path = "../../support/helper" }\n')
+        helper = self.make_package("support/helper", "helper", 'license = "MIT"\n')
+        generator = runpy.run_path(str(self.root / "packaging/licenses/generate.py"))
+        manifest_path = self.root / "packaging/licenses/manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["inputs"] = generator["inputs"]()
+        self.assertIn("support/helper/Cargo.toml", manifest["inputs"])
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        (self.root / "packaging/licenses/reviewed.sha256").write_text(
+            generator["digest"](manifest_path.read_bytes()) + "\n")
+        env = dict(os.environ, CARGO_HOME=str(self.root / "empty-cargo-cache"))
+        result = self.run_check("--release-check", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        helper.write_text(helper.read_text().replace('license = "MIT"', 'license = "Apache-2.0"'))
+        for mode in ["--check", "--release-check"]:
+            result = self.run_check(mode, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stale or modified", result.stderr)
 
     def test_missing_workspace_member_fails_explicitly(self):
         (self.root / "apps/quarry-egui/Cargo.toml").unlink()
         result = self.run_check("--check")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Workspace manifest not found", result.stderr)
+        self.assertIn("Cannot read Cargo workspace", result.stderr)
 
     def test_other_target_cannot_use_arm_inventory(self):
         result = self.run_check("--check", "--target", "x86_64-apple-darwin")

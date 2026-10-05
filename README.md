@@ -64,7 +64,7 @@ bug reports; maintainer responses are best effort.
 
 ## Install Quarry
 
-Source builds require macOS, Xcode command line tools, Python 3.11 or newer,
+Source builds require macOS, Xcode command line tools, Python 3,
 and the Rust toolchain pinned in `rust-toolchain.toml`. Clone the repository
 with its full Git history:
 
