@@ -8,7 +8,7 @@
     "LICENSE-MIT": "3641f379cac8e0f6903292982d0617f3cb6193271fdf74b06f2e01f25e23d70f",
     "apps/quarry-appkit/Cargo.toml": "9a123247711d0e7f97da51fae0bb44d1be9bd33b183b980558eb57c89dbd418c",
     "apps/quarry-cli/Cargo.toml": "8ff3fef2627aae02fef6fd6d6c4911c20688d1107b7fc738a781117c5dc38336",
-    "apps/quarry-egui/Cargo.toml": "e176d5db92692bd1b572b4ae8e2306b95065f164140eebe460859b4b22e55558",
+    "apps/quarry-egui/Cargo.toml": "d205c50afa29f869448f823964b91ae5559435a42ee1dfb7358940b2c82ba8a5",
     "crates/quarry-core/Cargo.toml": "84f5a41320bce3adc22411a595a39a99275e252e8f06ccfa70c791ef2f19113b",
     "crates/quarry-delimited/Cargo.toml": "b0a79530d15e05119b569db3fbb163ae8e087914c011cd643a18527b50b8bf38",
     "packaging/licenses/AUDIT.md": "451a8afdf969e9b84c51a85b0db2b8c397bd69e2ce5896003fbb5e83416f6dd1",

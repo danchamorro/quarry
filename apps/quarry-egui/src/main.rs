@@ -40,6 +40,7 @@ use quarry_core::{
 };
 use tempfile::TempDir;
 
+mod about;
 mod storage;
 use storage::{PendingStorageOperation, STORAGE_REVIEW_BYTES, StorageReview};
 
@@ -290,7 +291,7 @@ fn main() -> eframe::Result<()> {
             winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
         let open_document_receiver = install_application_handlers();
         let mut app = eframe::create_native(
-            "Quarry — Viewer Alpha",
+            "Quarry",
             options,
             Box::new(move |creation| {
                 configure_style(&creation.egui_ctx);
@@ -307,7 +308,7 @@ fn main() -> eframe::Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     eframe::run_native(
-        "Quarry — Viewer Alpha",
+        "Quarry",
         options,
         Box::new(move |creation| {
             configure_style(&creation.egui_ctx);
@@ -317,6 +318,7 @@ fn main() -> eframe::Result<()> {
 }
 
 struct QuarryApp {
+    about: about::About,
     working_directory: PathBuf,
     storage_review: Option<StorageReview>,
     storage_approved: bool,
@@ -513,6 +515,7 @@ impl Default for FilterRuleDraft {
 impl QuarryApp {
     fn new(initial_path: Option<PathBuf>, started: Instant) -> Self {
         let mut app = Self {
+            about: about::About::new(),
             working_directory: std::env::temp_dir(),
             storage_review: None,
             storage_approved: false,
@@ -853,6 +856,10 @@ impl QuarryApp {
     }
 
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        if action == Action::About {
+            self.about.open();
+            return;
+        }
         if let Some(document) = self.document.as_mut() {
             document.commit_edits();
         }
@@ -960,6 +967,7 @@ impl QuarryApp {
         let result = match action {
             Action::Choose
             | Action::TemporaryStorage
+            | Action::About
             | Action::ReopenWithFormat(_, _)
             | Action::ReloadFromDisk
             | Action::Save
@@ -1748,7 +1756,11 @@ impl eframe::App for QuarryApp {
             }
         }
 
+        if self.close_confirmation_open {
+            self.about.open = false;
+        }
         let storage_review_open = self.storage_review.is_some();
+        let interaction_blocked = storage_review_open || self.about.open;
         if storage_review_open && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -1758,7 +1770,7 @@ impl eframe::App for QuarryApp {
             .as_ref()
             .is_some_and(|document| !document.filter_active());
         let mut focus_find = false;
-        if !storage_review_open
+        if !interaction_blocked
             && find_available
             && !self.close_confirmation_open
             && self.structural_dialog.is_none()
@@ -1784,7 +1796,7 @@ impl eframe::App for QuarryApp {
                     )),
             )
             .show(ctx, |ui| {
-                if storage_review_open {
+                if interaction_blocked {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
@@ -1928,7 +1940,7 @@ impl eframe::App for QuarryApp {
             egui::TopBottomPanel::top("quarry-notice")
                 .frame(panel_frame(fill).inner_margin(egui::Margin::symmetric(10, 5)))
                 .show(ctx, |ui| {
-                    if storage_review_open {
+                    if interaction_blocked {
                         ui.disable();
                         ui.set_opacity(1.0);
                     }
@@ -1941,7 +1953,8 @@ impl eframe::App for QuarryApp {
 
         if self.find_bar_open {
             let mut close_find = false;
-            let find_escape_allowed = !self.columns_open
+            let find_escape_allowed = !self.about.open
+                && !self.columns_open
                 && !self.filters_open
                 && !self.close_confirmation_open
                 && self.structural_dialog.is_none()
@@ -1956,7 +1969,7 @@ impl eframe::App for QuarryApp {
                         .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 209, 213))),
                 )
                 .show(ctx, |ui| {
-                    if storage_review_open {
+                    if interaction_blocked {
                         ui.disable();
                         ui.set_opacity(1.0);
                     }
@@ -2013,7 +2026,7 @@ impl eframe::App for QuarryApp {
                     .inner_margin(egui::Margin::symmetric(14, 4)),
             )
             .show(ctx, |ui| {
-                if storage_review_open {
+                if interaction_blocked {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
@@ -2028,7 +2041,7 @@ impl eframe::App for QuarryApp {
                 }
             });
 
-        if !storage_review_open
+        if !interaction_blocked
             && action.is_none()
             && !self.close_confirmation_open
             && self.document.as_ref().is_some_and(Document::is_save_ready)
@@ -2036,7 +2049,7 @@ impl eframe::App for QuarryApp {
         {
             action = Some(Action::Save);
         }
-        if !storage_review_open
+        if !interaction_blocked
             && action.is_none()
             && !self.close_confirmation_open
             && self.structural_dialog.is_none()
@@ -2052,7 +2065,7 @@ impl eframe::App for QuarryApp {
                         .focused()
                         .is_some_and(|id| is_filter_text_input(id, self.filter_rules.len()))
                 }));
-        if !storage_review_open && action.is_none() && self.document.is_some() && !filter_owns_keys
+        if !interaction_blocked && action.is_none() && self.document.is_some() && !filter_owns_keys
         {
             action = ctx.input(|input| {
                 if input.key_pressed(egui::Key::PageDown) {
@@ -2064,11 +2077,11 @@ impl eframe::App for QuarryApp {
                 }
             });
         }
-        if !storage_review_open && let Some(action) = action {
+        if !interaction_blocked && let Some(action) = action {
             self.apply(ctx, action);
         }
 
-        if self.storage_review.is_none() && self.format_draft.is_some() {
+        if self.storage_review.is_none() && !self.about.open && self.format_draft.is_some() {
             self.columns_open = false;
             self.filters_open = false;
             surrender_filter_text_focus(ctx, self.filter_rules.len());
@@ -2077,7 +2090,7 @@ impl eframe::App for QuarryApp {
         let column_command = self
             .document
             .as_ref()
-            .filter(|_| self.storage_review.is_none())
+            .filter(|_| self.storage_review.is_none() && !self.about.open)
             .and_then(|document| {
                 show_column_manager(
                     ctx,
@@ -2093,7 +2106,7 @@ impl eframe::App for QuarryApp {
         let filter_action = self
             .document
             .as_ref()
-            .filter(|_| self.storage_review.is_none())
+            .filter(|_| self.storage_review.is_none() && !self.about.open)
             .and_then(|document| {
                 show_filter_manager(
                     ctx,
@@ -2113,7 +2126,7 @@ impl eframe::App for QuarryApp {
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
             .show(ctx, |ui| {
-                if self.storage_review.is_some() {
+                if self.storage_review.is_some() || self.about.open {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
@@ -2143,7 +2156,7 @@ impl eframe::App for QuarryApp {
         let structural_dialog_action = self
             .structural_dialog
             .as_mut()
-            .filter(|_| self.storage_review.is_none())
+            .filter(|_| self.storage_review.is_none() && !self.about.open)
             .zip(self.document.as_ref())
             .and_then(|(dialog, document)| {
                 show_structural_dialog(ctx, dialog, &mut self.sort_match_case, document)
@@ -2154,7 +2167,7 @@ impl eframe::App for QuarryApp {
         let duplicate_action = self
             .document
             .as_ref()
-            .filter(|_| self.storage_review.is_none())
+            .filter(|_| self.storage_review.is_none() && !self.about.open)
             .and_then(|document| {
                 let StructuralJob::DuplicatePreview { summary, .. } =
                     document.structural_job.as_ref()?
@@ -2182,14 +2195,14 @@ impl eframe::App for QuarryApp {
                         .map(|edit| (edit.row, edit.column)),
                 )
         });
-        if self.storage_review.is_none() && copy_event_targets_selection {
+        if self.storage_review.is_none() && !self.about.open && copy_event_targets_selection {
             self.copy_selection(ctx);
         }
         if grid_error.is_some() {
             self.notice = grid_error.map(AppMessage::error);
         }
 
-        if self.storage_review.is_none() && self.close_confirmation_open {
+        if self.storage_review.is_none() && !self.about.open && self.close_confirmation_open {
             let mut discard_and_close = false;
             let mut keep_editing = false;
             let mut save_and_close = false;
@@ -2262,6 +2275,9 @@ impl eframe::App for QuarryApp {
                 ctx.request_discard("storage review opened");
             }
             self.show_storage_review(ctx);
+        }
+        if self.storage_review.is_none() && !self.close_confirmation_open {
+            self.about.show(ctx);
         }
         if self.document.as_ref().is_some_and(|document| {
             document.job.is_some()
@@ -2344,6 +2360,7 @@ fn detected_delimiter_label(delimiter: u8) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
+    About,
     Choose,
     TemporaryStorage,
     ReopenWithFormat(DelimiterMode, HeaderMode),
@@ -3076,6 +3093,10 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             .clicked()
         {
             action = Some(Action::TemporaryStorage);
+        }
+        ui.separator();
+        if ui.button("About & Feedback…").clicked() {
+            action = Some(Action::About);
         }
         action
     });
@@ -10086,6 +10107,118 @@ mod tests {
             super::QUARRY_SELECTED_TEXT
         );
         assert_eq!(style.visuals.hyperlink_color, super::QUARRY_YELLOW_TEXT);
+    }
+
+    #[test]
+    fn about_feedback_is_accessible_and_preserves_document_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("private-example.csv");
+        fs::write(&source, b"name,value\nprivate-value,1\n").unwrap();
+        for with_document in [false, true] {
+            let mut app = QuarryApp::new(None, Instant::now());
+            if with_document {
+                app.open_path(source.clone()).unwrap();
+                finish_index(app.document.as_mut().unwrap());
+                commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
+            }
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_style(&ctx);
+            let mut time = 0.0;
+            let mut render = |app: &mut QuarryApp, events| {
+                time += 2.0;
+                ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(860.0, 540.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest()),
+                )
+            };
+            let click = |target| {
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target,
+                    data: None,
+                })
+            };
+            let output = render(&mut app, vec![]);
+            let menu_label = if with_document {
+                "File menu: private-example.csv"
+            } else {
+                "File menu"
+            };
+            let (menu, _) = accessible_button(&output, menu_label);
+            render(&mut app, vec![click(menu)]);
+            let output = render(&mut app, vec![]);
+            let (about, _) = accessible_button(&output, "About & Feedback…");
+            render(&mut app, vec![click(about)]);
+            assert!(app.about.open);
+            let output = render(&mut app, vec![]);
+            let (copy, _) = accessible_button(&output, "Copy build details");
+            let output = render(&mut app, vec![click(copy)]);
+            let copied = output
+                .platform_output
+                .commands
+                .iter()
+                .find_map(|command| {
+                    if let egui::OutputCommand::CopyText(text) = command {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .expect("copying build details should populate the clipboard");
+            assert!(copied.contains(env!("CARGO_PKG_VERSION")));
+            assert!(copied.contains("Build: source build"));
+            assert!(!copied.contains("private"));
+
+            for (label, url) in [
+                (
+                    "Report a bug or share feedback",
+                    "https://github.com/danchamorro/quarry/issues/new?template=bug_report.yml",
+                ),
+                (
+                    "User guide",
+                    "https://github.com/danchamorro/quarry/blob/main/docs/USER_GUIDE.md",
+                ),
+            ] {
+                let output = render(&mut app, vec![]);
+                let (button, node) = accessible_button(&output, label);
+                let bounds = node.bounds().expect("action has screen bounds");
+                assert!(bounds.x0 >= 0.0 && bounds.x1 <= 860.0 && bounds.y1 <= 540.0);
+                let output = render(&mut app, vec![click(button)]);
+                assert!(output.platform_output.commands.iter().any(|command| {
+                    matches!(command, egui::OutputCommand::OpenUrl(open) if open.url == url)
+                }));
+            }
+
+            // About owns keyboard input; inspecting build details must not save or undo data.
+            for key in [egui::Key::S, egui::Key::Z, egui::Key::F] {
+                render(
+                    &mut app,
+                    vec![individual_edit_key(key, egui::Modifiers::COMMAND)],
+                );
+            }
+            assert!(!app.find_bar_open);
+            if with_document {
+                assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 1)], b"2");
+            }
+            assert_eq!(fs::read(&source).unwrap(), b"name,value\nprivate-value,1\n");
+            render(
+                &mut app,
+                vec![individual_edit_key(
+                    egui::Key::Escape,
+                    egui::Modifiers::NONE,
+                )],
+            );
+            assert!(!app.about.open);
+        }
     }
 
     #[test]

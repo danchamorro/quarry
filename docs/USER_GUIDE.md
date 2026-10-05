@@ -27,6 +27,7 @@ delimited files in the Quarry macOS app.
 - [Case matching](#case-matching)
 - [Mouse and keyboard reference](#mouse-and-keyboard-reference)
 - [Troubleshooting](#troubleshooting)
+- [Version and feedback](#version-and-feedback)
 
 ## Getting started
 
@@ -83,6 +84,23 @@ after indexing finishes.
 4. Open the file menu, choose **Save As…**, and select a new filename.
 
 This creates an edited copy and preserves the original file.
+
+## Version and feedback
+
+Open the **File menu → About & Feedback…** to see Quarry's version and beta
+status. Packaged apps also show their build number and source revision.
+**Copy build details** copies the version, build, revision, source status and
+platform, without including your file paths or document contents. Unpackaged
+source builds show the Cargo version and identify unavailable build metadata.
+
+Choose **Report a bug or share feedback** to open the public GitHub bug form,
+or **User guide** to open this guide. Include build details, your exact macOS
+version, reproduction steps, and expected and actual results. Use a small
+synthetic example and redact private information from screenshots and logs.
+Close the panel with **Close** or Escape.
+
+This panel was added after beta 1; that release's build identity is listed in
+the [beta tester guide](BETA_TESTER_GUIDE.md#candidate-and-compatibility).
 
 ## How to
 
