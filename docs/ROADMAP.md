@@ -4,11 +4,11 @@ The roadmap is ordered by technical risk rather than feature excitement.
 
 Quarry follows the [free and open-source policy](../README.md#free-and-open-source):
 all application features remain available in source builds, and official
-releases are intended to be free of charge. There are no paid tiers or
-activation requirements. Public release still depends on the acceptance gates
-below.
+releases are free of charge. There are no paid tiers or activation requirements.
+The first public beta is available with documented validation limits. The
+[beta checklist](BETA_RELEASE_CHECKLIST.md) tracks remaining acceptance work.
 
-## Focus before the first public beta
+## Completed priorities for the first public beta
 
 The [Priority Checklist Before Beta](PRE_BETA_CHECKLIST.md) records four completed
 feature priorities: individual cell/header Undo, numeric filters, duplicate
@@ -52,17 +52,18 @@ exact Save As output passed with the original source unchanged. The original
 The [2026-09-06 connected-workflow validation](benchmarks/2026-09-06-pre-beta-closeout.md)
 passed in the clean installed app at `f5efee2`, covering cell/header Undo/Redo,
 Save As, numeric filtering, exact export, duplicate removal and Undo/Redo,
-final Save, source preservation, and working-file cleanup. Owner review remains
-pending in the checklist. Completed alpha phases below retain their existing scope.
+final Save, source preservation, and working-file cleanup. The first public beta
+was authorized with remaining validation documented in its release notes.
+Completed alpha phases below retain their existing scope.
 Date/time sorting remains planned in Phase 6D and does not block this checklist.
 
 The dialog polish follow-up merged in
 [PR #40](https://github.com/danchamorro/quarry/pull/40) as `69d5f15`; its clean
 installed build passed native checks. Filters, Columns, Sort, and duplicate
-review use the existing egui framework. The next milestone is
-[beta release preparation](BETA_RELEASE_CHECKLIST.md), with explicit supported
-platforms, candidate validation, license notices, signing, notarization, and
-owner acceptance. A public beta has not been released.
+review use the existing egui framework. The signed and notarized
+[public beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1)
+is available for Apple Silicon. The [beta checklist](BETA_RELEASE_CHECKLIST.md)
+tracks the remaining compatibility, accessibility and installation validation.
 
 ## Current progress: 2026-09-07
 

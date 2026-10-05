@@ -1,28 +1,31 @@
-# Quarry invited tester guide
+# Quarry beta tester guide
 
-**Preparation draft:** remaining acceptance and owner approval precede invitations.
+**Public beta:** use disposable copies and report problems with reproducible examples.
 
-This beta is for Apple Silicon Macs. Use the signed ZIP supplied privately with
-your invitation. Intel Macs, Linux, and Windows are outside this beta's scope.
+This beta targets Apple Silicon Macs on macOS 26 and 27 and is available free
+from GitHub Releases. Broader acceptance remains in progress; the evidence
+below identifies what has passed. Intel Macs, Linux desktop and Windows are outside scope.
 
 ## Candidate and compatibility
 
-- Candidate: **0.1.0 (105)**, clean revision
-  `159e14950f6b4694129a810e19299c2f7fb950df`.
-- Tested system: **macOS 26.6.2, Apple Silicon (ARM64)** only. Other macOS
-  versions, Intel Macs, Linux, and Windows have no acceptance claim for this ZIP.
-- Local signed-ZIP checks passed editing, filtering/export, sort, duplicates,
-  Undo/Redo, and save/reopen. Fresh-environment and broader checks remain open.
-- Existing-VM installation/rollback/launch passed; edit/save workflow owner-reported, saved/source bytes verified.
-- Archive: `Quarry-notarized.zip`, **3,611,149 bytes**, signed and notarized.
-- SHA-256: `31e72cb0b8cafb62bca76e7d40b00ffcb6638fc10d5ca3100205e2ce8e7d80fb`.
+- Candidate: **0.1.0 (127)**, clean revision
+  `30fee5d62ff23bb4803f73fbe5b14129162efb43`.
+- Host tested: **macOS 27.0.1 (26A434), Apple Silicon**. Bounded signed-ZIP
+  workflows passed; this does not yet establish full support on macOS 27.
+- macOS 26.6.2 file install/rollback, Gatekeeper and native launch passed; its
+  complete native workflow and fresh-environment acceptance remain open.
+- Archive: `Quarry-0.1.0-beta.1-macos-arm64.zip`, **3,622,188 bytes**, signed and notarized.
+- SHA-256: `f8fac678f75343bd5eef856826a274ed965928881a8aa02b04dab7452af3cc44`.
+- Read the [release notes](BETA_RELEASE_NOTES.md) and
+  [acceptance evidence](benchmarks/2026-10-05-beta-build127.md).
 
 ## Install or update
 
 1. Save any open work and quit Quarry completely before replacing the app.
    Keep a copy of your previous app until the new copy works.
-2. Download the owner-provided private ZIP. To check a copy in Downloads, run
-   `shasum -a 256 ~/Downloads/Quarry-notarized.zip` in Terminal and compare the
+2. Download the ZIP from
+   [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1). To check a copy in Downloads, run
+   `shasum -a 256 ~/Downloads/Quarry-0.1.0-beta.1-macos-arm64.zip` in Terminal and compare the
    result with the SHA-256 above. Report a mismatch before proceeding.
 3. Extract the ZIP and move `Quarry.app` into Applications.
 4. Open Quarry normally from Applications. Record any macOS first-launch

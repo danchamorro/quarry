@@ -27,10 +27,14 @@ commit.
 
 The [beta release checklist](BETA_RELEASE_CHECKLIST.md) separates local package
 validation from the acceptance and distribution gates for a public candidate.
-The current frozen candidate is [0.1.0 (105), clean `159e149`](#clean-local-candidate-2026-09-08).
-The earlier trial and build 98 records below remain historical evidence.
+The current frozen candidate is [0.1.0 (127), clean `30fee5d`](benchmarks/2026-10-05-beta-build127.md).
+The earlier trial and build 98/105 records below remain historical evidence.
+The [public beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1)
+is available free through GitHub Releases for Apple Silicon, targeting macOS
+26 and 27 with the validation limits in its release notes. Keep bundles out of
+Git source history; distribute approved archives as release assets.
 
-Official releases are intended to be free of charge under Quarry's
+Official releases are free of charge under Quarry's
 [free and open-source policy](../README.md#free-and-open-source). Source builds
 include all application features without paid tiers or activation. Signing and
 notarization establish trusted distribution; they do not unlock features.
@@ -45,7 +49,7 @@ only the documented Apple Silicon host.
 
 - macOS with the Xcode command line tools.
 - The Rust toolchain selected by `rust-toolchain.toml`.
-- Python 3 for the offline notice freshness check.
+- Python 3 and the pinned Cargo toolchain for the offline notice freshness check.
 - A non-shallow Quarry checkout with complete Git history and `Cargo.lock`
   present.
 - Quarry, including a Cargo-launched development copy, must be closed before

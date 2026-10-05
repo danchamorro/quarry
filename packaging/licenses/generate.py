@@ -24,6 +24,33 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def workspace_manifests():
+    pending = [ROOT / "Cargo.toml"]
+    inspected, manifests = set(), set()
+    while pending:
+        manifest = pending.pop().resolve()
+        if manifest in inspected:
+            continue
+        result = subprocess.run([
+            "cargo", "metadata", "--no-deps", "--format-version", "1",
+            "--offline", "--locked", "--manifest-path", str(manifest),
+        ], cwd=ROOT, text=True, capture_output=True)
+        if result.returncode:
+            raise ValueError("Cannot read Cargo workspace: " + result.stderr.strip())
+        metadata = json.loads(result.stdout)
+        inspected.add(manifest)
+        for package in metadata["packages"]:
+            package_manifest = Path(package["manifest_path"]).resolve()
+            manifests.add(package_manifest)
+            inspected.add(package_manifest)
+            # --no-deps omits excluded path packages, but exposes their resolved
+            # paths. Inspect those packages recursively without registry access.
+            pending.extend(Path(dependency["path"]) / "Cargo.toml"
+                           for dependency in package["dependencies"]
+                           if dependency.get("path"))
+    return manifests
+
+
 def inputs():
     paths = [ROOT / name for name in (
         "Cargo.lock", "Cargo.toml", "rust-toolchain.toml", "LICENSE-MIT", "LICENSE-APACHE",
@@ -31,8 +58,7 @@ def inputs():
         "packaging/licenses/about.toml", "packaging/licenses/supplemental.json",
         "packaging/licenses/AUDIT.md",
     )]
-    paths += list(ROOT.glob("apps/*/Cargo.toml"))
-    paths += list(ROOT.glob("crates/*/Cargo.toml"))
+    paths += workspace_manifests()
     paths += list((HERE / "rust").glob("*"))
     return {str(p.relative_to(ROOT)): digest(p.read_bytes()) for p in sorted(paths)}
 
