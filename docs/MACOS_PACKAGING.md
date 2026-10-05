@@ -30,6 +30,13 @@ validation from the acceptance and distribution gates for a public candidate.
 The current frozen candidate is [0.1.0 (105), clean `159e149`](#clean-local-candidate-2026-09-08).
 The earlier trial and build 98 records below remain historical evidence.
 
+Official releases are intended to be free of charge under Quarry's
+[free and open-source policy](../README.md#free-and-open-source). Source builds
+include all application features without paid tiers or activation. Signing and
+notarization establish trusted distribution; they do not unlock features.
+The project remains dual-licensed under MIT or Apache-2.0, and public downloads
+remain subject to the release checklist.
+
 The plist declares macOS 11.0 as its minimum. The packaging command does not pin
 or verify the Mach-O deployment target, and the current acceptance run exercises
 only the documented Apple Silicon host.

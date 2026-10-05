@@ -1,7 +1,9 @@
 # Contributing to Quarry
 
-Quarry is an open-source, performance-first project. Contributions are welcome
-under the dual MIT or Apache-2.0 license.
+Quarry is a free and open-source, performance-first project. Contributions are
+welcome under the existing MIT OR Apache-2.0 licenses. All application features
+are available in source builds, and official packaged releases will be free of
+charge when available. See the [project direction](../README.md#free-and-open-source).
 
 ## Priorities
 In the early project, contributions should favor:
@@ -68,22 +70,15 @@ validation follows the installed-app checklist in
 ## Pull requests
 Keep changes focused. Explain the problem, design, tradeoffs, tests, and performance impact. Screenshots are useful for UI work; benchmark tables are useful for engine work.
 
-## Contributor License Agreement
-Before a first pull request can be merged, contributors must sign the
-[Quarry CLA](CLA.md). It confirms you have the right to contribute the code and
-grants the maintainer the rights needed to license the Project, including any
-future change to the Project's license terms. You keep full ownership of your
-contributions and may use them however you like elsewhere.
+## Contribution licensing
 
-To sign, comment on your pull request with:
+Contributions submitted for inclusion in Quarry are accepted under the same
+[MIT](../LICENSE-MIT) OR [Apache-2.0](../LICENSE-APACHE) terms as the project,
+allowing recipients to choose either license. You retain ownership of your
+contributions. No separate Contributor License Agreement (CLA) or signing
+comment is required.
 
-```
-I have read the Quarry CLA (docs/CLA.md) and I agree to its terms.
-Signed: Full Name <email@example.com>, YYYY-MM-DD
-```
-
-Signing once covers all your future contributions.
-
-## License
-Quarry is dual-licensed under MIT or Apache-2.0. Contributions are accepted
-under those same terms.
+Submit only work you have the right to contribute, including any necessary
+employer permission. Identify third-party material, its source, and its license
+in your pull request, and preserve the required notices. This also applies to
+work created with AI assistance; disclose any uncertain provenance for review.

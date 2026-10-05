@@ -3,7 +3,7 @@
 **Version:** 0.5 Draft
 **Platform:** macOS first
 **Core engine:** Rust
-**Model:** Open source
+**Model:** Free and open source
 
 ## Product vision
 Quarry is a performance-first desktop application for people who work with delimited text files too large for conventional editors and spreadsheets.
@@ -12,6 +12,11 @@ Quarry is a performance-first desktop application for people who work with delim
 > A user should be able to open a 10 GB CSV on a Mac, see useful data within seconds, and begin navigating it without waiting for the entire file to load into memory.
 
 Longer term, Quarry should make files substantially larger than physical RAM practical to inspect and transform.
+
+Quarry is fully open source under MIT or Apache-2.0. All application features
+remain available in source builds, with no paid tiers or activation. Official
+releases are intended to be free of charge when released. See the
+[project policy](../README.md#free-and-open-source).
 
 ## Problem
 Data professionals regularly receive multi-gigabyte CSV, TSV, and pipe-delimited files. Common tools may consume enormous memory, freeze, impose limits, or require importing the data elsewhere before inspection. Quarry fills that gap on macOS.
@@ -253,7 +258,7 @@ semantics rather than silent date guessing.
 
 ## Version 0.4: desktop packaging and workflow polish (complete)
 
-Phase 7A packages the selected egui application as the customer-facing
+Phase 7A packages the selected egui application as the user-facing
 `/Applications/Quarry.app`. Its stable bundle identifier is
 `io.github.danchamorro.quarry`, and the bundle executable is `Quarry`.
 The checked-in icon, Cargo version, numeric build version, full Git commit,
@@ -358,5 +363,5 @@ Validated minimum macOS version; encoding breadth; persistent index
 format/invalidation.
 [ADR 0003](adr/0003-select-egui-ui.md) selects the UI framework.
 
-The initial engine ships with a benchmark-oriented CLI and is dual-licensed
-under MIT or Apache-2.0.
+Quarry, including the desktop application, engine, and benchmark-oriented CLI,
+is dual-licensed under MIT or Apache-2.0.

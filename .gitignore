@@ -1,4 +1,7 @@
 /target/
+# Local owner instructions and private planning notes.
+/AGENTS.md
+/docs/*.private.md
 /LARGE_FILE.csv
 /LARGE_FILE_*.csv
 /daily_weather_preprocessed_1896_2023.csv

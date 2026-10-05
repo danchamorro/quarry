@@ -39,6 +39,12 @@ and feedback. Download details are supplied privately to invited testers.
 Follow the [packaging guide](MACOS_PACKAGING.md) for build, signing, installation, and
 rollback procedures. Do not upload app bundles to GitHub.
 
+Quarry's [free and open-source policy](../README.md#free-and-open-source)
+applies to release preparation: official releases are intended to be free of
+charge, and source builds include all application features without paid tiers
+or activation. This direction does not close the candidate acceptance or
+publication gates below.
+
 ## Separate local build 118 desktop checks, 2026-09-20
 
 The automated/native desktop QA checkpoint is complete for installed
@@ -192,9 +198,9 @@ metadata-change workflow. The remaining acceptance gates below still apply.
 - [ ] Test that exact candidate's Gatekeeper acceptance on a fresh supported
   macOS environment (another Mac or a clean VM). The earlier dirty trial's
   successful offline VM launch does not close this gate.
-- [ ] Obtain owner approval for the distribution arrangement and public release
-  information. Private download links and tester records are maintained outside
-  this repository.
+- [ ] Obtain owner approval for the free download channel and public release
+  information. Private prerelease download links and tester records are
+  maintained outside this repository.
 - [ ] Approve candidate release notes containing the supported-system matrix,
   known limits, update/rollback guidance, and feedback link. Publish only after
   the preceding release gates and explicit owner authorization are complete.
