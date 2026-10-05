@@ -1526,7 +1526,9 @@ impl eframe::App for QuarryApp {
             self.intercept_dirty_close(ctx);
 
             #[cfg(target_os = "macos")]
-            self.poll_open_documents();
+            if !self.about.open {
+                self.poll_open_documents();
+            }
         }
 
         let local_file_hovered = self.document.is_none()
@@ -1545,7 +1547,7 @@ impl eframe::App for QuarryApp {
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>()
         });
-        if self.storage_review.is_none() && !dropped_paths.is_empty() {
+        if self.storage_review.is_none() && !self.about.open && !dropped_paths.is_empty() {
             self.handle_dropped_paths(dropped_paths);
         }
 
@@ -10107,6 +10109,61 @@ mod tests {
             super::QUARRY_SELECTED_TEXT
         );
         assert_eq!(style.visuals.hyperlink_color, super::QUARRY_YELLOW_TEXT);
+    }
+
+    #[test]
+    fn about_blocks_dropped_files_and_defers_native_open_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.csv");
+        let replacement = directory.path().join("replacement.csv");
+        fs::write(&original, b"name,value\nfirst,1\n").unwrap();
+        fs::write(&replacement, b"name,value\nsecond,2\n").unwrap();
+        for editing in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = QuarryApp::new(Some(original.clone()), Instant::now());
+            finish_index(app.document.as_mut().unwrap());
+            let _ = ctx.run(grid_input(), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+            });
+            if editing {
+                let document = app.document.as_mut().unwrap();
+                document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
+                document.cell_edit.as_mut().unwrap().draft = "unsaved".into();
+            }
+            app.apply(&ctx, Action::About);
+            #[cfg(target_os = "macos")]
+            {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                app.open_document_receiver = Some(receiver);
+                sender.send(replacement.clone()).unwrap();
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    dropped_files: vec![egui::DroppedFile {
+                        path: Some(replacement.clone()),
+                        ..Default::default()
+                    }],
+                    ..grid_input()
+                },
+                |ctx| eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest()),
+            );
+            let document = app.document.as_ref().unwrap();
+            assert_eq!(document.logical_path, original);
+            assert!(app.notice.is_none());
+            if editing {
+                assert_eq!(document.cell_edit.as_ref().unwrap().draft, "unsaved");
+                assert!(document.cell_edits.is_empty());
+            }
+
+            #[cfg(target_os = "macos")]
+            if !editing {
+                app.about.open = false;
+                let _ = ctx.run(grid_input(), |ctx| {
+                    eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+                });
+                assert_eq!(app.document.as_ref().unwrap().logical_path, replacement);
+            }
+        }
     }
 
     #[test]
