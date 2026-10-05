@@ -42,6 +42,9 @@ repository freshness and integrity only. It does not inspect the local Cargo
 cache or re-read dependency files; regeneration performs those source checks.
 Workspace manifests come from Cargo metadata (`--no-deps --offline --locked`),
 including implicit local path members and honoring member patterns/exclusions.
+Declared local path dependencies are inspected recursively, including excluded
+packages and their transitive path dependencies. Exclusion from workspace
+membership does not exclude a dependency's manifest from the freshness check.
 This reads package metadata without compiling or downloading dependencies and
 works with an empty registry cache. Unrelated local app directories do not
 affect the inventory.
@@ -75,14 +78,15 @@ require a new source audit. HTML escaping changes markup representation, not ren
 
 ## Collected source coverage
 
-The 2026-10-05 packaging follow-up limits manifest discovery to declared
-Cargo workspace membership. An unrelated local app had caused a false
+The 2026-10-05 packaging follow-up limits manifest discovery to Cargo workspace
+members and their declared local path dependencies. An unrelated local app had caused a false
 stale-inventory failure. Regeneration with the verified cargo-about 0.9.2
 binary produced byte-identical notice HTML; the dependency lockfile, member
 manifests, supplemental notices, and runtime resources were unchanged. Only
 the generator and this audit changed in the recorded inputs. Regressions cover
 unrelated app directories, member globs/exclusions, missing member manifests,
-and license-only changes in implicit path members. The latter uses an empty
+and license-only changes in implicit members and excluded transitive path
+dependencies. The dependency regressions use an empty
 Cargo cache and verifies that both freshness and release checks reject stale
 reviewed inputs. Cargo provides membership semantics directly, so a separate
 Python TOML parser and Python 3.11 requirement are unnecessary.

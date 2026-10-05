@@ -127,6 +127,34 @@ class NoticeChecks(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cannot read Cargo workspace", result.stderr)
 
+    def test_excluded_transitive_path_change_invalidates_review_offline(self):
+        (self.root / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["fixtures/app"]\n'
+            'exclude = ["support/helper", "support/nested"]\n')
+        self.make_package("fixtures/app", "app",
+                          '[dependencies]\nalias = { package = "helper", path = "../../support/helper" }\n')
+        self.make_package("support/helper", "helper",
+                          '[dependencies]\nnested = { path = "../nested" }\nserde = "1"\n')
+        nested = self.make_package("support/nested", "nested", 'license = "MIT"\n')
+        generator = runpy.run_path(str(self.root / "packaging/licenses/generate.py"))
+        manifest_path = self.root / "packaging/licenses/manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["inputs"] = generator["inputs"]()
+        for relative in ["support/helper/Cargo.toml", "support/nested/Cargo.toml"]:
+            self.assertIn(relative, manifest["inputs"])
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        (self.root / "packaging/licenses/reviewed.sha256").write_text(
+            generator["digest"](manifest_path.read_bytes()) + "\n")
+        env = dict(os.environ, CARGO_HOME=str(self.root / "empty-cargo-cache"))
+        result = self.run_check("--release-check", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        nested.write_text(nested.read_text().replace('license = "MIT"', 'license = "Apache-2.0"'))
+        for mode in ["--check", "--release-check"]:
+            result = self.run_check(mode, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stale or modified", result.stderr)
+        self.assertFalse(list((self.root / "support").rglob("Cargo.lock")))
+
     def test_other_target_cannot_use_arm_inventory(self):
         result = self.run_check("--check", "--target", "x86_64-apple-darwin")
         self.assertNotEqual(result.returncode, 0)

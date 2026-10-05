@@ -25,18 +25,30 @@ def digest(data):
 
 
 def workspace_manifests():
-    result = subprocess.run([
-        "cargo", "metadata", "--no-deps", "--format-version", "1",
-        "--offline", "--locked", "--manifest-path", str(ROOT / "Cargo.toml"),
-    ], cwd=ROOT, text=True, capture_output=True)
-    if result.returncode:
-        raise ValueError("Cannot read Cargo workspace: " + result.stderr.strip())
-    metadata = json.loads(result.stdout)
-    members = set(metadata["workspace_members"])
-    return {
-        Path(package["manifest_path"])
-        for package in metadata["packages"] if package["id"] in members
-    }
+    pending = [ROOT / "Cargo.toml"]
+    inspected, manifests = set(), set()
+    while pending:
+        manifest = pending.pop().resolve()
+        if manifest in inspected:
+            continue
+        result = subprocess.run([
+            "cargo", "metadata", "--no-deps", "--format-version", "1",
+            "--offline", "--locked", "--manifest-path", str(manifest),
+        ], cwd=ROOT, text=True, capture_output=True)
+        if result.returncode:
+            raise ValueError("Cannot read Cargo workspace: " + result.stderr.strip())
+        metadata = json.loads(result.stdout)
+        inspected.add(manifest)
+        for package in metadata["packages"]:
+            package_manifest = Path(package["manifest_path"]).resolve()
+            manifests.add(package_manifest)
+            inspected.add(package_manifest)
+            # --no-deps omits excluded path packages, but exposes their resolved
+            # paths. Inspect those packages recursively without registry access.
+            pending.extend(Path(dependency["path"]) / "Cargo.toml"
+                           for dependency in package["dependencies"]
+                           if dependency.get("path"))
+    return manifests
 
 
 def inputs():
