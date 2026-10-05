@@ -5,7 +5,7 @@
 # Quarry
 
 <p align="center">
-  <strong>A macOS editor for large CSV and delimited files, validated at 12 GB and 50 GB.</strong>
+  <strong>A free and open-source macOS editor for large CSV and delimited files, validated at 12 GB and 50 GB.</strong>
 </p>
 
 Quarry combines a familiar editable data grid with a bounded Rust engine. Open,
@@ -20,6 +20,24 @@ working memory bounded and does not change the source until you choose
 > transformation, filtering, sorting, and file-safety workflows are complete.
 > Beta preparation is tracked in the [beta release checklist](docs/BETA_RELEASE_CHECKLIST.md).
 > A public beta has not been released.
+
+## Free and open source
+
+Quarry's desktop app, Rust engine, and CLI are open source under
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. All application
+features are available in source builds. There are no paid editions, feature
+paywalls, license keys, or activation requirements.
+
+Official packaged releases will be free of charge when available. For now,
+build and install from source using the instructions below. Public downloads
+still depend on the validation and signing work in the
+[beta release checklist](docs/BETA_RELEASE_CHECKLIST.md).
+
+Bug reports, documentation improvements, tests, and code contributions are
+welcome. See the [contributing guide](docs/CONTRIBUTING.md) for the development
+workflow and contributor terms. Use the
+[issue tracker](https://github.com/danchamorro/quarry/issues) for questions and
+bug reports; maintainer responses are best effort.
 
 ## Why Quarry
 
@@ -46,7 +64,17 @@ working memory bounded and does not change the source until you choose
 
 ## Install Quarry
 
-Quit any running Quarry copy, then install and verify the application:
+Source builds require macOS, Xcode command line tools, Python 3, and the Rust
+toolchain pinned in `rust-toolchain.toml`. Clone the repository with its full Git
+history:
+
+```bash
+git clone https://github.com/danchamorro/quarry.git
+cd quarry
+```
+
+Save or discard any unsaved work and quit Quarry, then install and verify the
+application:
 
 ```bash
 ./scripts/macos-app.sh install
@@ -254,4 +282,7 @@ public so the process and results can be inspected.
 
 ## License
 
-Quarry is dual-licensed under MIT or Apache-2.0.
+Quarry is dual-licensed under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option (`MIT OR Apache-2.0`). Bundled
+dependencies retain their own licenses; packages include the required
+[third-party notices](packaging/licenses/THIRD_PARTY_NOTICES.html).

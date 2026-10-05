@@ -2,6 +2,12 @@
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
+Quarry follows the [free and open-source policy](../README.md#free-and-open-source):
+all application features remain available in source builds, and official
+releases are intended to be free of charge. There are no paid tiers or
+activation requirements. Public release still depends on the acceptance gates
+below.
+
 ## Focus before the first public beta
 
 The [Priority Checklist Before Beta](PRE_BETA_CHECKLIST.md) records four completed
