@@ -58,6 +58,26 @@ class NoticeChecks(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("stale or modified", result.stderr)
 
+    def test_unrelated_local_app_does_not_change_inventory(self):
+        path = self.root / "apps/local-experiment/Cargo.toml"
+        path.parent.mkdir(parents=True)
+        path.write_text("This is not a workspace manifest and must not be read.\n")
+        result = self.run_check("--release-check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_member_globs_and_exclusions_select_only_declared_manifests(self):
+        generator = runpy.run_path(str(self.root / "packaging/licenses/generate.py"))
+        (self.root / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["apps/*"]\nexclude = ["apps/quarry-appkit"]\n')
+        selected = {str(p.relative_to(self.root.resolve())) for p in generator["workspace_manifests"]()}
+        self.assertEqual(selected, {"apps/quarry-cli/Cargo.toml", "apps/quarry-egui/Cargo.toml"})
+
+    def test_missing_workspace_member_fails_explicitly(self):
+        (self.root / "apps/quarry-egui/Cargo.toml").unlink()
+        result = self.run_check("--check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Workspace manifest not found", result.stderr)
+
     def test_other_target_cannot_use_arm_inventory(self):
         result = self.run_check("--check", "--target", "x86_64-apple-darwin")
         self.assertNotEqual(result.returncode, 0)

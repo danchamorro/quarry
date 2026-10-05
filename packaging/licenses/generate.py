@@ -9,6 +9,10 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit("Notice checks require Python 3.11 or newer.")
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = ROOT / "packaging/licenses"
@@ -24,6 +28,27 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def workspace_manifests():
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]
+    excluded = {
+        path.resolve()
+        for pattern in workspace.get("exclude", [])
+        for path in ROOT.glob(pattern)
+    }
+    manifests = set()
+    for pattern in workspace["members"]:
+        members = list(ROOT.glob(pattern))
+        if not members:
+            raise ValueError("Workspace member not found: " + pattern)
+        for member in members:
+            if member.resolve() not in excluded:
+                manifest = member / "Cargo.toml"
+                if not manifest.is_file():
+                    raise ValueError("Workspace manifest not found: " + str(manifest))
+                manifests.add(manifest)
+    return manifests
+
+
 def inputs():
     paths = [ROOT / name for name in (
         "Cargo.lock", "Cargo.toml", "rust-toolchain.toml", "LICENSE-MIT", "LICENSE-APACHE",
@@ -31,8 +56,7 @@ def inputs():
         "packaging/licenses/about.toml", "packaging/licenses/supplemental.json",
         "packaging/licenses/AUDIT.md",
     )]
-    paths += list(ROOT.glob("apps/*/Cargo.toml"))
-    paths += list(ROOT.glob("crates/*/Cargo.toml"))
+    paths += workspace_manifests()
     paths += list((HERE / "rust").glob("*"))
     return {str(p.relative_to(ROOT)): digest(p.read_bytes()) for p in sorted(paths)}
 

@@ -45,7 +45,7 @@ only the documented Apple Silicon host.
 
 - macOS with the Xcode command line tools.
 - The Rust toolchain selected by `rust-toolchain.toml`.
-- Python 3 for the offline notice freshness check.
+- Python 3.11 or newer for the offline notice freshness check.
 - A non-shallow Quarry checkout with complete Git history and `Cargo.lock`
   present.
 - Quarry, including a Cargo-launched development copy, must be closed before
