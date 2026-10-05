@@ -16,5 +16,5 @@ tempfile = "3.27.0"
 libc = "0.2"
 objc2.workspace = true
 objc2-app-kit.workspace = true
-objc2-foundation = { workspace = true, features = ["NSArray", "NSURL"] }
+objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSURL"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }

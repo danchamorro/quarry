@@ -10,7 +10,7 @@ body:
     id: build
     attributes:
       label: Quarry version and revision
-      description: Include the version and Git revision from your build or bundle verification, if known.
+      description: Paste File menu → About & Feedback → Copy build details. For older builds without that panel, include the version and Git revision from the release notes or bundle verification.
       placeholder: Version, commit, source build or local app bundle
     validations:
       required: true

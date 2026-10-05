@@ -59,6 +59,9 @@ See the [user guide](USER_GUIDE.md) for each control's behavior.
 ## Feedback and limits
 
 Report failures with the [GitHub bug form](https://github.com/danchamorro/quarry/issues/new?template=bug_report.yml).
+In builds after beta 1, open **File menu → About & Feedback…** and choose
+**Copy build details**; the same panel links to the feedback form and user guide.
+For beta 1, use the candidate identity listed above.
 Include candidate version, macOS/model, steps, expected and actual results,
 file size, and whether the source or unsaved work was affected. For slow jobs,
 include elapsed time, memory, available disk, and the displayed operation phase.
