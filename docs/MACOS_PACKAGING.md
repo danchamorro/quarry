@@ -29,11 +29,12 @@ The [beta release checklist](BETA_RELEASE_CHECKLIST.md) separates local package
 validation from the acceptance and distribution gates for a public candidate.
 The current frozen candidate is [0.1.0 (127), clean `30fee5d`](benchmarks/2026-10-05-beta-build127.md).
 The earlier trial and build 98/105 records below remain historical evidence.
-The owner selected GitHub Releases for free beta downloads and Apple Silicon
-on macOS 26 and 27, subject to acceptance on both. Keep bundles out of Git
-source history; distribute approved archives as release assets.
+The [public beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1)
+is available free through GitHub Releases for Apple Silicon, targeting macOS
+26 and 27 with the validation limits in its release notes. Keep bundles out of
+Git source history; distribute approved archives as release assets.
 
-Official releases are intended to be free of charge under Quarry's
+Official releases are free of charge under Quarry's
 [free and open-source policy](../README.md#free-and-open-source). Source builds
 include all application features without paid tiers or activation. Signing and
 notarization establish trusted distribution; they do not unlock features.

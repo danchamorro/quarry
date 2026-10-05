@@ -4,11 +4,13 @@
 `30fee5d62ff23bb4803f73fbe5b14129162efb43` is the current signed candidate.
 Signing, notarization, stapling, local Gatekeeper, extracted-bundle verification,
 bounded native workflows, and 12 GB GUI and CLI/core checks passed. The beta
-is **not published or fully accepted**. Remaining gates are listed below.
+is published as [v0.1.0-beta.1](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1).
+Broader acceptance remains incomplete; follow-up checks are listed below.
 
 The owner selected **GitHub Releases** for free downloads and **Apple Silicon
-on macOS 26 and 27**, with acceptance on both before publication. This is the
-release target, not a claim that every version in those families has passed.
+on macOS 26 and 27**. Publication was subsequently authorized as a beta with
+the current validation limits documented. Full acceptance on both remains
+follow-up work, not a claim that every version in those families has passed.
 Keep app bundles out of Git source history; upload approved archives as release
 assets. The main application remains egui.
 
@@ -32,7 +34,11 @@ The bundle and Mach-O minimum declaration of macOS 11.0 is not a support claim.
 Test and record exact OS versions; do not infer compatibility across an entire
 major version from a single run.
 
-## Candidate gates
+## Release record and remaining acceptance
+
+Repository integration and required CI are tracked in
+[PR #52](https://github.com/danchamorro/quarry/pull/52). Publication approval
+does not mark the unchecked validation items below as passed.
 
 - [x] Complete pre-beta feature priorities; see the [feature checklist](PRE_BETA_CHECKLIST.md).
 - [x] Freeze version, clean source revision, build identity, toolchain and archive hash.
@@ -49,7 +55,6 @@ major version from a single run.
   exported record with an independent oracle, and verify the source hash.
 - [x] Select free download host and target OS/architecture scope.
 - [x] Create an unpublished GitHub draft with the exact signed archive and checksum.
-- [ ] Pass required CI and review for the final repository changes.
 - [ ] Complete the connected native workflow on both target macOS versions,
   including wide files, accessibility, smaller windows, Finder opening,
   drag-and-drop, and temporary-storage recovery.
@@ -62,10 +67,10 @@ major version from a single run.
   in the macOS 26 VM; native Finder installation/download remains separate.
 - [ ] Verify browser-downloaded, quarantined first launch on a fresh supported
   Mac or clean VM. The previously used VM alone does not close this gate.
-- [ ] Resolve candidate defects or record owner-accepted nonblocking issues
-  and workarounds in the release notes.
-- [ ] Obtain final owner acceptance of the connected workflow and release notes.
-- [ ] Publish the approved prerelease and verify its download/hash.
+- [ ] Resolve defects found during the remaining acceptance checks and record
+  applicable workarounds in the release notes.
+- [x] Obtain authorization to publish this beta with the documented validation limits.
+- [x] Publish the approved prerelease and verify its download/hash.
 
 ## Connected acceptance workflow
 

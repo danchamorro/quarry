@@ -1,10 +1,10 @@
-# Quarry invited tester guide
+# Quarry beta tester guide
 
-**Preparation draft:** remaining acceptance and owner approval precede invitations.
+**Public beta:** use disposable copies and report problems with reproducible examples.
 
-This beta targets Apple Silicon Macs on macOS 26 and 27. GitHub Releases is
-the selected free download channel. Acceptance on both versions must finish
-before publication. Intel Macs, Linux desktop and Windows are outside scope.
+This beta targets Apple Silicon Macs on macOS 26 and 27 and is available free
+from GitHub Releases. Broader acceptance remains in progress; the evidence
+below identifies what has passed. Intel Macs, Linux desktop and Windows are outside scope.
 
 ## Candidate and compatibility
 
@@ -16,15 +16,15 @@ before publication. Intel Macs, Linux desktop and Windows are outside scope.
   complete native workflow and fresh-environment acceptance remain open.
 - Archive: `Quarry-0.1.0-beta.1-macos-arm64.zip`, **3,622,188 bytes**, signed and notarized.
 - SHA-256: `f8fac678f75343bd5eef856826a274ed965928881a8aa02b04dab7452af3cc44`.
-- Read the [draft release notes](BETA_RELEASE_NOTES.md) and
+- Read the [release notes](BETA_RELEASE_NOTES.md) and
   [acceptance evidence](benchmarks/2026-10-05-beta-build127.md).
 
 ## Install or update
 
 1. Save any open work and quit Quarry completely before replacing the app.
    Keep a copy of your previous app until the new copy works.
-2. Once published, download the ZIP from
-   [GitHub Releases](https://github.com/danchamorro/quarry/releases). To check a copy in Downloads, run
+2. Download the ZIP from
+   [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1). To check a copy in Downloads, run
    `shasum -a 256 ~/Downloads/Quarry-0.1.0-beta.1-macos-arm64.zip` in Terminal and compare the
    result with the SHA-256 above. Report a mismatch before proceeding.
 3. Extract the ZIP and move `Quarry.app` into Applications.

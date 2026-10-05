@@ -16,10 +16,11 @@ The first rows appear without waiting for the complete file scan. Quarry keeps
 working memory bounded and does not change the source until you choose
 **Save**.
 
-> **Current status:** installable macOS alpha. Core viewing, editing,
-> transformation, filtering, sorting, and file-safety workflows are complete.
-> Beta preparation is tracked in the [beta release checklist](docs/BETA_RELEASE_CHECKLIST.md).
-> A public beta has not been released.
+> **Current status:** [public macOS beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1)
+> for Apple Silicon. Core viewing, editing, transformation, filtering, sorting,
+> and file-safety workflows are implemented. Broader validation remains in progress;
+> see the [release notes](docs/BETA_RELEASE_NOTES.md) and
+> [beta checklist](docs/BETA_RELEASE_CHECKLIST.md).
 
 ## Free and open source
 
@@ -28,10 +29,9 @@ Quarry's desktop app, Rust engine, and CLI are open source under
 features are available in source builds. There are no paid editions, feature
 paywalls, license keys, or activation requirements.
 
-Official packaged releases will be free of charge when available. For now,
-build and install from source using the instructions below. Public downloads
-still depend on the validation and signing work in the
-[beta release checklist](docs/BETA_RELEASE_CHECKLIST.md).
+Official packaged releases are free of charge. Download the signed and
+notarized [macOS beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1),
+or build and install from source using the instructions below.
 
 Bug reports, documentation improvements, tests, and code contributions are
 welcome. See the [contributing guide](docs/CONTRIBUTING.md) for the development
@@ -63,6 +63,15 @@ bug reports; maintainer responses are best effort.
 | Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |
 
 ## Install Quarry
+
+For the packaged beta, download the Apple Silicon ZIP from
+[GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1),
+extract it, and move `Quarry.app` to Applications. Save your work and quit any
+older copy before replacing it. The beta targets macOS 26 and 27; workflow
+validation is strongest on macOS 27.0.1. See the
+[tester guide](docs/BETA_TESTER_GUIDE.md) for checksums, installation and known limits.
+
+### Build from source
 
 Source builds require macOS, Xcode command line tools, Python 3,
 and the Rust toolchain pinned in `rust-toolchain.toml`. Clone the repository

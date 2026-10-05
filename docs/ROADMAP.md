@@ -59,10 +59,10 @@ Date/time sorting remains planned in Phase 6D and does not block this checklist.
 The dialog polish follow-up merged in
 [PR #40](https://github.com/danchamorro/quarry/pull/40) as `69d5f15`; its clean
 installed build passed native checks. Filters, Columns, Sort, and duplicate
-review use the existing egui framework. The next milestone is
-[beta release preparation](BETA_RELEASE_CHECKLIST.md), with explicit supported
-platforms, candidate validation, license notices, signing, notarization, and
-owner acceptance. A public beta has not been released.
+review use the existing egui framework. The signed and notarized
+[public beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1)
+is available for Apple Silicon. The [beta checklist](BETA_RELEASE_CHECKLIST.md)
+tracks the remaining compatibility, accessibility and installation validation.
 
 ## Current progress: 2026-09-07
 
