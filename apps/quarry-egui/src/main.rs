@@ -51,6 +51,8 @@ const COLUMN_RULER_HEIGHT: f32 = 22.0;
 const HEADER_HEIGHT: f32 = COLUMN_RULER_HEIGHT + ROW_HEIGHT;
 const ROW_NUMBER_WIDTH: f32 = 74.0;
 const MAX_RENDERED_COLUMNS: usize = 64;
+// Bound text layout for huge fields without imposing compact-label limits on cells.
+const MAX_GRID_TEXT_CHARS: usize = 16 * 1024;
 const SCROLLBAR_WIDTH: f32 = 18.0;
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
@@ -8339,7 +8341,7 @@ fn show_table(
                 && let Some(source) = fields.get(column)
             {
                 width = width.max(
-                    text_width(field_text(document.cell_value(row, column, source)))
+                    text_width(grid_field_text(document.cell_value(row, column, source)))
                         + 2.0 * ui.spacing().button_padding.x,
                 );
             }
@@ -9037,7 +9039,7 @@ fn show_table(
                                         let value = source.map(|source| {
                                             document.cell_value(record_row, column, source)
                                         });
-                                        let text = value.map_or_else(String::new, field_text);
+                                        let text = value.map_or_else(String::new, grid_field_text);
                                         let active_selection_highlight = document
                                             .selection
                                             .is_some_and(|selection| {
@@ -9058,6 +9060,7 @@ fn show_table(
                                                 selected,
                                                 RichText::new(&text).monospace(),
                                             )
+                                            .wrap_mode(egui::TextWrapMode::Extend)
                                             .small(),
                                         );
                                         let enabled = ui.is_enabled();
@@ -9323,14 +9326,33 @@ fn panel_frame(fill: Color32) -> egui::Frame {
 }
 
 fn field_text(field: &[u8]) -> String {
-    let rendered = String::from_utf8_lossy(field)
-        .replace('\n', "\\n")
-        .replace('\r', "\\r");
-    if rendered.chars().count() <= 120 {
-        rendered
-    } else {
-        rendered.chars().take(117).collect::<String>() + "..."
+    field_preview(field, 120)
+}
+
+fn grid_field_text(field: &[u8]) -> String {
+    field_preview(field, MAX_GRID_TEXT_CHARS)
+}
+
+fn field_preview(field: &[u8], max_chars: usize) -> String {
+    // Decode only enough bytes for the preview plus one character of lookahead.
+    // A partial UTF-8 sequence at this byte boundary is beyond the retained text.
+    let prefix = &field[..field.len().min(4 * (max_chars + 1))];
+    let decoded = String::from_utf8_lossy(prefix);
+    let mut characters = decoded
+        .chars()
+        .flat_map(|ch| match ch {
+            '\n' => [Some('\\'), Some('n')],
+            '\r' => [Some('\\'), Some('r')],
+            _ => [Some(ch), None],
+        })
+        .flatten();
+    let mut rendered: String = characters.by_ref().take(max_chars).collect();
+    if characters.next().is_some() {
+        let end = rendered.char_indices().nth(max_chars - 3).unwrap().0;
+        rendered.truncate(end);
+        rendered.push_str("...");
     }
+    rendered
 }
 
 fn accessible_header_name(name: &str) -> &str {
@@ -14262,6 +14284,115 @@ mod tests {
             rendered_column_range(shifted, &column_offsets, column_spacing, None).start,
             4
         );
+    }
+
+    #[test]
+    fn grid_previews_preserve_long_unicode_values_and_bound_huge_fields() {
+        for value in [
+            "description ".repeat(150),
+            "é界🙂".repeat(600),
+            "quoted\r\nmultiline ".repeat(100),
+        ] {
+            assert_eq!(
+                super::grid_field_text(value.as_bytes()),
+                value.replace('\n', "\\n").replace('\r', "\\r")
+            );
+            assert_eq!(super::field_text(value.as_bytes()).chars().count(), 120);
+        }
+        let limit = super::MAX_GRID_TEXT_CHARS;
+        let exact = "🙂".repeat(limit);
+        assert_eq!(super::grid_field_text(exact.as_bytes()), exact);
+        let huge = "🙂".repeat(limit * 128);
+        assert_eq!(
+            super::grid_field_text(huge.as_bytes()),
+            "🙂".repeat(limit - 3) + "..."
+        );
+        assert_eq!(super::grid_field_text(b"a\xffb\n"), "a�b\\n");
+        // The byte lookahead ends inside an emoji; the retained prefix remains valid.
+        let boundary = "a".to_owned() + &huge;
+        let preview = super::grid_field_text(boundary.as_bytes());
+        assert!(!preview.contains('�'));
+        assert_eq!(preview.chars().count(), limit);
+    }
+
+    #[test]
+    fn long_cells_auto_fit_without_truncation_in_regular_and_wide_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let value = "Long description ".repeat(10) + "VISIBLE END";
+        for total_columns in [34, 65] {
+            let path = directory.path().join(format!("long-{total_columns}.csv"));
+            let mut values = vec!["short"; total_columns];
+            values[0] = &value;
+            let original = format!(
+                "{}\n{}\n",
+                vec!["description"; total_columns].join(","),
+                values.join(",")
+            );
+            fs::write(&path, &original).unwrap();
+            let mut document = Document::prepare(
+                &path,
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            let ctx = egui::Context::default();
+            configure_style(&ctx);
+            ctx.enable_accesskit();
+            let render = |document: &mut Document| {
+                ctx.run(grid_input_with_width(2400.0), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_grid(ui, document).unwrap();
+                    });
+                })
+            };
+            for _ in 0..2 {
+                let _ = render(&mut document);
+            }
+            // Exercise the source value and a longer unsaved replacement.
+            for expected in [&value, &(value.clone() + " with an unsaved ending")] {
+                if expected != &value {
+                    commit_test_cell(&mut document, 1, 0, expected);
+                }
+                document.auto_fit_columns = true;
+                for _ in 0..4 {
+                    let _ = render(&mut document);
+                }
+                let output = render(&mut document);
+                let text = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == expected => {
+                            Some((shape.clip_rect, text))
+                        }
+                        _ => None,
+                    })
+                    .expect("the full long cell must be painted");
+                assert_eq!(text.1.galley.rows.len(), 1, "cells must stay on one row");
+                let bounds = text.1.galley.rect.translate(text.1.pos.to_vec2());
+                assert!(
+                    text.0.expand(1.0).contains_rect(bounds),
+                    "auto-fit clips the cell ending: {bounds:?} in {:?}",
+                    text.0
+                );
+                let label = format!("Select row 1, column 1 (description): {expected}");
+                assert!(
+                    output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .any(|(_, node)| node.label() == Some(label.as_str()))
+                );
+                document.selection = Some(GridSelection::Cell { row: 1, column: 0 });
+                assert_eq!(document.copy_selection_text().unwrap(), *expected);
+            }
+            assert_eq!(fs::read_to_string(path).unwrap(), original);
+        }
     }
 
     #[test]
