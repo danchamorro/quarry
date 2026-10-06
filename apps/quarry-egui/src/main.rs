@@ -12720,7 +12720,18 @@ mod tests {
                 b"keep".to_vec(),
             ))
             .unwrap();
-        assert_eq!(footer_range_text(&document), "Finding matching rows…");
+        // The worker can publish matches before the first frame, but export must
+        // stay disabled until the document has consumed its completion.
+        assert!(document.filter_job.is_some());
+        assert!(!document.is_filtered_export_ready());
+        let output = ctx.run(grid_input(), |ctx| {
+            let _ = show_filter_manager(ctx, &mut open, &mut rules, &mut match_case, &document);
+        });
+        assert!(
+            accessible_button(&output, "Export Filtered Rows…")
+                .1
+                .is_disabled()
+        );
         finish_filter(&mut document);
         assert!(document.is_filtered_export_ready());
         let output = ctx.run(grid_input(), |ctx| {
