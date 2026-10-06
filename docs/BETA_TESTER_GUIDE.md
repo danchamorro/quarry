@@ -12,12 +12,16 @@ below identifies what has passed. Intel Macs, Linux desktop and Windows are outs
   `30fee5d62ff23bb4803f73fbe5b14129162efb43`.
 - Host tested: **macOS 27.0.1 (26A434), Apple Silicon**. Bounded signed-ZIP
   workflows passed; this does not yet establish full support on macOS 27.
+- A VMPal guest on the same OS passed Chrome download with quarantine, Finder
+  installation, normal first launch and basic CSV opening. The guest was not
+  established as newly provisioned; clean-environment acceptance remains open.
 - macOS 26.6.2 file install/rollback, Gatekeeper and native launch passed; its
   complete native workflow and fresh-environment acceptance remain open.
 - Archive: `Quarry-0.1.0-beta.1-macos-arm64.zip`, **3,622,188 bytes**, signed and notarized.
 - SHA-256: `f8fac678f75343bd5eef856826a274ed965928881a8aa02b04dab7452af3cc44`.
 - Read the [release notes](BETA_RELEASE_NOTES.md) and
-  [acceptance evidence](benchmarks/2026-10-05-beta-build127.md).
+  [acceptance evidence](benchmarks/2026-10-05-beta-build127.md) and
+  [VMPal installation report](benchmarks/2026-10-06-vmpal-beta-install.md).
 
 ## Install or update
 
