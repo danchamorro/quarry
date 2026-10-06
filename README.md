@@ -43,9 +43,10 @@ bug reports; maintainer responses are best effort.
 
 Start with the [Wiki](https://github.com/danchamorro/quarry/wiki) for installation,
 common workflows, and answers to frequent questions. The
-[Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) tracks
-feature priorities and progress; [issues](https://github.com/danchamorro/quarry/issues)
-contain scope and acceptance criteria. Propose a feature through
+[Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) is the
+authoritative home for all future features, later ideas, priorities, and progress.
+Linked [issues](https://github.com/danchamorro/quarry/issues) contain scope and
+acceptance or discovery criteria. Propose a feature through
 [New issue](https://github.com/danchamorro/quarry/issues/new/choose).
 
 ## Why Quarry

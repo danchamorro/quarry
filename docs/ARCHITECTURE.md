@@ -54,7 +54,8 @@ crates. See
 Core uses `std::fs::File`, fixed-size sequential reads, and seeks from the
 nearest structural checkpoint for viewport access. Memory mapping remains
 deferred until measurements show a benefit that justifies the dependency and
-platform tradeoffs.
+platform tradeoffs. [Issue #75](https://github.com/danchamorro/quarry/issues/75)
+tracks that conditional investigation.
 
 ## Progressive open
 Bootstrap by sampling a bounded region and parsing enough rows for the first viewport. Return that viewport immediately. Continue structural indexing in background workers.
@@ -65,7 +66,8 @@ Delimited files cannot be indexed correctly by blindly finding newline bytes bec
 By default, the current index scans 1 MiB chunks and starts with one byte-offset
 checkpoint per 4,096 records. Checkpoints have a 16 MiB default budget; when
 full, the interval doubles and existing checkpoints compact. Persistent sidecar
-indexes and their invalidation rules remain deferred.
+indexes and their invalidation rules remain deferred;
+[issue #60](https://github.com/danchamorro/quarry/issues/60) tracks the design.
 
 ## Parsing
 Optimize common paths without compromising quoted fields, escaped quotes, embedded delimiters/newlines, CRLF/LF, UTF-8 boundaries, malformed records, wide rows, or giant fields. Avoid allocating an owned string for every cell; materialize only what the viewport needs.
@@ -95,6 +97,7 @@ Header columns are known immediately. If a later ragged row contains more
 fields, the viewer appends those newly known source columns without resetting
 the existing layout. Discovering the maximum width of an entire headerless
 ragged file would require a separate full scan and remains deferred.
+[Issue #76](https://github.com/danchamorro/quarry/issues/76) tracks the proposal.
 
 ## Clipboard copying
 The viewer retains a selected cell only while its row and column remain visible,
@@ -114,7 +117,8 @@ buffer when filtering is active, compact metadata per known column, bounded
 individual-edit history, the user-driven Find navigation history, and at most a
 64 MiB clipboard payload.
 [ADR 0002](adr/0002-defer-viewport-cache.md) records why an application viewport
-cache remains deferred.
+cache remains deferred. The conditional reassessment is tracked in
+[issue #77](https://github.com/danchamorro/quarry/issues/77).
 
 Before a materialized operation, unsaved cell and header values remain a sparse
 overlay on the active indexed CSV. A confirmed Split, Combine, Move Selected
@@ -242,7 +246,8 @@ regressions cover these semantics and the accessible controls.
 Filtering still scans the active indexed CSV without the sparse data-cell
 overlay, so the viewer requires those edits to be saved or discarded before a
 new filter begins. An active filter must be cleared before editing or using
-Find/Replace. Overlay-aware filtering remains deferred.
+Find/Replace. Overlay-aware filtering remains deferred and is tracked in
+[issue #78](https://github.com/danchamorro/quarry/issues/78).
 
 A `FilterQuery` owns the Filters tool's case setting and one or more
 `FilterPredicate` values. Each predicate stores a source column, operator,
@@ -354,7 +359,8 @@ final flush and sync. Cancellation, failure, or a source conflict removes every
 unpublished run and staging file. Reopening the completed CSV lets navigation,
 search, filtering, Save, Save As, Discard, and one-level Undo/Redo continue
 through existing physical-row paths. A separate lazy row-order index remains
-deferred until a later feature proves it is needed.
+deferred until a later feature proves it is needed;
+[issue #79](https://github.com/danchamorro/quarry/issues/79) records that condition.
 
 The deterministic [Phase 6A release validation](benchmarks/2026-08-21-stable-text-sort.md)
 measured 16.88 MiB and 17.55 MiB peak process RSS for the 1 GB and 12 GB sorts.
@@ -419,7 +425,8 @@ streams those ranges through the private working-copy path, preserves the
 header and unselected records, applies sparse edits to retained records, and
 keeps Save, Save As, Discard, Undo, and Redo behavior. Filtering clears row
 selection, and row selection plus deletion remain unavailable while filtered.
-Row insertion remains a separate later feature.
+Row insertion is tracked separately in
+[issue #73](https://github.com/danchamorro/quarry/issues/73).
 
 A document is dirty while effective cell or header edits exist, or while its
 active CSV is a materialized working copy that differs from the last opened or

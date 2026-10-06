@@ -5,6 +5,10 @@
 **Core engine:** Rust
 **Model:** Free and open source
 
+This document records product requirements and design context. All future
+roadmap items and planning decisions live in the
+[Quarry Roadmap project](https://github.com/users/danchamorro/projects/1).
+
 ## Product vision
 Quarry is a performance-first desktop application for people who work with delimited text files too large for conventional editors and spreadsheets.
 
@@ -243,7 +247,10 @@ Invalid nonblank values abort with a data-row and column error before publicatio
 The existing bounded runs, guarded working copy, cancellation, and history apply
 to both modes. Text remains the default. The [1 GB numeric validation](benchmarks/2026-09-04-numeric-sort.md)
 records exact output, Text compatibility, memory, temporary disk, and
-cancellation. Date, locale-aware, and multi-column sorting remain later slices.
+cancellation. Date, locale-aware, and multi-column sorting are tracked in
+[issues #56](https://github.com/danchamorro/quarry/issues/56),
+[#63](https://github.com/danchamorro/quarry/issues/63), and
+[#64](https://github.com/danchamorro/quarry/issues/64).
 
 Phase 6C extends the same Sort window with Character count, Word count,
 Shuffle, and Reverse. Character count measures Unicode scalar values, including
@@ -299,7 +306,8 @@ remove unpublished output.
 
 Filtered-view deletion semantics must be chosen before implementation. A visible
 filtered position must not be treated as a physical data row unless Quarry can
-identify that row unambiguously. Row insertion remains a separate later feature.
+identify that row unambiguously. Row insertion is tracked separately in
+[issue #73](https://github.com/danchamorro/quarry/issues/73).
 
 ## Progressive opening
 1. Open the file and sample a bounded region.
