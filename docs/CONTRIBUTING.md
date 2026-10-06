@@ -14,6 +14,32 @@ In the early project, contributions should favor:
 5. Maintainability
 6. Feature breadth
 
+## Proposing and tracking work
+
+Search [existing issues](https://github.com/danchamorro/quarry/issues) and the
+[Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) before
+opening a [feature request](https://github.com/danchamorro/quarry/issues/new?template=feature_request.yml).
+Explain the user problem, the smallest useful scope, acceptance criteria, and
+how the workflow scales beyond RAM. Use synthetic examples; public issues must
+not contain production data, credentials, or confidential logs.
+
+Discuss material scope and architectural decisions before implementation.
+Maintainers move work through **Backlog → Ready → In progress → In review → Done**:
+Ready means the scope and acceptance criteria are agreed; Done means the criteria
+are met and the change is merged. A packaged release may follow separately.
+**Priority**, **Area**, and **Target release** support planning. An **Unscheduled**
+release target is not a delivery promise. New repository issues are added to the
+project automatically for triage.
+
+Link implementation pull requests to their issue. Use `Closes #<number>` only
+when the pull request completes its acceptance criteria; otherwise link the issue
+without closing it. Keep implementation checklists in issues and live status in
+the project, rather than duplicating them in documentation.
+
+The [Wiki](https://github.com/danchamorro/quarry/wiki) is a navigation and onboarding
+layer. Detailed guides, architectural decisions, benchmarks, and release evidence
+remain in `docs/` so they can be reviewed and versioned with the code.
+
 ## Development expectations
 Rust code should use `rustfmt`, `clippy`, focused tests, clear error handling, and documented unsafe code. Unsafe code is allowed only when justified by measurement and accompanied by invariants and tests.
 
