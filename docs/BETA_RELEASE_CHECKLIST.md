@@ -1,7 +1,7 @@
 # Beta release checklist
 
-**Status, 2026-10-06:** clean **0.1.0 (127)** at
-`30fee5d62ff23bb4803f73fbe5b14129162efb43` is the current signed candidate.
+**Public release status, 2026-10-06:** clean **0.1.0 (127)** at
+`30fee5d62ff23bb4803f73fbe5b14129162efb43` is the current published beta.
 Signing, notarization, stapling, local Gatekeeper, extracted-bundle verification,
 bounded native workflows, and 12 GB GUI and CLI/core checks passed. The beta
 is published as [v0.1.0-beta.1](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1).
