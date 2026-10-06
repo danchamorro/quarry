@@ -16,7 +16,7 @@ The first rows appear without waiting for the complete file scan. Quarry keeps
 working memory bounded and does not change the source until you choose
 **Save**.
 
-> **Current status:** [public macOS beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1)
+> **Current status:** [public macOS beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.2)
 > for Apple Silicon. Core viewing, editing, transformation, filtering, sorting,
 > and file-safety workflows are implemented. Broader validation remains in progress;
 > see the [release notes](docs/BETA_RELEASE_NOTES.md) and
@@ -30,7 +30,7 @@ features are available in source builds. There are no paid editions, feature
 paywalls, license keys, or activation requirements.
 
 Official packaged releases are free of charge. Download the signed and
-notarized [macOS beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1),
+notarized [macOS beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.2),
 or build and install from source using the instructions below.
 
 Bug reports, documentation improvements, tests, and code contributions are
@@ -75,10 +75,10 @@ acceptance or discovery criteria. Propose a feature through
 ## Install Quarry
 
 For the packaged beta, download the Apple Silicon ZIP from
-[GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1),
+[GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.2),
 extract it, and move `Quarry.app` to Applications. Save your work and quit any
-older copy before replacing it. The beta targets macOS 26 and 27; workflow
-validation is strongest on macOS 27.0.1. See the
+older copy before replacing it. The beta targets macOS 26 and 27; this archive
+has been tested on macOS 27.0.1, with macOS 26 validation outstanding. See the
 [tester guide](docs/BETA_TESTER_GUIDE.md) for checksums, installation and known limits.
 
 ### Build from source

@@ -27,11 +27,12 @@ commit.
 
 The [beta release checklist](BETA_RELEASE_CHECKLIST.md) separates local package
 validation from the acceptance and distribution gates for a public candidate.
-The current published beta is [0.1.0 (127), clean `30fee5d`](benchmarks/2026-10-05-beta-build127.md).
-The unpublished [beta 2 candidate, build 140](benchmarks/2026-10-06-beta-build140.md),
-has its own frozen identity and validation record.
-The earlier trial and build 98/105 records below remain historical evidence.
-The [public beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1)
+The current published beta is [beta 2, build 140, clean `fc0a0b8`](benchmarks/2026-10-06-beta-build140.md).
+Its exact signed archive passed update and bounded native workflows in VMPal
+on macOS 27.0.1; macOS 26 and broader acceptance remain outstanding.
+[Build 127](benchmarks/2026-10-05-beta-build127.md), the earlier trial and the
+build 98/105 records below remain historical evidence.
+The [public beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.2)
 is available free through GitHub Releases for Apple Silicon, targeting macOS
 26 and 27 with the validation limits in its release notes. Keep bundles out of
 Git source history; distribute approved archives as release assets.
