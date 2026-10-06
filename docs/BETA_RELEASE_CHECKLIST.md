@@ -9,6 +9,12 @@ Browser download, Finder installation and normal first launch also passed in
 a VMPal guest on macOS 27.0.1. Broader acceptance remains incomplete; follow-up
 checks are listed below.
 
+An **unpublished beta 2 candidate, build 140**, includes the newer desktop fixes.
+Its [separate evidence](benchmarks/2026-10-06-beta-build140.md) and
+[draft notes](releases/v0.1.0-beta.2.md) record its identity and validation limits.
+The checklist below continues to describe published build 127; its passes must
+not be treated as build 140 acceptance.
+
 The owner selected **GitHub Releases** for free downloads and **Apple Silicon
 on macOS 26 and 27**. Publication was subsequently authorized as a beta with
 the current validation limits documented. Full acceptance on both remains
