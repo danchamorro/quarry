@@ -27,7 +27,9 @@ commit.
 
 The [beta release checklist](BETA_RELEASE_CHECKLIST.md) separates local package
 validation from the acceptance and distribution gates for a public candidate.
-The current frozen candidate is [0.1.0 (127), clean `30fee5d`](benchmarks/2026-10-05-beta-build127.md).
+The current published beta is [0.1.0 (127), clean `30fee5d`](benchmarks/2026-10-05-beta-build127.md).
+The unpublished [beta 2 candidate, build 140](benchmarks/2026-10-06-beta-build140.md),
+has its own frozen identity and validation record.
 The earlier trial and build 98/105 records below remain historical evidence.
 The [public beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1)
 is available free through GitHub Releases for Apple Silicon, targeting macOS
