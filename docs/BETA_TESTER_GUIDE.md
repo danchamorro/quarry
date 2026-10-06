@@ -6,7 +6,7 @@ This beta targets Apple Silicon Macs on macOS 26 and 27 and is available free
 from GitHub Releases. Broader acceptance remains in progress; the evidence
 below identifies what has passed. Intel Macs, Linux desktop and Windows are outside scope.
 
-## Release and compatibility
+## Candidate and compatibility
 
 - Current release: **0.1.0 beta 2, build 140**, clean revision
   `fc0a0b8b59278c96ad69756e0e20b2bffed7001d`.
