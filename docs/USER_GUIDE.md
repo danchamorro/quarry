@@ -526,6 +526,12 @@ Click **Auto-fit columns** at the bottom of the **Columns…** window to fit eve
 shown column to its header and the cell values already loaded into the grid.
 Auto-fit works with any number of shown columns.
 
+Long cell values stay on one line. Widen the column or auto-fit it, then scroll
+horizontally to read text beyond the window edge. The grid and auto-fit use up
+to 16,384 displayed characters per cell, including escaped line breaks; larger
+values end with `...` to keep very large fields responsive. **Copy** and cell
+editing use the underlying value, not the grid preview.
+
 ### Temporary storage and free space
 
 Choose **File → Temporary storage…** to select a working folder on a drive
