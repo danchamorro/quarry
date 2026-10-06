@@ -39,6 +39,15 @@ workflow and contributor terms. Use the
 [issue tracker](https://github.com/danchamorro/quarry/issues) for questions and
 bug reports; maintainer responses are best effort.
 
+## Documentation and roadmap
+
+Start with the [Wiki](https://github.com/danchamorro/quarry/wiki) for installation,
+common workflows, and answers to frequent questions. The
+[Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) tracks
+feature priorities and progress; [issues](https://github.com/danchamorro/quarry/issues)
+contain scope and acceptance criteria. Propose a feature through
+[New issue](https://github.com/danchamorro/quarry/issues/new/choose).
+
 ## Why Quarry
 
 - **Start working quickly.** Progressive opening returns useful rows before the
@@ -270,10 +279,12 @@ rules, cache declarations, resource measurements, and limitations.
 
 ## Project documents
 
+- [Wiki documentation home](https://github.com/danchamorro/quarry/wiki)
+- [Live roadmap project](https://github.com/users/danchamorro/projects/1)
 - [User guide](docs/USER_GUIDE.md)
 - [Product requirements](docs/PRD.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [Roadmap](docs/ROADMAP.md)
+- [Product direction](docs/ROADMAP.md)
 - [Priority checklist before beta](docs/PRE_BETA_CHECKLIST.md)
 - [Beta release checklist and testing guidance](docs/BETA_RELEASE_CHECKLIST.md)
 - [Engineering principles](docs/ENGINEERING_PRINCIPLES.md)

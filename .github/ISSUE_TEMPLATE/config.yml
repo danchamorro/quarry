@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation and common workflows
+    url: https://github.com/danchamorro/quarry/wiki
+    about: Find installation instructions, the user guide, and frequently asked questions.
+  - name: Public roadmap
+    url: https://github.com/users/danchamorro/projects/1
+    about: Check feature priorities and progress before opening a new proposal.

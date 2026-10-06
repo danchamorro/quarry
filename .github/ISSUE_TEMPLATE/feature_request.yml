@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a focused improvement to Quarry's large-file workflow.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues and the public Quarry Roadmap before proposing work. Issues are public: use synthetic examples and do not upload production CSVs, personal data, credentials, or confidential logs. A proposal does not imply a release commitment.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem and benefit
+      description: Describe the task, current difficulty, and who benefits.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Proposed scope
+      description: Describe the smallest useful behavior, what it includes, and what can wait. Link related issues or roadmap items.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Give observable outcomes that would show this works correctly.
+      placeholder: |
+        - [ ] Given ..., the user can ...
+        - [ ] Cancellation preserves ...
+    validations:
+      required: true
+  - type: textarea
+    id: scale_safety
+    attributes:
+      label: Scale and data safety
+      description: Describe expected file sizes or shapes, temporary storage, cancellation, unsaved work, and source preservation where relevant. Use synthetic examples only.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and context
+      description: Describe current workarounds, tradeoffs, or related workflows.
