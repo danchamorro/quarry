@@ -43,9 +43,8 @@ current build 140. The older archive remains available as
 [v0.1.0-beta.1](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1).
 
 See the [build 127 evidence](benchmarks/2026-10-05-beta-build127.md),
-[VMPal installation report](benchmarks/2026-10-06-vmpal-beta-install.md),
-[tester guide](BETA_TESTER_GUIDE.md), [release notes](BETA_RELEASE_NOTES.md),
-and [packaging procedure](MACOS_PACKAGING.md).
+[VMPal installation report](benchmarks/2026-10-06-vmpal-beta-install.md), and
+[beta 1 release notes](releases/v0.1.0-beta.1.md).
 [Earlier candidate evidence](BETA_RELEASE_HISTORY.md) is preserved separately;
 the [September desktop report](benchmarks/2026-09-20-desktop-build118.md)
 does not count as an exact-build-127 run.
