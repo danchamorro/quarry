@@ -1,19 +1,33 @@
 # Beta release checklist
 
-**Public release status, 2026-10-06:** clean **0.1.0 (127)** at
-`30fee5d62ff23bb4803f73fbe5b14129162efb43` is the current published beta.
-Signing, notarization, stapling, local Gatekeeper, extracted-bundle verification,
-bounded native workflows, and 12 GB GUI and CLI/core checks passed. The beta
-is published as [v0.1.0-beta.1](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1).
-Browser download, Finder installation and normal first launch also passed in
-a VMPal guest on macOS 27.0.1. Broader acceptance remains incomplete; follow-up
-checks are listed below.
+**Public release status, 2026-10-06:** [v0.1.0-beta.2](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.2)
+is published with clean **0.1.0 (140)** at
+`fc0a0b8b59278c96ad69756e0e20b2bffed7001d`. The exact signed archive and checksum
+passed an anonymous public download check. See its
+[verification report](benchmarks/2026-10-06-beta-build140.md) and
+[release notes](releases/v0.1.0-beta.2.md).
 
-An **unpublished beta 2 candidate, build 140**, includes the newer desktop fixes.
-Its [separate evidence](benchmarks/2026-10-06-beta-build140.md) and
-[draft notes](releases/v0.1.0-beta.2.md) record its identity and validation limits.
-The checklist below continues to describe published build 127; its passes must
-not be treated as build 140 acceptance.
+## Current beta 2 acceptance
+
+The following applies only to build 140. Publication with documented validation
+limits does not mark the unchecked items as passed.
+
+- [x] Freeze the clean revision, build, toolchain and archive SHA-256.
+- [x] Verify Developer ID signature, hardened runtime, notarization, staple,
+  Gatekeeper and the extracted app against the frozen bundle.
+- [x] Verify a VMPal update from build 127 on macOS 27.0.1 (26A434), retaining
+  a signature-checked rollback copy.
+- [x] Verify launch, cell grid lines, auto-fit and long-value display/copy,
+  cell edit/Undo/Redo, unsaved quit, exact Save As/reopen and About details.
+- [x] Publish the approved prerelease and verify tag, public ZIP size and checksum.
+- [ ] Validate this archive on macOS 26.
+- [ ] Complete connected native workflows, wide-grid accessibility, large-file
+  GUI and temporary-storage recovery checks for this archive.
+- [ ] Verify first launch after a browser download with quarantine.
+- [ ] Verify first launch in a clean environment and first launch while offline.
+- [ ] Retest the earlier CJK font-rendering limitation.
+
+## Distribution policy
 
 The owner selected **GitHub Releases** for free downloads and **Apple Silicon
 on macOS 26 and 27**. Publication was subsequently authorized as a beta with
@@ -21,6 +35,12 @@ the current validation limits documented. Full acceptance on both remains
 follow-up work, not a claim that every version in those families has passed.
 Keep app bundles out of Git source history; upload approved archives as release
 assets. The main application remains egui.
+
+## Historical beta 1 acceptance
+
+Everything in the next two subsections applies only to **build 127**, not the
+current build 140. The older archive remains available as
+[v0.1.0-beta.1](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1).
 
 See the [build 127 evidence](benchmarks/2026-10-05-beta-build127.md),
 [VMPal installation report](benchmarks/2026-10-06-vmpal-beta-install.md),
@@ -30,7 +50,7 @@ and [packaging procedure](MACOS_PACKAGING.md).
 the [September desktop report](benchmarks/2026-09-20-desktop-build118.md)
 does not count as an exact-build-127 run.
 
-## Platform matrix
+### Build 127 platform matrix
 
 | Platform | Build 127 evidence | Remaining acceptance |
 |---|---|---|
@@ -43,7 +63,7 @@ The bundle and Mach-O minimum declaration of macOS 11.0 is not a support claim.
 Test and record exact OS versions; do not infer compatibility across an entire
 major version from a single run.
 
-## Release record and remaining acceptance
+### Build 127 release record and incomplete checks
 
 Repository integration and required CI are tracked in
 [PR #52](https://github.com/danchamorro/quarry/pull/52). Publication approval
