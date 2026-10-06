@@ -7,6 +7,16 @@ passed an anonymous public download check. See its
 [verification report](benchmarks/2026-10-06-beta-build140.md) and
 [release notes](releases/v0.1.0-beta.2.md).
 
+## Platform matrix
+
+This matrix describes **build 140** only. Build 127's historical matrix is below.
+
+| Platform | Build 140 evidence | Remaining acceptance |
+|---|---|---|
+| macOS 27, Apple Silicon | VMPal 27.0.1 (26A434): update, signature/Gatekeeper, launch and the bounded native checks listed below passed | Complete workflows, wide-grid accessibility, large-file GUI, temporary-storage recovery, browser quarantine, clean-environment and offline first launch |
+| macOS 26, Apple Silicon | Not tested for this archive | Installation, launch and native acceptance |
+| Intel Mac, Linux desktop, Windows | No packaged-release acceptance | Outside this beta's scope |
+
 ## Current beta 2 acceptance
 
 The following applies only to build 140. Publication with documented validation
