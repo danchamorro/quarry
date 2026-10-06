@@ -16,6 +16,14 @@ In the early project, contributions should favor:
 
 ## Proposing and tracking work
 
+The [Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) is
+the authoritative home for every future feature, later idea, and engineering
+investigation. Record each as an issue in the project, even when it is exploratory.
+Use the `idea` label for possibilities needing discovery; agree on scope and
+remove that label when accepting an implementation item. Keep current status,
+priority, area, and release target in Projects. Do not add parallel future-work
+lists to the repository or Wiki. Design documents may link to the relevant issue.
+
 Search [existing issues](https://github.com/danchamorro/quarry/issues) and the
 [Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) before
 opening a [feature request](https://github.com/danchamorro/quarry/issues/new?template=feature_request.yml).

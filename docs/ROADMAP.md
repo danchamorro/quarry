@@ -1,71 +1,62 @@
 # Quarry Roadmap
 
-The [public Quarry Roadmap project](https://github.com/users/danchamorro/projects/1)
-tracks current priorities, status, and target releases. Individual
-[issues](https://github.com/danchamorro/quarry/issues) hold scope and acceptance
-criteria. This document records product direction; it is not a second task board.
+The [Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) is
+the authoritative home for **all future roadmap items**, including exploratory
+ideas, engineering investigations, planned features, priorities, and release
+targets. Each item has a linked [issue](https://github.com/danchamorro/quarry/issues)
+for its problem, scope, design questions, and acceptance or discovery criteria.
+
+Create and update roadmap items there. Do not maintain a separate future-work
+list or ordered backlog in this file, the Wiki, or another repository document.
+
+## Product focus
 
 Quarry focuses on correct, responsive editing of delimited files larger than RAM.
 New workflows must preserve bounded memory, explicit progress and cancellation,
 source safety, and useful keyboard and accessibility behavior. The existing egui
 desktop application remains the main application.
 
-## Current foundation
+## Using the roadmap
 
-The macOS app supports progressive opening, navigation, cell and header editing,
-Find/Replace, filtering and export, column transformations, row deletion,
-duplicate removal, several sort modes, and guarded saving. See the
-[User Guide](USER_GUIDE.md) for current-source behavior and
-[GitHub Releases](https://github.com/danchamorro/quarry/releases) for the features
-included in each packaged beta. A merged feature is not necessarily released yet.
+- **Backlog:** all tracked work, including ideas awaiting prioritization or design.
+- **Ideas:** exploratory issues labeled `idea`; recording an idea is not a promise
+  to implement it. Agree on scope before moving it to Ready, and remove the label
+  when it becomes an accepted implementation item.
+- **Active work:** the workflow board from Backlog through Done.
+- **Releases:** work grouped by Target release. **Unscheduled** means no release
+  commitment; a merged change may ship in a later packaged release.
 
-The [roadmap history](ROADMAP_HISTORY.md) preserves the earlier phase checklists
-and their benchmark and acceptance evidence. Release readiness continues to use
-the [beta checklist](BETA_RELEASE_CHECKLIST.md).
+The project's Priority, Area, Target release, and Status fields hold current
+planning decisions. Maintainers triage new issues, split broad investigations
+into focused implementation issues, and link pull requests to the work they
+complete. See [Contributing](CONTRIBUTING.md#proposing-and-tracking-work).
+
+## Documentation and evidence
+
+The [User Guide](USER_GUIDE.md) documents current-source behavior, and
+[GitHub Releases](https://github.com/danchamorro/quarry/releases) defines what is
+included in each packaged build. Architecture documents and ADRs retain design
+rationale and link to issues when future investigation is relevant. Release
+acceptance evidence remains in the [beta checklist](BETA_RELEASE_CHECKLIST.md).
+
+[Roadmap history](ROADMAP_HISTORY.md) preserves the earlier phase checklists and
+benchmark evidence as an archival snapshot. Its unfinished items and later ideas
+have been captured in Projects; the archive is not an active planning list.
 
 ## Post-beta sequence
 
-The existing feature direction is:
-
-1. [Append compatible CSV files](https://github.com/danchamorro/quarry/issues/54):
-   combine row batches with an explicit compatibility contract and bounded work.
-2. [Independent document tabs](https://github.com/danchamorro/quarry/issues/55):
-   preserve each document's edits, history, jobs, and save state.
-3. [A terminal frontend](https://github.com/danchamorro/quarry/issues/58): define
-   a small useful first slice on the shared engine, then split implementation
-   into focused issues.
-
-This sequence expresses direction, not release dates. Use the project's
-**Priority** and **Target release** fields for current scheduling. An
-**Unscheduled** target makes no release commitment.
+Follow priorities and dependencies in the [live project](https://github.com/users/danchamorro/projects/1).
+This section remains a navigation destination for older links, not a second
+ordered feature list.
 
 ### Phase 6D: Date and time sorting (planned)
 
-[Date/time sorting](https://github.com/danchamorro/quarry/issues/56) carries forward
-unfinished Phase 6D. It needs explicit formats and agreed handling of timezones,
-invalid values, and blanks before implementation. Ambiguous dates must not be
-guessed silently; stable chronology and bounded external sorting remain required.
+The former Phase 6D is tracked in [issue #56](https://github.com/danchamorro/quarry/issues/56).
+Its scope, parsing decisions, and acceptance criteria belong in that issue.
 
 ## Platform direction
 
-[Linux desktop support](https://github.com/danchamorro/quarry/issues/57) is the
-first platform-expansion priority. Define and validate a bounded desktop matrix
-before claiming support. Linux core/CLI CI does not establish desktop acceptance.
-Other platform expansion remains exploratory.
-
-## Later ideas
-
-Persistent indexes, richer encoding and malformed-file feedback, multi-column
-sorting, row insertion, side-by-side comparison, and key-based joins remain
-possible directions. They need concrete user benefits, scope, and scalability
-criteria before becoming implementation commitments. The
-[historical ideas list](ROADMAP_HISTORY.md#later-possibilities) retains the wider
-set of possibilities.
-
-## Planning and contribution workflow
-
-Use the [Wiki](https://github.com/danchamorro/quarry/wiki) to find documentation
-and the [contributing guide](CONTRIBUTING.md) to propose or implement work.
-The project provides a Backlog table, an Active work board, and a Releases view
-grouped by target release. Keep detailed checklists in issues and current status
-in the project so updates have one home.
+Platform investigations and scheduling are tracked in the
+[project](https://github.com/users/danchamorro/projects/1). The
+[beta platform matrix](BETA_RELEASE_CHECKLIST.md#platform-matrix) records what
+has actually been validated; a roadmap item does not establish platform support.
