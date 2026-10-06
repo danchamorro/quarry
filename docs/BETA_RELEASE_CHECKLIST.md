@@ -1,11 +1,13 @@
 # Beta release checklist
 
-**Status, 2026-10-05:** clean **0.1.0 (127)** at
+**Status, 2026-10-06:** clean **0.1.0 (127)** at
 `30fee5d62ff23bb4803f73fbe5b14129162efb43` is the current signed candidate.
 Signing, notarization, stapling, local Gatekeeper, extracted-bundle verification,
 bounded native workflows, and 12 GB GUI and CLI/core checks passed. The beta
 is published as [v0.1.0-beta.1](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1).
-Broader acceptance remains incomplete; follow-up checks are listed below.
+Browser download, Finder installation and normal first launch also passed in
+a VMPal guest on macOS 27.0.1. Broader acceptance remains incomplete; follow-up
+checks are listed below.
 
 The owner selected **GitHub Releases** for free downloads and **Apple Silicon
 on macOS 26 and 27**. Publication was subsequently authorized as a beta with
@@ -15,6 +17,7 @@ Keep app bundles out of Git source history; upload approved archives as release
 assets. The main application remains egui.
 
 See the [build 127 evidence](benchmarks/2026-10-05-beta-build127.md),
+[VMPal installation report](benchmarks/2026-10-06-vmpal-beta-install.md),
 [tester guide](BETA_TESTER_GUIDE.md), [release notes](BETA_RELEASE_NOTES.md),
 and [packaging procedure](MACOS_PACKAGING.md).
 [Earlier candidate evidence](BETA_RELEASE_HISTORY.md) is preserved separately;
@@ -25,7 +28,7 @@ does not count as an exact-build-127 run.
 
 | Platform | Build 127 evidence | Remaining acceptance |
 |---|---|---|
-| macOS 27, Apple Silicon | Host 27.0.1 (26A434): signed ZIP verified, native small workflows, 12 GB GUI open/filter/export/cancellation and CLI/core checks passed | Wide-grid accessibility, complete compact-window and Finder/drag-and-drop workflows, temporary-storage recovery, fresh-environment first launch |
+| macOS 27, Apple Silicon | Host 27.0.1 (26A434): signed ZIP verified, native small workflows, 12 GB GUI open/filter/export/cancellation and CLI/core checks passed. VMPal guest on the same OS: Chrome download with quarantine, Finder installation, normal first launch and basic CSV opening passed | Wide-grid accessibility, complete compact-window and Finder/drag-and-drop workflows, temporary-storage recovery, fresh-environment first launch |
 | macOS 26, Apple Silicon | 26.6.2 (25G83): signature, staple, Gatekeeper, file installation/rollback and native launch passed | Complete connected native workflow and fresh-environment first launch |
 | Intel Mac, Linux desktop, Windows | No release acceptance | Outside this beta's scope |
 | Linux core/CLI | CI checks pass for the packaging-fix source revision | Engineering evidence only; not desktop support |
@@ -65,8 +68,13 @@ does not mark the unchecked validation items below as passed.
   selected-folder sort/Undo retention and insufficient-space recovery.
 - [x] Verify file installation, update and rollback for this exact signed candidate
   in the macOS 26 VM; native Finder installation/download remains separate.
+- [x] Verify browser download with quarantine, Finder installation and normal
+  first launch in the macOS 27.0.1 VMPal guest, with no prior app installation
+  at `/Applications/Quarry.app`.
 - [ ] Verify browser-downloaded, quarantined first launch on a fresh supported
-  Mac or clean VM. The previously used VM alone does not close this gate.
+  Mac or clean VM. Neither existing VM establishes a newly provisioned
+  environment or absence of cached Gatekeeper assessments; the VMPal run
+  does not close this gate.
 - [ ] Resolve defects found during the remaining acceptance checks and record
   applicable workarounds in the release notes.
 - [x] Obtain authorization to publish this beta with the documented validation limits.

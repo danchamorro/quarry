@@ -51,6 +51,12 @@ unsaved-quit protection, Save As/reopen, filtering, sorting and duplicate remova
 A 12 GB CSV also passed progressive opening, last-row navigation, filtering,
 exact export comparison and export cancellation without changing the source.
 
+A VMPal guest on macOS 27.0.1 also passed Chrome download with quarantine,
+Finder installation, Gatekeeper assessment, normal first launch and basic CSV
+opening. A CJK glyph rendered as a fallback box, so complete Unicode font
+rendering is not established. The existing guest does not close fresh-environment
+acceptance. See the [installation report](benchmarks/2026-10-06-vmpal-beta-install.md).
+
 ## Install, update and feedback
 
 Download the [signed archive](https://github.com/danchamorro/quarry/releases/download/v0.1.0-beta.1/Quarry-0.1.0-beta.1-macos-arm64.zip) and verify
