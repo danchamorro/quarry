@@ -8458,8 +8458,9 @@ fn show_table(
 
         ui.set_min_width(content_width.max(viewport_width));
         ui.spacing_mut().item_spacing.y = 0.0;
-        let divider_left = ui.cursor().left();
-        let divider_y = ui.cursor().top() + COLUMN_RULER_HEIGHT;
+        let mut header_rect = egui::Rect::NOTHING;
+        let mut row_bottoms = Vec::with_capacity(row_count);
+        let mut fixed_dividers = Vec::new();
         let mut table = TableBuilder::new(ui)
             .id_salt(if virtualized {
                 "quarry-grid-virtual"
@@ -8509,17 +8510,26 @@ fn show_table(
         table
             .header(HEADER_HEIGHT, |mut header| {
                 header.col(|ui| {
+                    header_rect = ui.max_rect();
+                    fixed_dividers.push(ui.max_rect().right() + column_spacing * 0.5);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.add_space(COLUMN_RULER_HEIGHT);
                     });
                 });
                 if spacer_width.is_some() {
-                    header.col(|_| {});
+                    header.col(|ui| {
+                        header_rect = header_rect.union(ui.max_rect());
+                        fixed_dividers.push(ui.max_rect().right() + column_spacing * 0.5);
+                    });
                 }
                 for (_, column, name) in &visible_headers {
                     let column = *column;
                     header.col(|ui| {
+                        header_rect = header_rect.union(ui.max_rect());
+                        if virtualized {
+                            fixed_dividers.push(ui.max_rect().right() + column_spacing * 0.5);
+                        }
                         ui.push_id(("column-header", column), |ui| {
                             let selected = document.selected_columns.contains(&column);
                             paint_column_selection(ui, selected);
@@ -8819,6 +8829,7 @@ fn show_table(
                             .saturating_sub(document.data_start)
                             .saturating_add(1);
                         table_row.col(|ui| {
+                            row_bottoms.push(ui.max_rect().bottom());
                             ui.scope_builder(
                                 egui::UiBuilder::new().id(("row-selection", record_row)),
                                 |ui| {
@@ -9213,13 +9224,20 @@ fn show_table(
                         }
                 });
             });
-            ui.painter().line_segment(
-                [
-                    egui::pos2(divider_left, divider_y),
-                    egui::pos2(ui.min_rect().right(), divider_y),
-                ],
-                column_ruler_divider_stroke(ui.visuals()),
-            );
+            // Paint after all cell backgrounds so stripes and selection cannot erase borders.
+            // Geometry comes only from the rendered rows/columns, including resized columns.
+            let stroke = column_ruler_divider_stroke(ui.visuals());
+            let left = header_rect.left();
+            let right = ui.min_rect().right().max(header_rect.right() + column_spacing * 0.5);
+            let bottom = row_bottoms.last().copied().unwrap_or(header_rect.bottom());
+            for y in [header_rect.top(), header_rect.top() + COLUMN_RULER_HEIGHT, header_rect.bottom()]
+                .into_iter().chain(row_bottoms)
+            {
+                ui.painter().hline(left..=right, y, stroke);
+            }
+            for x in std::iter::once(left).chain(fixed_dividers) {
+                ui.painter().vline(x, header_rect.top()..=bottom, stroke);
+            }
         });
 
     if cancel_header_edit {
@@ -11182,7 +11200,7 @@ mod tests {
     ) -> f32 {
         let divider_stroke = column_ruler_divider_stroke(visuals);
         let minimum_divider_span = 74.0 + header_count as f32 * 80.0;
-        let divider_shapes = output
+        let horizontal_lines = output
             .shapes
             .iter()
             .enumerate()
@@ -11196,6 +11214,14 @@ mod tests {
                 }
                 _ => None,
             })
+            .collect::<Vec<_>>();
+        let top = horizontal_lines
+            .iter()
+            .map(|(_, points)| points[0].y)
+            .fold(f32::INFINITY, f32::min);
+        let divider_shapes = horizontal_lines
+            .into_iter()
+            .filter(|(_, points)| points[0].y == top + super::COLUMN_RULER_HEIGHT)
             .collect::<Vec<_>>();
         assert_eq!(
             divider_shapes.len(),
