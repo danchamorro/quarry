@@ -49,7 +49,9 @@ Follow priorities and dependencies in the [live project](https://github.com/user
 This section remains a navigation destination for older links, not a second
 ordered feature list.
 
-### Phase 6D: Date and time sorting (planned)
+<a id="phase-6d-date-and-time-sorting-planned"></a>
+
+### Former Phase 6D: Date and time sorting
 
 The former Phase 6D is tracked in [issue #56](https://github.com/danchamorro/quarry/issues/56).
 Its scope, parsing decisions, and acceptance criteria belong in that issue.
