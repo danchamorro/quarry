@@ -3,6 +3,7 @@ use super::*;
 const MAX_DOCUMENT_TABS: usize = 8;
 const MAX_WRITE_JOBS: usize = 2;
 
+/// Owns one document's drafts, feedback, worker reservations and close decisions.
 pub(super) struct DocumentTab {
     pub(super) id: u64,
     pub(super) storage_review: Option<StorageReview>,
@@ -36,6 +37,7 @@ pub(super) struct DocumentTab {
 }
 
 impl DocumentTab {
+    /// Creates an empty tab with an identity that remains stable across switches.
     pub(super) fn new(id: u64) -> Self {
         Self {
             id,
@@ -72,6 +74,7 @@ impl DocumentTab {
 }
 
 impl DocumentTab {
+    /// Lists shared text-widget IDs whose cursor and Undo state must follow this tab.
     fn editor_ids(&self) -> Vec<egui::Id> {
         let mut ids = [
             JUMP_INPUT_ID,
@@ -94,6 +97,7 @@ impl DocumentTab {
         ids
     }
 
+    /// Adds unsaved-change and activity markers to the document's filename.
     fn title(&self) -> String {
         self.document.as_ref().map_or_else(
             || "No file".into(),
@@ -112,6 +116,7 @@ impl DocumentTab {
         )
     }
 
+    /// Includes read workers as well as operations that materialize files.
     pub(super) fn busy(&self) -> bool {
         self.document.as_ref().is_some_and(|document| {
             document.job.is_some()
@@ -124,6 +129,7 @@ impl DocumentTab {
         })
     }
 
+    /// Counts file operations and structural analysis against the global job limit.
     fn writing(&self) -> bool {
         self.document.as_ref().is_some_and(|document| {
             document.save_job.is_some()
@@ -136,9 +142,10 @@ impl DocumentTab {
     }
 }
 
-// Canonical parents cover destinations that do not yet exist. File identities
-// additionally prevent two tabs from writing through distinct hard links.
+/// Compares canonical paths, canonical parents of new outputs, and Unix file identities.
+/// This protects destinations reached through relative paths, symlinks or hard links.
 pub(super) fn paths_alias(left: &Path, right: &Path) -> bool {
+    /// Resolves a new destination through its parent when the file does not exist yet.
     fn normalized(path: &Path) -> PathBuf {
         std::fs::canonicalize(path).unwrap_or_else(|_| {
             let parent = path
@@ -164,10 +171,12 @@ pub(super) fn paths_alias(left: &Path, right: &Path) -> bool {
 }
 
 impl QuarryApp {
+    /// Visits the active slot and every retained tab without changing visible focus.
     pub(super) fn document_tabs(&self) -> impl Iterator<Item = &DocumentTab> {
         std::iter::once(&self.active).chain(self.tabs.iter())
     }
 
+    /// Commits grid drafts, swaps ownership, and schedules restoration of tab UI state.
     fn activate_tab(&mut self, id: u64) {
         if self.active.id == id {
             return;
@@ -185,6 +194,7 @@ impl QuarryApp {
         }
     }
 
+    /// Saves outgoing editor state and restores the selected tab before further input.
     fn switch_tab(&mut self, ctx: &egui::Context, id: u64) {
         if self.active.id == id {
             return;
@@ -194,6 +204,7 @@ impl QuarryApp {
         self.reset_tab_focus(ctx);
     }
 
+    /// Captures text cursor/Undo state and the column manager's selection for this tab.
     pub(super) fn remember_tab_focus(&mut self, ctx: &egui::Context) {
         if self.pending_tab_focus {
             return;
@@ -208,6 +219,7 @@ impl QuarryApp {
             .collect();
     }
 
+    /// Restores only the incoming tab's widget state, releasing focus and stale popups.
     pub(super) fn reset_tab_focus(&mut self, ctx: &egui::Context) {
         if !self.pending_tab_focus {
             return;
@@ -245,6 +257,8 @@ impl QuarryApp {
         egui::Popup::close_all(ctx);
     }
 
+    /// Selects an already-open source or prepares a new tab without replacing old work.
+    /// Closing decisions, reserved outputs and the document cap can reject the request.
     pub(super) fn open_document_tab(
         &mut self,
         path: PathBuf,
@@ -311,6 +325,7 @@ impl QuarryApp {
         Ok(())
     }
 
+    /// Rejects another tab's source/working file and every reserved writer output.
     pub(super) fn destination_available(&self, destination: &Path) -> bool {
         !self.document_tabs().any(|tab| {
             (tab.id != self.active.id
@@ -325,6 +340,7 @@ impl QuarryApp {
         })
     }
 
+    /// Applies the shared two-operation limit to document tabs and Combine Files.
     pub(super) fn write_slot_available(&self) -> bool {
         self.document_tabs().filter(|tab| tab.writing()).count()
             + usize::from(
@@ -335,9 +351,16 @@ impl QuarryApp {
             < MAX_WRITE_JOBS
     }
 
+    /// Polls jobs against their owning tab, surfaces failed reloads, and advances closes.
+    /// Background completions retain the visible document and its focus/history.
     pub(super) fn poll_document_tabs(&mut self, ctx: &egui::Context) {
         self.poll_active_document(ctx, true);
         let mut failed_reloads = Vec::new();
+        if self.active.document.is_none()
+            && let Some(notice) = self.active.notice.take()
+        {
+            failed_reloads.push(notice.text);
+        }
         for index in 0..self.tabs.len() {
             // Poll completions against their owning document, never the visible tab.
             std::mem::swap(&mut self.active, &mut self.tabs[index]);
@@ -350,12 +373,6 @@ impl QuarryApp {
             std::mem::swap(&mut self.active, &mut self.tabs[index]);
         }
         self.tabs.retain(|tab| tab.document.is_some());
-        if !failed_reloads.is_empty() {
-            if let Some(notice) = self.active.notice.take() {
-                failed_reloads.insert(0, notice.text);
-            }
-            self.active.notice = Some(AppMessage::error(failed_reloads.join("\n")));
-        }
         for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
             if !tab.writing() {
                 tab.write_destination = None;
@@ -368,8 +385,20 @@ impl QuarryApp {
             self.active.close_after_jobs = false;
             self.review_document_close(ctx);
         }
+        if self.active.document.is_none()
+            && let Some(id) = self.tabs.iter().min_by_key(|tab| tab.id).map(|tab| tab.id)
+        {
+            self.switch_tab(ctx, id);
+        }
+        if !failed_reloads.is_empty() {
+            if let Some(notice) = self.active.notice.take() {
+                failed_reloads.insert(0, notice.text);
+            }
+            self.active.notice = Some(AppMessage::error(failed_reloads.join("\n")));
+        }
     }
 
+    /// Cancels native window close until all tabs and active operations are reviewed.
     pub(super) fn intercept_dirty_close(&mut self, ctx: &egui::Context) {
         if !ctx.input(|input| input.viewport().close_requested()) || self.quit_authorized {
             return;
@@ -391,12 +420,14 @@ impl QuarryApp {
         self.review_document_close(ctx);
     }
 
+    /// Starts the active tab's close review without requesting an application quit.
     pub(super) fn request_tab_close(&mut self, ctx: &egui::Context) {
         if self.active.document.is_some() {
             self.review_document_close(ctx);
         }
     }
 
+    /// Commits drafts, waits for file operations, then prompts for unsaved changes.
     fn review_document_close(&mut self, ctx: &egui::Context) {
         if let Some(document) = self.active.document.as_mut() {
             document.commit_edits();
@@ -421,6 +452,8 @@ impl QuarryApp {
         self.finish_document_close(ctx);
     }
 
+    /// Removes an approved tab, or records a quit approval while retaining every tab.
+    /// Quit releases documents only after the entire session has been approved.
     fn finish_document_close(&mut self, ctx: &egui::Context) {
         self.active.close_confirmation_open = false;
         self.active.close_after_save = false;
@@ -466,6 +499,7 @@ impl QuarryApp {
         }
     }
 
+    /// Cancels close/quit intentions and clears approvals without discarding documents.
     pub(super) fn keep_editing(&mut self) {
         self.active.close_confirmation_open = false;
         self.active.close_after_save = false;
@@ -475,10 +509,12 @@ impl QuarryApp {
         self.quit_approved.clear();
     }
 
+    /// Approves the current close; quit keeps the document until all approvals finish.
     pub(super) fn discard_and_close(&mut self, ctx: &egui::Context) {
         self.finish_document_close(ctx);
     }
 
+    /// Renders accessible tabs, handles keyboard switching and reveals active tabs.
     pub(super) fn show_document_tabs(&mut self, ctx: &egui::Context, blocked: bool) {
         let mut tabs: Vec<_> = self
             .document_tabs()
@@ -613,6 +649,7 @@ impl QuarryApp {
         self.reset_tab_focus(ctx);
     }
 
+    /// Shows live progress and cancel/keep-editing controls while a close awaits a job.
     pub(super) fn show_closing_operation(&mut self, ctx: &egui::Context) {
         if !self.active.close_after_jobs && !self.active.close_after_save {
             return;
@@ -1069,6 +1106,62 @@ mod tests {
         assert!(notice.contains("could not reload"));
         assert!(notice.contains(&a.display().to_string()));
         assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new(FIND_INPUT_ID))));
+        assert!(
+            fs::read_to_string(saved)
+                .unwrap()
+                .starts_with("saved-a,value")
+        );
+    }
+
+    #[test]
+    fn failed_active_save_reload_selects_remaining_work_and_preserves_the_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = fixture(directory.path(), "a.csv");
+        let b = fixture(directory.path(), "b.csv");
+        let saved = directory.path().join("moved-saved-a.csv");
+        let ctx = egui::Context::default();
+        let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
+        let a_id = app.active.id;
+        app.open_new_path(b.clone()).unwrap();
+        edited(&mut app, "retained-b");
+        let b_id = app.active.id;
+        app.switch_tab(&ctx, a_id);
+        edited(&mut app, "saved-a");
+        assert!(app.save_current());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .save_job
+            .as_ref()
+            .unwrap()
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        fs::rename(&a, &saved).unwrap();
+        app.poll_document_tabs(&ctx);
+        assert_eq!(app.active.id, b_id);
+        assert!(app.tabs.is_empty());
+        let document = app.active.document.as_ref().unwrap();
+        assert_eq!(document.logical_path, b);
+        assert_eq!(document.column_name(0), "retained-b");
+        assert!(document.can_undo());
+        let notice = app.active.notice.as_ref().unwrap();
+        assert_eq!(notice.severity, MessageSeverity::Error);
+        assert!(notice.contains("could not reload"));
+        assert!(notice.contains(&a.display().to_string()));
+        app.swap_edit_history(false).unwrap();
+        assert_eq!(app.active.document.as_ref().unwrap().column_name(0), "name");
+        app.swap_edit_history(true).unwrap();
+        assert_eq!(
+            app.active.document.as_ref().unwrap().column_name(0),
+            "retained-b"
+        );
         assert!(
             fs::read_to_string(saved)
                 .unwrap()

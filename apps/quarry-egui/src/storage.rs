@@ -185,6 +185,8 @@ impl StorageReview {
 }
 
 impl QuarryApp {
+    /// Enforces the shared worker limit and defers large writes for this tab's review.
+    /// Returns true when the caller must not start the operation immediately.
     pub(super) fn defer_storage(&mut self, operation: PendingStorageOperation) -> bool {
         if !self.write_slot_available() {
             self.active.notice = Some(AppMessage::warning(
@@ -213,6 +215,7 @@ impl QuarryApp {
         true
     }
 
+    /// Stores the pending operation and disk estimate on the active document tab.
     pub(super) fn begin_storage_review(&mut self, operation: PendingStorageOperation) {
         let Some(document) = self.active.document.as_ref() else {
             return;
@@ -237,6 +240,7 @@ impl QuarryApp {
         self.active.notice = None;
     }
 
+    /// Opens working-folder settings without reserving a document operation.
     pub(super) fn open_storage_settings(&mut self) {
         self.active.storage_review = Some(StorageReview::new(
             self.working_directory.clone(),
@@ -250,7 +254,9 @@ impl QuarryApp {
         ));
     }
 
+    /// Reviews this tab's storage and propagates an accepted working folder to all tabs.
     pub(super) fn show_storage_review(&mut self, ctx: &egui::Context) {
+        let write_slot_available = self.write_slot_available();
         let Some(review) = self.active.storage_review.as_mut() else {
             return;
         };
@@ -298,6 +304,9 @@ impl QuarryApp {
                     });
                 } else {
                     ui.heading("Temporary storage");
+                }
+                if review.operation.is_some() && !write_slot_available {
+                    ui.colored_label(ERROR_TEXT, "Two file operations are already running. Wait for one to finish or cancel it before continuing.");
                 }
                 ui.add_space(6.0);
                 if !current {
@@ -382,7 +391,7 @@ impl QuarryApp {
                     if ui.button("Cancel").clicked() { cancel = true; }
                     if !review.ready() && ui.add_enabled(review.worker.is_none(), egui::Button::new("Check again")).clicked() { check = true; }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add_enabled(review.ready() && !check, egui::Button::new(if review.operation.is_some() { "Continue" } else { "Use folder" }).fill(QUARRY_YELLOW)).clicked() { accept = true; }
+                        if ui.add_enabled(review.ready() && !check && (review.operation.is_none() || write_slot_available), egui::Button::new(if review.operation.is_some() { "Continue" } else { "Use folder" }).fill(QUARRY_YELLOW)).clicked() { accept = true; }
                     });
                 });
             });
@@ -397,29 +406,42 @@ impl QuarryApp {
                 self.active.close_confirmation_open = true;
             }
         } else if accept {
-            let review = self.active.storage_review.take().unwrap();
-            if working {
-                self.working_directory = PathBuf::from(review.path_input);
-                if let Some(document) = self.active.document.as_mut() {
-                    document.working_directory = self.working_directory.clone();
-                }
-                for tab in &mut self.tabs {
-                    if let Some(document) = tab.document.as_mut() {
-                        document.working_directory = self.working_directory.clone();
-                    }
-                }
-            }
-            if let Some(operation) = review.operation {
-                // Only the operation resumed by this dialog bypasses the presentation gate.
-                // Engine checks still run immediately before writes.
-                self.active.storage_approved = true;
-                self.resume_storage_operation(operation, ctx);
-                self.active.storage_approved = false;
-            }
+            self.accept_storage_review(ctx, working);
         }
         ctx.request_repaint_after(POLL_INTERVAL);
     }
 
+    /// Rechecks capacity before consuming a review, including deferred split materialization.
+    /// A full worker budget retains the operation and its completed storage check for retry.
+    fn accept_storage_review(&mut self, ctx: &egui::Context, working: bool) {
+        if self
+            .active
+            .storage_review
+            .as_ref()
+            .is_some_and(|review| review.operation.is_some())
+            && !self.write_slot_available()
+        {
+            return;
+        }
+        let review = self.active.storage_review.take().unwrap();
+        if working {
+            self.working_directory = PathBuf::from(review.path_input);
+            for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
+                if let Some(document) = tab.document.as_mut() {
+                    document.working_directory = self.working_directory.clone();
+                }
+            }
+        }
+        if let Some(operation) = review.operation {
+            // Only the operation resumed by this dialog bypasses the presentation gate.
+            // Engine checks still run immediately before writes.
+            self.active.storage_approved = true;
+            self.resume_storage_operation(operation, ctx);
+            self.active.storage_approved = false;
+        }
+    }
+
+    /// Resumes the owning tab's approved operation through its normal safety guards.
     fn resume_storage_operation(
         &mut self,
         operation: PendingStorageOperation,
@@ -609,6 +631,131 @@ mod tests {
                 "background job stalled behind storage review"
             );
             std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn deferred_materialization_retains_review_until_a_global_write_slot_is_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = directory.path().join("a.csv");
+        let b = directory.path().join("b.csv");
+        let c = directory.path().join("c.csv");
+        let original = b"name,value\nAlpha|Beta,1\n";
+        for path in [&a, &b, &c] {
+            std::fs::write(path, original).unwrap();
+        }
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
+        finish(&mut app);
+        let transformation = ColumnTransformation::split_with_blank_headers(
+            0,
+            b"|".to_vec(),
+            2,
+            Some(b"name".to_vec()),
+        )
+        .unwrap();
+        app.begin_storage_review(PendingStorageOperation::Materialize(
+            transformation,
+            [0, 1].into_iter().collect(),
+            2,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.active.storage_review.as_ref().unwrap().ready() {
+            app.active.storage_review.as_mut().unwrap().poll();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        for (path, header) in [(&b, "saved-b"), (&c, "saved-c")] {
+            app.open_new_path(path.clone()).unwrap();
+            app.active
+                .document
+                .as_mut()
+                .unwrap()
+                .rename_header(0, header.into())
+                .unwrap();
+            assert!(app.save_as_picker_result(Some(path.with_extension("saved.csv"))));
+        }
+        app.open_new_path(a.clone()).unwrap();
+        assert!(!app.write_slot_available());
+        app.accept_storage_review(&ctx, true);
+        assert!(app.active.storage_review.as_ref().unwrap().ready());
+        assert!(!app.active.storage_approved);
+        assert!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .structural_job
+                .is_none()
+        );
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_storage_review(ctx)
+        });
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.label()
+                .or(node.value())
+                .is_some_and(|text| text.contains("Two file operations"))
+        }));
+        let continue_button = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Continue"))
+            .unwrap()
+            .1
+            .clone();
+        assert!(continue_button.is_disabled());
+
+        // Complete one owning tab's save without polling the other reserved writer.
+        app.open_new_path(b.clone()).unwrap();
+        while app.active.document.as_ref().unwrap().save_job.is_some() {
+            app.poll_active_document(&ctx, true);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        app.open_new_path(a.clone()).unwrap();
+        assert!(app.write_slot_available());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_storage_review(ctx)
+        });
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let (target, button) = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Continue"))
+            .unwrap();
+        assert!(!button.is_disabled());
+        let input = egui::RawInput {
+            events: vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: *target,
+                    data: None,
+                },
+            )],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.show_storage_review(ctx));
+        assert!(app.active.storage_review.is_none());
+        assert!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .structural_job
+                .is_some()
+        );
+        assert!(!app.write_slot_available());
+        while app.document_tabs().any(DocumentTab::busy) {
+            app.poll_document_tabs(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            std::fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
+            b"name,,value\nAlpha,Beta,1\n"
+        );
+        for path in [&a, &b, &c] {
+            assert_eq!(std::fs::read(path).unwrap(), original);
         }
     }
 

@@ -508,12 +508,14 @@ impl Default for FilterRuleDraft {
 }
 
 impl QuarryApp {
+    /// Opens each command-line path using the same tab and error policy as file drops.
     fn with_paths(paths: Vec<PathBuf>, started: Instant) -> Self {
         let mut app = Self::new(None, started);
         app.handle_dropped_paths(paths.into_iter().map(Some).collect());
         app
     }
 
+    /// Creates shared application state and an empty tab, optionally opening a source.
     fn new(initial_path: Option<PathBuf>, started: Instant) -> Self {
         let mut app = Self {
             about: about::About::new(),
@@ -553,11 +555,13 @@ impl QuarryApp {
             .map_err(|message| message.text)
     }
 
+    /// Opens a source with fresh format detection, preserving every existing tab.
     fn open_new_path(&mut self, path: PathBuf) -> Result<(), AppMessage> {
         self.open_path_with_options(path, OpenOptions::default())?;
         Ok(())
     }
 
+    /// Routes an explicit format to tab opening after checking the modal Combine dialog.
     fn open_path_with_options(
         &mut self,
         path: PathBuf,
@@ -571,6 +575,8 @@ impl QuarryApp {
         self.open_document_tab(path, options)
     }
 
+    /// Prepares a replacement before releasing the active tab's old document.
+    /// Callers must first guard against unsaved changes and active file operations.
     fn replace_document_with_options(
         &mut self,
         path: PathBuf,
@@ -596,6 +602,7 @@ impl QuarryApp {
         Ok(())
     }
 
+    /// Opens a new source and displays any failure on the tab that remains visible.
     fn open_path_and_report(&mut self, path: PathBuf) {
         if let Err(error) = self.open_new_path(path) {
             self.active.notice = Some(error);
@@ -609,6 +616,7 @@ impl QuarryApp {
         }
     }
 
+    /// Sends all selected native file-picker paths through the multi-file open policy.
     fn choose_file(&mut self) {
         if let Some(paths) = rfd::FileDialog::new()
             .set_title("Open delimited files")
@@ -618,6 +626,7 @@ impl QuarryApp {
         }
     }
 
+    /// Commits this tab's drafts and chooses an export path only for a clean document.
     fn choose_filtered_export(&mut self) {
         if let Some(document) = self.active.document.as_mut() {
             if document.save_job.is_some() {
@@ -654,6 +663,7 @@ impl QuarryApp {
         self.export_picker_result(dialog.save_file());
     }
 
+    /// Chooses a destination for this tab; false means no save or review was started.
     fn choose_save_as(&mut self) -> bool {
         let Some(document) = self.active.document.as_mut() else {
             self.active.notice = Some(AppMessage::warning("Open a file before using Save As."));
@@ -682,6 +692,7 @@ impl QuarryApp {
         self.save_as_picker_result(dialog.save_file())
     }
 
+    /// Starts an in-place save or storage review on the active tab, subject to job limits.
     fn save_current(&mut self) -> bool {
         if self.defer_storage(PendingStorageOperation::Save(None)) {
             return self.active.storage_review.is_some();
@@ -699,6 +710,7 @@ impl QuarryApp {
         self.active.notice.is_none()
     }
 
+    /// Rejects cross-tab destinations, then starts or reviews this tab's Save As.
     fn save_as_picker_result(&mut self, destination: Option<PathBuf>) -> bool {
         let Some(destination) = destination else {
             return false;
@@ -726,6 +738,7 @@ impl QuarryApp {
         self.active.notice.is_none()
     }
 
+    /// Reserves a safe destination for this tab's filtered export after storage approval.
     fn export_picker_result(&mut self, destination: Option<PathBuf>) {
         let Some(destination) = destination else {
             return;
@@ -752,6 +765,7 @@ impl QuarryApp {
         }
     }
 
+    /// Applies a format draft by guarded replacement of only the active document.
     fn reopen_document(&mut self, delimiter_mode: DelimiterMode, header_mode: HeaderMode) {
         self.active.format_draft = None;
         let Some(path) = self
@@ -778,6 +792,7 @@ impl QuarryApp {
         self.active.notice = result.err();
     }
 
+    /// Reloads only the active document using its currently applied format.
     fn reload_document(&mut self) {
         let Some((path, options)) = self.active.document.as_ref().map(|document| {
             (
@@ -791,6 +806,7 @@ impl QuarryApp {
         self.active.notice = self.reopen_current_path(path, options).err();
     }
 
+    /// Refuses replacement while this tab has unsaved edits or a file operation.
     fn reopen_current_path(
         &mut self,
         path: PathBuf,
@@ -815,6 +831,7 @@ impl QuarryApp {
         self.replace_document_with_options(path, options)
     }
 
+    /// Attempts every local path and collects failures without evicting open documents.
     fn handle_dropped_paths(&mut self, dropped: Vec<Option<PathBuf>>) {
         let mut failures = Vec::new();
         for path in dropped {
@@ -834,6 +851,7 @@ impl QuarryApp {
     }
 
     #[cfg(target_os = "macos")]
+    /// Drains Finder open requests into independent tabs when modal UI permits polling.
     fn poll_open_documents(&mut self) {
         let paths = self
             .open_document_receiver
@@ -845,6 +863,7 @@ impl QuarryApp {
         }
     }
 
+    /// Dispatches document actions to the active tab and application actions to shared state.
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
         if action == Action::CloseTab {
             self.request_tab_close(ctx);
@@ -1493,6 +1512,8 @@ impl QuarryApp {
         }
     }
 
+    /// Applies completions to the tab temporarily held in the active slot.
+    /// Background polling suppresses changes to the visible tab's editor focus.
     fn poll_active_document(&mut self, ctx: &egui::Context, visible: bool) {
         if let Some(document) = &mut self.active.document
             && let Err(error) = document.poll()

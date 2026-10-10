@@ -104,13 +104,13 @@ the original source still had `ID,Name,Amount`, and B's disk checksum was unchan
 
 ## Deterministic and CI validation
 
-Formatting, strict workspace Clippy, 350 workspace tests (including 142 egui
+Formatting, strict workspace Clippy, 352 workspace tests (including 144 egui
 tests), and release workspace builds passed locally. Regression coverage includes
 per-tab drafts/selection/history, live independent filters, background save and
 structural completion ownership, temporary-file cleanup, duplicate hard links,
 reserved destinations, the two-operation limit, quit cancellation, text cursor
 state, accessible keyboard interaction, compact visibility, and failed background
-reload recovery. Multi-file dropped input is exercised by deterministic egui
+reload recovery, active-tab recovery, and deferred-operation capacity checks. Multi-file drag-and-drop input is exercised by deterministic egui
 interaction tests; native multi-file opening used Finder events and command-line
 paths. The PR's latest commit must also pass required CI and CodeRabbit review
 before merge.

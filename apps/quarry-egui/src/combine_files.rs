@@ -325,6 +325,7 @@ enum DialogAction {
 }
 
 impl QuarryApp {
+    /// Opens Combine Files with the shared worker limit and all tab destinations protected.
     pub(super) fn open_combine_files(&mut self) {
         if !self.write_slot_available() {
             self.active.notice = Some(AppMessage::warning(
@@ -349,6 +350,7 @@ impl QuarryApp {
         self.active.notice = None;
     }
 
+    /// Handles dialog actions; opening a saved result creates a tab and retains old work.
     pub(super) fn show_combine_files(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.combine_files.as_mut() else {
             return;
