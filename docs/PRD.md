@@ -250,8 +250,7 @@ The existing bounded runs, guarded working copy, cancellation, and history apply
 to both modes. Text remains the default. The [1 GB numeric validation](benchmarks/2026-09-04-numeric-sort.md)
 records exact output, Text compatibility, memory, temporary disk, and
 cancellation. Locale-aware and multi-column sorting are tracked in
-[issues #56](https://github.com/danchamorro/quarry/issues/56),
-[#63](https://github.com/danchamorro/quarry/issues/63), and
+[issues #63](https://github.com/danchamorro/quarry/issues/63) and
 [#64](https://github.com/danchamorro/quarry/issues/64).
 
 Phase 6C extends the same Sort window with Character count, Word count,
@@ -263,7 +262,7 @@ whole data rows with the header fixed. They reuse guarded working copies,
 bounded merging, cancellation, and structural history. The [1 GB mode validation](benchmarks/2026-09-04-additional-sort-modes.md)
 records complete count, Shuffle, and Reverse runs.
 
-Phase 6D adds Date / time to the same window with explicit YYYY-MM-DD,
+Phase 6D ([issue #56](https://github.com/danchamorro/quarry/issues/56)) adds Date / time to the same window with explicit YYYY-MM-DD,
 MM/DD/YYYY, DD/MM/YYYY, timezone-free timestamps, and an RFC 3339 subset.
 Oldest/newest order uses exact seconds and nanoseconds. Offsets compare as UTC
 instants; clock values do not inherit a machine timezone. Blank keys follow the

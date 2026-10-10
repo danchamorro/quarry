@@ -47,5 +47,5 @@ before sorting. Offset spelling may differ while comparison keys are equal.
 Regression checks cover ambiguity, Gregorian leap centuries, nanosecond order,
 offset day/year boundaries, invalid values after spill, stable multipass ties,
 unsaved edits, quoting/multiline rows, UI accessibility, history, and Save As.
-Native VMPal checks and large-file measurements belong in the linked validation
-report before merge.
+Native VMPal checks and large-file measurements are recorded in the
+[validation report](../benchmarks/2026-10-10-date-time-sorting.md).
