@@ -81,7 +81,7 @@ general throughput measurements or a claim about every possible record shape.
 
 ## Automated checks
 
-Formatting, workspace Clippy with warnings denied, all 336 workspace tests,
+Formatting, workspace Clippy with warnings denied, all 337 workspace tests,
 and the release workspace build passed. Focused regressions cover:
 
 - Exact ordered output for multiple inputs, duplicates, multiline quoting,
@@ -93,6 +93,27 @@ and the release workspace build passed. Focused regressions cover:
 - Records crossing read chunks and worker panic completion reporting.
 - Compact footer/accessibility controls and preserving an unsaved document
   throughout a successful combination and attempted result open.
+
+## Review regression: unterminated first records
+
+Review identified that Auto delimiter detection ignored a complete first
+record without a final newline. The detector now finalizes a record only when
+the sample covers the entire file, preserving partial-sample behavior.
+Regressions cover comma, tab, pipe and semicolon inputs: a header-only file
+paired with data, two header-only files, and headerless single records with a
+quoted newline. They check direct opening, combination metadata and exact
+output bytes.
+
+A second native VMPal run used clean source
+`23559ed086d61692a3c5977394199ff736333a28`, version 0.1.0 (149), on the same
+macOS 27.0.1 guest. The package SHA-256 was
+`5764a77205236eae4581def3c8f2c11061a1531edd823b1cf62517605539afcf`, matching
+in the host and guest. Guest code-signature verification and launch passed.
+Using the native picker, Auto correctly combined an unterminated header-only
+TSV with a matching headered TSV containing one data row. The check reported
+two columns and one row; the saved 14-byte result matched independent expected
+bytes and reopened as a two-column TSV with the correct row. Both source
+hashes stayed unchanged. The test app was closed without modifying the inputs.
 
 Screenshots, build/test logs, package, fixtures and guest memory/checksum
 evidence are retained locally under `target/combine-files/`. The existing host
