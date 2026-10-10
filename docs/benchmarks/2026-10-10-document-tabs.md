@@ -18,6 +18,7 @@ Host and guest ZIP checksums matched. Each launched bundle reported clean source
 | 147 | `cdbced25223eef3c0c28891b341087923bc27a57` | `b5686ad8ee39b48f7b3702e3caed20acb7eb891eb97b54824cd4a5c3d6e062a4` | Eight tabs, keyboard wrap, ninth-open rejection; exposed resize visibility regression |
 | 148 | `31bec964c118de3c5e4f7a3665e8170e64bc221b` | `4c3c6aef202ff170d864177991ace9c4e6145f54af75a0419864d937120c448f` | Resize regression fixed; large files, concurrent file operations, cancellation and resource sampling |
 | 149 | `d80e7fd9f73e7feee7f5f199fdc1e210fb981d40` | `5a7b0e1953ae75e295535ff312d0247bba1f6f76bf9a24be732ea3a14caf997b` | Background save/reload failure recovery; other tab's edits and history retained |
+| 151 | `e3e03aef14e70fe106c559eaef618be8b6fa736b` | `e34d8df0044e36806a2142074b035d48aa0ab5d29fe1dc3b9d204dd374cd30d6` | Active save/reload failure selects retained work; deferred split review respects concurrent-worker capacity |
 
 Each build actually launched and rendered its test documents. Documentation-only
 commits after these builds do not change the tested executable code.
@@ -102,6 +103,38 @@ empty failed tab was absent. B's Undo and Redo still worked. The moved saved fil
 remained present at 10,395,000,159 bytes with header `RecoveredID,Name,Amount`;
 the original source still had `ID,Name,Amount`, and B's disk checksum was unchanged.
 
+Build 151 also reproduced the failure while the saved tab remained active. The
+watcher moved a separate 10 GB clone after publication. Quarry automatically
+selected B, retained its unsaved `VisibleB` header, displayed the saved-path error,
+and removed the empty failed tab. B's Undo/Redo continued to work and its disk
+checksum was unchanged. The moved file retained `ActiveRecoveryID,Name,Amount`.
+
+## Deferred-operation resource regression
+
+A completed split analysis can leave its materialization in an inactive tab's
+storage review. Automated review found that this deferred operation could bypass
+the global worker budget when resumed. Build 151 rechecks capacity before consuming
+the review, including operations that resume directly after analysis.
+
+The native test started split analysis on a separate synthetic 10 GB clone,
+switched away, and ran a 10 GB sort plus a separate 10 GB save. Returning to the
+pending split displayed **Two file operations are already running** with Continue
+disabled. When the save completed, the warning cleared and Continue became
+available. The split resumed, its close dialog showed **Applying column edit**,
+and cancelling it closed only that tab. The separate saved output remained
+available with `SecondDeferredID,Name,Amount`; the other sort could be cancelled
+independently. The clone's source remained unchanged.
+
+After both build-151 regressions, both original 10 GB inputs and the cancelled
+split clone still matched their original SHA-256. A fresh streaming byte oracle
+verified each additional saved output against the original with only its first
+header field replaced:
+
+| Output header | Output bytes | Verified SHA-256 |
+|---|---:|---|
+| `SecondDeferredID` | 10,395,000,164 | `c4a42ab53d9e8eaf9193b66388911ede5910ffcf2642a3749b525d542904ff86` |
+| `ActiveRecoveryID` | 10,395,000,164 | `ae06951e27dc0ea69cbe5f81875539352cf9f1dd793e6799cb7375548b62dde1` |
+
 ## Deterministic and CI validation
 
 Formatting, strict workspace Clippy, 352 workspace tests (including 144 egui
@@ -110,7 +143,8 @@ per-tab drafts/selection/history, live independent filters, background save and
 structural completion ownership, temporary-file cleanup, duplicate hard links,
 reserved destinations, the two-operation limit, quit cancellation, text cursor
 state, accessible keyboard interaction, compact visibility, and failed background
-reload recovery, active-tab recovery, and deferred-operation capacity checks. Multi-file drag-and-drop input is exercised by deterministic egui
-interaction tests; native multi-file opening used Finder events and command-line
+reload recovery, active-tab recovery, and deferred-operation capacity checks.
+Multi-file drag-and-drop input is exercised by deterministic egui interaction
+tests; native multi-file opening used Finder events and command-line
 paths. The PR's latest commit must also pass required CI and CodeRabbit review
 before merge.

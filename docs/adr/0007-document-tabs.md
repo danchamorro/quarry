@@ -37,7 +37,8 @@ Successfully saved files remain saved if quit is subsequently cancelled.
 
 If a completed in-place save cannot be reopened, its stale document is released.
 An inactive empty tab is removed and its saved-path/reopen error is shown on the
-visible tab, preserving that other document and its history. External file moves
+visible tab, preserving that other document and its history. An active failure
+selects a remaining document and carries the error to it. External file moves
 after publication can trigger this recovery; the saved bytes remain on disk.
 
 ## Resource policy
@@ -46,6 +47,8 @@ after publication can trigger this recovery; the saved bytes remain on disk.
 - At most two save/export/structural-operation workers across tabs and Combine
   Files. A third operation is rejected with an actionable message. Structural
   analysis also counts; a completed duplicate preview does not occupy a slot.
+  Deferred storage reviews recheck this budget before consuming their pending
+  operation, retaining the review until a slot is free.
 - Indexing, search, filtering, and filtered reads retain their existing per-document
   worker limits. With eight tabs, there are at most eight workers of each kind.
   Each structural/filter checkpoint index retains its existing 16 MiB budget;
