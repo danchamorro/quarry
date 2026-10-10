@@ -129,7 +129,9 @@ selection of the same path are rejected; header-only files are allowed.
 
 The output contains one header and every data row in the selected file order,
 including duplicates. Values, quoting and record endings are preserved; an
-unterminated record receives LF to keep the next file separate. Encoding BOMs
+unterminated record receives a line ending to keep the next file separate
+(CRLF when needed to preserve a trailing carriage return in the last field,
+otherwise LF). Encoding BOMs
 from subsequent inputs are omitted. The 64 MiB record and 65,536-column limits
 apply. A missing field is an incompatible row; an explicitly empty field is
 preserved.

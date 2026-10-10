@@ -13,7 +13,7 @@ use crate::export::{ExportTarget, source_matches_stamp};
 use crate::storage::output_parent;
 use crate::{
     DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, DEFAULT_SAMPLE_BYTES, FilterExportOutcome,
-    MAX_TRANSFORMATION_COLUMNS, QuarryError, SourceStamp, check_storage, detect_delimiter,
+    MAX_TRANSFORMATION_COLUMNS, QuarryError, SourceStamp, check_storage, detect_file_delimiter,
 };
 
 const BOM: &[u8] = b"\xef\xbb\xbf";
@@ -50,7 +50,7 @@ pub struct CombinePlan {
     pub delimiter: u8,
     pub has_header: bool,
     pub data_rows: u64,
-    /// Exact output length, including a terminating LF added to unterminated records.
+    /// Exact output length, including terminators added to unterminated records.
     pub output_bytes: u64,
 }
 
@@ -216,11 +216,13 @@ pub fn check_combine_files(
                 RecordScanner::new(delimiter)?;
                 delimiter
             } else {
-                let mut sample = Vec::new();
-                file.by_ref()
-                    .take(DEFAULT_SAMPLE_BYTES as u64)
-                    .read_to_end(&mut sample)?;
-                detect_delimiter(&sample, sample.len() as u64 == stamp.file_size())
+                detect_file_delimiter(
+                    &mut file,
+                    stamp.file_size(),
+                    DEFAULT_SAMPLE_BYTES,
+                    DEFAULT_MAX_RECORD_BYTES,
+                )
+                .map_err(|error| input_error(&path, Some(1), error))?
             };
             if let Some(expected) = delimiter {
                 if expected != observed_delimiter {
@@ -296,7 +298,7 @@ pub fn check_combine_files(
                     if included_record(options.has_header, index, row) {
                         let raw = output_record(record, index, row);
                         output_bytes = output_bytes
-                            .checked_add(raw.len() as u64 + u64::from(!raw.ends_with(b"\n")))
+                            .checked_add(raw.len() as u64 + output_ending(raw).len() as u64)
                             .ok_or(QuarryError::InvalidOption(
                                 "combined output size exceeds the supported limit",
                             ))?;
@@ -374,10 +376,9 @@ impl CombinePlan {
                         let raw = output_record(record, index, row);
                         output.write_all(raw)?;
                         bytes_written += raw.len() as u64;
-                        if !raw.ends_with(b"\n") {
-                            output.write_all(b"\n")?;
-                            bytes_written += 1;
-                        }
+                        let ending = output_ending(raw);
+                        output.write_all(ending)?;
+                        bytes_written += ending.len() as u64;
                     }
                     Ok(())
                 })? {
@@ -408,6 +409,17 @@ fn output_record(record: &[u8], file: usize, row: u64) -> &[u8] {
         record.strip_prefix(BOM).unwrap_or(record)
     } else {
         record
+    }
+}
+
+fn output_ending(record: &[u8]) -> &[u8] {
+    if record.ends_with(b"\n") {
+        b""
+    } else if record.ends_with(b"\r") {
+        // The existing CR is field data. A separate CRLF terminator preserves it.
+        b"\r\n"
+    } else {
+        b"\n"
     }
 }
 
@@ -653,6 +665,83 @@ mod tests {
                 assert_eq!(reopened.dialect.delimiter, delimiter as u8);
                 assert_eq!(reopened.first_rows[0].fields.len(), 2);
             }
+        }
+    }
+
+    #[test]
+    fn detects_long_first_records_and_rejects_their_width_mismatches() {
+        let payload = "x".repeat(DEFAULT_SAMPLE_BYTES + 32);
+        for delimiter in [',', '\t', '|', ';'] {
+            for quoted in [false, true] {
+                let field = if quoted {
+                    format!("\"{payload}\ninside{delimiter}field\"")
+                } else {
+                    payload.clone()
+                };
+                let first = format!("1{delimiter}{field}");
+                let second = format!("2{delimiter}two\n");
+                let dir = tempfile::tempdir().unwrap();
+                let paths = inputs(dir.path(), &[first.as_bytes(), second.as_bytes()]);
+                let opened =
+                    crate::Session::open(&paths[0], crate::OpenOptions::default()).unwrap();
+                assert_eq!(opened.dialect.delimiter, delimiter as u8);
+                assert_eq!(opened.first_rows[0].fields.len(), 2);
+                let checked = plan(paths, false).unwrap();
+                assert_eq!(checked.delimiter, delimiter as u8);
+                assert_eq!(checked.columns, 2);
+                let output = dir.path().join("out.csv");
+                checked.start_write(output.clone()).unwrap().wait().unwrap();
+                assert_eq!(
+                    fs::read(&output).unwrap(),
+                    format!("{first}\n{second}").as_bytes()
+                );
+
+                let mismatched = format!("2{delimiter}{field}{delimiter}extra");
+                let paths = inputs(dir.path(), &[first.as_bytes(), mismatched.as_bytes()]);
+                let error = plan(paths, false).unwrap_err().to_string();
+                assert!(error.contains("Expected 2 columns, found 3"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_trailing_carriage_returns_as_field_data() {
+        for (first, second, has_header, expected) in [
+            (
+                b"1,one\r".as_slice(),
+                b"2,two\r".as_slice(),
+                false,
+                b"1,one\r\r\n2,two\r\r\n".as_slice(),
+            ),
+            (
+                b"ID,Name\r".as_slice(),
+                b"ID,\"Name\r\"\n2,two\r".as_slice(),
+                true,
+                b"ID,Name\r\r\n2,two\r\r\n".as_slice(),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let checked = plan(inputs(dir.path(), &[first, second]), has_header).unwrap();
+            assert_eq!(checked.output_bytes, expected.len() as u64);
+            let output = dir.path().join("out.csv");
+            let summary = checked
+                .start_write(output.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert_eq!(summary.bytes_written, expected.len() as u64);
+            assert_eq!(fs::read(&output).unwrap(), expected);
+            let opened = crate::Session::open(output, crate::OpenOptions::default()).unwrap();
+            assert_eq!(opened.first_rows[1].fields[1], b"two\r");
+            assert_eq!(
+                opened.first_rows[0].fields[1],
+                if has_header {
+                    b"Name\r".as_slice()
+                } else {
+                    b"one\r".as_slice()
+                }
+            );
         }
     }
 

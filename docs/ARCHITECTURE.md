@@ -315,7 +315,9 @@ size. No output is written by this check.
 
 `CombinePlan::start_write` checks destination space and streams inputs in the
 selected order through `ExportTarget`. It omits later headers and encoding
-BOMs, adds LF to an unterminated record and otherwise copies record bytes.
+BOMs, adds a line ending to an unterminated record and otherwise copies record
+bytes. A final CR that belongs to a field receives a separate CRLF terminator
+so parsing the result retains that data byte; other unterminated records get LF.
 The shared target checks all input stamps immediately before no-clobber
 publication, after output flush and sync. Dropped/cancelled/failed jobs remove
 staging. Metadata grows with the number of selected files; record memory stays

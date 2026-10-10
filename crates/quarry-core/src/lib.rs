@@ -303,17 +303,18 @@ impl Session {
         let source_stamp = SourceStamp::from_file(&file)?;
         let file_size = source_stamp.file_size();
 
-        let mut sample = vec![0; options.sample_bytes.min(file_size as usize)];
-        let sample_len = read_up_to(&mut file, &mut sample)?;
-        sample.truncate(sample_len);
         let delimiter = match options.delimiter {
             Some(delimiter) => {
                 RecordScanner::new(delimiter)?;
                 delimiter
             }
-            None => detect_delimiter(&sample, sample.len() as u64 == file_size),
+            None => detect_file_delimiter(
+                &mut file,
+                file_size,
+                options.sample_bytes,
+                options.bootstrap_limit,
+            )?,
         };
-        drop(sample);
 
         file.seek(SeekFrom::Start(0))?;
         let (bootstrap, ends) = read_initial_records(
@@ -442,8 +443,40 @@ fn materialize_rows(bytes: &[u8], ends: &[u64], delimiter: u8) -> Result<Vec<Row
     Ok(rows)
 }
 
-fn detect_delimiter(sample: &[u8], at_eof: bool) -> u8 {
+fn detect_file_delimiter(
+    file: &mut File,
+    file_size: u64,
+    sample_bytes: usize,
+    limit: usize,
+) -> Result<u8, QuarryError> {
+    let mut sample = Vec::new();
+    let mut target = sample_bytes.min(limit);
+    loop {
+        file.by_ref()
+            .take((target - sample.len()) as u64)
+            .read_to_end(&mut sample)?;
+        let at_eof = sample.len() as u64 == file_size;
+        if let Some(delimiter) = detect_delimiter(&sample, at_eof) {
+            return Ok(delimiter);
+        }
+        if sample.len() >= limit {
+            return Err(QuarryError::BootstrapLimitExceeded {
+                limit,
+                rows_found: 0,
+            });
+        }
+        if sample.len() < target {
+            return Err(QuarryError::SourceChanged);
+        }
+        // A partial first record is not evidence for a one-column comma file.
+        // Grow only until a complete record is available, within the caller's cap.
+        target = target.saturating_mul(2).min(limit);
+    }
+}
+
+fn detect_delimiter(sample: &[u8], at_eof: bool) -> Option<u8> {
     let mut best = (0_usize, 0_usize, b',');
+    let mut has_record = false;
     for delimiter in *b",\t|;" {
         let Ok(mut scanner) = RecordScanner::new(delimiter) else {
             continue;
@@ -473,6 +506,8 @@ fn detect_delimiter(sample: &[u8], at_eof: bool) -> u8 {
             continue;
         }
 
+        has_record |= !ends.is_empty();
+
         let mut start = 0;
         let mut frequencies = HashMap::new();
         for (physical_row, end) in ends.into_iter().enumerate() {
@@ -497,7 +532,7 @@ fn detect_delimiter(sample: &[u8], at_eof: bool) -> u8 {
             best = (frequency, columns, delimiter);
         }
     }
-    best.2
+    (at_eof || has_record).then_some(best.2)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -656,18 +691,6 @@ fn read_rows_from_index(
     }
 
     Ok(rows)
-}
-
-fn read_up_to(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<usize> {
-    let mut read = 0;
-    while read < bytes.len() {
-        let count = reader.read(&mut bytes[read..])?;
-        if count == 0 {
-            break;
-        }
-        read += count;
-    }
-    Ok(read)
 }
 
 #[cfg(test)]
@@ -880,6 +903,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, QuarryError::BootstrapLimitExceeded { .. }));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn grows_delimiter_sample_without_exceeding_bootstrap_limit() {
+        let path = fixture(format!("ID\t{}\n", "x".repeat(100)).as_bytes());
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                rows: 1,
+                sample_bytes: 16,
+                bootstrap_limit: 128,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(session.dialect.delimiter, b'\t');
+        assert_eq!(session.first_rows[0].fields.len(), 2);
+        assert!(matches!(
+            Session::open(
+                &path,
+                OpenOptions {
+                    rows: 1,
+                    sample_bytes: 16,
+                    bootstrap_limit: 64,
+                    ..OpenOptions::default()
+                },
+            ),
+            Err(QuarryError::BootstrapLimitExceeded {
+                limit: 64,
+                rows_found: 0,
+            })
+        ));
         fs::remove_file(path).unwrap();
     }
 }
