@@ -177,6 +177,9 @@ impl QuarryApp {
                 document.commit_edits();
             }
             std::mem::swap(&mut self.active, &mut self.tabs[index]);
+            if self.tabs[index].document.is_none() {
+                self.tabs.remove(index);
+            }
             self.pending_tab_focus = true;
             self.reveal_tab = true;
         }
@@ -334,11 +337,24 @@ impl QuarryApp {
 
     pub(super) fn poll_document_tabs(&mut self, ctx: &egui::Context) {
         self.poll_active_document(ctx, true);
+        let mut failed_reloads = Vec::new();
         for index in 0..self.tabs.len() {
             // Poll completions against their owning document, never the visible tab.
             std::mem::swap(&mut self.active, &mut self.tabs[index]);
             self.poll_active_document(ctx, false);
+            if self.active.document.is_none()
+                && let Some(notice) = self.active.notice.take()
+            {
+                failed_reloads.push(notice.text);
+            }
             std::mem::swap(&mut self.active, &mut self.tabs[index]);
+        }
+        self.tabs.retain(|tab| tab.document.is_some());
+        if !failed_reloads.is_empty() {
+            if let Some(notice) = self.active.notice.take() {
+                failed_reloads.insert(0, notice.text);
+            }
+            self.active.notice = Some(AppMessage::error(failed_reloads.join("\n")));
         }
         for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
             if !tab.writing() {
@@ -1008,6 +1024,55 @@ mod tests {
                 .unwrap()
                 .available_filter_rows(),
             111
+        );
+    }
+
+    #[test]
+    fn failed_background_save_reload_surfaces_its_error_and_removes_the_empty_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = fixture(directory.path(), "a.csv");
+        let b = fixture(directory.path(), "b.csv");
+        let saved = directory.path().join("moved-saved-a.csv");
+        let ctx = egui::Context::default();
+        let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
+        edited(&mut app, "saved-a");
+        assert!(app.save_current());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .save_job
+            .as_ref()
+            .unwrap()
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        fs::rename(&a, &saved).unwrap();
+        app.open_new_path(b.clone()).unwrap();
+        edited(&mut app, "unsaved-b");
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(FIND_INPUT_ID)));
+        app.poll_document_tabs(&ctx);
+        assert!(app.tabs.is_empty());
+        assert_eq!(app.active.document.as_ref().unwrap().logical_path, b);
+        assert_eq!(
+            app.active.document.as_ref().unwrap().column_name(0),
+            "unsaved-b"
+        );
+        assert!(app.active.document.as_ref().unwrap().can_undo());
+        let notice = app.active.notice.as_ref().unwrap();
+        assert_eq!(notice.severity, MessageSeverity::Error);
+        assert!(notice.contains("could not reload"));
+        assert!(notice.contains(&a.display().to_string()));
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new(FIND_INPUT_ID))));
+        assert!(
+            fs::read_to_string(saved)
+                .unwrap()
+                .starts_with("saved-a,value")
         );
     }
 
