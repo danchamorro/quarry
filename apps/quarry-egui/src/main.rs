@@ -337,6 +337,7 @@ struct QuarryApp {
     quit_authorized: bool,
     quit_approved: BTreeSet<u64>,
     pending_tab_focus: bool,
+    reveal_tab: bool,
     started: Instant,
     logged_first_update: bool,
     #[cfg(target_os = "macos")]
@@ -525,6 +526,7 @@ impl QuarryApp {
             quit_authorized: false,
             quit_approved: BTreeSet::new(),
             pending_tab_focus: false,
+            reveal_tab: false,
             started,
             logged_first_update: false,
             #[cfg(target_os = "macos")]

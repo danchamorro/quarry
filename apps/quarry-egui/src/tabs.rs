@@ -178,6 +178,7 @@ impl QuarryApp {
             }
             std::mem::swap(&mut self.active, &mut self.tabs[index]);
             self.pending_tab_focus = true;
+            self.reveal_tab = true;
         }
     }
 
@@ -300,6 +301,7 @@ impl QuarryApp {
         tab.document = Some(document);
         let previous = std::mem::replace(&mut self.active, tab);
         self.pending_tab_focus = true;
+        self.reveal_tab = true;
         if previous.document.is_some() {
             self.tabs.push(previous);
         }
@@ -438,6 +440,7 @@ impl QuarryApp {
                 )
             };
             self.pending_tab_focus = true;
+            self.reveal_tab = true;
             self.reset_tab_focus(ctx);
             ctx.memory_mut(|memory| {
                 if let Some(id) = memory.focused() {
@@ -496,6 +499,7 @@ impl QuarryApp {
         tabs.sort_by_key(|tab| tab.0);
         let mut select = None;
         let mut close = None;
+        let reveal = std::mem::take(&mut self.reveal_tab);
         if !tabs.is_empty() {
             egui::TopBottomPanel::top("quarry-document-tabs")
                 .exact_height(30.0)
@@ -503,6 +507,7 @@ impl QuarryApp {
                     ui.add_enabled_ui(!blocked, |ui| {
                         egui::ScrollArea::horizontal()
                             .id_salt("quarry-tab-strip")
+                            .animated(false)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     for (id, title, path, caption) in &tabs {
@@ -517,6 +522,9 @@ impl QuarryApp {
                                                     .truncate(),
                                                 )
                                                 .on_hover_text(path);
+                                            if reveal && self.active.id == *id {
+                                                response.scroll_to_me(Some(Align::Center));
+                                            }
                                             response.widget_info(|| {
                                                 egui::WidgetInfo::selected(
                                                     egui::WidgetType::SelectableLabel,
@@ -1050,6 +1058,60 @@ mod tests {
                 .index,
             2
         );
+    }
+
+    #[test]
+    fn compact_strip_reveals_the_active_tab_after_open_and_keyboard_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = (0..8)
+            .map(|index| fixture(directory.path(), &format!("document-{index}.csv")))
+            .collect();
+        let mut app = QuarryApp::with_paths(paths, Instant::now());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        let render = |app: &mut QuarryApp, events| {
+            ctx.run(input(events), |ctx| {
+                eframe::App::update(app, ctx, &mut frame)
+            })
+        };
+        let mut render = render;
+        for _ in 0..4 {
+            render(&mut app, vec![]);
+        }
+        let assert_visible = |output: egui::FullOutput, filename: &str| {
+            let tree = output.platform_output.accesskit_update.unwrap();
+            let node = &tree
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label().is_some_and(|label| {
+                        label.starts_with(&format!("Document tab: {filename}"))
+                    })
+                })
+                .unwrap()
+                .1;
+            let bounds = node.bounds().unwrap();
+            assert!(
+                bounds.x0 >= 0.0 && bounds.x1 <= 860.0,
+                "selected tab is outside strip: {bounds:?}"
+            );
+        };
+        assert_visible(render(&mut app, vec![]), "document-7.csv");
+        render(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                modifiers: egui::Modifiers::CTRL,
+                pressed: true,
+                physical_key: None,
+                repeat: false,
+            }],
+        );
+        for _ in 0..4 {
+            render(&mut app, vec![]);
+        }
+        assert_visible(render(&mut app, vec![]), "document-0.csv");
     }
 
     #[test]
