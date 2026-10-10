@@ -517,9 +517,12 @@ column list scrolls. Each row aligns its checkbox, original column number,
 and name, including long names. Hover a truncated name to read it in full.
 Closing preserves the search text and the current view settings.
 
-These choices are view-only. They do not create an unsaved file change, and
-they do not alter the order written by Save. Original file-column numbers stay
-attached to their columns after a view reorder. Split, Combine, Move Selected
+These choices do not create an unsaved file change, and they do not alter the
+order written by **Save**. To keep a reordered layout in a new CSV, choose
+**Save As…**; reordering alone enables it without needing a cell or header edit.
+The saved copy uses the current column order and includes every column, even
+hidden columns. Original file-column numbers stay attached to their columns
+after a view reorder. Split, Combine, Move Selected
 Columns, and Delete Selected Columns create a newly numbered working document.
 
 Click **Auto-fit columns** at the bottom of the **Columns…** window to fit every
@@ -593,7 +596,11 @@ header change instead.
 
 - **Save** safely replaces the current file after the complete write succeeds.
 - **Save As…** writes to a new unused path, preserves the previous source, and
-  opens the saved copy after success.
+  opens the saved copy after success. It applies the column order set in
+  **Columns…**, includes hidden columns and all rows (even when a filter is
+  active), and includes any cell, header, or structural edits. Reordering
+  columns alone is enough to enable it. Use **Export Filtered Rows…** to save
+  only matching rows instead.
 - **Discard Changes** restores the last opened or saved file and removes all
   unsaved cell, header, Replace All, Split, Combine, Move Selected Columns,
   Delete Selected Columns, Delete Selected Rows, duplicate removal, and Sort changes.

@@ -49,7 +49,9 @@ alternatives and AND across filtered columns; background structural
 indexing; safe streaming filtered export to a new file;
 progress/cancellation; parsing metadata; diagnostics and benchmarks.
 
-Column controls operate on stable source-column identities. Header columns are
+Column controls operate on stable source-column identities. Save As writes the
+current column order, including hidden columns, and is available after a view
+reorder alone. Ordinary Save retains document order. Header columns are
 available immediately, while extra fields in ragged rows become available when
 the viewer encounters them.
 
