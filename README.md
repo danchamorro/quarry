@@ -63,6 +63,7 @@ acceptance or discovery criteria. Propose a feature through
 | Area | What Quarry supports |
 |---|---|
 | Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
+| Combine files | Combine two or more matching saved files in a chosen order; validate every record; keep one header and all data rows; save to a new file with progress and cancellation |
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
 | Find and replace | Literal Find Next and Find Previous, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
 | Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, Does not equal, exact numeric comparisons, and inclusive Between; same-column alternatives with AND across columns; text is case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
@@ -215,6 +216,7 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - [1 GB exact numeric filtering and export validation](docs/benchmarks/2026-09-05-numeric-filters.md)
 - [1 GB duplicate matching and removal validation](docs/benchmarks/2026-09-05-find-remove-duplicates.md)
 - [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)
+- [Matching-file combination and 20 GB write cancellation in VMPal](docs/benchmarks/2026-10-10-combine-files.md)
 - [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
 
 </details>

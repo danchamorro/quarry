@@ -311,6 +311,27 @@ filtered position must not be treated as a physical data row unless Quarry can
 identify that row unambiguously. Row insertion is tracked separately in
 [issue #73](https://github.com/danchamorro/quarry/issues/73).
 
+## Combining matching files
+
+**Combine Files** creates one new file from two or more saved files. Users
+select inputs, control their order and explicitly select header mode. Every
+input must use the same delimiter and every record must have the same column
+count. Header names and order match exactly, including case and whitespace.
+The first header is kept once; all data rows, including duplicates, are retained.
+
+A cancellable bounded scan validates the entire selection before writing and
+reports file-specific mismatch errors. The result summary includes column and
+row counts and exact output size. A destination-volume capacity check precedes
+the streaming write. Source stamps are rechecked before reads and publication;
+atomic no-clobber publication and staging cleanup preserve inputs and existing
+destinations on failure or cancellation.
+
+This workflow reads saved disk contents and leaves the current document and
+unsaved edits intact. The user opens the completed output explicitly through
+the existing document guard. It does not append to the active document or add
+cross-file history. See [the user guide](USER_GUIDE.md#combine-files) and
+[ADR 0006](adr/0006-combine-files.md).
+
 ## Progressive opening
 1. Open the file and sample a bounded region.
 2. Detect likely encoding/delimiter/quote settings.
