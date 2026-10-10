@@ -18,6 +18,7 @@ pub(super) struct CombineDialog {
     result: Option<CombineSummary>,
     message: Option<String>,
     cancel_requested: bool,
+    protected_paths: Vec<PathBuf>,
 }
 
 impl Default for CombineDialog {
@@ -35,6 +36,7 @@ impl Default for CombineDialog {
             result: None,
             message: None,
             cancel_requested: false,
+            protected_paths: Vec::new(),
         }
     }
 }
@@ -143,6 +145,18 @@ impl CombineDialog {
     }
 
     fn prepare_destination(&mut self, destination: PathBuf) {
+        if self
+            .protected_paths
+            .iter()
+            .any(|path| tabs::paths_alias(path, &destination))
+        {
+            self.space = None;
+            self.destination = None;
+            self.message = Some(
+                "This file is open or being written in another tab. Choose another output.".into(),
+            );
+            return;
+        }
         let Some(plan) = self.plan.as_ref() else {
             return;
         };
@@ -312,16 +326,27 @@ enum DialogAction {
 
 impl QuarryApp {
     pub(super) fn open_combine_files(&mut self) {
-        if self.document.as_ref().is_some_and(|doc| {
-            doc.save_job.is_some() || doc.export_job.is_some() || doc.structural_job.is_some()
-        }) {
-            self.notice = Some(AppMessage::warning(
-                "Wait for the active file operation before combining files.",
+        if !self.write_slot_available() {
+            self.active.notice = Some(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish or cancel it before combining files.",
             ));
             return;
         }
-        self.combine_files = Some(CombineDialog::default());
-        self.notice = None;
+        let protected_paths = self
+            .document_tabs()
+            .flat_map(|tab| {
+                tab.document
+                    .as_ref()
+                    .map(|document| document.logical_path.clone())
+                    .into_iter()
+                    .chain(tab.write_destination.clone())
+            })
+            .collect();
+        self.combine_files = Some(CombineDialog {
+            protected_paths,
+            ..Default::default()
+        });
+        self.active.notice = None;
     }
 
     pub(super) fn show_combine_files(&mut self, ctx: &egui::Context) {
@@ -334,8 +359,7 @@ impl QuarryApp {
                 self.combine_files = None;
             }
             DialogAction::Open(path, delimiter, has_header) => {
-                // The normal document guard preserves pending edits. Temporarily remove
-                // our modal so this intentional open can use that guard.
+                // Opening the result creates a tab, preserving all existing documents.
                 let dialog = self.combine_files.take();
                 if let Err(error) = self.open_path_with_options(
                     path,
@@ -351,20 +375,20 @@ impl QuarryApp {
                 ) {
                     self.combine_files = dialog;
                     self.combine_files.as_mut().unwrap().message = Some(format!(
-                        "The combined file is saved. {} Close this dialog to save or discard the open document first.",
+                        "The combined file is saved. {} Close this dialog and free a tab before opening the result.",
                         error.text
                     ));
                 } else {
-                    self.delimiter_mode = DelimiterMode::ALL
+                    self.active.delimiter_mode = DelimiterMode::ALL
                         .into_iter()
                         .find(|mode| mode.delimiter() == Some(delimiter))
                         .unwrap_or(DelimiterMode::Auto);
-                    self.header_mode = if has_header {
+                    self.active.header_mode = if has_header {
                         HeaderMode::FirstRow
                     } else {
                         HeaderMode::NoHeader
                     };
-                    self.notice = None;
+                    self.active.notice = None;
                 }
             }
         }
@@ -461,7 +485,7 @@ mod tests {
         fs::write(&a, b"ID,Name\n1,a\n").unwrap();
         fs::write(&b, b"ID,Name\n2,b\n").unwrap();
         let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
-        let doc = app.document.as_mut().unwrap();
+        let doc = app.active.document.as_mut().unwrap();
         doc.begin_cell_edit(1, 1, b"a".to_vec()).unwrap();
         doc.cell_edit.as_mut().unwrap().draft = "unsaved".into();
         app.open_combine_files();
@@ -478,7 +502,8 @@ mod tests {
         assert!(dialog.result.is_some());
         assert_eq!(fs::read(&out).unwrap(), b"ID,Name\n1,a\n2,b\n");
         assert_eq!(
-            app.document
+            app.active
+                .document
                 .as_ref()
                 .unwrap()
                 .cell_edit
@@ -488,7 +513,7 @@ mod tests {
             "unsaved"
         );
         assert!(app.open_new_path(out).is_err());
-        assert_eq!(app.document.as_ref().unwrap().logical_path, a);
+        assert_eq!(app.active.document.as_ref().unwrap().logical_path, a);
         assert_eq!(fs::read(&b).unwrap(), b"ID,Name\n2,b\n");
     }
 

@@ -63,6 +63,7 @@ acceptance or discovery criteria. Propose a feature through
 | Area | What Quarry supports |
 |---|---|
 | Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
+| Document tabs | Up to eight independent files; retain edits, selection, view, filters and background progress; safe per-tab close and session quit; two concurrent file operations |
 | Combine files | Combine two or more matching saved files in a chosen order; validate every record; keep one header and all data rows; save to a new file with progress and cancellation |
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
 | Find and replace | Literal Find Next and Find Previous, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |

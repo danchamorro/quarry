@@ -7,6 +7,7 @@ delimited files in the Quarry macOS app.
 
 - [Getting started](#getting-started)
 - [How to](#how-to)
+  - [Work with document tabs](#work-with-document-tabs)
   - [Combine files](#combine-files)
   - [Navigate the grid](#navigate-the-grid)
   - [Select and copy data](#select-and-copy-data)
@@ -48,7 +49,10 @@ any of these ways:
 
 - Double-click it in Finder after associating its file type with Quarry.
 - Open Quarry's file menu, choose **Open…**, and select the file.
-- Drop a local file onto the centered target shown when no file is open.
+- Drop one or more local files onto Quarry.
+
+Each file opens in a tab. Selecting multiple files in **Open…** opens all of them.
+Opening the same file again selects its existing tab and preserves its state.
 
 Quarry detects the delimiter and header row automatically. If the result is
 wrong, open **Format**, choose the correct delimiter and header settings, then
@@ -59,6 +63,8 @@ reopening the file with different settings.
 
 - The top ruler contains the one-based file-column numbers for the current
   document. View-only hiding and reordering preserve those identities.
+- The tab strip switches between open documents. A dot marks unsaved changes;
+  an activity marker indicates background work. Hover a tab to see its full path.
 - The row below the ruler contains the column names when the file has a header.
 - The numbers on the left identify data rows. The header is not counted as a
   data row.
@@ -105,6 +111,27 @@ the [beta tester guide](BETA_TESTER_GUIDE.md#candidate-and-compatibility).
 
 ## How to
 
+### Work with document tabs
+
+Use **Open…** or **⌘O**, Finder, or drag-and-drop to open files in separate tabs.
+Click a tab, or use **Ctrl-Tab** and **Ctrl-Shift-Tab**, to switch. Each tab keeps
+its edits, Undo/Redo, selection, visible columns, row position, search, filters,
+and background progress. Menus, copying, and save shortcuts act on the active tab.
+Opening a combined result also creates a tab, preserving existing unsaved work.
+
+Click a tab's **×**, choose **Close Tab**, or press **⌘W** to close it. Unsaved
+changes offer Save, Save As, Keep Editing, or Discard. Active file operations
+finish before the tab closes; you can keep editing or cancel the operation.
+Quitting reviews every document. Cancelling any quit prompt retains all tabs and
+their edits, including earlier discard approvals. Files already saved stay saved.
+
+Quarry supports eight open tabs and two simultaneous save/export/reshape
+operations. If you reach a limit, close a tab or wait for/cancel an operation.
+Indexing, searches, and filters can continue in background tabs. Temporary files
+and history remain available until their owning tab closes. Save As and export
+cannot write to a file open or being written in another tab; choose another
+destination or close that tab first.
+
 ### Combine files
 
 Use **File → Combine Files…** (also available with no file open) to put the
@@ -144,8 +171,8 @@ be a new file: an existing destination is never overwritten. Cancellation or
 failure removes unpublished output. Changes to an input after the file check
 require checking again.
 
-Opening the result still protects unsaved work in the current document. Save
-or discard that work before opening another file. Combining creates a separate
+Opening the result creates a tab and retains every other document's unsaved work.
+Combining creates a separate
 file, so it is not a change in the current document's Undo history. Once opened,
 the result supports the usual editing, Undo/Redo, filtering, Save and Save As.
 
@@ -679,7 +706,9 @@ setting.
 
 | Action | Mouse or keyboard |
 |---|---|
-| Open a file | **Open…** in the file menu or empty-state target |
+| Open files in tabs | **Open…** in the file menu or empty-state target, Command+O |
+| Switch document tabs | Click a tab, Ctrl-Tab, or Ctrl-Shift-Tab |
+| Close the active tab | Tab **×**, **Close Tab**, or Command+W |
 | Jump to a data row | Enter in **Row**, or click **Go** |
 | Edit a cell | Double-click, or select and press Enter or F2 |
 | Keep a cell edit | Enter or click elsewhere |

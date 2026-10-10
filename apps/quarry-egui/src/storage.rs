@@ -186,10 +186,16 @@ impl StorageReview {
 
 impl QuarryApp {
     pub(super) fn defer_storage(&mut self, operation: PendingStorageOperation) -> bool {
-        if self.storage_approved {
+        if !self.write_slot_available() {
+            self.active.notice = Some(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish or cancel it before starting another.",
+            ));
+            return true;
+        }
+        if self.active.storage_approved {
             return false;
         }
-        let Some(document) = self.document.as_mut() else {
+        let Some(document) = self.active.document.as_mut() else {
             return false;
         };
         document.commit_edits();
@@ -198,7 +204,7 @@ impl QuarryApp {
         }
         // A completed index prevents a byte-count fallback from greatly overstating padding/spill needs.
         if document.index.is_none() {
-            self.notice = Some(AppMessage::warning(
+            self.active.notice = Some(AppMessage::warning(
                 "Wait for indexing to finish so Quarry can calculate storage requirements.",
             ));
             return true;
@@ -208,7 +214,7 @@ impl QuarryApp {
     }
 
     pub(super) fn begin_storage_review(&mut self, operation: PendingStorageOperation) {
-        let Some(document) = self.document.as_ref() else {
+        let Some(document) = self.active.document.as_ref() else {
             return;
         };
         let directory = match &operation {
@@ -222,20 +228,21 @@ impl QuarryApp {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf();
-        self.storage_review = Some(StorageReview::new(
+        self.active.storage_review = Some(StorageReview::new(
             directory,
             operation.allowance(document),
             document.retained_storage_paths(),
             Some(operation),
         ));
-        self.notice = None;
+        self.active.notice = None;
     }
 
     pub(super) fn open_storage_settings(&mut self) {
-        self.storage_review = Some(StorageReview::new(
+        self.active.storage_review = Some(StorageReview::new(
             self.working_directory.clone(),
             0,
-            self.document
+            self.active
+                .document
                 .as_ref()
                 .map(Document::retained_storage_paths)
                 .unwrap_or_default(),
@@ -244,7 +251,7 @@ impl QuarryApp {
     }
 
     pub(super) fn show_storage_review(&mut self, ctx: &egui::Context) {
-        let Some(review) = self.storage_review.as_mut() else {
+        let Some(review) = self.active.storage_review.as_mut() else {
             return;
         };
         review.poll();
@@ -384,25 +391,30 @@ impl QuarryApp {
             review.check();
         }
         if cancel {
-            self.storage_review = None;
-            if self.close_after_save {
-                self.close_after_save = false;
-                self.close_confirmation_open = true;
+            self.active.storage_review = None;
+            if self.active.close_after_save {
+                self.active.close_after_save = false;
+                self.active.close_confirmation_open = true;
             }
         } else if accept {
-            let review = self.storage_review.take().unwrap();
+            let review = self.active.storage_review.take().unwrap();
             if working {
                 self.working_directory = PathBuf::from(review.path_input);
-                if let Some(document) = self.document.as_mut() {
+                if let Some(document) = self.active.document.as_mut() {
                     document.working_directory = self.working_directory.clone();
+                }
+                for tab in &mut self.tabs {
+                    if let Some(document) = tab.document.as_mut() {
+                        document.working_directory = self.working_directory.clone();
+                    }
                 }
             }
             if let Some(operation) = review.operation {
                 // Only the operation resumed by this dialog bypasses the presentation gate.
                 // Engine checks still run immediately before writes.
-                self.storage_approved = true;
+                self.active.storage_approved = true;
                 self.resume_storage_operation(operation, ctx);
-                self.storage_approved = false;
+                self.active.storage_approved = false;
             }
         }
         ctx.request_repaint_after(POLL_INTERVAL);
@@ -415,11 +427,12 @@ impl QuarryApp {
     ) {
         match operation {
             PendingStorageOperation::Structural(dialog) => {
-                self.structural_dialog = Some(dialog);
+                self.active.structural_dialog = Some(dialog);
                 self.apply_structural_dialog_action(StructuralDialogAction::Apply);
             }
             PendingStorageOperation::Materialize(transformation, columns, _) => {
-                self.notice = self
+                self.active.notice = self
+                    .active
                     .document
                     .as_mut()
                     .unwrap()
@@ -433,7 +446,8 @@ impl QuarryApp {
                 replacement,
                 case_sensitivity,
             } => {
-                self.notice = self
+                self.active.notice = self
+                    .active
                     .document
                     .as_mut()
                     .unwrap()
@@ -446,9 +460,9 @@ impl QuarryApp {
                 } else {
                     self.save_current()
                 };
-                if !started && self.close_after_save {
-                    self.close_after_save = false;
-                    self.close_confirmation_open = true;
+                if !started && self.active.close_after_save {
+                    self.active.close_after_save = false;
+                    self.active.close_confirmation_open = true;
                 }
             }
             PendingStorageOperation::Export(destination) => {
@@ -583,7 +597,7 @@ mod tests {
     ) -> egui::FullOutput {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            assert!(app.storage_review.is_some());
+            assert!(app.active.storage_review.is_some());
             let output = ctx.run(egui::RawInput::default(), |ctx| {
                 eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest());
             });
@@ -636,7 +650,7 @@ mod tests {
         std::fs::write(&source, original).unwrap();
         std::fs::write(&other, b"other\nfile\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        assert!(app.document.as_ref().unwrap().index.is_none());
+        assert!(app.active.document.as_ref().unwrap().index.is_none());
         app.open_storage_settings();
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -660,11 +674,11 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
         );
-        assert!(!app.close_confirmation_open);
-        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
+        assert!(!app.active.close_confirmation_open);
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), source);
         let frame = update_review_until(&mut app, &ctx, |app| {
-            app.document.as_ref().unwrap().index.is_some()
-                && app.storage_review.as_ref().unwrap().worker.is_none()
+            app.active.document.as_ref().unwrap().index.is_some()
+                && app.active.storage_review.as_ref().unwrap().worker.is_none()
         });
         assert!(
             frame
@@ -676,20 +690,31 @@ mod tests {
                 .any(|(_, node)| node.label() == Some("Use folder"))
         );
 
-        app.storage_review = None;
-        app.document
+        app.active.storage_review = None;
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_find_next(b"Grace")
             .unwrap();
         app.open_storage_settings();
         update_review_until(&mut app, &ctx, |app| {
-            app.document.as_ref().unwrap().search_job.is_none()
+            app.active.document.as_ref().unwrap().search_job.is_none()
         });
-        assert_eq!(app.document.as_ref().unwrap().last_match.unwrap().row, 2);
+        assert_eq!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .last_match
+                .unwrap()
+                .row,
+            2
+        );
 
-        app.storage_review = None;
-        app.document
+        app.active.storage_review = None;
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_filter(FilterQuery::single(
@@ -700,11 +725,12 @@ mod tests {
             .unwrap();
         app.open_storage_settings();
         update_review_until(&mut app, &ctx, |app| {
-            let document = app.document.as_ref().unwrap();
+            let document = app.active.document.as_ref().unwrap();
             document.filter_job.is_none() && document.visible_filter_rows().len() == 1
         });
         assert!(
-            app.document
+            app.active
+                .document
                 .as_ref()
                 .unwrap()
                 .filter_progress()
@@ -712,48 +738,65 @@ mod tests {
                 .done
         );
 
-        app.storage_review = None;
-        app.document
+        app.active.storage_review = None;
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_filtered_export(output.clone())
             .unwrap();
         app.open_storage_settings();
         update_review_until(&mut app, &ctx, |app| {
-            app.document.as_ref().unwrap().export_job.is_none()
+            app.active.document.as_ref().unwrap().export_job.is_none()
         });
         assert_eq!(
             std::fs::read(output).unwrap(),
             b"name,value\nAda Lovelace,1\n"
         );
 
-        app.storage_review = None;
-        let document = app.document.as_mut().unwrap();
+        app.active.storage_review = None;
+        let document = app.active.document.as_mut().unwrap();
         document.clear_filter().unwrap();
         document.start_split(0, b" ".to_vec()).unwrap();
         // Exercise the large-operation gate without allocating a large fixture.
         document.session.file_size = STORAGE_REVIEW_BYTES;
         app.open_storage_settings();
         update_review_until(&mut app, &ctx, |app| {
-            app.document
+            app.active
+                .document
                 .as_ref()
                 .unwrap()
                 .pending_materialization
                 .is_some()
         });
-        assert!(app.document.as_ref().unwrap().structural_job.is_none());
-        assert!(app.storage_review.as_ref().unwrap().operation.is_none());
+        assert!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .structural_job
+                .is_none()
+        );
+        assert!(
+            app.active
+                .storage_review
+                .as_ref()
+                .unwrap()
+                .operation
+                .is_none()
+        );
         assert_eq!(std::fs::read(&source).unwrap(), original);
-        app.storage_review = None;
+        app.active.storage_review = None;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
         });
         assert!(matches!(
-            app.storage_review.as_ref().unwrap().operation,
+            app.active.storage_review.as_ref().unwrap().operation,
             Some(PendingStorageOperation::Materialize(..))
         ));
         assert!(
-            app.document
+            app.active
+                .document
                 .as_ref()
                 .unwrap()
                 .pending_materialization
@@ -764,12 +807,12 @@ mod tests {
     fn finish(app: &mut QuarryApp) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             document.poll().unwrap();
             if let Some(ready) = document.poll_structural_edit().unwrap() {
                 app.install_materialized_working_copy(ready).unwrap();
             }
-            let document = app.document.as_ref().unwrap();
+            let document = app.active.document.as_ref().unwrap();
             if document.structural_job.is_none() && document.index.is_some() {
                 break;
             }
@@ -791,44 +834,66 @@ mod tests {
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
         finish(&mut app);
         app.working_directory = first.clone();
-        app.document.as_mut().unwrap().working_directory = first.clone();
+        app.active.document.as_mut().unwrap().working_directory = first.clone();
         app.apply_delete_columns(vec![2]);
         finish(&mut app);
-        let first_copy = app.document.as_ref().unwrap().session.path().to_path_buf();
+        let first_copy = app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .path()
+            .to_path_buf();
         assert!(first_copy.starts_with(&first));
         assert_eq!(
             std::fs::read(&first_copy).unwrap(),
             b"key,value\na,1\nb,2\nc,3\n"
         );
         app.working_directory = second.clone();
-        app.document.as_mut().unwrap().working_directory = second.clone();
+        app.active.document.as_mut().unwrap().working_directory = second.clone();
         app.apply_delete_rows(vec![2..=2]);
         finish(&mut app);
-        let second_copy = app.document.as_ref().unwrap().session.path().to_path_buf();
+        let second_copy = app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .path()
+            .to_path_buf();
         assert!(second_copy.starts_with(&second));
         assert!(first_copy.exists());
         app.swap_edit_history(false).unwrap();
         finish(&mut app);
-        assert_eq!(app.document.as_ref().unwrap().session.path(), first_copy);
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.path(),
+            first_copy
+        );
         app.swap_edit_history(true).unwrap();
         finish(&mut app);
-        assert_eq!(app.document.as_ref().unwrap().session.path(), second_copy);
-        app.document.as_mut().unwrap().working_directory = directory.path().join("disconnected");
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.path(),
+            second_copy
+        );
+        app.active.document.as_mut().unwrap().working_directory =
+            directory.path().join("disconnected");
         app.apply_delete_rows(vec![1..=1]);
         assert!(
-            app.notice
+            app.active
+                .notice
                 .as_ref()
                 .unwrap()
                 .contains("Choose another folder")
         );
-        assert!(!app.document.as_ref().unwrap().source_changed);
+        assert!(!app.active.document.as_ref().unwrap().source_changed);
         assert!(first_copy.exists() && second_copy.exists());
         assert_eq!(std::fs::read(&source).unwrap(), original);
         // Saving uses the source volume even though the selected working location vanished.
         assert!(app.save_current());
         let deadline = Instant::now() + Duration::from_secs(10);
         let saved = loop {
-            if let Some(saved) = app.document.as_mut().unwrap().poll_save().unwrap() {
+            if let Some(saved) = app.active.document.as_mut().unwrap().poll_save().unwrap() {
                 break saved;
             }
             assert!(Instant::now() < deadline);
@@ -848,7 +913,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().to_path_buf();
         let mut app = QuarryApp::new(None, Instant::now());
-        app.storage_review = Some(StorageReview {
+        app.active.storage_review = Some(StorageReview {
             operation: Some(PendingStorageOperation::DeleteRows(vec![1..=1])),
             path_input: path.display().to_string(),
             checked_path: path.clone(),
@@ -897,7 +962,7 @@ mod tests {
                 "missing {expected}"
             );
         }
-        let review = app.storage_review.as_mut().unwrap();
+        let review = app.active.storage_review.as_mut().unwrap();
         review
             .result
             .as_mut()
@@ -935,7 +1000,7 @@ mod tests {
         ctx.enable_accesskit();
         ctx.style_mut(|style| style.animation_time = 0.0);
         let output = update_review_until(&mut app, &ctx, |app| {
-            app.storage_review.as_ref().unwrap().ready()
+            app.active.storage_review.as_ref().unwrap().ready()
         });
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         for expected in [
@@ -960,7 +1025,14 @@ mod tests {
                 text.contains("Estimated temporary space") || text == "Working folder"
             })
         ));
-        assert!(app.document.as_ref().unwrap().structural_job.is_none());
+        assert!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .structural_job
+                .is_none()
+        );
 
         let target = nodes
             .iter()
@@ -995,9 +1067,9 @@ mod tests {
         let _ = ctx.run(click(*target), |ctx| {
             eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
         });
-        assert!(app.storage_review.is_none());
+        assert!(app.active.storage_review.is_none());
         finish(&mut app);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(
             std::fs::read(document.session.path()).unwrap(),
             b"key,value\na,1\nb,2\n"
@@ -1013,23 +1085,23 @@ mod tests {
         std::fs::write(&source, b"key\na\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
         finish(&mut app);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.cell_edits.insert((1, 0), b"edited".to_vec());
         // Simulate large metadata without writing a large fixture. No worker starts here.
         document.session.file_size = STORAGE_REVIEW_BYTES;
-        app.close_after_save = true;
+        app.active.close_after_save = true;
         assert!(app.save_current());
-        assert!(app.storage_review.is_some());
-        assert!(app.document.as_ref().unwrap().save_job.is_none());
+        assert!(app.active.storage_review.is_some());
+        assert!(app.active.document.as_ref().unwrap().save_job.is_none());
         assert_eq!(std::fs::read(&source).unwrap(), b"key\na\n");
         update_review_until(&mut app, &egui::Context::default(), |app| {
-            app.storage_review.as_ref().unwrap().worker.is_none()
+            app.active.storage_review.as_ref().unwrap().worker.is_none()
         });
-        assert!(app.close_after_save);
-        assert!(!app.close_confirmation_open);
-        app.storage_review = None;
+        assert!(app.active.close_after_save);
+        assert!(!app.active.close_confirmation_open);
+        app.active.storage_review = None;
         assert_eq!(
-            app.document.as_ref().unwrap().cell_edits[&(1, 0)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)],
             b"edited"
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);

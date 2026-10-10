@@ -43,7 +43,9 @@ use tempfile::TempDir;
 mod about;
 mod combine_files;
 mod storage;
+mod tabs;
 use storage::{PendingStorageOperation, STORAGE_REVIEW_BYTES, StorageReview};
+use tabs::DocumentTab;
 
 const BOOTSTRAP_ROWS: usize = 40;
 const OVERSCAN_ROWS: usize = 16;
@@ -278,7 +280,11 @@ fn main() -> eframe::Result<()> {
     };
 
     let started = Instant::now();
-    let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+    let initial_paths = std::env::args_os()
+        .skip(1)
+        .filter(|argument| !argument.to_string_lossy().starts_with("-psn_"))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
@@ -299,7 +305,7 @@ fn main() -> eframe::Result<()> {
             Box::new(move |creation| {
                 configure_style(&creation.egui_ctx);
                 attach_open_document_context(&creation.egui_ctx);
-                let mut app = QuarryApp::new(initial_path, started);
+                let mut app = QuarryApp::with_paths(initial_paths, started);
                 app.open_document_receiver = Some(open_document_receiver);
                 Ok(Box::new(app))
             }),
@@ -315,7 +321,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |creation| {
             configure_style(&creation.egui_ctx);
-            Ok(Box::new(QuarryApp::new(initial_path, started)))
+            Ok(Box::new(QuarryApp::with_paths(initial_paths, started)))
         }),
     )
 }
@@ -324,29 +330,13 @@ struct QuarryApp {
     about: about::About,
     combine_files: Option<combine_files::CombineDialog>,
     working_directory: PathBuf,
-    storage_review: Option<StorageReview>,
-    storage_approved: bool,
-    jump_input: String,
-    find_input: String,
-    replace_input: String,
-    find_match_case: bool,
-    find_bar_open: bool,
-    replace_expanded: bool,
-    filter_match_case: bool,
-    sort_match_case: bool,
-    column_search_input: String,
-    columns_open: bool,
-    structural_dialog: Option<StructuralDialog>,
-    filter_rules: Vec<FilterRuleDraft>,
-    filters_open: bool,
-    delimiter_mode: DelimiterMode,
-    header_mode: HeaderMode,
-    format_draft: Option<(DelimiterMode, HeaderMode)>,
-    document: Option<Document>,
-    notice: Option<AppMessage>,
-    footer_status: Option<AppMessage>,
-    close_confirmation_open: bool,
-    close_after_save: bool,
+    active: DocumentTab,
+    tabs: Vec<DocumentTab>,
+    next_tab_id: u64,
+    quit_pending: bool,
+    quit_authorized: bool,
+    quit_approved: BTreeSet<u64>,
+    pending_tab_focus: bool,
     started: Instant,
     logged_first_update: bool,
     #[cfg(target_os = "macos")]
@@ -517,34 +507,24 @@ impl Default for FilterRuleDraft {
 }
 
 impl QuarryApp {
+    fn with_paths(paths: Vec<PathBuf>, started: Instant) -> Self {
+        let mut app = Self::new(None, started);
+        app.handle_dropped_paths(paths.into_iter().map(Some).collect());
+        app
+    }
+
     fn new(initial_path: Option<PathBuf>, started: Instant) -> Self {
         let mut app = Self {
             about: about::About::new(),
             combine_files: None,
             working_directory: std::env::temp_dir(),
-            storage_review: None,
-            storage_approved: false,
-            jump_input: "1".into(),
-            find_input: String::new(),
-            replace_input: String::new(),
-            find_match_case: false,
-            find_bar_open: false,
-            replace_expanded: false,
-            filter_match_case: false,
-            sort_match_case: false,
-            column_search_input: String::new(),
-            columns_open: false,
-            structural_dialog: None,
-            filter_rules: vec![FilterRuleDraft::default()],
-            filters_open: false,
-            delimiter_mode: DelimiterMode::Auto,
-            header_mode: HeaderMode::Auto,
-            format_draft: None,
-            document: None,
-            notice: None,
-            footer_status: None,
-            close_confirmation_open: false,
-            close_after_save: false,
+            active: DocumentTab::new(1),
+            tabs: Vec::new(),
+            next_tab_id: 2,
+            quit_pending: false,
+            quit_authorized: false,
+            quit_approved: BTreeSet::new(),
+            pending_tab_focus: false,
             started,
             logged_first_update: false,
             #[cfg(target_os = "macos")]
@@ -559,8 +539,8 @@ impl QuarryApp {
     #[cfg(test)]
     fn open_options(&self) -> OpenOptions {
         OpenOptions {
-            delimiter: self.delimiter_mode.delimiter(),
-            header_mode: self.header_mode,
+            delimiter: self.active.delimiter_mode.delimiter(),
+            header_mode: self.active.header_mode,
             ..OpenOptions::default()
         }
     }
@@ -573,8 +553,6 @@ impl QuarryApp {
 
     fn open_new_path(&mut self, path: PathBuf) -> Result<(), AppMessage> {
         self.open_path_with_options(path, OpenOptions::default())?;
-        self.delimiter_mode = DelimiterMode::Auto;
-        self.header_mode = HeaderMode::Auto;
         Ok(())
     }
 
@@ -588,34 +566,7 @@ impl QuarryApp {
                 "Close Combine Files before opening another document.",
             ));
         }
-        if let Some(document) = self.document.as_mut() {
-            if document.save_job.is_some() {
-                return Err(AppMessage::warning(
-                    "Cancel the active save before opening another file.",
-                ));
-            }
-            if document.structural_job.is_some() {
-                return Err(AppMessage::warning(
-                    "Cancel the active change before opening another file.",
-                ));
-            }
-            document.commit_edits();
-            if document.is_dirty() {
-                return Err(AppMessage::warning(
-                    "Discard or save your changes before opening another file.",
-                ));
-            }
-        }
-        if self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.export_job.is_some())
-        {
-            return Err(AppMessage::warning(
-                "Cancel the active export and wait for it to finish before opening another file.",
-            ));
-        }
-        self.replace_document_with_options(path, options)
+        self.open_document_tab(path, options)
     }
 
     fn replace_document_with_options(
@@ -626,28 +577,30 @@ impl QuarryApp {
         let mut document = Document::prepare(&path, options).map_err(AppMessage::error)?;
         document.working_directory = self.working_directory.clone();
         document.start_indexing().map_err(AppMessage::error)?;
-        if let Some(current) = self.document.as_mut() {
+        if let Some(current) = self.active.document.as_mut() {
             current.shutdown();
         }
-        self.jump_input = "1".into();
-        self.column_search_input.clear();
-        self.columns_open = false;
-        self.find_bar_open = false;
-        self.replace_expanded = false;
-        self.structural_dialog = None;
-        self.filter_rules = vec![FilterRuleDraft::default()];
-        self.filters_open = false;
-        self.format_draft = None;
-        self.document = Some(document);
-        self.footer_status = None;
+        self.active.jump_input = "1".into();
+        self.active.column_search_input.clear();
+        self.active.columns_open = false;
+        self.active.find_bar_open = false;
+        self.active.replace_expanded = false;
+        self.active.structural_dialog = None;
+        self.active.filter_rules = vec![FilterRuleDraft::default()];
+        self.active.filters_open = false;
+        self.active.format_draft = None;
+        self.active.document = Some(document);
+        self.active.footer_status = None;
         Ok(())
     }
 
     fn open_path_and_report(&mut self, path: PathBuf) {
-        let result = self.open_new_path(path);
-        self.notice = result.err();
+        if let Err(error) = self.open_new_path(path) {
+            self.active.notice = Some(error);
+        }
     }
 
+    #[cfg(test)]
     fn open_picker_result(&mut self, path: Option<PathBuf>) {
         if let Some(path) = path {
             self.open_path_and_report(path);
@@ -655,49 +608,37 @@ impl QuarryApp {
     }
 
     fn choose_file(&mut self) {
-        if let Some(document) = self.document.as_mut() {
-            if document.save_job.is_some() {
-                self.notice = Some(AppMessage::warning(
-                    "Cancel the active save before opening another file.",
-                ));
-                return;
-            }
-            document.commit_edits();
-            if document.is_dirty() {
-                self.notice = Some(AppMessage::warning(
-                    "Discard or save your changes before opening another file.",
-                ));
-                return;
-            }
+        if let Some(paths) = rfd::FileDialog::new()
+            .set_title("Open delimited files")
+            .pick_files()
+        {
+            self.handle_dropped_paths(paths.into_iter().map(Some).collect());
         }
-        let path = rfd::FileDialog::new()
-            .set_title("Open a delimited file")
-            .pick_file();
-        self.open_picker_result(path);
     }
 
     fn choose_filtered_export(&mut self) {
-        if let Some(document) = self.document.as_mut() {
+        if let Some(document) = self.active.document.as_mut() {
             if document.save_job.is_some() {
-                self.notice = Some(AppMessage::warning(
+                self.active.notice = Some(AppMessage::warning(
                     "Cancel the active save before exporting filtered rows.",
                 ));
                 return;
             }
             document.commit_edits();
             if document.is_dirty() {
-                self.notice = Some(AppMessage::warning(
+                self.active.notice = Some(AppMessage::warning(
                     "Save or discard your changes before exporting filtered rows.",
                 ));
                 return;
             }
         }
         let Some(source) = self
+            .active
             .document
             .as_ref()
             .map(|document| document.logical_path.clone())
         else {
-            self.notice = Some(AppMessage::warning(
+            self.active.notice = Some(AppMessage::warning(
                 "Open and filter a file before exporting.",
             ));
             return;
@@ -712,13 +653,13 @@ impl QuarryApp {
     }
 
     fn choose_save_as(&mut self) -> bool {
-        let Some(document) = self.document.as_mut() else {
-            self.notice = Some(AppMessage::warning("Open a file before using Save As."));
+        let Some(document) = self.active.document.as_mut() else {
+            self.active.notice = Some(AppMessage::warning("Open a file before using Save As."));
             return false;
         };
         document.commit_edits();
         if !document.is_save_as_ready() {
-            self.notice = Some(AppMessage::warning(if document.save_job.is_some() {
+            self.active.notice = Some(AppMessage::warning(if document.save_job.is_some() {
                 "A save operation is already running."
             } else if document.export_job.is_some() {
                 "Cancel the active export before using Save As."
@@ -741,68 +682,86 @@ impl QuarryApp {
 
     fn save_current(&mut self) -> bool {
         if self.defer_storage(PendingStorageOperation::Save(None)) {
-            return self.storage_review.is_some();
+            return self.active.storage_review.is_some();
         }
         let result = self
+            .active
             .document
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before saving."))
             .and_then(Document::start_save);
-        self.notice = result.err();
-        if self.notice.is_none() {
-            self.footer_status = None;
+        self.active.notice = result.err();
+        if self.active.notice.is_none() {
+            self.active.footer_status = None;
         }
-        self.notice.is_none()
+        self.active.notice.is_none()
     }
 
     fn save_as_picker_result(&mut self, destination: Option<PathBuf>) -> bool {
         let Some(destination) = destination else {
             return false;
         };
+        if !self.destination_available(&destination) {
+            self.active.notice = Some(AppMessage::warning(
+                "This file is open or being written in another tab. Choose another destination or close that tab first.",
+            ));
+            return false;
+        }
         if self.defer_storage(PendingStorageOperation::Save(Some(destination.clone()))) {
-            return self.storage_review.is_some();
+            return self.active.storage_review.is_some();
         }
         let result = self
+            .active
             .document
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before using Save As."))
-            .and_then(|document| document.start_save_as(destination));
-        self.notice = result.err();
-        if self.notice.is_none() {
-            self.footer_status = None;
+            .and_then(|document| document.start_save_as(destination.clone()));
+        self.active.notice = result.err();
+        if self.active.notice.is_none() {
+            self.active.write_destination = Some(destination);
+            self.active.footer_status = None;
         }
-        self.notice.is_none()
+        self.active.notice.is_none()
     }
 
     fn export_picker_result(&mut self, destination: Option<PathBuf>) {
         let Some(destination) = destination else {
             return;
         };
+        if !self.destination_available(&destination) {
+            self.active.notice = Some(AppMessage::warning(
+                "This file is open or being written in another tab. Choose another destination or close that tab first.",
+            ));
+            return;
+        }
         if self.defer_storage(PendingStorageOperation::Export(destination.clone())) {
             return;
         }
         let result = self
+            .active
             .document
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open and filter a file before exporting."))
-            .and_then(|document| document.start_filtered_export(destination));
-        self.notice = result.err();
-        if self.notice.is_none() {
-            self.footer_status = None;
+            .and_then(|document| document.start_filtered_export(destination.clone()));
+        self.active.notice = result.err();
+        if self.active.notice.is_none() {
+            self.active.write_destination = Some(destination);
+            self.active.footer_status = None;
         }
     }
 
     fn reopen_document(&mut self, delimiter_mode: DelimiterMode, header_mode: HeaderMode) {
-        self.format_draft = None;
+        self.active.format_draft = None;
         let Some(path) = self
+            .active
             .document
             .as_ref()
             .map(|document| document.logical_path.clone())
         else {
-            self.notice = Some(AppMessage::warning("Open a file first."));
+            self.active.notice = Some(AppMessage::warning("Open a file first."));
             return;
         };
-        let result = self.open_path_with_options(
+        let result = self.reopen_current_path(
             path,
             OpenOptions {
                 delimiter: delimiter_mode.delimiter(),
@@ -811,46 +770,65 @@ impl QuarryApp {
             },
         );
         if result.is_ok() {
-            self.delimiter_mode = delimiter_mode;
-            self.header_mode = header_mode;
+            self.active.delimiter_mode = delimiter_mode;
+            self.active.header_mode = header_mode;
         }
-        self.notice = result.err();
+        self.active.notice = result.err();
     }
 
     fn reload_document(&mut self) {
-        let Some((path, options)) = self.document.as_ref().map(|document| {
+        let Some((path, options)) = self.active.document.as_ref().map(|document| {
             (
                 document.logical_path.clone(),
                 document.current_open_options(),
             )
         }) else {
-            self.notice = Some(AppMessage::warning("Open a file first."));
+            self.active.notice = Some(AppMessage::warning("Open a file first."));
             return;
         };
-        self.notice = self.open_path_with_options(path, options).err();
+        self.active.notice = self.reopen_current_path(path, options).err();
+    }
+
+    fn reopen_current_path(
+        &mut self,
+        path: PathBuf,
+        options: OpenOptions,
+    ) -> Result<(), AppMessage> {
+        if let Some(document) = self.active.document.as_mut() {
+            document.commit_edits();
+            if document.save_job.is_some()
+                || document.export_job.is_some()
+                || document.structural_job.is_some()
+            {
+                return Err(AppMessage::warning(
+                    "Wait for the active file operation before reopening this document.",
+                ));
+            }
+            if document.is_dirty() {
+                return Err(AppMessage::warning(
+                    "Discard or save your changes before reopening this document.",
+                ));
+            }
+        }
+        self.replace_document_with_options(path, options)
     }
 
     fn handle_dropped_paths(&mut self, dropped: Vec<Option<PathBuf>>) {
-        let count = dropped.len();
-        let Some(path) = dropped.into_iter().flatten().next() else {
-            self.notice = Some(AppMessage::warning(format!(
-                "Ignored {count} dropped item(s); Quarry can only open a local file."
-            )));
-            return;
-        };
-        let ignored = count.saturating_sub(1);
-        let result = self.open_new_path(path);
-        self.notice = match (result, ignored) {
-            (Ok(()), 0) => None,
-            (Ok(()), ignored) => Some(AppMessage::warning(format!(
-                "Opened one file and ignored {ignored} additional dropped item(s)."
-            ))),
-            (Err(error), 0) => Some(error),
-            (Err(mut error), ignored) => {
-                error.text = format!("{error} Ignored {ignored} additional dropped item(s).");
-                Some(error)
+        let mut failures = Vec::new();
+        for path in dropped {
+            match path {
+                Some(path) => {
+                    if let Err(error) = self.open_new_path(path.clone()) {
+                        failures.push(format!("{}: {}", path.display(), error.text));
+                    }
+                }
+                None => failures
+                    .push("Ignored a dropped item; Quarry can only open a local file.".into()),
             }
-        };
+        }
+        if !failures.is_empty() {
+            self.active.notice = Some(AppMessage::warning(failures.join("\n")));
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -866,6 +844,10 @@ impl QuarryApp {
     }
 
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        if action == Action::CloseTab {
+            self.request_tab_close(ctx);
+            return;
+        }
         if action == Action::CombineFiles {
             self.open_combine_files();
             return;
@@ -874,7 +856,7 @@ impl QuarryApp {
             self.about.open();
             return;
         }
-        if let Some(document) = self.document.as_mut() {
+        if let Some(document) = self.active.document.as_mut() {
             document.commit_edits();
         }
         match action {
@@ -882,11 +864,11 @@ impl QuarryApp {
                 self.open_storage_settings();
                 return;
             }
-            Action::ReplaceAll if !self.storage_approved => {
+            Action::ReplaceAll if !self.active.storage_approved => {
                 if self.defer_storage(PendingStorageOperation::ReplaceAll {
-                    query: self.find_input.as_bytes().to_vec(),
-                    replacement: self.replace_input.as_bytes().to_vec(),
-                    case_sensitivity: case_sensitivity(self.find_match_case),
+                    query: self.active.find_input.as_bytes().to_vec(),
+                    replacement: self.active.replace_input.as_bytes().to_vec(),
+                    case_sensitivity: case_sensitivity(self.active.find_match_case),
                 }) {
                     return;
                 }
@@ -907,79 +889,83 @@ impl QuarryApp {
             Action::ChooseFilteredExport => return self.choose_filtered_export(),
             Action::DiscardChanges => {
                 if self
+                    .active
                     .document
                     .as_ref()
                     .is_some_and(|document| document.structural_job.is_some())
                 {
-                    self.notice = Some(AppMessage::warning(
+                    self.active.notice = Some(AppMessage::warning(
                         "Cancel the active change before discarding changes.",
                     ));
                     return;
                 }
                 let structural = self
+                    .active
                     .document
                     .as_ref()
                     .is_some_and(Document::has_structural_edits);
                 if structural {
                     let document = self
+                        .active
                         .document
                         .as_ref()
                         .expect("structural changes require an open document");
                     let path = document.logical_path.clone();
                     let options = document.current_open_options();
-                    self.notice = self.replace_document_with_options(path, options).err();
+                    self.active.notice = self.replace_document_with_options(path, options).err();
                     return;
                 }
-                if let Some(document) = self.document.as_mut() {
+                if let Some(document) = self.active.document.as_mut() {
                     if document.save_job.is_some() {
-                        self.notice = Some(AppMessage::warning(
+                        self.active.notice = Some(AppMessage::warning(
                             "Wait for the save to finish before discarding changes.",
                         ));
                         return;
                     }
                     document.discard_edits();
                 }
-                self.notice = None;
+                self.active.notice = None;
                 return;
             }
             Action::OpenColumns => {
-                surrender_filter_text_focus(ctx, self.filter_rules.len());
-                self.filters_open = false;
-                self.format_draft = None;
+                surrender_filter_text_focus(ctx, self.active.filter_rules.len());
+                self.active.filters_open = false;
+                self.active.format_draft = None;
                 ctx.data_mut(|data| {
                     data.remove::<usize>(egui::Id::new("quarry-selected-managed-column"));
                 });
-                self.columns_open = true;
+                self.active.columns_open = true;
                 return;
             }
             Action::Undo => {
-                self.notice = self.swap_edit_history(false).err();
+                self.active.notice = self.swap_edit_history(false).err();
                 return;
             }
             Action::Redo => {
-                self.notice = self.swap_edit_history(true).err();
+                self.active.notice = self.swap_edit_history(true).err();
                 return;
             }
             Action::OpenFilters => {
                 ctx.memory_mut(|memory| {
                     memory.surrender_focus(egui::Id::new(COLUMN_SEARCH_INPUT_ID))
                 });
-                self.columns_open = false;
-                self.format_draft = None;
-                self.filters_open = true;
+                self.active.columns_open = false;
+                self.active.format_draft = None;
+                self.active.filters_open = true;
                 return;
             }
             _ => {}
         }
-        let Some(document) = self.document.as_mut() else {
+        let Some(document) = self.active.document.as_mut() else {
             return;
         };
         if document.source_changed {
-            self.notice = Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            self.active.notice = Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             return;
         }
         let result = match action {
             Action::Choose
+            | Action::CloseTab
             | Action::TemporaryStorage
             | Action::About
             | Action::CombineFiles
@@ -1001,40 +987,40 @@ impl QuarryApp {
                 document.auto_fit_columns = true;
                 Ok(())
             }
-            Action::Jump => parse_data_row(&self.jump_input, document.data_start)
+            Action::Jump => parse_data_row(&self.active.jump_input, document.data_start)
                 .map_err(AppMessage::warning)
                 .and_then(|start| document.navigate(start).map_err(AppMessage::error)),
             Action::FindPrevious => document
                 .start_find_previous_with_case(
-                    self.find_input.as_bytes(),
-                    case_sensitivity(self.find_match_case),
+                    self.active.find_input.as_bytes(),
+                    case_sensitivity(self.active.find_match_case),
                 )
                 .map_err(AppMessage::warning),
             Action::FindNext => document
                 .start_find_next_with_case(
-                    self.find_input.as_bytes(),
-                    case_sensitivity(self.find_match_case),
+                    self.active.find_input.as_bytes(),
+                    case_sensitivity(self.active.find_match_case),
                 )
                 .map_err(AppMessage::warning),
             Action::ReplaceCurrent => document
                 .replace_current_match_with_case(
-                    self.find_input.as_bytes(),
-                    self.replace_input.as_bytes(),
-                    case_sensitivity(self.find_match_case),
+                    self.active.find_input.as_bytes(),
+                    self.active.replace_input.as_bytes(),
+                    case_sensitivity(self.active.find_match_case),
                 )
                 .map_err(AppMessage::warning),
             Action::ReplaceAll => document.start_replace_all_with_case(
-                self.find_input.as_bytes(),
-                self.replace_input.as_bytes(),
-                case_sensitivity(self.find_match_case),
+                self.active.find_input.as_bytes(),
+                self.active.replace_input.as_bytes(),
+                case_sensitivity(self.active.find_match_case),
             ),
             Action::CancelSearch => {
                 document.cancel_search();
                 Ok(())
             }
             Action::ApplyFilter => filter_query_from_rules(
-                &self.filter_rules,
-                self.filter_match_case,
+                &self.active.filter_rules,
+                self.active.filter_match_case,
                 document.total_columns,
             )
             .map_err(AppMessage::warning)
@@ -1078,7 +1064,7 @@ impl QuarryApp {
                     | Action::Cancel
             )
         {
-            self.footer_status = if matches!(action, Action::FindPrevious | Action::FindNext)
+            self.active.footer_status = if matches!(action, Action::FindPrevious | Action::FindNext)
                 && document.search_job.is_none()
             {
                 document.search_status.clone().map(AppMessage::status)
@@ -1086,7 +1072,7 @@ impl QuarryApp {
                 None
             };
         }
-        self.notice = result.err();
+        self.active.notice = result.err();
     }
 
     fn apply_column_command(&mut self, ctx: &egui::Context, command: ColumnCommand) {
@@ -1094,7 +1080,7 @@ impl QuarryApp {
             self.apply(ctx, Action::AutoFitColumns);
             return;
         }
-        let Some(document) = self.document.as_mut() else {
+        let Some(document) = self.active.document.as_mut() else {
             return;
         };
         let result = match command {
@@ -1106,11 +1092,12 @@ impl QuarryApp {
             }
             ColumnCommand::AutoFit => unreachable!("auto-fit routes through the app action"),
         };
-        self.notice = result.err().map(AppMessage::warning);
+        self.active.notice = result.err().map(AppMessage::warning);
     }
 
     fn open_structural_dialog(&mut self, dialog: StructuralDialog) {
         let result = self
+            .active
             .document
             .as_ref()
             .ok_or_else(|| "Open a file before editing columns.".to_owned())
@@ -1121,27 +1108,28 @@ impl QuarryApp {
             });
         match result {
             Ok(()) => {
-                self.structural_dialog = Some(dialog);
-                self.notice = None;
+                self.active.structural_dialog = Some(dialog);
+                self.active.notice = None;
             }
-            Err(error) => self.notice = Some(AppMessage::warning(error)),
+            Err(error) => self.active.notice = Some(AppMessage::warning(error)),
         }
     }
 
     fn apply_structural_dialog_action(&mut self, action: StructuralDialogAction) {
         if action == StructuralDialogAction::Cancel {
-            self.structural_dialog = None;
+            self.active.structural_dialog = None;
             return;
         }
-        let Some(dialog) = self.structural_dialog.clone() else {
+        let Some(dialog) = self.active.structural_dialog.clone() else {
             return;
         };
         if self.defer_storage(PendingStorageOperation::Structural(dialog.clone())) {
-            self.structural_dialog = None;
+            self.active.structural_dialog = None;
             return;
         }
         let result =
-            self.document
+            self.active
+                .document
                 .as_mut()
                 .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
                 .and_then(|document| match dialog.request {
@@ -1161,23 +1149,24 @@ impl QuarryApp {
                         dialog.columns[0],
                         dialog.sort_direction,
                         dialog.sort_mode,
-                        case_sensitivity(self.sort_match_case),
+                        case_sensitivity(self.active.sort_match_case),
                     ),
                     StructuralRequest::Duplicates => document
                         .start_find_duplicates(dialog.columns, case_sensitivity(dialog.match_case)),
                 });
         match result {
             Ok(()) => {
-                self.structural_dialog = None;
-                self.notice = None;
-                self.footer_status = self
+                self.active.structural_dialog = None;
+                self.active.notice = None;
+                self.active.footer_status = self
+                    .active
                     .document
                     .as_ref()
                     .filter(|document| document.structural_job.is_none())
                     .and_then(|document| document.structural_status.clone())
                     .map(AppMessage::status);
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.active.notice = Some(error),
         }
     }
 
@@ -1186,13 +1175,15 @@ impl QuarryApp {
             return;
         }
         let result = self
+            .active
             .document
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
             .and_then(|document| document.start_delete_columns(columns));
-        self.notice = result.err();
-        if self.notice.is_none() {
-            self.footer_status = self
+        self.active.notice = result.err();
+        if self.active.notice.is_none() {
+            self.active.footer_status = self
+                .active
                 .document
                 .as_ref()
                 .filter(|document| document.structural_job.is_none())
@@ -1206,13 +1197,15 @@ impl QuarryApp {
             return;
         }
         let result = self
+            .active
             .document
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before deleting rows."))
             .and_then(|document| document.start_delete_rows(rows));
-        self.notice = result.err();
-        if self.notice.is_none() {
-            self.footer_status = self
+        self.active.notice = result.err();
+        if self.active.notice.is_none() {
+            self.active.footer_status = self
+                .active
                 .document
                 .as_ref()
                 .filter(|document| document.structural_job.is_none())
@@ -1225,7 +1218,7 @@ impl QuarryApp {
         &mut self,
         mut ready: MaterializedWorkingCopy,
     ) -> Result<(), String> {
-        let Some(current) = self.document.as_ref() else {
+        let Some(current) = self.active.document.as_ref() else {
             return Err("The document closed before the change finished.".into());
         };
         let options = current.current_open_options();
@@ -1253,6 +1246,7 @@ impl QuarryApp {
         ready: MaterializedWorkingCopy,
     ) {
         let current = self
+            .active
             .document
             .as_mut()
             .expect("the materialized document is still open");
@@ -1271,16 +1265,16 @@ impl QuarryApp {
             replacement.refresh_column_headers();
         }
         current.shutdown();
-        self.document = Some(replacement);
-        self.format_draft = None;
-        self.columns_open = false;
-        self.structural_dialog = None;
-        self.notice = None;
-        self.footer_status = Some(AppMessage::status(ready.notice));
+        self.active.document = Some(replacement);
+        self.active.format_draft = None;
+        self.active.columns_open = false;
+        self.active.structural_dialog = None;
+        self.active.notice = None;
+        self.active.footer_status = Some(AppMessage::status(ready.notice));
     }
 
     fn confirm_duplicate_removal(&mut self) -> Result<(), AppMessage> {
-        let Some(document) = self.document.as_ref() else {
+        let Some(document) = self.active.document.as_ref() else {
             return Ok(());
         };
         let Some(StructuralJob::DuplicatePreview { summary, .. }) = &document.structural_job else {
@@ -1292,6 +1286,7 @@ impl QuarryApp {
                 .map_err(AppMessage::error)?;
         replacement.start_indexing().map_err(AppMessage::error)?;
         let document = self
+            .active
             .document
             .as_mut()
             .expect("the preview document is open");
@@ -1331,6 +1326,7 @@ impl QuarryApp {
 
     fn swap_edit_history(&mut self, redo: bool) -> Result<(), AppMessage> {
         let current = self
+            .active
             .document
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before undoing a change."))?;
@@ -1371,7 +1367,7 @@ impl QuarryApp {
         } else {
             current.edit_history.redo.push(edit);
         }
-        self.footer_status = Some(AppMessage::status(if redo {
+        self.active.footer_status = Some(AppMessage::status(if redo {
             "Edit restored."
         } else {
             "Edit undone."
@@ -1380,7 +1376,7 @@ impl QuarryApp {
     }
 
     fn swap_structural_history(&mut self, redo: bool) -> Result<(), AppMessage> {
-        let Some(current) = self.document.as_mut() else {
+        let Some(current) = self.active.document.as_mut() else {
             return Err(AppMessage::warning("Open a file before undoing a change."));
         };
         current.commit_edits();
@@ -1447,6 +1443,7 @@ impl QuarryApp {
         replacement.start_indexing().map_err(AppMessage::error)?;
 
         let current = self
+            .active
             .document
             .as_mut()
             .expect("the document remains open while history is swapped");
@@ -1466,11 +1463,11 @@ impl QuarryApp {
         replacement.working_copy = Some(state);
         replacement.working_directory = self.working_directory.clone();
         current.shutdown();
-        self.document = Some(replacement);
-        self.structural_dialog = None;
-        self.columns_open = false;
-        self.notice = None;
-        self.footer_status = Some(AppMessage::status(if redo {
+        self.active.document = Some(replacement);
+        self.active.structural_dialog = None;
+        self.active.columns_open = false;
+        self.active.notice = None;
+        self.active.footer_status = Some(AppMessage::status(if redo {
             "Change restored."
         } else {
             "Change undone."
@@ -1480,6 +1477,7 @@ impl QuarryApp {
 
     fn copy_selection(&mut self, ctx: &egui::Context) {
         let result = self
+            .active
             .document
             .as_ref()
             .ok_or_else(|| "Open a file before copying.".to_owned())
@@ -1487,133 +1485,50 @@ impl QuarryApp {
         match result {
             Ok(text) => {
                 ctx.copy_text(text);
-                self.notice = None;
+                self.active.notice = None;
             }
-            Err(error) => self.notice = Some(AppMessage::warning(error)),
+            Err(error) => self.active.notice = Some(AppMessage::warning(error)),
         }
     }
 
-    fn intercept_dirty_close(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|input| input.viewport().close_requested()) {
-            return;
-        }
-        if let Some(dialog) = self.combine_files.as_mut() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if dialog.busy() {
-                dialog.cancel();
-            } else {
-                self.combine_files = None;
-            }
-            return;
-        }
-        if let Some(document) = self.document.as_mut() {
-            if document.save_job.is_some() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.close_confirmation_open = false;
-                self.close_after_save = true;
-                return;
-            }
-            document.commit_edits();
-            if document.is_dirty() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.close_confirmation_open = true;
-            }
-        }
-    }
-
-    fn keep_editing(&mut self) {
-        self.close_confirmation_open = false;
-        self.close_after_save = false;
-    }
-
-    fn discard_and_close(&mut self, ctx: &egui::Context) {
-        if let Some(mut document) = self.document.take() {
-            document.shutdown();
-        }
-        self.close_confirmation_open = false;
-        self.close_after_save = false;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-}
-
-impl eframe::App for QuarryApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.logged_first_update {
-            eprintln!(
-                "quarry-egui first update: {:.3} ms",
-                self.started.elapsed().as_secs_f64() * 1000.0
-            );
-            self.logged_first_update = true;
-        }
-
-        if self.storage_review.is_none() {
-            self.intercept_dirty_close(ctx);
-
-            #[cfg(target_os = "macos")]
-            if !self.about.open && self.combine_files.is_none() {
-                self.poll_open_documents();
-            }
-        }
-
-        let local_file_hovered = self.document.is_none()
-            && ctx.input(|input| {
-                input
-                    .raw
-                    .hovered_files
-                    .iter()
-                    .any(|file| file.path.is_some())
-            });
-        let dropped_paths = ctx.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect::<Vec<_>>()
-        });
-        if self.storage_review.is_none()
-            && !self.about.open
-            && self.combine_files.is_none()
-            && !dropped_paths.is_empty()
-        {
-            self.handle_dropped_paths(dropped_paths);
-        }
-
-        if let Some(document) = &mut self.document
+    fn poll_active_document(&mut self, ctx: &egui::Context, visible: bool) {
+        if let Some(document) = &mut self.active.document
             && let Err(error) = document.poll()
         {
-            self.footer_status = None;
-            self.notice = Some(AppMessage::error(error));
+            self.active.footer_status = None;
+            self.active.notice = Some(AppMessage::error(error));
         }
-        if let Some(document) = &mut self.document {
+        if let Some(document) = &mut self.active.document {
             let was_active = document.search_job.is_some();
             match document.poll_search() {
                 Ok(()) if was_active && document.search_job.is_none() => {
-                    self.notice = None;
-                    self.footer_status = document.search_status.clone().map(AppMessage::status);
+                    self.active.notice = None;
+                    self.active.footer_status =
+                        document.search_status.clone().map(AppMessage::status);
                 }
                 Ok(()) => {}
                 Err(error) => {
-                    self.footer_status = None;
-                    self.notice = Some(AppMessage::error(error));
+                    self.active.footer_status = None;
+                    self.active.notice = Some(AppMessage::error(error));
                 }
             }
         }
-        if let Some(document) = &mut self.document {
+        if let Some(document) = &mut self.active.document {
             let was_active = document.filter_job.is_some();
             match document.poll_filter() {
                 Ok(()) if was_active && document.filter_job.is_none() => {
-                    self.notice = None;
-                    self.footer_status = document.filter_status.clone().map(AppMessage::status);
+                    self.active.notice = None;
+                    self.active.footer_status =
+                        document.filter_status.clone().map(AppMessage::status);
                 }
                 Ok(()) => {}
                 Err(error) => {
-                    self.footer_status = None;
-                    self.notice = Some(AppMessage::error(error));
+                    self.active.footer_status = None;
+                    self.active.notice = Some(AppMessage::error(error));
                 }
             }
         }
-        if let Some(document) = &mut self.document {
+        if let Some(document) = &mut self.active.document {
             let was_active = document.export_job.is_some();
             match document.poll_filtered_export() {
                 Ok(()) if was_active && document.export_job.is_none() => {
@@ -1622,44 +1537,48 @@ impl eframe::App for QuarryApp {
                         .as_deref()
                         .is_some_and(|status| status.starts_with("Export failed"))
                     {
-                        self.footer_status = None;
-                        self.notice = status.map(AppMessage::error);
+                        self.active.footer_status = None;
+                        self.active.notice = status.map(AppMessage::error);
                     } else {
-                        self.notice = None;
-                        self.footer_status = status.map(AppMessage::status);
+                        self.active.notice = None;
+                        self.active.footer_status = status.map(AppMessage::status);
                     }
                 }
                 Ok(()) => {}
                 Err(error) => {
-                    self.footer_status = None;
-                    self.notice = Some(AppMessage::error(error));
+                    self.active.footer_status = None;
+                    self.active.notice = Some(AppMessage::error(error));
                 }
             }
         }
         let structural_was_active = self
+            .active
             .document
             .as_ref()
             .is_some_and(|document| document.structural_job.is_some());
         let structural_result = self
+            .active
             .document
             .as_mut()
             .map_or(Ok(None), Document::poll_structural_edit);
         match structural_result {
             Ok(Some(ready)) => {
                 if let Err(error) = self.install_materialized_working_copy(ready) {
-                    self.footer_status = None;
-                    self.notice = Some(AppMessage::error(error));
+                    self.active.footer_status = None;
+                    self.active.notice = Some(AppMessage::error(error));
                 }
             }
             Ok(None)
                 if structural_was_active
                     && self
+                        .active
                         .document
                         .as_ref()
                         .is_some_and(|document| document.structural_job.is_none()) =>
             {
-                self.notice = None;
-                self.footer_status = self
+                self.active.notice = None;
+                self.active.footer_status = self
+                    .active
                     .document
                     .as_ref()
                     .and_then(|document| document.structural_status.clone())
@@ -1667,12 +1586,13 @@ impl eframe::App for QuarryApp {
             }
             Ok(None) => {}
             Err(error) => {
-                self.footer_status = None;
-                self.notice = Some(error);
+                self.active.footer_status = None;
+                self.active.notice = Some(error);
             }
         }
-        if self.storage_review.is_none()
+        if self.active.storage_review.is_none()
             && let Some((transformation, selected_columns, records)) = self
+                .active
                 .document
                 .as_mut()
                 .and_then(|document| document.pending_materialization.take())
@@ -1684,13 +1604,19 @@ impl eframe::App for QuarryApp {
             ));
         }
         let save_was_active = self
+            .active
             .document
             .as_ref()
             .is_some_and(|document| document.save_job.is_some());
-        let save_result = self.document.as_mut().map_or(Ok(None), Document::poll_save);
+        let save_result = self
+            .active
+            .document
+            .as_mut()
+            .map_or(Ok(None), Document::poll_save);
         match save_result {
             Ok(Some((destination, in_place))) => {
                 let dialect = self
+                    .active
                     .document
                     .as_ref()
                     .expect("saved document is still open")
@@ -1707,46 +1633,48 @@ impl eframe::App for QuarryApp {
                 };
                 match self.replace_document_with_options(destination.clone(), options) {
                     Ok(()) => {
-                        self.notice = None;
-                        self.footer_status = Some(AppMessage::status(if in_place {
+                        self.active.notice = None;
+                        self.active.footer_status = Some(AppMessage::status(if in_place {
                             format!("Saved {}.", destination.display())
                         } else {
                             format!("Saved as {}.", destination.display())
                         }));
-                        if self.close_after_save {
-                            self.close_after_save = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        if self.active.close_after_save {
+                            self.active.close_after_save = false;
+                            self.active.close_ready = true;
                         }
                     }
                     Err(error) if in_place => {
-                        if let Some(mut document) = self.document.take() {
+                        if let Some(mut document) = self.active.document.take() {
                             document.shutdown();
                         }
-                        self.find_bar_open = false;
-                        self.replace_expanded = false;
-                        surrender_find_controls_focus(ctx);
-                        self.footer_status = None;
-                        self.notice = Some(AppMessage::error(format!(
+                        self.active.find_bar_open = false;
+                        self.active.replace_expanded = false;
+                        if visible {
+                            surrender_find_controls_focus(ctx);
+                        }
+                        self.active.footer_status = None;
+                        self.active.notice = Some(AppMessage::error(format!(
                             "Saved {} but could not reload it: {error}. Reopen the file to continue.",
                             destination.display()
                         )));
-                        if self.close_after_save {
-                            self.close_after_save = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        if self.active.close_after_save {
+                            self.active.close_after_save = false;
+                            self.active.close_ready = true;
                         }
                     }
                     Err(error) => {
-                        if let Some(document) = self.document.as_mut() {
+                        if let Some(document) = self.active.document.as_mut() {
                             document.save_status = None;
                         }
-                        self.footer_status = None;
-                        self.notice = Some(AppMessage::error(format!(
+                        self.active.footer_status = None;
+                        self.active.notice = Some(AppMessage::error(format!(
                             "Saved {} but could not open it: {error}",
                             destination.display()
                         )));
-                        if self.close_after_save {
-                            self.close_after_save = false;
-                            self.close_confirmation_open = true;
+                        if self.active.close_after_save {
+                            self.active.close_after_save = false;
+                            self.active.close_confirmation_open = true;
                         }
                     }
                 }
@@ -1754,63 +1682,128 @@ impl eframe::App for QuarryApp {
             Ok(None) => {
                 if save_was_active
                     && self
+                        .active
                         .document
                         .as_ref()
                         .is_some_and(|document| document.save_job.is_none())
                 {
-                    self.notice = None;
-                    self.footer_status = self
+                    self.active.notice = None;
+                    self.active.footer_status = self
+                        .active
                         .document
                         .as_ref()
                         .and_then(|document| document.save_status.clone())
                         .map(AppMessage::status);
                 }
-                if self.close_after_save
-                    && self.storage_review.is_none()
+                if self.active.close_after_save
+                    && self.active.storage_review.is_none()
                     && self
+                        .active
                         .document
                         .as_ref()
                         .is_some_and(|document| document.save_job.is_none())
                 {
-                    self.close_after_save = false;
-                    self.close_confirmation_open = true;
+                    self.active.close_after_save = false;
+                    self.active.close_confirmation_open = true;
                 }
             }
             Err(error) => {
-                self.footer_status = None;
-                self.notice = Some(error);
-                if self.close_after_save {
-                    self.close_after_save = false;
-                    self.close_confirmation_open = true;
+                self.active.footer_status = None;
+                self.active.notice = Some(error);
+                if self.active.close_after_save {
+                    self.active.close_after_save = false;
+                    self.active.close_confirmation_open = true;
                 }
             }
         }
+    }
+}
 
-        if self.close_confirmation_open {
+impl eframe::App for QuarryApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.logged_first_update {
+            eprintln!(
+                "quarry-egui first update: {:.3} ms",
+                self.started.elapsed().as_secs_f64() * 1000.0
+            );
+            self.logged_first_update = true;
+        }
+
+        self.remember_tab_focus(ctx);
+
+        if self.active.storage_review.is_none() {
+            self.intercept_dirty_close(ctx);
+
+            #[cfg(target_os = "macos")]
+            if !self.about.open && self.combine_files.is_none() {
+                self.poll_open_documents();
+            }
+        }
+
+        let local_file_hovered = self.active.document.is_none()
+            && ctx.input(|input| {
+                input
+                    .raw
+                    .hovered_files
+                    .iter()
+                    .any(|file| file.path.is_some())
+            });
+        let dropped_paths = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>()
+        });
+        if self.active.storage_review.is_none()
+            && !self.about.open
+            && self.combine_files.is_none()
+            && !dropped_paths.is_empty()
+        {
+            self.handle_dropped_paths(dropped_paths);
+        }
+
+        self.reset_tab_focus(ctx);
+        self.poll_document_tabs(ctx);
+
+        if self.active.close_confirmation_open {
             self.about.open = false;
         }
-        let storage_review_open = self.storage_review.is_some();
-        let interaction_blocked =
-            storage_review_open || self.about.open || self.combine_files.is_some();
+        let tabs_blocked = self.active.storage_review.is_some()
+            || self.about.open
+            || self.combine_files.is_some()
+            || self.active.close_confirmation_open
+            || self.active.close_after_save
+            || self.active.close_after_jobs
+            || self.active.structural_dialog.is_some();
+        self.show_document_tabs(ctx, tabs_blocked);
+        let storage_review_open = self.active.storage_review.is_some();
+        let interaction_blocked = storage_review_open
+            || self.about.open
+            || self.combine_files.is_some()
+            || self.active.close_after_save
+            || self.active.close_after_jobs;
         if storage_review_open && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
         let find_available = self
+            .active
             .document
             .as_ref()
             .is_some_and(|document| !document.filter_active());
         let mut focus_find = false;
         if !interaction_blocked
             && find_available
-            && !self.close_confirmation_open
-            && self.structural_dialog.is_none()
+            && !self.active.close_confirmation_open
+            && self.active.structural_dialog.is_none()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F))
         {
-            self.find_bar_open = true;
+            self.active.find_bar_open = true;
             focus_find = true;
         }
-        if !self.find_bar_open {
+        if !self.active.find_bar_open {
             surrender_find_controls_focus(ctx);
         }
 
@@ -1831,7 +1824,7 @@ impl eframe::App for QuarryApp {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
-                let document = self.document.as_ref();
+                let document = self.active.document.as_ref();
                 let document_open = document.is_some();
                 let filter_active = document.is_some_and(Document::filter_active);
                 let compact = ui.available_width() < 1_000.0;
@@ -1852,9 +1845,9 @@ impl eframe::App for QuarryApp {
                     if let Some(format_action) = format_menu(
                         ui,
                         document,
-                        self.delimiter_mode,
-                        self.header_mode,
-                        &mut self.format_draft,
+                        self.active.delimiter_mode,
+                        self.active.header_mode,
+                        &mut self.active.format_draft,
                         compact,
                         if compact {
                             COMPACT_FORMAT_MENU_WIDTH
@@ -1869,7 +1862,7 @@ impl eframe::App for QuarryApp {
                     let jump = ui
                         .add_enabled(
                             jump_enabled,
-                            egui::TextEdit::singleline(&mut self.jump_input)
+                            egui::TextEdit::singleline(&mut self.active.jump_input)
                                 .id(egui::Id::new(JUMP_INPUT_ID))
                                 .horizontal_align(Align::RIGHT)
                                 .desired_width(TOOLBAR_JUMP_WIDTH),
@@ -1955,13 +1948,13 @@ impl eframe::App for QuarryApp {
                         });
                     }
                     if find.clicked() {
-                        self.find_bar_open = true;
+                        self.active.find_bar_open = true;
                         focus_find = true;
                     }
                 });
             });
 
-        if let Some(notice) = self.notice.as_ref() {
+        if let Some(notice) = self.active.notice.as_ref() {
             let fill = match notice.severity {
                 MessageSeverity::Error => ERROR_FILL,
                 MessageSeverity::Warning => WARNING_FILL,
@@ -1978,18 +1971,18 @@ impl eframe::App for QuarryApp {
                     dismiss = notice_strip(ui, notice);
                 });
             if dismiss {
-                self.notice = None;
+                self.active.notice = None;
             }
         }
 
-        if self.find_bar_open {
+        if self.active.find_bar_open {
             let mut close_find = false;
             let find_escape_allowed = !self.about.open
-                && !self.columns_open
-                && !self.filters_open
-                && !self.close_confirmation_open
-                && self.structural_dialog.is_none()
-                && self.document.as_ref().is_none_or(|document| {
+                && !self.active.columns_open
+                && !self.active.filters_open
+                && !self.active.close_confirmation_open
+                && self.active.structural_dialog.is_none()
+                && self.active.document.as_ref().is_none_or(|document| {
                     document.cell_edit.is_none() && document.header_edit.is_none()
                 });
             egui::TopBottomPanel::top("quarry-find")
@@ -2009,21 +2002,21 @@ impl eframe::App for QuarryApp {
                             memory.request_focus(egui::Id::new(FIND_INPUT_ID));
                         });
                     }
-                    if let Some(document) = self.document.as_ref() {
+                    if let Some(document) = self.active.document.as_ref() {
                         let can_find_previous = document.can_find_previous_with_case(
-                            self.find_input.as_bytes(),
-                            case_sensitivity(self.find_match_case),
+                            self.active.find_input.as_bytes(),
+                            case_sensitivity(self.active.find_match_case),
                         );
                         let can_replace = document.can_replace_current_with_case(
-                            self.find_input.as_bytes(),
-                            case_sensitivity(self.find_match_case),
+                            self.active.find_input.as_bytes(),
+                            case_sensitivity(self.active.find_match_case),
                         );
                         let (search_action, close_requested) = search_controls(
                             ui,
-                            &mut self.find_input,
-                            &mut self.replace_input,
-                            &mut self.find_match_case,
-                            &mut self.replace_expanded,
+                            &mut self.active.find_input,
+                            &mut self.active.replace_input,
+                            &mut self.active.find_match_case,
+                            &mut self.active.replace_expanded,
                             document.is_search_ready(),
                             can_find_previous,
                             can_replace,
@@ -2045,7 +2038,7 @@ impl eframe::App for QuarryApp {
                     }
                 });
             if close_find {
-                self.find_bar_open = false;
+                self.active.find_bar_open = false;
                 surrender_find_controls_focus(ctx);
             }
         }
@@ -2061,9 +2054,9 @@ impl eframe::App for QuarryApp {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
-                if let Some(document) = &self.document {
+                if let Some(document) = &self.active.document {
                     if let Some(footer_action) =
-                        status_bar(ui, document, self.footer_status.as_deref())
+                        status_bar(ui, document, self.active.footer_status.as_deref())
                     {
                         action = Some(footer_action);
                     }
@@ -2074,29 +2067,36 @@ impl eframe::App for QuarryApp {
 
         if !interaction_blocked
             && action.is_none()
-            && !self.close_confirmation_open
-            && self.document.as_ref().is_some_and(Document::is_save_ready)
+            && !self.active.close_confirmation_open
+            && self
+                .active
+                .document
+                .as_ref()
+                .is_some_and(Document::is_save_ready)
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
         {
             action = Some(Action::Save);
         }
         if !interaction_blocked
             && action.is_none()
-            && !self.close_confirmation_open
-            && self.structural_dialog.is_none()
-            && self.format_draft.is_none()
-            && let Some(document) = self.document.as_ref()
+            && !self.active.close_confirmation_open
+            && self.active.structural_dialog.is_none()
+            && self.active.format_draft.is_none()
+            && let Some(document) = self.active.document.as_ref()
         {
             action = edit_history_shortcut(ctx, document);
         }
-        let filter_owns_keys = self.filters_open
+        let filter_owns_keys = self.active.filters_open
             && (egui::Popup::is_any_open(ctx)
                 || ctx.memory(|memory| {
                     memory
                         .focused()
-                        .is_some_and(|id| is_filter_text_input(id, self.filter_rules.len()))
+                        .is_some_and(|id| is_filter_text_input(id, self.active.filter_rules.len()))
                 }));
-        if !interaction_blocked && action.is_none() && self.document.is_some() && !filter_owns_keys
+        if !interaction_blocked
+            && action.is_none()
+            && self.active.document.is_some()
+            && !filter_owns_keys
         {
             action = ctx.input(|input| {
                 if input.key_pressed(egui::Key::PageDown) {
@@ -2112,21 +2112,22 @@ impl eframe::App for QuarryApp {
             self.apply(ctx, action);
         }
 
-        if !interaction_blocked && self.format_draft.is_some() {
-            self.columns_open = false;
-            self.filters_open = false;
-            surrender_filter_text_focus(ctx, self.filter_rules.len());
+        if !interaction_blocked && self.active.format_draft.is_some() {
+            self.active.columns_open = false;
+            self.active.filters_open = false;
+            surrender_filter_text_focus(ctx, self.active.filter_rules.len());
             ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new(COLUMN_SEARCH_INPUT_ID)));
         }
         let column_command = self
+            .active
             .document
             .as_ref()
             .filter(|_| !interaction_blocked)
             .and_then(|document| {
                 show_column_manager(
                     ctx,
-                    &mut self.columns_open,
-                    &mut self.column_search_input,
+                    &mut self.active.columns_open,
+                    &mut self.active.column_search_input,
                     document,
                 )
             });
@@ -2135,15 +2136,16 @@ impl eframe::App for QuarryApp {
         }
 
         let filter_action = self
+            .active
             .document
             .as_ref()
             .filter(|_| !interaction_blocked)
             .and_then(|document| {
                 show_filter_manager(
                     ctx,
-                    &mut self.filters_open,
-                    &mut self.filter_rules,
-                    &mut self.filter_match_case,
+                    &mut self.active.filters_open,
+                    &mut self.active.filter_rules,
+                    &mut self.active.filter_match_case,
                     document,
                 )
             });
@@ -2161,12 +2163,17 @@ impl eframe::App for QuarryApp {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
-                if let Some(document) = self.document.as_mut() {
-                    match show_grid_with_filter_case(
-                        ui,
-                        document,
-                        case_sensitivity(self.filter_match_case),
-                    ) {
+                if let Some(document) = self.active.document.as_mut() {
+                    let grid_result = ui
+                        .push_id(self.active.id, |ui| {
+                            show_grid_with_filter_case(
+                                ui,
+                                document,
+                                case_sensitivity(self.active.filter_match_case),
+                            )
+                        })
+                        .inner;
+                    match grid_result {
                         Ok(request) => requested_column_edit = request,
                         Err(error) => grid_error = Some(error),
                     }
@@ -2185,17 +2192,19 @@ impl eframe::App for QuarryApp {
             }
         }
         let structural_dialog_action = self
+            .active
             .structural_dialog
             .as_mut()
             .filter(|_| !interaction_blocked)
-            .zip(self.document.as_ref())
+            .zip(self.active.document.as_ref())
             .and_then(|(dialog, document)| {
-                show_structural_dialog(ctx, dialog, &mut self.sort_match_case, document)
+                show_structural_dialog(ctx, dialog, &mut self.active.sort_match_case, document)
             });
         if let Some(action) = structural_dialog_action {
             self.apply_structural_dialog_action(action);
         }
         let duplicate_action = self
+            .active
             .document
             .as_ref()
             .filter(|_| !interaction_blocked)
@@ -2209,16 +2218,16 @@ impl eframe::App for QuarryApp {
             });
         match duplicate_action {
             Some(StructuralDialogAction::Apply) => {
-                self.notice = self.confirm_duplicate_removal().err();
+                self.active.notice = self.confirm_duplicate_removal().err();
             }
             Some(StructuralDialogAction::Cancel) => self.apply(ctx, Action::CancelStructuralEdit),
             None => {}
         }
-        let copy_event_targets_selection = self.document.as_ref().is_some_and(|document| {
+        let copy_event_targets_selection = self.active.document.as_ref().is_some_and(|document| {
             document.selection.is_some()
                 && selection_copy_requested(
                     ctx,
-                    self.filter_rules.len(),
+                    self.active.filter_rules.len(),
                     document.header_edit.as_ref().map(|edit| edit.column),
                     document
                         .cell_edit
@@ -2230,10 +2239,10 @@ impl eframe::App for QuarryApp {
             self.copy_selection(ctx);
         }
         if grid_error.is_some() {
-            self.notice = grid_error.map(AppMessage::error);
+            self.active.notice = grid_error.map(AppMessage::error);
         }
 
-        if !interaction_blocked && self.close_confirmation_open {
+        if !interaction_blocked && self.active.close_confirmation_open {
             let mut discard_and_close = false;
             let mut keep_editing = false;
             let mut save_and_close = false;
@@ -2241,7 +2250,15 @@ impl eframe::App for QuarryApp {
             let modal =
                 egui::Modal::new(egui::Id::new("quarry-close-confirmation")).show(ctx, |ui| {
                     ui.heading("Unsaved changes");
-                    ui.label("This file has unsaved changes.");
+                    ui.label(
+                        self.active
+                            .document
+                            .as_ref()
+                            .map(|document| {
+                                format!("{} has unsaved changes.", document.logical_path.display())
+                            })
+                            .unwrap_or_default(),
+                    );
                     ui.label("Save them, save a new copy, keep editing, or discard them.");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -2250,7 +2267,10 @@ impl eframe::App for QuarryApp {
                         }
                         if ui
                             .add_enabled(
-                                self.document.as_ref().is_some_and(Document::is_save_ready),
+                                self.active
+                                    .document
+                                    .as_ref()
+                                    .is_some_and(Document::is_save_ready),
                                 egui::Button::new("Save and Close"),
                             )
                             .clicked()
@@ -2259,7 +2279,10 @@ impl eframe::App for QuarryApp {
                         }
                         if ui
                             .add_enabled(
-                                self.document.as_ref().is_some_and(Document::is_save_ready),
+                                self.active
+                                    .document
+                                    .as_ref()
+                                    .is_some_and(Document::is_save_ready),
                                 egui::Button::new("Save As and Close…"),
                             )
                             .clicked()
@@ -2268,7 +2291,8 @@ impl eframe::App for QuarryApp {
                         }
                         if ui
                             .add_enabled(
-                                self.document
+                                self.active
+                                    .document
                                     .as_ref()
                                     .is_none_or(|document| document.save_job.is_none()),
                                 egui::Button::new("Discard Changes and Close"),
@@ -2283,45 +2307,38 @@ impl eframe::App for QuarryApp {
             if keep_editing {
                 self.keep_editing();
             } else if save_and_close {
-                self.close_confirmation_open = false;
-                self.close_after_save = true;
+                self.active.close_confirmation_open = false;
+                self.active.close_after_save = true;
                 if !self.save_current() {
-                    self.close_after_save = false;
-                    self.close_confirmation_open = true;
+                    self.active.close_after_save = false;
+                    self.active.close_confirmation_open = true;
                 }
             } else if save_as_and_close {
-                self.close_confirmation_open = false;
-                self.close_after_save = true;
+                self.active.close_confirmation_open = false;
+                self.active.close_after_save = true;
                 if !self.choose_save_as() {
-                    self.close_after_save = false;
-                    self.close_confirmation_open = true;
+                    self.active.close_after_save = false;
+                    self.active.close_confirmation_open = true;
                 }
             } else if discard_and_close {
                 self.discard_and_close(ctx);
             }
         }
-        if self.storage_review.is_some() {
+        self.show_closing_operation(ctx);
+        if self.active.storage_review.is_some() {
             // Redraw a newly opened review without its previous dialog or an active grid.
             if !storage_review_open {
                 ctx.request_discard("storage review opened");
             }
             self.show_storage_review(ctx);
         }
-        if self.storage_review.is_none()
-            && !self.close_confirmation_open
+        if self.active.storage_review.is_none()
+            && !self.active.close_confirmation_open
             && self.combine_files.is_none()
         {
             self.about.show(ctx);
         }
-        if self.document.as_ref().is_some_and(|document| {
-            document.job.is_some()
-                || document.search_job.is_some()
-                || document.filter_job.is_some()
-                || document.filter_rows_loading()
-                || document.export_job.is_some()
-                || document.save_job.is_some()
-                || document.structural_job.is_some()
-        }) {
+        if self.document_tabs().any(DocumentTab::busy) {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
         if self.combine_files.is_some() {
@@ -2397,6 +2414,7 @@ fn detected_delimiter_label(delimiter: u8) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
+    CloseTab,
     About,
     CombineFiles,
     Choose,
@@ -3065,12 +3083,8 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
         ui.set_min_width(190.0);
         let mut action = None;
         let open = ui
-            .add_enabled(!file_operation_active && !dirty, egui::Button::new("Open…"))
-            .on_disabled_hover_text(if dirty {
-                "Discard or save your changes before opening another file."
-            } else {
-                "Cancel the active export and wait for it to finish first."
-            });
+            .button("Open…")
+            .on_hover_text("Open files in new tabs (⌘O)");
         if open.clicked() {
             action = Some(Action::Choose);
         }
@@ -3079,6 +3093,13 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             .clicked()
         {
             action = Some(Action::CombineFiles);
+        }
+        if ui
+            .add_enabled(document_open, egui::Button::new("Close Tab"))
+            .on_hover_text("Close this document (⌘W)")
+            .clicked()
+        {
+            action = Some(Action::CloseTab);
         }
         let reload = ui
             .add_enabled(
@@ -3443,9 +3464,14 @@ fn show_column_manager(
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let row_height = 28.0;
                 egui::ScrollArea::vertical()
-                    .id_salt("quarry-column-manager-list")
+                    .id_salt(("quarry-column-manager-list", &document.logical_path))
                     .auto_shrink([false, false])
-                    .max_height((ctx.content_rect().height() - 260.0).clamp(96.0, 336.0))
+                    .max_height(
+                        (ctx.content_rect().bottom()
+                            - compact_tool_anchor(ctx, "quarry-column-manager").y
+                            - 222.0)
+                            .clamp(96.0, 336.0),
+                    )
                     .show_rows(ui, row_height, filtered_positions.len(), |ui, rows| {
                         if filtered_positions.is_empty() {
                             ui.weak(if document.total_columns == 0 {
@@ -4143,8 +4169,8 @@ fn show_filter_manager(
                 (column, condition, value)
             }).inner;
             egui::ScrollArea::vertical()
-                .id_salt("quarry-filter-rules")
-                .max_height((ctx.content_rect().height() - 280.0).clamp(96.0, 360.0))
+                .id_salt(("quarry-filter-rules", &document.logical_path))
+                .max_height((ctx.content_rect().bottom() - compact_tool_anchor(ctx, "quarry-filter-manager").y - 242.0).clamp(96.0, 360.0))
                 .show(ui, |ui| {
                     let value_width = ui.available_width() - column_width - condition_width
                         - number_width - remove_width - 4.0 * ui.spacing().item_spacing.x;
@@ -9543,9 +9569,9 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     fn individual_edit_app(path: &Path) -> QuarryApp {
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(path.to_path_buf()).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         app
     }
 
@@ -9563,7 +9589,7 @@ mod tests {
         let original = b"\xef\xbb\xbfname,value\r\nfirst,1\r\n";
         fs::write(&source, original).unwrap();
         let mut app = individual_edit_app(&source);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         commit_test_cell(document, 1, 1, "line one\r\nline two,\"quoted\"");
         document.rename_header(1, "amount".into()).unwrap();
         commit_test_cell(document, 1, 1, "last");
@@ -9573,7 +9599,8 @@ mod tests {
         for expected in [Some("last"), Some("line one\r\nline two,\"quoted\"")] {
             app.swap_edit_history(false).unwrap();
             assert_eq!(
-                app.document
+                app.active
+                    .document
                     .as_ref()
                     .unwrap()
                     .cell_edits
@@ -9583,22 +9610,28 @@ mod tests {
             );
         }
         app.swap_edit_history(false).unwrap();
-        assert_eq!(app.document.as_ref().unwrap().column_name(1), "value");
+        assert_eq!(
+            app.active.document.as_ref().unwrap().column_name(1),
+            "value"
+        );
         app.swap_edit_history(false).unwrap();
-        assert!(!app.document.as_ref().unwrap().is_dirty());
-        assert!(!app.document.as_ref().unwrap().can_undo());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().can_undo());
 
         for _ in 0..4 {
             app.swap_edit_history(true).unwrap();
         }
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.column_name(1), "amount");
         assert!(document.cell_edits.is_empty());
         assert!(!document.can_redo());
         document.rename_header(1, "value".into()).unwrap();
         assert!(!document.is_dirty());
         app.swap_edit_history(false).unwrap();
-        assert_eq!(app.document.as_ref().unwrap().column_name(1), "amount");
+        assert_eq!(
+            app.active.document.as_ref().unwrap().column_name(1),
+            "amount"
+        );
         assert_eq!(fs::read(&source).unwrap(), original);
     }
 
@@ -9608,14 +9641,15 @@ mod tests {
         let source = directory.path().join("branch.csv");
         fs::write(&source, b"name,value\nfirst,1\n").unwrap();
         let mut app = individual_edit_app(&source);
-        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
-        app.document
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "2");
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(0, "renamed".into())
             .unwrap();
         app.swap_edit_history(false).unwrap();
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         let retained_bytes = document.edit_history.bytes;
         document.rename_header(0, "name".into()).unwrap();
         commit_test_cell(document, 1, 1, "2");
@@ -9632,11 +9666,14 @@ mod tests {
         commit_test_cell(document, 1, 1, "branch");
         assert!(!document.can_redo());
         app.swap_edit_history(false).unwrap();
-        assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 1)], b"2");
+        assert_eq!(
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            b"2"
+        );
         app.swap_edit_history(false).unwrap();
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.start_find_next(b"first").unwrap();
         finish_search(document);
         document
@@ -9646,7 +9683,7 @@ mod tests {
         assert!(!document.can_redo());
         assert_eq!(document.cell_edits[&(1, 0)], b"replacement");
         app.swap_edit_history(false).unwrap();
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
     }
 
     #[test]
@@ -9656,49 +9693,51 @@ mod tests {
         let original = b"email,city\na@b,x\n";
         fs::write(&source, original).unwrap();
         let mut app = individual_edit_app(&source);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.rename_header(1, "town".into()).unwrap();
         commit_test_cell(document, 1, 0, "alpha@beta");
         document.start_split(0, b"@".to_vec()).unwrap();
         finish_structural_edit(&mut app);
-        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "changed\npart");
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "changed\npart");
 
         app.swap_edit_history(false).unwrap();
-        assert!(app.document.as_ref().unwrap().cell_edits.is_empty());
+        assert!(app.active.document.as_ref().unwrap().cell_edits.is_empty());
         app.swap_edit_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_ref().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 2);
         assert_eq!(document.column_name(1), "town");
         assert_eq!(document.cell_edits[&(1, 0)], b"alpha@beta");
         app.swap_edit_history(false).unwrap();
         app.swap_edit_history(false).unwrap();
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
 
         app.swap_edit_history(true).unwrap();
         app.swap_edit_history(true).unwrap();
         app.swap_edit_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        assert_eq!(app.document.as_ref().unwrap().total_columns, 3);
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(app.active.document.as_ref().unwrap().total_columns, 3);
         app.swap_edit_history(true).unwrap();
         assert_eq!(
-            app.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
             b"changed\npart"
         );
-        assert!(!app.document.as_ref().unwrap().can_redo());
+        assert!(!app.active.document.as_ref().unwrap().can_redo());
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.swap_edit_history(false).unwrap();
         app.swap_edit_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(1, "new branch".into())
             .unwrap();
-        assert!(!app.document.as_ref().unwrap().can_redo());
+        assert!(!app.active.document.as_ref().unwrap().can_redo());
         assert!(
-            app.document
+            app.active
+                .document
                 .as_ref()
                 .unwrap()
                 .working_copy
@@ -9715,34 +9754,44 @@ mod tests {
         let source = directory.path().join("structural-branch.csv");
         fs::write(&source, b"email,city\na@b,x\n").unwrap();
         let mut app = individual_edit_app(&source);
-        commit_test_cell(app.document.as_mut().unwrap(), 1, 0, "alpha@beta");
-        app.document
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 0, "alpha@beta");
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(1, "obsolete".into())
             .unwrap();
         app.swap_edit_history(false).unwrap();
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_split(0, b"@".to_vec())
             .unwrap();
         finish_structural_edit(&mut app);
         app.swap_edit_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        assert!(app.document.as_ref().unwrap().edit_history.redo.is_empty());
-        assert_eq!(app.document.as_ref().unwrap().column_name(1), "city");
+        finish_index(app.active.document.as_mut().unwrap());
+        assert!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .edit_history
+                .redo
+                .is_empty()
+        );
+        assert_eq!(app.active.document.as_ref().unwrap().column_name(1), "city");
         app.swap_edit_history(false).unwrap();
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
         app.swap_edit_history(true).unwrap();
         assert_eq!(
-            app.document.as_ref().unwrap().cell_edits[&(1, 0)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)],
             b"alpha@beta"
         );
         app.swap_edit_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        assert_eq!(app.document.as_ref().unwrap().column_name(2), "city");
-        assert!(!app.document.as_ref().unwrap().can_redo());
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(app.active.document.as_ref().unwrap().column_name(2), "city");
+        assert!(!app.active.document.as_ref().unwrap().can_redo());
     }
 
     #[test]
@@ -9752,20 +9801,27 @@ mod tests {
         fs::write(&source, b"name\nvalue\n").unwrap();
         let mut app = individual_edit_app(&source);
         for edit in 0..=super::MAX_EDIT_HISTORY_ENTRIES {
-            app.document
+            app.active
+                .document
                 .as_mut()
                 .unwrap()
                 .rename_header(0, format!("name {edit}"))
                 .unwrap();
         }
         assert_eq!(
-            app.document.as_ref().unwrap().edit_history.undo.len(),
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .edit_history
+                .undo
+                .len(),
             super::MAX_EDIT_HISTORY_ENTRIES
         );
         for _ in 0..super::MAX_EDIT_HISTORY_ENTRIES {
             app.swap_edit_history(false).unwrap();
         }
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.column_name(0), "name 0");
         assert!(!document.can_undo());
         assert_eq!(
@@ -9775,20 +9831,20 @@ mod tests {
 
         app.apply(&egui::Context::default(), Action::DiscardChanges);
         let value_bytes = 6 * 1024 * 1024;
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.rename_header(0, "a".repeat(value_bytes)).unwrap();
         document.rename_header(0, "b".repeat(value_bytes)).unwrap();
         assert_eq!(document.edit_history.undo.len(), 1);
         assert_eq!(document.edit_history.bytes, 2 * value_bytes);
         assert!(document.edit_history.bytes <= super::MAX_EDIT_HISTORY_BYTES);
         app.swap_edit_history(false).unwrap();
-        assert!(!app.document.as_ref().unwrap().can_undo());
+        assert!(!app.active.document.as_ref().unwrap().can_undo());
         assert_eq!(
-            app.document.as_ref().unwrap().edit_history.bytes,
+            app.active.document.as_ref().unwrap().edit_history.bytes,
             2 * value_bytes
         );
         app.swap_edit_history(true).unwrap();
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document
             .rename_header(0, "x".repeat(super::MAX_EDIT_HISTORY_BYTES + 1))
             .unwrap();
@@ -9799,19 +9855,21 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), b"name\nvalue\n");
 
         app.apply(&egui::Context::default(), Action::DiscardChanges);
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_split(0, b"a".to_vec())
             .unwrap();
         finish_structural_edit(&mut app);
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(0, "x".repeat(super::MAX_EDIT_HISTORY_BYTES + 1))
             .unwrap();
         assert!(
-            !app.document.as_ref().unwrap().can_undo(),
+            !app.active.document.as_ref().unwrap().can_undo(),
             "structural Undo must not jump over an untracked edit"
         );
         assert!(app.swap_edit_history(false).is_err());
@@ -9826,15 +9884,17 @@ mod tests {
         fs::write(&source, b"name,value\nfirst,1\n").unwrap();
         fs::write(&other, b"other,value\nsecond,2\n").unwrap();
         let mut app = individual_edit_app(&source);
-        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
-        assert!(app.open_path(other.clone()).is_err());
-        assert!(app.document.as_ref().unwrap().can_undo());
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "2");
+        app.open_path(other.clone()).unwrap();
+        app.open_path(source.clone()).unwrap();
+        assert!(app.active.document.as_ref().unwrap().can_undo());
         app.save_as_picker_result(None);
-        assert!(app.document.as_ref().unwrap().can_undo());
+        assert!(app.active.document.as_ref().unwrap().can_undo());
 
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
         if app
+            .active
             .document
             .as_mut()
             .unwrap()
@@ -9843,16 +9903,17 @@ mod tests {
         {
             let _ = finish_app_save(&mut app, &ctx, &mut frame);
         }
-        assert_eq!(app.document.as_ref().unwrap().logical_path, source);
-        assert!(app.document.as_ref().unwrap().can_undo());
-        app.document
+        assert_eq!(app.active.document.as_ref().unwrap().logical_path, source);
+        assert!(app.active.document.as_ref().unwrap().can_undo());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_save_as(saved_copy.clone())
             .unwrap();
-        assert!(!app.document.as_ref().unwrap().can_undo());
+        assert!(!app.active.document.as_ref().unwrap().can_undo());
         let _ = finish_app_save(&mut app, &ctx, &mut frame);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.logical_path, saved_copy);
         assert!(!document.can_undo());
         assert!(!document.can_redo());
@@ -9862,22 +9923,22 @@ mod tests {
         commit_test_cell(document, 1, 1, "3");
         document.start_save().unwrap();
         let _ = finish_app_save(&mut app, &ctx, &mut frame);
-        assert!(!app.document.as_ref().unwrap().can_undo());
+        assert!(!app.active.document.as_ref().unwrap().can_undo());
         assert_eq!(fs::read(&saved_copy).unwrap(), b"name,value\nfirst,3\n");
-        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "4");
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "4");
         app.apply(&ctx, Action::DiscardChanges);
-        assert!(!app.document.as_ref().unwrap().can_undo());
-        assert!(!app.document.as_ref().unwrap().can_redo());
+        assert!(!app.active.document.as_ref().unwrap().can_undo());
+        assert!(!app.active.document.as_ref().unwrap().can_redo());
 
-        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "5");
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "5");
         app.swap_edit_history(false).unwrap();
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
         assert!(app.open_path(directory.path().join("missing.csv")).is_err());
-        assert!(app.document.as_ref().unwrap().can_redo());
+        assert!(app.active.document.as_ref().unwrap().can_redo());
         app.open_path(other.clone()).unwrap();
-        assert_eq!(app.document.as_ref().unwrap().logical_path, other);
-        assert!(!app.document.as_ref().unwrap().can_undo());
-        assert!(!app.document.as_ref().unwrap().can_redo());
+        assert_eq!(app.active.document.as_ref().unwrap().logical_path, other);
+        assert!(!app.active.document.as_ref().unwrap().can_undo());
+        assert!(!app.active.document.as_ref().unwrap().can_redo());
     }
 
     #[test]
@@ -9887,21 +9948,21 @@ mod tests {
         for action in ["undo", "redo", "save"] {
             fs::write(&source, b"name,value\nfirst,1\n").unwrap();
             let mut app = individual_edit_app(&source);
-            commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
+            commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "2");
             if action == "redo" {
                 app.swap_edit_history(false).unwrap();
             }
-            let before = app.document.as_ref().unwrap().cell_edits.clone();
+            let before = app.active.document.as_ref().unwrap().cell_edits.clone();
             fs::write(&source, b"name,value\nexternal,changed\n").unwrap();
             if action == "save" {
-                assert!(app.document.as_mut().unwrap().start_save().is_err());
+                assert!(app.active.document.as_mut().unwrap().start_save().is_err());
             } else {
                 assert!(app.swap_edit_history(action == "redo").is_err());
             }
-            assert!(app.document.as_ref().unwrap().source_changed);
-            assert!(!app.document.as_ref().unwrap().can_undo());
-            assert!(!app.document.as_ref().unwrap().can_redo());
-            assert_eq!(app.document.as_ref().unwrap().cell_edits, before);
+            assert!(app.active.document.as_ref().unwrap().source_changed);
+            assert!(!app.active.document.as_ref().unwrap().can_undo());
+            assert!(!app.active.document.as_ref().unwrap().can_redo());
+            assert_eq!(app.active.document.as_ref().unwrap().cell_edits, before);
             assert_eq!(
                 fs::read(&source).unwrap(),
                 b"name,value\nexternal,changed\n"
@@ -9958,15 +10019,16 @@ mod tests {
         );
         fs::write(&source, &original).unwrap();
         let mut app = individual_edit_app(&source);
-        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "edited");
-        app.document.as_mut().unwrap().selection = Some(GridSelection::Cell { row: 1, column: 0 });
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "edited");
+        app.active.document.as_mut().unwrap().selection =
+            Some(GridSelection::Cell { row: 1, column: 0 });
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut time = 0.0;
         let output = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
         let row_target = accessible_button(&output, "Select row 2").0;
         let undo_target = accessible_button(&output, "Undo Change").0;
-        let position = app.document.as_ref().unwrap().grid_position();
+        let position = app.active.document.as_ref().unwrap().grid_position();
         app.begin_storage_review(super::PendingStorageOperation::Structural(
             super::StructuralDialog::sort(0),
         ));
@@ -9998,9 +10060,9 @@ mod tests {
                 },
             ],
         );
-        assert!(app.storage_review.is_some());
-        assert!(!app.find_bar_open);
-        let document = app.document.as_ref().unwrap();
+        assert!(app.active.storage_review.is_some());
+        assert!(!app.active.find_bar_open);
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.grid_position(), position);
         assert_eq!(document.cell_edits[&(1, 1)], b"edited");
         assert_eq!(
@@ -10025,7 +10087,7 @@ mod tests {
                 .any(|command| { matches!(command, egui::OutputCommand::CopyText(_)) })
         );
         assert_eq!(fs::read_to_string(&source).unwrap(), original);
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -10042,7 +10104,7 @@ mod tests {
             shift: true,
             ..command
         };
-        commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "2");
         let output = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
         let (undo_id, undo_node) = accessible_button(&output, "Undo Change");
         assert!(!undo_node.is_disabled());
@@ -10058,7 +10120,7 @@ mod tests {
                 },
             )],
         );
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
         let output = individual_edit_frame(&mut app, &ctx, &mut time, vec![]);
         let (redo_id, redo_node) = accessible_button(&output, "Redo Change");
         assert!(!redo_node.is_disabled());
@@ -10074,25 +10136,31 @@ mod tests {
                 },
             )],
         );
-        assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 1)], b"2");
+        assert_eq!(
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            b"2"
+        );
         let _ = individual_edit_frame(
             &mut app,
             &ctx,
             &mut time,
             vec![individual_edit_key(egui::Key::Z, command)],
         );
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
         let _ = individual_edit_frame(
             &mut app,
             &ctx,
             &mut time,
             vec![individual_edit_key(egui::Key::Z, redo)],
         );
-        assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 1)], b"2");
+        assert_eq!(
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            b"2"
+        );
 
         for header in [false, true] {
             let before = if header { "name" } else { "2" };
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             let history_len = document.edit_history.undo.len();
             if header {
                 document.begin_header_edit(0);
@@ -10115,7 +10183,7 @@ mod tests {
                 &mut time,
                 vec![individual_edit_key(egui::Key::Z, command)],
             );
-            let document = app.document.as_ref().unwrap();
+            let document = app.active.document.as_ref().unwrap();
             let draft = if header {
                 &document.header_edit.as_ref().unwrap().draft
             } else {
@@ -10135,7 +10203,7 @@ mod tests {
                 &mut time,
                 vec![individual_edit_key(egui::Key::Enter, egui::Modifiers::NONE)],
             );
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             assert_eq!(document.edit_history.undo.len(), history_len + 1);
             if header {
                 document.begin_header_edit(0);
@@ -10149,7 +10217,7 @@ mod tests {
                 &mut time,
                 vec![individual_edit_key(egui::Key::Z, command)],
             );
-            let document = app.document.as_ref().unwrap();
+            let document = app.active.document.as_ref().unwrap();
             let draft = if header {
                 &document.header_edit.as_ref().unwrap().draft
             } else {
@@ -10176,7 +10244,7 @@ mod tests {
                 &mut time,
                 vec![individual_edit_key(egui::Key::Z, command)],
             );
-            let document = app.document.as_ref().unwrap();
+            let document = app.active.document.as_ref().unwrap();
             assert_eq!(document.edit_history.undo.len(), history_len);
             if header {
                 assert_eq!(document.column_name(0), before);
@@ -10235,12 +10303,12 @@ mod tests {
         for editing in [false, true] {
             let ctx = egui::Context::default();
             let mut app = QuarryApp::new(Some(original.clone()), Instant::now());
-            finish_index(app.document.as_mut().unwrap());
+            finish_index(app.active.document.as_mut().unwrap());
             let _ = ctx.run(grid_input(), |ctx| {
                 eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
             });
             if editing {
-                let document = app.document.as_mut().unwrap();
+                let document = app.active.document.as_mut().unwrap();
                 document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
                 document.cell_edit.as_mut().unwrap().draft = "unsaved".into();
             }
@@ -10261,9 +10329,9 @@ mod tests {
                 },
                 |ctx| eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest()),
             );
-            let document = app.document.as_ref().unwrap();
+            let document = app.active.document.as_ref().unwrap();
             assert_eq!(document.logical_path, original);
-            assert!(app.notice.is_none());
+            assert!(app.active.notice.is_none());
             if editing {
                 assert_eq!(document.cell_edit.as_ref().unwrap().draft, "unsaved");
                 assert!(document.cell_edits.is_empty());
@@ -10275,7 +10343,10 @@ mod tests {
                 let _ = ctx.run(grid_input(), |ctx| {
                     eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
                 });
-                assert_eq!(app.document.as_ref().unwrap().logical_path, replacement);
+                assert_eq!(
+                    app.active.document.as_ref().unwrap().logical_path,
+                    replacement
+                );
             }
         }
     }
@@ -10289,8 +10360,8 @@ mod tests {
             let mut app = QuarryApp::new(None, Instant::now());
             if with_document {
                 app.open_path(source.clone()).unwrap();
-                finish_index(app.document.as_mut().unwrap());
-                commit_test_cell(app.document.as_mut().unwrap(), 1, 1, "2");
+                finish_index(app.active.document.as_mut().unwrap());
+                commit_test_cell(app.active.document.as_mut().unwrap(), 1, 1, "2");
             }
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
@@ -10376,9 +10447,12 @@ mod tests {
                     vec![individual_edit_key(key, egui::Modifiers::COMMAND)],
                 );
             }
-            assert!(!app.find_bar_open);
+            assert!(!app.active.find_bar_open);
             if with_document {
-                assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 1)], b"2");
+                assert_eq!(
+                    app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+                    b"2"
+                );
             }
             assert_eq!(fs::read(&source).unwrap(), b"name,value\nprivate-value,1\n");
             render(
@@ -10443,7 +10517,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(&filename);
         fs::write(&path, b"name,value\nfirst,1\n").unwrap();
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
 
         let ctx = egui::Context::default();
@@ -10490,7 +10564,12 @@ mod tests {
             assert!(accessible_button(&output, label).1.is_disabled());
         }
 
-        app.document.as_mut().unwrap().move_column(1, 0).unwrap();
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .move_column(1, 0)
+            .unwrap();
         let output = ctx.run(grid_input_with_width(860.0), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
@@ -10498,13 +10577,14 @@ mod tests {
         for label in ["Save", "Discard Changes"] {
             assert!(accessible_button(&output, label).1.is_disabled());
         }
-        app.document.as_mut().unwrap().columns.reset();
+        app.active.document.as_mut().unwrap().columns.reset();
         let output = ctx.run(grid_input_with_width(860.0), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
         assert!(accessible_button(&output, "Save As…").1.is_disabled());
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(0, "changed".into())
@@ -10536,14 +10616,17 @@ mod tests {
         let output = dirty_ctx.run(grid_input_with_width(860.0), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
-        for label in ["Open…", "Reload from Disk"] {
-            assert!(accessible_button(&output, label).1.is_disabled());
-        }
+        assert!(!accessible_button(&output, "Open…").1.is_disabled());
+        assert!(
+            accessible_button(&output, "Reload from Disk")
+                .1
+                .is_disabled()
+        );
         for label in ["Save", "Save As…", "Discard Changes"] {
             assert!(!accessible_button(&output, label).1.is_disabled());
         }
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -10626,7 +10709,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            app.format_draft,
+            app.active.format_draft,
             Some((DelimiterMode::Auto, HeaderMode::Auto))
         );
         assert!(
@@ -10675,7 +10758,7 @@ mod tests {
         );
         let output = render(&mut app, vec![]);
         assert_eq!(
-            app.format_draft,
+            app.active.format_draft,
             Some((DelimiterMode::Tab, HeaderMode::Auto))
         );
         assert!(
@@ -10685,9 +10768,9 @@ mod tests {
         let (reopen, node) = accessible_button(&output, "Reopen with Changes");
         assert!(!node.is_disabled());
         let _ = render(&mut app, click(reopen));
-        assert_eq!(app.format_draft, None);
-        assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
-        assert_eq!(app.header_mode, HeaderMode::Auto);
+        assert_eq!(app.active.format_draft, None);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Tab);
+        assert_eq!(app.active.header_mode, HeaderMode::Auto);
 
         let output = render(&mut app, vec![]);
         let (format_id, _) = accessible_button(&output, "Format: Tab, Auto");
@@ -10708,7 +10791,7 @@ mod tests {
         let _ = render(&mut app, click(no_header));
         let output = render(&mut app, vec![]);
         assert_eq!(
-            app.format_draft,
+            app.active.format_draft,
             Some((DelimiterMode::Tab, HeaderMode::NoHeader))
         );
         assert!(
@@ -10717,12 +10800,12 @@ mod tests {
         );
         let cancel = accessible_button(&output, "Cancel").0;
         let _ = render(&mut app, click(cancel));
-        assert_eq!(app.format_draft, None);
-        assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
-        assert_eq!(app.header_mode, HeaderMode::Auto);
+        assert_eq!(app.active.format_draft, None);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Tab);
+        assert_eq!(app.active.header_mode, HeaderMode::Auto);
 
-        app.delimiter_mode = DelimiterMode::Semicolon;
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.delimiter_mode = DelimiterMode::Semicolon;
+        app.active.header_mode = HeaderMode::FirstRow;
         for width in [860.0, 1280.0] {
             let output = ctx.run(grid_input_with_width(width), |ctx| {
                 eframe::App::update(&mut app, ctx, &mut frame);
@@ -10731,7 +10814,7 @@ mod tests {
             let bounds = format.bounds().expect("Format menu should have bounds");
             assert!(bounds.x1 - bounds.x0 <= super::FORMAT_MENU_WIDTH as f64 + 1.0);
         }
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -10868,7 +10951,7 @@ mod tests {
         contents.extend_from_slice(&b"first,1\n".repeat(131_072));
         fs::write(&path, contents).unwrap();
         app.open_new_path(path).unwrap();
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         let initial_job = document.job.take().expect("index job should be active");
         initial_job.cancel();
         initial_job.wait().unwrap();
@@ -10901,10 +10984,11 @@ mod tests {
             });
             assert_eq!(
                 assert_toolbar(&ctx, &output, &document_labels, width),
-                empty_tops[index]
+                empty_tops[index] + 30.0
             );
             assert!(
-                app.document
+                app.active
+                    .document
                     .as_ref()
                     .unwrap()
                     .job
@@ -10913,7 +10997,7 @@ mod tests {
                 "indexing should remain active during layout assertions"
             );
         }
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
 
         for (index, width) in widths.into_iter().enumerate() {
             let output = ctx.run(grid_input_with_width(width), |ctx| {
@@ -10921,11 +11005,12 @@ mod tests {
             });
             assert_eq!(
                 assert_toolbar(&ctx, &output, &document_labels, width),
-                empty_tops[index]
+                empty_tops[index] + 30.0
             );
         }
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(0, "changed".into())
@@ -10936,11 +11021,11 @@ mod tests {
             });
             assert_eq!(
                 assert_toolbar(&ctx, &output, &document_labels, width),
-                empty_tops[index]
+                empty_tops[index] + 30.0
             );
         }
 
-        app.document.as_mut().unwrap().filter_query = Some(FilterQuery {
+        app.active.document.as_mut().unwrap().filter_query = Some(FilterQuery {
             predicates: (0..12)
                 .map(|_| FilterPredicate {
                     column: 0,
@@ -10969,12 +11054,12 @@ mod tests {
             });
             assert_eq!(
                 assert_toolbar(&ctx, &output, &filtered_labels, width),
-                empty_tops[index]
+                empty_tops[index] + 30.0
             );
             assert!(accessible_button(&output, "Find").1.is_disabled());
         }
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -11045,7 +11130,10 @@ mod tests {
         let hovered = hover_ctx.run(hover_input, |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
-        assert!(app.document.is_none(), "hovering must not open a file");
+        assert!(
+            app.active.document.is_none(),
+            "hovering must not open a file"
+        );
         assert!(hovered.shapes.iter().any(|shape| {
             matches!(
                 &shape.shape,
@@ -11064,8 +11152,8 @@ mod tests {
         let _ = hover_ctx.run(drop_input, |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
-        assert_eq!(app.document.as_ref().unwrap().session.path(), path);
-        app.document.as_mut().unwrap().shutdown();
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), path);
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[cfg(target_os = "macos")]
@@ -11151,16 +11239,16 @@ mod tests {
         let mut app = QuarryApp::new(None, Instant::now());
 
         app.open_path_and_report(missing);
-        let failed_open = app.notice.as_ref().unwrap().severity;
+        let failed_open = app.active.notice.as_ref().unwrap().severity;
 
         app.save_current();
-        let blocked_save = app.notice.as_ref().unwrap().severity;
+        let blocked_save = app.active.notice.as_ref().unwrap().severity;
 
         app.copy_selection(&egui::Context::default());
-        let blocked_copy = app.notice.as_ref().unwrap().severity;
+        let blocked_copy = app.active.notice.as_ref().unwrap().severity;
 
         app.handle_dropped_paths(vec![None]);
-        let ignored_drop = app.notice.as_ref().unwrap().severity;
+        let ignored_drop = app.active.notice.as_ref().unwrap().severity;
 
         for (source, actual, expected) in [
             ("failed open", failed_open, MessageSeverity::Error),
@@ -11439,6 +11527,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let ready = app
+                .active
                 .document
                 .as_mut()
                 .expect("the document remains open")
@@ -11448,6 +11537,7 @@ mod tests {
                 app.install_materialized_working_copy(ready).unwrap();
             }
             if app
+                .active
                 .document
                 .as_ref()
                 .is_some_and(|document| document.structural_job.is_none())
@@ -11457,7 +11547,7 @@ mod tests {
             assert!(Instant::now() < deadline, "column edit timed out");
             std::thread::yield_now();
         }
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         if document.job.is_some() {
             finish_index(document);
         } else {
@@ -11517,6 +11607,7 @@ mod tests {
     ) -> egui::FullOutput {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !app
+            .active
             .document
             .as_ref()
             .and_then(|document| document.save_job.as_ref())
@@ -11558,13 +11649,13 @@ mod tests {
         let mut document = Document::open(&source, OpenOptions::default()).unwrap();
         finish_index(&mut document);
         let mut app = QuarryApp::new(None, Instant::now());
-        app.document = Some(document);
+        app.active.document = Some(document);
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
         let _ = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         let first = document.viewport_start;
         let page = document.visible_rows as u64;
 
@@ -11587,7 +11678,10 @@ mod tests {
                     eframe::App::update(&mut app, ctx, &mut frame);
                 },
             );
-            assert_eq!(app.document.as_ref().unwrap().viewport_start, expected);
+            assert_eq!(
+                app.active.document.as_ref().unwrap().viewport_start,
+                expected
+            );
         }
     }
 
@@ -11607,10 +11701,10 @@ mod tests {
             |ctx| {
                 action = show_filter_manager(
                     ctx,
-                    &mut app.filters_open,
-                    &mut app.filter_rules,
-                    &mut app.filter_match_case,
-                    app.document.as_ref().unwrap(),
+                    &mut app.active.filters_open,
+                    &mut app.active.filter_rules,
+                    &mut app.active.filter_match_case,
+                    app.active.document.as_ref().unwrap(),
                 );
             },
         );
@@ -11649,7 +11743,7 @@ mod tests {
         )
         .unwrap();
         let mut app = individual_edit_app(&source);
-        app.filters_open = true;
+        app.active.filters_open = true;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         super::configure_style(&ctx);
@@ -11663,7 +11757,7 @@ mod tests {
         );
         let (_, output) =
             filter_manager_frame(&mut app, &ctx, vec![egui::Event::Text("Note".into())], size);
-        assert_eq!(app.filter_rules[0].column_search, "Note");
+        assert_eq!(app.active.filter_rules[0].column_search, "Note");
         let _ = filter_manager_frame(
             &mut app,
             &ctx,
@@ -11681,7 +11775,7 @@ mod tests {
             let _ = filter_manager_frame(&mut app, &ctx, vec![], size);
         }
         let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
-        assert!(app.filter_rules[0].column_search.is_empty());
+        assert!(app.active.filter_rules[0].column_search.is_empty());
         let check_visible = |output: &egui::FullOutput| {
             for label in [
                 "1: First name",
@@ -11724,7 +11818,7 @@ mod tests {
         );
         let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
         check_visible(&output);
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -11748,12 +11842,12 @@ mod tests {
         );
         fs::write(&source, &original).unwrap();
         let mut app = individual_edit_app(&source);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.move_column(96, 0).unwrap();
         document.set_column_shown(96, false).unwrap();
-        app.filters_open = true;
-        app.filter_rules[0].operator = FilterOperator::Equals;
-        app.filter_rules[0].value_input = "keep".into();
+        app.active.filters_open = true;
+        app.active.filter_rules[0].operator = FilterOperator::Equals;
+        app.active.filter_rules[0].value_input = "keep".into();
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let size = egui::vec2(1280.0, 780.0);
@@ -11771,7 +11865,7 @@ mod tests {
             vec![egui::Event::Text("Repeated".into())],
             size,
         );
-        assert_eq!(app.filter_rules[0].column_search, "Repeated");
+        assert_eq!(app.active.filter_rules[0].column_search, "Repeated");
         let tree = output.platform_output.accesskit_update.as_ref().unwrap();
         assert!(tree.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::TextInput
@@ -11792,11 +11886,11 @@ mod tests {
             filter_control_click(&output, "97: Repeated"),
             size,
         );
-        assert_eq!(app.filter_rules[0].column_input, "97");
-        let query = super::filter_query_from_rules(&app.filter_rules, false, 100).unwrap();
+        assert_eq!(app.active.filter_rules[0].column_input, "97");
+        let query = super::filter_query_from_rules(&app.active.filter_rules, false, 100).unwrap();
         assert_eq!(query.predicates[0].column, 96);
         app.apply(&ctx, Action::ApplyFilter);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         finish_filter(document);
         assert_eq!(document.available_filter_rows(), 1);
         assert_eq!(document.visible_filter_rows()[0].row, 1);
@@ -11819,7 +11913,7 @@ mod tests {
             filter_control_click(&output, "Rule 1 column"),
             size,
         );
-        let draft = super::filter_query_from_rules(&app.filter_rules, false, 100).unwrap();
+        let draft = super::filter_query_from_rules(&app.active.filter_rules, false, 100).unwrap();
         let escape = || {
             vec![egui::Event::Key {
                 key: egui::Key::Escape,
@@ -11832,7 +11926,7 @@ mod tests {
         let (action, _) = filter_manager_frame(&mut app, &ctx, escape(), size);
         assert!(action.is_none());
         assert!(
-            app.filters_open,
+            app.active.filters_open,
             "Escape must close the picker before Filters"
         );
         let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
@@ -11847,16 +11941,16 @@ mod tests {
         );
         let (action, _) = filter_manager_frame(&mut app, &ctx, escape(), size);
         assert!(action.is_none());
-        assert!(!app.filters_open);
+        assert!(!app.active.filters_open);
         assert_eq!(
-            super::filter_query_from_rules(&app.filter_rules, false, 100).unwrap(),
+            super::filter_query_from_rules(&app.active.filter_rules, false, 100).unwrap(),
             draft
         );
         assert_eq!(
-            app.document.as_ref().unwrap().filter_query.as_ref(),
+            app.active.document.as_ref().unwrap().filter_query.as_ref(),
             Some(&query)
         );
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         assert_eq!(fs::read_to_string(source).unwrap(), original);
     }
 
@@ -11866,8 +11960,8 @@ mod tests {
         let source = directory.path().join("filter-layout.csv");
         fs::write(&source, b"name\nfirst\n").unwrap();
         let mut app = individual_edit_app(&source);
-        app.filters_open = true;
-        app.filter_rules = vec![super::FilterRuleDraft::default(); 12];
+        app.active.filters_open = true;
+        app.active.filter_rules = vec![super::FilterRuleDraft::default(); 12];
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         super::configure_style(&ctx);
@@ -11897,7 +11991,7 @@ mod tests {
             node.value()
                 .is_some_and(|label| label.contains("invalid filter rule"))
         }));
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document
             .start_filter(FilterQuery::single(
                 0,
@@ -11916,7 +12010,8 @@ mod tests {
                 ("Export Filtered Rows…", false),
             ],
         );
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(0, "customer".into())
@@ -11931,7 +12026,7 @@ mod tests {
             ],
         );
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.clear_filter().unwrap();
         commit_test_cell(document, 1, 0, "edited");
         let _ = filter_manager_frame(&mut app, &ctx, vec![], size);
@@ -11949,7 +12044,7 @@ mod tests {
                         == Some("Save or discard cell edits before filtering the source file.")
                 })
         );
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -11962,10 +12057,10 @@ mod tests {
         )
         .unwrap();
         let mut app = individual_edit_app(&source);
-        app.filter_rules = vec![super::FilterRuleDraft::default(); 2];
-        app.filter_rules[0].value_input = "first".into();
-        app.filter_rules[1].value_input = "second".into();
-        app.filter_match_case = true;
+        app.active.filter_rules = vec![super::FilterRuleDraft::default(); 2];
+        app.active.filter_rules[0].value_input = "first".into();
+        app.active.filter_rules[1].value_input = "second".into();
+        app.active.filter_match_case = true;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         super::configure_style(&ctx);
@@ -11989,22 +12084,22 @@ mod tests {
             output
         };
         for size in [egui::vec2(860.0, 540.0), egui::vec2(1280.0, 780.0)] {
-            app.columns_open = false;
-            app.filters_open = false;
-            app.filter_rules[0].column_input = "1".into();
+            app.active.columns_open = false;
+            app.active.filters_open = false;
+            app.active.filter_rules[0].column_input = "1".into();
             let mut output = render(&mut app, vec![], size);
             for (label, id) in [
                 ("Filters…", "quarry-filter-manager"),
                 ("Columns…", "quarry-column-manager"),
                 ("Filters…", "quarry-filter-manager"),
             ] {
-                let draft = app.filter_rules.clone();
+                let draft = app.active.filter_rules.clone();
                 let events = filter_control_click(&output, label);
                 output = render(&mut app, events, size);
-                assert_eq!(app.filters_open, label == "Filters…");
-                assert_eq!(app.columns_open, label == "Columns…");
-                assert_eq!(app.filter_rules, draft);
-                assert!(app.filter_match_case);
+                assert_eq!(app.active.filters_open, label == "Filters…");
+                assert_eq!(app.active.columns_open, label == "Columns…");
+                assert_eq!(app.active.filter_rules, draft);
+                assert!(app.active.filter_match_case);
                 let panel = ctx
                     .memory(|memory| memory.area_rect(egui::Id::new(id)))
                     .unwrap();
@@ -12021,10 +12116,10 @@ mod tests {
                     (f64::from(panel.top()) - button.y1 - 6.0).abs() <= 1.0,
                     "{id} must sit below its toolbar button: panel={panel:?}, button={button:?}, viewport={size:?}"
                 );
-                if !app.filters_open {
+                if !app.active.filters_open {
                     continue;
                 }
-                app.filter_rules[0].column_input = "2".into();
+                app.active.filter_rules[0].column_input = "2".into();
                 output = render(&mut app, vec![], size);
                 let long_panel = ctx
                     .memory(|memory| memory.area_rect(egui::Id::new(id)))
@@ -12085,9 +12180,9 @@ mod tests {
                     "{long_value}\nline two\nline three\nline four\nline five\nline six\nline seven"
                 ),
             ] {
-                app.filter_rules[0].value_input = value.clone();
+                app.active.filter_rules[0].value_input = value.clone();
                 output = render(&mut app, vec![], size);
-                assert_eq!(app.filter_rules[0].value_input, value);
+                assert_eq!(app.active.filter_rules[0].value_input, value);
                 let panel = ctx
                     .memory(|memory| memory.area_rect(egui::Id::new("quarry-filter-manager")))
                     .unwrap();
@@ -12130,9 +12225,9 @@ mod tests {
                     );
                 }
             }
-            app.filter_rules[0].value_input = "first".into();
+            app.active.filter_rules[0].value_input = "first".into();
         }
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -12151,10 +12246,10 @@ mod tests {
                 |ctx| {
                     action = show_filter_manager(
                         ctx,
-                        &mut app.filters_open,
-                        &mut app.filter_rules,
-                        &mut app.filter_match_case,
-                        app.document.as_ref().unwrap(),
+                        &mut app.active.filters_open,
+                        &mut app.active.filter_rules,
+                        &mut app.active.filter_match_case,
+                        app.active.document.as_ref().unwrap(),
                     );
                 },
             );
@@ -12176,11 +12271,11 @@ mod tests {
         let original = b"amount,note\r\n99.999,below\r\n100,lower\r\n1e3,upper\r\n1000.0001,above\r\n,blank\r\nbad,invalid\r\n 1.00e2 ,\"line one\nline two\"\r\n";
         fs::write(&source, original).unwrap();
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(source.clone()).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        app.filters_open = true;
-        app.filter_match_case = true;
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active.filters_open = true;
+        app.active.filter_match_case = true;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let (_, output) = render(&mut app, &ctx, vec![]);
@@ -12217,7 +12312,7 @@ mod tests {
             .map(|(id, _)| *id)
             .unwrap();
         let _ = render(&mut app, &ctx, click(between));
-        assert_eq!(app.filter_rules[0].operator, FilterOperator::Between);
+        assert_eq!(app.active.filter_rules[0].operator, FilterOperator::Between);
         let (_, output) = render(&mut app, &ctx, vec![]);
         assert!(accessible_button(&output, "Apply filters").1.is_disabled());
         for operator in [
@@ -12271,8 +12366,8 @@ mod tests {
         let (action, _) = render(&mut app, &ctx, click(apply));
         assert_eq!(action, Some(Action::ApplyFilter));
         app.apply(&ctx, action.unwrap());
-        assert!(app.notice.is_none());
-        let document = app.document.as_mut().unwrap();
+        assert!(app.active.notice.is_none());
+        let document = app.active.document.as_mut().unwrap();
         finish_filter(document);
         assert_eq!(document.available_filter_rows(), 3);
         let active_query = document.filter_query.clone();
@@ -12284,12 +12379,12 @@ mod tests {
         assert_eq!(active_rows, vec![2, 3, 7]);
 
         for invalid in ["", "99", "NaN", "1,000"] {
-            app.filter_rules[0].upper_bound_input = invalid.into();
+            app.active.filter_rules[0].upper_bound_input = invalid.into();
             let (_, output) = render(&mut app, &ctx, vec![]);
             assert!(accessible_button(&output, "Apply filters").1.is_disabled());
             app.apply(&ctx, Action::ApplyFilter);
-            assert!(app.notice.is_some());
-            let document = app.document.as_ref().unwrap();
+            assert!(app.active.notice.is_some());
+            let document = app.active.document.as_ref().unwrap();
             assert_eq!(document.filter_query, active_query);
             assert_eq!(
                 document
@@ -12300,7 +12395,7 @@ mod tests {
                 active_rows
             );
         }
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.start_filtered_export(destination.clone()).unwrap();
         finish_filtered_export(document);
         assert_eq!(
@@ -12360,11 +12455,11 @@ mod tests {
         .unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
-        app.filters_open = true;
-        app.filter_rules[0].column_input = "2".to_owned();
-        app.filter_rules[0].operator = FilterOperator::Equals;
+        app.active.filters_open = true;
+        app.active.filter_rules[0].column_input = "2".to_owned();
+        app.active.filter_rules[0].operator = FilterOperator::Equals;
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -12372,10 +12467,10 @@ mod tests {
         let output = ctx.run(grid_input(), |ctx| {
             action = show_filter_manager(
                 ctx,
-                &mut app.filters_open,
-                &mut app.filter_rules,
-                &mut app.filter_match_case,
-                app.document.as_ref().unwrap(),
+                &mut app.active.filters_open,
+                &mut app.active.filter_rules,
+                &mut app.active.filter_match_case,
+                app.active.document.as_ref().unwrap(),
             );
         });
         let tree = output
@@ -12437,15 +12532,15 @@ mod tests {
             |ctx| {
                 action = show_filter_manager(
                     ctx,
-                    &mut app.filters_open,
-                    &mut app.filter_rules,
-                    &mut app.filter_match_case,
-                    app.document.as_ref().unwrap(),
+                    &mut app.active.filters_open,
+                    &mut app.active.filter_rules,
+                    &mut app.active.filter_match_case,
+                    app.active.document.as_ref().unwrap(),
                 );
             },
         );
         assert!(action.is_none(), "Enter should insert data, not apply");
-        assert_eq!(app.filter_rules[0].value_input, "line one\nline two");
+        assert_eq!(app.active.filter_rules[0].value_input, "line one\nline two");
 
         let _ = ctx.run(
             egui::RawInput {
@@ -12461,17 +12556,17 @@ mod tests {
             |ctx| {
                 action = show_filter_manager(
                     ctx,
-                    &mut app.filters_open,
-                    &mut app.filter_rules,
-                    &mut app.filter_match_case,
-                    app.document.as_ref().unwrap(),
+                    &mut app.active.filters_open,
+                    &mut app.active.filter_rules,
+                    &mut app.active.filter_match_case,
+                    app.active.document.as_ref().unwrap(),
                 );
             },
         );
         assert!(matches!(action, Some(Action::ApplyFilter)));
 
         app.apply(&ctx, action.unwrap());
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         finish_filter(document);
         assert_eq!(document.available_filter_rows(), 1);
         assert_eq!(document.visible_filter_rows()[0].fields[0], b"first");
@@ -12510,7 +12605,7 @@ mod tests {
         ctx.enable_accesskit();
         configure_style(&ctx);
         let mut app = QuarryApp::new(None, Instant::now());
-        app.document = Some(document);
+        app.active.document = Some(document);
         let mut frame = eframe::Frame::_new_kittest();
         let output = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
@@ -12530,7 +12625,7 @@ mod tests {
                 .all(|text| !text.starts_with("matches "))
         );
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -12702,9 +12797,9 @@ mod tests {
         .unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
-        app.filter_rules = vec![
+        app.active.filter_rules = vec![
             super::FilterRuleDraft {
                 column_input: "2".into(),
                 column_search: String::new(),
@@ -12728,14 +12823,14 @@ mod tests {
             },
         ];
         assert_eq!(
-            filter_button_label(app.document.as_ref().unwrap().filter_query.as_ref()),
+            filter_button_label(app.active.document.as_ref().unwrap().filter_query.as_ref()),
             "Filters…"
         );
         let ctx = egui::Context::default();
         app.apply(&ctx, Action::ApplyFilter);
-        assert!(app.notice.is_none());
+        assert!(app.active.notice.is_none());
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         finish_filter(document);
         assert_eq!(document.filter_query.as_ref().unwrap().predicates.len(), 3);
         assert_eq!(
@@ -13264,9 +13359,9 @@ mod tests {
         fs::write(&path, b"name,value\nfirst,1\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.rename_header(0, "button_name".into()).unwrap();
         document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
         document.cell_edit.as_mut().unwrap().draft = "line one\nline two".into();
@@ -13274,7 +13369,8 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut frame = eframe::Frame::_new_kittest();
-        app.close_confirmation_open = true;
+        app.quit_pending = true;
+        app.active.close_confirmation_open = true;
         let _ = ctx.run(
             egui::RawInput {
                 modifiers: egui::Modifiers::COMMAND,
@@ -13291,9 +13387,9 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(app.close_confirmation_open);
-        assert!(app.document.as_ref().unwrap().save_job.is_none());
-        assert!(app.document.as_ref().unwrap().is_dirty());
+        assert!(app.active.close_confirmation_open);
+        assert!(app.active.document.as_ref().unwrap().save_job.is_none());
+        assert!(app.active.document.as_ref().unwrap().is_dirty());
         app.keep_editing();
 
         let output = ctx.run(grid_input(), |ctx| {
@@ -13336,20 +13432,20 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(app.document.as_ref().unwrap().save_job.is_some());
+        assert!(app.active.document.as_ref().unwrap().save_job.is_some());
         let _ = finish_app_save(&mut app, &ctx, &mut frame);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), path);
         assert_eq!(document.column_name(0), "button_name");
         assert!(!document.is_dirty());
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::FirstRow);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.active.header_mode, HeaderMode::FirstRow);
         assert_eq!(
             fs::read(&path).unwrap(),
             b"button_name,value\nfirst,\"line one\nline two\"\n"
         );
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.begin_header_edit(0);
         document.header_edit.as_mut().unwrap().draft = "shortcut_name".into();
         let _ = ctx.run(
@@ -13368,9 +13464,9 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(app.document.as_ref().unwrap().save_job.is_some());
+        assert!(app.active.document.as_ref().unwrap().save_job.is_some());
         let _ = finish_app_save(&mut app, &ctx, &mut frame);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), path);
         assert_eq!(document.column_name(0), "shortcut_name");
         assert!(!document.is_dirty());
@@ -13379,12 +13475,14 @@ mod tests {
             b"shortcut_name,value\nfirst,\"line one\nline two\"\n"
         );
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(0, "close_name".into())
             .unwrap();
-        app.close_confirmation_open = true;
+        app.quit_pending = true;
+        app.active.close_confirmation_open = true;
         let output = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
@@ -13416,8 +13514,8 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(app.close_after_save);
-        assert!(app.document.as_ref().unwrap().save_job.is_some());
+        assert!(app.active.close_after_save);
+        assert!(app.active.document.as_ref().unwrap().save_job.is_some());
         let close_output = finish_app_save(&mut app, &ctx, &mut frame);
         assert!(
             close_output
@@ -13428,7 +13526,7 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Close))
         );
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.column_name(0), "close_name");
         assert!(!document.is_dirty());
         assert_eq!(
@@ -13436,7 +13534,7 @@ mod tests {
             b"close_name,value\nfirst,\"line one\nline two\"\n"
         );
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         fs::remove_file(path).unwrap();
     }
 
@@ -13452,10 +13550,10 @@ mod tests {
         fs::write(&source, b"\xEF\xBB\xBFfirst,1\nsecond,2\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::NoHeader;
+        app.active.header_mode = HeaderMode::NoHeader;
         app.open_path(source.clone()).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_mut().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
         let source_cell = document.visible_row(0).unwrap().1[0].clone();
         assert_eq!(source_cell, b"first");
         document.begin_cell_edit(0, 0, source_cell).unwrap();
@@ -13466,35 +13564,38 @@ mod tests {
         let mut frame = eframe::Frame::_new_kittest();
         assert!(app.save_current());
         let _ = finish_app_save(&mut app, &ctx, &mut frame);
-        assert!(app.notice.is_none());
+        assert!(app.active.notice.is_none());
         assert_eq!(
-            app.footer_status.as_ref().map(|message| message.severity),
+            app.active
+                .footer_status
+                .as_ref()
+                .map(|message| message.severity),
             Some(MessageSeverity::Status)
         );
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.data_start, 0);
         assert!(!document.is_dirty());
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::NoHeader);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.active.header_mode, HeaderMode::NoHeader);
         assert_eq!(
             fs::read(&source).unwrap(),
             b"\xEF\xBB\xBFsaved,1\nsecond,2\n"
         );
 
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_mut().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
         document.begin_cell_edit(1, 1, b"2".to_vec()).unwrap();
         document.cell_edit.as_mut().unwrap().draft = "saved as".into();
         assert!(app.save_as_picker_result(Some(destination.clone())));
         let _ = finish_app_save(&mut app, &ctx, &mut frame);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), destination);
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.data_start, 0);
         assert!(!document.is_dirty());
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::NoHeader);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.active.header_mode, HeaderMode::NoHeader);
         assert_eq!(
             fs::read(&source).unwrap(),
             b"\xEF\xBB\xBFsaved,1\nsecond,2\n"
@@ -13504,7 +13605,7 @@ mod tests {
             b"\xEF\xBB\xBFsaved,1\nsecond,saved as\n"
         );
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         for path in [source, destination] {
             fs::remove_file(path).unwrap();
         }
@@ -13521,12 +13622,12 @@ mod tests {
         fs::write(&path, b"name,value\nfirst,1\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
-        app.find_bar_open = true;
-        app.replace_expanded = true;
+        app.active.find_bar_open = true;
+        app.active.replace_expanded = true;
         {
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             document.rename_header(0, "renamed".into()).unwrap();
             document.start_save().unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -13542,11 +13643,12 @@ mod tests {
         let _ = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
-        assert!(app.document.is_none());
-        assert!(!app.find_bar_open);
-        assert!(!app.replace_expanded);
+        assert!(app.active.document.is_none());
+        assert!(!app.active.find_bar_open);
+        assert!(!app.active.replace_expanded);
         assert!(
-            app.notice
+            app.active
+                .notice
                 .as_deref()
                 .is_some_and(|notice| notice.contains("could not reload it"))
         );
@@ -13567,9 +13669,10 @@ mod tests {
         fs::write(&path, b"name,value\nfirst,1\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(0, "renamed".into())
@@ -13577,7 +13680,7 @@ mod tests {
         fs::rename(&path, &moved).unwrap();
 
         assert!(!app.save_current());
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert!(document.source_changed);
         assert!(document.is_dirty());
         assert_eq!(document.index_status(), "Source changed");
@@ -13587,44 +13690,45 @@ mod tests {
 
         let ctx = egui::Context::default();
         app.apply(&ctx, Action::PageDown);
-        assert_eq!(app.notice.as_deref(), Some(SOURCE_CHANGED_NOTICE));
+        assert_eq!(app.active.notice.as_deref(), Some(SOURCE_CHANGED_NOTICE));
         assert_eq!(
-            app.document.as_ref().unwrap().viewport_start,
+            app.active.document.as_ref().unwrap().viewport_start,
             viewport_start
         );
 
         app.apply(&ctx, Action::DiscardChanges);
         fs::rename(&moved, &path).unwrap();
         app.reload_document();
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert!(!document.source_changed);
         assert!(!document.is_dirty());
         assert_eq!(document.session.first_rows[1].fields[0], b"first");
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(0, "save_as_name".into())
             .unwrap();
         fs::rename(&path, &moved).unwrap();
         assert!(!app.save_as_picker_result(Some(destination.clone())));
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert!(document.source_changed);
         assert!(document.is_dirty());
         assert!(document.index.is_none());
         assert!(document.buffered_rows.is_empty());
         let viewport_start = document.viewport_start;
         app.apply(&ctx, Action::PageDown);
-        assert_eq!(app.notice.as_deref(), Some(SOURCE_CHANGED_NOTICE));
+        assert_eq!(app.active.notice.as_deref(), Some(SOURCE_CHANGED_NOTICE));
         assert_eq!(
-            app.document.as_ref().unwrap().viewport_start,
+            app.active.document.as_ref().unwrap().viewport_start,
             viewport_start
         );
         assert!(!destination.exists());
 
         app.apply(&ctx, Action::DiscardChanges);
         fs::rename(&moved, &path).unwrap();
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         fs::remove_file(path).unwrap();
     }
 
@@ -13643,9 +13747,9 @@ mod tests {
         fs::write(&other, b"other,value\nsecond,2\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(source.clone()).unwrap();
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.rename_header(0, "renamed".into()).unwrap();
         document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
         document.cell_edit.as_mut().unwrap().draft = "edited".into();
@@ -13658,7 +13762,7 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
         let close_output = ctx.run(close_input, |ctx| app.intercept_dirty_close(ctx));
-        assert!(app.close_confirmation_open);
+        assert!(app.active.close_confirmation_open);
         assert!(
             close_output
                 .viewport_output
@@ -13668,18 +13772,17 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
         );
-        app.close_after_save = true;
+        app.active.close_after_save = true;
         app.keep_editing();
-        assert!(!app.close_confirmation_open);
-        assert!(!app.close_after_save);
+        assert!(!app.active.close_confirmation_open);
+        assert!(!app.active.close_after_save);
+        app.open_path(other.clone()).unwrap();
+        app.handle_dropped_paths(vec![Some(source.clone())]);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), source);
         assert_eq!(
-            app.open_path(other.clone()).unwrap_err(),
-            "Discard or save your changes before opening another file."
-        );
-        app.handle_dropped_paths(vec![Some(other.clone())]);
-        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
-        assert_eq!(
-            app.document
+            app.active
+                .document
                 .as_mut()
                 .unwrap()
                 .start_filtered_export(destination.clone())
@@ -13687,7 +13790,8 @@ mod tests {
             "Save or discard your changes before exporting filtered rows."
         );
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_save_as(unopenable.clone())
@@ -13700,8 +13804,8 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
         let saving_close_output = ctx.run(saving_close_input, |ctx| app.intercept_dirty_close(ctx));
-        assert!(app.close_after_save);
-        assert!(!app.close_confirmation_open);
+        assert!(app.active.close_after_save);
+        assert!(!app.active.close_confirmation_open);
         assert!(
             saving_close_output
                 .viewport_output
@@ -13711,7 +13815,7 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
         );
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(
             document.rename_header(1, "amount".into()).unwrap_err(),
             "Wait for the save to finish before editing headers."
@@ -13724,11 +13828,12 @@ mod tests {
         assert!(document.is_dirty());
         assert_eq!(
             app.open_path(other.clone()).unwrap_err(),
-            "Cancel the active save before opening another file."
+            "Finish closing the document, or keep editing, before opening another file."
         );
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !app
+            .active
             .document
             .as_ref()
             .unwrap()
@@ -13746,9 +13851,9 @@ mod tests {
         let _ = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
-        assert!(app.close_confirmation_open);
-        assert!(!app.close_after_save);
-        let document = app.document.as_mut().unwrap();
+        assert!(app.active.close_confirmation_open);
+        assert!(!app.active.close_after_save);
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.session.path(), source);
         assert!(document.is_dirty());
         assert_eq!(
@@ -13757,15 +13862,17 @@ mod tests {
         );
         assert!(document.save_status.is_none());
 
-        app.close_confirmation_open = false;
-        app.document
+        app.active.close_confirmation_open = false;
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_save_as(destination.clone())
             .unwrap();
-        app.close_after_save = true;
+        app.active.close_after_save = true;
         let deadline = Instant::now() + Duration::from_secs(5);
         while !app
+            .active
             .document
             .as_ref()
             .unwrap()
@@ -13790,12 +13897,20 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Close))
         );
-        let document = app.document.as_ref().unwrap();
+        let saved_tab = app
+            .document_tabs()
+            .find(|tab| {
+                tab.document
+                    .as_ref()
+                    .is_some_and(|doc| doc.logical_path == destination)
+            })
+            .unwrap();
+        let document = saved_tab.document.as_ref().unwrap();
         assert_eq!(document.session.path(), destination);
         assert_eq!(document.column_name(0), "renamed");
         assert!(!document.is_dirty());
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::FirstRow);
+        assert_eq!(saved_tab.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(saved_tab.header_mode, HeaderMode::FirstRow);
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
         assert_eq!(
             fs::read(&destination).unwrap(),
@@ -13806,7 +13921,7 @@ mod tests {
             "report-edited.csv"
         );
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         for path in [source, other, destination] {
             fs::remove_file(path).unwrap();
         }
@@ -13823,10 +13938,10 @@ mod tests {
         let mut app = QuarryApp::new(Some(working), Instant::now());
         let working_copy = WorkingCopyState::new().unwrap();
         let working_directory = working_copy.directory.path().to_path_buf();
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.logical_path = source.clone();
         document.working_copy = Some(working_copy);
-        app.close_confirmation_open = true;
+        app.active.close_confirmation_open = true;
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -13860,7 +13975,7 @@ mod tests {
             |ctx| eframe::App::update(&mut app, ctx, &mut frame),
         );
 
-        assert!(app.document.is_none());
+        assert!(app.active.document.is_none());
         assert!(!working_directory.exists());
         assert_eq!(fs::read(&source).unwrap(), b"name\noriginal\n");
         assert!(
@@ -13870,7 +13985,7 @@ mod tests {
                 .unwrap()
                 .commands
                 .iter()
-                .any(|command| matches!(command, egui::ViewportCommand::Close))
+                .all(|command| !matches!(command, egui::ViewportCommand::Close))
         );
     }
 
@@ -13959,9 +14074,9 @@ mod tests {
         fs::write(&second, b"name,status\nsecond,keep\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(first.clone()).unwrap();
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         let file_size = document.session.file_size;
         document.filter_query = Some(FilterQuery::single(
             1,
@@ -13978,16 +14093,16 @@ mod tests {
             cancelled: false,
         });
 
-        app.notice = Some(AppMessage::warning("unchanged"));
+        app.active.notice = Some(AppMessage::warning("unchanged"));
         app.export_picker_result(None);
-        assert_eq!(app.notice.as_deref(), Some("unchanged"));
+        assert_eq!(app.active.notice.as_deref(), Some("unchanged"));
         app.export_picker_result(Some(first.clone()));
         assert_eq!(
-            app.notice.as_deref(),
+            app.active.notice.as_deref(),
             Some("export destination must differ from the source file")
         );
         app.export_picker_result(Some(cancelled.clone()));
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.cancel_filtered_export();
         assert!(document.export_cancel_requested);
         assert_eq!(
@@ -14002,19 +14117,17 @@ mod tests {
         assert!(!cancelled.exists());
 
         document.start_filtered_export(reopened.clone()).unwrap();
-        let error = app.open_path(second.clone()).unwrap_err();
-        assert_eq!(
-            error,
-            "Cancel the active export and wait for it to finish before opening another file."
-        );
-        let document = app.document.as_mut().unwrap();
+        app.open_path(second.clone()).unwrap();
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), second);
+        app.open_path(first.clone()).unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.session.path(), first);
         assert!(document.export_job.is_some());
 
         document.cancel_filtered_export();
         finish_filtered_export(document);
         app.open_path(second.clone()).unwrap();
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), second);
         assert!(document.export_job.is_none());
         assert!(document.export_status.is_none());
@@ -14027,7 +14140,7 @@ mod tests {
             "report-filtered"
         );
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         for path in [first, second, reopened] {
             if path.exists() {
                 fs::remove_file(path).unwrap();
@@ -14279,9 +14392,9 @@ mod tests {
         fs::write(&second, b"name,status\nsecond,keep\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(first.clone()).unwrap();
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document
             .start_filter(FilterQuery::single(
                 1,
@@ -14328,18 +14441,30 @@ mod tests {
         document.navigate_filter(200).unwrap();
         assert!(document.filter_read.is_some());
         assert!(document.pending_filter_read.is_some());
-        app.filters_open = true;
-        app.filter_rules[0].column_input = "2".into();
-        app.filter_rules[0].value_input = "keep".into();
-        app.filter_rules.push(super::FilterRuleDraft::default());
+        app.active.filters_open = true;
+        app.active.filter_rules[0].column_input = "2".into();
+        app.active.filter_rules[0].value_input = "keep".into();
+        app.active
+            .filter_rules
+            .push(super::FilterRuleDraft::default());
         app.open_path(second.clone()).unwrap();
-        assert!(!app.filters_open);
-        assert_eq!(app.filter_rules, vec![super::FilterRuleDraft::default()]);
-        assert!(!app.document.as_ref().unwrap().filter_active());
-        assert!(app.document.as_ref().unwrap().filter_read.is_none());
-        assert!(app.document.as_ref().unwrap().pending_filter_read.is_none());
+        assert!(!app.active.filters_open);
+        assert_eq!(
+            app.active.filter_rules,
+            vec![super::FilterRuleDraft::default()]
+        );
+        assert!(!app.active.document.as_ref().unwrap().filter_active());
+        assert!(app.active.document.as_ref().unwrap().filter_read.is_none());
+        assert!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .pending_filter_read
+                .is_none()
+        );
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         for path in [first, second] {
             fs::remove_file(path).unwrap();
         }
@@ -14509,7 +14634,7 @@ mod tests {
             )
             .unwrap();
             let mut app = QuarryApp::new(None, Instant::now());
-            app.document = Some(
+            app.active.document = Some(
                 Document::prepare(
                     &path,
                     OpenOptions {
@@ -14539,20 +14664,20 @@ mod tests {
                     .width()
             };
             if total_columns == 65 {
-                let document = app.document.as_mut().unwrap();
+                let document = app.active.document.as_mut().unwrap();
                 document.set_column_shown(64, false).unwrap();
                 let _ = render_grid(&ctx, document);
                 document.set_column_shown(64, true).unwrap();
             }
-            let before = render_grid(&ctx, app.document.as_mut().unwrap());
+            let before = render_grid(&ctx, app.active.document.as_mut().unwrap());
             let initial_width = header_width(&before, 0);
             let command = click_column_manager_control(
                 egui::accesskit::Role::Button,
                 "Auto-fit columns",
-                app.document.as_ref().unwrap(),
+                app.active.document.as_ref().unwrap(),
             );
             app.apply_column_command(&ctx, command);
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             for _ in 0..total_columns.div_ceil(MAX_RENDERED_COLUMNS) + 2 {
                 let _ = render_grid(&ctx, document);
             }
@@ -14898,7 +15023,7 @@ mod tests {
         finish_index(&mut document);
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.document = Some(document);
+        app.active.document = Some(document);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_style(&ctx);
@@ -14907,12 +15032,21 @@ mod tests {
         let mut command = None;
         for _ in 0..2 {
             let _ = ctx.run(grid_input(), |ctx| {
-                show_column_manager(ctx, &mut open, &mut search, app.document.as_ref().unwrap());
+                show_column_manager(
+                    ctx,
+                    &mut open,
+                    &mut search,
+                    app.active.document.as_ref().unwrap(),
+                );
             });
         }
         let output = ctx.run(grid_input(), |ctx| {
-            command =
-                show_column_manager(ctx, &mut open, &mut search, app.document.as_ref().unwrap());
+            command = show_column_manager(
+                ctx,
+                &mut open,
+                &mut search,
+                app.active.document.as_ref().unwrap(),
+            );
         });
         let tree = output
             .platform_output
@@ -14945,7 +15079,7 @@ mod tests {
         assert_eq!(drag_bounds[0].x1, drag_bounds[1].x1);
         assert!(drag_bounds[0].x1 - drag_bounds[0].x0 > 300.0);
         let name_left = [0, 1].map(|column| {
-            let name = app.document.as_ref().unwrap().column_name(column);
+            let name = app.active.document.as_ref().unwrap().column_name(column);
             output
                 .shapes
                 .iter()
@@ -14976,7 +15110,7 @@ mod tests {
                         ctx,
                         &mut open,
                         &mut search,
-                        app.document.as_ref().unwrap(),
+                        app.active.document.as_ref().unwrap(),
                     );
                 },
             );
@@ -15007,7 +15141,12 @@ mod tests {
 
         search = "c40".into();
         let filtered = ctx.run(grid_input(), |ctx| {
-            show_column_manager(ctx, &mut open, &mut search, app.document.as_ref().unwrap());
+            show_column_manager(
+                ctx,
+                &mut open,
+                &mut search,
+                app.active.document.as_ref().unwrap(),
+            );
         });
         let filtered_tree = filtered.platform_output.accesskit_update.unwrap();
         assert!(filtered_tree.nodes.iter().any(|(_, node)| {
@@ -15022,23 +15161,24 @@ mod tests {
         let command = click_column_manager_control(
             egui::accesskit::Role::CheckBox,
             "1  c1",
-            app.document.as_ref().unwrap(),
+            app.active.document.as_ref().unwrap(),
         );
         app.apply_column_command(&ctx, command);
-        assert!(app.document.as_ref().unwrap().columns.hidden[0]);
+        assert!(app.active.document.as_ref().unwrap().columns.hidden[0]);
 
         let command = click_column_manager_control(
             egui::accesskit::Role::Button,
             "Reset columns",
-            app.document.as_ref().unwrap(),
+            app.active.document.as_ref().unwrap(),
         );
         app.apply_column_command(&ctx, command);
         assert_eq!(
-            app.document.as_ref().unwrap().columns.order,
+            app.active.document.as_ref().unwrap().columns.order,
             (0..40).collect::<Vec<_>>()
         );
         assert!(
-            app.document
+            app.active
+                .document
                 .as_ref()
                 .unwrap()
                 .columns
@@ -15049,10 +15189,10 @@ mod tests {
         let command = click_column_manager_control(
             egui::accesskit::Role::Button,
             "Auto-fit columns",
-            app.document.as_ref().unwrap(),
+            app.active.document.as_ref().unwrap(),
         );
         app.apply_column_command(&ctx, command);
-        assert!(app.document.as_ref().unwrap().auto_fit_columns);
+        assert!(app.active.document.as_ref().unwrap().auto_fit_columns);
 
         app.apply_column_command(
             &ctx,
@@ -15062,7 +15202,7 @@ mod tests {
             },
         );
         assert_eq!(
-            &app.document.as_ref().unwrap().columns.order[..3],
+            &app.active.document.as_ref().unwrap().columns.order[..3],
             &[39, 0, 1]
         );
 
@@ -15079,7 +15219,12 @@ mod tests {
                 ..grid_input()
             },
             |ctx| {
-                show_column_manager(ctx, &mut open, &mut search, app.document.as_ref().unwrap());
+                show_column_manager(
+                    ctx,
+                    &mut open,
+                    &mut search,
+                    app.active.document.as_ref().unwrap(),
+                );
             },
         );
         assert!(!open);
@@ -15429,18 +15574,18 @@ mod tests {
         .unwrap();
         let original = fs::read(&source).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
 
         click_grid_control(
             "Select file column 1 (first)",
-            app.document.as_mut().unwrap(),
+            app.active.document.as_mut().unwrap(),
         );
         click_grid_control(
             "Select file column 2 (last)",
-            app.document.as_mut().unwrap(),
+            app.active.document.as_mut().unwrap(),
         );
         assert_eq!(
-            app.document.as_ref().unwrap().selected_columns,
+            app.active.document.as_ref().unwrap().selected_columns,
             BTreeSet::from([0, 1])
         );
 
@@ -15449,7 +15594,7 @@ mod tests {
         let header_target = grid_control_id(
             &ctx,
             "Select file column 2 (last)",
-            app.document.as_mut().unwrap(),
+            app.active.document.as_mut().unwrap(),
         );
         let mut opened_dialog = None;
         let _ = ctx.run(
@@ -15465,13 +15610,13 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    opened_dialog = show_grid(ui, app.document.as_mut().unwrap()).unwrap();
+                    opened_dialog = show_grid(ui, app.active.document.as_mut().unwrap()).unwrap();
                 });
             },
         );
         let menu_output = ctx.run(grid_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                opened_dialog = show_grid(ui, app.document.as_mut().unwrap()).unwrap();
+                opened_dialog = show_grid(ui, app.active.document.as_mut().unwrap()).unwrap();
             });
         });
         let menu_tree = menu_output
@@ -15507,7 +15652,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    opened_dialog = show_grid(ui, app.document.as_mut().unwrap()).unwrap();
+                    opened_dialog = show_grid(ui, app.active.document.as_mut().unwrap()).unwrap();
                 });
             },
         );
@@ -15522,7 +15667,7 @@ mod tests {
         app.apply_structural_dialog_action(StructuralDialogAction::Apply);
         finish_structural_edit(&mut app);
 
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 2);
         assert_eq!(
             document.session.first_rows[0].fields,
@@ -15540,7 +15685,7 @@ mod tests {
 
         let focus_ctx = egui::Context::default();
         focus_ctx.enable_accesskit();
-        let output = render_grid(&focus_ctx, app.document.as_mut().unwrap());
+        let output = render_grid(&focus_ctx, app.active.document.as_mut().unwrap());
         let tree = output
             .platform_output
             .accesskit_update
@@ -15567,18 +15712,19 @@ mod tests {
         fs::write(&source, b"a,b,c,d\nA1,B1,C1,D1\nA2,B2,C2,D2\n").unwrap();
         let original = fs::read(&source).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         assert!(parse_move_position("0", 4, 2).is_err());
         assert!(parse_move_position("4", 4, 2).is_err());
         assert_eq!(
-            app.document
+            app.active
+                .document
                 .as_mut()
                 .unwrap()
                 .start_delete_columns(vec![0, 1, 2, 3])
                 .unwrap_err(),
             "At least one column must remain."
         );
-        assert!(app.document.as_ref().unwrap().working_copy.is_none());
+        assert!(app.active.document.as_ref().unwrap().working_copy.is_none());
 
         let mut dialog = StructuralDialog::move_columns(vec![1, 3]);
         assert_eq!(dialog.position, "2");
@@ -15590,8 +15736,8 @@ mod tests {
                 show_structural_dialog(
                     ctx,
                     &mut dialog,
-                    &mut app.sort_match_case,
-                    app.document.as_ref().unwrap(),
+                    &mut app.active.sort_match_case,
+                    app.active.document.as_ref().unwrap(),
                 ),
                 None
             );
@@ -15616,10 +15762,10 @@ mod tests {
 
         app.open_structural_dialog(dialog);
         app.apply_structural_dialog_action(StructuralDialogAction::Apply);
-        app.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader));
+        app.active.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader));
         finish_structural_edit(&mut app);
-        assert_eq!(app.format_draft, None);
-        let document = app.document.as_ref().unwrap();
+        assert_eq!(app.active.format_draft, None);
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 4);
         assert_eq!(
             document.session.first_rows[0].fields,
@@ -15635,8 +15781,9 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         let redo_path = app
+            .active
             .document
             .as_ref()
             .unwrap()
@@ -15649,7 +15796,7 @@ mod tests {
             .path
             .clone();
         {
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             assert_eq!(
                 document.session.first_rows[0].fields,
                 ["a", "b", "c", "d"].map(|field| field.as_bytes().to_vec())
@@ -15670,11 +15817,11 @@ mod tests {
         }
 
         app.swap_structural_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         app.apply_delete_columns(vec![0, 2]);
-        assert!(app.notice.is_none());
+        assert!(app.active.notice.is_none());
         finish_structural_edit(&mut app);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 2);
         assert_eq!(
             document.session.first_rows[0].fields,
@@ -15689,15 +15836,15 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         assert_eq!(
-            app.document.as_ref().unwrap().session.first_rows[0].fields,
+            app.active.document.as_ref().unwrap().session.first_rows[0].fields,
             ["b", "d", "a", "c"].map(|field| field.as_bytes().to_vec())
         );
         app.swap_structural_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         assert_eq!(
-            app.document.as_ref().unwrap().session.first_rows[0].fields,
+            app.active.document.as_ref().unwrap().session.first_rows[0].fields,
             ["d", "c"].map(|field| field.as_bytes().to_vec())
         );
     }
@@ -15705,7 +15852,7 @@ mod tests {
     fn finish_duplicate_search(app: &mut QuarryApp) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             assert!(document.poll_structural_edit().unwrap().is_none());
             if !matches!(
                 document.structural_job,
@@ -15733,8 +15880,8 @@ mod tests {
             },
         )
         .unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_mut().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
         document.rename_header(2, "memo".into()).unwrap();
         document.begin_cell_edit(3, 0, b"b".to_vec()).unwrap();
         document.cell_edit.as_mut().unwrap().draft = "a".into();
@@ -15746,9 +15893,9 @@ mod tests {
         assert_eq!(action, Some(StructuralDialogAction::Apply));
         app.open_structural_dialog(dialog);
         app.apply_structural_dialog_action(action.unwrap());
-        assert!(app.notice.is_none());
+        assert!(app.active.notice.is_none());
         finish_duplicate_search(&mut app);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         let Some(super::StructuralJob::DuplicatePreview { summary, .. }) = &document.structural_job
         else {
             panic!("expected duplicate preview");
@@ -15800,23 +15947,24 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.confirm_duplicate_removal().unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_ref().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
         let expected = b"\xEF\xBB\xBFkey,status,memo\r\na,keep,\"first\nline\"\r\na,skip,other\r\n";
         assert_eq!(fs::read(document.session.path()).unwrap(), expected);
         assert!(document.is_dirty());
         assert_eq!(document.selected_columns, BTreeSet::from([0, 1]));
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_ref().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), source);
         assert_eq!(document.cell_edits[&(3, 0)], b"a");
         assert_eq!(document.column_name(2), "memo");
         assert_eq!(document.edit_history.undo.len(), history_len);
         app.swap_structural_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         let saved = directory.path().join("saved.csv");
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_save_as(saved.clone())
@@ -15824,7 +15972,7 @@ mod tests {
         finish_app_save(&mut app, &ctx, &mut eframe::Frame::_new_kittest());
         assert_eq!(fs::read(saved).unwrap(), expected);
         assert_eq!(fs::read(source).unwrap(), original);
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
     }
 
     #[test]
@@ -15842,14 +15990,15 @@ mod tests {
             },
         )
         .unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_find_duplicates(vec![0], CaseSensitivity::Sensitive)
             .unwrap();
         finish_duplicate_search(&mut app);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert!(document.structural_job.is_none());
         assert!(document.working_copy.is_none());
         assert!(!document.is_dirty());
@@ -15861,13 +16010,14 @@ mod tests {
                 .starts_with("No duplicates")
         );
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
             .unwrap();
         finish_duplicate_search(&mut app);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         let temp = document
             .working_copy
             .as_ref()
@@ -15885,23 +16035,31 @@ mod tests {
             .unwrap();
         document.cancel_structural_edit();
         finish_duplicate_search(&mut app);
-        assert!(app.document.as_ref().unwrap().working_copy.is_none());
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(app.active.document.as_ref().unwrap().working_copy.is_none());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
             .unwrap();
         finish_duplicate_search(&mut app);
         app.confirm_duplicate_removal().unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let working = app.document.as_ref().unwrap().session.path().to_path_buf();
+        finish_index(app.active.document.as_mut().unwrap());
+        let working = app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .path()
+            .to_path_buf();
         app.apply(&egui::Context::default(), Action::DiscardChanges);
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         assert!(!working.exists());
-        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), source);
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
         assert_eq!(fs::read(source).unwrap(), original);
     }
 
@@ -15919,19 +16077,21 @@ mod tests {
             },
         )
         .unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .rename_header(1, "memo".into())
             .unwrap();
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
             .unwrap();
         finish_duplicate_search(&mut app);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         let Some(super::StructuralJob::DuplicatePreview { summary, .. }) = &document.structural_job
         else {
             panic!("expected preview");
@@ -15942,17 +16102,23 @@ mod tests {
         let history_len = document.edit_history.undo.len();
         assert!(app.confirm_duplicate_removal().is_err());
         assert_eq!(
-            app.document.as_ref().unwrap().edit_history.undo.len(),
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .edit_history
+                .undo
+                .len(),
             history_len
         );
-        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), source);
         fs::write(&candidate, candidate_bytes).unwrap();
         fs::write(&source, b"key,value\nexternal,changed\n").unwrap();
         assert_eq!(
             app.confirm_duplicate_removal().unwrap_err(),
             SOURCE_CHANGED_NOTICE
         );
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.edit_history.undo.len(), history_len);
         assert_eq!(document.column_name(1), "memo");
         assert!(!candidate.exists());
@@ -15967,9 +16133,9 @@ mod tests {
         let original = b"id,name\n1,Ada\n2,Grace\n3,Linus\n4,Margaret\n";
         fs::write(&source, original).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         {
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             document.cell_edits.insert((3, 1), b"Edited".to_vec());
             document.selected_rows.ranges = vec![2..=2, 4..=4];
             document.selected_rows.anchor = Some(2);
@@ -15977,9 +16143,9 @@ mod tests {
         }
 
         app.apply_delete_rows(vec![2..=2, 4..=4]);
-        assert!(app.notice.is_none());
+        assert!(app.active.notice.is_none());
         finish_structural_edit(&mut app);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(
             document.session.first_rows[0].fields,
             ["id", "name"].map(|field| field.as_bytes().to_vec())
@@ -15997,23 +16163,32 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_ref().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.first_rows.len(), 5);
         assert_eq!(document.cell_edits.get(&(3, 1)), Some(&b"Edited".to_vec()));
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.swap_structural_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_ref().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.first_rows.len(), 3);
         assert_eq!(document.session.first_rows[2].fields[1], b"Edited");
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.apply(&egui::Context::default(), Action::DiscardChanges);
-        finish_index(app.document.as_mut().unwrap());
-        assert_eq!(app.document.as_ref().unwrap().session.first_rows.len(), 5);
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .session
+                .first_rows
+                .len(),
+            5
+        );
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
         assert_eq!(fs::read(&source).unwrap(), original);
     }
 
@@ -16067,7 +16242,8 @@ mod tests {
                 let external = b"external,value\nkeep,7\n";
                 fs::write(&source, original).unwrap();
                 let mut app = individual_edit_app(&source);
-                app.document
+                app.active
+                    .document
                     .as_mut()
                     .unwrap()
                     .start_sort_rows(
@@ -16080,16 +16256,17 @@ mod tests {
                 finish_structural_edit(&mut app);
                 if retain_redo {
                     app.swap_structural_history(false).unwrap();
-                    finish_index(app.document.as_mut().unwrap());
+                    finish_index(app.active.document.as_mut().unwrap());
                 }
-                let document = app.document.as_ref().unwrap();
+                let document = app.active.document.as_ref().unwrap();
                 let current_path = document.session.path().to_path_buf();
                 let current_bytes = fs::read(&current_path).unwrap();
                 let history = document.working_copy.as_ref().unwrap();
                 let expected_undo = history.undo.clone();
                 let expected_redo = history.redo.clone();
                 let expected_history_buttons = (document.can_undo(), document.can_redo());
-                app.document
+                app.active
+                    .document
                     .as_mut()
                     .unwrap()
                     .start_sort_rows(
@@ -16103,7 +16280,13 @@ mod tests {
                 let destination = loop {
                     let Some(super::StructuralJob::Sorting {
                         job, destination, ..
-                    }) = app.document.as_ref().unwrap().structural_job.as_ref()
+                    }) = app
+                        .active
+                        .document
+                        .as_ref()
+                        .unwrap()
+                        .structural_job
+                        .as_ref()
                     else {
                         panic!("expected pending sort");
                     };
@@ -16115,6 +16298,7 @@ mod tests {
                 };
                 if replace_published {
                     let ready = app
+                        .active
                         .document
                         .as_mut()
                         .unwrap()
@@ -16128,14 +16312,15 @@ mod tests {
                 } else {
                     fs::write(&destination, external).unwrap();
                     assert!(
-                        app.document
+                        app.active
+                            .document
                             .as_mut()
                             .unwrap()
                             .poll_structural_edit()
                             .is_err()
                     );
                 }
-                let document = app.document.as_ref().unwrap();
+                let document = app.active.document.as_ref().unwrap();
                 assert_eq!(document.session.path(), current_path);
                 assert_eq!(fs::read(&current_path).unwrap(), current_bytes);
                 assert_eq!(fs::read(&source).unwrap(), original);
@@ -16150,7 +16335,7 @@ mod tests {
                 for retained in [expected_undo, expected_redo].into_iter().flatten() {
                     assert!(retained.path.exists());
                 }
-                app.document.as_mut().unwrap().shutdown();
+                app.active.document.as_mut().unwrap().shutdown();
             }
         }
     }
@@ -16173,15 +16358,21 @@ mod tests {
             (super::SortDirection::Ascending, "8999"),
             (super::SortDirection::Descending, "0"),
         ] {
-            app.document
+            app.active
+                .document
                 .as_mut()
                 .unwrap()
                 .start_sort_rows(0, direction, SortMode::Number, CaseSensitivity::Insensitive)
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                let Some(super::StructuralJob::Sorting { job, .. }) =
-                    app.document.as_ref().unwrap().structural_job.as_ref()
+                let Some(super::StructuralJob::Sorting { job, .. }) = app
+                    .active
+                    .document
+                    .as_ref()
+                    .unwrap()
+                    .structural_job
+                    .as_ref()
                 else {
                     panic!("sort job should remain active until its handoff");
                 };
@@ -16193,6 +16384,7 @@ mod tests {
                 std::thread::yield_now();
             }
             let ready = app
+                .active
                 .document
                 .as_mut()
                 .unwrap()
@@ -16201,7 +16393,7 @@ mod tests {
                 .unwrap();
             assert!(ready.output_index.is_some());
             app.install_materialized_working_copy(ready).unwrap();
-            let document = app.document.as_mut().unwrap();
+            let document = app.active.document.as_mut().unwrap();
             assert!(
                 document.job.is_none(),
                 "sort must not launch another index scan"
@@ -16223,13 +16415,13 @@ mod tests {
             assert_eq!(fs::read_to_string(&source).unwrap(), original);
         }
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         assert_eq!(
-            app.document.as_ref().unwrap().session.first_rows[1].fields[0],
+            app.active.document.as_ref().unwrap().session.first_rows[1].fields[0],
             b"0"
         );
         assert_eq!(fs::read_to_string(&source).unwrap(), original);
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -16243,8 +16435,8 @@ mod tests {
         .unwrap();
         let original = fs::read(&source).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_ref().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(
             document.sort_temporary_disk_estimate(),
             Some(estimate_sort_temporary_bytes(
@@ -16257,7 +16449,7 @@ mod tests {
                 5,
             ))
         );
-        app.document.as_mut().unwrap().selected_columns = BTreeSet::from([0]);
+        app.active.document.as_mut().unwrap().selected_columns = BTreeSet::from([0]);
 
         let mut dialog = StructuralDialog::sort(0);
         assert_eq!(dialog.sort_mode, SortMode::Text);
@@ -16268,8 +16460,8 @@ mod tests {
                 show_structural_dialog(
                     ctx,
                     &mut dialog,
-                    &mut app.sort_match_case,
-                    app.document.as_ref().unwrap(),
+                    &mut app.active.sort_match_case,
+                    app.active.document.as_ref().unwrap(),
                 ),
                 None
             );
@@ -16344,7 +16536,7 @@ mod tests {
         app.open_structural_dialog(dialog);
         app.apply_structural_dialog_action(StructuralDialogAction::Apply);
         finish_structural_edit(&mut app);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(
             document.session.first_rows[0].fields,
             ["key", "name"].map(|value| value.as_bytes().to_vec())
@@ -16366,8 +16558,9 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         let original_names = app
+            .active
             .document
             .as_ref()
             .unwrap()
@@ -16384,8 +16577,9 @@ mod tests {
         );
 
         app.swap_structural_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         let redone_names = app
+            .active
             .document
             .as_ref()
             .unwrap()
@@ -16404,7 +16598,7 @@ mod tests {
         let source = directory.path().join("modal-layout.csv");
         fs::write(&source, b"name,value\nAvery,1\nAvery,2\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         super::configure_style(&ctx);
@@ -16425,8 +16619,8 @@ mod tests {
                     action = show_structural_dialog(
                         ctx,
                         dialog,
-                        &mut app.sort_match_case,
-                        app.document.as_ref().unwrap(),
+                        &mut app.active.sort_match_case,
+                        app.active.document.as_ref().unwrap(),
                     );
                 },
             );
@@ -16527,16 +16721,24 @@ mod tests {
             .0,
             Some(StructuralDialogAction::Cancel)
         );
-        assert!(app.document.as_ref().unwrap().structural_job.is_none());
-        assert!(!app.document.as_ref().unwrap().is_dirty());
-        app.document
+        assert!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .structural_job
+                .is_none()
+        );
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
             .unwrap();
         finish_duplicate_search(&mut app);
         let Some(super::StructuralJob::DuplicatePreview { summary, .. }) =
-            &app.document.as_ref().unwrap().structural_job
+            &app.active.document.as_ref().unwrap().structural_job
         else {
             panic!("expected duplicate preview");
         };
@@ -16578,8 +16780,12 @@ mod tests {
             .0,
             Some(StructuralDialogAction::Cancel)
         );
-        app.document.as_mut().unwrap().cancel_structural_edit();
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .cancel_structural_edit();
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
         assert_eq!(fs::read(source).unwrap(), b"name,value\nAvery,1\nAvery,2\n");
     }
 
@@ -16603,8 +16809,8 @@ mod tests {
             show_structural_dialog(
                 ctx,
                 dialog,
-                &mut app.sort_match_case,
-                app.document.as_ref().unwrap(),
+                &mut app.active.sort_match_case,
+                app.active.document.as_ref().unwrap(),
             );
         });
         let tree = output.platform_output.accesskit_update.unwrap();
@@ -16632,8 +16838,8 @@ mod tests {
                 action = show_structural_dialog(
                     ctx,
                     dialog,
-                    &mut app.sort_match_case,
-                    app.document.as_ref().unwrap(),
+                    &mut app.active.sort_match_case,
+                    app.active.document.as_ref().unwrap(),
                 );
             },
         );
@@ -16649,8 +16855,8 @@ mod tests {
         let sorted = b"amount,name\n,blank\n2,two\n+2.0,two-again\n10,ten\n1e2,hundred\n9007199254740992,large-1\n9007199254740993,large-2\n";
         fs::write(&source, original).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        app.sort_match_case = true;
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active.sort_match_case = true;
         let mut dialog = StructuralDialog::sort(0);
         assert_eq!(dialog.sort_mode, SortMode::Text);
         let ctx = egui::Context::default();
@@ -16677,7 +16883,7 @@ mod tests {
                 assert!(description.contains("Other values stop the sort."));
             }
             assert!(
-                app.sort_match_case,
+                app.active.sort_match_case,
                 "switching mode should retain the case preference"
             );
         }
@@ -16686,22 +16892,22 @@ mod tests {
         app.open_structural_dialog(dialog);
         app.apply_structural_dialog_action(action.unwrap());
         finish_structural_edit(&mut app);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(fs::read(document.session.path()).unwrap(), sorted);
         assert_eq!(document.selected_columns, BTreeSet::from([0]));
         assert!(document.is_dirty());
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         assert_eq!(
-            fs::read(app.document.as_ref().unwrap().session.path()).unwrap(),
+            fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
             original
         );
         app.swap_structural_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         assert_eq!(
-            fs::read(app.document.as_ref().unwrap().session.path()).unwrap(),
+            fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
             sorted
         );
 
@@ -16710,7 +16916,7 @@ mod tests {
         finish_app_save(&mut app, &ctx, &mut frame);
         assert_eq!(fs::read(destination).unwrap(), sorted);
         assert_eq!(fs::read(source).unwrap(), original);
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
     }
 
     #[test]
@@ -16783,8 +16989,8 @@ mod tests {
             ("Shuffle", None, None),
         ] {
             let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-            finish_index(app.document.as_mut().unwrap());
-            app.sort_match_case = true;
+            finish_index(app.active.document.as_mut().unwrap());
+            app.active.sort_match_case = true;
             let mut dialog = StructuralDialog::sort(0);
             dialog.sort_direction = super::SortDirection::Descending;
             let ctx = egui::Context::default();
@@ -16824,12 +17030,17 @@ mod tests {
             }
             let (action, _) = click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Sort");
             assert_eq!(action, Some(StructuralDialogAction::Apply));
-            assert!(app.sort_match_case);
+            assert!(app.active.sort_match_case);
             app.open_structural_dialog(dialog);
             app.apply_structural_dialog_action(action.unwrap());
             if direction.is_none() {
                 assert!(matches!(
-                    app.document.as_ref().unwrap().structural_job.as_ref(),
+                    app.active
+                        .document
+                        .as_ref()
+                        .unwrap()
+                        .structural_job
+                        .as_ref(),
                     Some(super::StructuralJob::Sorting {
                         direction: super::SortDirection::Ascending,
                         ..
@@ -16837,7 +17048,7 @@ mod tests {
                 ));
             }
             finish_structural_edit(&mut app);
-            let document = app.document.as_ref().unwrap();
+            let document = app.active.document.as_ref().unwrap();
             let sorted = fs::read(document.session.path()).unwrap();
             assert_eq!(
                 document.session.first_rows[0].fields,
@@ -16872,7 +17083,7 @@ mod tests {
                 assert_eq!(actual_rows, original_rows);
             }
             if direction.is_none() {
-                let status = app.footer_status.as_ref().unwrap().to_string();
+                let status = app.active.footer_status.as_ref().unwrap().to_string();
                 assert!(status.starts_with(if choice == "Reverse" {
                     "Reversed row order."
                 } else {
@@ -16883,15 +17094,15 @@ mod tests {
             assert!(document.is_dirty());
             assert_eq!(fs::read(&source).unwrap(), original.as_bytes());
             app.swap_structural_history(false).unwrap();
-            finish_index(app.document.as_mut().unwrap());
+            finish_index(app.active.document.as_mut().unwrap());
             assert_eq!(
-                fs::read(app.document.as_ref().unwrap().session.path()).unwrap(),
+                fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
                 original.as_bytes()
             );
             app.swap_structural_history(true).unwrap();
-            finish_index(app.document.as_mut().unwrap());
+            finish_index(app.active.document.as_mut().unwrap());
             assert_eq!(
-                fs::read(app.document.as_ref().unwrap().session.path()).unwrap(),
+                fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
                 sorted
             );
         }
@@ -16908,9 +17119,9 @@ mod tests {
         .unwrap();
         let original = fs::read(&source).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         let (_ctx, _target) = click_grid_control("Select file column 1 (email)", document);
         assert_eq!(
             document
@@ -16922,7 +17133,7 @@ mod tests {
         );
 
         app.open_structural_dialog(StructuralDialog::split(0));
-        let dialog = app.structural_dialog.as_mut().unwrap();
+        let dialog = app.active.structural_dialog.as_mut().unwrap();
         assert_eq!(dialog.columns, vec![0]);
         dialog.separator = "@".into();
         let ctx = egui::Context::default();
@@ -16932,8 +17143,8 @@ mod tests {
                 show_structural_dialog(
                     ctx,
                     dialog,
-                    &mut app.sort_match_case,
-                    app.document.as_ref().unwrap(),
+                    &mut app.active.sort_match_case,
+                    app.active.document.as_ref().unwrap(),
                 ),
                 None
             );
@@ -16958,6 +17169,7 @@ mod tests {
         app.apply_structural_dialog_action(StructuralDialogAction::Apply);
         finish_structural_edit(&mut app);
         let working_directory = app
+            .active
             .document
             .as_ref()
             .unwrap()
@@ -16967,7 +17179,7 @@ mod tests {
             .directory
             .path()
             .to_path_buf();
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.logical_path, source);
         assert_ne!(document.session.path(), source);
         assert_eq!(document.total_columns, 3);
@@ -16990,7 +17202,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
-        let output = render_grid(&ctx, app.document.as_mut().unwrap());
+        let output = render_grid(&ctx, app.active.document.as_mut().unwrap());
         let tree = output
             .platform_output
             .accesskit_update
@@ -17016,7 +17228,7 @@ mod tests {
         }
 
         app.apply(&egui::Context::default(), Action::DiscardChanges);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         finish_index(document);
         assert_eq!(document.session.path(), source);
         assert_eq!(document.total_columns, 2);
@@ -17418,15 +17630,16 @@ mod tests {
             .join(",");
         fs::write(&source, format!("{headers}\n{values}\n")).unwrap();
         let mut app = QuarryApp::new(Some(source), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_split(39, b":".to_vec())
             .unwrap();
         finish_structural_edit(&mut app);
 
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 41);
         assert_eq!(
             document
@@ -17458,10 +17671,10 @@ mod tests {
             };
             fs::write(&source, &original).unwrap();
             let mut app = QuarryApp::new(None, Instant::now());
-            app.header_mode = header_mode;
+            app.active.header_mode = header_mode;
             app.open_path(source.clone()).unwrap();
-            finish_index(app.document.as_mut().unwrap());
-            let document = app.document.as_mut().unwrap();
+            finish_index(app.active.document.as_mut().unwrap());
+            let document = app.active.document.as_mut().unwrap();
             document.move_column(2, 1).unwrap();
             document.set_column_shown(1, false).unwrap();
             assert!(!document.is_dirty());
@@ -17475,22 +17688,22 @@ mod tests {
                 .unwrap();
             document.cell_edit.as_mut().unwrap().draft = "Edited, \"name\"".into();
             assert!(app.save_as_picker_result(Some(destination.clone())));
-            assert!(!app.document.as_ref().unwrap().is_save_as_ready());
+            assert!(!app.active.document.as_ref().unwrap().is_save_as_ready());
 
             let ctx = egui::Context::default();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while app.document.as_ref().unwrap().logical_path != destination {
+            while app.active.document.as_ref().unwrap().logical_path != destination {
                 let _ = ctx.run(grid_input(), |ctx| {
                     eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
                 });
-                assert!(app.notice.is_none(), "{:?}", app.notice);
+                assert!(app.active.notice.is_none(), "{:?}", app.active.notice);
                 assert!(
                     Instant::now() < deadline,
                     "Save As did not reopen its output"
                 );
                 std::thread::yield_now();
             }
-            let document = app.document.as_ref().unwrap();
+            let document = app.active.document.as_ref().unwrap();
             assert!(!document.is_dirty());
             assert!(!document.has_reordered_columns());
             assert_eq!(document.total_columns, 3);
@@ -17517,8 +17730,8 @@ mod tests {
         original.push_str("2,Beta,20,undiscovered,tail\n3\n");
         fs::write(&source, &original).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_mut().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.total_columns, 3);
         document.move_column(2, 1).unwrap();
         let order = document.columns.order.clone();
@@ -17527,7 +17740,7 @@ mod tests {
         fs::write(&destination, b"keep this file").unwrap();
         assert!(!app.save_as_picker_result(Some(destination.clone())));
         assert_eq!(fs::read(&destination).unwrap(), b"keep this file");
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.columns.order, order);
         assert!(document.is_save_as_ready());
         document.source_changed = true;
@@ -17556,14 +17769,15 @@ mod tests {
         let original = b"ID,Name,Amount\n1,Alpha,10\n";
         fs::write(&source, original).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_move_columns(vec![2], 1)
             .unwrap();
         finish_structural_edit(&mut app);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert!(document.is_dirty());
         assert!(document.is_save_as_ready());
         document.move_column(0, 2).unwrap();
@@ -17588,15 +17802,16 @@ mod tests {
         fs::write(&source, b"email,city\nalice@example.com,New York\n").unwrap();
         let original = fs::read(&source).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_split(0, b"@".to_vec())
             .unwrap();
         finish_structural_edit(&mut app);
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         let row = document.data_start;
         document
             .begin_cell_edit(row, 1, b"example.com".to_vec())
@@ -17626,15 +17841,16 @@ mod tests {
         let source = directory.path().join("split-save-source.csv");
         fs::write(&source, b"email,city\nalice@example.com,New York\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_split(0, b"@".to_vec())
             .unwrap();
         finish_structural_edit(&mut app);
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         document.start_save().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let saved = loop {
@@ -17657,15 +17873,16 @@ mod tests {
         let source = directory.path().join("combine-source.csv");
         fs::write(&source, b"first,last,age\nAda,Lovelace,36\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_combine(vec![0, 1], b" ".to_vec())
             .unwrap();
         finish_structural_edit(&mut app);
 
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 2);
         assert_eq!(
             document.session.first_rows[0].fields,
@@ -17679,13 +17896,16 @@ mod tests {
         assert!(document.is_dirty());
 
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        assert_eq!(app.footer_status.as_deref(), Some("Change undone."));
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(app.active.footer_status.as_deref(), Some("Change undone."));
         assert_eq!(
-            app.footer_status.as_ref().map(|message| message.severity),
+            app.active
+                .footer_status
+                .as_ref()
+                .map(|message| message.severity),
             Some(MessageSeverity::Status)
         );
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.session.path(), source);
         assert_eq!(document.total_columns, 3);
         assert_eq!(
@@ -17696,8 +17916,8 @@ mod tests {
         assert!(!document.is_dirty());
 
         app.swap_structural_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_ref().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 2);
         assert_eq!(
             document.session.first_rows[1].fields,
@@ -17713,16 +17933,17 @@ mod tests {
         let source = directory.path().join("ragged-header.csv");
         fs::write(&source, b"only\nleft,right:tail\n").unwrap();
         let mut app = QuarryApp::new(Some(source), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        assert_eq!(app.document.as_ref().unwrap().total_columns, 2);
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(app.active.document.as_ref().unwrap().total_columns, 2);
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_split(1, b":".to_vec())
             .unwrap();
         finish_structural_edit(&mut app);
 
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 3);
         assert_eq!(
             document.session.first_rows[0].fields,
@@ -17740,15 +17961,15 @@ mod tests {
         let source = directory.path().join("undo-overlay.csv");
         fs::write(&source, b"email,city\na@b,x\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_mut().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
         document.rename_header(1, "town".into()).unwrap();
         document.begin_cell_edit(1, 0, b"a@b".to_vec()).unwrap();
         document.cell_edit.as_mut().unwrap().draft = "alpha@beta".into();
         document.commit_cell_edit();
         document.start_split(0, b"@".to_vec()).unwrap();
         finish_structural_edit(&mut app);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(
             document.session.first_rows[0].fields,
             vec![b"email".to_vec(), Vec::new(), b"town".to_vec()]
@@ -17759,8 +17980,8 @@ mod tests {
         );
 
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_mut().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.session.path(), source);
         assert_eq!(document.column_name(1), "town");
         assert_eq!(document.cell_edits.get(&(1, 0)).unwrap(), b"alpha@beta");
@@ -17792,10 +18013,10 @@ mod tests {
         assert!(document.can_redo_structural());
 
         app.swap_structural_history(true).unwrap();
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_mut().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
         assert!(document.can_redo_structural());
         document.begin_cell_edit(1, 1, b"x".to_vec()).unwrap();
         document.cell_edit.as_mut().unwrap().draft = "y".into();
@@ -17809,8 +18030,9 @@ mod tests {
         let source = directory.path().join("undo-source-guard.csv");
         fs::write(&source, b"email,city\na@b,x\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
-        app.document
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_split(0, b"@".to_vec())
@@ -17822,7 +18044,7 @@ mod tests {
             app.swap_structural_history(false).unwrap_err(),
             SOURCE_CHANGED_NOTICE
         );
-        assert!(app.document.as_ref().unwrap().source_changed);
+        assert!(app.active.document.as_ref().unwrap().source_changed);
     }
 
     #[test]
@@ -17831,10 +18053,10 @@ mod tests {
         let source = directory.path().join("combine-source-guard.csv");
         fs::write(&source, b"first,last\nAda,Lovelace\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         fs::remove_file(source).unwrap();
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(
             document
                 .start_combine(vec![0, 1], b" ".to_vec())
@@ -17852,10 +18074,10 @@ mod tests {
         let source = directory.path().join("split-source-guard.csv");
         fs::write(&source, b"email,city\na@b,x\n").unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.document.as_mut().unwrap());
+        finish_index(app.active.document.as_mut().unwrap());
         fs::remove_file(source).unwrap();
 
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         assert_eq!(
             document.start_split(0, b"@".to_vec()).unwrap_err(),
             SOURCE_CHANGED_NOTICE
@@ -17919,7 +18141,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut app = QuarryApp::new(None, Instant::now());
-        app.document = Some(document);
+        app.active.document = Some(document);
         let mut frame = eframe::Frame::_new_kittest();
         let output = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
@@ -17952,7 +18174,7 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        let selection = app.document.as_ref().unwrap().selection.unwrap();
+        let selection = app.active.document.as_ref().unwrap().selection.unwrap();
         assert!(matches!(
             selection,
             GridSelection::Cell {
@@ -17962,7 +18184,8 @@ mod tests {
             }
         ));
         assert_eq!(
-            app.document
+            app.active
+                .document
                 .as_ref()
                 .unwrap()
                 .copy_selection_text()
@@ -17973,7 +18196,7 @@ mod tests {
             matches!(command, egui::OutputCommand::CopyText(text) if text == "line one\nline two")
         }));
 
-        app.find_bar_open = true;
+        app.active.find_bar_open = true;
         ctx.memory_mut(|memory| {
             memory.request_focus(egui::Id::new(FIND_INPUT_ID));
         });
@@ -17990,7 +18213,7 @@ mod tests {
             matches!(command, egui::OutputCommand::CopyText(text) if text == "line one\nline two")
         }));
 
-        let mut document = app.document.take().unwrap();
+        let mut document = app.active.document.take().unwrap();
 
         let _ = click_grid_control("Select row 1", &mut document);
         assert!(matches!(
@@ -18033,10 +18256,10 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut app = QuarryApp::new(None, Instant::now());
-        app.find_bar_open = true;
-        app.replace_expanded = true;
-        app.replace_input = "copy this".into();
-        app.document = Some(document);
+        app.active.find_bar_open = true;
+        app.active.replace_expanded = true;
+        app.active.replace_input = "copy this".into();
+        app.active.document = Some(document);
         let mut frame = eframe::Frame::_new_kittest();
         let _ = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
@@ -18074,7 +18297,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(copied, ["copy"]);
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -18105,7 +18328,7 @@ mod tests {
         ctx.enable_accesskit();
         super::configure_style(&ctx);
         let mut app = QuarryApp::new(None, Instant::now());
-        app.document = Some(document);
+        app.active.document = Some(document);
         let mut frame = eframe::Frame::_new_kittest();
         let render = |height: f32, app: &mut QuarryApp, frame: &mut eframe::Frame| {
             ctx.run(
@@ -18121,7 +18344,7 @@ mod tests {
         };
         let output = render(1052.0, &mut app, &mut frame);
 
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         let reference_rows = document.visible_rows;
         assert!(reference_rows > 0);
         assert_eq!(document.display_end(), reference_rows as u64);
@@ -18155,9 +18378,9 @@ mod tests {
         );
 
         let _ = render(852.0, &mut app, &mut frame);
-        let smaller_rows = app.document.as_ref().unwrap().visible_rows;
+        let smaller_rows = app.active.document.as_ref().unwrap().visible_rows;
         let _ = render(1252.0, &mut app, &mut frame);
-        let larger_rows = app.document.as_ref().unwrap().visible_rows;
+        let larger_rows = app.active.document.as_ref().unwrap().visible_rows;
         assert!(
             smaller_rows < reference_rows,
             "smaller window kept {smaller_rows} rows from the {reference_rows}-row reference"
@@ -18167,7 +18390,7 @@ mod tests {
             "larger window kept {larger_rows} rows from the {reference_rows}-row reference"
         );
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         drop(app);
         fs::remove_file(path).unwrap();
     }
@@ -18361,7 +18584,7 @@ mod tests {
         fs::write(&path, b"name\nfirst\n").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(path.clone()).unwrap();
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
@@ -18369,7 +18592,7 @@ mod tests {
         let _ = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
-        assert!(!app.find_bar_open);
+        assert!(!app.active.find_bar_open);
 
         let command = egui::Modifiers::COMMAND;
         let _ = ctx.run(
@@ -18388,7 +18611,7 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(app.find_bar_open);
+        assert!(app.active.find_bar_open);
         assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new(FIND_INPUT_ID))));
 
         let path_position = ctx
@@ -18426,9 +18649,10 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(app.find_bar_open);
+        assert!(app.active.find_bar_open);
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .begin_cell_edit(1, 0, b"first".to_vec())
@@ -18452,8 +18676,8 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(app.find_bar_open);
-        assert!(app.document.as_ref().unwrap().cell_edit.is_none());
+        assert!(app.active.find_bar_open);
+        assert!(app.active.document.as_ref().unwrap().cell_edit.is_none());
 
         let _ = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
@@ -18478,15 +18702,15 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(!app.find_bar_open);
+        assert!(!app.active.find_bar_open);
         assert!(!ctx.memory(|memory| memory.has_focus(egui::Id::new(FIND_INPUT_ID))));
 
-        app.find_bar_open = true;
-        app.replace_expanded = true;
+        app.active.find_bar_open = true;
+        app.active.replace_expanded = true;
         app.open_path(path).unwrap();
-        assert!(!app.find_bar_open);
-        assert!(!app.replace_expanded);
-        app.document.as_mut().unwrap().shutdown();
+        assert!(app.active.find_bar_open);
+        assert!(app.active.replace_expanded);
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -18515,7 +18739,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut app = QuarryApp::new(None, Instant::now());
-        app.document = Some(document);
+        app.active.document = Some(document);
         let mut frame = eframe::Frame::_new_kittest();
         let output = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
@@ -18547,9 +18771,9 @@ mod tests {
                 eframe::App::update(&mut app, ctx, &mut frame);
             },
         );
-        assert!(!app.find_bar_open);
+        assert!(!app.active.find_bar_open);
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
@@ -18941,13 +19165,13 @@ mod tests {
         document.commit_cell_edit();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.find_input = "needle".into();
-        app.replace_input = "x".into();
-        app.document = Some(document);
+        app.active.find_input = "needle".into();
+        app.active.replace_input = "x".into();
+        app.active.document = Some(document);
         app.apply(&egui::Context::default(), Action::ReplaceAll);
         finish_structural_edit(&mut app);
 
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(fs::read(&path).unwrap(), source);
         assert_ne!(document.session.path(), path);
         assert_eq!(
@@ -18955,15 +19179,15 @@ mod tests {
             b"name\noverlay x x\nsource x\n"
         );
         assert!(document.is_dirty());
-        assert!(app.notice.is_none());
+        assert!(app.active.notice.is_none());
         assert_eq!(
-            app.footer_status.as_deref(),
+            app.active.footer_status.as_deref(),
             Some("Replaced 3 occurrences. Save to keep it, or discard changes.")
         );
 
         app.swap_structural_history(false).unwrap();
-        finish_index(app.document.as_mut().unwrap());
-        let document = app.document.as_ref().unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), path);
         assert_eq!(
             document.cell_edits.get(&(1, 0)).map(Vec::as_slice),
@@ -18993,13 +19217,14 @@ mod tests {
         finish_index(&mut document);
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.find_input = "missing".into();
-        app.document = Some(document);
+        app.active.find_input = "missing".into();
+        app.active.document = Some(document);
         let ctx = egui::Context::default();
         app.apply(&ctx, Action::FindNext);
         app.apply(&ctx, Action::CancelSearch);
         assert!(
-            app.document
+            app.active
+                .document
                 .as_ref()
                 .unwrap()
                 .search_progress()
@@ -19007,8 +19232,8 @@ mod tests {
                 .cancelled
         );
 
-        app.document.as_mut().unwrap().shutdown();
-        assert!(app.document.as_ref().unwrap().search_job.is_none());
+        app.active.document.as_mut().unwrap().shutdown();
+        assert!(app.active.document.as_ref().unwrap().search_job.is_none());
         fs::remove_file(path).unwrap();
     }
 
@@ -19493,14 +19718,14 @@ mod tests {
         assert!(!progress.done, "test file indexed before replacement");
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.document = Some(current);
+        app.active.document = Some(current);
         app.open_path(second.clone()).unwrap();
 
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), second);
         assert_eq!(document.buffered_rows[0].fields[0], b"second");
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         drop(app);
         for path in [first, second] {
             fs::remove_file(path).unwrap();
@@ -19508,7 +19733,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_and_cancelled_opens_preserve_the_document_and_drops_open_one_file() {
+    fn failed_and_cancelled_opens_preserve_the_document_and_drops_open_each_file() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -19521,51 +19746,59 @@ mod tests {
         fs::write(&malformed, b"\"unterminated").unwrap();
 
         let mut app = QuarryApp::new(None, Instant::now());
-        app.delimiter_mode = DelimiterMode::Comma;
-        app.header_mode = HeaderMode::FirstRow;
+        app.active.delimiter_mode = DelimiterMode::Comma;
+        app.active.header_mode = HeaderMode::FirstRow;
         app.open_path(first.clone()).unwrap();
-        assert_eq!(app.delimiter_mode, DelimiterMode::Comma);
-        assert_eq!(app.header_mode, HeaderMode::FirstRow);
-        app.document.as_mut().unwrap().move_column(1, 0).unwrap();
-        app.document
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Comma);
+        assert_eq!(app.active.header_mode, HeaderMode::FirstRow);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .move_column(1, 0)
+            .unwrap();
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .set_column_shown(0, false)
             .unwrap();
         app.open_picker_result(None);
-        assert_eq!(app.document.as_ref().unwrap().session.path(), first);
-        assert_eq!(app.delimiter_mode, DelimiterMode::Comma);
-        assert_eq!(app.header_mode, HeaderMode::FirstRow);
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), first);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Comma);
+        assert_eq!(app.active.header_mode, HeaderMode::FirstRow);
 
         app.open_path_and_report(malformed.clone());
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), first);
         assert_eq!(document.columns.order, [1, 0]);
         assert!(document.columns.hidden[0]);
-        assert!(app.notice.as_deref().unwrap().contains("unterminated"));
-        assert_eq!(app.delimiter_mode, DelimiterMode::Comma);
-        assert_eq!(app.header_mode, HeaderMode::FirstRow);
+        assert!(
+            app.active
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("unterminated")
+        );
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Comma);
+        assert_eq!(app.active.header_mode, HeaderMode::FirstRow);
 
         app.open_picker_result(Some(second.clone()));
-        assert_eq!(app.document.as_ref().unwrap().session.path(), second);
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::Auto);
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), second);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.active.header_mode, HeaderMode::Auto);
         app.reopen_document(DelimiterMode::Comma, HeaderMode::FirstRow);
 
         app.handle_dropped_paths(vec![Some(first.clone()), Some(second.clone())]);
-        let document = app.document.as_ref().unwrap();
-        assert_eq!(document.session.path(), first);
-        assert_eq!(document.columns.order, [0, 1]);
-        assert!(document.columns.hidden.iter().all(|hidden| !hidden));
-        assert!(app.notice.as_deref().unwrap().contains("ignored 1"));
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::Auto);
-
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), second);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].document.as_ref().unwrap().columns.order, [1, 0]);
+        assert!(app.tabs[0].document.as_ref().unwrap().columns.hidden[0]);
         app.handle_dropped_paths(vec![None]);
-        assert_eq!(app.document.as_ref().unwrap().session.path(), first);
-        assert!(app.notice.as_deref().unwrap().contains("local file"));
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), second);
+        assert!(app.active.notice.as_deref().unwrap().contains("local file"));
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         drop(app);
         for path in [first, second, malformed] {
             fs::remove_file(path).unwrap();
@@ -19583,7 +19816,8 @@ mod tests {
         let destination = directory.path().join("saved.csv");
         fs::write(&source, b"value\n2\n1\n").unwrap();
         let mut app = individual_edit_app(&source);
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_sort_rows(
@@ -19594,7 +19828,7 @@ mod tests {
             )
             .unwrap();
         finish_structural_edit(&mut app);
-        let document = app.document.as_mut().unwrap();
+        let document = app.active.document.as_mut().unwrap();
         let working_path = document.session.path().to_path_buf();
         document.begin_cell_edit(1, 0, b"1".to_vec()).unwrap();
         document.cell_edit.as_mut().unwrap().draft = "3".into();
@@ -19630,22 +19864,26 @@ mod tests {
             );
         };
         request_native_quit(&mut app);
-        assert!(app.close_confirmation_open);
+        assert!(app.active.close_confirmation_open);
         assert!(working_path.exists());
-        assert!(app.document.as_ref().unwrap().cell_edit.is_none());
-        assert_eq!(app.document.as_ref().unwrap().cell_edits[&(1, 0)], b"3");
+        assert!(app.active.document.as_ref().unwrap().cell_edit.is_none());
+        assert_eq!(
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)],
+            b"3"
+        );
         app.keep_editing();
-        assert!(!app.close_confirmation_open);
+        assert!(!app.active.close_confirmation_open);
         assert!(working_path.exists());
 
-        app.document
+        app.active
+            .document
             .as_mut()
             .unwrap()
             .start_save_as(destination.clone())
             .unwrap();
         request_native_quit(&mut app);
-        assert!(app.close_after_save);
-        assert!(!app.close_confirmation_open);
+        assert!(app.active.close_after_save);
+        assert!(!app.active.close_confirmation_open);
         let output = finish_app_save(&mut app, &ctx, &mut eframe::Frame::_new_kittest());
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
@@ -19653,7 +19891,7 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Close))
         );
-        assert!(!app.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
         assert_eq!(fs::read(&destination).unwrap(), b"value\n3\n2\n");
         assert_eq!(fs::read(&source).unwrap(), b"value\n2\n1\n");
         assert_eq!(
@@ -19682,16 +19920,16 @@ mod tests {
 
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut app = QuarryApp::new(None, Instant::now());
-        app.delimiter_mode = DelimiterMode::Tab;
-        app.header_mode = HeaderMode::NoHeader;
+        app.active.delimiter_mode = DelimiterMode::Tab;
+        app.active.header_mode = HeaderMode::NoHeader;
         app.open_document_receiver = Some(receiver);
         sender.send(source.clone()).unwrap();
         app.poll_open_documents();
 
-        assert_eq!(app.document.as_ref().unwrap().session.path(), source);
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::Auto);
-        app.document.as_mut().unwrap().shutdown();
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), source);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.active.header_mode, HeaderMode::Auto);
+        app.active.document.as_mut().unwrap().shutdown();
         fs::remove_file(source).unwrap();
     }
 
@@ -19706,50 +19944,70 @@ mod tests {
 
         let mut app = QuarryApp::new(None, Instant::now());
         app.open_new_path(path.clone()).unwrap();
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::Auto);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.active.header_mode, HeaderMode::Auto);
         assert_eq!(
-            app.document.as_ref().unwrap().session.dialect.delimiter,
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .session
+                .dialect
+                .delimiter,
             b','
         );
-        assert!(app.document.as_ref().unwrap().session.dialect.has_header);
+        assert!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .session
+                .dialect
+                .has_header
+        );
 
-        app.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader));
+        app.active.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader));
         fs::write(&path, b"name\tvalue\nsecond\t2\n").unwrap();
         app.reload_document();
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), path);
         assert_eq!(document.session.dialect.delimiter, b',');
         assert!(document.session.dialect.has_header);
         assert_eq!(document.headers, ["name\tvalue"]);
         assert_eq!(document.buffered_rows[0].fields[0], b"second\t2");
-        assert_eq!(app.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(app.header_mode, HeaderMode::Auto);
-        assert_eq!(app.format_draft, None);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(app.active.header_mode, HeaderMode::Auto);
+        assert_eq!(app.active.format_draft, None);
 
         app.reopen_document(DelimiterMode::Tab, HeaderMode::NoHeader);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), path);
         assert_eq!(document.session.dialect.delimiter, b'\t');
         assert!(!document.session.dialect.has_header);
         assert_eq!(document.headers, ["Column 1", "Column 2"]);
         assert_eq!(document.buffered_rows[0].fields[0], b"name");
         assert_eq!(document.buffered_rows[0].fields[1], b"value");
-        assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
-        assert_eq!(app.header_mode, HeaderMode::NoHeader);
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Tab);
+        assert_eq!(app.active.header_mode, HeaderMode::NoHeader);
         assert_eq!(DelimiterMode::Pipe.delimiter(), Some(b'|'));
         assert_eq!(DelimiterMode::Semicolon.delimiter(), Some(b';'));
 
         fs::write(&path, b"\"unterminated").unwrap();
         app.reopen_document(DelimiterMode::Comma, HeaderMode::FirstRow);
-        let document = app.document.as_ref().unwrap();
+        let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.headers, ["Column 1", "Column 2"]);
         assert_eq!(document.buffered_rows[0].fields[0], b"name");
-        assert_eq!(app.delimiter_mode, DelimiterMode::Tab);
-        assert_eq!(app.header_mode, HeaderMode::NoHeader);
-        assert!(app.notice.as_deref().unwrap().contains("unterminated"));
+        assert_eq!(app.active.delimiter_mode, DelimiterMode::Tab);
+        assert_eq!(app.active.header_mode, HeaderMode::NoHeader);
+        assert!(
+            app.active
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("unterminated")
+        );
 
-        app.document.as_mut().unwrap().shutdown();
+        app.active.document.as_mut().unwrap().shutdown();
         drop(app);
         fs::remove_file(path).unwrap();
     }

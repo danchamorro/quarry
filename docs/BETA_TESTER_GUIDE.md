@@ -79,6 +79,8 @@ only synthetic reproductions, never private datasets or credentials.
 Clear active filters before editing; save or discard cell edits before filtering.
 Undo history is bounded, and case-insensitive matching folds ASCII letters only.
 Read the [documented limits](USER_GUIDE.md#undo-and-redo-changes) and
-[filter rules](USER_GUIDE.md#filter-rows). CSV append, document tabs, and a TUI
-remain [future work](ROADMAP.md#post-beta-sequence). The
+[filter rules](USER_GUIDE.md#filter-rows). Current source builds also include
+[Combine Files](USER_GUIDE.md#combine-files) and
+[document tabs](USER_GUIDE.md#work-with-document-tabs); existing beta downloads
+may predate them. A TUI remains [future work](ROADMAP.md#post-beta-sequence). The
 [beta checklist](BETA_RELEASE_CHECKLIST.md) tracks acceptance still outstanding.
