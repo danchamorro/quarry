@@ -81,7 +81,7 @@ general throughput measurements or a claim about every possible record shape.
 
 ## Automated checks
 
-Formatting, workspace Clippy with warnings denied, all 337 workspace tests,
+Formatting, workspace Clippy with warnings denied, all 340 workspace tests,
 and the release workspace build passed. Focused regressions cover:
 
 - Exact ordered output for multiple inputs, duplicates, multiline quoting,
@@ -114,6 +114,26 @@ TSV with a matching headered TSV containing one data row. The check reported
 two columns and one row; the saved 14-byte result matched independent expected
 bytes and reopened as a two-column TSV with the correct row. Both source
 hashes stayed unchanged. The test app was closed without modifying the inputs.
+
+Further review covered first records longer than the initial detection sample
+and unterminated records whose last field ends in a carriage return. Detection
+now extends the sample until it contains a complete record, within the existing
+bootstrap/record limit. Appending CRLF after a data CR preserves the field value.
+Regression tests cover long quoted/multiline and unquoted first records for all
+four delimiters, mismatched widths after the initial sample, the bootstrap cap,
+and exact output/reopened values for trailing CRs in headers and data.
+
+A third native VMPal run used clean source
+`e4cf6a11699b90d27e2cdd9a001772bcf3ab70ae`, version 0.1.0 (151), on the same
+guest. The package SHA-256 was
+`8648ac0d48f2946a1cfe5296df643182028ff3a46783b1c601e93441fbcccd64` in both
+host and guest; signature verification and launch passed. Two headerless TSV
+inputs each had one record longer than 1 MiB and ending in a data CR. Auto
+reported two columns and two rows, and the 2,097,226-byte output matched the
+independently assembled expected bytes (SHA-256
+`50d097284d640722823e39320c8aeca4a5c43a455ac153de1ffb98804d43b209`).
+Opening the result showed Tab, no header, two columns and two rows. Both source
+hashes stayed unchanged, and the test app was closed.
 
 Screenshots, build/test logs, package, fixtures and guest memory/checksum
 evidence are retained locally under `target/combine-files/`. The existing host
