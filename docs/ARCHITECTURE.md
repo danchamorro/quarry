@@ -51,6 +51,14 @@ crates. See
 [ADR 0001](adr/0001-initial-engine.md).
 
 ## File access
+
+The egui app owns up to eight independent document tabs. Each tab retains its
+session, edits/history, selection, view, filters, dialogs, and worker completions.
+All tabs are polled, while input targets only the active tab. At most two file
+operations run concurrently across tabs and Combine Files. Temporary working
+files are released when their owning document closes. See
+[ADR 0007](adr/0007-document-tabs.md) for lifecycle and resource policy.
+
 Core uses `std::fs::File`, fixed-size sequential reads, and seeks from the
 nearest structural checkpoint for viewport access. Memory mapping remains
 deferred until measurements show a benefit that justifies the dependency and
