@@ -24,8 +24,8 @@ cached widths and scroll position by tab ID.
 
 Open, Finder requests, command-line paths, and multi-file drops create tabs. A
 canonical-path or hard-link duplicate of a document's logical source or current
-working file selects its owner without resetting its edits or format. A temporary
-working file never becomes another tab's independently owned source. Reload and
+working file selects its owner without resetting its edits or format. The current
+temporary working file never becomes another tab's independently owned source. Reload and
 format reopening remain explicit replacement
 operations with unsaved-change and active-operation guards. Save As moves only its
 own tab to the saved copy. Destinations belonging to another open tab or an active

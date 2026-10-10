@@ -21,6 +21,7 @@ Host and guest ZIP checksums matched. Each launched bundle reported clean source
 | 151 | `e3e03aef14e70fe106c559eaef618be8b6fa736b` | `e34d8df0044e36806a2142074b035d48aa0ab5d29fe1dc3b9d204dd374cd30d6` | Active save/reload failure selects retained work; deferred split review respects concurrent-worker capacity |
 | 153 | `0240d82f78a609bb59cdb32bdeca4cd0d527951a` | `5a317acec9f5fa1a69d76415d13b3ec84d268c4876cce7dbc027c3bd97824f47` | Native quit preserves idle Combine Files selections, running checks, and a combined-file write |
 | 155 | `326cca7976a4bedb917c50a89a66c379dc5f1b46` | `3ff2c09f425c438ac8b39573a5f8039f6fc25c194d707bc9496b01ecd7aa533a` | Case-only Save As aliases rejected across tabs; retained edits and Undo/Redo |
+| 157 | `47c94adf81411bbfb022ff69c5760611fa9489cd` | `cbdc332b85c45aa9f2308bcd23e5ab25a019f9426d126a90e6fb0e0dd087c1d6` | Finder opening a current working file selects its owner; closing it preserves the other tab |
 
 Each build actually launched and rendered its test documents. Documentation-only
 commits after these builds do not change the tested executable code.
@@ -199,6 +200,15 @@ retains its source, edit, and Undo history. The original source remains unchange
 This regression passed locally and in VMPal. The guest test executable's signature
 verified and its SHA-256 was
 `de14febef6bc89a4733342a7215bfd5992fe5b5d5c228f67922ac6bf63c8a418`.
+
+Build 157 also launched natively. A text sort materialized A's working file while
+B retained an unsaved `OwnerRetainedB` header. Opening A's temporary file through
+a Finder event selected A with only two tabs. Command-W then reviewed A's logical
+source; discarding that synthetic sort closed A and removed its temporary file.
+Only B remained, with its edit and native Undo/Redo intact. Both original sources
+matched their entire generated 200-row fixtures. A's source SHA-256 was
+`07fddac26d3ebe7130bef18b0f77d0ae48e74195444c396e28c5264fce688bed`;
+B's remained `4b036b6e314d400ec645cf51421d49af5ec9a34a07097f072f1e0e6a13898539`.
 
 ## Deterministic and CI validation
 
