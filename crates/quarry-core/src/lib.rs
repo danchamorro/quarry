@@ -311,7 +311,7 @@ impl Session {
                 RecordScanner::new(delimiter)?;
                 delimiter
             }
-            None => detect_delimiter(&sample),
+            None => detect_delimiter(&sample, sample.len() as u64 == file_size),
         };
         drop(sample);
 
@@ -442,7 +442,7 @@ fn materialize_rows(bytes: &[u8], ends: &[u64], delimiter: u8) -> Result<Vec<Row
     Ok(rows)
 }
 
-fn detect_delimiter(sample: &[u8]) -> u8 {
+fn detect_delimiter(sample: &[u8], at_eof: bool) -> u8 {
     let mut best = (0_usize, 0_usize, b',');
     for delimiter in *b",\t|;" {
         let Ok(mut scanner) = RecordScanner::new(delimiter) else {
@@ -456,6 +456,19 @@ fn detect_delimiter(sample: &[u8]) -> u8 {
                 }
             })
             .is_err()
+        {
+            continue;
+        }
+        // Only a complete sample can finish the last record. A bounded sample
+        // may end in the middle of a field or quoted record.
+        if at_eof
+            && scanner
+                .finish(sample.len() as u64, |end| {
+                    if ends.len() < 32 {
+                        ends.push(end);
+                    }
+                })
+                .is_err()
         {
             continue;
         }

@@ -220,7 +220,7 @@ pub fn check_combine_files(
                 file.by_ref()
                     .take(DEFAULT_SAMPLE_BYTES as u64)
                     .read_to_end(&mut sample)?;
-                detect_delimiter(&sample)
+                detect_delimiter(&sample, sample.len() as u64 == stamp.file_size())
             };
             if let Some(expected) = delimiter {
                 if expected != observed_delimiter {
@@ -602,6 +602,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fs::read(destination).unwrap(), b"1,one\n2,two\n");
+    }
+
+    #[test]
+    fn auto_detects_unterminated_header_only_and_single_record_inputs() {
+        for delimiter in [',', '\t', '|', ';'] {
+            for (first, second, has_header, rows, expected) in [
+                (
+                    format!("ID{delimiter}Name"),
+                    format!("ID{delimiter}Name\n2{delimiter}two\n"),
+                    true,
+                    1,
+                    format!("ID{delimiter}Name\n2{delimiter}two\n"),
+                ),
+                (
+                    format!("ID{delimiter}Name"),
+                    format!("ID{delimiter}Name"),
+                    true,
+                    0,
+                    format!("ID{delimiter}Name\n"),
+                ),
+                (
+                    format!("1{delimiter}\"first\nvalue\""),
+                    format!("2{delimiter}second"),
+                    false,
+                    2,
+                    format!("1{delimiter}\"first\nvalue\"\n2{delimiter}second\n"),
+                ),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = inputs(dir.path(), &[first.as_bytes(), second.as_bytes()]);
+                let opened =
+                    crate::Session::open(&paths[0], crate::OpenOptions::default()).unwrap();
+                assert_eq!(opened.dialect.delimiter, delimiter as u8);
+                assert_eq!(opened.first_rows[0].fields.len(), 2);
+                let checked = plan(paths, has_header).unwrap();
+                assert_eq!(checked.delimiter, delimiter as u8);
+                assert_eq!(checked.columns, 2);
+                assert_eq!(checked.data_rows, rows);
+                let output = dir.path().join("out.csv");
+                checked
+                    .start_write(output.clone())
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(fs::read(&output).unwrap(), expected.as_bytes());
+                let reopened =
+                    crate::Session::open(&output, crate::OpenOptions::default()).unwrap();
+                assert_eq!(reopened.dialect.delimiter, delimiter as u8);
+                assert_eq!(reopened.first_rows[0].fields.len(), 2);
+            }
+        }
     }
 
     #[test]
