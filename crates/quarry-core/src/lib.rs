@@ -1,4 +1,5 @@
 mod case;
+mod combine;
 mod export;
 mod filter;
 mod index;
@@ -20,6 +21,10 @@ use std::time::{Duration, Instant};
 use source_stamp::SourceStamp;
 
 pub use case::CaseSensitivity;
+pub use combine::{
+    CombineInput, CombineJob, CombineOptions, CombinePlan, CombineProgress, CombineSummary,
+    check_combine_files,
+};
 pub use export::{
     ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress,
     FilterExportSummary, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob,
@@ -66,6 +71,11 @@ pub(crate) fn parse_source_record(
 
 #[derive(Debug)]
 pub enum QuarryError {
+    CombineFile {
+        path: PathBuf,
+        record: Option<u64>,
+        reason: String,
+    },
     Io(io::Error),
     Storage {
         directory: PathBuf,
@@ -114,6 +124,17 @@ pub enum QuarryError {
 impl fmt::Display for QuarryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CombineFile {
+                path,
+                record,
+                reason,
+            } => {
+                write!(f, "{}", path.display())?;
+                if let Some(record) = record {
+                    write!(f, ", record {record}")?;
+                }
+                write!(f, ": {reason}")
+            }
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::Storage { directory, error } => write!(
                 f,

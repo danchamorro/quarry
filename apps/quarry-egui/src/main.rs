@@ -41,6 +41,7 @@ use quarry_core::{
 use tempfile::TempDir;
 
 mod about;
+mod combine_files;
 mod storage;
 use storage::{PendingStorageOperation, STORAGE_REVIEW_BYTES, StorageReview};
 
@@ -321,6 +322,7 @@ fn main() -> eframe::Result<()> {
 
 struct QuarryApp {
     about: about::About,
+    combine_files: Option<combine_files::CombineDialog>,
     working_directory: PathBuf,
     storage_review: Option<StorageReview>,
     storage_approved: bool,
@@ -518,6 +520,7 @@ impl QuarryApp {
     fn new(initial_path: Option<PathBuf>, started: Instant) -> Self {
         let mut app = Self {
             about: about::About::new(),
+            combine_files: None,
             working_directory: std::env::temp_dir(),
             storage_review: None,
             storage_approved: false,
@@ -580,6 +583,11 @@ impl QuarryApp {
         path: PathBuf,
         options: OpenOptions,
     ) -> Result<(), AppMessage> {
+        if self.combine_files.is_some() {
+            return Err(AppMessage::warning(
+                "Close Combine Files before opening another document.",
+            ));
+        }
         if let Some(document) = self.document.as_mut() {
             if document.save_job.is_some() {
                 return Err(AppMessage::warning(
@@ -858,6 +866,10 @@ impl QuarryApp {
     }
 
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        if action == Action::CombineFiles {
+            self.open_combine_files();
+            return;
+        }
         if action == Action::About {
             self.about.open();
             return;
@@ -970,6 +982,7 @@ impl QuarryApp {
             Action::Choose
             | Action::TemporaryStorage
             | Action::About
+            | Action::CombineFiles
             | Action::ReopenWithFormat(_, _)
             | Action::ReloadFromDisk
             | Action::Save
@@ -1484,6 +1497,15 @@ impl QuarryApp {
         if !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
+        if let Some(dialog) = self.combine_files.as_mut() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if dialog.busy() {
+                dialog.cancel();
+            } else {
+                self.combine_files = None;
+            }
+            return;
+        }
         if let Some(document) = self.document.as_mut() {
             if document.save_job.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1528,7 +1550,7 @@ impl eframe::App for QuarryApp {
             self.intercept_dirty_close(ctx);
 
             #[cfg(target_os = "macos")]
-            if !self.about.open {
+            if !self.about.open && self.combine_files.is_none() {
                 self.poll_open_documents();
             }
         }
@@ -1549,7 +1571,11 @@ impl eframe::App for QuarryApp {
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>()
         });
-        if self.storage_review.is_none() && !self.about.open && !dropped_paths.is_empty() {
+        if self.storage_review.is_none()
+            && !self.about.open
+            && self.combine_files.is_none()
+            && !dropped_paths.is_empty()
+        {
             self.handle_dropped_paths(dropped_paths);
         }
 
@@ -1764,7 +1790,8 @@ impl eframe::App for QuarryApp {
             self.about.open = false;
         }
         let storage_review_open = self.storage_review.is_some();
-        let interaction_blocked = storage_review_open || self.about.open;
+        let interaction_blocked =
+            storage_review_open || self.about.open || self.combine_files.is_some();
         if storage_review_open && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -2085,7 +2112,7 @@ impl eframe::App for QuarryApp {
             self.apply(ctx, action);
         }
 
-        if self.storage_review.is_none() && !self.about.open && self.format_draft.is_some() {
+        if !interaction_blocked && self.format_draft.is_some() {
             self.columns_open = false;
             self.filters_open = false;
             surrender_filter_text_focus(ctx, self.filter_rules.len());
@@ -2094,7 +2121,7 @@ impl eframe::App for QuarryApp {
         let column_command = self
             .document
             .as_ref()
-            .filter(|_| self.storage_review.is_none() && !self.about.open)
+            .filter(|_| !interaction_blocked)
             .and_then(|document| {
                 show_column_manager(
                     ctx,
@@ -2110,7 +2137,7 @@ impl eframe::App for QuarryApp {
         let filter_action = self
             .document
             .as_ref()
-            .filter(|_| self.storage_review.is_none() && !self.about.open)
+            .filter(|_| !interaction_blocked)
             .and_then(|document| {
                 show_filter_manager(
                     ctx,
@@ -2130,7 +2157,7 @@ impl eframe::App for QuarryApp {
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
             .show(ctx, |ui| {
-                if self.storage_review.is_some() || self.about.open {
+                if interaction_blocked {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
@@ -2160,7 +2187,7 @@ impl eframe::App for QuarryApp {
         let structural_dialog_action = self
             .structural_dialog
             .as_mut()
-            .filter(|_| self.storage_review.is_none() && !self.about.open)
+            .filter(|_| !interaction_blocked)
             .zip(self.document.as_ref())
             .and_then(|(dialog, document)| {
                 show_structural_dialog(ctx, dialog, &mut self.sort_match_case, document)
@@ -2171,7 +2198,7 @@ impl eframe::App for QuarryApp {
         let duplicate_action = self
             .document
             .as_ref()
-            .filter(|_| self.storage_review.is_none() && !self.about.open)
+            .filter(|_| !interaction_blocked)
             .and_then(|document| {
                 let StructuralJob::DuplicatePreview { summary, .. } =
                     document.structural_job.as_ref()?
@@ -2199,14 +2226,14 @@ impl eframe::App for QuarryApp {
                         .map(|edit| (edit.row, edit.column)),
                 )
         });
-        if self.storage_review.is_none() && !self.about.open && copy_event_targets_selection {
+        if !interaction_blocked && copy_event_targets_selection {
             self.copy_selection(ctx);
         }
         if grid_error.is_some() {
             self.notice = grid_error.map(AppMessage::error);
         }
 
-        if self.storage_review.is_none() && !self.about.open && self.close_confirmation_open {
+        if !interaction_blocked && self.close_confirmation_open {
             let mut discard_and_close = false;
             let mut keep_editing = false;
             let mut save_and_close = false;
@@ -2280,7 +2307,10 @@ impl eframe::App for QuarryApp {
             }
             self.show_storage_review(ctx);
         }
-        if self.storage_review.is_none() && !self.close_confirmation_open {
+        if self.storage_review.is_none()
+            && !self.close_confirmation_open
+            && self.combine_files.is_none()
+        {
             self.about.show(ctx);
         }
         if self.document.as_ref().is_some_and(|document| {
@@ -2293,6 +2323,9 @@ impl eframe::App for QuarryApp {
                 || document.structural_job.is_some()
         }) {
             ctx.request_repaint_after(POLL_INTERVAL);
+        }
+        if self.combine_files.is_some() {
+            self.show_combine_files(ctx);
         }
     }
 }
@@ -2365,6 +2398,7 @@ fn detected_delimiter_label(delimiter: u8) -> &'static str {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     About,
+    CombineFiles,
     Choose,
     TemporaryStorage,
     ReopenWithFormat(DelimiterMode, HeaderMode),
@@ -3040,6 +3074,12 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
         if open.clicked() {
             action = Some(Action::Choose);
         }
+        if ui
+            .add_enabled(!file_operation_active, egui::Button::new("Combine Files…"))
+            .clicked()
+        {
+            action = Some(Action::CombineFiles);
+        }
         let reload = ui
             .add_enabled(
                 document_open && !file_operation_active && !dirty,
@@ -3173,6 +3213,9 @@ fn show_empty_state(ui: &mut egui::Ui, local_file_hovered: bool) -> Option<Actio
             ui.label(RichText::new("Drop a delimited file here, or").size(16.0));
             if ui.button("Open…").clicked() {
                 action = Some(Action::Choose);
+            }
+            if ui.button("Combine Files…").clicked() {
+                action = Some(Action::CombineFiles);
             }
         },
     );

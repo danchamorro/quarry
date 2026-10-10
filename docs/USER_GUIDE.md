@@ -7,6 +7,7 @@ delimited files in the Quarry macOS app.
 
 - [Getting started](#getting-started)
 - [How to](#how-to)
+  - [Combine files](#combine-files)
   - [Navigate the grid](#navigate-the-grid)
   - [Select and copy data](#select-and-copy-data)
   - [Delete rows](#delete-rows)
@@ -103,6 +104,47 @@ This panel was added after beta 1; that release's build identity is listed in
 the [beta tester guide](BETA_TESTER_GUIDE.md#candidate-and-compatibility).
 
 ## How to
+
+### Combine files
+
+Use **File → Combine Files…** (also available with no file open) to put the
+rows from two or more matching files into one new file.
+
+1. Choose **Add Files…** and select the files. Add more files if needed.
+2. Use **Up**, **Down**, and **Remove** to set the output order.
+3. Leave **Files have a header row** checked when every file has a header.
+   For headerless files, uncheck it so every first row remains data. Choose the
+   delimiter or leave **Auto** to detect it independently in each input.
+4. Choose **Check Files**. Quarry scans all records in the background and
+   reports the matching file, column and data-row counts. You can cancel.
+5. Choose **Choose Output…**, select a new file name, review output size and
+   available space, then choose **Combine and Save**.
+6. When complete, choose **Open Combined File** to inspect or edit the result.
+
+All files must have the same delimiter and number of columns in every record.
+For files with headers, the decoded column names must match exactly in the
+same order, including case and spaces. Quarry identifies the input and record
+when a mismatch or malformed record is found. Empty files and repeated
+selection of the same path are rejected; header-only files are allowed.
+
+The output contains one header and every data row in the selected file order,
+including duplicates. Values, quoting and record endings are preserved; an
+unterminated record receives LF to keep the next file separate. Encoding BOMs
+from subsequent inputs are omitted. The 64 MiB record and 65,536-column limits
+apply. A missing field is an incompatible row; an explicitly empty field is
+preserved.
+
+Combining reads the selected **saved files on disk**. It leaves every input and
+the current document unchanged; unsaved edits in an open document are not
+included. Save those edits first if they should be combined. The output must
+be a new file: an existing destination is never overwritten. Cancellation or
+failure removes unpublished output. Changes to an input after the file check
+require checking again.
+
+Opening the result still protects unsaved work in the current document. Save
+or discard that work before opening another file. Combining creates a separate
+file, so it is not a change in the current document's Undo history. Once opened,
+the result supports the usual editing, Undo/Redo, filtering, Save and Save As.
 
 ### Navigate the grid
 

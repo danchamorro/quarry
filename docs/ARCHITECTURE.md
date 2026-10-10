@@ -304,6 +304,25 @@ flushes and syncs it before publishing the destination without overwriting an
 existing path. Cancellation or failure removes the temporary file and never
 publishes the destination. The source path itself is rejected as a destination.
 
+## Combining files
+
+The standalone Combine Files workflow runs a two-pass core pipeline. A
+`CombineJob<CombinePlan>` checks the explicit header mode, matching delimiters,
+decoded headers and every record's width. It retains one bounded record and
+read buffer, one reference header and metadata per input; it opens one input
+at a time. The plan records source stamps, data-row counts and exact output
+size. No output is written by this check.
+
+`CombinePlan::start_write` checks destination space and streams inputs in the
+selected order through `ExportTarget`. It omits later headers and encoding
+BOMs, adds LF to an unterminated record and otherwise copies record bytes.
+The shared target checks all input stamps immediately before no-clobber
+publication, after output flush and sync. Dropped/cancelled/failed jobs remove
+staging. Metadata grows with the number of selected files; record memory stays
+bounded independently of their total size. The GUI keeps this job outside the
+active `Document`, so its edits and history are preserved. See
+[ADR 0006](adr/0006-combine-files.md).
+
 ## Sorting
 
 Quarry sorts data rows by exactly one selected numbered column using stable,

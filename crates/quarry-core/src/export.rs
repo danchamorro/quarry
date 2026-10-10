@@ -1678,9 +1678,23 @@ pub(crate) struct ExportTarget {
     destination: PathBuf,
     publication: Publication,
     first_record_bom_guard: FirstRecordBomGuard,
+    additional_sources: Vec<(PathBuf, SourceStamp)>,
 }
 
 impl ExportTarget {
+    pub(crate) fn new_combined(
+        sources: Vec<(PathBuf, SourceStamp)>,
+        destination: PathBuf,
+    ) -> Result<Self, QuarryError> {
+        for (path, _) in &sources {
+            validate_destination(path, &destination)?;
+        }
+        let mut target = Self::create(destination, Publication::CreateNew)?;
+        target.additional_sources = sources;
+        target.ensure_source_unchanged()?;
+        Ok(target)
+    }
+
     fn new(source: &Path, destination: PathBuf) -> Result<Self, QuarryError> {
         validate_destination(source, &destination)?;
         Self::create(destination, Publication::CreateNew)
@@ -1890,6 +1904,7 @@ impl ExportTarget {
                         destination,
                         publication,
                         first_record_bom_guard: FirstRecordBomGuard::Inactive,
+                        additional_sources: Vec::new(),
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -1995,6 +2010,18 @@ impl ExportTarget {
     }
 
     fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
+        for (path, stamp) in &self.additional_sources {
+            let unchanged = File::open(path)
+                .ok()
+                .is_some_and(|file| source_matches_stamp(&file, path, stamp).unwrap_or(false));
+            if !unchanged {
+                return Err(QuarryError::CombineFile {
+                    path: path.clone(),
+                    record: None,
+                    reason: "File changed after validation. Check the files again.".into(),
+                });
+            }
+        }
         let unchanged = match &self.publication {
             Publication::CreateNew => true,
             Publication::GuardedCreateNew {
