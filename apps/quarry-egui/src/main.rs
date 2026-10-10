@@ -5425,7 +5425,7 @@ impl Document {
             .or_else(|| {
                 let records = self.index.as_ref()?.indexed_rows();
                 if self.data_start > records {
-                    Some("This file has no header. Reopen with No header before adding rows.")
+                    Some("This file is empty. Reopen with No header before adding rows.")
                 } else if !rows && records == 0 {
                     Some("Add a row first so an empty file can retain its columns.")
                 } else {
