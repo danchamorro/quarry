@@ -35,6 +35,11 @@ Discard approvals during quit do not release documents until the whole quit is
 approved, so cancelling a later prompt retains every tab and its Undo history.
 Successfully saved files remain saved if quit is subsequently cancelled.
 
+If a completed in-place save cannot be reopened, its stale document is released.
+An inactive empty tab is removed and its saved-path/reopen error is shown on the
+visible tab, preserving that other document and its history. External file moves
+after publication can trigger this recovery; the saved bytes remain on disk.
+
 ## Resource policy
 
 - At most eight open documents; opening beyond that limit fails without eviction.
@@ -65,3 +70,8 @@ queued-operation semantics.
 The horizontal tab strip provides full-path tooltips, accessible tab and close
 names, dirty/activity markers, and Ctrl-Tab/Ctrl-Shift-Tab navigation. Cmd-O opens
 files and Cmd-W closes the active tab. The toolbar remains a separate bounded row.
+The selected tab is revealed immediately on navigation and window resize.
+
+[Release VM evidence](../benchmarks/2026-10-10-document-tabs.md) records simultaneous
+large documents, native cancellation/recovery, source and output hashes, and RSS
+observations separately from deterministic tests.
