@@ -499,7 +499,14 @@ impl QuarryApp {
         tabs.sort_by_key(|tab| tab.0);
         let mut select = None;
         let mut close = None;
-        let reveal = std::mem::take(&mut self.reveal_tab);
+        let width = ctx.content_rect().width();
+        let resized = ctx.data_mut(|data| {
+            let key = egui::Id::new("quarry-tab-strip-width");
+            let previous = data.get_temp::<f32>(key);
+            data.insert_temp(key, width);
+            previous != Some(width)
+        });
+        let reveal = std::mem::take(&mut self.reveal_tab) || resized;
         if !tabs.is_empty() {
             egui::TopBottomPanel::top("quarry-document-tabs")
                 .exact_height(30.0)
@@ -1070,14 +1077,18 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut frame = eframe::Frame::_new_kittest();
-        let render = |app: &mut QuarryApp, events| {
-            ctx.run(input(events), |ctx| {
-                eframe::App::update(app, ctx, &mut frame)
-            })
+        let mut width = 1280.0;
+        let render = |app: &mut QuarryApp, events, width| {
+            let mut raw = input(events);
+            raw.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 540.0),
+            ));
+            ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame))
         };
         let mut render = render;
         for _ in 0..4 {
-            render(&mut app, vec![]);
+            render(&mut app, vec![], width);
         }
         let assert_visible = |output: egui::FullOutput, filename: &str| {
             let tree = output.platform_output.accesskit_update.unwrap();
@@ -1097,7 +1108,11 @@ mod tests {
                 "selected tab is outside strip: {bounds:?}"
             );
         };
-        assert_visible(render(&mut app, vec![]), "document-7.csv");
+        width = 860.0;
+        for _ in 0..4 {
+            render(&mut app, vec![], width);
+        }
+        assert_visible(render(&mut app, vec![], width), "document-7.csv");
         render(
             &mut app,
             vec![egui::Event::Key {
@@ -1107,11 +1122,12 @@ mod tests {
                 physical_key: None,
                 repeat: false,
             }],
+            width,
         );
         for _ in 0..4 {
-            render(&mut app, vec![]);
+            render(&mut app, vec![], width);
         }
-        assert_visible(render(&mut app, vec![]), "document-0.csv");
+        assert_visible(render(&mut app, vec![], width), "document-0.csv");
     }
 
     #[test]
