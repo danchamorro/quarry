@@ -20,6 +20,7 @@ Host and guest ZIP checksums matched. Each launched bundle reported clean source
 | 149 | `d80e7fd9f73e7feee7f5f199fdc1e210fb981d40` | `5a7b0e1953ae75e295535ff312d0247bba1f6f76bf9a24be732ea3a14caf997b` | Background save/reload failure recovery; other tab's edits and history retained |
 | 151 | `e3e03aef14e70fe106c559eaef618be8b6fa736b` | `e34d8df0044e36806a2142074b035d48aa0ab5d29fe1dc3b9d204dd374cd30d6` | Active save/reload failure selects retained work; deferred split review respects concurrent-worker capacity |
 | 153 | `0240d82f78a609bb59cdb32bdeca4cd0d527951a` | `5a317acec9f5fa1a69d76415d13b3ec84d268c4876cce7dbc027c3bd97824f47` | Native quit preserves idle Combine Files selections, running checks, and a combined-file write |
+| 155 | `326cca7976a4bedb917c50a89a66c379dc5f1b46` | `3ff2c09f425c438ac8b39573a5f8039f6fc25c194d707bc9496b01ecd7aa533a` | Case-only Save As aliases rejected across tabs; retained edits and Undo/Redo |
 
 Each build actually launched and rendered its test documents. Documentation-only
 commits after these builds do not change the tested executable code.
@@ -158,15 +159,42 @@ oracle concatenated the first input and the second input after its first header;
 the entire output matched at SHA-256
 `73fcdfb39b33f56896b0ac6d9c9cb4d834a7c7e4e571854662392ef4c7666b58`.
 
+## Pending output aliases on macOS volumes
+
+Review caught that two still-nonexistent outputs such as `out.csv` and `OUT.csv`
+can name the same file on ordinary macOS storage. Build 155 checks the target
+volume's case-sensitivity capability before comparing pending names. Canonically
+equivalent Unicode names are also protected. Existing file identities remain
+authoritative; an unavailable capability uses conservative case-insensitive
+comparison for pending names.
+
+The regression ran in VMPal on the guest's case-insensitive APFS volume and a
+separate 64 MiB case-sensitive APFS disk image. An independent filesystem probe
+confirmed each volume's behavior. The test reserved an output before publication,
+rejected a case-only alias on the insensitive volume with no second save job or
+created output, and allowed distinct names on the sensitive volume. It also
+covered composed/decomposed Unicode and preserved meaningful accent differences.
+The copied test binary's SHA-256 was
+`f80233e625d583f98c4bcf13b3a5ebe2b766a07f0578828a1c51beb0a02d7bd6`;
+its signature verified and both runs passed. The scratch image was detached.
+
+The packaged app actually launched two documents. A 10 GB Save As to
+`caseguard2.csv` completed while the other tab's request for `CASEGUARD2.csv`
+was rejected with **This file is open or being written in another tab**. The
+second tab retained `CaseRetainedB`, its original path, and Undo/Redo. The
+before-publication condition is asserted by the regression above; the native
+test verifies the picker, guard, and retained document state.
+
 ## Deterministic and CI validation
 
-Formatting, strict workspace Clippy, 353 workspace tests (including 145 egui
+Formatting, strict workspace Clippy, 354 workspace tests (including 146 egui
 tests), and release workspace builds passed locally. Regression coverage includes
 per-tab drafts/selection/history, live independent filters, background save and
 structural completion ownership, temporary-file cleanup, duplicate hard links,
 reserved destinations, the two-operation limit, quit cancellation, text cursor
 state, accessible keyboard interaction, compact visibility, and failed background
-reload recovery, active-tab recovery, and deferred-operation capacity checks.
+reload recovery, active-tab recovery, deferred-operation capacity checks, and
+pending output aliases under both macOS volume case rules.
 Multi-file drag-and-drop input is exercised by deterministic egui interaction
 tests; native multi-file opening used Finder events and command-line
 paths. The PR's latest commit must also pass required CI and CodeRabbit review
