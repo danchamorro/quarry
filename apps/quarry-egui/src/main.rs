@@ -709,7 +709,7 @@ impl QuarryApp {
             return false;
         };
         document.commit_edits();
-        if !document.is_save_ready() {
+        if !document.is_save_as_ready() {
             self.notice = Some(AppMessage::warning(if document.save_job.is_some() {
                 "A save operation is already running."
             } else if document.export_job.is_some() {
@@ -717,7 +717,7 @@ impl QuarryApp {
             } else if document.source_changed {
                 SOURCE_CHANGED_NOTICE
             } else {
-                "Make a change before using Save As."
+                "Make a change or reorder columns before using Save As."
             }));
             return false;
         }
@@ -2996,6 +2996,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             || document.structural_job.is_some()
     });
     let save_ready = document.is_some_and(Document::is_save_ready);
+    let save_as_ready = document.is_some_and(Document::is_save_as_ready);
     let discard_ready = document.is_some_and(|document| {
         document.is_dirty() && document.save_job.is_none() && document.structural_job.is_none()
     });
@@ -3065,11 +3066,12 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             action = Some(Action::Save);
         }
         let save_as = ui
-            .add_enabled(save_ready, egui::Button::new("Save As…"))
+            .add_enabled(save_as_ready, egui::Button::new("Save As…"))
+            .on_hover_text("Save a new copy in the current column order, including hidden columns")
             .on_disabled_hover_text(if !document_open {
                 "Open a file before using Save As."
-            } else if !dirty {
-                "Make a change before using Save As."
+            } else if !dirty && !document.is_some_and(Document::has_reordered_columns) {
+                "Make a change or reorder columns before using Save As."
             } else {
                 "Wait for the active file operation to finish."
             });
@@ -6680,8 +6682,28 @@ impl Document {
     }
 
     fn is_save_ready(&self) -> bool {
+        self.is_dirty() && self.save_operations_ready()
+    }
+
+    fn has_reordered_columns(&self) -> bool {
+        !self.columns.order.iter().copied().eq(0..self.total_columns)
+    }
+
+    fn save_as_transformation(&self) -> Option<ColumnTransformation> {
+        self.has_reordered_columns()
+            .then(|| ColumnTransformation::Arrange {
+                source_width: self.total_columns,
+                // Visibility never removes data from the saved copy.
+                output_columns: self.columns.order.clone(),
+            })
+    }
+
+    fn is_save_as_ready(&self) -> bool {
+        (self.is_dirty() || self.has_reordered_columns()) && self.save_operations_ready()
+    }
+
+    fn save_operations_ready(&self) -> bool {
         !self.source_changed
-            && self.is_dirty()
             && self.save_job.is_none()
             && self.export_job.is_none()
             && self.structural_job.is_none()
@@ -6713,7 +6735,7 @@ impl Document {
             ));
         }
         self.commit_edits();
-        if !self.is_dirty() {
+        if !(self.is_dirty() || destination.is_some() && self.has_reordered_columns()) {
             return Err(AppMessage::warning("Make a change before saving."));
         }
         let renames = self
@@ -6723,10 +6745,19 @@ impl Document {
             .collect();
         let saving_in_place = destination.is_none();
         let result = match destination {
-            Some(destination) => {
-                self.session
-                    .start_save_as_with_edits(renames, self.cell_edits.clone(), destination)
-            }
+            Some(destination) => match self.save_as_transformation() {
+                Some(transformation) => self.session.start_save_as_with_transformation(
+                    renames,
+                    self.cell_edits.clone(),
+                    transformation,
+                    destination,
+                ),
+                None => self.session.start_save_as_with_edits(
+                    renames,
+                    self.cell_edits.clone(),
+                    destination,
+                ),
+            },
             None if self.has_structural_edits() => self.session.start_save_to_original(
                 renames,
                 self.cell_edits.clone(),
@@ -10415,6 +10446,20 @@ mod tests {
         for label in ["Save", "Save As…", "Discard Changes"] {
             assert!(accessible_button(&output, label).1.is_disabled());
         }
+
+        app.document.as_mut().unwrap().move_column(1, 0).unwrap();
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert!(!accessible_button(&output, "Save As…").1.is_disabled());
+        for label in ["Save", "Discard Changes"] {
+            assert!(accessible_button(&output, label).1.is_disabled());
+        }
+        app.document.as_mut().unwrap().columns.reset();
+        let output = ctx.run(grid_input_with_width(860.0), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        assert!(accessible_button(&output, "Save As…").1.is_disabled());
 
         app.document
             .as_mut()
@@ -17354,6 +17399,142 @@ mod tests {
             document.session.first_rows[1].fields[39..=40],
             [b"left".to_vec(), b"right".to_vec()]
         );
+    }
+
+    #[test]
+    fn save_as_applies_view_order_and_edits_preserving_hidden_columns_and_source() {
+        for header_mode in [HeaderMode::FirstRow, HeaderMode::NoHeader] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.csv");
+            let destination = directory.path().join("reordered.csv");
+            let data = "1,\"Alpha, One\",10\r\n2,\"line one\nline two\",20\r\n3,,30\r\n";
+            let original = if header_mode == HeaderMode::FirstRow {
+                format!("ID,Name,Amount\r\n{data}")
+            } else {
+                data.to_owned()
+            };
+            fs::write(&source, &original).unwrap();
+            let mut app = QuarryApp::new(None, Instant::now());
+            app.header_mode = header_mode;
+            app.open_path(source.clone()).unwrap();
+            finish_index(app.document.as_mut().unwrap());
+            let document = app.document.as_mut().unwrap();
+            document.move_column(2, 1).unwrap();
+            document.set_column_shown(1, false).unwrap();
+            assert!(!document.is_dirty());
+            assert!(!document.is_save_ready());
+            assert!(document.is_save_as_ready());
+            if header_mode == HeaderMode::FirstRow {
+                document.rename_header(2, "Total".into()).unwrap();
+            }
+            document
+                .begin_cell_edit(document.data_start, 1, b"Alpha, One".to_vec())
+                .unwrap();
+            document.cell_edit.as_mut().unwrap().draft = "Edited, \"name\"".into();
+            assert!(app.save_as_picker_result(Some(destination.clone())));
+            assert!(!app.document.as_ref().unwrap().is_save_as_ready());
+
+            let ctx = egui::Context::default();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.document.as_ref().unwrap().logical_path != destination {
+                let _ = ctx.run(grid_input(), |ctx| {
+                    eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+                });
+                assert!(app.notice.is_none(), "{:?}", app.notice);
+                assert!(
+                    Instant::now() < deadline,
+                    "Save As did not reopen its output"
+                );
+                std::thread::yield_now();
+            }
+            let document = app.document.as_ref().unwrap();
+            assert!(!document.is_dirty());
+            assert!(!document.has_reordered_columns());
+            assert_eq!(document.total_columns, 3);
+            assert_eq!(document.columns.visible, [0, 1, 2]);
+            assert_eq!(fs::read_to_string(&source).unwrap(), original);
+            let expected =
+                "1,10,\"Edited, \"\"name\"\"\"\r\n2,20,\"line one\nline two\"\r\n3,30,\r\n";
+            let expected = if header_mode == HeaderMode::FirstRow {
+                format!("ID,Total,Name\r\n{expected}")
+            } else {
+                expected.to_owned()
+            };
+            assert_eq!(fs::read_to_string(&destination).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn reordered_save_as_preserves_late_ragged_fields_and_failed_save_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let destination = directory.path().join("reordered.csv");
+        let mut original = "ID,Name,Amount\n".to_owned();
+        original.push_str(&"1,Alpha,10\n".repeat(100));
+        original.push_str("2,Beta,20,undiscovered,tail\n3\n");
+        fs::write(&source, &original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(document.total_columns, 3);
+        document.move_column(2, 1).unwrap();
+        let order = document.columns.order.clone();
+        assert!(document.start_save().is_err());
+        assert!(!app.save_as_picker_result(None));
+        fs::write(&destination, b"keep this file").unwrap();
+        assert!(!app.save_as_picker_result(Some(destination.clone())));
+        assert_eq!(fs::read(&destination).unwrap(), b"keep this file");
+        let document = app.document.as_mut().unwrap();
+        assert_eq!(document.columns.order, order);
+        assert!(document.is_save_as_ready());
+        document.source_changed = true;
+        assert!(!document.is_save_as_ready());
+        assert!(document.start_save_as(destination.clone()).is_err());
+        document.source_changed = false;
+        fs::remove_file(&destination).unwrap();
+        document.start_save_as(destination.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while document.poll_save().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "Save As timed out");
+            std::thread::yield_now();
+        }
+        let mut expected = "ID,Amount,Name\n".to_owned();
+        expected.push_str(&"1,10,Alpha\n".repeat(100));
+        expected.push_str("2,20,Beta,undiscovered,tail\n3,,\n");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), expected);
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn structural_move_and_view_order_can_be_saved_without_cell_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let destination = directory.path().join("reordered.csv");
+        let original = b"ID,Name,Amount\n1,Alpha,10\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.document.as_mut().unwrap());
+        app.document
+            .as_mut()
+            .unwrap()
+            .start_move_columns(vec![2], 1)
+            .unwrap();
+        finish_structural_edit(&mut app);
+        let document = app.document.as_mut().unwrap();
+        assert!(document.is_dirty());
+        assert!(document.is_save_as_ready());
+        document.move_column(0, 2).unwrap();
+        document.start_save_as(destination.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while document.poll_save().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "Save As timed out");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"Amount,Name,ID\n10,Alpha,1\n"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
     }
 
     #[test]

@@ -107,7 +107,9 @@ impl PendingStorageOperation {
                 }),
             ),
             Self::Export(_) => document.session.file_size,
-            Self::DeleteRows(_) | Self::Save(_) => plain(),
+            Self::Save(Some(_)) => document
+                .materialization_storage_estimate(document.save_as_transformation().as_ref(), None),
+            Self::DeleteRows(_) | Self::Save(None) => plain(),
         }
     }
 }
@@ -594,6 +596,34 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn reordered_save_as_reserves_space_for_padding_every_ragged_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("ragged.csv");
+        let header = vec!["x"; 128].join(",");
+        let original = format!("{header}\n{}", "1\n".repeat(1000));
+        std::fs::write(&source, &original).unwrap();
+        let mut document = Document::open(
+            &source,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        document.index = Some(document.job.take().unwrap().wait().unwrap());
+        let ordinary_save_bytes = PendingStorageOperation::Save(None).allowance(&document);
+        document.move_column(127, 0).unwrap();
+        let copy = PendingStorageOperation::Save(Some(directory.path().join("copy.csv")));
+        // Each short row must gain 127 separators when projected to the known width.
+        let padded_bytes = original.len() as u64 + 127 * 1000;
+        assert!(copy.allowance(&document) >= padded_bytes);
+        assert_eq!(
+            PendingStorageOperation::Save(None).allowance(&document),
+            ordinary_save_bytes
+        );
     }
 
     #[test]
