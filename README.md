@@ -71,7 +71,7 @@ acceptance or discovery criteria. Propose a feature through
 | Edit | Direct cell and header editing; multiline values; individual edit Undo and Redo; one-level structural history; Discard Changes |
 | Duplicates | Match selected columns, review the extra-row count, then explicitly remove later occurrences; keep the first row in current order; include unsaved values; bounded memory and cancellation |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or delete the selected columns; continue editing the result before saving |
-| Sort | Text, exact Number, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
+| Sort | Text, exact Number, explicit Date / time, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
 | Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |
 
 ## Install Quarry

@@ -506,17 +506,19 @@ unchanged until **Save**.
 
 ### Sort rows
 
-Only Text, Number, Character count, and Word count use the selected column's
+Only Text, Number, Date / time, Character count, and Word count use the selected column's
 values. Shuffle and Reverse reorder all data rows and ignore the selected
 column. The current **Sort Rows…** menu still requires one selected column to
 open the window, including when choosing Shuffle or Reverse.
 
-1. Select exactly one numbered column: the column to sort by for Text, Number,
+1. Select exactly one numbered column: the column to sort by for Text, Number, Date / time,
    Character count, or Word count, or any column for Shuffle or Reverse.
 2. Right-click its number and choose **Sort Rows…**.
 3. Choose a type from **Sort as**:
    - **Text** (the default): alphabetical text order, such as `1, 10, 2`.
    - **Number**: exact numeric order, such as `1, 2, 10`.
+   - **Date / time**: chronological order using an explicit format. Choose
+     **Oldest first** or **Newest first**, then select the matching format.
    - **Character count**: shortest or longest values first, including spaces
      and embedded newlines. Counts Unicode scalar values, so a combining mark
      counts separately from its base letter. It does not count UTF-8 bytes.
@@ -525,7 +527,7 @@ open the window, including when choosing Shuffle or Reverse.
    - **Shuffle**: randomly reorder all data rows. Each use generates a fresh
      shuffle; equal-looking or duplicate rows remain separate records.
    - **Reverse**: put the last data row first and the first data row last.
-4. Use the **Direction** buttons for Text, Number, Character count, or Word count.
+4. Use the **Direction** buttons for Text, Number, Date / time, Character count, or Word count.
    Shuffle and Reverse operate on the current whole-row order and ignore the
    selected column, so they have no direction control.
 5. For Text, leave **Match case** off to ignore ASCII letter case, or turn it
@@ -575,6 +577,43 @@ percentage.
 
 The sorted grid is an unsaved working version. You can continue editing it,
 undo the sort, save it, or discard it.
+
+#### Date and time formats
+
+Choose **Date / time** in **Sort as**, then choose **Date / time format**:
+
+| Format | Example | Interpretation |
+|---|---|---|
+| YYYY-MM-DD | `2026-03-04` | March 4, 2026 |
+| MM/DD/YYYY | `03/04/2026` | March 4, 2026 |
+| DD/MM/YYYY | `03/04/2026` | April 3, 2026 |
+| YYYY-MM-DD HH:MM:SS (no timezone) | `2026-03-04 09:30:00` | Compare clock values without applying a timezone; uppercase `T` may replace the space |
+| RFC 3339 (with timezone) | `2026-03-04T09:30:00+02:00` | Compare UTC instants; uppercase `Z` means UTC |
+
+Dates require Gregorian years **0001–9999**, four year digits, and two month and
+day digits. Timestamps require two-digit hours, minutes, and seconds. They may
+include **1–9 fractional-second digits**, such as `.125` or `.000000001`.
+RFC 3339 uses uppercase `T` and `Z`, or a signed `HH:MM` offset within 23:59.
+Leap seconds, unknown offset `-00:00`, timezone names, and mixed date formats
+are unsupported. Quarry never guesses date order or uses the machine timezone.
+
+Blank, missing, or ASCII-whitespace-only cells sort first with **Oldest first**
+and last with **Newest first**. Surrounding ASCII whitespace is ignored when
+comparing; original cell spelling is preserved. Equal dates or UTC instants
+keep their relative order in either direction. Unsaved cell edits are included.
+
+A nonblank value that does not match the selected format stops the sort and
+identifies its one-based data row and column. The current document and source
+are preserved. Choose the matching format or correct the value and retry.
+
+For reproducible CLI validation, use `sort-save-as --mode date --date-format`
+with `ymd`, `mdy`, `dmy`, `datetime`, or `rfc3339`; the format is required. For
+example:
+
+```bash
+quarry sort-save-as input.csv dates.csv --column 2 --order asc \
+  --mode date --date-format mdy --header first-row
+```
 
 ### Manage the visible columns
 

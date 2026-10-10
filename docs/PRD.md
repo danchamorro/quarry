@@ -249,7 +249,7 @@ Invalid nonblank values abort with a data-row and column error before publicatio
 The existing bounded runs, guarded working copy, cancellation, and history apply
 to both modes. Text remains the default. The [1 GB numeric validation](benchmarks/2026-09-04-numeric-sort.md)
 records exact output, Text compatibility, memory, temporary disk, and
-cancellation. Date, locale-aware, and multi-column sorting are tracked in
+cancellation. Locale-aware and multi-column sorting are tracked in
 [issues #56](https://github.com/danchamorro/quarry/issues/56),
 [#63](https://github.com/danchamorro/quarry/issues/63), and
 [#64](https://github.com/danchamorro/quarry/issues/64).
@@ -261,9 +261,16 @@ UTF-8 in the selected count column aborts with row/column context. Equal counts
 remain stable. Shuffle and Reverse ignore the selected column and reorder
 whole data rows with the header fixed. They reuse guarded working copies,
 bounded merging, cancellation, and structural history. The [1 GB mode validation](benchmarks/2026-09-04-additional-sort-modes.md)
-records complete count, Shuffle, and Reverse runs. Date and time sorting
-is planned separately in Phase 6D, with explicit input formats and timezone
-semantics rather than silent date guessing.
+records complete count, Shuffle, and Reverse runs.
+
+Phase 6D adds Date / time to the same window with explicit YYYY-MM-DD,
+MM/DD/YYYY, DD/MM/YYYY, timezone-free timestamps, and an RFC 3339 subset.
+Oldest/newest order uses exact seconds and nanoseconds. Offsets compare as UTC
+instants; clock values do not inherit a machine timezone. Blank keys follow the
+numeric blank policy; invalid nonblank values stop with row/column diagnostics.
+Original text and equal-key order are retained, with existing edits, working-copy
+history, saving, and cancellation. See [ADR 0008](adr/0008-date-time-sorting.md)
+and [supported formats](USER_GUIDE.md#date-and-time-formats).
 
 ## Version 0.4: desktop packaging and workflow polish (complete)
 

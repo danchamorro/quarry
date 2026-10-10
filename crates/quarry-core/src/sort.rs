@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use quarry_delimited::{RecordScanner, parse_record};
 
+use crate::date_time_sort::date_time_key;
 use crate::estimate_edited_output_bytes;
 use crate::export::{ExportTarget, PrivatePublication, source_matches_stamp};
 use crate::storage::{
@@ -21,7 +22,7 @@ use crate::storage::{
     storage_error,
 };
 use crate::{
-    CaseSensitivity, CompletedIndex, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK,
+    CaseSensitivity, CompletedIndex, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, DateTimeFormat,
     FilterExportOutcome, IndexConfig, QuarryError, Session, SourceStamp, StructuralIndex,
 };
 
@@ -51,6 +52,7 @@ pub enum SortDirection {
 pub enum SortMode {
     Text,
     Number,
+    DateTime { format: DateTimeFormat },
     CharacterCount,
     WordCount,
     Shuffle { seed: u64 },
@@ -82,6 +84,9 @@ impl SortSpec {
     /// equal values share a key, and blank numeric fields have an empty key.
     /// Numbers accept ASCII whitespace, a sign, a decimal point, and an optional
     /// exponent from -1,000,000 to 1,000,000. Other nonblank values return an error.
+    /// Date/time keys require the chosen fixed format, compare clock values or
+    /// offset-normalized instants, and give blank fields an empty key. Invalid
+    /// nonblank values return an error; source spelling is never changed.
     /// Character counts use Unicode scalar values, including combining marks;
     /// word counts split at Unicode whitespace. `ordinal` is the zero-based source
     /// data-row position and determines Shuffle and Reverse keys.
@@ -95,6 +100,7 @@ impl SortSpec {
                 Ok(key)
             }
             SortMode::Number => numeric_key(value),
+            SortMode::DateTime { format } => date_time_key(value, format),
             SortMode::CharacterCount | SortMode::WordCount => {
                 let value = std::str::from_utf8(value)
                     .map_err(|_| invalid_sort_output("expected valid UTF-8 text"))?;
@@ -1123,6 +1129,15 @@ impl<'a> InitialRunBuilder<'a> {
                         SortMode::Number => QuarryError::InvalidNumericSortValue {
                             data_row: self.rows.saturating_add(1),
                             column: spec.column.saturating_add(1),
+                        },
+                        SortMode::DateTime { format } => QuarryError::InvalidDateTimeSortValue {
+                            data_row: self.rows.saturating_add(1),
+                            column: spec.column.saturating_add(1),
+                            format,
+                            reason: match error {
+                                QuarryError::InvalidOption(reason) => reason,
+                                _ => "value does not match the selected date/time format",
+                            },
                         },
                         SortMode::CharacterCount | SortMode::WordCount => {
                             QuarryError::InvalidUtf8SortValue {
@@ -2385,6 +2400,112 @@ mod tests {
             assert_eq!(fs::read(&source).unwrap(), source_bytes);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn date_time_sort_spills_preserves_whole_rows_edits_and_equal_instants() {
+        let directory = case();
+        let source = directory.join("dates.csv");
+        let rows = [
+            "a,2027-01-01T00:00:00Z,edited\n",
+            "b,2026-03-04T09:30:00+02:00,\"猫,one\"\n",
+            "c,2026-03-04T07:30:00.000000000Z,\"line\n two\"\n",
+            "d,2026-03-04T07:30:00.000000001Z,later\n",
+            "e,,blank\n",
+            "f\n",
+        ];
+        let original = format!("id,time,note\n{}", rows.concat());
+        fs::write(&source, &original).unwrap();
+        let source_session = session(&source, HeaderMode::FirstRow);
+        for (direction, order) in [
+            (SortDirection::Ascending, "efabcd"),
+            (SortDirection::Descending, "dbcaef"),
+        ] {
+            let destination = directory.join(format!("{direction:?}.csv"));
+            let job = start_custom(
+                &source_session,
+                BTreeMap::from([(1, b"when".to_vec())]),
+                BTreeMap::from([((1, 1), b"2025-01-01T00:00:00Z".to_vec())]),
+                SortSpec {
+                    mode: SortMode::DateTime {
+                        format: DateTimeFormat::Rfc3339,
+                    },
+                    ..number_spec(direction)
+                },
+                &destination,
+                SortConfig {
+                    run_memory_bytes: 1,
+                    ..tiny_config()
+                },
+            );
+            wait_done(&job);
+            let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("cancelled");
+            };
+            let expected = format!(
+                "id,when,note\n{}",
+                order
+                    .bytes()
+                    .map(|id| {
+                        if id == b'a' {
+                            "a,2025-01-01T00:00:00Z,edited\n"
+                        } else {
+                            rows[(id - b'a') as usize]
+                        }
+                    })
+                    .collect::<String>()
+            );
+            assert_eq!(fs::read(&destination).unwrap(), expected.as_bytes());
+            assert!(summary.merge_passes > 2);
+            assert!(summary.stable_ties_verified && summary.record_multiset_verified);
+            assert!(sort_artifacts(&directory).is_empty());
+        }
+        assert_eq!(fs::read(&source).unwrap(), original.as_bytes());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_date_after_spilling_reports_coordinates_and_preserves_source() {
+        let directory = case();
+        let source = directory.join("dates.csv");
+        let destination = directory.join("sorted.csv");
+        let original = b"id,time\na,2000-02-29\nb,2026-03-04\nc,1900-02-29\n";
+        fs::write(&source, original).unwrap();
+        let job = start_custom(
+            &session(&source, HeaderMode::FirstRow),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            SortSpec {
+                mode: SortMode::DateTime {
+                    format: DateTimeFormat::YearMonthDay,
+                },
+                ..number_spec(SortDirection::Ascending)
+            },
+            &destination,
+            SortConfig {
+                run_memory_bytes: 1,
+                ..tiny_config()
+            },
+        );
+        wait_done(&job);
+        assert!(job.progress().runs_created > 0);
+        let error = job.error().unwrap();
+        assert!(
+            error.contains("data row 3, column 2 using YYYY-MM-DD"),
+            "{error}"
+        );
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::InvalidDateTimeSortValue {
+                data_row: 3,
+                column: 2,
+                ..
+            })
+        ));
+        assert!(!destination.exists());
+        assert!(sort_artifacts(&directory).is_empty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

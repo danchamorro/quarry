@@ -1,5 +1,6 @@
 mod case;
 mod combine;
+mod date_time_sort;
 mod export;
 mod filter;
 mod index;
@@ -25,6 +26,7 @@ pub use combine::{
     CombineInput, CombineJob, CombineOptions, CombinePlan, CombineProgress, CombineSummary,
     check_combine_files,
 };
+pub use date_time_sort::DateTimeFormat;
 pub use export::{
     ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress,
     FilterExportSummary, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob,
@@ -110,6 +112,12 @@ pub enum QuarryError {
         data_row: u64,
         column: usize,
     },
+    InvalidDateTimeSortValue {
+        data_row: u64,
+        column: usize,
+        format: DateTimeFormat,
+        reason: &'static str,
+    },
     InvalidFilter {
         rule: usize,
         reason: &'static str,
@@ -179,6 +187,16 @@ impl fmt::Display for QuarryError {
             Self::InvalidUtf8SortValue { data_row, column } => write!(
                 f,
                 "Cannot count text at data row {data_row}, column {column}: expected valid UTF-8 text."
+            ),
+            Self::InvalidDateTimeSortValue {
+                data_row,
+                column,
+                format,
+                reason,
+            } => write!(
+                f,
+                "Cannot sort as Date / time at data row {data_row}, column {column} using {}: {reason}. Choose the matching format or correct the value. The current document is preserved.",
+                format.label()
             ),
             Self::InvalidFilter { rule, reason } => {
                 write!(f, "invalid filter rule {rule}: {reason}")

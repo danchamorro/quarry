@@ -335,6 +335,17 @@ active `Document`, so its edits and history are preserved. See
 
 ## Sorting
 
+Date/time sorting uses explicit fixed formats and compact 12-byte chronological
+keys: signed whole seconds (with a sign flip for byte ordering) followed by
+nanoseconds. Gregorian calendar validation accepts years 0001–9999. Date-only
+and timezone-free timestamps use clock values; RFC 3339 offsets normalize to
+UTC without consulting locale or the machine timezone. Blank keys are empty.
+Invalid values produce a format-specific data-row/column error before private
+publication. Equal keys retain source ordinals in both directions. The existing
+external run/merge budgets, source guards, progress, cancellation, storage review,
+completed-index handoff, and structural history apply unchanged. Original cell
+spelling is preserved. See [the date/time decision](adr/0008-date-time-sorting.md).
+
 Quarry sorts data rows by exactly one selected numbered column using stable,
 ASCII case-insensitive text ordering by default. The Sort tool's **Match case**
 setting switches key comparison to raw bytes. **Number** instead builds exact,
