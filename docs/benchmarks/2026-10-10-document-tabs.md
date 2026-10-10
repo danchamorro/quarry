@@ -19,6 +19,7 @@ Host and guest ZIP checksums matched. Each launched bundle reported clean source
 | 148 | `31bec964c118de3c5e4f7a3665e8170e64bc221b` | `4c3c6aef202ff170d864177991ace9c4e6145f54af75a0419864d937120c448f` | Resize regression fixed; large files, concurrent file operations, cancellation and resource sampling |
 | 149 | `d80e7fd9f73e7feee7f5f199fdc1e210fb981d40` | `5a7b0e1953ae75e295535ff312d0247bba1f6f76bf9a24be732ea3a14caf997b` | Background save/reload failure recovery; other tab's edits and history retained |
 | 151 | `e3e03aef14e70fe106c559eaef618be8b6fa736b` | `e34d8df0044e36806a2142074b035d48aa0ab5d29fe1dc3b9d204dd374cd30d6` | Active save/reload failure selects retained work; deferred split review respects concurrent-worker capacity |
+| 153 | `0240d82f78a609bb59cdb32bdeca4cd0d527951a` | `5a317acec9f5fa1a69d76415d13b3ec84d268c4876cce7dbc027c3bd97824f47` | Native quit preserves idle Combine Files selections, running checks, and a combined-file write |
 
 Each build actually launched and rendered its test documents. Documentation-only
 commits after these builds do not change the tested executable code.
@@ -134,6 +135,28 @@ header field replaced:
 |---|---:|---|
 | `SecondDeferredID` | 10,395,000,164 | `c4a42ab53d9e8eaf9193b66388911ede5910ffcf2642a3749b525d542904ff86` |
 | `ActiveRecoveryID` | 10,395,000,164 | `ae06951e27dc0ea69cbe5f81875539352cf9f1dd793e6799cb7375548b62dde1` |
+
+## Quit with Combine Files open
+
+Review found that native quit previously cancelled an active Combine Files job or
+removed an idle dialog before any document quit approval. Build 153 blocks quit
+while the dialog is open and explains that it must be closed explicitly. It keeps
+file selections, format choices, checked plans, results and running operations.
+
+In the native VM test, B retained an unsaved `QuitRetained` header. Command-Q kept
+an idle Combine Files selection available and displayed **Close Combine Files
+before quitting Quarry**. The dialog then checked two synthetic 10 GB files;
+another Command-Q left the check running, and it completed with the same two
+files, three columns and 110,000,018 data rows. A subsequent combined-file write
+continued after Command-Q at 5% progress and published 20,790,000,285 bytes.
+The completed result and close explanation remained visible. Explicitly closing
+the dialog then allowed document quit review; Keep Editing retained B's edit and
+Undo/Redo. Only the created synthetic edit was discarded to end the session.
+
+Both original inputs again matched their SHA-256. An independent streaming
+oracle concatenated the first input and the second input after its first header;
+the entire output matched at SHA-256
+`73fcdfb39b33f56896b0ac6d9c9cb4d834a7c7e4e571854662392ef4c7666b58`.
 
 ## Deterministic and CI validation
 
