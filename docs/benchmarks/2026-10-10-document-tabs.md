@@ -185,16 +185,32 @@ second tab retained `CaseRetainedB`, its original path, and Undo/Redo. The
 before-publication condition is asserted by the regression above; the native
 test verifies the picker, guard, and retained document state.
 
+## Opening a materialized working file
+
+Review found that opening the current working file from a tab's temporary storage
+could create a second tab sharing that file's lifetime. Duplicate opening now
+checks both the logical source and the current session path, selecting the owner.
+The regression materializes a reverse-row edit, switches to another modified
+document, opens both the working path and a hard-link alias, and confirms that
+both requests select the existing owner without adding a tab. Discarding and
+closing that owner then removes its temporary file while the other document
+retains its source, edit, and Undo history. The original source remains unchanged.
+
+This regression passed locally and in VMPal. The guest test executable's signature
+verified and its SHA-256 was
+`de14febef6bc89a4733342a7215bfd5992fe5b5d5c228f67922ac6bf63c8a418`.
+
 ## Deterministic and CI validation
 
-Formatting, strict workspace Clippy, 354 workspace tests (including 146 egui
+Formatting, strict workspace Clippy, 355 workspace tests (including 147 egui
 tests), and release workspace builds passed locally. Regression coverage includes
 per-tab drafts/selection/history, live independent filters, background save and
 structural completion ownership, temporary-file cleanup, duplicate hard links,
 reserved destinations, the two-operation limit, quit cancellation, text cursor
 state, accessible keyboard interaction, compact visibility, and failed background
 reload recovery, active-tab recovery, deferred-operation capacity checks, and
-pending output aliases under both macOS volume case rules.
+pending output aliases under both macOS volume case rules, and working-file
+duplicate ownership and cleanup.
 Multi-file drag-and-drop input is exercised by deterministic egui interaction
 tests; native multi-file opening used Finder events and command-line
 paths. The PR's latest commit must also pass required CI and CodeRabbit review

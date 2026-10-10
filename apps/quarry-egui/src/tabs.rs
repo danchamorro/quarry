@@ -374,7 +374,9 @@ impl QuarryApp {
         let existing = self.document_tabs().find_map(|tab| {
             tab.document
                 .as_ref()
-                .filter(|doc| paths_alias(&path, &doc.logical_path))
+                .filter(|doc| {
+                    paths_alias(&path, &doc.logical_path) || paths_alias(&path, doc.session.path())
+                })
                 .map(|_| tab.id)
         });
         if let Some(id) = existing {
@@ -1147,6 +1149,65 @@ mod tests {
         );
         assert_eq!(app.active.id, before);
         assert!(app.active.document.as_ref().unwrap().can_undo());
+    }
+
+    #[test]
+    fn opening_a_materialized_working_file_selects_its_owner_without_sharing_its_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = fixture(directory.path(), "a.csv");
+        let b = fixture(directory.path(), "b.csv");
+        let original = fs::read(&a).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
+        let a_id = app.active.id;
+        poll_until_idle(&mut app, &ctx);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_sort_rows(
+                0,
+                SortDirection::Ascending,
+                SortMode::Reverse,
+                CaseSensitivity::Insensitive,
+            )
+            .unwrap();
+        poll_until_idle(&mut app, &ctx);
+        let working = app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .path()
+            .to_path_buf();
+        assert_ne!(working, a);
+        assert!(working.exists());
+        let alias = directory.path().join("working-alias.csv");
+        fs::hard_link(&working, &alias).unwrap();
+        app.open_new_path(b.clone()).unwrap();
+        let b_id = app.active.id;
+        edited(&mut app, "retained-b");
+        for path in [working.clone(), alias] {
+            app.open_new_path(path).unwrap();
+            assert_eq!(app.active.id, a_id);
+            assert_eq!(app.document_tabs().count(), 2);
+            let document = app.active.document.as_ref().unwrap();
+            assert_eq!(document.logical_path, a);
+            assert!(document.is_dirty());
+            assert!(document.can_undo());
+            app.switch_tab(&ctx, b_id);
+        }
+        app.switch_tab(&ctx, a_id);
+        app.discard_and_close(&ctx);
+        assert!(!working.exists());
+        assert!(app.tabs.is_empty());
+        assert_eq!(app.active.id, b_id);
+        let retained = app.active.document.as_ref().unwrap();
+        assert_eq!(retained.logical_path, b);
+        assert_eq!(retained.column_name(0), "retained-b");
+        assert!(retained.can_undo());
+        assert_eq!(fs::read(a).unwrap(), original);
     }
 
     #[test]
