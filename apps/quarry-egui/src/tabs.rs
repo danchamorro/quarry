@@ -157,7 +157,9 @@ pub(super) fn paths_alias(left: &Path, right: &Path) -> bool {
                 .join(path.file_name().unwrap_or_default())
         })
     }
-    if normalized(left) == normalized(right) {
+    let left_normalized = normalized(left);
+    let right_normalized = normalized(right);
+    if left_normalized == right_normalized {
         return true;
     }
     #[cfg(unix)]
@@ -167,7 +169,103 @@ pub(super) fn paths_alias(left: &Path, right: &Path) -> bool {
             return left.dev() == right.dev() && left.ino() == right.ino();
         }
     }
+    #[cfg(target_os = "macos")]
+    if left_normalized.parent() == right_normalized.parent()
+        && let (Some(parent), Some(left), Some(right)) = (
+            left_normalized.parent(),
+            left_normalized.file_name(),
+            right_normalized.file_name(),
+        )
+    {
+        // Existing file identities above remain authoritative. Pending outputs
+        // need the target volume's comparison rules before either file exists.
+        return macos_names_alias(
+            left,
+            right,
+            macos_volume_case_sensitive(parent).unwrap_or(false),
+        );
+    }
     false
+}
+
+/// Reads the target volume's case-sensitivity capability without creating files.
+#[cfg(target_os = "macos")]
+fn macos_volume_case_sensitive(parent: &Path) -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let parent = std::ffi::CString::new(parent.as_os_str().as_bytes()).ok()?;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: CString supplies a terminated path and statfs writes the complete
+    // correctly sized output on success. No uninitialized output is read on failure.
+    if unsafe { libc::statfs(parent.as_ptr(), filesystem.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statfs succeeded and initialized its output, including the mount path.
+    let filesystem = unsafe { filesystem.assume_init() };
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    #[repr(C)]
+    struct VolumeAttributes {
+        length: u32,
+        capabilities: libc::vol_capabilities_attr_t,
+    }
+    let mut output = VolumeAttributes {
+        length: 0,
+        capabilities: libc::vol_capabilities_attr_t {
+            capabilities: [0; 4],
+            valid: [0; 4],
+        },
+    };
+    // SAFETY: statfs returned a terminated mount path. The C-layout buffer has
+    // a length prefix and exactly the requested volume-capabilities attribute.
+    let status = unsafe {
+        libc::getattrlist(
+            filesystem.f_mntonname.as_ptr(),
+            (&mut attributes as *mut libc::attrlist).cast(),
+            (&mut output as *mut VolumeAttributes).cast(),
+            std::mem::size_of::<VolumeAttributes>(),
+            0,
+        )
+    };
+    let format = libc::VOL_CAPABILITIES_FORMAT;
+    let sensitive = libc::VOL_CAP_FMT_CASE_SENSITIVE;
+    if status != 0
+        || output.length as usize != std::mem::size_of::<VolumeAttributes>()
+        || output.capabilities.valid[format] & sensitive == 0
+    {
+        return None;
+    }
+    Some(output.capabilities.capabilities[format] & sensitive != 0)
+}
+
+/// Compares native names with canonical Unicode equivalence and the volume's case rule.
+#[cfg(target_os = "macos")]
+fn macos_names_alias(
+    left: &std::ffi::OsStr,
+    right: &std::ffi::OsStr,
+    case_sensitive: bool,
+) -> bool {
+    use objc2_foundation::{NSComparisonResult, NSString, NSStringCompareOptions};
+    use std::os::unix::ffi::OsStrExt;
+    match (left.to_str(), right.to_str()) {
+        (Some(left), Some(right)) => {
+            let options = if case_sensitive {
+                NSStringCompareOptions::empty()
+            } else {
+                NSStringCompareOptions::CaseInsensitiveSearch
+            };
+            NSString::from_str(left).compare_options(&NSString::from_str(right), options)
+                == NSComparisonResult::Same
+        }
+        _ if case_sensitive => left == right,
+        _ => left.as_bytes().eq_ignore_ascii_case(right.as_bytes()),
+    }
 }
 
 impl QuarryApp {
@@ -804,6 +902,81 @@ mod tests {
         app.switch_tab(&ctx, a_id);
         assert_eq!(app.active.document.as_ref().unwrap().logical_path, saved);
         assert!(!app.active.document.as_ref().unwrap().is_dirty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pending_destinations_follow_volume_case_rules_and_unicode_equivalence() {
+        use std::ffi::OsStr;
+        let directory = tempfile::tempdir().unwrap();
+        let sensitive = macos_volume_case_sensitive(directory.path()).unwrap();
+        // Check the capability against actual filesystem behavior, independently
+        // of the name comparison used for still-nonexistent reservations below.
+        let probe = directory.path().join("case-probe.csv");
+        let upper_probe = directory.path().join("CASE-PROBE.csv");
+        fs::write(&probe, b"lower").unwrap();
+        fs::write(&upper_probe, b"upper").unwrap();
+        assert_eq!(
+            fs::read(&probe).unwrap(),
+            if sensitive { b"lower" } else { b"upper" }
+        );
+        assert_eq!(paths_alias(&probe, &upper_probe), !sensitive);
+        eprintln!("volume case-sensitive: {sensitive}; test directory: {directory:?}");
+        let output = directory.path().join("out.csv");
+        let upper = directory.path().join("OUT.csv");
+        assert!(!output.exists());
+        assert!(!upper.exists());
+        assert_eq!(paths_alias(&output, &upper), !sensitive);
+        assert!(paths_alias(
+            &directory.path().join("caf\u{e9}.csv"),
+            &directory.path().join("cafe\u{301}.csv")
+        ));
+        assert!(!paths_alias(
+            &output,
+            &directory.path().join("different.csv")
+        ));
+        assert!(!macos_names_alias(
+            OsStr::new("out.csv"),
+            OsStr::new("OUT.csv"),
+            true
+        ));
+        assert!(macos_names_alias(
+            OsStr::new("out.csv"),
+            OsStr::new("OUT.csv"),
+            false
+        ));
+        assert!(macos_names_alias(
+            OsStr::new("CAF\u{c9}.csv"),
+            OsStr::new("cafe\u{301}.CSV"),
+            false
+        ));
+        assert!(!macos_names_alias(
+            OsStr::new("caf\u{e9}.csv"),
+            OsStr::new("cafe.csv"),
+            false
+        ));
+
+        let a = fixture(directory.path(), "a.csv");
+        let b = fixture(directory.path(), "b.csv");
+        let mut app = QuarryApp::new(Some(a), Instant::now());
+        // Reserve a still-nonexistent output, as a writer does before publication.
+        app.active.write_destination = Some(output.clone());
+        app.open_new_path(b).unwrap();
+        edited(&mut app, "retained-b");
+        assert_eq!(app.destination_available(&upper), sensitive);
+        if !sensitive {
+            assert!(!app.save_as_picker_result(Some(upper.clone())));
+            assert!(
+                app.active
+                    .notice
+                    .as_ref()
+                    .unwrap()
+                    .contains("being written")
+            );
+            assert!(app.active.document.as_ref().unwrap().save_job.is_none());
+            assert!(!output.exists());
+            assert!(!upper.exists());
+        }
     }
 
     #[test]

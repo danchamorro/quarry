@@ -28,6 +28,10 @@ its edits or format. Reload and format reopening remain explicit replacement
 operations with unsaved-change and active-operation guards. Save As moves only its
 own tab to the saved copy. Destinations belonging to another open tab or an active
 writer are rejected, including hard links and normalized new destinations.
+On macOS, pending output names also use the target volume's case-sensitivity
+capability and canonical Unicode equivalence. Existing file identities remain
+authoritative; an unavailable volume capability conservatively rejects names
+that differ only by case.
 
 Closing a tab prompts for its unsaved edits and waits visibly for active file
 operations, with Keep Editing and cancellation controls. Quit reviews every tab.
