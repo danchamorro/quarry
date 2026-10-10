@@ -521,37 +521,45 @@ mod tests {
     }
 
     #[test]
-    fn combines_ten_files_in_selected_order_without_losing_duplicates_or_quoting() {
-        let dir = tempfile::tempdir().unwrap();
-        let records = [b"ID,Name\r\n1,\"line one\nline two\"".as_slice(); 10];
-        let paths = inputs(dir.path(), &records);
-        let before = paths
-            .iter()
-            .map(fs::read)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let plan = plan(paths.clone(), true).unwrap();
-        assert_eq!(plan.inputs.len(), 10);
-        assert_eq!(plan.data_rows, 10);
-        assert_eq!(plan.columns, 2);
-        let expected = [
-            b"ID,Name\r\n".as_slice(),
-            b"1,\"line one\nline two\"\n".repeat(10).as_slice(),
-        ]
-        .concat();
-        assert_eq!(plan.output_bytes, expected.len() as u64);
-        let destination = dir.path().join("combined.csv");
-        let summary = plan
-            .start_write(destination.clone())
-            .unwrap()
-            .wait()
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary.data_rows, 10);
-        assert_eq!(summary.bytes_written, expected.len() as u64);
-        assert_eq!(fs::read(destination).unwrap(), expected);
-        for (path, bytes) in paths.iter().zip(before) {
-            assert_eq!(fs::read(path).unwrap(), bytes);
+    fn combines_varied_file_counts_in_selected_order_with_duplicates_and_quoting() {
+        for count in [2, 5, 10] {
+            let dir = tempfile::tempdir().unwrap();
+            let records = (0..count)
+                .map(|i| format!("ID,Name\r\n{},\"line one\nline two\"", i / 2).into_bytes())
+                .collect::<Vec<_>>();
+            let mut paths = inputs(
+                dir.path(),
+                &records.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            );
+            paths.reverse();
+            let before = paths
+                .iter()
+                .map(fs::read)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let plan = plan(paths.clone(), true).unwrap();
+            assert_eq!(plan.inputs.len(), count);
+            assert_eq!(plan.data_rows, count as u64);
+            assert_eq!(plan.columns, 2);
+            let mut expected = b"ID,Name\r\n".to_vec();
+            for i in (0..count).rev() {
+                expected
+                    .extend_from_slice(format!("{},\"line one\nline two\"\n", i / 2).as_bytes());
+            }
+            assert_eq!(plan.output_bytes, expected.len() as u64);
+            let destination = dir.path().join("combined.csv");
+            let summary = plan
+                .start_write(destination.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert_eq!(summary.data_rows, count as u64);
+            assert_eq!(summary.bytes_written, expected.len() as u64);
+            assert_eq!(fs::read(destination).unwrap(), expected);
+            for (path, bytes) in paths.iter().zip(before) {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
         }
     }
 
