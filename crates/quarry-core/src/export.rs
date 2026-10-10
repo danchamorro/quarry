@@ -988,11 +988,16 @@ enum SaveTarget {
     },
 }
 
-/// Blank rows inserted before a zero-based source record (the header is excluded).
+/// Blank rows inserted at a boundary in zero-based physical source records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowInsertion {
+    /// Includes the header: use 1 before the first data row with a header,
+    /// or 0 without a header. Use the total source record count to append.
+    /// Position 0 is rejected for files with a header, preserving that header.
     pub position: u64,
+    /// Positive number of blank data rows to insert.
     pub count: u64,
+    /// Number of fields in each inserted blank row.
     pub width: usize,
 }
 
@@ -2643,9 +2648,17 @@ fn run_save_as(
             ));
         }
     }
+    // Row insertion counts records to validate its boundary, but untouched
+    // records stream verbatim. Reserve whole-source reserialization only for
+    // transformations and replacement, matching the desktop storage preflight.
+    let serialized_records = if edits.transformation.is_some() || edits.replacement.is_some() {
+        records
+    } else {
+        0
+    };
     let required = estimate_edited_output_bytes(
         shared.total_bytes,
-        records,
+        serialized_records,
         &edits.headers,
         &edits.cells,
         edits
@@ -7880,6 +7893,10 @@ mod tests {
             fs::metadata(&source).unwrap().len()
         );
         assert!(progress.bytes_written > 100);
+        assert_eq!(
+            progress.estimated_output_bytes,
+            fs::metadata(&source).unwrap().len() + 3 + 100 * 3 + 5
+        );
         assert!(progress.estimated_output_bytes >= progress.bytes_written);
         assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
         fs::remove_dir_all(source.parent().unwrap()).unwrap();

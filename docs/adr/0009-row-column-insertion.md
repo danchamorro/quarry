@@ -65,3 +65,11 @@ endings. Temporary disk grows with output size, while memory grows with record
 size and schema width. History remains bounded to one adjacent whole-file change.
 Native checks and representative resource measurements are recorded in
 [the insertion validation report](../benchmarks/2026-10-10-row-column-insertion.md).
+
+The public core RowInsertion.position is a zero-based physical record boundary,
+including the header: 1 inserts before the first data row with a header, 0 does
+so without a header, and the total source record count appends. The desktop
+converts its one-based data-row control to this coordinate system. The count
+pass validates that boundary; only transformations or replacement pass the full
+record count into the storage estimator. Row insertion uses the same sparse-edit
+allowance as desktop preflight, plus its blank-row allowance.
