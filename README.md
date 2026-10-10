@@ -71,7 +71,7 @@ acceptance or discovery criteria. Propose a feature through
 | Edit | Direct cell and header editing; multiline values; individual edit Undo and Redo; one-level structural history; Discard Changes |
 | Duplicates | Match selected columns, review the extra-row count, then explicitly remove later occurrences; keep the first row in current order; include unsaved values; bounded memory and cancellation |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or delete the selected columns; continue editing the result before saving |
-| Sort | Text, exact Number, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
+| Sort | Text, exact Number, explicit Date / time, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
 | Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |
 
 ## Install Quarry
@@ -196,7 +196,7 @@ The 50 GB sort still proves completion and correctness, but its timing predates
 the adaptive merge optimization and is not a current throughput estimate.
 
 The historical sorting results in this section measure Text mode. Number,
-Character count, Word count, Shuffle, and Reverse have separate 1 GB validations
+Date / time, Character count, Word count, Shuffle, and Reverse have separate 1 GB validations
 linked below.
 Numeric filters and their exported results also have a separate 1 GB validation.
 
@@ -214,6 +214,7 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - [Original deterministic stable Sort validation](docs/benchmarks/2026-08-21-stable-text-sort.md)
 - [August 23 12 GB `FIRSTNAME` sort optimization](docs/benchmarks/2026-08-23-12gb-sort-performance.md)
 - [1 GB exact numeric sorting validation](docs/benchmarks/2026-09-04-numeric-sort.md)
+- [Date and time sorting validation in VMPal](docs/benchmarks/2026-10-10-date-time-sorting.md)
 - [1 GB exact numeric filtering and export validation](docs/benchmarks/2026-09-05-numeric-filters.md)
 - [1 GB duplicate matching and removal validation](docs/benchmarks/2026-09-05-find-remove-duplicates.md)
 - [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)

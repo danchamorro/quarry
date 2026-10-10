@@ -8,10 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, CompletedIndex, Dialect, DuplicateJob, DuplicateOutcome,
-    DuplicateSpec, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex,
-    FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery,
-    HeaderMode, IndexConfig, IndexJob, IndexProgress, LiteralReplacement,
+    CaseSensitivity, ColumnTransformation, CompletedIndex, DateTimeFormat, Dialect, DuplicateJob,
+    DuplicateOutcome, DuplicateSpec, FilterExportJob, FilterExportOutcome, FilterExportProgress,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
+    FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress, LiteralReplacement,
     MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob,
     SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
     Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
@@ -89,7 +89,8 @@ fn print_help() {
          [--output-header NAME]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry sort-save-as <SOURCE> <DESTINATION> [--column N] \
-         [--order asc|desc] [--mode text|number|characters|words|shuffle|reverse] \
+         [--order asc|desc] [--mode text|number|date|characters|words|shuffle|reverse] \
+         [--date-format ymd|mdy|dmy|datetime|rfc3339] \
          [--seed N] [--delimiter ,] [--header auto|first-row|none] \
          [--temp-dir DIRECTORY] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
@@ -105,7 +106,8 @@ fn print_help() {
          Temporary runs use --temp-dir when set; final output staging stays beside its destination.\n\
          Filters: between includes both bounds and requires --upper-bound (or UPPER after --and).\n\
          Numeric values accept signed decimals and scientific notation; blank or invalid cells do not match.\n\
-         Sort: --column and --order are required for text, number, characters, and words.\n\
+         Sort: --column and --order are required for text, number, date, characters, and words.\n\
+         Date sorting requires --date-format; no locale or timezone guessing.\n\
          Shuffle and reverse reorder all data rows; --seed repeats a shuffle within the same build."
     );
 }
@@ -1327,6 +1329,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut column = None;
     let mut direction = None;
     let mut mode = SortMode::Text;
+    let mut date_format = None;
     let mut shuffle_seed = None;
     let mut delimiter = None;
     let mut header_mode = HeaderMode::Auto;
@@ -1341,19 +1344,35 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
                 direction = Some(parse_sort_direction(value(&args, &mut cursor, "--order")?)?)
             }
             "--mode" => {
-                mode =
-                    match value(&args, &mut cursor, "--mode")? {
-                        "text" => SortMode::Text,
-                        "number" => SortMode::Number,
-                        "characters" => SortMode::CharacterCount,
-                        "words" => SortMode::WordCount,
-                        "shuffle" => SortMode::Shuffle { seed: 0 },
-                        "reverse" => SortMode::Reverse,
-                        _ => return Err(
-                            "--mode must be text, number, characters, words, shuffle, or reverse"
-                                .into(),
-                        ),
-                    };
+                mode = match value(&args, &mut cursor, "--mode")? {
+                    "text" => SortMode::Text,
+                    "number" => SortMode::Number,
+                    "date" => SortMode::DateTime {
+                        format: DateTimeFormat::YearMonthDay,
+                    },
+                    "characters" => SortMode::CharacterCount,
+                    "words" => SortMode::WordCount,
+                    "shuffle" => SortMode::Shuffle { seed: 0 },
+                    "reverse" => SortMode::Reverse,
+                    _ => return Err(
+                        "--mode must be text, number, date, characters, words, shuffle, or reverse"
+                            .into(),
+                    ),
+                };
+            }
+            "--date-format" => {
+                date_format = Some(match value(&args, &mut cursor, "--date-format")? {
+                    "ymd" => DateTimeFormat::YearMonthDay,
+                    "mdy" => DateTimeFormat::MonthDayYear,
+                    "dmy" => DateTimeFormat::DayMonthYear,
+                    "datetime" => DateTimeFormat::DateTime,
+                    "rfc3339" => DateTimeFormat::Rfc3339,
+                    _ => {
+                        return Err(
+                            "--date-format must be ymd, mdy, dmy, datetime, or rfc3339".into()
+                        );
+                    }
+                });
             }
             "--seed" => shuffle_seed = Some(value(&args, &mut cursor, "--seed")?.parse::<u64>()?),
             "--delimiter" => {
@@ -1385,6 +1404,11 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
 
     let source = source.ok_or("sort-save-as requires a source file path")?;
     let destination = destination.ok_or("sort-save-as requires a destination file path")?;
+    if let SortMode::DateTime { format } = &mut mode {
+        *format = date_format.ok_or("--mode date requires --date-format")?;
+    } else if date_format.is_some() {
+        return Err("--date-format is only supported with --mode date".into());
+    }
     let column = if mode.uses_column() {
         column.ok_or("sort-save-as requires --column")?
     } else {
@@ -1563,6 +1587,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         match mode {
             SortMode::Text => "text",
             SortMode::Number => "number",
+            SortMode::DateTime { .. } => "date",
             SortMode::CharacterCount => "characters",
             SortMode::WordCount => "words",
             SortMode::Shuffle { .. } => "shuffle",
@@ -1580,6 +1605,9 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     }
     if let SortMode::Shuffle { seed } = mode {
         println!("Shuffle seed: {seed}");
+    }
+    if let SortMode::DateTime { format } = mode {
+        println!("Date/time format: {}", format.cli_name());
     }
     println!(
         "Estimated temporary disk: {} ({} bytes)",
@@ -4843,7 +4871,7 @@ mod tests {
             (vec![], "sort-save-as requires a source file path"),
             (
                 vec!["source.csv", "sorted.csv", "--mode", "numeric"],
-                "--mode must be text, number, characters, words, shuffle, or reverse",
+                "--mode must be text, number, date, characters, words, shuffle, or reverse",
             ),
             (
                 vec!["source.csv"],
@@ -5168,6 +5196,65 @@ mod tests {
                 order.into(),
                 "--mode".into(),
                 "number".into(),
+                "--header".into(),
+                "first-row".into(),
+            ])
+            .unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), expected.as_bytes());
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn date_sort_command_requires_format_and_preserves_instants_ties_and_source() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "quarry-date-sort-command-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let original = b"time,id\n2026-01-01T01:00:00+02:00,a\n2025-12-31T23:00:00Z,b\n2025-12-31T22:59:59.999999999Z,c\n,d\n";
+        fs::write(&source, original).unwrap();
+        for args in [
+            vec!["--mode", "date"],
+            vec!["--date-format", "ymd"],
+            vec!["--mode", "date", "--date-format", "auto"],
+        ] {
+            let mut arguments = vec![
+                source.to_string_lossy().into_owned(),
+                directory.join("invalid.csv").to_string_lossy().into_owned(),
+            ];
+            arguments.extend(args.into_iter().map(str::to_owned));
+            assert!(sort_save_as_command(arguments).is_err());
+            assert!(!directory.join("invalid.csv").exists());
+        }
+        for (order, expected) in [
+            (
+                "asc",
+                "time,id\n,d\n2025-12-31T22:59:59.999999999Z,c\n2026-01-01T01:00:00+02:00,a\n2025-12-31T23:00:00Z,b\n",
+            ),
+            (
+                "desc",
+                "time,id\n2026-01-01T01:00:00+02:00,a\n2025-12-31T23:00:00Z,b\n2025-12-31T22:59:59.999999999Z,c\n,d\n",
+            ),
+        ] {
+            let destination = directory.join(format!("{order}.csv"));
+            sort_save_as_command(vec![
+                source.to_string_lossy().into_owned(),
+                destination.to_string_lossy().into_owned(),
+                "--column".into(),
+                "1".into(),
+                "--order".into(),
+                order.into(),
+                "--mode".into(),
+                "date".into(),
+                "--date-format".into(),
+                "rfc3339".into(),
                 "--header".into(),
                 "first-row".into(),
             ])

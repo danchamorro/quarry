@@ -28,14 +28,14 @@ use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 #[cfg(test)]
 use quarry_core::SearchProgress;
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, CompletedIndex, DuplicateJob, DuplicateOutcome,
-    DuplicateSpec, DuplicateSummary, FilterExportJob, FilterExportOutcome, FilterExportProgress,
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
-    FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob,
-    IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError,
-    ReplaceAllJob, ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob, SearchMatch,
-    SearchOutcome, SearchPosition, Session, SortDirection, SortJob, SortMode, SortOutcome,
-    SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    CaseSensitivity, ColumnTransformation, CompletedIndex, DateTimeFormat, DuplicateJob,
+    DuplicateOutcome, DuplicateSpec, DuplicateSummary, FilterExportJob, FilterExportOutcome,
+    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
+    FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
+    IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
+    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob,
+    SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection, SortJob, SortMode,
+    SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
     estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
@@ -3690,10 +3690,12 @@ enum StructuralDialogAction {
     Cancel,
 }
 
+/// Name the comparison mode independently of its selected format or shuffle seed.
 fn sort_mode_label(mode: SortMode) -> &'static str {
     match mode {
         SortMode::Text => "Text",
         SortMode::Number => "Number",
+        SortMode::DateTime { .. } => "Date / time",
         SortMode::CharacterCount => "Character count",
         SortMode::WordCount => "Word count",
         SortMode::Shuffle { .. } => "Shuffle",
@@ -3820,14 +3822,33 @@ fn show_structural_dialog(
                     .selected_text(sort_mode_label(dialog.sort_mode))
                     .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
                     .show_ui(ui, |ui| {
-                        for mode in [SortMode::Text, SortMode::Number, SortMode::CharacterCount,
+                        for mode in [SortMode::Text, SortMode::Number,
+                            SortMode::DateTime { format: DateTimeFormat::YearMonthDay }, SortMode::CharacterCount,
                             SortMode::WordCount, SortMode::Shuffle { seed: 0 }, SortMode::Reverse] {
-                            if ui.selectable_value(&mut dialog.sort_mode, mode, sort_mode_label(mode)).clicked() {
+                            let selected = dialog.sort_mode == mode || matches!((dialog.sort_mode, mode),
+                                (SortMode::DateTime { .. }, SortMode::DateTime { .. }));
+                            if ui.selectable_label(selected, sort_mode_label(mode)).clicked() {
+                                if !selected { dialog.sort_mode = mode; }
                                 ui.close();
                             }
                         }
                     }).response.labelled_by(label.id);
                 let _ = ui.ctx().accesskit_node_builder(response.id, |node| node.set_label("Sort as"));
+                if let SortMode::DateTime { format } = &mut dialog.sort_mode {
+                    let label = ui.weak("Date / time format");
+                    let response = egui::ComboBox::from_id_salt("quarry-sort-date-time-format")
+                        .width(ui.available_width())
+                        .selected_text(format.label())
+                        .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
+                        .show_ui(ui, |ui| {
+                            for choice in DateTimeFormat::ALL {
+                                if ui.selectable_value(format, choice, choice.label()).clicked() { ui.close(); }
+                            }
+                        }).response.labelled_by(label.id);
+                    let _ = ui.ctx().accesskit_node_builder(response.id, |node| node.set_label("Date / time format"));
+                    ui.small(format.description());
+                    ui.small("Blank cells sort first oldest, last newest. Other invalid values stop the sort. Surrounding ASCII whitespace is ignored.");
+                }
                 if dialog.sort_mode.uses_column() {
                     ui.weak("Direction");
                     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
@@ -3850,6 +3871,7 @@ fn show_structural_dialog(
                         }
                     }
                     SortMode::Number => "Signed numbers, decimals and scientific notation. Blank cells sort first ascending, last descending. Other values stop the sort.",
+                    SortMode::DateTime { format } => format.description(),
                     SortMode::CharacterCount => "Count Unicode characters, including spaces. Combining marks count separately. Invalid UTF-8 stops the sort.",
                     SortMode::WordCount => "Count words separated by Unicode whitespace. Invalid UTF-8 stops the sort.",
                     SortMode::Shuffle { .. } => "Randomize the entire data row order. The selected column is ignored.",
@@ -9566,8 +9588,11 @@ fn ensure_copy_capacity(output: &str, added: usize, max_bytes: usize) -> Result<
     }
 }
 
+/// Describe direction in the selected mode's units, including oldest/newest dates.
 fn sort_direction_label(mode: SortMode, direction: SortDirection) -> &'static str {
     match (mode, direction) {
+        (SortMode::DateTime { .. }, SortDirection::Ascending) => "Oldest first",
+        (SortMode::DateTime { .. }, SortDirection::Descending) => "Newest first",
         (SortMode::CharacterCount, SortDirection::Ascending) => "Shortest first",
         (SortMode::CharacterCount, SortDirection::Descending) => "Longest first",
         (SortMode::WordCount, SortDirection::Ascending) => "Fewest first",
@@ -16820,7 +16845,13 @@ mod tests {
     ) -> (Option<StructuralDialogAction>, egui::FullOutput) {
         if matches!(
             label,
-            "Text" | "Number" | "Character count" | "Word count" | "Shuffle" | "Reverse"
+            "Text"
+                | "Number"
+                | "Date / time"
+                | "Character count"
+                | "Word count"
+                | "Shuffle"
+                | "Reverse"
         ) && !egui::Popup::is_any_open(ctx)
         {
             assert_eq!(
@@ -16912,6 +16943,87 @@ mod tests {
         }
         assert_eq!(dialog.sort_mode, SortMode::Number);
         assert_eq!(action, Some(StructuralDialogAction::Apply));
+        app.open_structural_dialog(dialog);
+        app.apply_structural_dialog_action(action.unwrap());
+        finish_structural_edit(&mut app);
+        let document = app.active.document.as_ref().unwrap();
+        assert_eq!(fs::read(document.session.path()).unwrap(), sorted);
+        assert_eq!(document.selected_columns, BTreeSet::from([0]));
+        assert!(document.is_dirty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
+            original
+        );
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
+            sorted
+        );
+
+        assert!(app.save_as_picker_result(Some(destination.clone())));
+        let mut frame = eframe::Frame::_new_kittest();
+        finish_app_save(&mut app, &ctx, &mut frame);
+        assert_eq!(fs::read(destination).unwrap(), sorted);
+        assert_eq!(fs::read(source).unwrap(), original);
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
+    }
+
+    #[test]
+    fn date_sort_format_is_accessible_and_preserves_history_and_save_as() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("date-sort.csv");
+        let destination = directory.path().join("date-sort-output.csv");
+        let original = b"date,name\n03/04/2026,march\n04/03/2026,april\n,blank\n03/04/2026,march-again\n02/29/2024,leap\n";
+        let sorted = b"date,name\n04/03/2026,april\n03/04/2026,march\n03/04/2026,march-again\n02/29/2024,leap\n,blank\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active.sort_match_case = true;
+        let mut dialog = StructuralDialog::sort(0);
+        assert_eq!(dialog.sort_mode, SortMode::Text);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (_, output) = click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Date / time");
+        let tree = output.platform_output.accesskit_update.unwrap();
+        for label in ["Date / time format", "Oldest first", "Newest first"] {
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(label)),
+                "{label}"
+            );
+        }
+        assert!(
+            !tree
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Match case"))
+        );
+        click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Date / time format");
+        click_sort_dialog_control(&ctx, &mut dialog, &mut app, "MM/DD/YYYY");
+        assert_eq!(
+            dialog.sort_mode,
+            SortMode::DateTime {
+                format: super::DateTimeFormat::MonthDayYear
+            }
+        );
+        // Re-selecting the same mode must retain the chosen date format.
+        click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Date / time");
+        assert_eq!(
+            dialog.sort_mode,
+            SortMode::DateTime {
+                format: super::DateTimeFormat::MonthDayYear
+            }
+        );
+        click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Newest first");
+        let (action, _) = click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Sort");
+        assert_eq!(action, Some(StructuralDialogAction::Apply));
+        assert!(app.active.sort_match_case);
         app.open_structural_dialog(dialog);
         app.apply_structural_dialog_action(action.unwrap());
         finish_structural_edit(&mut app);
