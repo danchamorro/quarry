@@ -3690,6 +3690,7 @@ enum StructuralDialogAction {
     Cancel,
 }
 
+/// Name the comparison mode independently of its selected format or shuffle seed.
 fn sort_mode_label(mode: SortMode) -> &'static str {
     match mode {
         SortMode::Text => "Text",
@@ -9587,6 +9588,7 @@ fn ensure_copy_capacity(output: &str, added: usize, max_bytes: usize) -> Result<
     }
 }
 
+/// Describe direction in the selected mode's units, including oldest/newest dates.
 fn sort_direction_label(mode: SortMode, direction: SortDirection) -> &'static str {
     match (mode, direction) {
         (SortMode::DateTime { .. }, SortDirection::Ascending) => "Oldest first",

@@ -3,6 +3,7 @@
 
 use crate::QuarryError;
 
+/// Explicit input grammars; none infer date order or a machine timezone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateTimeFormat {
     YearMonthDay,
@@ -21,6 +22,7 @@ impl DateTimeFormat {
         Self::Rfc3339,
     ];
 
+    /// Display the required field order or timezone semantics in format pickers.
     pub const fn label(self) -> &'static str {
         match self {
             Self::YearMonthDay => "YYYY-MM-DD",
@@ -31,6 +33,7 @@ impl DateTimeFormat {
         }
     }
 
+    /// Return the stable spelling accepted by the validation CLI's `--date-format`.
     pub const fn cli_name(self) -> &'static str {
         match self {
             Self::YearMonthDay => "ymd",
@@ -41,6 +44,7 @@ impl DateTimeFormat {
         }
     }
 
+    /// Explain ambiguous-date interpretation and the supported timestamp subset.
     pub const fn description(self) -> &'static str {
         match self {
             Self::YearMonthDay => {
@@ -62,10 +66,12 @@ impl DateTimeFormat {
     }
 }
 
+/// Carry a bounded parser reason for the sort scanner to attach row/column context.
 fn invalid(reason: &'static str) -> QuarryError {
     QuarryError::InvalidOption(reason)
 }
 
+/// Parse an ASCII field; callers supply at most nine digits, so arithmetic fits i64.
 fn digits(value: &[u8]) -> Result<i64, QuarryError> {
     value.iter().try_fold(0, |number, byte| {
         if byte.is_ascii_digit() {
@@ -78,6 +84,8 @@ fn digits(value: &[u8]) -> Result<i64, QuarryError> {
     })
 }
 
+/// Validate an exact-width date and count Gregorian days since 0001-01-01.
+/// Timestamp formats use the same year/month/day grammar as `YearMonthDay`.
 fn date_days(value: &[u8], format: DateTimeFormat) -> Result<i64, QuarryError> {
     if value.len() != 10 {
         return Err(invalid("expected a date with exactly ten characters"));
@@ -128,6 +136,9 @@ fn date_days(value: &[u8], format: DateTimeFormat) -> Result<i64, QuarryError> {
         - 1)
 }
 
+/// Encode chronology as sign-flipped big-endian seconds followed by nanoseconds.
+/// Blank keys are empty. Offsets normalize to UTC; clock values stay timezone-free.
+/// Invalid nonblank values fail without changing the source field's spelling.
 pub(crate) fn date_time_key(value: &[u8], format: DateTimeFormat) -> Result<Vec<u8>, QuarryError> {
     let value = value.trim_ascii();
     if value.is_empty() {

@@ -100,8 +100,34 @@ oracle in both directions:
 - Oldest: `c109f69d7edf32200fc89c18428463641b823f1d1017ca5d75ee762ef9bd453d`
 - Newest: `6c325913d22edaabe3af55ed973ca1a4bf3543b12d0a3df5ec1f87b1e746a298`
 
-Cancellation requested at the 1 MiB threshold was observed at 2 MiB, stopped
-after 3 MiB scanned, and joined in **0.654 ms**. No destination, sort run, or
+Cancellation used the same guest CLI and synthetic large fixture, from
+`/tmp/quarry-date-sort-review`, with its existing cancellation validation option:
+
+```bash
+./quarry-cli-98aaa4f sort-save-as large.csv cancelled.csv --column 1 --order asc \
+  --mode date --date-format rfc3339 --header first-row --temp-dir . \
+  --cancel-after-bytes 1048576 --cache-state warm > cancellation.log 2>&1
+```
+
+The captured guest CLI output included:
+
+```text
+Outcome: cancelled
+Rows sorted: 9311
+Sorted runs created: 0
+Merge passes: 0
+Bytes scanned: 3.00 MiB (3145728 bytes) of 1.08 GiB (1155000013 bytes)
+Output bytes written: 0.00 B (0 bytes)
+Destination published: no
+Cancellation requested after: 2.00 MiB (2097152 bytes)
+Cancellation latency: 0.654 ms
+```
+
+The CLI polls progress at 1 ms and requests cancellation once the threshold is
+observed; progress updates can therefore overshoot the configured 1 MiB threshold.
+The latency is the worker's `cancellation_latency`, measured from the cancellation
+request through cleanup, rather than the CLI's polling/join wall time. The scan
+stopped after 3 MiB. No destination, sort run, or
 export staging artifact remained. The source SHA-256 remained unchanged after
 all runs. This fixture is smaller than the VM's RAM; these measurements do not
 claim a new 50 GB date-sort or controlled cold-cache result. The sort continues

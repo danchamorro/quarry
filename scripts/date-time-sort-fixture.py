@@ -16,12 +16,14 @@ from pathlib import Path
 
 
 def record(fields):
+    """Encode a complete UTF-8 CSV record, including quoting and embedded newlines."""
     stream = io.StringIO(newline="")
     csv.writer(stream, lineterminator="\n").writerow(fields)
     return stream.getvalue().encode("utf-8")
 
 
 def digest(path):
+    """Hash source bytes in fixed-size blocks without loading the fixture into RAM."""
     result = hashlib.sha256()
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
@@ -30,6 +32,7 @@ def digest(path):
 
 
 def small(directory):
+    """Write all five grammars and stable ascending/descending datetime oracles."""
     dates = [dt.datetime(2026, 3, 4), dt.datetime(2026, 4, 3),
              dt.datetime(2000, 2, 29), dt.datetime(1900, 3, 1),
              dt.datetime(1, 1, 1), dt.datetime(9999, 12, 31),
@@ -57,6 +60,7 @@ def small(directory):
 
 
 def large(directory, count):
+    """Generate repeated UTC keys and hash whole expected outputs in bounded batches."""
     utc = dt.timezone.utc
     base = dt.datetime(2025, 12, 31, 23, 0, tzinfo=utc)
     templates, keys = [], []
@@ -71,6 +75,7 @@ def large(directory, count):
     header = b"date,id,note\n"
 
     def row(index):
+        """Keep a source ordinal in each full row so equal-key stability is observable."""
         return templates[index % 64].replace(b"IDPLACEHOLDER", f"{index:010}".encode())
 
     path = directory / "large.csv"
