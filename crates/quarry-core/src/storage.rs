@@ -239,6 +239,21 @@ pub fn estimate_edited_output_bytes(
                     bytes = bytes.saturating_add(serialized(header));
                 }
             }
+            ColumnTransformation::Insert {
+                source_width,
+                count,
+                headers,
+                ..
+            } => {
+                bytes = bytes.saturating_add(
+                    records.saturating_mul((*source_width as u64).saturating_add(*count as u64)),
+                );
+                if let Some(headers) = headers {
+                    bytes = headers
+                        .iter()
+                        .fold(bytes, |sum, name| sum.saturating_add(serialized(name)));
+                }
+            }
             ColumnTransformation::Arrange { output_columns, .. } => {
                 bytes = bytes.saturating_add(records.saturating_mul(output_columns.len() as u64));
             }

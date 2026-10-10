@@ -33,9 +33,9 @@ use quarry_core::{
     FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
     FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
     IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
-    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, SaveAsJob, SaveAsOutcome, SearchJob,
-    SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection, SortJob, SortMode,
-    SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome,
+    SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection, SortJob,
+    SortMode, SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
     estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
@@ -409,6 +409,8 @@ struct FilterRuleDraft {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StructuralRequest {
+    InsertRows,
+    InsertColumns,
     Split,
     Combine,
     Move,
@@ -428,6 +430,7 @@ struct StructuralDialog {
     request: StructuralRequest,
     columns: Vec<usize>,
     separator: String,
+    count: String,
     position: String,
     sort_direction: SortDirection,
     sort_mode: SortMode,
@@ -435,11 +438,30 @@ struct StructuralDialog {
 }
 
 impl StructuralDialog {
+    fn insert_rows(position: u64) -> Self {
+        Self {
+            request: StructuralRequest::InsertRows,
+            columns: Vec::new(),
+            position: position.saturating_add(1).to_string(),
+            ..Self::sort(0)
+        }
+    }
+
+    fn insert_columns(position: usize) -> Self {
+        Self {
+            request: StructuralRequest::InsertColumns,
+            columns: Vec::new(),
+            position: position.saturating_add(1).to_string(),
+            ..Self::sort(0)
+        }
+    }
+
     fn split(column: usize) -> Self {
         Self {
             request: StructuralRequest::Split,
             columns: vec![column],
             separator: String::new(),
+            count: "1".into(),
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
@@ -452,6 +474,7 @@ impl StructuralDialog {
             request: StructuralRequest::Combine,
             columns,
             separator: String::new(),
+            count: "1".into(),
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
@@ -467,6 +490,7 @@ impl StructuralDialog {
             request: StructuralRequest::Move,
             columns,
             separator: String::new(),
+            count: "1".into(),
             position,
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
@@ -479,6 +503,7 @@ impl StructuralDialog {
             request: StructuralRequest::Sort,
             columns: vec![column],
             separator: String::new(),
+            count: "1".into(),
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
@@ -873,6 +898,23 @@ impl QuarryApp {
             self.open_combine_files();
             return;
         }
+        if matches!(action, Action::InsertRows | Action::InsertColumns) {
+            let dialog = self.active.document.as_ref().map(|document| {
+                if action == Action::InsertRows {
+                    StructuralDialog::insert_rows(
+                        document
+                            .storage_record_count()
+                            .saturating_sub(document.data_start),
+                    )
+                } else {
+                    StructuralDialog::insert_columns(document.total_columns)
+                }
+            });
+            if let Some(dialog) = dialog {
+                self.open_structural_dialog(dialog);
+            }
+            return;
+        }
         if action == Action::About {
             self.about.open();
             return;
@@ -997,6 +1039,8 @@ impl QuarryApp {
             | Action::ChooseFilteredExport
             | Action::DiscardChanges
             | Action::OpenColumns
+            | Action::InsertRows
+            | Action::InsertColumns
             | Action::Undo
             | Action::Redo
             | Action::OpenFilters => {
@@ -1148,33 +1192,36 @@ impl QuarryApp {
             self.active.structural_dialog = None;
             return;
         }
-        let result =
-            self.active
-                .document
-                .as_mut()
-                .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
-                .and_then(|document| match dialog.request {
-                    StructuralRequest::Split => document
-                        .start_split(dialog.columns[0], dialog.separator.as_bytes().to_vec()),
-                    StructuralRequest::Combine => {
-                        document.start_combine(dialog.columns, dialog.separator.as_bytes().to_vec())
-                    }
-                    StructuralRequest::Move => parse_move_position(
-                        &dialog.position,
-                        document.total_columns,
-                        dialog.columns.len(),
-                    )
-                    .map_err(AppMessage::warning)
-                    .and_then(|position| document.start_move_columns(dialog.columns, position)),
-                    StructuralRequest::Sort => document.start_sort_rows(
-                        dialog.columns[0],
-                        dialog.sort_direction,
-                        dialog.sort_mode,
-                        case_sensitivity(self.active.sort_match_case),
-                    ),
-                    StructuralRequest::Duplicates => document
-                        .start_find_duplicates(dialog.columns, case_sensitivity(dialog.match_case)),
-                });
+        let result = self
+            .active
+            .document
+            .as_mut()
+            .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
+            .and_then(|document| match dialog.request {
+                StructuralRequest::InsertRows => document.insert_rows_from_dialog(&dialog),
+                StructuralRequest::InsertColumns => document.insert_columns_from_dialog(&dialog),
+                StructuralRequest::Split => {
+                    document.start_split(dialog.columns[0], dialog.separator.as_bytes().to_vec())
+                }
+                StructuralRequest::Combine => {
+                    document.start_combine(dialog.columns, dialog.separator.as_bytes().to_vec())
+                }
+                StructuralRequest::Move => parse_move_position(
+                    &dialog.position,
+                    document.total_columns,
+                    dialog.columns.len(),
+                )
+                .map_err(AppMessage::warning)
+                .and_then(|position| document.start_move_columns(dialog.columns, position)),
+                StructuralRequest::Sort => document.start_sort_rows(
+                    dialog.columns[0],
+                    dialog.sort_direction,
+                    dialog.sort_mode,
+                    case_sensitivity(self.active.sort_match_case),
+                ),
+                StructuralRequest::Duplicates => document
+                    .start_find_duplicates(dialog.columns, case_sensitivity(dialog.match_case)),
+            });
         match result {
             Ok(()) => {
                 self.active.structural_dialog = None;
@@ -1936,6 +1983,21 @@ impl eframe::App for QuarryApp {
                         action = Some(Action::Redo);
                     }
 
+                    ui.add_enabled_ui(document_open, |ui| {
+                        ui.menu_button("Insert", |ui| {
+                            for (label, insertion_action, rows) in [
+                                ("Rows…", Action::InsertRows, true),
+                                ("Columns…", Action::InsertColumns, false),
+                            ] {
+                                let reason = document.and_then(|document| document.insertion_disabled_reason(rows));
+                                if ui.add_enabled(reason.is_none(), egui::Button::new(label))
+                                    .on_disabled_hover_text(reason.unwrap_or_default()).clicked() {
+                                    action = Some(insertion_action);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
                     let columns = ui.add_enabled(document_open, egui::Button::new("Columns…"));
                     ctx.data_mut(|data| data.insert_temp(egui::Id::new(("quarry-column-manager", "anchor")), columns.rect.right_bottom()));
                     if columns.clicked() {
@@ -2449,6 +2511,8 @@ enum Action {
     PageDown,
     AutoFitColumns,
     OpenColumns,
+    InsertRows,
+    InsertColumns,
     Undo,
     Redo,
     OpenFilters,
@@ -3703,6 +3767,28 @@ fn sort_mode_label(mode: SortMode) -> &'static str {
     }
 }
 
+fn parse_insertion_count(input: &str) -> Result<u64, String> {
+    input
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| "Enter a positive whole-number count.".into())
+}
+
+fn parse_insertion_position(input: &str, size: u64) -> Result<u64, String> {
+    let last = size
+        .checked_add(1)
+        .ok_or("This document is too large to insert into.")?;
+    input
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|position| (1..=last).contains(position))
+        .map(|position| position - 1)
+        .ok_or_else(|| format!("Enter a position between 1 and {last}."))
+}
+
 fn show_structural_dialog(
     ctx: &egui::Context,
     dialog: &mut StructuralDialog,
@@ -3716,6 +3802,8 @@ fn show_structural_dialog(
     let mut sort_description = None;
     let mut disk_description = None;
     let title = match dialog.request {
+        StructuralRequest::InsertRows => "Insert Rows",
+        StructuralRequest::InsertColumns => "Insert Columns",
         StructuralRequest::Split => "Split Columns",
         StructuralRequest::Combine => "Combine Columns",
         StructuralRequest::Move => "Move Columns",
@@ -3750,9 +3838,50 @@ fn show_structural_dialog(
             "Selected column{}: {columns}",
             if dialog.columns.len() == 1 { "" } else { "s" }
         );
-        ui.add(egui::Label::new(&selected).truncate()).on_hover_text(&selected);
+        if !matches!(dialog.request, StructuralRequest::InsertRows | StructuralRequest::InsertColumns) {
+            ui.add(egui::Label::new(&selected).truncate()).on_hover_text(&selected);
+        }
         ui.add_space(6.0);
         match dialog.request {
+            StructuralRequest::InsertRows | StructuralRequest::InsertColumns => {
+                let rows = dialog.request == StructuralRequest::InsertRows;
+                let position_label = if rows { "Insert before data row" } else { "Insert before file column" };
+                let label = ui.label(position_label);
+                let position = ui.add_sized([ui.available_width(), 26.0],
+                    egui::TextEdit::singleline(&mut dialog.position)
+                        .id(egui::Id::new(STRUCTURAL_POSITION_INPUT_ID))).labelled_by(label.id);
+                let _ = ui.ctx().accesskit_node_builder(position.id, |node| node.set_label(position_label));
+                let count_label = if rows { "Number of rows" } else { "Number of columns" };
+                let label = ui.label(count_label);
+                let count = ui.add_sized([ui.available_width(), 26.0],
+                    egui::TextEdit::singleline(&mut dialog.count)
+                        .id(egui::Id::new("quarry-insertion-count"))).labelled_by(label.id);
+                let _ = ui.ctx().accesskit_node_builder(count.id, |node| node.set_label(count_label));
+                let mut focused = position.has_focus() || count.has_focus();
+                if !rows && document.session.dialect.has_header {
+                    let label = ui.label("First new column name (optional)");
+                    let name = ui.add_sized([ui.available_width(), 26.0],
+                        egui::TextEdit::singleline(&mut dialog.separator)
+                            .id(egui::Id::new("quarry-insertion-header"))).labelled_by(label.id);
+                    let _ = ui.ctx().accesskit_node_builder(name.id, |node| node.set_label("First new column name (optional)"));
+                    focused |= name.has_focus();
+                    ui.small("Additional new column names start blank and can be renamed in the grid.");
+                }
+                let size = if rows { document.storage_record_count().saturating_sub(document.data_start) } else { document.total_columns as u64 };
+                ui.small(format!("Positions are 1–{}. Use {} to add at the end.", size.saturating_add(1), size.saturating_add(1)));
+                ui.small(if rows {
+                    "Blank rows are added in the current data-row order. The header stays fixed."
+                } else {
+                    "Positions follow numbered file columns, including hidden columns. The full file order is shown after insertion."
+                });
+                ui.small("New cells are editable. Undo reverses the insertion; Save or Save As keeps it.");
+                let reason = document.insertion_disabled_reason(rows).map(str::to_owned).or_else(|| {
+                    if rows { document.row_insertion_from_dialog(dialog).map(|_| ()).err() }
+                    else { document.column_insertion_from_dialog(dialog).map(|_| ()).err() }
+                });
+                if let Some(reason) = &reason { ui.colored_label(ERROR_TEXT, reason); }
+                (reason.is_none(), focused, reason)
+            }
             StructuralRequest::Duplicates => {
                 ui.label("Find rows with matching values in the selected columns.");
                 ui.checkbox(&mut dialog.match_case, "Match case");
@@ -3917,6 +4046,7 @@ fn show_structural_dialog(
                 action = Some(StructuralDialogAction::Cancel);
             }
             let submit_label = match dialog.request {
+                StructuralRequest::InsertRows | StructuralRequest::InsertColumns => "Insert",
                 StructuralRequest::Move => "Move",
                 StructuralRequest::Sort => "Sort",
                 StructuralRequest::Duplicates => "Find duplicates",
@@ -4880,6 +5010,12 @@ enum StructuralJob {
         direction: SortDirection,
         mode: SortMode,
     },
+    InsertingRows {
+        job: SaveAsJob,
+        destination: PathBuf,
+        undo: WorkingCopySnapshot,
+        count: u64,
+    },
     DeletingRows {
         job: SaveAsJob,
         destination: PathBuf,
@@ -5282,6 +5418,130 @@ impl Document {
         } else {
             None
         }
+    }
+
+    fn insertion_disabled_reason(&self, rows: bool) -> Option<&'static str> {
+        self.structural_edit_disabled_reason()
+            .or_else(|| {
+                let records = self.index.as_ref()?.indexed_rows();
+                if self.data_start > records {
+                    Some("This file has no header. Reopen with No header before adding rows.")
+                } else if !rows && records == 0 {
+                    Some("Add a row first so an empty file can retain its columns.")
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.index
+                    .is_none()
+                    .then_some("Wait for indexing to finish before inserting rows or columns.")
+            })
+    }
+
+    fn row_insertion_from_dialog(&self, dialog: &StructuralDialog) -> Result<RowInsertion, String> {
+        let rows = self.storage_record_count().saturating_sub(self.data_start);
+        let position = parse_insertion_position(&dialog.position, rows)?;
+        let count = parse_insertion_count(&dialog.count)?;
+        if self.storage_record_count().checked_add(count).is_none() {
+            return Err("The row count is too large.".into());
+        }
+        Ok(RowInsertion {
+            position: position + self.data_start,
+            count,
+            width: self.total_columns.max(1),
+        })
+    }
+
+    fn column_insertion_from_dialog(
+        &self,
+        dialog: &StructuralDialog,
+    ) -> Result<ColumnTransformation, String> {
+        let position =
+            parse_insertion_position(&dialog.position, self.total_columns as u64)? as usize;
+        let count = usize::try_from(parse_insertion_count(&dialog.count)?)
+            .map_err(|_| "The column count is too large.")?;
+        if self
+            .total_columns
+            .checked_add(count)
+            .is_none_or(|width| width > MAX_TRANSFORMATION_COLUMNS)
+        {
+            return Err(format!(
+                "The result must have at most {MAX_TRANSFORMATION_COLUMNS} columns."
+            ));
+        }
+        let headers = self.session.dialect.has_header.then(|| {
+            let mut names = vec![Vec::new(); count];
+            names[0] = dialog.separator.as_bytes().to_vec();
+            names
+        });
+        Ok(ColumnTransformation::Insert {
+            source_width: self.total_columns,
+            position,
+            count,
+            headers,
+        })
+    }
+
+    fn insert_columns_from_dialog(&mut self, dialog: &StructuralDialog) -> Result<(), AppMessage> {
+        if let Some(reason) = self.insertion_disabled_reason(false) {
+            return Err(AppMessage::warning(reason));
+        }
+        let transformation = self
+            .column_insertion_from_dialog(dialog)
+            .map_err(AppMessage::warning)?;
+        let ColumnTransformation::Insert {
+            position, count, ..
+        } = &transformation
+        else {
+            unreachable!()
+        };
+        let selected = (*position..position + count).collect();
+        self.commit_edits();
+        self.cancel_search();
+        self.begin_materialization(transformation, selected)
+    }
+
+    fn insert_rows_from_dialog(&mut self, dialog: &StructuralDialog) -> Result<(), AppMessage> {
+        if let Some(reason) = self.insertion_disabled_reason(true) {
+            return Err(AppMessage::warning(reason));
+        }
+        let insertion = self
+            .row_insertion_from_dialog(dialog)
+            .map_err(AppMessage::warning)?;
+        self.commit_edits();
+        self.cancel_search();
+        let MaterializationPreparation {
+            undo,
+            destination,
+            renames,
+        } = self.prepare_materialization()?;
+        let job = match self.session.start_create_working_copy_inserting_rows(
+            renames,
+            self.cell_edits.clone(),
+            insertion,
+            &destination,
+        ) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.cleanup_empty_working_copy();
+                self.invalidate_changed_source();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+            Err(error) => {
+                self.cleanup_empty_working_copy();
+                return Err(AppMessage::error(error.to_string()));
+            }
+        };
+        self.structural_job = Some(StructuralJob::InsertingRows {
+            job,
+            destination,
+            undo,
+            count: insertion.count,
+        });
+        self.structural_status = Some(format!("Inserting {} rows…", insertion.count));
+        self.structural_cancel_requested = false;
+        Ok(())
     }
 
     fn start_split(&mut self, source_column: usize, separator: Vec<u8>) -> Result<(), AppMessage> {
@@ -5855,7 +6115,9 @@ impl Document {
             StructuralJob::Materializing { job, .. } => job.progress().done,
             StructuralJob::Replacing { job, .. } => job.progress().done,
             StructuralJob::Sorting { job, .. } => job.progress().done,
-            StructuralJob::DeletingRows { job, .. } => job.progress().done,
+            StructuralJob::DeletingRows { job, .. } | StructuralJob::InsertingRows { job, .. } => {
+                job.progress().done
+            }
         };
         if !done {
             return Ok(None);
@@ -6006,6 +6268,45 @@ impl Document {
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Column edit failed. The document was not changed.".into());
+                    Err(AppMessage::error(error.to_string()))
+                }
+            },
+            StructuralJob::InsertingRows {
+                job,
+                destination,
+                undo,
+                count,
+            } => match job.wait() {
+                Ok(SaveAsOutcome::Complete(summary)) => {
+                    debug_assert_eq!(summary.destination, destination);
+                    Ok(Some(MaterializedWorkingCopy {
+                        path: summary.destination,
+                        output_index: None,
+                        undo,
+                        selected_columns: BTreeSet::new(),
+                        notice: format!(
+                            "Inserted {count} row{}. Save to keep it, or discard changes.",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                    }))
+                }
+                Ok(SaveAsOutcome::Cancelled) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Row insertion cancelled. The document was not changed.".into());
+                    Ok(None)
+                }
+                Err(QuarryError::SourceChanged) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.invalidate_changed_source();
+                    Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status =
+                        Some("Row insertion failed. The document was not changed.".into());
                     Err(AppMessage::error(error.to_string()))
                 }
             },
@@ -6171,7 +6472,9 @@ impl Document {
             StructuralJob::Materializing { job, .. } => job.cancel(),
             StructuralJob::Replacing { job, .. } => job.cancel(),
             StructuralJob::Sorting { job, .. } => job.cancel(),
-            StructuralJob::DeletingRows { job, .. } => job.cancel(),
+            StructuralJob::DeletingRows { job, .. } | StructuralJob::InsertingRows { job, .. } => {
+                job.cancel()
+            }
         }
         self.structural_cancel_requested = true;
         self.structural_status = Some("Cancelling change…".into());
@@ -6262,6 +6565,15 @@ impl Document {
                     progress.total_bytes,
                     progress.done,
                 ));
+            }
+            StructuralJob::InsertingRows { job, .. } => {
+                let progress = job.progress();
+                (
+                    progress.bytes_scanned,
+                    progress.total_bytes,
+                    progress.done,
+                    "Inserting rows",
+                )
             }
             StructuralJob::DeletingRows { job, .. } => {
                 let progress = job.progress();
@@ -7510,7 +7822,8 @@ impl Document {
                 StructuralJob::Materializing { job, .. } => job.cancel(),
                 StructuralJob::Replacing { job, .. } => job.cancel(),
                 StructuralJob::Sorting { job, .. } => job.cancel(),
-                StructuralJob::DeletingRows { job, .. } => job.cancel(),
+                StructuralJob::DeletingRows { job, .. }
+                | StructuralJob::InsertingRows { job, .. } => job.cancel(),
             }
         }
         self.structural_cancel_requested = false;
@@ -8784,6 +9097,15 @@ fn show_table(
                                 egui::Popup::menu(&response)
                                     .open_memory(popup_command)
                                     .show(|ui| {
+                                    for (label, position) in [("Insert Columns Before…", column), ("Insert Columns After…", column.saturating_add(1))] {
+                                        let reason = document.insertion_disabled_reason(false);
+                                        if ui.add_enabled(reason.is_none(), egui::Button::new(label))
+                                            .on_disabled_hover_text(reason.unwrap_or_default()).clicked() {
+                                            interaction.column_request = Some(GridColumnRequest::Dialog(StructuralDialog::insert_columns(position)));
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
                                     let split_column = selected_split_column(
                                         &document.selected_columns,
                                     );
@@ -9086,6 +9408,15 @@ fn show_table(
                                 egui::Popup::menu(&response)
                                     .open_memory(popup_command)
                                     .show(|ui| {
+                                        for (label, position) in [("Insert Rows Above…", display_row - 1), ("Insert Rows Below…", display_row)] {
+                                            let reason = document.insertion_disabled_reason(true);
+                                            if ui.add_enabled(reason.is_none(), egui::Button::new(label))
+                                                .on_disabled_hover_text(reason.unwrap_or_default()).clicked() {
+                                                interaction.column_request = Some(GridColumnRequest::Dialog(StructuralDialog::insert_rows(position)));
+                                                ui.close();
+                                            }
+                                        }
+                                        ui.separator();
                                         let disabled_reason = document
                                             .structural_edit_disabled_reason()
                                             .or_else(|| {
@@ -20161,5 +20492,329 @@ mod tests {
             parse_file_column("41", 40).unwrap_err(),
             "File column must be between 1 and 40."
         );
+    }
+    #[test]
+    fn insertion_rows_and_columns_keep_pending_edits_history_and_exact_save_as() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let destination = directory.path().join("inserted.csv");
+        let original = b"ID,Note\n1,one\n2,two\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
+        document.rename_header(0, "Number".into()).unwrap();
+        document.begin_cell_edit(1, 1, b"one".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "edited, 猫\nline".into();
+        let mut rows = StructuralDialog::insert_rows(1);
+        rows.count = "2".into();
+        app.active.structural_dialog = Some(rows);
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        assert!(app.active.notice.is_none(), "{:?}", app.active.notice);
+        finish_structural_edit(&mut app);
+        let expected = "Number,Note\n1,\"edited, 猫\nline\"\n,\n,\n2,two\n";
+        assert_eq!(
+            fs::read_to_string(app.active.document.as_ref().unwrap().session.path()).unwrap(),
+            expected
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
+        assert_eq!(
+            document.header_renames.get(&0).map(String::as_str),
+            Some("Number")
+        );
+        assert_eq!(
+            document.cell_edits.get(&(1, 1)).unwrap(),
+            "edited, 猫\nline".as_bytes()
+        );
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            fs::read_to_string(app.active.document.as_ref().unwrap().session.path()).unwrap(),
+            expected
+        );
+        let mut columns = StructuralDialog::insert_columns(1);
+        columns.count = "2".into();
+        columns.separator = "New".into();
+        app.active.structural_dialog = Some(columns);
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let document = app.active.document.as_mut().unwrap();
+        assert_eq!(document.total_columns, 4);
+        assert_eq!(document.selected_columns, BTreeSet::from([1, 2]));
+        document.begin_cell_edit(2, 1, Vec::new()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "added".into();
+        assert!(app.save_as_picker_result(Some(destination.clone())));
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.active.document.as_ref().unwrap().logical_path != destination {
+            let _ = ctx.run(grid_input(), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest())
+            });
+            assert!(app.active.notice.is_none(), "{:?}", app.active.notice);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "Number,New,,Note\n1,,,\"edited, 猫\nline\"\n,added,,\n,,,\n2,,,two\n"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
+    }
+
+    #[test]
+    fn insertion_supports_empty_headerless_and_header_only_documents() {
+        for (bytes, header_mode) in [
+            (b"".as_slice(), HeaderMode::NoHeader),
+            (b"A,B".as_slice(), HeaderMode::FirstRow),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.csv");
+            fs::write(&source, bytes).unwrap();
+            let mut app = QuarryApp::new(None, Instant::now());
+            app.active.header_mode = header_mode;
+            app.open_path(source.clone()).unwrap();
+            finish_index(app.active.document.as_mut().unwrap());
+            let document = app.active.document.as_mut().unwrap();
+            if bytes.is_empty() {
+                assert!(document.insertion_disabled_reason(false).is_some());
+            }
+            let mut rows = StructuralDialog::insert_rows(0);
+            rows.count = "2".into();
+            document.insert_rows_from_dialog(&rows).unwrap();
+            finish_structural_edit(&mut app);
+            let document = app.active.document.as_mut().unwrap();
+            assert_eq!(
+                document.index.as_ref().unwrap().indexed_rows(),
+                document.data_start + 2
+            );
+            let mut columns = StructuralDialog::insert_columns(document.total_columns);
+            columns.count = "2".into();
+            document.insert_columns_from_dialog(&columns).unwrap();
+            finish_structural_edit(&mut app);
+            let document = app.active.document.as_mut().unwrap();
+            let row = document.data_start;
+            let column = document.total_columns - 1;
+            document.begin_cell_edit(row, column, Vec::new()).unwrap();
+            document.cell_edit.as_mut().unwrap().draft = "new value".into();
+            document.commit_edits();
+            let destination = directory.path().join("saved.csv");
+            document.start_save_as(destination.clone()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while document.poll_save().unwrap().is_none() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                fs::read_to_string(destination).unwrap(),
+                if bytes.is_empty() {
+                    ",,new value\n,,\n"
+                } else {
+                    "A,B,,\n,,,new value\n,,,\n"
+                }
+            );
+            assert_eq!(fs::read(&source).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn insertion_positions_counts_and_hidden_reordered_columns_are_explicit() {
+        for invalid in ["", "0", "-1", "1.5", "18446744073709551616"] {
+            assert!(super::parse_insertion_count(invalid).is_err());
+            assert!(super::parse_insertion_position(invalid, 3).is_err());
+        }
+        assert_eq!(super::parse_insertion_position("4", 3).unwrap(), 3);
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let original = b"A,B,C\none,two,three\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.active.header_mode = super::HeaderMode::FirstRow;
+        app.open_path(source.clone()).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_mut().unwrap();
+        document.move_column(2, 0).unwrap();
+        document.set_column_shown(1, false).unwrap();
+        let mut columns = StructuralDialog::insert_columns(1);
+        columns.separator = "New".into();
+        document.insert_columns_from_dialog(&columns).unwrap();
+        finish_structural_edit(&mut app);
+        let document = app.active.document.as_ref().unwrap();
+        assert_eq!(document.columns.order, [0, 1, 2, 3]);
+        assert_eq!(document.columns.visible, [0, 1, 2, 3]);
+        assert_eq!(
+            fs::read_to_string(document.session.path()).unwrap(),
+            "A,New,B,C\none,,two,three\n"
+        );
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn insertion_requires_clear_filter_and_completed_index_without_losing_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        fs::write(&source, b"A,B\none,two\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        let document = app.active.document.as_mut().unwrap();
+        assert!(
+            document
+                .insert_rows_from_dialog(&StructuralDialog::insert_rows(0))
+                .is_err()
+        );
+        finish_index(document);
+        document
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"one".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        assert!(
+            document
+                .insert_rows_from_dialog(&StructuralDialog::insert_rows(0))
+                .is_err()
+        );
+        assert!(
+            document
+                .insert_columns_from_dialog(&StructuralDialog::insert_columns(0))
+                .is_err()
+        );
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read(source).unwrap(), b"A,B\none,two\n");
+    }
+
+    #[test]
+    fn insertion_dialog_controls_are_accessible_and_invalid_submission_is_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        fs::write(&source, b"A,B\n1,x\n").unwrap();
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        finish_index(app.active.document.as_mut().unwrap());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        for rows in [true, false] {
+            let mut dialog = if rows {
+                StructuralDialog::insert_rows(0)
+            } else {
+                StructuralDialog::insert_columns(0)
+            };
+            dialog.count = "0".into();
+            let out = ctx.run(grid_input(), |ctx| {
+                assert_eq!(
+                    show_structural_dialog(
+                        ctx,
+                        &mut dialog,
+                        &mut app.active.sort_match_case,
+                        app.active.document.as_ref().unwrap()
+                    ),
+                    None
+                );
+            });
+            let nodes = out.platform_output.accesskit_update.unwrap().nodes;
+            let label = if rows {
+                "Number of rows"
+            } else {
+                "Number of columns"
+            };
+            assert!(nodes.iter().any(|(_, node)| node.label() == Some(label)));
+            let (_, apply) = nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Insert"))
+                .unwrap();
+            assert!(apply.is_disabled());
+            dialog.count = "1".into();
+            let (action, _) = click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Insert");
+            assert_eq!(action, Some(StructuralDialogAction::Apply));
+        }
+    }
+    #[test]
+    fn insertion_context_menus_use_clicked_file_boundaries() {
+        for (target_label, command, expected) in [
+            (
+                "Select file column 2 (city)",
+                "Insert Columns Before…",
+                StructuralDialog::insert_columns(1),
+            ),
+            (
+                "Select file column 2 (city)",
+                "Insert Columns After…",
+                StructuralDialog::insert_columns(2),
+            ),
+            (
+                "Select row 2",
+                "Insert Rows Above…",
+                StructuralDialog::insert_rows(1),
+            ),
+            (
+                "Select row 2",
+                "Insert Rows Below…",
+                StructuralDialog::insert_rows(2),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("menu.csv");
+            fs::write(&source, b"name,city\nAda,London\nGrace,Arlington\n").unwrap();
+            let mut document = Document::open(
+                &source,
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            finish_index(&mut document);
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let target = grid_control_id(&ctx, target_label, &mut document);
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::ShowContextMenu,
+                            target,
+                            data: None,
+                        },
+                    )],
+                    ..grid_input()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_grid(ui, &mut document).unwrap();
+                    });
+                },
+            );
+            let menu = render_grid(&ctx, &mut document);
+            let tree = menu.platform_output.accesskit_update.unwrap();
+            let (target, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(command))
+                .unwrap();
+            assert!(!node.is_disabled());
+            let target = *target;
+            let mut request = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Click,
+                            target,
+                            data: None,
+                        },
+                    )],
+                    ..grid_input()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        request = show_grid(ui, &mut document).unwrap();
+                    });
+                },
+            );
+            assert_eq!(request, Some(GridColumnRequest::Dialog(expected)));
+        }
     }
 }
