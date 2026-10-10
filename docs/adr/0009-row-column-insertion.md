@@ -21,11 +21,14 @@ defines the current physical row order. Materialization resets column visibility
 and order, as existing structural operations do.
 
 Rows use a cancellable count pass followed by a guarded save-worker copy.
-Retain one bounded record and reuse a blank row buffer; write the count without
+Stream untouched source records directly from a fixed read chunk, including
+records larger than the rewrite limit. Retain one bounded record only for
+pending value edits and reuse a blank row buffer; write the count without
 allocating a list of rows. Preserve raw records except pending edits, BOM
 relocation before a first headerless row, and a required final separator.
 Use the first record's newline style, with CRLF when needed to preserve a final
-literal carriage return. Enforce the output record limit after adding a separator.
+literal carriage return. Inserting before record zero determines its ending
+with a bounded scanner peek and rewind, without retaining that record. Enforce the output record limit after adding a separator.
 
 Columns use the existing streaming field transformation. Insert blank values and
 optional header names, pad short records to the known source width, and retain

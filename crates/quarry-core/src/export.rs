@@ -2985,7 +2985,52 @@ fn write_blank_rows(
     Ok(Some(written))
 }
 
-/// Streams source records once after the guarded count pass; retains raw bytes outside edits.
+/// Determines the first record's ending without retaining an oversized record.
+fn insertion_record_ending(
+    source: &mut File,
+    delimiter: u8,
+    chunk: &mut [u8],
+    shared: &SharedState,
+) -> Result<Option<&'static [u8]>, QuarryError> {
+    let start = source.stream_position()?;
+    let mut scanner = RecordScanner::new(delimiter)?;
+    let mut offset = 0_u64;
+    let mut previous_byte = None;
+    let ending = loop {
+        if shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let read = source.read(chunk)?;
+        if read == 0 {
+            break b"\n".as_slice();
+        }
+        let mut first_ending = None;
+        scanner.scan_chunk(&chunk[..read], offset, |end| {
+            if first_ending.is_none() {
+                let local_end = (end - offset) as usize;
+                let before_lf = if local_end > 1 {
+                    Some(chunk[local_end - 2])
+                } else {
+                    previous_byte
+                };
+                first_ending = Some(if before_lf == Some(b'\r') {
+                    b"\r\n".as_slice()
+                } else {
+                    b"\n".as_slice()
+                });
+            }
+        })?;
+        if let Some(ending) = first_ending {
+            break ending;
+        }
+        previous_byte = chunk[..read].last().copied();
+        offset += read as u64;
+    };
+    source.seek(SeekFrom::Start(start))?;
+    Ok(Some(ending))
+}
+
+/// Streams untouched records directly; only pending value edits use a bounded buffer.
 #[allow(clippy::too_many_arguments)]
 fn copy_with_inserted_rows(
     source: &mut File,
@@ -3004,70 +3049,122 @@ fn copy_with_inserted_rows(
     let mut absolute_start = 0_u64;
     let mut row_number = 0_u64;
     let mut inserted = false;
-    let mut ending = b"\n".to_vec();
+    // Insertion before record zero needs its ending before any source bytes are
+    // copied. Peek with the same bounded chunk, then rewind; other positions
+    // learn the ending while streaming the first record.
+    let mut ending = if insertion.position == 0 {
+        let Some(ending) = insertion_record_ending(source, delimiter, &mut chunk, shared)? else {
+            return Ok(None);
+        };
+        ending.to_vec()
+    } else {
+        b"\n".to_vec()
+    };
     let mut last_terminated = true;
     let mut last_record_bytes = 0_u64;
     let mut last_trailing_cr = false;
     let mut bytes_written = 0_u64;
     {
-        let mut write_record = |record: &[u8]| -> Result<bool, QuarryError> {
+        let mut record_started = false;
+        let mut source_tail = None;
+        let mut previous_source_byte = None;
+        let mut record_output_bytes = 0_u64;
+        let mut bom_bytes_to_skip = if insertion.position == 0 && source_had_bom {
+            UTF8_BOM.len()
+        } else {
+            0
+        };
+        let mut write_segment = |segment: &[u8], finished: bool| -> Result<bool, QuarryError> {
             if shared.cancel_requested.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            if record.len() > config.max_record_bytes {
-                return Err(QuarryError::RecordTooLarge {
-                    limit: config.max_record_bytes,
-                });
+            if segment.is_empty() && !finished {
+                return Ok(true);
             }
-            if row_number == 0 && record.ends_with(b"\r\n") {
-                ending = b"\r\n".to_vec();
+            if !record_started {
+                if row_number == insertion.position {
+                    let prefix = if row_number == 0 && source_had_bom {
+                        UTF8_BOM
+                    } else {
+                        &[]
+                    };
+                    let Some(written) =
+                        write_blank_rows(output, insertion, delimiter, &ending, prefix, shared)?
+                    else {
+                        return Ok(false);
+                    };
+                    bytes_written = bytes_written.saturating_add(written);
+                    inserted = true;
+                }
+                record_started = true;
             }
-            if row_number == insertion.position {
-                let prefix = if row_number == 0 && source_had_bom {
-                    UTF8_BOM
-                } else {
-                    &[]
-                };
-                let Some(written) =
-                    write_blank_rows(output, insertion, delimiter, &ending, prefix, shared)?
-                else {
-                    return Ok(false);
-                };
-                bytes_written = bytes_written.saturating_add(written);
-                inserted = true;
+            for byte in segment.iter().rev().take(2).rev() {
+                previous_source_byte = source_tail;
+                source_tail = Some(*byte);
             }
-            let raw = if row_number == 0 && inserted && source_had_bom {
-                record.strip_prefix(UTF8_BOM).unwrap_or(record)
+            let rewrite = row_number == 0 && !edits.headers.is_empty()
+                || edits
+                    .cells
+                    .range((row_number, 0)..=(row_number, usize::MAX))
+                    .next()
+                    .is_some();
+            if rewrite {
+                if record.len().saturating_add(segment.len()) > config.max_record_bytes {
+                    return Err(QuarryError::RecordTooLarge {
+                        limit: config.max_record_bytes,
+                    });
+                }
+                record.extend_from_slice(segment);
+                if finished {
+                    let raw = if row_number == 0 && inserted && source_had_bom {
+                        record.strip_prefix(UTF8_BOM).unwrap_or(&record)
+                    } else {
+                        &record
+                    };
+                    let written = write_saved_record(
+                        output,
+                        raw,
+                        row_number,
+                        delimiter,
+                        has_header,
+                        edits,
+                        config.max_record_bytes,
+                    )?;
+                    record_output_bytes = written.bytes_written;
+                    bytes_written = bytes_written.saturating_add(written.bytes_written);
+                }
             } else {
-                record
-            };
-            let written = write_saved_record(
-                output,
-                raw,
-                row_number,
-                delimiter,
-                has_header,
-                edits,
-                config.max_record_bytes,
-            )?;
-            // A BOM-only source represents one empty record. Relocating its BOM
-            // must not make that final zero-byte record disappear.
-            let preserved_empty_record = raw.is_empty() && written.bytes_written == 0;
-            if preserved_empty_record {
-                output.write_all(&ending)?;
+                let skip = segment.len().min(bom_bytes_to_skip);
+                bom_bytes_to_skip -= skip;
+                let raw = &segment[skip..];
+                output.write_all(raw)?;
+                record_output_bytes = record_output_bytes.saturating_add(raw.len() as u64);
+                bytes_written = bytes_written.saturating_add(raw.len() as u64);
             }
-            bytes_written = bytes_written
-                .saturating_add(written.bytes_written)
-                .saturating_add(if preserved_empty_record {
-                    ending.len() as u64
-                } else {
-                    0
-                });
+            if finished {
+                if row_number == 0
+                    && source_tail == Some(b'\n')
+                    && previous_source_byte == Some(b'\r')
+                {
+                    ending = b"\r\n".to_vec();
+                }
+                // Relocating a BOM-only record must retain its empty record.
+                let preserved_empty_record = record_output_bytes == 0;
+                if preserved_empty_record {
+                    output.write_all(&ending)?;
+                    bytes_written = bytes_written.saturating_add(ending.len() as u64);
+                }
+                last_terminated = source_tail == Some(b'\n') || preserved_empty_record;
+                last_record_bytes = record_output_bytes;
+                last_trailing_cr = source_tail == Some(b'\r');
+                row_number += 1;
+                record.clear();
+                record_started = false;
+                record_output_bytes = 0;
+                source_tail = None;
+                previous_source_byte = None;
+            }
             shared.bytes_written.store(bytes_written, Ordering::Release);
-            last_terminated = record.ends_with(b"\n") || preserved_empty_record;
-            last_record_bytes = written.bytes_written;
-            last_trailing_cr = record.ends_with(b"\r");
-            row_number += 1;
             Ok(true)
         };
         loop {
@@ -3078,15 +3175,10 @@ fn copy_with_inserted_rows(
             let mut deferred_error = None;
             let mut cancelled = false;
             if read == 0 {
-                scanner.finish(absolute_start, |_| {
-                    if deferred_error.is_none() {
-                        match write_record(&record) {
-                            Ok(true) => {}
-                            Ok(false) => cancelled = true,
-                            Err(error) => deferred_error = Some(error),
-                        }
-                    }
-                    record.clear();
+                scanner.finish(absolute_start, |_| match write_segment(&[], true) {
+                    Ok(true) => {}
+                    Ok(false) => cancelled = true,
+                    Err(error) => deferred_error = Some(error),
                 })?;
                 if let Some(error) = deferred_error {
                     return Err(error);
@@ -3100,22 +3192,12 @@ fn copy_with_inserted_rows(
             let scan_result = scanner.scan_chunk(&chunk[..read], absolute_start, |end| {
                 let local_end = (end - absolute_start) as usize;
                 if deferred_error.is_none() && !cancelled {
-                    if record.len().saturating_add(local_end - segment_start)
-                        > config.max_record_bytes
-                    {
-                        deferred_error = Some(QuarryError::RecordTooLarge {
-                            limit: config.max_record_bytes,
-                        });
-                    } else {
-                        record.extend_from_slice(&chunk[segment_start..local_end]);
-                        match write_record(&record) {
-                            Ok(true) => {}
-                            Ok(false) => cancelled = true,
-                            Err(error) => deferred_error = Some(error),
-                        }
+                    match write_segment(&chunk[segment_start..local_end], true) {
+                        Ok(true) => {}
+                        Ok(false) => cancelled = true,
+                        Err(error) => deferred_error = Some(error),
                     }
                 }
-                record.clear();
                 segment_start = local_end;
             });
             if let Some(error) = deferred_error {
@@ -3125,12 +3207,9 @@ fn copy_with_inserted_rows(
                 return Ok(None);
             }
             scan_result?;
-            if record.len().saturating_add(read - segment_start) > config.max_record_bytes {
-                return Err(QuarryError::RecordTooLarge {
-                    limit: config.max_record_bytes,
-                });
+            if !write_segment(&chunk[segment_start..read], false)? {
+                return Ok(None);
             }
-            record.extend_from_slice(&chunk[segment_start..read]);
             absolute_start += read as u64;
             shared
                 .bytes_scanned
@@ -7684,6 +7763,95 @@ mod tests {
             fs::remove_dir_all(source.parent().unwrap()).unwrap();
         }
     }
+    #[test]
+    fn inserted_rows_stream_oversized_untouched_records_but_bound_edits() {
+        for chunk_bytes in [1, 2, 7, 32] {
+            for (original, positions, ending) in [
+                (
+                    b"\"long\nvalue\",x\r\n2,y\r\n".as_slice(),
+                    vec![0, 1, 2],
+                    b",\r\n".as_slice(),
+                ),
+                (
+                    b"\xEF\xBB\xBF\"long\nvalue\",x\r\n2,y".as_slice(),
+                    vec![0, 1],
+                    b",\r\n".as_slice(),
+                ),
+                (b"\"long\nvalue\",x".as_slice(), vec![0], b",\n".as_slice()),
+            ] {
+                for position in positions {
+                    let source = fixture(original);
+                    let out = destination(&source, "streamed.csv");
+                    let run = |cells| {
+                        let session = session(&source, b',', HeaderMode::NoHeader);
+                        SaveAsJob::start_worker_with_row_insertion(
+                            source.clone(),
+                            session.file_size,
+                            b',',
+                            false,
+                            SaveEdits {
+                                headers: BTreeMap::new(),
+                                cells,
+                                transformation: None,
+                            },
+                            None,
+                            vec![],
+                            Some(super::RowInsertion {
+                                position,
+                                count: 1,
+                                width: 2,
+                            }),
+                            SaveTarget::WorkingCopy(out.clone(), session.source_stamp),
+                            ExportConfig {
+                                chunk_bytes,
+                                max_record_bytes: 8,
+                            },
+                        )
+                        .unwrap()
+                        .wait()
+                    };
+                    assert!(matches!(
+                        run(BTreeMap::new()).unwrap(),
+                        SaveAsOutcome::Complete(_)
+                    ));
+                    let marker = if original.starts_with(super::UTF8_BOM) {
+                        3
+                    } else {
+                        0
+                    };
+                    let boundary = if position == 0 {
+                        marker
+                    } else if position == 1 {
+                        original.windows(2).position(|w| w == b"\r\n").unwrap() + 2
+                    } else {
+                        original.len()
+                    };
+                    let mut expected = original[..boundary].to_vec();
+                    expected.extend_from_slice(ending);
+                    expected.extend_from_slice(&original[boundary..]);
+                    assert_eq!(fs::read(&out).unwrap(), expected);
+                    fs::remove_file(&out).unwrap();
+                    assert!(matches!(
+                        run(BTreeMap::from([((0, 0), b"edited".to_vec())])),
+                        Err(QuarryError::RecordTooLarge { limit: 8 })
+                    ));
+                    assert!(!out.exists());
+                    assert_eq!(fs::read(&source).unwrap(), original);
+                    assert!(
+                        fs::read_dir(source.parent().unwrap())
+                            .unwrap()
+                            .all(|entry| !entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".quarry-export-"))
+                    );
+                    fs::remove_dir_all(source.parent().unwrap()).unwrap();
+                }
+            }
+        }
+    }
+
     #[test]
     fn insertion_progress_reports_the_count_pass_and_output_allowance() {
         let source = fixture(b"A,B\n1,x\n2,y\n");

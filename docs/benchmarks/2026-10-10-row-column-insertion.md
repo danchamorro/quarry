@@ -124,3 +124,13 @@ The review follow-up exposes separate counting progress, a conservative output
 allowance and written-byte progress, including while blank rows precede source
 copying. New engine/UI regressions bring the passing workspace total to **380**
 (184 core, 155 egui). The empty forced-header message now describes an empty file.
+
+A subsequent CodeRabbit review found that unchanged source records were still
+entering the bounded rewrite buffer during row insertion. The copy path now
+streams them directly and buffers only pending edits. A regression uses a small
+configured limit with oversized quoted/multiline records, CRLF, BOM, terminated
+and unterminated sources, insertion before/between/after records, and chunk sizes
+1/2/7/32. Exact output is checked; editing an oversized record still fails safely
+without publishing output. The existing appended-separator limit remains tested.
+All 381 workspace tests, strict workspace Clippy and formatting passed after
+this streaming correction inside VMPal.

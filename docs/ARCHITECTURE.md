@@ -692,7 +692,8 @@ hashes, and successful destination reopen checks.
 
 [ADR 0009](adr/0009-row-column-insertion.md) defines physical insertion boundaries.
 Row insertion uses the guarded save worker with a fixed read chunk, one bounded
-record and one reusable blank row. A cancellable count pass validates the boundary;
+record for pending value edits and one reusable blank row. Untouched source
+records stream directly, including records above the rewrite limit. A cancellable count pass validates the boundary;
 the copy pass retains original bytes except pending edits and any separator
 needed before appended rows. Column insertion is a normal bounded field
 transformation and pads short records without dropping late fields. Neither
