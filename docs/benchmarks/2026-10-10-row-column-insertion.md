@@ -116,3 +116,11 @@ not cancellation-latency measurements.
 The fixture is smaller than VM RAM. This validates bounded behavior for this
 workload, without a new 50 GB or cold-cache claim. Output size governs temporary
 disk use; existing preflight accounts for working output and retained history.
+
+
+## Review follow-up
+
+The review follow-up exposes separate counting progress, a conservative output
+allowance and written-byte progress, including while blank rows precede source
+copying. New engine/UI regressions bring the passing workspace total to **380**
+(184 core, 155 egui). The empty forced-header message now describes an empty file.

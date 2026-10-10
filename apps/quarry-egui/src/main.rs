@@ -34,9 +34,9 @@ use quarry_core::{
     FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
     IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
     QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome,
-    SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection, SortJob,
-    SortMode, SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
-    estimate_sort_temporary_bytes,
+    SaveAsProgress, SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection,
+    SortJob, SortMode, SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
+    StructuralIndex, estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
 
@@ -5038,6 +5038,53 @@ struct StructuralProgressDisplay {
     animate: bool,
 }
 
+/// Count first, then show written bytes against the conservative output allowance.
+fn materialization_progress(
+    progress: SaveAsProgress,
+    operation: &str,
+) -> StructuralProgressDisplay {
+    if progress.done {
+        StructuralProgressDisplay {
+            fraction: 1.0,
+            label: format!("{operation} · complete"),
+            animate: false,
+        }
+    } else if progress.preparing {
+        let counted = progress_fraction(
+            progress.preparation_bytes_scanned,
+            progress.total_bytes,
+            false,
+        );
+        StructuralProgressDisplay {
+            fraction: 0.2 * counted,
+            label: format!("{operation} · counting {:.1}%", counted * 100.0),
+            animate: progress.preparation_bytes_scanned == 0,
+        }
+    } else if progress.estimated_output_bytes == 0 {
+        StructuralProgressDisplay {
+            fraction: 0.0,
+            label: format!("{operation} · preparing…"),
+            animate: true,
+        }
+    } else {
+        StructuralProgressDisplay {
+            fraction: (0.2
+                + 0.8
+                    * progress_fraction(
+                        progress.bytes_written,
+                        progress.estimated_output_bytes,
+                        false,
+                    ))
+            .min(0.99),
+            label: format!(
+                "{operation} · {} written",
+                format_bytes(progress.bytes_written)
+            ),
+            animate: progress.bytes_written == 0,
+        }
+    }
+}
+
 fn sort_progress(
     preparing: bool,
     preparation_bytes_scanned: u64,
@@ -6539,13 +6586,10 @@ impl Document {
                 )
             }
             StructuralJob::Materializing { job, .. } => {
-                let progress = job.progress();
-                (
-                    progress.bytes_scanned,
-                    progress.total_bytes,
-                    progress.done,
+                return Some(materialization_progress(
+                    job.progress(),
                     "Applying column edit",
-                )
+                ));
             }
             StructuralJob::Replacing { job, .. } => {
                 let progress = job.progress();
@@ -6567,13 +6611,7 @@ impl Document {
                 ));
             }
             StructuralJob::InsertingRows { job, .. } => {
-                let progress = job.progress();
-                (
-                    progress.bytes_scanned,
-                    progress.total_bytes,
-                    progress.done,
-                    "Inserting rows",
-                )
+                return Some(materialization_progress(job.progress(), "Inserting rows"));
             }
             StructuralJob::DeletingRows { job, .. } => {
                 let progress = job.progress();
@@ -20816,5 +20854,34 @@ mod tests {
             );
             assert_eq!(request, Some(GridColumnRequest::Dialog(expected)));
         }
+    }
+    #[test]
+    fn insertion_progress_tracks_counting_and_writing_before_source_copy() {
+        let mut progress = super::SaveAsProgress {
+            preparing: true,
+            preparation_bytes_scanned: 50,
+            estimated_output_bytes: 0,
+            bytes_scanned: 0,
+            bytes_written: 0,
+            total_bytes: 100,
+            elapsed: Duration::ZERO,
+            done: false,
+            cancelled: false,
+        };
+        let counted = super::materialization_progress(progress, "Inserting rows");
+        assert_eq!(counted.fraction, 0.1);
+        assert!(counted.label.contains("counting 50.0%"));
+        progress.preparing = false;
+        progress.estimated_output_bytes = 1_000;
+        progress.bytes_written = 500;
+        let writing = super::materialization_progress(progress, "Inserting rows");
+        assert!((writing.fraction - 0.6).abs() < 0.001);
+        assert!(writing.label.contains("500.00 B written"));
+        assert!(!writing.animate);
+        progress.done = true;
+        assert_eq!(
+            super::materialization_progress(progress, "Inserting rows").fraction,
+            1.0
+        );
     }
 }

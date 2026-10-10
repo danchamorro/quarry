@@ -21,7 +21,7 @@ use crate::filter::{
     FilterQuery, PredicateMatcher, compile_matchers, matching_fields, predicate_groups,
     validate_query,
 };
-use crate::storage::{check_storage, count_records, output_parent, storage_error};
+use crate::storage::{check_storage, output_parent, storage_error};
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
     SourceStamp,
@@ -80,6 +80,11 @@ pub enum SaveAsOutcome {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SaveAsProgress {
+    /// Counting phase before a structural write; independent of copy progress.
+    pub preparing: bool,
+    pub preparation_bytes_scanned: u64,
+    /// Conservative output allowance, available after counting.
+    pub estimated_output_bytes: u64,
     pub bytes_scanned: u64,
     pub bytes_written: u64,
     pub total_bytes: u64,
@@ -661,6 +666,9 @@ fn split_field(field: &[u8], separator: &[u8], output_count: usize) -> Vec<Vec<u
 }
 
 struct SharedState {
+    preparing: AtomicBool,
+    preparation_bytes_scanned: AtomicU64,
+    estimated_output_bytes: AtomicU64,
     bytes_scanned: AtomicU64,
     rows_scanned: AtomicU64,
     rows_written: AtomicU64,
@@ -677,6 +685,9 @@ struct SharedState {
 impl SharedState {
     fn new(total_bytes: u64) -> Self {
         Self {
+            preparing: AtomicBool::new(false),
+            preparation_bytes_scanned: AtomicU64::new(0),
+            estimated_output_bytes: AtomicU64::new(0),
             bytes_scanned: AtomicU64::new(0),
             rows_scanned: AtomicU64::new(0),
             rows_written: AtomicU64::new(0),
@@ -1378,6 +1389,12 @@ impl SaveAsJob {
                 .is_some_and(|publication| publication.is_ready());
         let finished_nanos = self.shared.finished_nanos.load(Ordering::Acquire);
         SaveAsProgress {
+            preparing: self.shared.preparing.load(Ordering::Acquire),
+            preparation_bytes_scanned: self
+                .shared
+                .preparation_bytes_scanned
+                .load(Ordering::Acquire),
+            estimated_output_bytes: self.shared.estimated_output_bytes.load(Ordering::Acquire),
             bytes_scanned: self.shared.bytes_scanned.load(Ordering::Acquire),
             bytes_written: self.shared.bytes_written.load(Ordering::Acquire),
             total_bytes: self.shared.total_bytes,
@@ -2596,7 +2613,18 @@ fn run_save_as(
         || edits.replacement.is_some()
         || edits.inserted_rows.is_some()
     {
-        let Some(records) = count_records(&mut source, delimiter, &shared.cancel_requested)? else {
+        shared.preparing.store(true, Ordering::Release);
+        let Some(records) = crate::storage::count_records_with_progress(
+            &mut source,
+            delimiter,
+            &shared.cancel_requested,
+            |bytes| {
+                shared
+                    .preparation_bytes_scanned
+                    .store(bytes, Ordering::Release);
+            },
+        )?
+        else {
             return Ok(SaveWorkerOutcome::Cancelled);
         };
         records
@@ -2632,6 +2660,10 @@ fn run_save_as(
             .map_or(0, RowInsertion::additional_output_bytes),
     );
     check_storage(output_parent(&output.destination), required)?;
+    shared
+        .estimated_output_bytes
+        .store(required, Ordering::Release);
+    shared.preparing.store(false, Ordering::Release);
     let copied = if let Some(insertion) = edits.inserted_rows {
         copy_with_inserted_rows(
             &mut source,
@@ -7651,5 +7683,37 @@ mod tests {
             );
             fs::remove_dir_all(source.parent().unwrap()).unwrap();
         }
+    }
+    #[test]
+    fn insertion_progress_reports_the_count_pass_and_output_allowance() {
+        let source = fixture(b"A,B\n1,x\n2,y\n");
+        let out = destination(&source, "progress.csv");
+        let job = session(&source, b',', HeaderMode::FirstRow)
+            .start_create_working_copy_inserting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                super::RowInsertion {
+                    position: 1,
+                    count: 100,
+                    width: 2,
+                },
+                &out,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.progress().done {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let progress = job.progress();
+        assert!(!progress.preparing);
+        assert_eq!(
+            progress.preparation_bytes_scanned,
+            fs::metadata(&source).unwrap().len()
+        );
+        assert!(progress.bytes_written > 100);
+        assert!(progress.estimated_output_bytes >= progress.bytes_written);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        fs::remove_dir_all(source.parent().unwrap()).unwrap();
     }
 }

@@ -60,7 +60,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("unknown benchmark mode".into()),
     };
     let mut cancellation_requested = false;
+    let mut saw_counting = false;
+    let mut saw_writing = false;
     while !job.progress().done {
+        let phase = job.progress();
+        saw_counting |= phase.preparing && phase.preparation_bytes_scanned > 0;
+        saw_writing |= !phase.preparing && phase.bytes_written > 0;
         if args[3].starts_with("cancel-")
             && !cancellation_requested
             && job.progress().bytes_written >= 1_048_576
@@ -72,6 +77,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let progress = job.progress();
     let outcome = job.wait()?;
+    println!(
+        "counted={} estimated={} saw_counting={} saw_writing={}",
+        progress.preparation_bytes_scanned,
+        progress.estimated_output_bytes,
+        saw_counting,
+        saw_writing
+    );
     println!(
         "mode={} seconds={:.6} scanned={} written={} cancel_requested={} outcome={:?}",
         args[3],

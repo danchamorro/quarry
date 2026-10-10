@@ -215,7 +215,7 @@ numbered column and choose **Insert Columns Before… / After…**.
 2. For a file with headers, optionally name the first new column. Additional
    names start blank and can be renamed directly in the grid.
 3. Choose **Insert**. Larger operations first check temporary storage; choose
-   **Continue** once the check passes. Progress and **Cancel** appear in the footer.
+   **Continue** once the check passes. Counting progress, written bytes and **Cancel** appear in the footer.
 4. Edit new cells as usual. Use **Row → Go** to reach rows added farther down
    the file. Choose **Save** to update the source or **Save As…** for a new file.
 
