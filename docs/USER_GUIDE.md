@@ -124,6 +124,8 @@ changes offer Save, Save As, Keep Editing, or Discard. Active file operations
 finish before the tab closes; you can keep editing or cancel the operation.
 Quitting reviews every document. Cancelling any quit prompt retains all tabs and
 their edits, including earlier discard approvals. Files already saved stay saved.
+If Combine Files is open, quit keeps its selections and running operation intact.
+Explicitly close that dialog (or cancel its operation) before quitting.
 
 Quarry supports eight open tabs and two simultaneous save/export/reshape
 operations. If you reach a limit, close a tab or wait for/cancel an operation.

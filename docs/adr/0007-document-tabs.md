@@ -34,6 +34,9 @@ operations, with Keep Editing and cancellation controls. Quit reviews every tab.
 Discard approvals during quit do not release documents until the whole quit is
 approved, so cancelling a later prompt retains every tab and its Undo history.
 Successfully saved files remain saved if quit is subsequently cancelled.
+An open Combine Files dialog blocks quit with a visible explanation, retaining
+its selections, checked plan and running operation. Closing that dialog or
+cancelling its job requires an explicit dialog action before document quit review.
 
 If a completed in-place save cannot be reopened, its stale document is released.
 An inactive empty tab is removed and its saved-path/reopen error is shown on the

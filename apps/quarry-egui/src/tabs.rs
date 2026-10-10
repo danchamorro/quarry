@@ -405,11 +405,7 @@ impl QuarryApp {
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         if let Some(dialog) = self.combine_files.as_mut() {
-            if dialog.busy() {
-                dialog.cancel();
-            } else {
-                self.combine_files = None;
-            }
+            dialog.preserve_for_quit();
             return;
         }
         if self.quit_pending {

@@ -42,6 +42,22 @@ impl Default for CombineDialog {
 }
 
 impl CombineDialog {
+    /// Blocks implicit quit without changing selections, plans or running operations.
+    /// Users must explicitly close this dialog or cancel its operation before quitting.
+    pub(super) fn preserve_for_quit(&mut self) {
+        let warning = "Close Combine Files before quitting Quarry. Your selected files and running operation are kept.";
+        if self
+            .message
+            .as_ref()
+            .is_none_or(|message| !message.contains(warning))
+        {
+            self.message = Some(self.message.take().map_or_else(
+                || warning.to_owned(),
+                |message| format!("{warning}\n{message}"),
+            ));
+        }
+    }
+
     pub(super) fn busy(&self) -> bool {
         self.checking.is_some() || self.writing.is_some() || self.storage_check.is_some()
     }
@@ -477,6 +493,88 @@ mod tests {
         );
         assert_eq!(dialog.paths[1], first);
         assert!(dialog.message.is_none());
+    }
+
+    #[test]
+    fn native_quit_retains_combine_selections_checks_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.csv");
+        let b = dir.path().join("b.csv");
+        fs::write(&a, b"ID,Name\n1,a\n").unwrap();
+        fs::write(&b, b"ID,Name\n2,b\n").unwrap();
+        for stage in 0..3 {
+            let ctx = egui::Context::default();
+            let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
+            app.active
+                .document
+                .as_mut()
+                .unwrap()
+                .rename_header(0, "Unsaved".into())
+                .unwrap();
+            app.open_combine_files();
+            let dialog = app.combine_files.as_mut().unwrap();
+            dialog.delimiter = DelimiterMode::Comma;
+            dialog.add_paths(vec![b.clone(), a.clone()]);
+            let out = dir.path().join(format!("out-{stage}.csv"));
+            if stage > 0 {
+                dialog.start_check();
+            }
+            if stage == 2 {
+                finish(dialog);
+                dialog.prepare_destination(out.clone());
+                finish(dialog);
+                dialog.start_write();
+            }
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let output = ctx.run(input, |ctx| {
+                eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+            });
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::CancelClose)
+            );
+            assert!(!app.quit_pending);
+            assert!(!app.quit_authorized);
+            let dialog = app.combine_files.as_mut().unwrap();
+            assert_eq!(dialog.paths, vec![b.clone(), a.clone()]);
+            assert_eq!(dialog.delimiter, DelimiterMode::Comma);
+            assert!(dialog.has_header);
+            assert!(!dialog.cancel_requested);
+            assert!(
+                dialog
+                    .message
+                    .as_ref()
+                    .unwrap()
+                    .contains("Close Combine Files before quitting")
+            );
+            finish(dialog);
+            if stage > 0 {
+                assert_eq!(dialog.plan.as_ref().unwrap().data_rows, 2);
+            }
+            if stage == 2 {
+                assert!(dialog.result.is_some());
+                assert_eq!(fs::read(&out).unwrap(), b"ID,Name\n2,b\n1,a\n");
+            }
+            app.keep_editing();
+            assert_eq!(
+                app.combine_files.as_ref().unwrap().paths,
+                vec![b.clone(), a.clone()]
+            );
+            assert_eq!(
+                app.active.document.as_ref().unwrap().column_name(0),
+                "Unsaved"
+            );
+            assert!(app.active.document.as_ref().unwrap().can_undo());
+        }
+        assert_eq!(fs::read(&a).unwrap(), b"ID,Name\n1,a\n");
+        assert_eq!(fs::read(&b).unwrap(), b"ID,Name\n2,b\n");
     }
 
     #[test]

@@ -137,7 +137,7 @@ header field replaced:
 
 ## Deterministic and CI validation
 
-Formatting, strict workspace Clippy, 352 workspace tests (including 144 egui
+Formatting, strict workspace Clippy, 353 workspace tests (including 145 egui
 tests), and release workspace builds passed locally. Regression coverage includes
 per-tab drafts/selection/history, live independent filters, background save and
 structural completion ownership, temporary-file cleanup, duplicate hard links,
