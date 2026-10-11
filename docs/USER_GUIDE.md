@@ -202,6 +202,42 @@ rather than a continuous source-row range.
 A copied row is serialized as tab-separated text in the underlying file-column
 order, including columns hidden in the current view. Copy is limited to 64 MiB.
 
+### Add rows and columns
+
+Choose **Insert → Rows…** or **Insert → Columns…** in the toolbar. You can also
+right-click a numbered row and choose **Insert Rows Above… / Below…**, or a
+numbered column and choose **Insert Columns Before… / After…**.
+
+1. Set the position and number to insert. Positions start at 1; the dialog shows
+   the position that adds at the end. Row positions count data rows, excluding
+   the header. Column positions follow the numbered **file columns**, including
+   hidden columns.
+2. For a file with headers, optionally name the first new column. Additional
+   names start blank and can be renamed directly in the grid.
+3. Choose **Insert**. Larger operations first check temporary storage; choose
+   **Continue** once the check passes. Counting progress, written bytes and **Cancel** appear in the footer.
+4. Edit new cells as usual. Use **Row → Go** to reach rows added farther down
+   the file. Choose **Save** to update the source or **Save As…** for a new file.
+
+Insertion includes pending cell and header edits and leaves the saved source
+unchanged until Save. **Undo / Redo** reverses or reapplies the insertion using
+the existing one-level structural history; **Discard Changes** restores the last
+opened or saved file. Cancelled or failed insertion preserves the current document.
+
+Wait for indexing and conflicting operations to finish, and clear filters first.
+Rows are inserted in the current physical order, including a prior sort.
+After insertion, the grid shows all columns in file order; view-only hiding and
+reordering are reset. Inserting columns preserves late extra fields in ragged
+rows and pads short records with empty fields to the currently known width.
+New rows use that known width; insertion does not discover the maximum width of
+a ragged file.
+
+Headerless files gain blank values without a new header. Header-only files
+support both operations. To start from an empty file, use **Format… → Header →
+No Header**, add a row (which creates one blank column), then add columns.
+An empty file cannot retain columns until it contains a record. The existing
+64 MiB record and 65,536-column limits apply.
+
 ### Delete rows
 
 1. Click a numbered row gutter to select one data row.

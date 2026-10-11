@@ -26,6 +26,8 @@ impl PendingStorageOperation {
     fn action_name(&self) -> &'static str {
         match self {
             Self::Structural(dialog) => match dialog.request {
+                StructuralRequest::InsertRows => "insert rows",
+                StructuralRequest::InsertColumns => "insert columns",
                 StructuralRequest::Sort => "sort",
                 StructuralRequest::Duplicates => "find duplicates",
                 StructuralRequest::Split => "split columns",
@@ -49,6 +51,16 @@ impl PendingStorageOperation {
         let plain = || document.materialization_storage_estimate(None, None);
         match self {
             Self::Structural(dialog) => match dialog.request {
+                StructuralRequest::InsertRows => document
+                    .row_insertion_from_dialog(dialog)
+                    .map_or(0, |insertion| {
+                        plain().saturating_add(insertion.additional_output_bytes())
+                    }),
+                StructuralRequest::InsertColumns => document
+                    .column_insertion_from_dialog(dialog)
+                    .map_or(0, |transformation| {
+                        document.materialization_storage_estimate(Some(&transformation), None)
+                    }),
                 // Read-only analysis determines the actual padded width before its review.
                 StructuralRequest::Split => 0,
                 StructuralRequest::Sort => {
@@ -496,7 +508,7 @@ impl QuarryApp {
 }
 
 impl Document {
-    fn storage_record_count(&self) -> u64 {
+    pub(super) fn storage_record_count(&self) -> u64 {
         self.index.as_ref().map_or(
             self.session.file_size.saturating_add(1),
             StructuralIndex::indexed_rows,

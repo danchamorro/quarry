@@ -21,7 +21,7 @@ use crate::filter::{
     FilterQuery, PredicateMatcher, compile_matchers, matching_fields, predicate_groups,
     validate_query,
 };
-use crate::storage::{check_storage, count_records, output_parent, storage_error};
+use crate::storage::{check_storage, output_parent, storage_error};
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
     SourceStamp,
@@ -80,6 +80,11 @@ pub enum SaveAsOutcome {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SaveAsProgress {
+    /// Counting phase before a structural write; independent of copy progress.
+    pub preparing: bool,
+    pub preparation_bytes_scanned: u64,
+    /// Conservative output allowance, available after counting.
+    pub estimated_output_bytes: u64,
     pub bytes_scanned: u64,
     pub bytes_written: u64,
     pub total_bytes: u64,
@@ -137,6 +142,13 @@ pub const MAX_TRANSFORMATION_COLUMNS: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnTransformation {
+    /// Insert blank data fields at a zero-based source-column boundary.
+    Insert {
+        source_width: usize,
+        position: usize,
+        count: usize,
+        headers: Option<Vec<Vec<u8>>>,
+    },
     Split {
         source_column: usize,
         separator: Vec<u8>,
@@ -205,6 +217,16 @@ impl ColumnTransformation {
     ) -> Result<Vec<Vec<u8>>, QuarryError> {
         self.validate_input_width(fields.len())?;
         match self {
+            Self::Insert {
+                source_width,
+                position,
+                count,
+                ..
+            } => {
+                fields.resize_with(fields.len().max(*source_width), Vec::new);
+                fields.splice(*position..*position, (0..*count).map(|_| Vec::new()));
+                Ok(fields)
+            }
             Self::Split {
                 source_column,
                 separator,
@@ -297,12 +319,36 @@ impl ColumnTransformation {
                     "join output header requires a headered source",
                 )),
             },
+            Self::Insert { count, headers, .. } => match (has_header, headers) {
+                (true, Some(names)) if names.len() == *count => Ok(()),
+                (false, None) => Ok(()),
+                _ => Err(QuarryError::InvalidOption(
+                    "inserted column names must match the count and source header mode",
+                )),
+            },
             Self::Arrange { .. } => Ok(()),
         }
     }
 
     fn validate_shape(&self) -> Result<(), QuarryError> {
         match self {
+            Self::Insert {
+                source_width,
+                position,
+                count,
+                ..
+            } => {
+                if *count == 0
+                    || *position > *source_width
+                    || source_width
+                        .checked_add(*count)
+                        .is_none_or(|width| width > MAX_TRANSFORMATION_COLUMNS)
+                {
+                    return Err(QuarryError::InvalidOption(
+                        "inserted columns require a valid position, positive count, and supported output width",
+                    ));
+                }
+            }
             Self::Split {
                 source_column,
                 separator,
@@ -400,6 +446,20 @@ impl ColumnTransformation {
                 "source record column count exceeds the supported limit",
             ));
         }
+        if let Self::Insert {
+            source_width,
+            count,
+            ..
+        } = self
+            && input_columns
+                .max(*source_width)
+                .checked_add(*count)
+                .is_none_or(|width| width > MAX_TRANSFORMATION_COLUMNS)
+        {
+            return Err(QuarryError::InvalidOption(
+                "inserted columns exceed the supported record width",
+            ));
+        }
         if let Self::Split {
             source_column,
             output_count,
@@ -421,6 +481,7 @@ impl ColumnTransformation {
 
     fn replaces_source_column(&self, column: usize) -> bool {
         match self {
+            Self::Insert { .. } => false,
             Self::Split { source_column, .. } => column == *source_column,
             Self::Join { source_columns, .. } => source_columns.contains(&column),
             Self::Arrange {
@@ -432,7 +493,7 @@ impl ColumnTransformation {
 
     fn joined_columns(&self) -> BTreeSet<usize> {
         match self {
-            Self::Split { .. } | Self::Arrange { .. } => BTreeSet::new(),
+            Self::Insert { .. } | Self::Split { .. } | Self::Arrange { .. } => BTreeSet::new(),
             Self::Join { source_columns, .. } => source_columns.iter().copied().collect(),
         }
     }
@@ -443,6 +504,24 @@ impl ColumnTransformation {
         joined_columns: &BTreeSet<usize>,
     ) -> Result<Vec<Vec<u8>>, QuarryError> {
         self.validate_input_width(fields.len())?;
+        if let Self::Insert {
+            source_width,
+            position,
+            headers,
+            ..
+        } = self
+        {
+            fields.resize_with(fields.len().max(*source_width), Vec::new);
+            fields.splice(
+                *position..*position,
+                headers
+                    .as_ref()
+                    .expect("header mode is validated")
+                    .iter()
+                    .cloned(),
+            );
+            return Ok(fields);
+        }
         if let Self::Arrange {
             source_width,
             output_columns,
@@ -456,7 +535,9 @@ impl ColumnTransformation {
                 .iter()
                 .max()
                 .expect("join columns are validated"),
-            Self::Arrange { .. } => unreachable!("arrange returned above"),
+            Self::Insert { .. } | Self::Arrange { .. } => {
+                unreachable!("insertion and arrange returned above")
+            }
         };
         fields.resize_with(
             fields.len().max(last_source_column.saturating_add(1)),
@@ -585,6 +666,9 @@ fn split_field(field: &[u8], separator: &[u8], output_count: usize) -> Vec<Vec<u
 }
 
 struct SharedState {
+    preparing: AtomicBool,
+    preparation_bytes_scanned: AtomicU64,
+    estimated_output_bytes: AtomicU64,
     bytes_scanned: AtomicU64,
     rows_scanned: AtomicU64,
     rows_written: AtomicU64,
@@ -601,6 +685,9 @@ struct SharedState {
 impl SharedState {
     fn new(total_bytes: u64) -> Self {
         Self {
+            preparing: AtomicBool::new(false),
+            preparation_bytes_scanned: AtomicU64::new(0),
+            estimated_output_bytes: AtomicU64::new(0),
             bytes_scanned: AtomicU64::new(0),
             rows_scanned: AtomicU64::new(0),
             rows_written: AtomicU64::new(0),
@@ -901,6 +988,41 @@ enum SaveTarget {
     },
 }
 
+/// Blank rows inserted at a boundary in zero-based physical source records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowInsertion {
+    /// Includes the header: use 1 before the first data row with a header,
+    /// or 0 without a header. Use the total source record count to append.
+    /// Position 0 is rejected for files with a header, preserving that header.
+    pub position: u64,
+    /// Positive number of blank data rows to insert.
+    pub count: u64,
+    /// Number of fields in each inserted blank row.
+    pub width: usize,
+}
+
+impl RowInsertion {
+    fn validate(self, has_header: bool) -> Result<(), QuarryError> {
+        if self.position < u64::from(has_header)
+            || self.count == 0
+            || self.width == 0
+            || self.width > MAX_TRANSFORMATION_COLUMNS
+        {
+            return Err(QuarryError::InvalidOption(
+                "row insertion requires a data-row position, positive count, and supported column width",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Conservative extra output for blank rows, a separating newline, and a BOM.
+    pub fn additional_output_bytes(self) -> u64 {
+        self.count
+            .saturating_mul((self.width as u64).saturating_add(1))
+            .saturating_add(5)
+    }
+}
+
 struct SaveEdits {
     headers: BTreeMap<usize, Vec<u8>>,
     cells: BTreeMap<(u64, usize), Vec<u8>>,
@@ -913,6 +1035,7 @@ struct PreparedSaveEdits {
     transformation: Option<PreparedColumnTransformation>,
     replacement: Option<LiteralReplacement>,
     deleted_rows: Vec<RangeInclusive<u64>>,
+    inserted_rows: Option<RowInsertion>,
 }
 
 impl PreparedSaveEdits {
@@ -920,6 +1043,12 @@ impl PreparedSaveEdits {
         let record_too_large = || QuarryError::RecordTooLarge {
             limit: max_record_bytes,
         };
+        if self
+            .inserted_rows
+            .is_some_and(|insertion| insertion.width.saturating_add(1) > max_record_bytes)
+        {
+            return Err(record_too_large());
+        }
         let mut header_clone_bytes = self
             .headers
             .iter()
@@ -983,6 +1112,13 @@ impl PreparedSaveEdits {
                     header_clone_bytes = header_clone_bytes.saturating_add(header.len());
                 }
             }
+            ColumnTransformation::Insert { headers, .. } => {
+                if let Some(headers) = headers {
+                    header_clone_bytes = headers.iter().fold(header_clone_bytes, |sum, name| {
+                        sum.saturating_add(name.len())
+                    });
+                }
+            }
             ColumnTransformation::Arrange { .. } => {}
         }
         (header_clone_bytes <= max_record_bytes)
@@ -1015,6 +1151,7 @@ impl SaveEdits {
                 .transpose()?,
             replacement,
             deleted_rows,
+            inserted_rows: None,
         })
     }
 }
@@ -1113,6 +1250,33 @@ impl SaveAsJob {
         target: SaveTarget,
         config: ExportConfig,
     ) -> Result<Self, QuarryError> {
+        Self::start_worker_with_row_insertion(
+            source_path,
+            file_size,
+            delimiter,
+            has_header,
+            edits,
+            replacement,
+            deleted_rows,
+            None,
+            target,
+            config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_worker_with_row_insertion(
+        source_path: PathBuf,
+        file_size: u64,
+        delimiter: u8,
+        has_header: bool,
+        edits: SaveEdits,
+        replacement: Option<LiteralReplacement>,
+        deleted_rows: Vec<RangeInclusive<u64>>,
+        inserted_rows: Option<RowInsertion>,
+        target: SaveTarget,
+        config: ExportConfig,
+    ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption("save-as chunk must be non-zero"));
         }
@@ -1145,7 +1309,19 @@ impl SaveAsJob {
                 "cell edits must target data rows",
             ));
         }
-        let edits = edits.prepare(has_header, replacement, deleted_rows)?;
+        let mut edits = edits.prepare(has_header, replacement, deleted_rows)?;
+        if let Some(insertion) = inserted_rows {
+            insertion.validate(has_header)?;
+            if !edits.deleted_rows.is_empty()
+                || edits.replacement.is_some()
+                || edits.transformation.is_some()
+            {
+                return Err(QuarryError::InvalidOption(
+                    "row insertion cannot combine with another structural operation",
+                ));
+            }
+            edits.inserted_rows = Some(insertion);
+        }
         edits.validate_size_lower_bounds(config.max_record_bytes)?;
         let source = File::open(&source_path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -1218,6 +1394,12 @@ impl SaveAsJob {
                 .is_some_and(|publication| publication.is_ready());
         let finished_nanos = self.shared.finished_nanos.load(Ordering::Acquire);
         SaveAsProgress {
+            preparing: self.shared.preparing.load(Ordering::Acquire),
+            preparation_bytes_scanned: self
+                .shared
+                .preparation_bytes_scanned
+                .load(Ordering::Acquire),
+            estimated_output_bytes: self.shared.estimated_output_bytes.load(Ordering::Acquire),
             bytes_scanned: self.shared.bytes_scanned.load(Ordering::Acquire),
             bytes_written: self.shared.bytes_written.load(Ordering::Acquire),
             total_bytes: self.shared.total_bytes,
@@ -1438,6 +1620,35 @@ impl Session {
                 cells: cell_edits,
                 transformation: Some(transformation),
             },
+            SaveTarget::WorkingCopy(
+                destination.as_ref().to_path_buf(),
+                self.source_stamp.clone(),
+            ),
+            DEFAULT_EXPORT_CONFIG,
+        )
+    }
+
+    /// Create an unpublished working version with blank rows and existing sparse edits.
+    pub fn start_create_working_copy_inserting_rows(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        insertion: RowInsertion,
+        destination: impl AsRef<Path>,
+    ) -> Result<SaveAsJob, QuarryError> {
+        SaveAsJob::start_worker_with_row_insertion(
+            self.path.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.dialect.has_header,
+            SaveEdits {
+                headers: header_renames,
+                cells: cell_edits,
+                transformation: None,
+            },
+            None,
+            Vec::new(),
+            Some(insertion),
             SaveTarget::WorkingCopy(
                 destination.as_ref().to_path_buf(),
                 self.source_stamp.clone(),
@@ -2403,17 +2614,51 @@ fn run_save_as(
     if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(SaveWorkerOutcome::Cancelled);
     }
-    let records = if edits.transformation.is_some() || edits.replacement.is_some() {
-        let Some(records) = count_records(&mut source, delimiter, &shared.cancel_requested)? else {
+    let records = if edits.transformation.is_some()
+        || edits.replacement.is_some()
+        || edits.inserted_rows.is_some()
+    {
+        shared.preparing.store(true, Ordering::Release);
+        let Some(records) = crate::storage::count_records_with_progress(
+            &mut source,
+            delimiter,
+            &shared.cancel_requested,
+            |bytes| {
+                shared
+                    .preparation_bytes_scanned
+                    .store(bytes, Ordering::Release);
+            },
+        )?
+        else {
             return Ok(SaveWorkerOutcome::Cancelled);
         };
         records
     } else {
         0
     };
+    if let Some(insertion) = edits.inserted_rows {
+        if insertion.position > records || (has_header && records == 0) {
+            return Err(QuarryError::InvalidOption(
+                "row insertion position is outside the source data",
+            ));
+        }
+        if records.checked_add(insertion.count).is_none() {
+            return Err(QuarryError::InvalidOption(
+                "inserted row count exceeds the supported limit",
+            ));
+        }
+    }
+    // Row insertion counts records to validate its boundary, but untouched
+    // records stream verbatim. Reserve whole-source reserialization only for
+    // transformations and replacement, matching the desktop storage preflight.
+    let serialized_records = if edits.transformation.is_some() || edits.replacement.is_some() {
+        records
+    } else {
+        0
+    };
     let required = estimate_edited_output_bytes(
         shared.total_bytes,
-        records,
+        serialized_records,
         &edits.headers,
         &edits.cells,
         edits
@@ -2421,9 +2666,29 @@ fn run_save_as(
             .as_ref()
             .map(|value| &value.transformation),
         edits.replacement.as_ref(),
+    )
+    .saturating_add(
+        edits
+            .inserted_rows
+            .map_or(0, RowInsertion::additional_output_bytes),
     );
     check_storage(output_parent(&output.destination), required)?;
-    let copied = if edits.cells.is_empty()
+    shared
+        .estimated_output_bytes
+        .store(required, Ordering::Release);
+    shared.preparing.store(false, Ordering::Release);
+    let copied = if let Some(insertion) = edits.inserted_rows {
+        copy_with_inserted_rows(
+            &mut source,
+            &mut output,
+            delimiter,
+            has_header,
+            edits,
+            insertion,
+            config,
+            shared,
+        )
+    } else if edits.cells.is_empty()
         && edits.transformation.is_none()
         && edits.replacement.is_none()
         && edits.deleted_rows.is_empty()
@@ -2700,6 +2965,316 @@ fn analyze_split_record(
     }
     *observed_max_pieces = (*observed_max_pieces).max(pieces);
     Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_blank_rows(
+    output: &mut ExportTarget,
+    insertion: RowInsertion,
+    delimiter: u8,
+    ending: &[u8],
+    prefix: &[u8],
+    shared: &SharedState,
+) -> Result<Option<u64>, QuarryError> {
+    let mut row = vec![delimiter; insertion.width - 1];
+    row.extend_from_slice(ending);
+    if shared.cancel_requested.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    output.write_all(prefix)?;
+    let mut written = prefix.len() as u64;
+    for _ in 0..insertion.count {
+        if shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        output.write_all(&row)?;
+        written = written
+            .checked_add(row.len() as u64)
+            .ok_or(QuarryError::InvalidOption("inserted output is too large"))?;
+        shared
+            .bytes_written
+            .fetch_add(row.len() as u64, Ordering::Release);
+    }
+    Ok(Some(written))
+}
+
+/// Determines the first record's ending without retaining an oversized record.
+fn insertion_record_ending(
+    source: &mut File,
+    delimiter: u8,
+    chunk: &mut [u8],
+    shared: &SharedState,
+) -> Result<Option<&'static [u8]>, QuarryError> {
+    let start = source.stream_position()?;
+    let mut scanner = RecordScanner::new(delimiter)?;
+    let mut offset = 0_u64;
+    let mut previous_byte = None;
+    let ending = loop {
+        if shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let read = source.read(chunk)?;
+        if read == 0 {
+            break b"\n".as_slice();
+        }
+        let mut first_ending = None;
+        scanner.scan_chunk(&chunk[..read], offset, |end| {
+            if first_ending.is_none() {
+                let local_end = (end - offset) as usize;
+                let before_lf = if local_end > 1 {
+                    Some(chunk[local_end - 2])
+                } else {
+                    previous_byte
+                };
+                first_ending = Some(if before_lf == Some(b'\r') {
+                    b"\r\n".as_slice()
+                } else {
+                    b"\n".as_slice()
+                });
+            }
+        })?;
+        if let Some(ending) = first_ending {
+            break ending;
+        }
+        previous_byte = chunk[..read].last().copied();
+        offset += read as u64;
+    };
+    source.seek(SeekFrom::Start(start))?;
+    Ok(Some(ending))
+}
+
+/// Streams untouched records directly; only pending value edits use a bounded buffer.
+#[allow(clippy::too_many_arguments)]
+fn copy_with_inserted_rows(
+    source: &mut File,
+    output: &mut ExportTarget,
+    delimiter: u8,
+    has_header: bool,
+    edits: &PreparedSaveEdits,
+    insertion: RowInsertion,
+    config: ExportConfig,
+    shared: &SharedState,
+) -> Result<Option<SaveCopySummary>, QuarryError> {
+    let source_had_bom = source_starts_with_utf8_bom(source)?;
+    let mut scanner = RecordScanner::new(delimiter)?;
+    let mut chunk = vec![0; config.chunk_bytes];
+    let mut record = Vec::new();
+    let mut absolute_start = 0_u64;
+    let mut row_number = 0_u64;
+    let mut inserted = false;
+    // Insertion before record zero needs its ending before any source bytes are
+    // copied. Peek with the same bounded chunk, then rewind; other positions
+    // learn the ending while streaming the first record.
+    let mut ending = if insertion.position == 0 {
+        let Some(ending) = insertion_record_ending(source, delimiter, &mut chunk, shared)? else {
+            return Ok(None);
+        };
+        ending.to_vec()
+    } else {
+        b"\n".to_vec()
+    };
+    let mut last_terminated = true;
+    let mut last_record_bytes = 0_u64;
+    let mut last_trailing_cr = false;
+    let mut bytes_written = 0_u64;
+    {
+        let mut record_started = false;
+        let mut source_tail = None;
+        let mut previous_source_byte = None;
+        let mut record_output_bytes = 0_u64;
+        let mut bom_bytes_to_skip = if insertion.position == 0 && source_had_bom {
+            UTF8_BOM.len()
+        } else {
+            0
+        };
+        let mut write_segment = |segment: &[u8], finished: bool| -> Result<bool, QuarryError> {
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            if segment.is_empty() && !finished {
+                return Ok(true);
+            }
+            if !record_started {
+                if row_number == insertion.position {
+                    let prefix = if row_number == 0 && source_had_bom {
+                        UTF8_BOM
+                    } else {
+                        &[]
+                    };
+                    let Some(written) =
+                        write_blank_rows(output, insertion, delimiter, &ending, prefix, shared)?
+                    else {
+                        return Ok(false);
+                    };
+                    bytes_written = bytes_written.saturating_add(written);
+                    inserted = true;
+                }
+                record_started = true;
+            }
+            for byte in segment.iter().rev().take(2).rev() {
+                previous_source_byte = source_tail;
+                source_tail = Some(*byte);
+            }
+            let rewrite = row_number == 0 && !edits.headers.is_empty()
+                || edits
+                    .cells
+                    .range((row_number, 0)..=(row_number, usize::MAX))
+                    .next()
+                    .is_some();
+            if rewrite {
+                if record.len().saturating_add(segment.len()) > config.max_record_bytes {
+                    return Err(QuarryError::RecordTooLarge {
+                        limit: config.max_record_bytes,
+                    });
+                }
+                record.extend_from_slice(segment);
+                if finished {
+                    let raw = if row_number == 0 && inserted && source_had_bom {
+                        record.strip_prefix(UTF8_BOM).unwrap_or(&record)
+                    } else {
+                        &record
+                    };
+                    let written = write_saved_record(
+                        output,
+                        raw,
+                        row_number,
+                        delimiter,
+                        has_header,
+                        edits,
+                        config.max_record_bytes,
+                    )?;
+                    record_output_bytes = written.bytes_written;
+                    bytes_written = bytes_written.saturating_add(written.bytes_written);
+                }
+            } else {
+                let skip = segment.len().min(bom_bytes_to_skip);
+                bom_bytes_to_skip -= skip;
+                let raw = &segment[skip..];
+                output.write_all(raw)?;
+                record_output_bytes = record_output_bytes.saturating_add(raw.len() as u64);
+                bytes_written = bytes_written.saturating_add(raw.len() as u64);
+            }
+            if finished {
+                if row_number == 0
+                    && source_tail == Some(b'\n')
+                    && previous_source_byte == Some(b'\r')
+                {
+                    ending = b"\r\n".to_vec();
+                }
+                // Relocating a BOM-only record must retain its empty record.
+                let preserved_empty_record = record_output_bytes == 0;
+                if preserved_empty_record {
+                    output.write_all(&ending)?;
+                    bytes_written = bytes_written.saturating_add(ending.len() as u64);
+                }
+                last_terminated = source_tail == Some(b'\n') || preserved_empty_record;
+                last_record_bytes = record_output_bytes;
+                last_trailing_cr = source_tail == Some(b'\r');
+                row_number += 1;
+                record.clear();
+                record_started = false;
+                record_output_bytes = 0;
+                source_tail = None;
+                previous_source_byte = None;
+            }
+            shared.bytes_written.store(bytes_written, Ordering::Release);
+            Ok(true)
+        };
+        loop {
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let read = source.read(&mut chunk)?;
+            let mut deferred_error = None;
+            let mut cancelled = false;
+            if read == 0 {
+                scanner.finish(absolute_start, |_| match write_segment(&[], true) {
+                    Ok(true) => {}
+                    Ok(false) => cancelled = true,
+                    Err(error) => deferred_error = Some(error),
+                })?;
+                if let Some(error) = deferred_error {
+                    return Err(error);
+                }
+                if cancelled {
+                    return Ok(None);
+                }
+                break;
+            }
+            let mut segment_start = 0;
+            let scan_result = scanner.scan_chunk(&chunk[..read], absolute_start, |end| {
+                let local_end = (end - absolute_start) as usize;
+                if deferred_error.is_none() && !cancelled {
+                    match write_segment(&chunk[segment_start..local_end], true) {
+                        Ok(true) => {}
+                        Ok(false) => cancelled = true,
+                        Err(error) => deferred_error = Some(error),
+                    }
+                }
+                segment_start = local_end;
+            });
+            if let Some(error) = deferred_error {
+                return Err(error);
+            }
+            if cancelled {
+                return Ok(None);
+            }
+            scan_result?;
+            if !write_segment(&chunk[segment_start..read], false)? {
+                return Ok(None);
+            }
+            absolute_start += read as u64;
+            shared
+                .bytes_scanned
+                .store(absolute_start, Ordering::Release);
+        }
+    }
+    // Handle insertion at the end, separating any unterminated final source record.
+    if edits
+        .cells
+        .last_key_value()
+        .is_some_and(|((row, _), _)| *row >= row_number)
+    {
+        return Err(QuarryError::InvalidOption("cell edit row is out of range"));
+    }
+    if !inserted {
+        if row_number != insertion.position {
+            return Err(QuarryError::InvalidOption(
+                "row insertion position is outside the source data",
+            ));
+        }
+        if row_number > 0 && !last_terminated {
+            // LF alone would turn a trailing CR value byte into a CRLF terminator.
+            if last_trailing_cr && ending == b"\n" {
+                ending = b"\r\n".to_vec();
+            }
+            if last_record_bytes.saturating_add(ending.len() as u64)
+                > config.max_record_bytes as u64
+            {
+                return Err(QuarryError::RecordTooLarge {
+                    limit: config.max_record_bytes,
+                });
+            }
+            output.write_all(&ending)?;
+            bytes_written = bytes_written.saturating_add(ending.len() as u64);
+        }
+        let prefix = if row_number == 0 && source_had_bom {
+            UTF8_BOM
+        } else {
+            &[]
+        };
+        let Some(written) =
+            write_blank_rows(output, insertion, delimiter, &ending, prefix, shared)?
+        else {
+            return Ok(None);
+        };
+        bytes_written = bytes_written.saturating_add(written);
+    }
+    shared.bytes_written.store(bytes_written, Ordering::Release);
+    Ok(Some(SaveCopySummary {
+        bytes_written,
+        replacements: 0,
+    }))
 }
 
 fn copy_with_rewritten_records(
@@ -6742,5 +7317,588 @@ mod tests {
         assert!(temporary_exports(&destination).is_empty());
         fs::remove_file(&source).unwrap();
         remove_case(&source);
+    }
+    fn insert_rows_test_job(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        header: bool,
+        insertion: super::RowInsertion,
+        chunk_bytes: usize,
+        headers: BTreeMap<usize, Vec<u8>>,
+        cells: BTreeMap<(u64, usize), Vec<u8>>,
+    ) -> Result<SaveAsJob, QuarryError> {
+        let session = session(
+            source,
+            b',',
+            if header {
+                HeaderMode::FirstRow
+            } else {
+                HeaderMode::NoHeader
+            },
+        );
+        SaveAsJob::start_worker_with_row_insertion(
+            source.to_path_buf(),
+            session.file_size,
+            b',',
+            header,
+            SaveEdits {
+                headers,
+                cells,
+                transformation: None,
+            },
+            None,
+            Vec::new(),
+            Some(insertion),
+            SaveTarget::WorkingCopy(destination.to_path_buf(), session.source_stamp),
+            ExportConfig {
+                chunk_bytes,
+                ..super::DEFAULT_EXPORT_CONFIG
+            },
+        )
+    }
+
+    #[test]
+    fn inserted_rows_preserve_edits_raw_multiline_records_and_source() {
+        let original = "ID,Note\r\n1,\"猫, \"\"quote\"\"\nnext\"\r\n2,end";
+        let source = fixture(original.as_bytes());
+        let out = destination(&source, "inserted.csv");
+        let job = insert_rows_test_job(
+            &source,
+            &out,
+            true,
+            super::RowInsertion {
+                position: 2,
+                count: 2,
+                width: 2,
+            },
+            1,
+            BTreeMap::from([(0, b"Number".to_vec())]),
+            BTreeMap::from([((1, 0), b"edited".to_vec())]),
+        )
+        .unwrap();
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(
+            fs::read_to_string(&out).unwrap(),
+            "Number,Note\r\nedited,\"猫, \"\"quote\"\"\nnext\"\r\n,\r\n,\r\n2,end"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original.as_bytes());
+        fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn inserted_rows_handle_start_end_bom_empty_and_header_only_sources() {
+        for (original, header, position, width, expected) in [
+            (
+                b"A,B\n1,x\n2,y".as_slice(),
+                true,
+                1,
+                2,
+                b"A,B\n,\n1,x\n2,y".as_slice(),
+            ),
+            (
+                b"A,B\r\n1,x".as_slice(),
+                true,
+                2,
+                2,
+                b"A,B\r\n1,x\r\n,\r\n".as_slice(),
+            ),
+            (b"A,B".as_slice(), true, 1, 2, b"A,B\n,\n".as_slice()),
+            (b"".as_slice(), false, 0, 1, b"\n".as_slice()),
+            (
+                b"\xef\xbb\xbf".as_slice(),
+                false,
+                0,
+                1,
+                b"\xef\xbb\xbf\n\n".as_slice(),
+            ),
+            (
+                b"\xef\xbb\xbf".as_slice(),
+                false,
+                1,
+                1,
+                b"\xef\xbb\xbf\n\n".as_slice(),
+            ),
+            (b"x\r".as_slice(), false, 1, 1, b"x\r\r\n\r\n".as_slice()),
+            (
+                b"\xef\xbb\xbf1,x\n2,y".as_slice(),
+                false,
+                0,
+                2,
+                b"\xef\xbb\xbf,\n1,x\n2,y".as_slice(),
+            ),
+            (
+                b"\"literal\",x\r\n2,y\r\n".as_slice(),
+                false,
+                2,
+                2,
+                b"\"literal\",x\r\n2,y\r\n,\r\n".as_slice(),
+            ),
+        ] {
+            for chunk_bytes in [1, 2, 7, 1024] {
+                let source = fixture(original);
+                let out = destination(&source, "inserted.csv");
+                let job = insert_rows_test_job(
+                    &source,
+                    &out,
+                    header,
+                    super::RowInsertion {
+                        position,
+                        count: 1,
+                        width,
+                    },
+                    chunk_bytes,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                )
+                .unwrap();
+                assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+                assert_eq!(
+                    fs::read(&out).unwrap(),
+                    expected,
+                    "chunk {chunk_bytes}, source {original:?}"
+                );
+                assert_eq!(fs::read(&source).unwrap(), original);
+                fs::remove_dir_all(source.parent().unwrap()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn inserted_columns_pad_ragged_rows_keep_late_fields_and_quote_names() {
+        let original = b"ID,Note\r\n1,\"line\nnext\"\r\n2\r\n3,tail,late";
+        let source = fixture(original);
+        let out = destination(&source, "columns.csv");
+        let job = session(&source, b',', HeaderMode::FirstRow)
+            .start_create_working_copy(
+                BTreeMap::from([(0, b"Number".to_vec())]),
+                BTreeMap::from([((1, 0), b"edited".to_vec())]),
+                ColumnTransformation::Insert {
+                    source_width: 2,
+                    position: 1,
+                    count: 2,
+                    headers: Some(vec!["新,\"name\"".as_bytes().to_vec(), Vec::new()]),
+                },
+                &out,
+            )
+            .unwrap();
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(
+            fs::read_to_string(&out).unwrap(),
+            "Number,\"新,\"\"name\"\"\",,Note\r\nedited,,,\"line\nnext\"\r\n2,,,\r\n3,,,tail,late"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn inserted_columns_handle_header_only_headerless_and_every_boundary() {
+        for (original, header, position, expected) in [
+            (b"A,B".as_slice(), true, 0, b",A,B".as_slice()),
+            (b"A,B\n".as_slice(), true, 2, b"A,B,\n".as_slice()),
+            (b"1,x\n2".as_slice(), false, 0, b",1,x\n,2,".as_slice()),
+            (
+                b"\xef\xbb\xbf1,x\r\n".as_slice(),
+                false,
+                2,
+                b"\xef\xbb\xbf1,x,\r\n".as_slice(),
+            ),
+        ] {
+            let source = fixture(original);
+            let out = destination(&source, "inserted.csv");
+            let transformation = ColumnTransformation::Insert {
+                source_width: 2,
+                position,
+                count: 1,
+                headers: header.then(|| vec![Vec::new()]),
+            };
+            let job = session(
+                &source,
+                b',',
+                if header {
+                    HeaderMode::FirstRow
+                } else {
+                    HeaderMode::NoHeader
+                },
+            )
+            .start_create_working_copy(BTreeMap::new(), BTreeMap::new(), transformation, &out)
+            .unwrap();
+            assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+            assert_eq!(fs::read(&out).unwrap(), expected);
+            assert_eq!(fs::read(&source).unwrap(), original);
+            fs::remove_dir_all(source.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn insertion_rejects_invalid_counts_positions_headers_and_widths_without_output() {
+        let source = fixture(b"A,B\n1,x\n");
+        for insertion in [
+            super::RowInsertion {
+                position: 0,
+                count: 1,
+                width: 2,
+            },
+            super::RowInsertion {
+                position: 3,
+                count: 1,
+                width: 2,
+            },
+            super::RowInsertion {
+                position: 1,
+                count: 0,
+                width: 2,
+            },
+            super::RowInsertion {
+                position: 1,
+                count: 1,
+                width: 0,
+            },
+            super::RowInsertion {
+                position: 1,
+                count: u64::MAX,
+                width: 2,
+            },
+        ] {
+            let out = destination(&source, "invalid.csv");
+            let result = insert_rows_test_job(
+                &source,
+                &out,
+                true,
+                insertion,
+                1,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
+            assert!(match result {
+                Err(_) => true,
+                Ok(job) => job.wait().is_err(),
+            });
+            assert!(!out.exists());
+            assert!(temporary_exports(&out).is_empty());
+        }
+        for transform in [
+            ColumnTransformation::Insert {
+                source_width: 2,
+                position: 3,
+                count: 1,
+                headers: Some(vec![Vec::new()]),
+            },
+            ColumnTransformation::Insert {
+                source_width: 2,
+                position: 1,
+                count: 0,
+                headers: Some(vec![]),
+            },
+            ColumnTransformation::Insert {
+                source_width: MAX_TRANSFORMATION_COLUMNS,
+                position: 1,
+                count: 1,
+                headers: Some(vec![Vec::new()]),
+            },
+            ColumnTransformation::Insert {
+                source_width: 2,
+                position: 1,
+                count: 2,
+                headers: Some(vec![Vec::new()]),
+            },
+            ColumnTransformation::Insert {
+                source_width: 2,
+                position: 1,
+                count: 1,
+                headers: None,
+            },
+        ] {
+            let out = destination(&source, "invalid.csv");
+            assert!(
+                session(&source, b',', HeaderMode::FirstRow)
+                    .start_create_working_copy(BTreeMap::new(), BTreeMap::new(), transform, &out)
+                    .is_err()
+            );
+            assert!(!out.exists());
+        }
+        fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn insertion_cancellation_and_conflicts_preserve_sources_and_cleanup() {
+        let original = b"A,B\n1,x\n";
+        let source = fixture(original);
+        let out = destination(&source, "cancelled.csv");
+        let job = insert_rows_test_job(
+            &source,
+            &out,
+            true,
+            super::RowInsertion {
+                position: 1,
+                count: 10_000_000,
+                width: 2,
+            },
+            1,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.progress().bytes_written < 1024 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        job.cancel();
+        assert_eq!(job.wait().unwrap(), SaveAsOutcome::Cancelled);
+        assert!(!out.exists());
+        assert!(temporary_exports(&out).is_empty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        let session = session(&source, b',', HeaderMode::FirstRow);
+        fs::write(&source, b"changed\n").unwrap();
+        assert!(matches!(
+            session.start_create_working_copy_inserting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                super::RowInsertion {
+                    position: 1,
+                    count: 1,
+                    width: 2
+                },
+                &out
+            ),
+            Err(QuarryError::SourceChanged)
+        ));
+        assert!(!out.exists());
+        fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn insertion_bounds_blank_records_and_estimates_expansion() {
+        let source = fixture(b"x\n");
+        let out = destination(&source, "too-wide.csv");
+        let session = session(&source, b',', HeaderMode::NoHeader);
+        let result = SaveAsJob::start_worker_with_row_insertion(
+            source.clone(),
+            session.file_size,
+            b',',
+            false,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            None,
+            vec![],
+            Some(super::RowInsertion {
+                position: 0,
+                count: 1,
+                width: 5,
+            }),
+            SaveTarget::WorkingCopy(out.clone(), session.source_stamp),
+            ExportConfig {
+                max_record_bytes: 4,
+                ..super::DEFAULT_EXPORT_CONFIG
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(QuarryError::RecordTooLarge { limit: 4 })
+        ));
+        assert!(!out.exists());
+        assert_eq!(
+            super::RowInsertion {
+                position: 0,
+                count: 2,
+                width: 3
+            }
+            .additional_output_bytes(),
+            13
+        );
+        let transform = ColumnTransformation::Insert {
+            source_width: 3,
+            position: 1,
+            count: 2,
+            headers: None,
+        };
+        let allowance = crate::estimate_edited_output_bytes(
+            100,
+            10,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(&transform),
+            None,
+        );
+        assert!(allowance >= 120);
+        fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn inserted_rows_bound_the_separator_added_to_an_unterminated_record() {
+        for original in [b"abcd".as_slice(), b"abc\r".as_slice()] {
+            let source = fixture(original);
+            let out = destination(&source, "bounded.csv");
+            let session = session(&source, b',', HeaderMode::NoHeader);
+            let job = SaveAsJob::start_worker_with_row_insertion(
+                source.clone(),
+                session.file_size,
+                b',',
+                false,
+                SaveEdits {
+                    headers: BTreeMap::new(),
+                    cells: BTreeMap::new(),
+                    transformation: None,
+                },
+                None,
+                vec![],
+                Some(super::RowInsertion {
+                    position: 1,
+                    count: 1,
+                    width: 1,
+                }),
+                SaveTarget::WorkingCopy(out.clone(), session.source_stamp),
+                ExportConfig {
+                    max_record_bytes: 4,
+                    ..super::DEFAULT_EXPORT_CONFIG
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                job.wait(),
+                Err(QuarryError::RecordTooLarge { limit: 4 })
+            ));
+            assert!(!out.exists());
+            assert_eq!(fs::read(&source).unwrap(), original);
+            assert!(
+                fs::read_dir(source.parent().unwrap())
+                    .unwrap()
+                    .all(|entry| {
+                        !entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".quarry-export-")
+                    })
+            );
+            fs::remove_dir_all(source.parent().unwrap()).unwrap();
+        }
+    }
+    #[test]
+    fn inserted_rows_stream_oversized_untouched_records_but_bound_edits() {
+        for chunk_bytes in [1, 2, 7, 32] {
+            for (original, positions, ending) in [
+                (
+                    b"\"long\nvalue\",x\r\n2,y\r\n".as_slice(),
+                    vec![0, 1, 2],
+                    b",\r\n".as_slice(),
+                ),
+                (
+                    b"\xEF\xBB\xBF\"long\nvalue\",x\r\n2,y".as_slice(),
+                    vec![0, 1],
+                    b",\r\n".as_slice(),
+                ),
+                (b"\"long\nvalue\",x".as_slice(), vec![0], b",\n".as_slice()),
+            ] {
+                for position in positions {
+                    let source = fixture(original);
+                    let out = destination(&source, "streamed.csv");
+                    let run = |cells| {
+                        let session = session(&source, b',', HeaderMode::NoHeader);
+                        SaveAsJob::start_worker_with_row_insertion(
+                            source.clone(),
+                            session.file_size,
+                            b',',
+                            false,
+                            SaveEdits {
+                                headers: BTreeMap::new(),
+                                cells,
+                                transformation: None,
+                            },
+                            None,
+                            vec![],
+                            Some(super::RowInsertion {
+                                position,
+                                count: 1,
+                                width: 2,
+                            }),
+                            SaveTarget::WorkingCopy(out.clone(), session.source_stamp),
+                            ExportConfig {
+                                chunk_bytes,
+                                max_record_bytes: 8,
+                            },
+                        )
+                        .unwrap()
+                        .wait()
+                    };
+                    assert!(matches!(
+                        run(BTreeMap::new()).unwrap(),
+                        SaveAsOutcome::Complete(_)
+                    ));
+                    let marker = if original.starts_with(super::UTF8_BOM) {
+                        3
+                    } else {
+                        0
+                    };
+                    let boundary = if position == 0 {
+                        marker
+                    } else if position == 1 {
+                        original.windows(2).position(|w| w == b"\r\n").unwrap() + 2
+                    } else {
+                        original.len()
+                    };
+                    let mut expected = original[..boundary].to_vec();
+                    expected.extend_from_slice(ending);
+                    expected.extend_from_slice(&original[boundary..]);
+                    assert_eq!(fs::read(&out).unwrap(), expected);
+                    fs::remove_file(&out).unwrap();
+                    assert!(matches!(
+                        run(BTreeMap::from([((0, 0), b"edited".to_vec())])),
+                        Err(QuarryError::RecordTooLarge { limit: 8 })
+                    ));
+                    assert!(!out.exists());
+                    assert_eq!(fs::read(&source).unwrap(), original);
+                    assert!(
+                        fs::read_dir(source.parent().unwrap())
+                            .unwrap()
+                            .all(|entry| !entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".quarry-export-"))
+                    );
+                    fs::remove_dir_all(source.parent().unwrap()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn insertion_progress_reports_the_count_pass_and_output_allowance() {
+        let source = fixture(b"A,B\n1,x\n2,y\n");
+        let out = destination(&source, "progress.csv");
+        let job = session(&source, b',', HeaderMode::FirstRow)
+            .start_create_working_copy_inserting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                super::RowInsertion {
+                    position: 1,
+                    count: 100,
+                    width: 2,
+                },
+                &out,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.progress().done {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let progress = job.progress();
+        assert!(!progress.preparing);
+        assert_eq!(
+            progress.preparation_bytes_scanned,
+            fs::metadata(&source).unwrap().len()
+        );
+        assert!(progress.bytes_written > 100);
+        assert_eq!(
+            progress.estimated_output_bytes,
+            fs::metadata(&source).unwrap().len() + 3 + 100 * 3 + 5
+        );
+        assert!(progress.estimated_output_bytes >= progress.bytes_written);
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        fs::remove_dir_all(source.parent().unwrap()).unwrap();
     }
 }

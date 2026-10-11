@@ -30,8 +30,9 @@ pub use date_time_sort::DateTimeFormat;
 pub use export::{
     ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress,
     FilterExportSummary, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob,
-    ReplaceAllOutcome, ReplaceAllSummary, SaveAsJob, SaveAsOutcome, SaveAsProgress, SaveAsSummary,
-    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, SplitAnalysisSummary,
+    ReplaceAllOutcome, ReplaceAllSummary, RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress,
+    SaveAsSummary, SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress,
+    SplitAnalysisSummary,
 };
 pub use filter::{
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,

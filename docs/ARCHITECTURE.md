@@ -130,7 +130,7 @@ cache remains deferred. The conditional reassessment is tracked in
 
 Before a materialized operation, unsaved cell and header values remain a sparse
 overlay on the active indexed CSV. A confirmed Split, Combine, Move Selected
-Columns, Delete Selected Columns, Delete Selected Rows, or Replace All does not
+Columns, Delete Selected Columns, Delete Selected Rows, Insert Rows, Insert Columns, or Replace All does not
 stay as a lazy operation. A bounded worker materializes the operation and sparse
 overlay into a private working CSV, then Quarry reopens that file as the ordinary
 indexed document. Split first makes a cancellable analysis pass that retains
@@ -687,3 +687,15 @@ hashes, and successful destination reopen checks.
 
 ## Architecture rule
 **If a feature only works because the entire file fits in RAM, it is not a finished Quarry feature.**
+
+## Row and column insertion
+
+[ADR 0009](adr/0009-row-column-insertion.md) defines physical insertion boundaries.
+Row insertion uses the guarded save worker with a fixed read chunk, one bounded
+record for pending value edits and one reusable blank row. Untouched source
+records stream directly, including records above the rewrite limit. A cancellable count pass validates the boundary;
+the copy pass retains original bytes except pending edits and any separator
+needed before appended rows. Column insertion is a normal bounded field
+transformation and pads short records without dropping late fields. Neither
+keeps inserted rows in memory. Existing temporary-storage, source guards,
+publication, working-copy history and save boundaries apply.
