@@ -10,6 +10,7 @@ delimited files in the Quarry macOS app.
   - [Work with document tabs](#work-with-document-tabs)
   - [Combine files](#combine-files)
   - [Navigate the grid](#navigate-the-grid)
+  - [Inspect whitespace](#inspect-whitespace)
   - [Select and copy data](#select-and-copy-data)
   - [Delete rows](#delete-rows)
   - [Find and remove duplicates](#find-and-remove-duplicates)
@@ -191,6 +192,29 @@ the result supports the usual editing, Undo/Redo, filtering, Save and Save As.
 The number of visible rows follows the available window height. When a filter
 is active, direct row jumping is disabled because the grid is showing matches
 rather than a continuous source-row range.
+
+### Inspect whitespace
+
+Quarry marks leading and trailing whitespace, repeated spaces, tabs, line breaks,
+and special Unicode whitespace as soon as you inspect a cell. Ordinary single
+spaces between words stay unmarked in the normal view.
+
+Choose **View → Show All Whitespace** to reveal those single spaces too. The
+checkbox applies to every document tab and is remembered when Quarry restarts.
+Turn it off to return to the subtle normal view.
+
+Spaces appear as muted dots (·). Tabs, carriage returns, line feeds, and
+non-breaking spaces appear as [TAB], [CR], [LF], and [NBSP]; other Unicode
+whitespace uses its code point, such as [U+202F]. A small triangle at the cell's
+upper-right corner remains visible when the relevant whitespace is clipped.
+Hover over the cell for counts describing its full value. A hollow circle means
+full-value inspection is still running.
+
+These marks only affect the view. Editing, copying, filtering, and saving use
+the actual field values. The toggle does not modify the document or add an
+Undo entry. Use [Clean up columns](#clean-up-columns) when you want to change
+the data itself. Whitespace inspection follows the visible viewport and does
+not scan the entire file.
 
 ### Select and copy data
 

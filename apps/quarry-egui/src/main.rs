@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -45,6 +46,7 @@ mod about;
 mod combine_files;
 mod storage;
 mod tabs;
+mod whitespace;
 use storage::{PendingStorageOperation, STORAGE_REVIEW_BYTES, StorageReview};
 use tabs::DocumentTab;
 
@@ -70,8 +72,8 @@ const STATUS_JOB_WIDTH: f32 = 360.0;
 const STATUS_CANCEL_WIDTH: f32 = 112.0;
 const DOCUMENT_MENU_WIDTH: f32 = 220.0;
 const FORMAT_MENU_WIDTH: f32 = 190.0;
-const COMPACT_DOCUMENT_MENU_WIDTH: f32 = 132.0;
-const COMPACT_FORMAT_MENU_WIDTH: f32 = 90.0;
+const COMPACT_DOCUMENT_MENU_WIDTH: f32 = 100.0;
+const COMPACT_FORMAT_MENU_WIDTH: f32 = 78.0;
 const TOOLBAR_JUMP_WIDTH: f32 = 52.0;
 const TOOLBAR_FILTER_WIDTH: f32 = 78.0;
 const JUMP_INPUT_ID: &str = "quarry-jump-input";
@@ -328,6 +330,7 @@ fn main() -> eframe::Result<()> {
 }
 
 struct QuarryApp {
+    whitespace_preferences: whitespace::Preferences,
     about: about::About,
     combine_files: Option<combine_files::CombineDialog>,
     working_directory: PathBuf,
@@ -571,6 +574,7 @@ impl QuarryApp {
     /// Opens each command-line path using the same tab and error policy as file drops.
     fn with_paths(paths: Vec<PathBuf>, started: Instant) -> Self {
         let mut app = Self::new(None, started);
+        app.whitespace_preferences = whitespace::Preferences::application();
         app.handle_dropped_paths(paths.into_iter().map(Some).collect());
         app
     }
@@ -578,6 +582,7 @@ impl QuarryApp {
     /// Creates shared application state and an empty tab, optionally opening a source.
     fn new(initial_path: Option<PathBuf>, started: Instant) -> Self {
         let mut app = Self {
+            whitespace_preferences: whitespace::Preferences::default(),
             about: about::About::new(),
             combine_files: None,
             working_directory: std::env::temp_dir(),
@@ -950,6 +955,15 @@ impl QuarryApp {
             }
             return;
         }
+        if let Action::ShowAllWhitespace(all) = action {
+            if let Err(error) = self.whitespace_preferences.set(all) {
+                self.active.notice = Some(AppMessage::warning(format!(
+                    "Whitespace view changed, but its preference could not be saved: {error}"
+                )));
+            }
+            ctx.request_repaint();
+            return;
+        }
         if action == Action::About {
             self.about.open();
             return;
@@ -1066,6 +1080,7 @@ impl QuarryApp {
             | Action::CloseTab
             | Action::TemporaryStorage
             | Action::About
+            | Action::ShowAllWhitespace(_)
             | Action::CombineFiles
             | Action::ReopenWithFormat(_, _)
             | Action::ReloadFromDisk
@@ -1971,6 +1986,9 @@ impl eframe::App for QuarryApp {
                     ) {
                         action = Some(format_action);
                     }
+                    if let Some(view_action) = whitespace_view_menu(ui, self.whitespace_preferences.show_all) {
+                        action = Some(view_action);
+                    }
                     let label = ui.label("Row");
                     let jump_enabled = ui.is_enabled() && document_open && !filter_active;
                     let jump = ui
@@ -2293,6 +2311,7 @@ impl eframe::App for QuarryApp {
                     ui.set_opacity(1.0);
                 }
                 if let Some(document) = self.active.document.as_mut() {
+                    document.whitespace_all = self.whitespace_preferences.show_all;
                     let grid_result = ui
                         .push_id(self.active.id, |ui| {
                             show_grid_with_filter_case(
@@ -2543,6 +2562,7 @@ fn detected_delimiter_label(delimiter: u8) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
+    ShowAllWhitespace(bool),
     CloseTab,
     About,
     CombineFiles,
@@ -5462,7 +5482,7 @@ struct Document {
     source_changed: bool,
     filter_viewport_start: u64,
     filter_buffer_start: u64,
-    filtered_rows: Vec<FilterMatch>,
+    filtered_rows: Vec<Arc<FilterMatch>>,
     filter_read: Option<ActiveFilterRead>,
     pending_filter_read: Option<FilterReadWindow>,
     reveal_cell: Option<(u64, usize)>,
@@ -5482,7 +5502,9 @@ struct Document {
     data_start: u64,
     viewport_start: u64,
     buffer_start: u64,
-    buffered_rows: Vec<Row>,
+    buffered_rows: Vec<Arc<Row>>,
+    whitespace: whitespace::Cache,
+    whitespace_all: bool,
     auto_fit_columns: bool,
     fitted_column_widths: BTreeMap<usize, f32>,
     columns_to_fit: VecDeque<usize>,
@@ -5555,6 +5577,7 @@ impl Document {
             .skip(data_start as usize)
             .take(buffer_rows)
             .cloned()
+            .map(Arc::new)
             .collect();
         let progress = IndexProgress {
             bytes_scanned: 0,
@@ -5623,6 +5646,8 @@ impl Document {
             viewport_start: data_start,
             buffer_start: data_start,
             buffered_rows,
+            whitespace: whitespace::Cache::default(),
+            whitespace_all: false,
             auto_fit_columns: false,
             fitted_column_widths: BTreeMap::new(),
             columns_to_fit: VecDeque::new(),
@@ -7224,6 +7249,7 @@ impl Document {
         self.export_cancel_requested = false;
         self.filter_viewport_start = 0;
         self.filter_buffer_start = 0;
+        self.whitespace.invalidate();
         self.filtered_rows.clear();
         self.selection = None;
         self.selected_rows.clear();
@@ -7252,6 +7278,7 @@ impl Document {
             self.refresh_filter_snapshot_for(required);
             self.navigate_filter(self.filter_viewport_start)?;
         } else {
+            self.whitespace.invalidate();
             self.filtered_rows.clear();
             self.filter_buffer_start = 0;
             self.filter_viewport_start = 0;
@@ -7283,6 +7310,7 @@ impl Document {
                 self.filter_query = None;
                 self.filter_progress = None;
                 self.filter_status = None;
+                self.whitespace.invalidate();
                 self.filtered_rows.clear();
                 self.filter_viewport_start = 0;
                 self.filter_buffer_start = 0;
@@ -7314,7 +7342,8 @@ impl Document {
                 }
                 self.last_viewport_read = Some(active.started.elapsed());
                 self.filter_buffer_start = active.window.start_match;
-                self.filtered_rows = rows;
+                self.whitespace.invalidate();
+                self.filtered_rows = rows.into_iter().map(Arc::new).collect();
             }
             Ok(FilterReadOutcome::Complete(_) | FilterReadOutcome::Cancelled) => {}
             Err(error) => {
@@ -7579,7 +7608,9 @@ impl Document {
         self.filter_index = None;
         self.filter_query = None;
         self.filter_progress = None;
+        self.whitespace.invalidate();
         self.buffered_rows.clear();
+        self.whitespace.invalidate();
         self.filtered_rows.clear();
         self.selection = None;
         self.selected_rows.clear();
@@ -7623,6 +7654,7 @@ impl Document {
         self.export_cancel_requested = false;
         self.filter_viewport_start = 0;
         self.filter_buffer_start = 0;
+        self.whitespace.invalidate();
         self.filtered_rows.clear();
         self.selection = None;
         self.selected_rows.clear();
@@ -7974,6 +8006,7 @@ impl Document {
     }
 
     fn set_edit_value(&mut self, target: EditTarget, value: Option<Vec<u8>>) {
+        self.whitespace.invalidate();
         match target {
             EditTarget::Header(column) => {
                 if let Some(value) = value {
@@ -8006,6 +8039,7 @@ impl Document {
             return;
         }
         self.header_edit = None;
+        self.whitespace.invalidate();
         self.header_renames.clear();
         self.refresh_column_headers();
     }
@@ -8135,6 +8169,7 @@ impl Document {
     }
 
     fn shutdown(&mut self) {
+        self.whitespace.invalidate();
         self.stop_filter_read();
         if let Some(job) = self.structural_job.take() {
             match job {
@@ -8280,6 +8315,7 @@ impl Document {
             self.cancel_filter_read_for_navigation();
             self.filter_viewport_start = 0;
             self.filter_buffer_start = 0;
+            self.whitespace.invalidate();
             self.filtered_rows.clear();
             self.clear_hidden_selection();
             return Ok(());
@@ -8356,7 +8392,8 @@ impl Document {
         }
         self.last_viewport_read = Some(began.elapsed());
         self.buffer_start = start;
-        self.buffered_rows = rows;
+        self.whitespace.invalidate();
+        self.buffered_rows = rows.into_iter().map(Arc::new).collect();
         Ok(())
     }
 
@@ -8394,6 +8431,7 @@ impl Document {
         let Some(window) = self.filter_read_window(viewport_start) else {
             self.cancel_filter_read_for_navigation();
             self.filter_buffer_start = 0;
+            self.whitespace.invalidate();
             self.filtered_rows.clear();
             return Ok(());
         };
@@ -8461,7 +8499,7 @@ impl Document {
         }
     }
 
-    fn visible_rows(&self) -> &[Row] {
+    fn visible_rows(&self) -> &[Arc<Row>] {
         let offset = usize::try_from(self.viewport_start.saturating_sub(self.buffer_start))
             .unwrap_or(self.buffered_rows.len())
             .min(self.buffered_rows.len());
@@ -8471,7 +8509,7 @@ impl Document {
         &self.buffered_rows[offset..end]
     }
 
-    fn visible_filter_rows(&self) -> &[FilterMatch] {
+    fn visible_filter_rows(&self) -> &[Arc<FilterMatch>] {
         let offset = usize::try_from(
             self.filter_viewport_start
                 .saturating_sub(self.filter_buffer_start),
@@ -8534,6 +8572,40 @@ impl Document {
         self.cell_edits
             .get(&(row, column))
             .map_or(source, Vec::as_slice)
+    }
+
+    fn header_value(&self, column: usize) -> Option<&[u8]> {
+        if !self.session.dialect.has_header {
+            return None;
+        }
+        if let Some(name) = self.header_renames.get(&column) {
+            return Some(name.as_bytes());
+        }
+        self.session
+            .first_rows
+            .first()?
+            .fields
+            .get(column)
+            .map(Vec::as_slice)
+    }
+
+    /// Share immutable loaded rows with the inspector; never copy huge source cells on a frame.
+    fn whitespace_input(&self, row: u64, column: usize) -> whitespace::Input {
+        if let Some(value) = self.cell_edits.get(&(row, column)) {
+            return whitespace::Input::Owned(Arc::new(value.clone()));
+        }
+        if self.filter_active() {
+            let found = self
+                .filtered_rows
+                .iter()
+                .find(|value| value.row == row)
+                .expect("inspected filtered row is loaded");
+            whitespace::Input::Filtered(found.clone(), column)
+        } else {
+            let index = usize::try_from(row.saturating_sub(self.buffer_start))
+                .expect("loaded row offset fits usize");
+            whitespace::Input::Row(self.buffered_rows[index].clone(), column)
+        }
     }
 
     fn row_with_edits(&self, row: u64, fields: &[Vec<u8>]) -> Vec<Vec<u8>> {
@@ -9085,12 +9157,28 @@ fn show_grid(
     show_grid_with_filter_case(ui, document, CaseSensitivity::Insensitive)
 }
 
+fn whitespace_view_menu(ui: &mut egui::Ui, show_all: bool) -> Option<Action> {
+    let mut action = None;
+    ui.menu_button("View", |ui| {
+        let mut all = show_all;
+        if ui.checkbox(&mut all, "Show All Whitespace").changed() {
+            action = Some(Action::ShowAllWhitespace(all));
+            ui.close();
+        }
+        ui.label("Normal view marks edge and repeated spaces,\ntabs, line breaks, and special whitespace.");
+    });
+    action
+}
+
 fn show_table(
     ui: &mut egui::Ui,
     document: &mut Document,
     reveal_cell: Option<(u64, usize)>,
     filter_case_sensitivity: CaseSensitivity,
 ) -> GridInteraction {
+    let mut whitespace = std::mem::take(&mut document.whitespace);
+    whitespace.begin_frame();
+    let show_all = document.whitespace_all;
     let row_count = document.visible_row_count();
     let auto_fit_columns = std::mem::take(&mut document.auto_fit_columns);
     let virtualized = document.headers.len() > MAX_RENDERED_COLUMNS;
@@ -9118,14 +9206,31 @@ fn show_table(
                 .size()
                 .x
         };
-        let mut width = (text_width(document.column_name(column)) + 12.0).max(80.0);
+        let header_text = document.header_value(column).map_or_else(
+            || document.column_name(column),
+            |value| {
+                whitespace::render(value, None, show_all, 120, ui.visuals().text_color())
+                    .job
+                    .text
+            },
+        );
+        let mut width = (text_width(header_text) + 16.0).max(80.0);
         for index in 0..row_count {
             if let Some((row, fields)) = document.visible_row(index)
                 && let Some(source) = fields.get(column)
             {
                 width = width.max(
-                    text_width(grid_field_text(document.cell_value(row, column, source)))
-                        + 2.0 * ui.spacing().button_padding.x,
+                    text_width(
+                        whitespace::render(
+                            document.cell_value(row, column, source),
+                            None,
+                            show_all,
+                            MAX_GRID_TEXT_CHARS,
+                            ui.visuals().text_color(),
+                        )
+                        .job
+                        .text,
+                    ) + 2.0 * ui.spacing().button_padding.x,
                 );
             }
         }
@@ -9583,9 +9688,21 @@ fn show_table(
                                     }
                                 } else {
                                     let editable = document.header_is_editable(column);
+                                    let header_value = document.header_value(column);
+                                    let summary = header_value.and_then(|value| whitespace.get(
+                                        whitespace::CellId { row: None, column }, value.len(),
+                                        || whitespace::Input::Owned(Arc::new(value.to_vec())),
+                                    ));
+                                    let rendered = whitespace::render(
+                                        header_value.unwrap_or(name.as_bytes()), summary, show_all && header_value.is_some(), 120,
+                                        ui.visuals().text_color(),
+                                    );
+                                    let indicated = summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
+                                    let pending = header_value.is_some() && summary.is_none();
+                                    let explanation = header_value.map(|_| whitespace.explanation(summary, show_all));
                                     let response = ui.add_sized(
                                         [width, 17.0],
-                                        egui::Label::new(RichText::new(name).monospace())
+                                        egui::Label::new(rendered.job)
                                             .truncate()
                                             .sense(if editable {
                                                 egui::Sense::click()
@@ -9593,6 +9710,12 @@ fn show_table(
                                                 egui::Sense::hover()
                                             }),
                                     );
+                                    whitespace::paint_indicator(ui, &response, indicated, pending);
+                                    if let Some(explanation) = &explanation {
+                                        let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                                            node.set_description(explanation.clone());
+                                        });
+                                    }
                                     if editable {
                                         response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
@@ -9610,10 +9733,12 @@ fn show_table(
                                                 && ui.input(|input| {
                                                     input.key_pressed(egui::Key::Enter)
                                                 })));
-                                        response.on_hover_text("Click to rename");
+                                        response.on_hover_text(format!("Click to rename\n{}", explanation.unwrap_or_default()));
                                         if activate {
                                             begin_header_edit = Some(column);
                                         }
+                                    } else if let Some(explanation) = explanation {
+                                        response.on_hover_text(explanation);
                                     }
                                 }
                             });
@@ -9849,6 +9974,17 @@ fn show_table(
                                             document.cell_value(record_row, column, source)
                                         });
                                         let text = value.map_or_else(String::new, grid_field_text);
+                                        let summary = value.and_then(|value| whitespace.get(
+                                            whitespace::CellId { row: Some(record_row), column },
+                                            value.len(), || document.whitespace_input(record_row, column),
+                                        ));
+                                        let rendered = whitespace::render(value.unwrap_or_default(), summary,
+                                            show_all, MAX_GRID_TEXT_CHARS, ui.visuals().text_color());
+                                        let indicated = summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
+                                        let pending = value.is_some() && summary.is_none();
+                                        let explanation = if value.is_some() {
+                                            whitespace.explanation(summary, show_all)
+                                        } else { "Field is absent from this row.".into() };
                                         let active_selection_highlight = document
                                             .selection
                                             .is_some_and(|selection| {
@@ -9867,11 +10003,12 @@ fn show_table(
                                             [ui.available_width(), ROW_HEIGHT],
                                             egui::Button::selectable(
                                                 selected,
-                                                RichText::new(&text).monospace(),
+                                                rendered.job,
                                             )
                                             .wrap_mode(egui::TextWrapMode::Extend)
                                             .small(),
                                         );
+                                        whitespace::paint_indicator(ui, &response, indicated, pending);
                                         let enabled = ui.is_enabled();
                                         response.widget_info(|| {
                                             egui::WidgetInfo::selected(
@@ -9887,7 +10024,7 @@ fn show_table(
                                         let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
                                             node.set_selected(selected);
                                             node.set_description(
-                                                "Activate to select. Open the context menu to copy or filter by this value.",
+                                                format!("Activate to select. Open the context menu to copy or filter by this value. {explanation}"),
                                             );
                                             node.add_action(
                                                 egui::accesskit::Action::ShowContextMenu,
@@ -10023,11 +10160,11 @@ fn show_table(
                                         if let Some(reason) =
                                             document.cell_edit_disabled_reason(source)
                                         {
-                                            response.on_hover_text(reason);
+                                            response.on_hover_text(format!("{reason}\n{explanation}"));
                                         } else {
-                                            response.on_hover_text(
-                                                "Double-click or press Enter/F2 to edit",
-                                            );
+                                            response.on_hover_text(format!(
+                                                "Double-click or press Enter/F2 to edit\n{explanation}",
+                                            ));
                                         }
                                     }
                                     },
@@ -10052,6 +10189,8 @@ fn show_table(
             }
         });
 
+    whitespace.finish_frame(ui.ctx());
+    document.whitespace = whitespace;
     if cancel_header_edit {
         active_header_edit = None;
     } else if commit_header_edit && let Some(edit) = active_header_edit.take() {
@@ -21644,5 +21783,397 @@ mod tests {
     #[test]
     fn cleanup_handoff_source_change_uses_shared_recovery_warning() {
         cleanup_source_change_warning(true);
+    }
+
+    fn settle_whitespace(ctx: &egui::Context, document: &mut Document) -> egui::FullOutput {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = render_grid(ctx, document);
+            if !document.whitespace.pending() {
+                return output;
+            }
+            assert!(Instant::now() < deadline, "whitespace inspection timed out");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn whitespace_toggle_is_accessible_keyboard_operable_and_shared_without_editing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("spaces.csv");
+        fs::write(&source, b"name\nNew York\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut render = |app: &mut QuarryApp, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    ..grid_input()
+                },
+                |ctx| {
+                    eframe::App::update(app, ctx, &mut frame);
+                },
+            )
+        };
+        let click = |target| {
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target,
+                data: None,
+            })
+        };
+        let output = render(&mut app, vec![]);
+        let menu = accessible_button(&output, "View").0;
+        let _ = render(&mut app, vec![click(menu)]);
+        let output = render(&mut app, vec![]);
+        let (target, node) = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Show All Whitespace"))
+            .unwrap();
+        assert_eq!(node.role(), egui::accesskit::Role::CheckBox);
+        assert_eq!(node.toggled(), Some(egui::accesskit::Toggled::False));
+        let _ = render(&mut app, vec![click(*target)]);
+        assert!(app.whitespace_preferences.show_all);
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().can_undo());
+        let output = render(&mut app, vec![]);
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="New·York"))
+        );
+        let second = directory.path().join("second.csv");
+        fs::write(&second, b"name\nSan Diego\n").unwrap();
+        app.open_new_path(second).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let output = render(&mut app, vec![]);
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="San·Diego"))
+        );
+        // Open by accessibility, then operate the focused checkbox with Space.
+        let menu = accessible_button(&output, "View").0;
+        let _ = render(&mut app, vec![click(menu)]);
+        let output = render(&mut app, vec![]);
+        let (target, _) = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Show All Whitespace"))
+            .unwrap();
+        let _ = render(
+            &mut app,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: *target,
+                    data: None,
+                },
+            )],
+        );
+        let _ = render(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!app.whitespace_preferences.show_all);
+        // A view action must not commit an existing editor draft.
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .begin_cell_edit(1, 0, b"San Diego".to_vec())
+            .unwrap();
+        document.cell_edit.as_mut().unwrap().draft = " draft ".into();
+        app.apply(&ctx, Action::ShowAllWhitespace(true));
+        let document = app.active.document.as_ref().unwrap();
+        assert_eq!(document.cell_edit.as_ref().unwrap().draft, " draft ");
+        assert!(document.cell_edits.is_empty());
+        assert!(!document.can_undo());
+    }
+
+    #[test]
+    fn whitespace_indicator_reports_hidden_tail_and_raw_accessible_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("hidden.csv");
+        let value = "x".repeat(super::MAX_GRID_TEXT_CHARS + 100) + " \t";
+        fs::write(&source, format!("name\n{value}\n")).unwrap();
+        let mut document = Document::open(
+            &source,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = settle_whitespace(&ctx, &mut document);
+        let description = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, n)| {
+                n.label()
+                    .is_some_and(|label| label.starts_with("Select row 1, column 1"))
+            })
+            .unwrap()
+            .1
+            .description()
+            .unwrap()
+            .to_owned();
+        assert!(
+            description.contains("2 trailing whitespace characters"),
+            "{description}"
+        );
+        assert!(description.contains("1 tab"));
+        let indicators: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Path(path) if path.fill == egui::Color32::from_rgb(111, 145, 150) => {
+                    Some((s.clip_rect, path))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!indicators.is_empty());
+        for (clip, path) in indicators {
+            assert!(
+                path.points.iter().all(|point| clip.contains(*point)),
+                "clipped text must not push the indicator outside its cell"
+            );
+        }
+        document.selection = Some(GridSelection::Cell { row: 1, column: 0 });
+        assert_eq!(document.copy_selection_text().unwrap(), value);
+    }
+
+    #[test]
+    fn whitespace_metadata_refreshes_after_cell_header_history_and_discard() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.csv");
+        fs::write(&path, b"name\nword\n").unwrap();
+        let mut app = individual_edit_app(&path);
+        let ctx = egui::Context::default();
+        let key = super::whitespace::CellId {
+            row: Some(1),
+            column: 0,
+        };
+        let cached = |d: &mut Document| {
+            d.whitespace
+                .get(key, 4, || panic!("expected cached summary"))
+                .unwrap()
+        };
+        settle_whitespace(&ctx, app.active.document.as_mut().unwrap());
+        assert!(!cached(app.active.document.as_mut().unwrap()).any());
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 0, " word ");
+        settle_whitespace(&ctx, app.active.document.as_mut().unwrap());
+        assert_eq!(cached(app.active.document.as_mut().unwrap()).trailing, 1);
+        app.swap_edit_history(false).unwrap();
+        settle_whitespace(&ctx, app.active.document.as_mut().unwrap());
+        assert!(!cached(app.active.document.as_mut().unwrap()).any());
+        app.swap_edit_history(true).unwrap();
+        settle_whitespace(&ctx, app.active.document.as_mut().unwrap());
+        assert!(cached(app.active.document.as_mut().unwrap()).likely());
+        let d = app.active.document.as_mut().unwrap();
+        d.rename_header(0, " name ".into()).unwrap();
+        settle_whitespace(&ctx, d);
+        assert_eq!(
+            d.whitespace
+                .get(
+                    super::whitespace::CellId {
+                        row: None,
+                        column: 0
+                    },
+                    6,
+                    || panic!("cached header")
+                )
+                .unwrap()
+                .leading,
+            1
+        );
+        d.discard_edits();
+        settle_whitespace(&ctx, d);
+        assert!(!cached(d).any());
+    }
+
+    #[test]
+    fn whitespace_wide_filtered_rows_use_physical_cells_and_isolated_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wide.csv");
+        let mut values = vec!["normal"; 65];
+        values[64] = " end ";
+        fs::write(
+            &path,
+            format!("{}\n{}\n", vec!["column"; 65].join(","), values.join(",")),
+        )
+        .unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document
+            .start_filter(FilterQuery::single(
+                64,
+                FilterOperator::Equals,
+                b" end ".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(&mut document);
+        document.reveal_cell = Some((1, 64));
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = settle_whitespace(&ctx, &mut document);
+        let node = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, n)| n.label() == Some("Select row 1, column 65 (column):  end "))
+            .unwrap()
+            .1;
+        assert!(node.description().unwrap().contains("1 leading whitespace"));
+        assert!(
+            node.description()
+                .unwrap()
+                .contains("1 trailing whitespace")
+        );
+        let other = directory.path().join("other.csv");
+        fs::write(&other, b"name\nend\n").unwrap();
+        let mut other = Document::open(
+            &other,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut other);
+        settle_whitespace(&ctx, &mut other);
+        assert!(
+            !other
+                .whitespace
+                .get(
+                    super::whitespace::CellId {
+                        row: Some(1),
+                        column: 0
+                    },
+                    3,
+                    || panic!("cached")
+                )
+                .unwrap()
+                .any()
+        );
+    }
+
+    #[test]
+    fn whitespace_cleanup_reclassifies_replacement_and_save_preserves_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raw.csv");
+        let original = b" name ,notes,empty\n New York ,\"a\tb\r\nc\",\n";
+        fs::write(&path, original).unwrap();
+        let mut app = individual_edit_app(&path);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        app.apply(&ctx, Action::ShowAllWhitespace(true));
+        let d = app.active.document.as_mut().unwrap();
+        d.whitespace_all = true;
+        settle_whitespace(&ctx, d);
+        d.selection = Some(GridSelection::Cell { row: 1, column: 1 });
+        assert_eq!(d.copy_selection_text().unwrap(), "a\tb\r\nc");
+        let saved = directory.path().join("saved.csv");
+        assert_eq!(
+            d.start_save_as(saved.clone()).unwrap_err(),
+            AppMessage::warning("Make a change before saving.")
+        );
+        commit_test_cell(d, 1, 2, "saved");
+        d.start_save_as(saved.clone()).unwrap();
+        finish_app_save(&mut app, &ctx, &mut frame);
+        assert_eq!(
+            fs::read(&saved).unwrap(),
+            b" name ,notes,empty\n New York ,\"a\tb\r\nc\",saved\n"
+        );
+        let d = app.active.document.as_mut().unwrap();
+        d.start_cleanup(quarry_core::ColumnCleanup {
+            columns: vec![0],
+            operation: quarry_core::CleanupOperation::Trim,
+        })
+        .unwrap();
+        finish_structural_edit(&mut app);
+        let d = app.active.document.as_mut().unwrap();
+        settle_whitespace(&ctx, d);
+        let s = d
+            .whitespace
+            .get(
+                super::whitespace::CellId {
+                    row: Some(1),
+                    column: 0,
+                },
+                8,
+                || panic!("cached"),
+            )
+            .unwrap();
+        assert!(!s.likely());
+        assert!(s.any());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn whitespace_view_does_not_mark_generated_headers_or_empty_missing_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("no-header.csv");
+        fs::write(&path, b"New York,,\none\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.whitespace_all = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = settle_whitespace(&ctx, &mut document);
+        assert!(!output.shapes.iter().any(
+            |s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text().contains("Column·"))
+        ));
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, n)| n.label()
+            == Some("Select row 1, column 2 (Column 2): ")
+            && n.description().unwrap().contains("No whitespace")));
+        assert!(nodes.iter().any(|(_, n)| n.label()
+            == Some("Select row 2, column 2 (Column 2): ")
+            && n.description().unwrap().contains("absent")));
     }
 }
