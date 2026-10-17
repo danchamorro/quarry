@@ -182,20 +182,42 @@ pub fn estimate_edited_output_bytes(
     transformation: Option<&ColumnTransformation>,
     replacement: Option<&LiteralReplacement>,
 ) -> u64 {
+    estimate_edited_output_bytes_from_values(
+        source_bytes,
+        records,
+        headers
+            .iter()
+            .map(|(column, value)| (*column, value.as_slice())),
+        cells.iter().map(|(key, value)| (*key, value.as_slice())),
+        transformation,
+        replacement,
+    )
+}
+
+/// Estimate borrowed overlays without copying their field bytes. Cell iteration should
+/// follow row order; repeated nonconsecutive rows conservatively overestimate the result.
+pub fn estimate_edited_output_bytes_from_values<'a>(
+    source_bytes: u64,
+    records: u64,
+    headers: impl IntoIterator<Item = (usize, &'a [u8])>,
+    cells: impl IntoIterator<Item = ((u64, usize), &'a [u8])>,
+    transformation: Option<&ColumnTransformation>,
+    replacement: Option<&LiteralReplacement>,
+) -> u64 {
     let serialized = |value: &[u8]| (value.len() as u64).saturating_mul(2).saturating_add(2);
-    let overlay = headers
-        .values()
-        .chain(cells.values())
-        .fold(0_u64, |sum, value| sum.saturating_add(serialized(value)));
+    let mut overlay = 0_u64;
+    let mut header_edited = false;
+    for (_, value) in headers {
+        header_edited = true;
+        overlay = overlay.saturating_add(serialized(value));
+    }
     let mut previous_row = None;
-    let edited_rows = cells
-        .keys()
-        .fold(0_u64, |count, (row, _)| {
-            let new_row = previous_row != Some(*row);
-            previous_row = Some(*row);
-            count.saturating_add(u64::from(new_row))
-        })
-        .saturating_add(u64::from(!headers.is_empty()));
+    let mut edited_rows = u64::from(header_edited);
+    for ((row, _), value) in cells {
+        overlay = overlay.saturating_add(serialized(value));
+        edited_rows = edited_rows.saturating_add(u64::from(previous_row != Some(row)));
+        previous_row = Some(row);
+    }
     // Sort/duplicate materialization may quote every BOM-looking first field,
     // including rows without edits. Sparse saves pass zero and use edited rows.
     let mut bytes = source_bytes
@@ -573,5 +595,40 @@ mod tests {
             assert!(required >= output.bytes_written);
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn borrowed_overlay_estimates_preserve_bounds_without_owned_snapshots() {
+        let headers = BTreeMap::from([(0, b"x".to_vec())]);
+        let cells = BTreeMap::from([
+            ((1, 0), b"ab".to_vec()),
+            ((1, 1), b"c".to_vec()),
+            ((3, 0), b"d".to_vec()),
+        ]);
+        let borrowed = super::estimate_edited_output_bytes_from_values(
+            100,
+            0,
+            headers.iter().map(|(key, value)| (*key, value.as_slice())),
+            cells.iter().map(|(key, value)| (*key, value.as_slice())),
+            None,
+            None,
+        );
+        // (100 source + 18 overlay + 6 row-quote allowance) * 2 + 3 BOM allowance.
+        assert_eq!(borrowed, 251);
+        assert_eq!(
+            super::estimate_edited_output_bytes(100, 0, &headers, &cells, None, None),
+            251
+        );
+        assert_eq!(
+            super::estimate_edited_output_bytes_from_values(
+                u64::MAX,
+                0,
+                std::iter::empty(),
+                std::iter::empty(),
+                None,
+                None,
+            ),
+            u64::MAX
+        );
     }
 }

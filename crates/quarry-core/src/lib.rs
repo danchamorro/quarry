@@ -52,7 +52,7 @@ pub use sort::{
 };
 pub use storage::{
     StorageSpace, check_storage, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
-    inspect_storage,
+    estimate_edited_output_bytes_from_values, inspect_storage,
 };
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
