@@ -59,7 +59,7 @@ expected indicators. The preference survived an application restart.
 
 ## Automated validation and bounds
 
-Workspace tests: 415 passing tests, including 19 added whitespace checks and a
+Workspace tests: 416 passing tests, including 20 added whitespace checks and a
 borrowed storage-estimate regression.
 Rustfmt, workspace Clippy with warnings denied, and the release workspace build
 passed.
@@ -94,3 +94,8 @@ share the existing byte allocation and remain immutable after a later edit.
 The existing owned storage-estimate API is retained as an adapter to the same
 borrowed implementation; the exact-bound test and all existing storage tests
 pass. Native Save As was repeated successfully after this representation change.
+
+The zero-match-filter polling regression failed before its fix with
+“zero-match polls must retain header inspection” and passed afterward. Pending
+zero-match polls leave the shared inspector job and header summaries alone;
+filter scan-error and row-buffer boundaries invalidate only row metadata.

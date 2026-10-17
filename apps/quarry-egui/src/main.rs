@@ -7278,7 +7278,6 @@ impl Document {
             self.refresh_filter_snapshot_for(required);
             self.navigate_filter(self.filter_viewport_start)?;
         } else {
-            self.whitespace.invalidate();
             self.filtered_rows.clear();
             self.filter_buffer_start = 0;
             self.filter_viewport_start = 0;
@@ -7310,7 +7309,7 @@ impl Document {
                 self.filter_query = None;
                 self.filter_progress = None;
                 self.filter_status = None;
-                self.whitespace.invalidate();
+                self.whitespace.invalidate_rows();
                 self.filtered_rows.clear();
                 self.filter_viewport_start = 0;
                 self.filter_buffer_start = 0;
@@ -8320,7 +8319,7 @@ impl Document {
             self.cancel_filter_read_for_navigation();
             self.filter_viewport_start = 0;
             self.filter_buffer_start = 0;
-            self.whitespace.invalidate();
+            self.whitespace.invalidate_rows();
             self.filtered_rows.clear();
             self.clear_hidden_selection();
             return Ok(());
@@ -8436,7 +8435,7 @@ impl Document {
         let Some(window) = self.filter_read_window(viewport_start) else {
             self.cancel_filter_read_for_navigation();
             self.filter_buffer_start = 0;
-            self.whitespace.invalidate();
+            self.whitespace.invalidate_rows();
             self.filtered_rows.clear();
             return Ok(());
         };
@@ -22340,5 +22339,45 @@ mod tests {
             "worker snapshots remain immutable after later edits"
         );
         assert_eq!(input.bytes(), b"name");
+    }
+
+    #[test]
+    fn whitespace_zero_match_filter_poll_keeps_completed_header_inspection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zero-match-header.csv");
+        fs::write(&path, b" name ,value\nrow,x\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let ctx = egui::Context::default();
+        settle_whitespace(&ctx, &mut document);
+        document
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"absent".to_vec(),
+            ))
+            .unwrap();
+        document.poll_filter_scan().unwrap();
+        let id = super::whitespace::CellId {
+            row: None,
+            column: 0,
+        };
+        assert_eq!(
+            document
+                .whitespace
+                .get(id, 6, || panic!(
+                    "zero-match polls must retain header inspection"
+                ))
+                .unwrap()
+                .leading,
+            1
+        );
     }
 }
