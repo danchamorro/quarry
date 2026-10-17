@@ -59,8 +59,8 @@ expected indicators. The preference survived an application restart.
 
 ## Automated validation and bounds
 
-Workspace tests: 416 passing tests, including 20 added whitespace checks and a
-borrowed storage-estimate regression.
+Workspace tests: 417 passing tests, including 20 added whitespace checks plus borrowed storage-
+estimate and Sort-dialog snapshot regressions.
 Rustfmt, workspace Clippy with warnings denied, and the release workspace build
 passed.
 
@@ -99,3 +99,11 @@ The zero-match-filter polling regression failed before its fix with
 “zero-match polls must retain header inspection” and passed afterward. Pending
 zero-match polls leave the shared inspector job and header summaries alone;
 filter scan-error and row-buffer boundaries invalidate only row metadata.
+
+The Sort estimate/dialog regression measured 4,194,304 bytes of owned pending-
+edit snapshots across one direct estimate and three dialog frames before the
+fix, and zero afterward. This is test-only accounting at the owned-job snapshot
+boundary, not a claim of zero total UI allocation. The estimate still matches
+the existing owned API's bound, uses the current editor draft, and preserves
+pending values and source bytes. Header and cell payloads are borrowed; core
+jobs continue to receive owned snapshots when they start.

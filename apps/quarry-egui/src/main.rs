@@ -6158,26 +6158,31 @@ impl Document {
         Ok(())
     }
 
+    /// Dialog frames borrow effective values; only actual core jobs need owned snapshots.
     fn sort_temporary_disk_estimate(&self) -> Option<u64> {
         let records = self.index.as_ref()?.indexed_rows();
         let mut headers: BTreeMap<_, _> = self
             .header_renames
             .iter()
-            .map(|(column, value)| (*column, value.as_bytes().to_vec()))
+            .map(|(column, value)| (*column, value.as_bytes()))
             .collect();
-        let mut cells = self.owned_cell_edits();
+        let mut cells: BTreeMap<_, _> = self
+            .cell_edits
+            .iter()
+            .map(|(key, value)| (*key, value.as_slice()))
+            .collect();
         if let Some(edit) = &self.header_edit {
-            headers.insert(edit.column, edit.draft.as_bytes().to_vec());
+            headers.insert(edit.column, edit.draft.as_bytes());
         }
         if let Some(edit) = &self.cell_edit {
-            cells.insert((edit.row, edit.column), edit.draft.as_bytes().to_vec());
+            cells.insert((edit.row, edit.column), edit.draft.as_bytes());
         }
         Some(estimate_sort_temporary_bytes(
-            quarry_core::estimate_edited_output_bytes(
+            quarry_core::estimate_edited_output_bytes_from_values(
                 self.session.file_size,
                 records,
-                &headers,
-                &cells,
+                headers,
+                cells,
                 None,
                 None,
             ),
@@ -8623,7 +8628,13 @@ impl Document {
     fn owned_cell_edits(&self) -> BTreeMap<(u64, usize), Vec<u8>> {
         self.cell_edits
             .iter()
-            .map(|(key, value)| (*key, value.as_ref().clone()))
+            .map(|(key, value)| {
+                #[cfg(test)]
+                OWNED_EDIT_SNAPSHOT_BYTES.with(|bytes| {
+                    bytes.set(bytes.get().saturating_add(value.len()));
+                });
+                (*key, value.as_ref().clone())
+            })
             .collect()
     }
 
@@ -10433,6 +10444,12 @@ fn format_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.2} {}", UNITS[unit])
+}
+
+// Test-only accounting at the owned-job boundary catches byte copies on UI paths.
+#[cfg(test)]
+std::thread_local! {
+    static OWNED_EDIT_SNAPSHOT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -22379,5 +22396,66 @@ mod tests {
                 .leading,
             1
         );
+    }
+
+    #[test]
+    fn sort_estimate_and_dialog_frames_do_not_copy_owned_edit_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sort-snapshots.csv");
+        fs::write(&path, b"name,value\nrow,x\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let pending = "p".repeat(1024 * 1024);
+        commit_test_cell(&mut document, 1, 1, &pending);
+        document.rename_header(0, "header".repeat(1024)).unwrap();
+        document.begin_cell_edit(1, 1, b"x".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "effective draft".into();
+        let headers = std::collections::BTreeMap::from([(
+            0,
+            document.header_renames[&0].as_bytes().to_vec(),
+        )]);
+        let cells = std::collections::BTreeMap::from([((1, 1), b"effective draft".to_vec())]);
+        let records = document.index.as_ref().unwrap().indexed_rows();
+        let expected = estimate_sort_temporary_bytes(
+            quarry_core::estimate_edited_output_bytes(
+                document.session.file_size,
+                records,
+                &headers,
+                &cells,
+                None,
+                None,
+            ),
+            records - document.data_start,
+        );
+        super::OWNED_EDIT_SNAPSHOT_BYTES.with(|bytes| bytes.set(0));
+        assert_eq!(document.sort_temporary_disk_estimate(), Some(expected));
+        let ctx = egui::Context::default();
+        let mut dialog = StructuralDialog::sort(0);
+        let mut match_case = false;
+        for _ in 0..3 {
+            let _ = ctx.run(grid_input(), |ctx| {
+                show_structural_dialog(ctx, &mut dialog, &mut match_case, &document);
+            });
+        }
+        super::OWNED_EDIT_SNAPSHOT_BYTES.with(|bytes| {
+            assert_eq!(
+                bytes.get(),
+                0,
+                "read-only estimates must not copy pending edit payloads"
+            )
+        });
+        assert_eq!(document.cell_edits[&(1, 1)].as_slice(), pending.as_bytes());
+        assert_eq!(
+            document.cell_edit.as_ref().unwrap().draft,
+            "effective draft"
+        );
+        assert_eq!(fs::read(path).unwrap(), b"name,value\nrow,x\n");
     }
 }
