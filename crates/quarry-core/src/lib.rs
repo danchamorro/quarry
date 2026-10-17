@@ -1,4 +1,5 @@
 mod case;
+mod cleanup;
 mod combine;
 mod date_time_sort;
 mod export;
@@ -22,17 +23,18 @@ use std::time::{Duration, Instant};
 use source_stamp::SourceStamp;
 
 pub use case::CaseSensitivity;
+pub use cleanup::{CleanupOperation, ColumnCleanup};
 pub use combine::{
     CombineInput, CombineJob, CombineOptions, CombinePlan, CombineProgress, CombineSummary,
     check_combine_files,
 };
 pub use date_time_sort::DateTimeFormat;
 pub use export::{
-    ColumnTransformation, FilterExportJob, FilterExportOutcome, FilterExportProgress,
-    FilterExportSummary, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob,
-    ReplaceAllOutcome, ReplaceAllSummary, RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress,
-    SaveAsSummary, SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress,
-    SplitAnalysisSummary,
+    CleanupJob, CleanupOutcome, CleanupSummary, ColumnTransformation, FilterExportJob,
+    FilterExportOutcome, FilterExportProgress, FilterExportSummary, LiteralReplacement,
+    MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob, ReplaceAllOutcome, ReplaceAllSummary, RowInsertion,
+    SaveAsJob, SaveAsOutcome, SaveAsProgress, SaveAsSummary, SplitAnalysisJob,
+    SplitAnalysisOutcome, SplitAnalysisProgress, SplitAnalysisSummary,
 };
 pub use filter::{
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
@@ -106,6 +108,10 @@ pub enum QuarryError {
         indexed_matches: u64,
     },
     InvalidNumericSortValue {
+        data_row: u64,
+        column: usize,
+    },
+    InvalidCleanupText {
         data_row: u64,
         column: usize,
     },
@@ -184,6 +190,10 @@ impl fmt::Display for QuarryError {
             Self::InvalidNumericSortValue { data_row, column } => write!(
                 f,
                 "Cannot sort as Number at data row {data_row}, column {column}: expected a number (for example -12.5 or 1e3)."
+            ),
+            Self::InvalidCleanupText { data_row, column } => write!(
+                f,
+                "Cannot clean text at data row {data_row}, column {column}: expected valid UTF-8 text."
             ),
             Self::InvalidUtf8SortValue { data_row, column } => write!(
                 f,

@@ -532,6 +532,33 @@ logical current file only after validating both the original source stamp and
 the active working snapshot stamp. Save As publishes a new file and leaves the
 previous logical source unchanged.
 
+## Selected-column cleanup
+
+Cleanup shares the guarded streaming save worker and private working-copy
+handoff. A selected-column request carries sorted physical column identities and
+one operation: Unicode Trim, Uppercase, Lowercase or Fill Empty Cells. Missing
+fields stay absent; the header is never cleaned. Pending cell values are applied
+before transformation.
+
+The cleanup job reports changed cells, not literal replacement occurrences.
+A zero-change cleanup discards its private output and preserves the previous
+document and history. Ordinary Save As with a cleanup transformation still
+creates the requested output. Cancellation and source checks use the existing
+worker/publication contract.
+
+The dialog previews at most eight existing cells from twenty loaded rows, with
+a 32 KiB input budget and a 4 KiB per-value preview limit. It calls the same
+value transformation used by Apply, without scanning the file or decoding
+truncated values. The preview is explicitly a sample; output counts come from the
+full operation.
+
+Input and output records remain bounded by the existing record limit. Unicode
+case conversion has a temporary allocation bounded by three times the input
+record limit and validates the output limit before serialization. The conservative
+storage estimate includes case expansion or a fill value for every targeted field
+in every record. This may overestimate sparse fill operations and never treats
+available memory as proportional to file size.
+
 ## Column transformations
 
 The desktop calls the multi-column operation **Combine Columns…**, while

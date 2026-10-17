@@ -70,6 +70,7 @@ acceptance or discovery criteria. Propose a feature through
 | Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, Does not equal, exact numeric comparisons, and inclusive Between; same-column alternatives with AND across columns; text is case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
 | Edit | Direct cell and header editing; multiline values; insert blank rows or columns at a chosen position and count; optional new column name; individual edit Undo and Redo; one-level structural history; Discard Changes |
 | Duplicates | Match selected columns, review the extra-row count, then explicitly remove later occurrences; keep the first row in current order; include unsaved values; bounded memory and cancellation |
+| Clean up columns | Trim surrounding Unicode whitespace, convert uppercase/lowercase, or fill existing empty cells in selected columns; sampled preview, exact changed-cell counts and safe Undo/Redo |
 | Reshape columns | Select columns in the grid, then Split, Combine, Move, or delete the selected columns; continue editing the result before saving |
 | Sort | Text, exact Number, explicit Date / time, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
 | Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |

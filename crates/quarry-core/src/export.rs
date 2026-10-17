@@ -1,3 +1,4 @@
+use crate::ColumnCleanup;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -142,6 +143,7 @@ pub const MAX_TRANSFORMATION_COLUMNS: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnTransformation {
+    Cleanup(ColumnCleanup),
     /// Insert blank data fields at a zero-based source-column boundary.
     Insert {
         source_width: usize,
@@ -217,6 +219,10 @@ impl ColumnTransformation {
     ) -> Result<Vec<Vec<u8>>, QuarryError> {
         self.validate_input_width(fields.len())?;
         match self {
+            Self::Cleanup(cleanup) => {
+                cleanup.apply_to_fields(&mut fields, 1, max_record_bytes)?;
+                Ok(fields)
+            }
             Self::Insert {
                 source_width,
                 position,
@@ -326,12 +332,13 @@ impl ColumnTransformation {
                     "inserted column names must match the count and source header mode",
                 )),
             },
-            Self::Arrange { .. } => Ok(()),
+            Self::Arrange { .. } | Self::Cleanup(_) => Ok(()),
         }
     }
 
     fn validate_shape(&self) -> Result<(), QuarryError> {
         match self {
+            Self::Cleanup(cleanup) => cleanup.validate()?,
             Self::Insert {
                 source_width,
                 position,
@@ -481,7 +488,7 @@ impl ColumnTransformation {
 
     fn replaces_source_column(&self, column: usize) -> bool {
         match self {
-            Self::Insert { .. } => false,
+            Self::Insert { .. } | Self::Cleanup(_) => false,
             Self::Split { source_column, .. } => column == *source_column,
             Self::Join { source_columns, .. } => source_columns.contains(&column),
             Self::Arrange {
@@ -493,7 +500,9 @@ impl ColumnTransformation {
 
     fn joined_columns(&self) -> BTreeSet<usize> {
         match self {
-            Self::Insert { .. } | Self::Split { .. } | Self::Arrange { .. } => BTreeSet::new(),
+            Self::Insert { .. } | Self::Split { .. } | Self::Arrange { .. } | Self::Cleanup(_) => {
+                BTreeSet::new()
+            }
             Self::Join { source_columns, .. } => source_columns.iter().copied().collect(),
         }
     }
@@ -504,6 +513,9 @@ impl ColumnTransformation {
         joined_columns: &BTreeSet<usize>,
     ) -> Result<Vec<Vec<u8>>, QuarryError> {
         self.validate_input_width(fields.len())?;
+        if matches!(self, Self::Cleanup(_)) {
+            return Ok(fields);
+        }
         if let Self::Insert {
             source_width,
             position,
@@ -535,7 +547,7 @@ impl ColumnTransformation {
                 .iter()
                 .max()
                 .expect("join columns are validated"),
-            Self::Insert { .. } | Self::Arrange { .. } => {
+            Self::Insert { .. } | Self::Arrange { .. } | Self::Cleanup(_) => {
                 unreachable!("insertion and arrange returned above")
             }
         };
@@ -973,6 +985,24 @@ pub struct SaveAsJob {
     handle: Option<JoinHandle<Result<SaveWorkerOutcome, QuarryError>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupSummary {
+    pub destination: PathBuf,
+    pub bytes_written: u64,
+    pub changed_cells: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    Complete(CleanupSummary),
+    Unchanged,
+    Cancelled,
+}
+
+pub struct CleanupJob {
+    inner: SaveAsJob,
+}
+
 pub struct ReplaceAllJob {
     inner: SaveAsJob,
 }
@@ -980,6 +1010,7 @@ pub struct ReplaceAllJob {
 enum SaveTarget {
     New(PathBuf, SourceStamp),
     WorkingCopy(PathBuf, SourceStamp),
+    CleanedWorkingCopy(PathBuf, SourceStamp),
     Source(SourceStamp),
     Existing {
         destination: PathBuf,
@@ -1036,6 +1067,7 @@ struct PreparedSaveEdits {
     replacement: Option<LiteralReplacement>,
     deleted_rows: Vec<RangeInclusive<u64>>,
     inserted_rows: Option<RowInsertion>,
+    cleanup_noop: bool,
 }
 
 impl PreparedSaveEdits {
@@ -1119,7 +1151,7 @@ impl PreparedSaveEdits {
                     });
                 }
             }
-            ColumnTransformation::Arrange { .. } => {}
+            ColumnTransformation::Arrange { .. } | ColumnTransformation::Cleanup(_) => {}
         }
         (header_clone_bytes <= max_record_bytes)
             .then_some(())
@@ -1152,6 +1184,7 @@ impl SaveEdits {
             replacement,
             deleted_rows,
             inserted_rows: None,
+            cleanup_noop: false,
         })
     }
 }
@@ -1309,7 +1342,9 @@ impl SaveAsJob {
                 "cell edits must target data rows",
             ));
         }
+        let cleanup_noop = matches!(target, SaveTarget::CleanedWorkingCopy(..));
         let mut edits = edits.prepare(has_header, replacement, deleted_rows)?;
+        edits.cleanup_noop = cleanup_noop;
         if let Some(insertion) = inserted_rows {
             insertion.validate(has_header)?;
             if !edits.deleted_rows.is_empty()
@@ -1334,7 +1369,8 @@ impl SaveAsJob {
             SaveTarget::New(destination, expected) => {
                 ExportTarget::new_guarded(&source_path, destination, &source, expected)?
             }
-            SaveTarget::WorkingCopy(destination, expected) => {
+            SaveTarget::WorkingCopy(destination, expected)
+            | SaveTarget::CleanedWorkingCopy(destination, expected) => {
                 ExportTarget::new_private_guarded(&source_path, destination, &source, expected)?
             }
             SaveTarget::Source(expected) => {
@@ -1484,6 +1520,32 @@ impl ReplaceAllJob {
             })),
             SaveWorkerOutcome::NoMatch => Ok(ReplaceAllOutcome::NoMatch),
             SaveWorkerOutcome::Cancelled => Ok(ReplaceAllOutcome::Cancelled),
+        }
+    }
+}
+
+impl CleanupJob {
+    pub fn progress(&self) -> SaveAsProgress {
+        self.inner.progress()
+    }
+    pub fn error(&self) -> Option<String> {
+        self.inner.error()
+    }
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+    pub fn wait(self) -> Result<CleanupOutcome, QuarryError> {
+        match self.inner.wait_worker()? {
+            SaveWorkerOutcome::Complete {
+                summary,
+                replacements,
+            } => Ok(CleanupOutcome::Complete(CleanupSummary {
+                destination: summary.destination,
+                bytes_written: summary.bytes_written,
+                changed_cells: replacements,
+            })),
+            SaveWorkerOutcome::NoMatch => Ok(CleanupOutcome::Unchanged),
+            SaveWorkerOutcome::Cancelled => Ok(CleanupOutcome::Cancelled),
         }
     }
 }
@@ -1687,6 +1749,34 @@ impl Session {
             ),
             DEFAULT_EXPORT_CONFIG,
         )
+    }
+
+    /// Clean selected existing data fields into an unpublished working version.
+    pub fn start_create_cleaned_working_copy(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        cleanup: ColumnCleanup,
+        destination: impl AsRef<Path>,
+    ) -> Result<CleanupJob, QuarryError> {
+        cleanup.validate()?;
+        let inner = SaveAsJob::start_with_edits(
+            self.path.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.dialect.has_header,
+            SaveEdits {
+                headers: header_renames,
+                cells: cell_edits,
+                transformation: Some(ColumnTransformation::Cleanup(cleanup)),
+            },
+            SaveTarget::CleanedWorkingCopy(
+                destination.as_ref().to_path_buf(),
+                self.source_stamp.clone(),
+            ),
+            DEFAULT_EXPORT_CONFIG,
+        )?;
+        Ok(CleanupJob { inner })
     }
 
     pub fn start_create_replaced_working_copy(
@@ -2720,7 +2810,9 @@ fn run_save_as(
         )
     };
     match copied {
-        Ok(Some(summary)) if edits.replacement.is_some() && summary.replacements == 0 => {
+        Ok(Some(summary))
+            if (edits.replacement.is_some() || edits.cleanup_noop) && summary.replacements == 0 =>
+        {
             if shared.cancel_requested.load(Ordering::Acquire) {
                 output.discard()?;
                 return Ok(SaveWorkerOutcome::Cancelled);
@@ -3566,6 +3658,36 @@ fn write_saved_record(
             limit: max_record_bytes,
         });
     }
+    if let Some(cleanup) = edits.transformation.as_ref().and_then(|t| {
+        if let ColumnTransformation::Cleanup(cleanup) = &t.transformation {
+            Some(cleanup)
+        } else {
+            None
+        }
+    }) {
+        if has_header && row_number == 0 {
+            let bytes_written = if edits.headers.is_empty() {
+                output.write_all(record)?;
+                record.len() as u64
+            } else {
+                write_rewritten_header(output, record, delimiter, &edits.headers, max_record_bytes)?
+            };
+            return Ok(SaveCopySummary {
+                bytes_written,
+                replacements: 0,
+            });
+        }
+        return write_cleaned_data_record(
+            output,
+            record,
+            row_number,
+            delimiter,
+            &edits.cells,
+            cleanup,
+            has_header,
+            max_record_bytes,
+        );
+    }
     if edits.transformation.is_some() {
         return write_transformed_record(
             output,
@@ -3634,6 +3756,71 @@ fn write_saved_record(
     Ok(SaveCopySummary {
         bytes_written: record.len() as u64,
         replacements: 0,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cleaned_data_record(
+    output: &mut ExportTarget,
+    record: &[u8],
+    row_number: u64,
+    delimiter: u8,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    cleanup: &ColumnCleanup,
+    has_header: bool,
+    max_record_bytes: usize,
+) -> Result<SaveCopySummary, QuarryError> {
+    let original = record;
+    let (prefix, record) = if row_number == 0 {
+        record
+            .strip_prefix(UTF8_BOM)
+            .map_or((&[][..], record), |r| (UTF8_BOM, r))
+    } else {
+        (&[][..], record)
+    };
+    let ending = if record.ends_with(b"\r\n") {
+        b"\r\n".as_slice()
+    } else if record.ends_with(b"\n") {
+        b"\n".as_slice()
+    } else {
+        b"".as_slice()
+    };
+    let mut fields = parse_record_with_field_limit(record, delimiter, MAX_TRANSFORMATION_COLUMNS)?
+        .into_iter()
+        .map(|f| f.into_owned())
+        .collect::<Vec<_>>();
+    let row_edits = cell_edits.range((row_number, 0)..=(row_number, usize::MAX));
+    let has_edits = row_edits.clone().next().is_some();
+    for ((_, column), value) in row_edits {
+        let field = fields.get_mut(*column).ok_or(QuarryError::InvalidOption(
+            "cell edit column is out of range",
+        ))?;
+        *field = value.clone();
+    }
+    let changes = cleanup.apply_to_fields_validated(
+        &mut fields,
+        row_number + u64::from(!has_header),
+        max_record_bytes,
+    )?;
+    if changes == 0 && !has_edits {
+        output.write_all(original)?;
+        return Ok(SaveCopySummary {
+            bytes_written: original.len() as u64,
+            replacements: 0,
+        });
+    }
+    let bytes_written = write_serialized_fields(
+        output,
+        prefix,
+        &fields,
+        delimiter,
+        ending,
+        row_number == 0,
+        max_record_bytes,
+    )?;
+    Ok(SaveCopySummary {
+        bytes_written,
+        replacements: changes,
     })
 }
 
@@ -7900,5 +8087,263 @@ mod tests {
         assert!(progress.estimated_output_bytes >= progress.bytes_written);
         assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
         fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn cleanup_jobs_preserve_shape_pending_edits_and_untargeted_bytes() {
+        use crate::{CleanupOperation, CleanupOutcome, ColumnCleanup};
+        let source_bytes = "name,empty,case,raw\r\n\" \tAlice\n \",,Straße,"
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain([0xff])
+            .chain(b"\r\n\" Bob \",,\r\nlonely".iter().copied())
+            .collect::<Vec<_>>();
+        let source = fixture(&source_bytes);
+        let sess = session(&source, b',', HeaderMode::FirstRow);
+        let cases: [(CleanupOperation, Vec<usize>, u64, Vec<u8>); 4] = [
+            (
+                CleanupOperation::Trim,
+                vec![0, 1, 2],
+                2u64,
+                "Full Name,empty,case,raw\r\nAlice,,Straße,"
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain([0xff])
+                    .chain(b"\r\nCarol,,\r\nlonely".iter().copied())
+                    .collect(),
+            ),
+            (
+                CleanupOperation::Uppercase,
+                vec![2],
+                1,
+                "Full Name,empty,case,raw\r\n\" \tAlice\n \",,STRASSE,"
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain([0xff])
+                    .chain(b"\r\n  Carol  ,,\r\nlonely".iter().copied())
+                    .collect(),
+            ),
+            (
+                CleanupOperation::Lowercase,
+                vec![2],
+                1,
+                "Full Name,empty,case,raw\r\n\" \tAlice\n \",,straße,"
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain([0xff])
+                    .chain(b"\r\n  Carol  ,,\r\nlonely".iter().copied())
+                    .collect(),
+            ),
+            (
+                CleanupOperation::FillEmpty(b"filled".to_vec()),
+                vec![1],
+                2,
+                "Full Name,empty,case,raw\r\n\" \tAlice\n \",filled,Straße,"
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain([0xff])
+                    .chain(b"\r\n  Carol  ,filled,\r\nlonely".iter().copied())
+                    .collect(),
+            ),
+        ];
+        for (i, (operation, columns, changed, expected)) in cases.into_iter().enumerate() {
+            let out = destination(&source, &format!("cleanup-{i}.csv"));
+            let job = sess
+                .start_create_cleaned_working_copy(
+                    BTreeMap::from([(0, b"Full Name".to_vec())]),
+                    BTreeMap::from([((2, 0), b"  Carol  ".to_vec())]),
+                    ColumnCleanup { columns, operation },
+                    &out,
+                )
+                .unwrap();
+            let CleanupOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("expected cleanup")
+            };
+            assert_eq!(summary.changed_cells, changed);
+            assert_eq!(fs::read(&out).unwrap(), expected, "case {i}");
+            assert_eq!(fs::read(&source).unwrap(), source_bytes);
+            assert!(temporary_exports(&out).is_empty());
+            fs::remove_file(out).unwrap();
+        }
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn cleanup_noop_cancel_invalid_text_and_generic_export_keep_contracts() {
+        use crate::{CleanupOperation, CleanupOutcome, ColumnCleanup};
+        let source = fixture(b"name,value\nAlice,ok\n");
+        let sess = session(&source, b',', HeaderMode::FirstRow);
+        let clean = ColumnCleanup {
+            columns: vec![0],
+            operation: CleanupOperation::Trim,
+        };
+        let out = destination(&source, "cleanup-noop.csv");
+        let job = sess
+            .start_create_cleaned_working_copy(
+                BTreeMap::from([(0, b"renamed".to_vec())]),
+                BTreeMap::new(),
+                clean.clone(),
+                &out,
+            )
+            .unwrap();
+        assert_eq!(job.wait().unwrap(), CleanupOutcome::Unchanged);
+        assert!(!out.exists());
+        assert!(temporary_exports(&out).is_empty());
+        // A generic Save As still creates output even when cleanup changes nothing.
+        let export = destination(&source, "cleanup-export.csv");
+        let job = sess
+            .start_save_as_with_transformation(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                ColumnTransformation::Cleanup(clean),
+                &export,
+            )
+            .unwrap();
+        assert!(matches!(job.wait().unwrap(), SaveAsOutcome::Complete(_)));
+        assert_eq!(fs::read(&export).unwrap(), b"name,value\nAlice,ok\n");
+        fs::remove_file(export).unwrap();
+        let cancelled = destination(&source, "cleanup-cancel.csv");
+        let job = sess
+            .start_create_cleaned_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                ColumnCleanup {
+                    columns: vec![0],
+                    operation: CleanupOperation::Uppercase,
+                },
+                &cancelled,
+            )
+            .unwrap();
+        job.cancel();
+        assert_eq!(job.wait().unwrap(), CleanupOutcome::Cancelled);
+        assert!(!cancelled.exists());
+        assert!(temporary_exports(&cancelled).is_empty());
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+
+        let source = fixture(b"a,b\nvalid,\xff\n");
+        let sess = session(&source, b',', HeaderMode::FirstRow);
+        let out = destination(&source, "cleanup-invalid.csv");
+        let job = sess
+            .start_create_cleaned_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                ColumnCleanup {
+                    columns: vec![1],
+                    operation: CleanupOperation::Lowercase,
+                },
+                &out,
+            )
+            .unwrap();
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::InvalidCleanupText {
+                data_row: 1,
+                column: 2
+            })
+        ));
+        assert!(!out.exists());
+        assert!(temporary_exports(&out).is_empty());
+        assert_eq!(fs::read(&source).unwrap(), b"a,b\nvalid,\xff\n");
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+
+    #[test]
+    fn cleanup_expansion_limits_and_source_conflicts_leave_no_output() {
+        use crate::{CleanupJob, CleanupOperation, ColumnCleanup};
+        let source = fixture(b"a\n\n");
+        let sess = session(&source, b',', HeaderMode::FirstRow);
+        let out = destination(&source, "cleanup-limit.csv");
+        let cleanup = ColumnCleanup {
+            columns: vec![0],
+            operation: CleanupOperation::FillEmpty(vec![b'x'; 100]),
+        };
+        let inner = SaveAsJob::start_with_edits(
+            source.clone(),
+            sess.file_size,
+            b',',
+            true,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: Some(ColumnTransformation::Cleanup(cleanup)),
+            },
+            SaveTarget::CleanedWorkingCopy(out.clone(), sess.source_stamp.clone()),
+            ExportConfig {
+                chunk_bytes: 1,
+                max_record_bytes: 32,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            (CleanupJob { inner }).wait(),
+            Err(QuarryError::RecordTooLarge { limit: 32 })
+        ));
+        assert!(!out.exists());
+        assert!(temporary_exports(&out).is_empty());
+        fs::write(&source, b"a\nnew content\n").unwrap();
+        assert!(matches!(
+            sess.start_create_cleaned_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                ColumnCleanup {
+                    columns: vec![0],
+                    operation: CleanupOperation::Uppercase
+                },
+                &out
+            ),
+            Err(QuarryError::SourceChanged)
+        ));
+        fs::remove_file(&source).unwrap();
+        remove_case(&source);
+    }
+    #[test]
+    fn cleanup_small_chunks_preserve_bom_empty_records_and_multiline_fields() {
+        use crate::{CleanupJob, CleanupOperation, CleanupOutcome, ColumnCleanup};
+        let source_bytes = b"\xef\xbb\xbf\"  one\nline  \",keep\r\n ,tail\r\n";
+        // A UTF-8 BOM belongs to the file, not to the first headerless value.
+        for chunk_bytes in [1, 2, 7, 32] {
+            let source = fixture(source_bytes);
+            let sess = session(&source, b',', HeaderMode::NoHeader);
+            let out = destination(&source, "cleanup-chunks.csv");
+            let inner = SaveAsJob::start_with_edits(
+                source.clone(),
+                sess.file_size,
+                b',',
+                false,
+                SaveEdits {
+                    headers: BTreeMap::new(),
+                    cells: BTreeMap::new(),
+                    transformation: Some(ColumnTransformation::Cleanup(ColumnCleanup {
+                        columns: vec![0],
+                        operation: CleanupOperation::Trim,
+                    })),
+                },
+                SaveTarget::CleanedWorkingCopy(out.clone(), sess.source_stamp.clone()),
+                ExportConfig {
+                    chunk_bytes,
+                    max_record_bytes: 1024,
+                },
+            )
+            .unwrap();
+            let CleanupOutcome::Complete(result) = (CleanupJob { inner }).wait().unwrap() else {
+                panic!("expected change")
+            };
+            assert_eq!(result.changed_cells, 2);
+            assert_eq!(
+                fs::read(&out).unwrap(),
+                b"\xef\xbb\xbf\"one\nline\",keep\r\n,tail\r\n"
+            );
+            assert_eq!(fs::read(&source).unwrap(), source_bytes);
+            fs::remove_file(&out).unwrap();
+            fs::remove_file(&source).unwrap();
+            remove_case(&source);
+        }
     }
 }

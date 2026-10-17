@@ -19,6 +19,7 @@ delimited files in the Quarry macOS app.
   - [Filter rows](#filter-rows)
   - [Export filtered rows](#export-filtered-rows)
   - [Select columns](#select-columns)
+  - [Clean up columns](#clean-up-columns)
   - [Split columns](#split-columns)
   - [Combine columns](#combine-columns)
   - [Move or delete columns](#move-or-delete-columns)
@@ -445,6 +446,36 @@ Column operations begin from the numbered ruler above the header names:
   an unselected number selects that column first.
 
 Selected columns are highlighted in the ruler and down the grid.
+
+### Clean up columns
+
+Select one or more numbered file columns, right-click a selected number, and
+choose **Clean Up Columns…**. Clear any active filters first: cleanup applies
+to all data rows in the selected columns.
+
+Choose one operation:
+
+- **Trim whitespace** removes surrounding Unicode whitespace, including spaces,
+  tabs, non-breaking spaces and line breaks. Internal spacing is unchanged.
+- **Uppercase** and **Lowercase** use Unicode case conversion without language
+  inference or transliteration.
+- **Fill Empty Cells** fills existing zero-length fields with the entered value.
+  Fields containing only spaces and missing fields in short rows are unchanged.
+  To fill whitespace-only fields too, run Trim first.
+
+The before/after preview is a bounded sample of loaded rows, not a scan of the
+whole file. Large values can be omitted from the preview; Apply still processes
+their full values. An unchanged sample does not mean later rows are unchanged.
+
+**Apply** includes pending cell edits and leaves headers, other columns, row
+order and each row's field count intact. The footer reports the exact number of
+changed cells after completion. The change stays unsaved until Save or Save As;
+the current structural Undo/Redo and Discard behavior applies. No changed cells,
+cancellation, or failure preserves the prior document and history.
+
+Text cleanup fails explicitly on invalid UTF-8 in selected values. Fill keeps
+nonempty values as-is. Output limits and storage review remain enforced, including
+for case conversions and fill values that increase the output size.
 
 ### Split columns
 
