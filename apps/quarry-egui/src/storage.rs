@@ -26,6 +26,10 @@ impl PendingStorageOperation {
     fn action_name(&self) -> &'static str {
         match self {
             Self::Structural(dialog) => match dialog.request {
+                StructuralRequest::CleanupTrim
+                | StructuralRequest::CleanupUppercase
+                | StructuralRequest::CleanupLowercase
+                | StructuralRequest::CleanupFill => "clean up columns",
                 StructuralRequest::InsertRows => "insert rows",
                 StructuralRequest::InsertColumns => "insert columns",
                 StructuralRequest::Sort => "sort",
@@ -51,6 +55,14 @@ impl PendingStorageOperation {
         let plain = || document.materialization_storage_estimate(None, None);
         match self {
             Self::Structural(dialog) => match dialog.request {
+                StructuralRequest::CleanupTrim
+                | StructuralRequest::CleanupUppercase
+                | StructuralRequest::CleanupLowercase
+                | StructuralRequest::CleanupFill => document.materialization_storage_estimate(
+                    Some(&ColumnTransformation::Cleanup(dialog.cleanup())),
+                    None,
+                ),
+
                 StructuralRequest::InsertRows => document
                     .row_insertion_from_dialog(dialog)
                     .map_or(0, |insertion| {

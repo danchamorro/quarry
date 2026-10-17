@@ -208,6 +208,22 @@ pub fn estimate_edited_output_bytes(
     }
     if let Some(transformation) = transformation {
         match transformation {
+            ColumnTransformation::Cleanup(cleanup) => {
+                match &cleanup.operation {
+                    crate::CleanupOperation::Trim => {}
+                    crate::CleanupOperation::Uppercase | crate::CleanupOperation::Lowercase => {
+                        // Unicode full case mappings contain at most three scalars per input scalar.
+                        bytes = bytes.saturating_mul(3);
+                    }
+                    crate::CleanupOperation::FillEmpty(value) => {
+                        bytes = bytes.saturating_add(
+                            records
+                                .saturating_mul(cleanup.columns.len() as u64)
+                                .saturating_mul(serialized(value)),
+                        );
+                    }
+                }
+            }
             ColumnTransformation::Split {
                 source_column,
                 output_count,
@@ -494,6 +510,22 @@ mod tests {
         let headers = BTreeMap::from([(0, b"wide,header".to_vec())]);
         let cells = BTreeMap::from([((1, 0), b"expanded,\"value\"|two".to_vec())]);
         let transformations = [
+            ColumnTransformation::Cleanup(crate::ColumnCleanup {
+                columns: vec![0, 1, 2],
+                operation: crate::CleanupOperation::Trim,
+            }),
+            ColumnTransformation::Cleanup(crate::ColumnCleanup {
+                columns: vec![0, 1, 2],
+                operation: crate::CleanupOperation::Uppercase,
+            }),
+            ColumnTransformation::Cleanup(crate::ColumnCleanup {
+                columns: vec![0, 1, 2],
+                operation: crate::CleanupOperation::Lowercase,
+            }),
+            ColumnTransformation::Cleanup(crate::ColumnCleanup {
+                columns: vec![0, 1, 2],
+                operation: crate::CleanupOperation::FillEmpty(b"filled,\"quoted\"\nvalue".to_vec()),
+            }),
             ColumnTransformation::Arrange {
                 source_width: 3,
                 output_columns: vec![2, 0],

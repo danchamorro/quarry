@@ -28,15 +28,16 @@ use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 #[cfg(test)]
 use quarry_core::SearchProgress;
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, CompletedIndex, DateTimeFormat, DuplicateJob,
-    DuplicateOutcome, DuplicateSpec, DuplicateSummary, FilterExportJob, FilterExportOutcome,
-    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
-    FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
-    IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
-    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome,
-    SaveAsProgress, SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection,
-    SortJob, SortMode, SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
-    StructuralIndex, estimate_sort_temporary_bytes,
+    CaseSensitivity, CleanupJob, CleanupOperation, CleanupOutcome, ColumnCleanup,
+    ColumnTransformation, CompletedIndex, DateTimeFormat, DuplicateJob, DuplicateOutcome,
+    DuplicateSpec, DuplicateSummary, FilterExportJob, FilterExportOutcome, FilterExportProgress,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
+    FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob,
+    IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError,
+    ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress,
+    SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection, SortJob,
+    SortMode, SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    estimate_sort_temporary_bytes,
 };
 use tempfile::TempDir;
 
@@ -409,6 +410,10 @@ struct FilterRuleDraft {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StructuralRequest {
+    CleanupTrim,
+    CleanupUppercase,
+    CleanupLowercase,
+    CleanupFill,
     InsertRows,
     InsertColumns,
     Split,
@@ -416,6 +421,15 @@ enum StructuralRequest {
     Move,
     Sort,
     Duplicates,
+}
+
+impl StructuralRequest {
+    fn is_cleanup(self) -> bool {
+        matches!(
+            self,
+            Self::CleanupTrim | Self::CleanupUppercase | Self::CleanupLowercase | Self::CleanupFill
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +452,27 @@ struct StructuralDialog {
 }
 
 impl StructuralDialog {
+    fn cleanup_columns(columns: Vec<usize>) -> Self {
+        Self {
+            request: StructuralRequest::CleanupTrim,
+            columns,
+            ..Self::sort(0)
+        }
+    }
+    fn cleanup(&self) -> ColumnCleanup {
+        ColumnCleanup {
+            columns: self.columns.clone(),
+            operation: match self.request {
+                StructuralRequest::CleanupTrim => CleanupOperation::Trim,
+                StructuralRequest::CleanupUppercase => CleanupOperation::Uppercase,
+                StructuralRequest::CleanupLowercase => CleanupOperation::Lowercase,
+                StructuralRequest::CleanupFill => {
+                    CleanupOperation::FillEmpty(self.separator.as_bytes().to_vec())
+                }
+                _ => unreachable!("not a cleanup dialog"),
+            },
+        }
+    }
     fn insert_rows(position: u64) -> Self {
         Self {
             request: StructuralRequest::InsertRows,
@@ -1173,6 +1208,11 @@ impl QuarryApp {
             });
         match result {
             Ok(()) => {
+                if dialog.request.is_cleanup() {
+                    if let Some(document) = self.active.document.as_mut() {
+                        document.commit_edits();
+                    }
+                }
                 self.active.structural_dialog = Some(dialog);
                 self.active.notice = None;
             }
@@ -1198,6 +1238,10 @@ impl QuarryApp {
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
             .and_then(|document| match dialog.request {
+                StructuralRequest::CleanupTrim
+                | StructuralRequest::CleanupUppercase
+                | StructuralRequest::CleanupLowercase
+                | StructuralRequest::CleanupFill => document.start_cleanup(dialog.cleanup()),
                 StructuralRequest::InsertRows => document.insert_rows_from_dialog(&dialog),
                 StructuralRequest::InsertColumns => document.insert_columns_from_dialog(&dialog),
                 StructuralRequest::Split => {
@@ -3789,12 +3833,155 @@ fn parse_insertion_position(input: &str, size: u64) -> Result<u64, String> {
         .ok_or_else(|| format!("Enter a position between 1 and {last}."))
 }
 
+fn show_cleanup_dialog(
+    ctx: &egui::Context,
+    dialog: &mut StructuralDialog,
+    document: &Document,
+) -> Option<StructuralDialogAction> {
+    let mut action = None;
+    let modal = egui::Modal::new(egui::Id::new("quarry-cleanup-dialog"))
+        .frame(tool_dialog_frame(ctx))
+        .show(ctx, |ui| {
+            tool_dialog_style(ui.style_mut());
+            ui.set_width(480.0);
+            ui.heading("Clean Up Columns");
+            ui.label("Applies to all data rows in the selected file columns.");
+            let mut targets = dialog.columns.iter().take(8)
+                .map(|c| format!("{}: {}", c + 1, field_preview(document.column_name(*c).as_bytes(), 80)))
+                .collect::<Vec<_>>().join(", ");
+            if dialog.columns.len() > 8 {
+                targets.push_str(&format!(" … and {} more", dialog.columns.len() - 8));
+            }
+            ui.add(egui::Label::new(format!("Selected columns: {targets}")).truncate()).on_hover_text(&targets);
+            ui.separator();
+            ui.label("Operation");
+            ui.horizontal_wrapped(|ui| {
+                for (request, name) in [
+                    (StructuralRequest::CleanupTrim, "Trim whitespace"),
+                    (StructuralRequest::CleanupUppercase, "Uppercase"),
+                    (StructuralRequest::CleanupLowercase, "Lowercase"),
+                    (StructuralRequest::CleanupFill, "Fill Empty Cells"),
+                ] {
+                    ui.selectable_value(&mut dialog.request, request, name);
+                }
+            });
+            if dialog.request == StructuralRequest::CleanupFill {
+                let label = ui.label("Fill value");
+                let input = ui.add(egui::TextEdit::multiline(&mut dialog.separator)
+                    .id_salt("cleanup-fill-value").desired_rows(2).desired_width(f32::INFINITY))
+                    .labelled_by(label.id);
+                let _ = ctx.accesskit_node_builder(input.id, |node| node.set_label("Fill value"));
+                ui.weak("Only existing empty fields are filled. Spaces and missing fields stay unchanged.");
+            } else if dialog.request == StructuralRequest::CleanupTrim {
+                ui.weak("Remove surrounding spaces, tabs and line breaks. Keep internal spacing.");
+            } else {
+                ui.weak("Unicode case conversion. No language-specific rules or transliteration.");
+            }
+            ui.separator();
+            ui.strong("Sample preview");
+            ui.weak("A small sample of loaded rows, not a full-file scan. Other rows may also change.");
+            let cleanup = dialog.cleanup();
+            let preview = cleanup_preview(document, &cleanup);
+            egui::ScrollArea::vertical().id_salt("cleanup-preview").max_height(180.0).show(ui, |ui| {
+                for line in &preview.lines { ui.label(line); }
+                if preview.lines.is_empty() { ui.label("No loaded fields to preview."); }
+                if preview.skipped { ui.weak("Some large values are not previewed; Apply still checks the full values."); }
+            });
+            let reason = document.structural_edit_disabled_reason().map(str::to_owned)
+                .or_else(|| cleanup.validate().err().map(|e| e.to_string()))
+                .or(preview.error);
+            if let Some(error) = &reason { ui.colored_label(Color32::DARK_RED, error); }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() { action = Some(StructuralDialogAction::Cancel); }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add_enabled(reason.is_none(), egui::Button::new(RichText::new("Apply").color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW)).clicked() {
+                        action = Some(StructuralDialogAction::Apply);
+                    }
+                });
+            });
+        });
+    if modal.should_close() {
+        action = Some(StructuralDialogAction::Cancel);
+    }
+    action
+}
+
+struct CleanupPreview {
+    lines: Vec<String>,
+    skipped: bool,
+    error: Option<String>,
+}
+
+fn cleanup_preview(document: &Document, cleanup: &ColumnCleanup) -> CleanupPreview {
+    let mut result = CleanupPreview {
+        lines: Vec::new(),
+        skipped: false,
+        error: None,
+    };
+    let mut budget = 32 * 1024usize;
+    for (offset, row) in document.buffered_rows.iter().enumerate().take(20) {
+        let physical = document.buffer_start + offset as u64;
+        if physical < document.data_start {
+            continue;
+        }
+        let data_row = physical - document.data_start + 1;
+        for &column in &cleanup.columns {
+            if result.lines.len() >= 8 {
+                return result;
+            }
+            let Some(source) = row.fields.get(column) else {
+                continue;
+            };
+            let value = document
+                .cell_edits
+                .get(&(physical, column))
+                .map_or(source.as_slice(), Vec::as_slice);
+            let fill_len = if let CleanupOperation::FillEmpty(v) = &cleanup.operation {
+                v.len()
+            } else {
+                0
+            };
+            if value.len() > 4096
+                || fill_len > 4096
+                || value.len().saturating_add(fill_len) > budget
+            {
+                result.skipped = true;
+                continue;
+            }
+            budget -= value.len().saturating_add(fill_len);
+            match cleanup
+                .operation
+                .clean_value(value, data_row, column + 1, 64 * 1024 * 1024)
+            {
+                Ok(next) => {
+                    let after = next.as_deref().unwrap_or(value);
+                    result.lines.push(format!(
+                        "Row {data_row}, column {}: before \"{}\"; after \"{}\"",
+                        column + 1,
+                        field_preview(value, 100),
+                        field_preview(after, 100)
+                    ));
+                }
+                Err(error) => {
+                    result.error = Some(error.to_string());
+                    return result;
+                }
+            }
+        }
+    }
+    result
+}
+
 fn show_structural_dialog(
     ctx: &egui::Context,
     dialog: &mut StructuralDialog,
     sort_match_case: &mut bool,
     document: &Document,
 ) -> Option<StructuralDialogAction> {
+    if dialog.request.is_cleanup() {
+        return show_cleanup_dialog(ctx, dialog, document);
+    }
     let mut action = None;
     let sort_disk = (dialog.request == StructuralRequest::Sort)
         .then(|| document.sort_temporary_disk_estimate())
@@ -3809,6 +3996,7 @@ fn show_structural_dialog(
         StructuralRequest::Move => "Move Columns",
         StructuralRequest::Sort => "Sort Rows",
         StructuralRequest::Duplicates => "Find Duplicates",
+        _ => unreachable!("cleanup rendered separately"),
     };
     let modal = egui::Modal::new(egui::Id::new("quarry-structural-dialog"))
         .frame(tool_dialog_frame(ctx))
@@ -3843,6 +4031,7 @@ fn show_structural_dialog(
         }
         ui.add_space(6.0);
         match dialog.request {
+            StructuralRequest::CleanupTrim | StructuralRequest::CleanupUppercase | StructuralRequest::CleanupLowercase | StructuralRequest::CleanupFill => unreachable!("cleanup rendered separately"),
             StructuralRequest::InsertRows | StructuralRequest::InsertColumns => {
                 let rows = dialog.request == StructuralRequest::InsertRows;
                 let position_label = if rows { "Insert before data row" } else { "Insert before file column" };
@@ -4051,6 +4240,7 @@ fn show_structural_dialog(
                 StructuralRequest::Sort => "Sort",
                 StructuralRequest::Duplicates => "Find duplicates",
                 StructuralRequest::Split | StructuralRequest::Combine => "OK",
+                _ => unreachable!("cleanup rendered separately"),
             };
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let mut apply = ui.add_enabled(valid, egui::Button::new(RichText::new(submit_label).color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW));
@@ -4973,6 +5163,12 @@ struct MaterializationPreparation {
 }
 
 enum StructuralJob {
+    Cleaning {
+        job: CleanupJob,
+        destination: PathBuf,
+        selected_columns: BTreeSet<usize>,
+        undo: WorkingCopySnapshot,
+    },
     FindingDuplicates {
         job: DuplicateJob,
         destination: PathBuf,
@@ -6069,6 +6265,51 @@ impl Document {
             .map_err(|message| message.text)
     }
 
+    fn start_cleanup(&mut self, cleanup: ColumnCleanup) -> Result<(), AppMessage> {
+        if let Some(reason) = self.structural_edit_disabled_reason() {
+            return Err(AppMessage::warning(reason));
+        }
+        cleanup
+            .validate()
+            .map_err(|e| AppMessage::warning(e.to_string()))?;
+        for &column in &cleanup.columns {
+            self.validate_column(column).map_err(AppMessage::warning)?;
+        }
+        self.commit_edits();
+        self.cancel_search();
+        let selected_columns = cleanup.columns.iter().copied().collect();
+        let MaterializationPreparation {
+            undo,
+            destination,
+            renames,
+        } = self.prepare_materialization()?;
+        let job = match self.session.start_create_cleaned_working_copy(
+            renames,
+            self.cell_edits.clone(),
+            cleanup,
+            destination.clone(),
+        ) {
+            Ok(job) => job,
+            Err(error) => {
+                self.cleanup_empty_working_copy();
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                }
+                return Err(AppMessage::error(error.to_string()));
+            }
+        };
+        self.structural_job = Some(StructuralJob::Cleaning {
+            job,
+            destination,
+            selected_columns,
+            undo,
+        });
+        self.structural_status = Some("Cleaning columns…".into());
+        self.structural_cancel_requested = false;
+        Ok(())
+    }
+
     fn start_replace_all_with_case(
         &mut self,
         query: &[u8],
@@ -6156,6 +6397,7 @@ impl Document {
             return Ok(None);
         };
         let done = match job {
+            StructuralJob::Cleaning { job, .. } => job.progress().done,
             StructuralJob::FindingDuplicates { job, .. } => job.progress().done,
             StructuralJob::DuplicatePreview { .. } => false,
             StructuralJob::AnalyzingSplit { job, .. } => job.progress().done,
@@ -6279,6 +6521,46 @@ impl Document {
                 Err(error) => {
                     self.structural_status =
                         Some("Split failed. The document was not changed.".into());
+                    Err(AppMessage::error(error.to_string()))
+                }
+            },
+            StructuralJob::Cleaning {
+                job,
+                destination,
+                selected_columns,
+                undo,
+            } => match job.wait() {
+                Ok(CleanupOutcome::Complete(summary)) => Ok(Some(MaterializedWorkingCopy {
+                    path: summary.destination,
+                    output_index: None,
+                    undo,
+                    selected_columns,
+                    notice: format!(
+                        "Cleaned {} cell{}. Save to keep it, or discard changes.",
+                        summary.changed_cells,
+                        if summary.changed_cells == 1 { "" } else { "s" }
+                    ),
+                })),
+                Ok(outcome @ (CleanupOutcome::Unchanged | CleanupOutcome::Cancelled)) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    self.structural_status = Some(
+                        if matches!(outcome, CleanupOutcome::Unchanged) {
+                            "No cells changed. The document was not changed."
+                        } else {
+                            "Cleanup cancelled. The document was not changed."
+                        }
+                        .into(),
+                    );
+                    Ok(None)
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(destination);
+                    self.cleanup_empty_working_copy();
+                    if matches!(error, QuarryError::SourceChanged) {
+                        self.invalidate_changed_source();
+                        return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                    }
                     Err(AppMessage::error(error.to_string()))
                 }
             },
@@ -6518,6 +6800,7 @@ impl Document {
             StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
             StructuralJob::Materializing { job, .. } => job.cancel(),
             StructuralJob::Replacing { job, .. } => job.cancel(),
+            StructuralJob::Cleaning { job, .. } => job.cancel(),
             StructuralJob::Sorting { job, .. } => job.cancel(),
             StructuralJob::DeletingRows { job, .. } | StructuralJob::InsertingRows { job, .. } => {
                 job.cancel()
@@ -6590,6 +6873,9 @@ impl Document {
                     job.progress(),
                     "Applying column edit",
                 ));
+            }
+            StructuralJob::Cleaning { job, .. } => {
+                return Some(materialization_progress(job.progress(), "Cleaning columns"));
             }
             StructuralJob::Replacing { job, .. } => {
                 let progress = job.progress();
@@ -7859,6 +8145,7 @@ impl Document {
                 StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
                 StructuralJob::Materializing { job, .. } => job.cancel(),
                 StructuralJob::Replacing { job, .. } => job.cancel(),
+                StructuralJob::Cleaning { job, .. } => job.cancel(),
                 StructuralJob::Sorting { job, .. } => job.cancel(),
                 StructuralJob::DeletingRows { job, .. }
                 | StructuralJob::InsertingRows { job, .. } => job.cancel(),
@@ -9142,6 +9429,14 @@ fn show_table(
                                             interaction.column_request = Some(GridColumnRequest::Dialog(StructuralDialog::insert_columns(position)));
                                             ui.close();
                                         }
+                                    }
+                                    ui.separator();
+                                    let cleanup_columns = document.selected_columns.iter().copied().filter(|c| *c < document.total_columns).collect::<Vec<_>>();
+                                    let cleanup_reason = document.structural_edit_disabled_reason();
+                                    if ui.add_enabled(cleanup_reason.is_none() && !cleanup_columns.is_empty(), egui::Button::new("Clean Up Columns…"))
+                                        .on_disabled_hover_text(cleanup_reason.unwrap_or("Select a file column first.")).clicked() {
+                                        interaction.column_request = Some(GridColumnRequest::Dialog(StructuralDialog::cleanup_columns(cleanup_columns)));
+                                        ui.close();
                                     }
                                     ui.separator();
                                     let split_column = selected_split_column(
@@ -20883,5 +21178,471 @@ mod tests {
             super::materialization_progress(progress, "Inserting rows").fraction,
             1.0
         );
+    }
+    #[test]
+    fn cleanup_preview_and_apply_use_pending_values_and_keep_history() {
+        use super::{StructuralDialog, StructuralDialogAction, cleanup_preview};
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cleanup.csv");
+        let original = b"name,other\n  Alice  ,keep\n  Bob  ,untouched\n";
+        fs::write(&path, original).unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document
+            .begin_cell_edit(1, 0, b"  Alice  ".to_vec())
+            .unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "  Carol  ".into();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.active.document = Some(document);
+        app.open_structural_dialog(StructuralDialog::cleanup_columns(vec![0]));
+        let doc = app.active.document.as_ref().unwrap();
+        let preview = cleanup_preview(
+            doc,
+            &ColumnCleanup {
+                columns: vec![0],
+                operation: CleanupOperation::Trim,
+            },
+        );
+        assert!(preview.error.is_none());
+        assert!(
+            preview
+                .lines
+                .iter()
+                .any(|l| l.contains("Carol") && !l.contains("Alice"))
+        );
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let doc = app.active.document.as_ref().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::read(doc.session.path()).unwrap(),
+            b"name,other\nCarol,keep\nBob,untouched\n"
+        );
+        assert!(
+            app.active
+                .footer_status
+                .as_ref()
+                .unwrap()
+                .contains("Cleaned 2 cells")
+        );
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let doc = app.active.document.as_ref().unwrap();
+        assert_eq!(
+            doc.cell_edits.get(&(1, 0)).map(Vec::as_slice),
+            Some(b"  Carol  ".as_slice())
+        );
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
+            b"name,other\nCarol,keep\nBob,untouched\n"
+        );
+    }
+
+    #[test]
+    fn cleanup_modes_noop_and_preview_bounds_are_observable() {
+        use super::{StructuralDialog, StructuralDialogAction, StructuralRequest, cleanup_preview};
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        for (request, fill, expected, count) in [
+            (
+                StructuralRequest::CleanupUppercase,
+                "",
+                "name,value\nSTRASSE,\nΟΣ,  \n",
+                1,
+            ),
+            (
+                StructuralRequest::CleanupLowercase,
+                "",
+                "name,value\nstraße,\nος,  \n",
+                2,
+            ),
+            (
+                StructuralRequest::CleanupFill,
+                "filled",
+                "name,value\nStraße,filled\nΟΣ,  \n",
+                1,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("cleanup-modes.csv");
+            fs::write(&path, "name,value\nStraße,\nΟΣ,  \n").unwrap();
+            let mut document = Document::open(
+                &path,
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            finish_index(&mut document);
+            let mut app = QuarryApp::new(None, Instant::now());
+            app.active.document = Some(document);
+            let mut dialog = StructuralDialog::cleanup_columns(vec![0, 1]);
+            dialog.request = request;
+            dialog.separator = fill.into();
+            app.open_structural_dialog(dialog);
+            app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+            finish_structural_edit(&mut app);
+            assert_eq!(
+                fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
+                expected.as_bytes()
+            );
+            assert!(
+                app.active
+                    .footer_status
+                    .as_ref()
+                    .unwrap()
+                    .contains(&format!("Cleaned {count} cell"))
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preview-large.csv");
+        fs::write(&path, format!("value\n{}\n", "a".repeat(8192))).unwrap();
+        let mut doc = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut doc);
+        let preview = cleanup_preview(
+            &doc,
+            &ColumnCleanup {
+                columns: vec![0],
+                operation: CleanupOperation::Uppercase,
+            },
+        );
+        assert!(preview.skipped);
+        assert!(preview.lines.is_empty());
+        assert!(preview.error.is_none());
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.active.document = Some(doc);
+        app.open_structural_dialog(StructuralDialog::cleanup_columns(vec![0]));
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let doc = app.active.document.as_ref().unwrap();
+        assert!(!doc.is_dirty());
+        assert_eq!(doc.session.path(), path);
+    }
+
+    #[test]
+    fn cleanup_cancel_after_worker_completion_preserves_document_and_history() {
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cleanup-cancel.csv");
+        let original = b"name,other\n  Alice  ,keep\n";
+        fs::write(&path, original).unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document
+            .begin_cell_edit(1, 0, b"  Alice  ".to_vec())
+            .unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "  Carol  ".into();
+        document.commit_edits();
+        let edits = document.cell_edits.clone();
+        let history = document.edit_history.clone();
+        document
+            .start_cleanup(ColumnCleanup {
+                columns: vec![0],
+                operation: CleanupOperation::Trim,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let super::StructuralJob::Cleaning { job, .. } =
+                document.structural_job.as_ref().unwrap()
+            else {
+                panic!("expected cleanup job");
+            };
+            if job.progress().done {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        document.cancel_structural_edit();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while document.structural_job.is_some() {
+            assert!(
+                document.poll_structural_edit().unwrap().is_none(),
+                "a cancelled completed result must not be accepted"
+            );
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(document.session.path(), path);
+        assert_eq!(document.cell_edits, edits);
+        assert_eq!(document.edit_history, history);
+        assert!(
+            document.working_copy.is_none(),
+            "session={:?} logical={:?} undo={:?} redo={:?}",
+            document.session.path(),
+            document.logical_path,
+            document.working_copy.as_ref().unwrap().undo,
+            document.working_copy.as_ref().unwrap().redo
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+        assert!(
+            document
+                .structural_status
+                .as_deref()
+                .unwrap()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn cleanup_dialog_exposes_operations_fill_label_and_filter_guard() {
+        use super::{StructuralRequest, show_cleanup_dialog};
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cleanup-controls.csv");
+        fs::write(&path, b"name,value\nAlice,\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut dialog = StructuralDialog::cleanup_columns(vec![1]);
+        dialog.request = StructuralRequest::CleanupFill;
+        let output = ctx.run(grid_input(), |ctx| {
+            assert_eq!(show_cleanup_dialog(ctx, &mut dialog, &document), None);
+        });
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        for label in [
+            "Trim whitespace",
+            "Uppercase",
+            "Lowercase",
+            "Fill Empty Cells",
+            "Fill value",
+            "Apply",
+            "Cancel",
+        ] {
+            assert!(
+                nodes.iter().any(|(_, node)| node.label() == Some(label)),
+                "missing {label}"
+            );
+        }
+        document
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"Alice".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(&mut document);
+        let output = ctx.run(grid_input(), |ctx| {
+            assert_eq!(show_cleanup_dialog(ctx, &mut dialog, &document), None);
+        });
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(
+            nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Apply"))
+                .unwrap()
+                .1
+                .is_disabled()
+        );
+        assert!(
+            document
+                .start_cleanup(ColumnCleanup {
+                    columns: vec![1],
+                    operation: CleanupOperation::FillEmpty(b"filled".to_vec())
+                })
+                .is_err()
+        );
+        assert!(document.structural_job.is_none());
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn cleanup_scans_past_preview_and_preserves_work_after_failure_or_noop() {
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("late-cleanup.csv");
+        let mut original = b"name,raw\n".to_vec();
+        for _ in 0..30 {
+            original.extend_from_slice(b"clean,ok\n");
+        }
+        original.extend_from_slice(b"  late  ,\xff\n");
+        fs::write(&path, &original).unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let trim = ColumnCleanup {
+            columns: vec![0],
+            operation: CleanupOperation::Trim,
+        };
+        let sample = super::cleanup_preview(&document, &trim);
+        assert!(sample.error.is_none());
+        assert!(sample.lines.iter().all(|line| !line.contains("late")));
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.active.document = Some(document);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_cleanup(trim.clone())
+            .unwrap();
+        finish_structural_edit(&mut app);
+        assert!(
+            app.active
+                .footer_status
+                .as_deref()
+                .unwrap()
+                .contains("Cleaned 1 cell")
+        );
+        let doc = app.active.document.as_mut().unwrap();
+        assert!(
+            fs::read(doc.session.path())
+                .unwrap()
+                .ends_with(b"late,\xff\n")
+        );
+        doc.begin_cell_edit(1, 0, b"clean".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "Carol".into();
+        doc.commit_edits();
+        let previous_path = doc.session.path().to_path_buf();
+        let edits = doc.cell_edits.clone();
+        let history = doc.edit_history.clone();
+        let undo = doc.working_copy.as_ref().unwrap().undo.clone();
+        doc.start_cleanup(ColumnCleanup {
+            columns: vec![1],
+            operation: CleanupOperation::Lowercase,
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            match doc.poll_structural_edit() {
+                Err(error) => break error,
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("invalid text must not produce a working version"),
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert!(
+            error.text.contains("31") && error.text.contains("2"),
+            "{}",
+            error.text
+        );
+        assert_eq!(doc.session.path(), previous_path);
+        assert_eq!(doc.cell_edits, edits);
+        assert_eq!(doc.edit_history, history);
+        assert_eq!(doc.working_copy.as_ref().unwrap().undo, undo);
+        doc.start_cleanup(trim).unwrap();
+        finish_structural_edit(&mut app);
+        let doc = app.active.document.as_ref().unwrap();
+        assert_eq!(doc.session.path(), previous_path);
+        assert_eq!(doc.cell_edits, edits);
+        assert_eq!(doc.edit_history, history);
+        assert_eq!(doc.working_copy.as_ref().unwrap().undo, undo);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(doc.working_copy.as_ref().unwrap().directory.path())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    fn cleanup_source_change_warning(at_handoff: bool) {
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cleanup-source-change.csv");
+        let original = b"name\n  Alice  \n";
+        fs::write(&path, original).unwrap();
+        let mut app = individual_edit_app(&path);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_cleanup(ColumnCleanup {
+                columns: vec![0],
+                operation: CleanupOperation::Trim,
+            })
+            .unwrap();
+        finish_structural_edit(&mut app);
+        let doc = app.active.document.as_mut().unwrap();
+        let working_path = doc.session.path().to_path_buf();
+        let cleanup = ColumnCleanup {
+            columns: vec![0],
+            operation: CleanupOperation::Uppercase,
+        };
+        let message = if at_handoff {
+            doc.start_cleanup(cleanup).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let super::StructuralJob::Cleaning { job, .. } =
+                    doc.structural_job.as_ref().unwrap()
+                else {
+                    panic!("expected cleanup");
+                };
+                if job.progress().done {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            fs::write(&working_path, b"name\nchanged outside\n").unwrap();
+            loop {
+                match doc.poll_structural_edit() {
+                    Err(error) => break error,
+                    Ok(None) => {}
+                    Ok(Some(_)) => panic!("changed source must not be accepted"),
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        } else {
+            fs::write(&working_path, b"name\nchanged outside\n").unwrap();
+            doc.start_cleanup(cleanup).unwrap_err()
+        };
+        assert_eq!(
+            message,
+            super::AppMessage::warning(super::SOURCE_CHANGED_NOTICE)
+        );
+        assert!(doc.source_changed);
+        assert!(doc.structural_job.is_none());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn cleanup_start_source_change_uses_shared_recovery_warning() {
+        cleanup_source_change_warning(false);
+    }
+
+    #[test]
+    fn cleanup_handoff_source_change_uses_shared_recovery_warning() {
+        cleanup_source_change_warning(true);
     }
 }
