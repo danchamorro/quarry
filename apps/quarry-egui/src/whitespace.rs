@@ -461,6 +461,21 @@ pub(super) fn paint_indicator(ui: &egui::Ui, response: &Response, indicated: boo
     }
 }
 
+/// Ignore unusable environment roots instead of writing preferences beneath the working directory.
+fn unix_preferences_path(
+    config_root: Option<PathBuf>,
+    user_root: Option<PathBuf>,
+) -> Option<PathBuf> {
+    config_root
+        .filter(|root| root.is_absolute())
+        .or_else(|| {
+            user_root
+                .filter(|root| root.is_absolute())
+                .map(|root| root.join(".config"))
+        })
+        .map(|root| root.join("quarry/view-preferences"))
+}
+
 #[derive(Default)]
 pub(super) struct Preferences {
     pub show_all: bool,
@@ -481,16 +496,20 @@ impl Preferences {
     }
     pub fn application() -> Self {
         let path = if cfg!(target_os = "macos") {
-            std::env::var_os("HOME").map(|p| {
-                PathBuf::from(p).join("Library/Application Support/Quarry/view-preferences")
-            })
-        } else if cfg!(target_os = "windows") {
-            std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Quarry/view-preferences"))
-        } else {
-            std::env::var_os("XDG_CONFIG_HOME")
+            std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
-                .map(|p| p.join("quarry/view-preferences"))
+                .filter(|root| root.is_absolute())
+                .map(|root| root.join("Library/Application Support/Quarry/view-preferences"))
+        } else if cfg!(target_os = "windows") {
+            std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .filter(|root| root.is_absolute())
+                .map(|root| root.join("Quarry/view-preferences"))
+        } else {
+            unix_preferences_path(
+                std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+                std::env::var_os("HOME").map(PathBuf::from),
+            )
         };
         Self::load(path)
     }
@@ -751,5 +770,32 @@ mod tests {
         let mut blocked = Preferences::load(Some(dir.path().to_path_buf()));
         assert!(blocked.set(true).is_err());
         assert!(blocked.show_all, "view still changes if persistence fails");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preference_paths_reject_empty_and_relative_config_roots() {
+        let user_root = PathBuf::from("/users/quarry-test");
+        let fallback = user_root.join(".config/quarry/view-preferences");
+        assert_eq!(unix_preferences_path(None, Some(PathBuf::from(""))), None);
+        assert_eq!(
+            unix_preferences_path(None, Some(PathBuf::from("relative"))),
+            None
+        );
+        for value in ["", "config", "./config", "../config"] {
+            assert_eq!(
+                unix_preferences_path(Some(PathBuf::from(value)), Some(user_root.clone())),
+                Some(fallback.clone())
+            );
+            assert_eq!(
+                unix_preferences_path(Some(PathBuf::from(value)), None),
+                None
+            );
+        }
+        assert_eq!(unix_preferences_path(None, Some(user_root)), Some(fallback));
+        assert_eq!(
+            unix_preferences_path(Some(PathBuf::from("/config-root")), None),
+            Some(PathBuf::from("/config-root/quarry/view-preferences"))
+        );
     }
 }

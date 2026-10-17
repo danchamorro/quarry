@@ -59,7 +59,7 @@ expected indicators. The preference survived an application restart.
 
 ## Automated validation and bounds
 
-Workspace tests: 417 passing tests, including 20 added whitespace checks plus borrowed storage-
+Workspace tests: 418 passing tests, including 21 added whitespace checks plus borrowed storage-
 estimate and Sort-dialog snapshot regressions.
 Rustfmt, workspace Clippy with warnings denied, and the release workspace build
 passed.
@@ -107,3 +107,9 @@ boundary, not a claim of zero total UI allocation. The estimate still matches
 the existing owned API's bound, uses the current editor draft, and preserves
 pending values and source bytes. Header and cell payloads are borrowed; core
 jobs continue to receive owned snapshots when they start.
+
+The preference-path regression initially selected a working-directory-relative
+path for an empty config root. Empty/relative roots now fall back to an absolute
+user config directory, and absent/unusable roots do not create a relative
+preference path. Tests cover empty, relative, missing, and absolute roots without
+mutating the process environment.
