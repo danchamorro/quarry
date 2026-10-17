@@ -74,10 +74,12 @@ small read chunks and BOMs, no-op/cancel behavior, and structural history.
 
 Focused egui checks also cover operation/fill accessibility labels, filter
 gating, preview bounds, effective pending values, and cancellation at the
-completed-worker handoff. The cancellation handoff regression passes without
+completed-worker handoff. The source-change warning regressions failed before the fix and passed after it
+for both job startup and publication handoff.
+The cancellation handoff regression passes without
 a production fix: the shared worker's publication protocol already protects it.
 
-The final workspace run passed 393 tests; strict Clippy and formatting passed.
+The final workspace run passed 395 tests; strict Clippy and formatting passed.
 The packaging self-test passed its rollback and license checks, including 17
 license-generator tests.
 

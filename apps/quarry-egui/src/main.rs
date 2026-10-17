@@ -6294,6 +6294,7 @@ impl Document {
                 self.cleanup_empty_working_copy();
                 if matches!(error, QuarryError::SourceChanged) {
                     self.invalidate_changed_source();
+                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
                 return Err(AppMessage::error(error.to_string()));
             }
@@ -6558,6 +6559,7 @@ impl Document {
                     self.cleanup_empty_working_copy();
                     if matches!(error, QuarryError::SourceChanged) {
                         self.invalidate_changed_source();
+                        return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                     }
                     Err(AppMessage::error(error.to_string()))
                 }
@@ -21571,5 +21573,76 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn cleanup_source_change_warning(at_handoff: bool) {
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cleanup-source-change.csv");
+        let original = b"name\n  Alice  \n";
+        fs::write(&path, original).unwrap();
+        let mut app = individual_edit_app(&path);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_cleanup(ColumnCleanup {
+                columns: vec![0],
+                operation: CleanupOperation::Trim,
+            })
+            .unwrap();
+        finish_structural_edit(&mut app);
+        let doc = app.active.document.as_mut().unwrap();
+        let working_path = doc.session.path().to_path_buf();
+        let cleanup = ColumnCleanup {
+            columns: vec![0],
+            operation: CleanupOperation::Uppercase,
+        };
+        let message = if at_handoff {
+            doc.start_cleanup(cleanup).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let super::StructuralJob::Cleaning { job, .. } =
+                    doc.structural_job.as_ref().unwrap()
+                else {
+                    panic!("expected cleanup");
+                };
+                if job.progress().done {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            fs::write(&working_path, b"name\nchanged outside\n").unwrap();
+            loop {
+                match doc.poll_structural_edit() {
+                    Err(error) => break error,
+                    Ok(None) => {}
+                    Ok(Some(_)) => panic!("changed source must not be accepted"),
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        } else {
+            fs::write(&working_path, b"name\nchanged outside\n").unwrap();
+            doc.start_cleanup(cleanup).unwrap_err()
+        };
+        assert_eq!(
+            message,
+            super::AppMessage::warning(super::SOURCE_CHANGED_NOTICE)
+        );
+        assert!(doc.source_changed);
+        assert!(doc.structural_job.is_none());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn cleanup_start_source_change_uses_shared_recovery_warning() {
+        cleanup_source_change_warning(false);
+    }
+
+    #[test]
+    fn cleanup_handoff_source_change_uses_shared_recovery_warning() {
+        cleanup_source_change_warning(true);
     }
 }
