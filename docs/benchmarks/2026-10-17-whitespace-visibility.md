@@ -26,7 +26,8 @@ memory observations, not a comparable CPU or startup-latency benchmark.
 | Release build | View | Maximum RSS in sampled interval |
 | --- | --- | ---: |
 | Baseline build 149 | Existing grid | 125.63 MiB |
-| Candidate | Show All Whitespace enabled | 126.09 MiB |
+| Initial candidate | Show All Whitespace enabled | 126.09 MiB |
+| Revised candidate with shared snapshots | Show All Whitespace enabled | 127.67 MiB |
 
 These samples demonstrate bounded memory on this dataset; they do not establish
 an overall process peak or a latency improvement. Both builds accepted page
@@ -44,6 +45,9 @@ expected indicators. The preference survived an application restart.
 - A 20,000-character field with a space and tab beyond the preview reports two
   trailing whitespace characters. The same check passed with a 32 MiB field,
   whose full-value inspection runs on the background worker.
+- Following review, a 32 MiB header was opened with explicit Header row format.
+  Its trailing-space indicator and tooltip stayed correct after repeated page
+  navigation. Completed header summaries survive row-buffer changes.
 - A 65-column native grid retained the final-column edge marks after horizontal
   navigation. Filtering to the exact space-padded value returned one match and
   preserved its indicator and full-value tooltip.
@@ -55,7 +59,8 @@ expected indicators. The preference survived an application restart.
 
 ## Automated validation and bounds
 
-Workspace tests: 412 passing tests, including 17 added whitespace checks.
+Workspace tests: 415 passing tests, including 19 added whitespace checks and a
+borrowed storage-estimate regression.
 Rustfmt, workspace Clippy with warnings denied, and the release workspace build
 passed.
 
@@ -70,11 +75,22 @@ Each document keeps at most 16,384 summaries with bounded LRU bookkeeping.
 There is one worker per document and at most 128 requested cells per batch,
 normally limited to 8 MiB of selected field bytes. A single larger field may
 exceed that batch limit, subject to Quarry's existing 64 MiB record limit.
-Loaded source rows are shared with the worker; edited/header snapshots are
-copied only on a cache miss. Cancellation is checked at 16 KiB intervals.
+Source sessions/rows and pending header/cell edits are shared immutably with
+the worker. Rendering does not copy entire source headers or edited values;
+core data jobs still receive owned snapshots when an operation starts. Cancellation is checked at 16 KiB intervals.
 Metadata does not retain complete field values after analysis.
 
 Rendering retains the existing 16,384-character cell preview bound (120 for
 headers), including mark expansion. Full-value inspection covers a loaded cell
 even when its whitespace lies outside that prefix. It does not provide a
 file-wide whitespace count, and an unvisited cell is inspected when rendered.
+
+## Review regression
+
+The large-header navigation regression failed before the fix with
+“scrolling must retain completed header inspection” and passed afterward.
+A second check proves that source-header and pending-edit inspector snapshots
+share the existing byte allocation and remain immutable after a later edit.
+The existing owned storage-estimate API is retained as an adapter to the same
+borrowed implementation; the exact-bound test and all existing storage tests
+pass. Native Save As was repeated successfully after this representation change.

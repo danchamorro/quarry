@@ -1,6 +1,6 @@
 //! View-only whitespace inspection. Raw values remain authoritative for data operations.
 use eframe::egui::{self, Color32, FontId, Response, Shape, Stroke, TextFormat, text::LayoutJob};
-use quarry_core::{FilterMatch, Row};
+use quarry_core::{FilterMatch, Row, Session};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -26,13 +26,17 @@ pub(super) struct CellId {
 
 #[derive(Clone)]
 pub(super) enum Input {
+    Header(Arc<Session>, usize),
+    Text(Arc<String>),
     Row(Arc<Row>, usize),
     Filtered(Arc<FilterMatch>, usize),
     Owned(Arc<Vec<u8>>),
 }
 impl Input {
-    fn bytes(&self) -> &[u8] {
+    pub(super) fn bytes(&self) -> &[u8] {
         match self {
+            Self::Header(session, column) => &session.first_rows[0].fields[*column],
+            Self::Text(value) => value.as_bytes(),
             Self::Row(row, column) => &row.fields[*column],
             Self::Filtered(row, column) => &row.fields[*column],
             Self::Owned(value) => value,
@@ -282,6 +286,19 @@ impl Cache {
             ctx.request_repaint_after(std::time::Duration::from_millis(20));
         }
     }
+    /// Navigation changes loaded rows, but not the current document's header values.
+    pub fn invalidate_rows(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.stop();
+        }
+        self.entries.retain(|id, _| id.row.is_none());
+        self.usage.retain(|(_, id)| id.row.is_none());
+        self.requests.clear();
+        self.requested.clear();
+        self.queued_bytes = 0;
+        self.failed = false;
+    }
+
     pub fn invalidate(&mut self) {
         if let Some(job) = self.job.take() {
             job.stop();

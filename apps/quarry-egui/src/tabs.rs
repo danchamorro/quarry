@@ -861,7 +861,7 @@ mod tests {
         edited(&mut app, "edited-b");
         app.switch_tab(&ctx, a_id);
         assert_eq!(
-            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)].as_slice(),
             b"42"
         );
         assert_eq!(app.active.find_input, "row100");

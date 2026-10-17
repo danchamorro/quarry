@@ -3956,7 +3956,7 @@ fn cleanup_preview(document: &Document, cleanup: &ColumnCleanup) -> CleanupPrevi
             let value = document
                 .cell_edits
                 .get(&(physical, column))
-                .map_or(source.as_slice(), Vec::as_slice);
+                .map_or(source.as_slice(), |value| value.as_slice());
             let fill_len = if let CleanupOperation::FillEmpty(v) = &cleanup.operation {
                 v.len()
             } else {
@@ -5115,8 +5115,8 @@ impl WorkingCopyState {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct StructuralOverlay {
-    header_renames: BTreeMap<usize, String>,
-    cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+    header_renames: BTreeMap<usize, Arc<String>>,
+    cell_edits: BTreeMap<(u64, usize), Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5448,7 +5448,7 @@ impl ColumnView {
 struct Document {
     working_directory: PathBuf,
     pending_materialization: Option<(ColumnTransformation, BTreeSet<usize>, u64)>,
-    session: Session,
+    session: Arc<Session>,
     logical_path: PathBuf,
     original_session: Option<Session>,
     working_copy: Option<WorkingCopyState>,
@@ -5491,9 +5491,9 @@ struct Document {
     selected_columns: BTreeSet<usize>,
     column_selection_anchor: Option<usize>,
     headers: Vec<String>,
-    header_renames: BTreeMap<usize, String>,
+    header_renames: BTreeMap<usize, Arc<String>>,
     header_edit: Option<HeaderEdit>,
-    cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+    cell_edits: BTreeMap<(u64, usize), Arc<Vec<u8>>>,
     cell_edit: Option<CellEdit>,
     cell_focus_requested: Option<(u64, usize)>,
     column_focus_requested: Option<usize>,
@@ -5589,7 +5589,7 @@ impl Document {
         };
 
         Ok(Self {
-            session,
+            session: Arc::new(session),
             logical_path: path.to_path_buf(),
             working_directory: std::env::temp_dir(),
             pending_materialization: None,
@@ -5786,7 +5786,7 @@ impl Document {
         } = self.prepare_materialization()?;
         let job = match self.session.start_create_working_copy_inserting_rows(
             renames,
-            self.cell_edits.clone(),
+            self.owned_cell_edits(),
             insertion,
             &destination,
         ) {
@@ -5837,7 +5837,7 @@ impl Document {
             )));
         }
         let job = match self.session.start_analyze_split(
-            self.cell_edits.clone(),
+            self.owned_cell_edits(),
             source_column,
             separator.clone(),
             max_pieces,
@@ -5969,7 +5969,7 @@ impl Document {
         } = self.prepare_materialization()?;
         let job = match self.session.start_create_working_copy_deleting_rows(
             renames,
-            self.cell_edits.clone(),
+            self.owned_cell_edits(),
             rows,
             &destination,
         ) {
@@ -6063,7 +6063,7 @@ impl Document {
         } = self.prepare_materialization()?;
         let job = match self.session.start_create_sorted_working_copy(
             renames,
-            self.cell_edits.clone(),
+            self.owned_cell_edits(),
             SortSpec {
                 column,
                 direction,
@@ -6128,7 +6128,7 @@ impl Document {
         let selected_columns = columns.iter().copied().collect();
         let job = match self.session.start_find_duplicates(
             renames,
-            self.cell_edits.clone(),
+            self.owned_cell_edits(),
             DuplicateSpec {
                 columns,
                 case_sensitivity,
@@ -6165,7 +6165,7 @@ impl Document {
             .iter()
             .map(|(column, value)| (*column, value.as_bytes().to_vec()))
             .collect();
-        let mut cells = self.cell_edits.clone();
+        let mut cells = self.owned_cell_edits();
         if let Some(edit) = &self.header_edit {
             headers.insert(edit.column, edit.draft.as_bytes().to_vec());
         }
@@ -6253,7 +6253,7 @@ impl Document {
         } = self.prepare_materialization()?;
         let job = match self.session.start_create_working_copy(
             renames,
-            self.cell_edits.clone(),
+            self.owned_cell_edits(),
             transformation,
             destination.clone(),
         ) {
@@ -6310,7 +6310,7 @@ impl Document {
         } = self.prepare_materialization()?;
         let job = match self.session.start_create_cleaned_working_copy(
             renames,
-            self.cell_edits.clone(),
+            self.owned_cell_edits(),
             cleanup,
             destination.clone(),
         ) {
@@ -6363,7 +6363,7 @@ impl Document {
         } = self.prepare_materialization()?;
         let job = match self.session.start_create_replaced_working_copy(
             renames,
-            self.cell_edits.clone(),
+            self.owned_cell_edits(),
             LiteralReplacement {
                 needle: query.to_vec(),
                 replacement: replacement.to_vec(),
@@ -7029,7 +7029,7 @@ impl Document {
                     index,
                     query.to_vec(),
                     position,
-                    self.cell_edits.clone(),
+                    self.owned_cell_edits(),
                     case_sensitivity,
                 )
                 .map_err(|error| error.to_string())?,
@@ -7131,7 +7131,7 @@ impl Document {
         let effective = self
             .cell_edits
             .get(&key)
-            .map_or(source.as_slice(), Vec::as_slice);
+            .map_or(source.as_slice(), |value| value.as_slice());
         let next = replace_literal_all_with_case(effective, query, replacement, case_sensitivity)
             .expect("replaceable match contains the query");
         if next.as_slice() != effective {
@@ -7249,7 +7249,7 @@ impl Document {
         self.export_cancel_requested = false;
         self.filter_viewport_start = 0;
         self.filter_buffer_start = 0;
-        self.whitespace.invalidate();
+        self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
         self.selection = None;
         self.selected_rows.clear();
@@ -7342,7 +7342,7 @@ impl Document {
                 }
                 self.last_viewport_read = Some(active.started.elapsed());
                 self.filter_buffer_start = active.window.start_match;
-                self.whitespace.invalidate();
+                self.whitespace.invalidate_rows();
                 self.filtered_rows = rows.into_iter().map(Arc::new).collect();
             }
             Ok(FilterReadOutcome::Complete(_) | FilterReadOutcome::Cancelled) => {}
@@ -7527,26 +7527,26 @@ impl Document {
             Some(destination) => match self.save_as_transformation() {
                 Some(transformation) => self.session.start_save_as_with_transformation(
                     renames,
-                    self.cell_edits.clone(),
+                    self.owned_cell_edits(),
                     transformation,
                     destination,
                 ),
                 None => self.session.start_save_as_with_edits(
                     renames,
-                    self.cell_edits.clone(),
+                    self.owned_cell_edits(),
                     destination,
                 ),
             },
             None if self.has_structural_edits() => self.session.start_save_to_original(
                 renames,
-                self.cell_edits.clone(),
+                self.owned_cell_edits(),
                 self.original_session
                     .as_ref()
                     .expect("a structural working copy retains the original source guard"),
             ),
             None => self
                 .session
-                .start_save_with_edits(renames, self.cell_edits.clone()),
+                .start_save_with_edits(renames, self.owned_cell_edits()),
         };
         let job = match result {
             Ok(job) => job,
@@ -7608,9 +7608,9 @@ impl Document {
         self.filter_index = None;
         self.filter_query = None;
         self.filter_progress = None;
-        self.whitespace.invalidate();
+        self.whitespace.invalidate_rows();
         self.buffered_rows.clear();
-        self.whitespace.invalidate();
+        self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
         self.selection = None;
         self.selected_rows.clear();
@@ -7654,7 +7654,7 @@ impl Document {
         self.export_cancel_requested = false;
         self.filter_viewport_start = 0;
         self.filter_buffer_start = 0;
-        self.whitespace.invalidate();
+        self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
         self.selection = None;
         self.selected_rows.clear();
@@ -7861,7 +7861,7 @@ impl Document {
             let draft = self
                 .header_renames
                 .get(&column)
-                .cloned()
+                .map(|name| name.as_ref().clone())
                 .unwrap_or_else(|| source_name.to_owned());
             self.commit_cell_edit();
             self.commit_header_edit();
@@ -7890,7 +7890,7 @@ impl Document {
             .source_header_name(column)
             .expect("editable header has source text");
         let next = (name.as_bytes() != source_name.as_bytes()).then_some(name);
-        if self.header_renames.get(&column) != next.as_ref() {
+        if self.header_renames.get(&column).map(|name| name.as_str()) != next.as_deref() {
             self.record_value_edit(EditTarget::Header(column), next.map(String::into_bytes));
         }
         Ok(())
@@ -7942,7 +7942,7 @@ impl Document {
         let draft = self
             .cell_edits
             .get(&(row, column))
-            .map_or(source.as_slice(), Vec::as_slice);
+            .map_or(source.as_slice(), |value| value.as_slice());
         let draft = std::str::from_utf8(draft)
             .expect("editable cell text was checked as UTF-8")
             .to_owned();
@@ -7968,7 +7968,7 @@ impl Document {
         let key = (edit.row, edit.column);
         let next =
             (edit.draft.as_bytes() != edit.source.as_slice()).then(|| edit.draft.into_bytes());
-        if self.cell_edits.get(&key) == next.as_ref() {
+        if self.cell_edits.get(&key).map(|value| value.as_slice()) == next.as_deref() {
             return;
         }
         self.record_value_edit(EditTarget::Cell(edit.row, edit.column), next);
@@ -7991,7 +7991,10 @@ impl Document {
                 .header_renames
                 .get(&column)
                 .map(|name| name.as_bytes().to_vec()),
-            EditTarget::Cell(row, column) => self.cell_edits.get(&(row, column)).cloned(),
+            EditTarget::Cell(row, column) => self
+                .cell_edits
+                .get(&(row, column))
+                .map(|value| value.as_ref().clone()),
         };
         if before == after {
             return;
@@ -8012,7 +8015,9 @@ impl Document {
                 if let Some(value) = value {
                     self.header_renames.insert(
                         column,
-                        String::from_utf8(value).expect("header history contains valid UTF-8"),
+                        Arc::new(
+                            String::from_utf8(value).expect("header history contains valid UTF-8"),
+                        ),
                     );
                 } else {
                     self.header_renames.remove(&column);
@@ -8021,7 +8026,7 @@ impl Document {
             }
             EditTarget::Cell(row, column) => {
                 if let Some(value) = value {
-                    self.cell_edits.insert((row, column), value);
+                    self.cell_edits.insert((row, column), Arc::new(value));
                 } else {
                     self.cell_edits.remove(&(row, column));
                 }
@@ -8392,7 +8397,7 @@ impl Document {
         }
         self.last_viewport_read = Some(began.elapsed());
         self.buffer_start = start;
-        self.whitespace.invalidate();
+        self.whitespace.invalidate_rows();
         self.buffered_rows = rows.into_iter().map(Arc::new).collect();
         Ok(())
     }
@@ -8551,13 +8556,13 @@ impl Document {
             .get(index)?
             .fields
             .get(column)
-            .map(Vec::as_slice)
+            .map(|value| value.as_slice())
     }
 
     fn effective_cell(&self, row: u64, column: usize) -> Option<&[u8]> {
         self.cell_edits
             .get(&(row, column))
-            .map(Vec::as_slice)
+            .map(|value| value.as_slice())
             .or_else(|| self.source_cell(row, column))
     }
 
@@ -8571,7 +8576,7 @@ impl Document {
         }
         self.cell_edits
             .get(&(row, column))
-            .map_or(source, Vec::as_slice)
+            .map_or(source, |value| value.as_slice())
     }
 
     fn header_value(&self, column: usize) -> Option<&[u8]> {
@@ -8586,13 +8591,13 @@ impl Document {
             .first()?
             .fields
             .get(column)
-            .map(Vec::as_slice)
+            .map(|value| value.as_slice())
     }
 
     /// Share immutable loaded rows with the inspector; never copy huge source cells on a frame.
     fn whitespace_input(&self, row: u64, column: usize) -> whitespace::Input {
         if let Some(value) = self.cell_edits.get(&(row, column)) {
-            return whitespace::Input::Owned(Arc::new(value.clone()));
+            return whitespace::Input::Owned(value.clone());
         }
         if self.filter_active() {
             let found = self
@@ -8606,6 +8611,21 @@ impl Document {
                 .expect("loaded row offset fits usize");
             whitespace::Input::Row(self.buffered_rows[index].clone(), column)
         }
+    }
+
+    fn whitespace_header_input(&self, column: usize) -> whitespace::Input {
+        self.header_renames.get(&column).map_or_else(
+            || whitespace::Input::Header(self.session.clone(), column),
+            |name| whitespace::Input::Text(name.clone()),
+        )
+    }
+
+    /// Core jobs own their snapshots; copying is deferred until starting a data operation.
+    fn owned_cell_edits(&self) -> BTreeMap<(u64, usize), Vec<u8>> {
+        self.cell_edits
+            .iter()
+            .map(|(key, value)| (*key, value.as_ref().clone()))
+            .collect()
     }
 
     fn row_with_edits(&self, row: u64, fields: &[Vec<u8>]) -> Vec<Vec<u8>> {
@@ -9691,7 +9711,7 @@ fn show_table(
                                     let header_value = document.header_value(column);
                                     let summary = header_value.and_then(|value| whitespace.get(
                                         whitespace::CellId { row: None, column }, value.len(),
-                                        || whitespace::Input::Owned(Arc::new(value.to_vec())),
+                                        || document.whitespace_header_input(column),
                                     ));
                                     let rendered = whitespace::render(
                                         header_value.unwrap_or(name.as_bytes()), summary, show_all && header_value.is_some(), 120,
@@ -9918,7 +9938,7 @@ fn show_table(
                                         ui,
                                         document.selected_columns.contains(&column),
                                     );
-                                    let source = fields.get(column).map(Vec::as_slice);
+                                    let source = fields.get(column).map(|value| value.as_slice());
                                     let header = &document.headers[visible_column];
                                     let accessible_header = accessible_header_name(header);
                                     if let Some(edit) = active_cell_edit.as_mut().filter(|edit| {
@@ -10326,7 +10346,7 @@ fn selection_fields_text(
             let mut output = String::new();
             append_clipboard_field(
                 &mut output,
-                fields.get(column).map_or(&[], Vec::as_slice),
+                fields.get(column).map_or(&[], |value| value.as_slice()),
                 false,
                 max_bytes,
             )?;
@@ -10456,7 +10476,7 @@ mod tests {
                     .unwrap()
                     .cell_edits
                     .get(&(1, 1))
-                    .map(Vec::as_slice),
+                    .map(|value| value.as_slice()),
                 expected.map(str::as_bytes),
             );
         }
@@ -10518,7 +10538,7 @@ mod tests {
         assert!(!document.can_redo());
         app.swap_edit_history(false).unwrap();
         assert_eq!(
-            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)].as_slice(),
             b"2"
         );
         app.swap_edit_history(false).unwrap();
@@ -10532,7 +10552,7 @@ mod tests {
             .unwrap();
         finish_search(document);
         assert!(!document.can_redo());
-        assert_eq!(document.cell_edits[&(1, 0)], b"replacement");
+        assert_eq!(document.cell_edits[&(1, 0)].as_slice(), b"replacement");
         app.swap_edit_history(false).unwrap();
         assert!(!app.active.document.as_ref().unwrap().is_dirty());
     }
@@ -10558,7 +10578,7 @@ mod tests {
         let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.total_columns, 2);
         assert_eq!(document.column_name(1), "town");
-        assert_eq!(document.cell_edits[&(1, 0)], b"alpha@beta");
+        assert_eq!(document.cell_edits[&(1, 0)].as_slice(), b"alpha@beta");
         app.swap_edit_history(false).unwrap();
         app.swap_edit_history(false).unwrap();
         assert!(!app.active.document.as_ref().unwrap().is_dirty());
@@ -10570,7 +10590,7 @@ mod tests {
         assert_eq!(app.active.document.as_ref().unwrap().total_columns, 3);
         app.swap_edit_history(true).unwrap();
         assert_eq!(
-            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)].as_slice(),
             b"changed\npart"
         );
         assert!(!app.active.document.as_ref().unwrap().can_redo());
@@ -10636,7 +10656,7 @@ mod tests {
         assert!(!app.active.document.as_ref().unwrap().is_dirty());
         app.swap_edit_history(true).unwrap();
         assert_eq!(
-            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)].as_slice(),
             b"alpha@beta"
         );
         app.swap_edit_history(true).unwrap();
@@ -10915,7 +10935,7 @@ mod tests {
         assert!(!app.active.find_bar_open);
         let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.grid_position(), position);
-        assert_eq!(document.cell_edits[&(1, 1)], b"edited");
+        assert_eq!(document.cell_edits[&(1, 1)].as_slice(), b"edited");
         assert_eq!(
             document.selection,
             Some(GridSelection::Cell { row: 1, column: 0 })
@@ -10988,7 +11008,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)].as_slice(),
             b"2"
         );
         let _ = individual_edit_frame(
@@ -11005,7 +11025,7 @@ mod tests {
             vec![individual_edit_key(egui::Key::Z, redo)],
         );
         assert_eq!(
-            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)].as_slice(),
             b"2"
         );
 
@@ -11100,7 +11120,7 @@ mod tests {
             if header {
                 assert_eq!(document.column_name(0), before);
             } else {
-                assert_eq!(document.cell_edits[&(1, 1)], before.as_bytes());
+                assert_eq!(document.cell_edits[&(1, 1)].as_slice(), before.as_bytes());
             }
         }
         assert_eq!(fs::read(&source).unwrap(), b"name,value\nfirst,1\n");
@@ -11301,7 +11321,7 @@ mod tests {
             assert!(!app.active.find_bar_open);
             if with_document {
                 assert_eq!(
-                    app.active.document.as_ref().unwrap().cell_edits[&(1, 1)],
+                    app.active.document.as_ref().unwrap().cell_edits[&(1, 1)].as_slice(),
                     b"2"
                 );
             }
@@ -13849,7 +13869,7 @@ mod tests {
         document.set_column_shown(0, true).unwrap();
         assert_eq!(document.column_name(0), "renamed");
         assert_eq!(
-            document.header_renames.get(&0).map(String::as_str),
+            document.header_renames.get(&0).map(|value| value.as_str()),
             Some("renamed")
         );
 
@@ -14066,7 +14086,10 @@ mod tests {
             cell_control
         );
         assert_eq!(
-            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 1))
+                .map(|value| value.as_slice()),
             Some(b"changed\r\nvalue".as_slice())
         );
         assert!(document.search_query.is_empty());
@@ -14097,7 +14120,10 @@ mod tests {
         document.navigate(2).unwrap();
         document.navigate(1).unwrap();
         assert_eq!(
-            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 1))
+                .map(|value| value.as_slice()),
             Some(b"changed\r\nvalue".as_slice())
         );
         let _ = ctx.run(grid_input(), |ctx| {
@@ -14135,7 +14161,10 @@ mod tests {
             cell_control
         );
         assert_eq!(
-            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 1))
+                .map(|value| value.as_slice()),
             Some(b"changed\r\nvalue".as_slice())
         );
 
@@ -14156,7 +14185,10 @@ mod tests {
         let _ = render_grid(&ctx, &mut document);
         assert!(document.cell_edit.is_none());
         assert_eq!(
-            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 1))
+                .map(|value| value.as_slice()),
             Some(b"focus loss".as_slice())
         );
 
@@ -14166,7 +14198,10 @@ mod tests {
         document.scroll_rows(1).unwrap();
         assert!(document.cell_edit.is_none());
         assert_eq!(
-            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 1))
+                .map(|value| value.as_slice()),
             Some(b"wheel navigation".as_slice())
         );
         document.navigate(1).unwrap();
@@ -14708,7 +14743,10 @@ mod tests {
         assert_eq!(document.session.path(), source);
         assert!(document.is_dirty());
         assert_eq!(
-            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 1))
+                .map(|value| value.as_slice()),
             Some(b"edited".as_slice())
         );
         assert!(document.save_status.is_none());
@@ -15041,12 +15079,9 @@ mod tests {
         assert_eq!(document.available_filter_rows(), 66);
         assert_eq!(document.filter_viewport_start, 0);
         assert_eq!(document.visible_row_count(), 7);
-        assert!(
-            document
-                .visible_filter_rows()
-                .iter()
-                .all(|row| { row.fields.get(1).map(Vec::as_slice) == Some(b"keep".as_slice()) })
-        );
+        assert!(document.visible_filter_rows().iter().all(|row| {
+            row.fields.get(1).map(|value| value.as_slice()) == Some(b"keep".as_slice())
+        }));
         assert_eq!(document.visible_filter_rows()[0].match_ordinal, 0);
         assert_eq!(document.visible_filter_rows()[0].row, 3);
         assert_eq!(document.columns.order, order);
@@ -16790,7 +16825,7 @@ mod tests {
         );
         assert_eq!(preview_action, Some(StructuralDialogAction::Apply));
         assert_eq!(document.session.path(), source);
-        assert_eq!(document.cell_edits[&(3, 0)], b"a");
+        assert_eq!(document.cell_edits[&(3, 0)].as_slice(), b"a");
         assert!(!document.can_undo());
         assert!(document.begin_cell_edit(1, 0, b"a".to_vec()).is_err());
         assert!(document.start_save().is_err());
@@ -16808,7 +16843,7 @@ mod tests {
         finish_index(app.active.document.as_mut().unwrap());
         let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), source);
-        assert_eq!(document.cell_edits[&(3, 0)], b"a");
+        assert_eq!(document.cell_edits[&(3, 0)].as_slice(), b"a");
         assert_eq!(document.column_name(2), "memo");
         assert_eq!(document.edit_history.undo.len(), history_len);
         app.swap_structural_history(true).unwrap();
@@ -16987,7 +17022,9 @@ mod tests {
         finish_index(app.active.document.as_mut().unwrap());
         {
             let document = app.active.document.as_mut().unwrap();
-            document.cell_edits.insert((3, 1), b"Edited".to_vec());
+            document
+                .cell_edits
+                .insert((3, 1), b"Edited".to_vec().into());
             document.selected_rows.ranges = vec![2..=2, 4..=4];
             document.selected_rows.anchor = Some(2);
             document.selection = Some(GridSelection::Row { row: 2 });
@@ -17017,7 +17054,13 @@ mod tests {
         finish_index(app.active.document.as_mut().unwrap());
         let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.first_rows.len(), 5);
-        assert_eq!(document.cell_edits.get(&(3, 1)), Some(&b"Edited".to_vec()));
+        assert_eq!(
+            document
+                .cell_edits
+                .get(&(3, 1))
+                .map(|value| value.as_slice()),
+            Some(b"Edited".as_slice())
+        );
         assert_eq!(fs::read(&source).unwrap(), original);
 
         app.swap_structural_history(true).unwrap();
@@ -18922,7 +18965,10 @@ mod tests {
         let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.session.path(), source);
         assert_eq!(document.column_name(1), "town");
-        assert_eq!(document.cell_edits.get(&(1, 0)).unwrap(), b"alpha@beta");
+        assert_eq!(
+            document.cell_edits.get(&(1, 0)).unwrap().as_slice(),
+            b"alpha@beta"
+        );
         assert!(document.is_dirty());
         assert!(document.can_redo_structural());
 
@@ -19928,7 +19974,10 @@ mod tests {
             .replace_current_match_with_case(b"needle", b"X", CaseSensitivity::Sensitive)
             .unwrap();
         assert_eq!(
-            document.cell_edits.get(&(1, 0)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 0))
+                .map(|value| value.as_slice()),
             Some(b"Needle X".as_slice())
         );
 
@@ -19985,13 +20034,13 @@ mod tests {
         finish_search(&mut document);
         assert!(document.can_replace_current(b"aa"));
         document.replace_current_match(b"aa", b"x").unwrap();
-        assert_eq!(document.cell_edits.get(&(1, 0)).unwrap(), b"xx");
+        assert_eq!(document.cell_edits.get(&(1, 0)).unwrap().as_slice(), b"xx");
         finish_search(&mut document);
         let next = document.last_match.as_ref().unwrap();
         assert_eq!((next.row, next.column), (2, 1));
 
         document.replace_current_match(b"aa", b"").unwrap();
-        assert_eq!(document.cell_edits.get(&(2, 1)).unwrap(), b"");
+        assert_eq!(document.cell_edits.get(&(2, 1)).unwrap().as_slice(), b"");
         finish_search(&mut document);
         assert_eq!(
             document.search_status.as_deref(),
@@ -20022,7 +20071,9 @@ mod tests {
             record_offset: 0,
         });
         document.selection = Some(GridSelection::Cell { row: 1, column: 1 });
-        document.cell_edits.insert((1, 1), b"needle".to_vec());
+        document
+            .cell_edits
+            .insert((1, 1), b"needle".to_vec().into());
 
         assert!(document.can_replace_current(b"needle"));
         assert_eq!(
@@ -20032,7 +20083,10 @@ mod tests {
             "The current matched cell is no longer available for replacement."
         );
         assert_eq!(
-            document.cell_edits.get(&(1, 1)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 1))
+                .map(|value| value.as_slice()),
             Some(b"needle".as_slice())
         );
         document.shutdown();
@@ -20128,7 +20182,10 @@ mod tests {
         let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.session.path(), path);
         assert_eq!(
-            document.cell_edits.get(&(1, 0)).map(Vec::as_slice),
+            document
+                .cell_edits
+                .get(&(1, 0))
+                .map(|value| value.as_slice()),
             Some(b"overlay needle needle".as_slice())
         );
     }
@@ -20209,8 +20266,14 @@ mod tests {
         assert!(!document.columns.hidden[39]);
         assert!(document.columns.visible.contains(&39));
         assert_eq!(document.columns.start, 0);
-        assert_eq!(document.headers.first().map(String::as_str), Some("c1"));
-        assert_eq!(document.headers.last().map(String::as_str), Some("c40"));
+        assert_eq!(
+            document.headers.first().map(|value| value.as_str()),
+            Some("c1")
+        );
+        assert_eq!(
+            document.headers.last().map(|value| value.as_str()),
+            Some("c40")
+        );
         assert_eq!(document.reveal_cell, Some((1, 39)));
 
         let ctx = egui::Context::default();
@@ -20265,8 +20328,14 @@ mod tests {
         document.view_column(39).unwrap();
         assert_eq!(document.columns.start, 0);
         assert_eq!(document.columns.visible.len(), 40);
-        assert_eq!(document.headers.first().map(String::as_str), Some("c1"));
-        assert_eq!(document.headers.last().map(String::as_str), Some("c40"));
+        assert_eq!(
+            document.headers.first().map(|value| value.as_str()),
+            Some("c1")
+        );
+        assert_eq!(
+            document.headers.last().map(|value| value.as_str()),
+            Some("c40")
+        );
 
         document.selection = Some(GridSelection::Cell { row: 1, column: 39 });
         assert_eq!(document.copy_selection_text().unwrap(), "v40");
@@ -20334,8 +20403,14 @@ mod tests {
         assert_eq!(document.columns.start, 0);
         assert_eq!(document.columns.order, (0..40).collect::<Vec<_>>());
         assert!(document.columns.hidden.iter().all(|hidden| !hidden));
-        assert_eq!(document.headers.first().map(String::as_str), Some("c1"));
-        assert_eq!(document.headers.last().map(String::as_str), Some("c40"));
+        assert_eq!(
+            document.headers.first().map(|value| value.as_str()),
+            Some("c1")
+        );
+        assert_eq!(
+            document.headers.last().map(|value| value.as_str()),
+            Some("c40")
+        );
 
         fs::remove_file(path).unwrap();
     }
@@ -20806,7 +20881,7 @@ mod tests {
         assert!(working_path.exists());
         assert!(app.active.document.as_ref().unwrap().cell_edit.is_none());
         assert_eq!(
-            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)].as_slice(),
             b"3"
         );
         app.keep_editing();
@@ -20994,11 +21069,11 @@ mod tests {
         finish_index(app.active.document.as_mut().unwrap());
         let document = app.active.document.as_ref().unwrap();
         assert_eq!(
-            document.header_renames.get(&0).map(String::as_str),
+            document.header_renames.get(&0).map(|value| value.as_str()),
             Some("Number")
         );
         assert_eq!(
-            document.cell_edits.get(&(1, 1)).unwrap(),
+            document.cell_edits.get(&(1, 1)).unwrap().as_slice(),
             "edited, 猫\nline".as_bytes()
         );
         app.swap_structural_history(true).unwrap();
@@ -21376,7 +21451,7 @@ mod tests {
         finish_index(app.active.document.as_mut().unwrap());
         let doc = app.active.document.as_ref().unwrap();
         assert_eq!(
-            doc.cell_edits.get(&(1, 0)).map(Vec::as_slice),
+            doc.cell_edits.get(&(1, 0)).map(|value| value.as_slice()),
             Some(b"  Carol  ".as_slice())
         );
         app.swap_structural_history(true).unwrap();
@@ -22175,5 +22250,95 @@ mod tests {
         assert!(nodes.iter().any(|(_, n)| n.label()
             == Some("Select row 2, column 2 (Column 2): ")
             && n.description().unwrap().contains("absent")));
+    }
+
+    #[test]
+    fn whitespace_large_header_is_not_reinspected_when_row_buffers_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-header.csv");
+        fs::write(
+            &path,
+            format!(
+                "{},value\n{}",
+                "H".repeat(1024 * 1024) + " ",
+                "row,x\n".repeat(400)
+            ),
+        )
+        .unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let ctx = egui::Context::default();
+        settle_whitespace(&ctx, &mut document);
+        let id = super::whitespace::CellId {
+            row: None,
+            column: 0,
+        };
+        assert_eq!(
+            document
+                .whitespace
+                .get(id, 1024 * 1024 + 1, || panic!(
+                    "header should already be classified"
+                ))
+                .unwrap()
+                .trailing,
+            1
+        );
+        document.load_buffer(250).unwrap();
+        assert_eq!(
+            document
+                .whitespace
+                .get(id, 1024 * 1024 + 1, || panic!(
+                    "scrolling must retain completed header inspection"
+                ))
+                .unwrap()
+                .trailing,
+            1
+        );
+    }
+
+    #[test]
+    fn whitespace_inspection_shares_source_headers_and_pending_edit_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.csv");
+        fs::write(&path, b"name,value\nrow,original\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let input = document.whitespace_header_input(0);
+        assert_eq!(
+            input.bytes().as_ptr(),
+            document.session.first_rows[0].fields[0].as_ptr()
+        );
+        document
+            .rename_header(0, "header ".repeat(128 * 1024))
+            .unwrap();
+        let header = document.whitespace_header_input(0);
+        assert_eq!(
+            header.bytes().as_ptr(),
+            document.header_renames[&0].as_bytes().as_ptr()
+        );
+        commit_test_cell(&mut document, 1, 1, &"edited ".repeat(128 * 1024));
+        let cell = document.whitespace_input(1, 1);
+        assert_eq!(cell.bytes().as_ptr(), document.cell_edits[&(1, 1)].as_ptr());
+        commit_test_cell(&mut document, 1, 1, "new");
+        assert!(
+            cell.bytes().starts_with(b"edited "),
+            "worker snapshots remain immutable after later edits"
+        );
+        assert_eq!(input.bytes(), b"name");
     }
 }

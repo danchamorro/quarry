@@ -1,6 +1,7 @@
 use super::*;
 use quarry_core::{
-    StorageSpace, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes, inspect_storage,
+    StorageSpace, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes_from_values,
+    inspect_storage,
 };
 use std::thread::{self, JoinHandle};
 
@@ -549,32 +550,30 @@ impl Document {
         replacement: Option<&LiteralReplacement>,
         records: u64,
     ) -> u64 {
-        let renames = self
-            .header_renames
-            .iter()
-            .map(|(column, value)| (*column, value.as_bytes().to_vec()))
-            .collect();
-        estimate_edited_output_bytes(
+        estimate_edited_output_bytes_from_values(
             self.session.file_size,
             records,
-            &renames,
-            &self.cell_edits,
+            self.header_renames
+                .iter()
+                .map(|(column, value)| (*column, value.as_bytes())),
+            self.cell_edits
+                .iter()
+                .map(|(key, value)| (*key, value.as_slice())),
             transformation,
             replacement,
         )
     }
 
     fn reordered_storage_estimate(&self) -> u64 {
-        let renames = self
-            .header_renames
-            .iter()
-            .map(|(column, value)| (*column, value.as_bytes().to_vec()))
-            .collect();
-        estimate_edited_output_bytes(
+        estimate_edited_output_bytes_from_values(
             self.session.file_size,
             self.storage_record_count(),
-            &renames,
-            &self.cell_edits,
+            self.header_renames
+                .iter()
+                .map(|(column, value)| (*column, value.as_bytes())),
+            self.cell_edits
+                .iter()
+                .map(|(key, value)| (*key, value.as_slice())),
             None,
             None,
         )
@@ -930,7 +929,10 @@ mod tests {
         document.clear_filter().unwrap();
         document.start_split(0, b" ".to_vec()).unwrap();
         // Exercise the large-operation gate without allocating a large fixture.
-        document.session.file_size = STORAGE_REVIEW_BYTES;
+        document.whitespace.invalidate();
+        std::sync::Arc::get_mut(&mut document.session)
+            .unwrap()
+            .file_size = STORAGE_REVIEW_BYTES;
         app.open_storage_settings();
         update_review_until(&mut app, &ctx, |app| {
             app.active
@@ -1257,9 +1259,14 @@ mod tests {
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
         finish(&mut app);
         let document = app.active.document.as_mut().unwrap();
-        document.cell_edits.insert((1, 0), b"edited".to_vec());
+        document
+            .cell_edits
+            .insert((1, 0), b"edited".to_vec().into());
         // Simulate large metadata without writing a large fixture. No worker starts here.
-        document.session.file_size = STORAGE_REVIEW_BYTES;
+        document.whitespace.invalidate();
+        std::sync::Arc::get_mut(&mut document.session)
+            .unwrap()
+            .file_size = STORAGE_REVIEW_BYTES;
         app.active.close_after_save = true;
         assert!(app.save_current());
         assert!(app.active.storage_review.is_some());
@@ -1272,7 +1279,7 @@ mod tests {
         assert!(!app.active.close_confirmation_open);
         app.active.storage_review = None;
         assert_eq!(
-            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)],
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 0)].as_slice(),
             b"edited"
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
