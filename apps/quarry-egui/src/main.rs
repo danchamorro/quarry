@@ -21476,4 +21476,100 @@ mod tests {
         assert!(document.structural_job.is_none());
         assert!(!document.is_dirty());
     }
+
+    #[test]
+    fn cleanup_scans_past_preview_and_preserves_work_after_failure_or_noop() {
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("late-cleanup.csv");
+        let mut original = b"name,raw\n".to_vec();
+        for _ in 0..30 {
+            original.extend_from_slice(b"clean,ok\n");
+        }
+        original.extend_from_slice(b"  late  ,\xff\n");
+        fs::write(&path, &original).unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let trim = ColumnCleanup {
+            columns: vec![0],
+            operation: CleanupOperation::Trim,
+        };
+        let sample = super::cleanup_preview(&document, &trim);
+        assert!(sample.error.is_none());
+        assert!(sample.lines.iter().all(|line| !line.contains("late")));
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.active.document = Some(document);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_cleanup(trim.clone())
+            .unwrap();
+        finish_structural_edit(&mut app);
+        assert!(
+            app.active
+                .footer_status
+                .as_deref()
+                .unwrap()
+                .contains("Cleaned 1 cell")
+        );
+        let doc = app.active.document.as_mut().unwrap();
+        assert!(
+            fs::read(doc.session.path())
+                .unwrap()
+                .ends_with(b"late,\xff\n")
+        );
+        doc.begin_cell_edit(1, 0, b"clean".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "Carol".into();
+        doc.commit_edits();
+        let previous_path = doc.session.path().to_path_buf();
+        let edits = doc.cell_edits.clone();
+        let history = doc.edit_history.clone();
+        let undo = doc.working_copy.as_ref().unwrap().undo.clone();
+        doc.start_cleanup(ColumnCleanup {
+            columns: vec![1],
+            operation: CleanupOperation::Lowercase,
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            match doc.poll_structural_edit() {
+                Err(error) => break error,
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("invalid text must not produce a working version"),
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert!(
+            error.text.contains("31") && error.text.contains("2"),
+            "{}",
+            error.text
+        );
+        assert_eq!(doc.session.path(), previous_path);
+        assert_eq!(doc.cell_edits, edits);
+        assert_eq!(doc.edit_history, history);
+        assert_eq!(doc.working_copy.as_ref().unwrap().undo, undo);
+        doc.start_cleanup(trim).unwrap();
+        finish_structural_edit(&mut app);
+        let doc = app.active.document.as_ref().unwrap();
+        assert_eq!(doc.session.path(), previous_path);
+        assert_eq!(doc.cell_edits, edits);
+        assert_eq!(doc.edit_history, history);
+        assert_eq!(doc.working_copy.as_ref().unwrap().undo, undo);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(doc.working_copy.as_ref().unwrap().directory.path())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
 }

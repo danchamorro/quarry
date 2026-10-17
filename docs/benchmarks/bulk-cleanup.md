@@ -77,7 +77,7 @@ gating, preview bounds, effective pending values, and cancellation at the
 completed-worker handoff. The cancellation handoff regression passes without
 a production fix: the shared worker's publication protocol already protects it.
 
-The final workspace run passed 392 tests; strict Clippy and formatting passed.
+The final workspace run passed 393 tests; strict Clippy and formatting passed.
 The packaging self-test passed its rollback and license checks, including 17
 license-generator tests.
 
