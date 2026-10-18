@@ -430,7 +430,6 @@ impl RecordScanner {
             .scan_chunk(&self.shadow, absolute_start / 2 + skip, |end| {
                 on_end(end * 2)
             })
-            .map(|offset| offset * 2)
             .map_err(|mut error| {
                 error.offset *= 2;
                 QuarryError::Parse(error)
@@ -1581,6 +1580,22 @@ mod tests {
             let reopened = crate::Session::open(&output, crate::OpenOptions::default()).unwrap();
             assert_eq!(reopened.encoding(), encoding);
             assert!(reopened.first_rows.is_empty());
+        }
+    }
+    #[test]
+    fn scanner_returns_record_counts_in_every_encoding() {
+        for encoding in Encoding::ALL {
+            let bytes = encoding.encode(b"a,b\nc,d\n", 4096).unwrap();
+            let mut scanner = RecordScanner::new(b',', encoding).unwrap();
+            let mut ends = Vec::new();
+            assert_eq!(
+                scanner.scan_chunk(&bytes, 0, |end| ends.push(end)).unwrap(),
+                2
+            );
+            assert_eq!(
+                ends,
+                vec![4 * encoding.width() as u64, 8 * encoding.width() as u64]
+            );
         }
     }
 }
