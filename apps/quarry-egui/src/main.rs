@@ -2060,7 +2060,7 @@ impl eframe::App for QuarryApp {
                     let undo = ui
                         .add_enabled(can_undo, egui::Button::new("Undo"))
                         .on_disabled_hover_text(
-                            "No retained change to undo. Finish editing and clear filters before using history. Edits beyond the history limit can block whole-file Undo. Save to keep changes or discard to restore the source; both reset history.",
+                            "No retained change to undo. Finish editing before using history, and clear filters before whole-file Undo. Edits beyond the history limit can block whole-file Undo. Save to keep changes or discard to restore the source; both reset history.",
                         )
                         .on_hover_text("Undo the last edit or whole-file change (Command/Ctrl+Z).");
                     undo.widget_info(|| {
@@ -7551,7 +7551,11 @@ impl Document {
         if self.filter_refresh_pending {
             self.filter_refresh_pending = false;
             if let Some(query) = self.filter_query.clone() {
+                let viewport = self.filter_viewport_start;
+                let scroll_points = self.scroll_points;
                 self.start_filter(query)?;
+                self.filter_viewport_start = viewport;
+                self.scroll_points = scroll_points;
             }
         }
         self.poll_filter_scan()?;
@@ -7570,12 +7574,22 @@ impl Document {
                 .filter_viewport_start
                 .saturating_add(self.visible_rows as u64)
                 .min(progress.matches_found);
-            self.refresh_filter_snapshot_for(required);
-            self.navigate_filter(self.filter_viewport_start)?;
+            // A partial scan cannot yet clamp a later page against the final match count.
+            if progress.done
+                || progress.matches_found
+                    >= self
+                        .filter_viewport_start
+                        .saturating_add(self.visible_rows as u64)
+            {
+                self.refresh_filter_snapshot_for(required);
+                self.navigate_filter(self.filter_viewport_start)?;
+            }
         } else {
             self.filtered_rows.clear();
             self.filter_buffer_start = 0;
-            self.filter_viewport_start = 0;
+            if progress.done {
+                self.filter_viewport_start = 0;
+            }
         }
         if !progress.done {
             return Ok(());
@@ -8652,6 +8666,9 @@ impl Document {
     }
 
     fn navigate_filter(&mut self, requested: u64) -> Result<(), String> {
+        if self.filter_refresh_pending {
+            return Ok(());
+        }
         let available = self.available_filter_rows();
         if available == 0 {
             self.cancel_filter_read_for_navigation();
@@ -14080,6 +14097,53 @@ mod tests {
 
         document.shutdown();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn editing_a_later_filtered_page_preserves_its_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-position.csv");
+        fs::write(
+            &source,
+            format!(
+                "id,status\n{}",
+                (0..1000)
+                    .map(|id| format!("{id},keep\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document.set_visible_rows(5).unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.navigate_filter(500).unwrap();
+        finish_filter_read(document);
+        commit_test_cell(document, 501, 0, "edited");
+        finish_filter(document);
+        assert_eq!(document.filter_viewport_start, 500);
+        assert_eq!(document.visible_filter_rows()[0].row, 501);
+        commit_test_cell(document, 501, 1, "drop");
+        finish_filter(document);
+        assert_eq!(document.filter_viewport_start, 500);
+        assert_eq!(document.visible_filter_rows()[0].row, 502);
+        document.navigate_filter(999).unwrap();
+        finish_filter_read(document);
+        let row = document.visible_filter_rows()[0].row;
+        commit_test_cell(document, row, 1, "drop");
+        finish_filter(document);
+        assert_eq!(
+            document.filter_viewport_start,
+            document.available_filter_rows() - 5
+        );
+        document.shutdown();
     }
 
     #[test]

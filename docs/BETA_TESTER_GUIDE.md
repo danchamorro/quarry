@@ -76,7 +76,7 @@ include elapsed time, memory, available disk, and the displayed operation phase.
 GitHub reports are public: redact paths, screenshots, logs, and values. Share
 only synthetic reproductions, never private datasets or credentials.
 
-Clear active filters before editing; save or discard cell edits before filtering.
+Filters include unsaved cell values. After a filter completes, editing a cell or using value Undo/Redo refreshes the results while preserving your page where possible. Clear filters before structural changes or Find/Replace.
 Undo history is bounded, and case-insensitive matching folds ASCII letters only.
 Read the [documented limits](USER_GUIDE.md#undo-and-redo-changes) and
 [filter rules](USER_GUIDE.md#filter-rows). Current source builds also include
