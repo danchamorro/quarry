@@ -232,7 +232,7 @@ pub fn estimate_edited_output_bytes_from_values<'a>(
         match transformation {
             ColumnTransformation::Cleanup(cleanup) => {
                 match &cleanup.operation {
-                    crate::CleanupOperation::Trim => {}
+                    crate::CleanupOperation::Trim | crate::CleanupOperation::CollapseSpaces => {}
                     crate::CleanupOperation::Uppercase | crate::CleanupOperation::Lowercase => {
                         // Unicode full case mappings contain at most three scalars per input scalar.
                         bytes = bytes.saturating_mul(3);
@@ -535,6 +535,10 @@ mod tests {
             ColumnTransformation::Cleanup(crate::ColumnCleanup {
                 columns: vec![0, 1, 2],
                 operation: crate::CleanupOperation::Trim,
+            }),
+            ColumnTransformation::Cleanup(crate::ColumnCleanup {
+                columns: vec![0, 1, 2],
+                operation: crate::CleanupOperation::CollapseSpaces,
             }),
             ColumnTransformation::Cleanup(crate::ColumnCleanup {
                 columns: vec![0, 1, 2],

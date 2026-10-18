@@ -28,6 +28,7 @@ impl PendingStorageOperation {
         match self {
             Self::Structural(dialog) => match dialog.request {
                 StructuralRequest::CleanupTrim
+                | StructuralRequest::CleanupCollapseSpaces
                 | StructuralRequest::CleanupUppercase
                 | StructuralRequest::CleanupLowercase
                 | StructuralRequest::CleanupFill => "clean up columns",
@@ -57,6 +58,7 @@ impl PendingStorageOperation {
         match self {
             Self::Structural(dialog) => match dialog.request {
                 StructuralRequest::CleanupTrim
+                | StructuralRequest::CleanupCollapseSpaces
                 | StructuralRequest::CleanupUppercase
                 | StructuralRequest::CleanupLowercase
                 | StructuralRequest::CleanupFill => document.materialization_storage_estimate(

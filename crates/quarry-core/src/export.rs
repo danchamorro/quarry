@@ -8100,7 +8100,7 @@ mod tests {
             .collect::<Vec<_>>();
         let source = fixture(&source_bytes);
         let sess = session(&source, b',', HeaderMode::FirstRow);
-        let cases: [(CleanupOperation, Vec<usize>, u64, Vec<u8>); 4] = [
+        let cases: [(CleanupOperation, Vec<usize>, u64, Vec<u8>); 5] = [
             (
                 CleanupOperation::Trim,
                 vec![0, 1, 2],
@@ -8111,6 +8111,18 @@ mod tests {
                     .copied()
                     .chain([0xff])
                     .chain(b"\r\nCarol,,\r\nlonely".iter().copied())
+                    .collect(),
+            ),
+            (
+                CleanupOperation::CollapseSpaces,
+                vec![0, 1, 2],
+                1,
+                "Full Name,empty,case,raw\r\n\" \tAlice\n \",,Straße,"
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain([0xff])
+                    .chain(b"\r\n Carol ,,\r\nlonely".iter().copied())
                     .collect(),
             ),
             (
