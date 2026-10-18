@@ -92,6 +92,13 @@ impl RecordScanner {
         })
     }
 
+    /// Scan bytes whose encoding has no UTF-8 signature (for example a legacy code page).
+    pub fn at_offset_without_bom(delimiter: u8, record_start: u64) -> Result<Self, ParseError> {
+        let mut scanner = Self::at_offset(delimiter, record_start)?;
+        scanner.bom_checked = true;
+        Ok(scanner)
+    }
+
     pub fn record_start(&self) -> u64 {
         self.record_start
     }
@@ -143,6 +150,7 @@ impl RecordScanner {
         }
 
         self.bom_checked = true;
+        self.record_start = UTF8_BOM.len() as u64;
         self.scan_data_chunk(
             &bytes[index..],
             absolute_start + index as u64,
@@ -559,5 +567,20 @@ mod tests {
             scanner.finish(11, |_| {}).unwrap_err().kind,
             ParseErrorKind::UnterminatedQuote
         );
+    }
+    #[test]
+    fn a_bom_only_file_has_no_csv_record() {
+        for chunk_bytes in 1..=3 {
+            let mut scanner = RecordScanner::new(b',').unwrap();
+            let mut ends = Vec::new();
+            let bytes = b"\xef\xbb\xbf";
+            for (chunk, offset) in bytes.chunks(chunk_bytes).zip((0..).step_by(chunk_bytes)) {
+                scanner
+                    .scan_chunk(chunk, offset as u64, |end| ends.push(end))
+                    .unwrap();
+            }
+            assert!(!scanner.finish(3, |end| ends.push(end)).unwrap());
+            assert!(ends.is_empty());
+        }
     }
 }

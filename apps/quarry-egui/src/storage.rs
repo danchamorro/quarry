@@ -20,6 +20,7 @@ pub(super) enum PendingStorageOperation {
         case_sensitivity: CaseSensitivity,
     },
     Save(Option<PathBuf>),
+    SaveUtf8(PathBuf),
     Export(PathBuf),
 }
 
@@ -45,73 +46,83 @@ impl PendingStorageOperation {
             Self::DeleteColumns(_) => "delete columns",
             Self::DeleteRows(_) => "delete rows",
             Self::ReplaceAll { .. } => "replace text",
-            Self::Save(_) => "save",
+            Self::Save(_) | Self::SaveUtf8(_) => "save",
             Self::Export(_) => "export",
         }
     }
 
     fn uses_working_directory(&self) -> bool {
-        !matches!(self, Self::Save(_) | Self::Export(_))
+        !matches!(self, Self::Save(_) | Self::SaveUtf8(_) | Self::Export(_))
     }
 
     /// Conservatively estimates additional disk space for the pending action.
     fn allowance(&self, document: &Document) -> u64 {
         let plain = || document.materialization_storage_estimate(None, None);
         match self {
-            Self::Structural(dialog) => match dialog.request {
-                StructuralRequest::CleanupTrim
-                | StructuralRequest::CleanupCollapseSpaces
-                | StructuralRequest::CleanupUppercase
-                | StructuralRequest::CleanupLowercase
-                | StructuralRequest::CleanupFill => document.materialization_storage_estimate(
-                    Some(&ColumnTransformation::Cleanup(dialog.cleanup())),
-                    None,
-                ),
+            Self::Structural(dialog) => {
+                match dialog.request {
+                    StructuralRequest::CleanupTrim
+                    | StructuralRequest::CleanupCollapseSpaces
+                    | StructuralRequest::CleanupUppercase
+                    | StructuralRequest::CleanupLowercase
+                    | StructuralRequest::CleanupFill => document.materialization_storage_estimate(
+                        Some(&ColumnTransformation::Cleanup(dialog.cleanup())),
+                        None,
+                    ),
 
-                StructuralRequest::InsertRows => document
-                    .row_insertion_from_dialog(dialog)
-                    .map_or(0, |insertion| {
-                        plain().saturating_add(insertion.additional_output_bytes())
-                    }),
-                StructuralRequest::InsertColumns => document
-                    .column_insertion_from_dialog(dialog)
-                    .map_or(0, |transformation| {
-                        document.materialization_storage_estimate(Some(&transformation), None)
-                    }),
-                // Read-only analysis determines the actual padded width before its review.
-                StructuralRequest::Split => 0,
-                StructuralRequest::Sort => document
-                    .sort_plan_disk_estimate(dialog.sort_plan(false).keys.len())
-                    .unwrap_or(u64::MAX),
-                StructuralRequest::Duplicates => estimate_duplicate_temporary_bytes(
-                    document.reordered_storage_estimate(),
-                    document
-                        .storage_record_count()
-                        .saturating_sub(document.data_start),
-                    dialog.columns.len(),
-                ),
-                StructuralRequest::Combine => document.materialization_storage_estimate(
-                    Some(&ColumnTransformation::Join {
-                        source_columns: dialog.columns.clone(),
-                        separator: dialog.separator.as_bytes().to_vec(),
-                        output_header: document.session.dialect.has_header.then(|| {
-                            document
-                                .current_header_fields()
-                                .get(dialog.columns[0])
-                                .cloned()
-                                .unwrap_or_default()
+                    StructuralRequest::InsertRows => document
+                        .row_insertion_from_dialog(dialog)
+                        .map_or(0, |insertion| {
+                            plain().saturating_add(
+                                insertion.additional_output_bytes().saturating_mul(
+                                    if document.session.encoding() == Encoding::Utf8 {
+                                        1
+                                    } else {
+                                        2
+                                    },
+                                ),
+                            )
                         }),
-                    }),
-                    None,
-                ),
-                StructuralRequest::Move => document.materialization_storage_estimate(
-                    Some(&ColumnTransformation::Arrange {
-                        source_width: document.total_columns,
-                        output_columns: (0..document.total_columns).collect(),
-                    }),
-                    None,
-                ),
-            },
+                    StructuralRequest::InsertColumns => document
+                        .column_insertion_from_dialog(dialog)
+                        .map_or(0, |transformation| {
+                            document.materialization_storage_estimate(Some(&transformation), None)
+                        }),
+                    // Read-only analysis determines the actual padded width before its review.
+                    StructuralRequest::Split => 0,
+                    StructuralRequest::Sort => document
+                        .sort_plan_disk_estimate(dialog.sort_plan(false).keys.len())
+                        .unwrap_or(u64::MAX),
+                    StructuralRequest::Duplicates => estimate_duplicate_temporary_bytes(
+                        document.reordered_storage_estimate(),
+                        document
+                            .storage_record_count()
+                            .saturating_sub(document.data_start),
+                        dialog.columns.len(),
+                    ),
+                    StructuralRequest::Combine => document.materialization_storage_estimate(
+                        Some(&ColumnTransformation::Join {
+                            source_columns: dialog.columns.clone(),
+                            separator: dialog.separator.as_bytes().to_vec(),
+                            output_header: document.session.dialect.has_header.then(|| {
+                                document
+                                    .current_header_fields()
+                                    .get(dialog.columns[0])
+                                    .cloned()
+                                    .unwrap_or_default()
+                            }),
+                        }),
+                        None,
+                    ),
+                    StructuralRequest::Move => document.materialization_storage_estimate(
+                        Some(&ColumnTransformation::Arrange {
+                            source_width: document.total_columns,
+                            output_columns: (0..document.total_columns).collect(),
+                        }),
+                        None,
+                    ),
+                }
+            }
             Self::Materialize(transformation, _, records) => document
                 .materialization_storage_estimate_for_records(Some(transformation), None, *records),
             Self::DeleteColumns(columns) => document.materialization_storage_estimate(
@@ -135,7 +146,15 @@ impl PendingStorageOperation {
                     case_sensitivity: *case_sensitivity,
                 }),
             ),
-            Self::Export(_) => document.session.file_size,
+            Self::Export(_) => document.session.file_size.saturating_mul(
+                if document.session.encoding() == Encoding::Utf8 {
+                    1
+                } else {
+                    3
+                },
+            ),
+            Self::SaveUtf8(_) => document
+                .materialization_storage_estimate(document.save_as_transformation().as_ref(), None),
             Self::Save(Some(_)) => document
                 .materialization_storage_estimate(document.save_as_transformation().as_ref(), None),
             Self::DeleteRows(_) | Self::Save(None) => plain(),
@@ -254,7 +273,8 @@ impl QuarryApp {
                 .as_ref()
                 .unwrap_or(&document.logical_path)
                 .parent(),
-            PendingStorageOperation::Export(destination) => destination.parent(),
+            PendingStorageOperation::SaveUtf8(destination)
+            | PendingStorageOperation::Export(destination) => destination.parent(),
             _ => Some(self.working_directory.as_path()),
         }
         .filter(|path| !path.as_os_str().is_empty())
@@ -325,7 +345,7 @@ impl QuarryApp {
                         {
                             "Quarry uses temporary files to sort large files without loading everything into memory. Your original file stays unchanged until you save."
                         }
-                        PendingStorageOperation::Save(_) =>
+                        PendingStorageOperation::Save(_) | PendingStorageOperation::SaveUtf8(_) =>
                             "Quarry uses temporary space to save your changes safely. Continue will save your changes.",
                         PendingStorageOperation::Export(_) =>
                             "Quarry uses temporary space to prepare your export. Your open file will stay unchanged.",
@@ -516,6 +536,9 @@ impl QuarryApp {
                     self.active.close_confirmation_open = true;
                 }
             }
+            PendingStorageOperation::SaveUtf8(destination) => {
+                self.save_as_picker_result_format(Some(destination), true);
+            }
             PendingStorageOperation::Export(destination) => {
                 self.export_picker_result(Some(destination))
             }
@@ -566,6 +589,11 @@ impl Document {
             transformation,
             replacement,
         )
+        .saturating_mul(if self.session.encoding() == Encoding::Utf8 {
+            1
+        } else {
+            3
+        })
     }
 
     fn reordered_storage_estimate(&self) -> u64 {
@@ -581,6 +609,11 @@ impl Document {
             None,
             None,
         )
+        .saturating_mul(if self.session.encoding() == Encoding::Utf8 {
+            1
+        } else {
+            3
+        })
     }
 
     fn retained_storage_paths(&self) -> Vec<PathBuf> {
@@ -1287,5 +1320,29 @@ mod tests {
             b"edited"
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn encoding_storage_allowances_apply_expansion_only_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        std::fs::write(&source, b"name\ncaf\xe9\n").unwrap();
+        let document = Document::prepare_with_encoding(
+            &source,
+            OpenOptions::default(),
+            Some(Encoding::Latin1),
+        )
+        .unwrap();
+        assert_eq!(
+            PendingStorageOperation::SaveUtf8(directory.path().join("copy.csv"))
+                .allowance(&document),
+            document.materialization_storage_estimate(None, None)
+        );
+        let utf8_source = directory.path().join("utf8.csv");
+        std::fs::write(&utf8_source, b"name\nvalue\n").unwrap();
+        let utf8 = Document::prepare(&utf8_source, OpenOptions::default()).unwrap();
+        assert_eq!(
+            PendingStorageOperation::Export(directory.path().join("filtered.csv")).allowance(&utf8),
+            utf8.session.file_size
+        );
     }
 }

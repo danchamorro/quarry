@@ -1,7 +1,7 @@
 use super::*;
 use quarry_core::{
-    CombineJob, CombineOptions, CombinePlan, CombineSummary, StorageSpace, check_combine_files,
-    check_storage,
+    CombineJob, CombineOptions, CombinePlan, CombineSummary, StorageSpace,
+    check_combine_files_with_encoding, check_storage,
 };
 use std::thread::{self, JoinHandle};
 
@@ -9,6 +9,7 @@ pub(super) struct CombineDialog {
     paths: Vec<PathBuf>,
     has_header: bool,
     delimiter: DelimiterMode,
+    encoding: Option<Encoding>,
     plan: Option<CombinePlan>,
     checking: Option<CombineJob<CombinePlan>>,
     writing: Option<CombineJob<CombineSummary>>,
@@ -27,6 +28,7 @@ impl Default for CombineDialog {
             paths: Vec::new(),
             has_header: true,
             delimiter: DelimiterMode::Auto,
+            encoding: None,
             plan: None,
             checking: None,
             writing: None,
@@ -72,12 +74,13 @@ impl CombineDialog {
     fn start_check(&mut self) {
         self.invalidate();
         self.cancel_requested = false;
-        match check_combine_files(
+        match check_combine_files_with_encoding(
             self.paths.clone(),
             CombineOptions {
                 delimiter: self.delimiter.delimiter(),
                 has_header: self.has_header,
             },
+            self.encoding,
         ) {
             Ok(job) => self.checking = Some(job),
             Err(error) => self.message = Some(error.to_string()),
@@ -239,7 +242,7 @@ impl CombineDialog {
                     ui.horizontal(|ui| {
                         if ui.button("Close").clicked() { action = DialogAction::Close; }
                         if ui.button("Open Combined File").clicked() {
-                            action = DialogAction::Open(result.destination.clone(), self.plan.as_ref().map(|p| p.delimiter).unwrap_or(b','), self.has_header);
+                            action = DialogAction::Open(result.destination.clone(), self.plan.as_ref().map(|p| p.delimiter).unwrap_or(b','), self.has_header, self.plan.as_ref().map(|p| p.encoding).unwrap_or(Encoding::Utf8));
                         }
                     });
                     return;
@@ -279,21 +282,32 @@ impl CombineDialog {
                         if let Some(paths) = rfd::FileDialog::new().set_title("Choose files to combine").pick_files() { self.add_paths(paths); }
                     }
                     let header_changed = ui.checkbox(&mut self.has_header, "Files have a header row").changed();
-                    let previous = self.delimiter;
+                    let previous = (self.delimiter, self.encoding);
                     ui.horizontal(|ui| {
                         ui.label("Delimiter");
                         egui::ComboBox::from_id_salt("combine-delimiter").selected_text(self.delimiter.label()).show_ui(ui, |ui| {
                             for mode in DelimiterMode::ALL { ui.selectable_value(&mut self.delimiter, mode, mode.label()); }
                         });
                     });
-                    if header_changed || previous != self.delimiter { self.invalidate(); }
+                    ui.horizontal(|ui| {
+                        ui.label("Encoding");
+                        egui::ComboBox::from_id_salt("combine-encoding")
+                            .selected_text(encoding_choice_label(self.encoding))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.encoding, None, "Auto (BOM or UTF-8)");
+                                for encoding in Encoding::ALL {
+                                    ui.selectable_value(&mut self.encoding, Some(encoding), encoding.label());
+                                }
+                            });
+                    });
+                    if header_changed || previous != (self.delimiter, self.encoding) { self.invalidate(); }
                 });
                 ui.small(if self.has_header { "Headers must match exactly, in the same order. The output keeps one header." } else { "Every row must have the same number of columns. All rows are kept." });
                 ui.small("Uses saved files on disk. Duplicates are kept. Unsaved edits are not included.");
                 if let Some(plan) = &self.plan {
                     ui.separator();
                     ui.label(format!("{} matching files · {} columns · {} data rows", plan.inputs.len(), plan.columns, plan.data_rows));
-                    ui.label(format!("Output size: {}", format_bytes(plan.output_bytes)));
+                    ui.label(format!("Output size: {} · {}", format_bytes(plan.output_bytes), plan.encoding));
                 }
                 if let Some(destination) = &self.destination {
                     ui.add(egui::Label::new(format!("Output: {}", destination.display())).truncate()).on_hover_text(destination.display().to_string());
@@ -337,7 +351,7 @@ impl CombineDialog {
 enum DialogAction {
     None,
     Close,
-    Open(PathBuf, u8, bool),
+    Open(PathBuf, u8, bool, Encoding),
 }
 
 impl QuarryApp {
@@ -376,10 +390,10 @@ impl QuarryApp {
             DialogAction::Close => {
                 self.combine_files = None;
             }
-            DialogAction::Open(path, delimiter, has_header) => {
+            DialogAction::Open(path, delimiter, has_header, encoding) => {
                 // Opening the result creates a tab, preserving all existing documents.
                 let dialog = self.combine_files.take();
-                if let Err(error) = self.open_path_with_options(
+                if let Err(error) = self.open_document_tab_with_encoding(
                     path,
                     OpenOptions {
                         delimiter: Some(delimiter),
@@ -390,6 +404,7 @@ impl QuarryApp {
                         },
                         ..OpenOptions::default()
                     },
+                    Some(encoding),
                 ) {
                     self.combine_files = dialog;
                     self.combine_files.as_mut().unwrap().message = Some(format!(

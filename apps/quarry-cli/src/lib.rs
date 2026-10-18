@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use quarry_core::{
     CaseSensitivity, ColumnTransformation, CompletedIndex, DateTimeFormat, Dialect, DuplicateJob,
-    DuplicateOutcome, DuplicateSpec, FilterExportJob, FilterExportOutcome, FilterExportProgress,
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
-    FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress, LiteralReplacement,
-    MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob,
-    SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
-    Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
+    DuplicateOutcome, DuplicateSpec, Encoding, FilterExportJob, FilterExportOutcome,
+    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
+    FilterProgress, FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress,
+    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome,
+    SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition,
+    SearchProgress, Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
     SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex, check_storage,
     estimate_edited_output_bytes, estimate_sort_temporary_bytes, inspect_storage,
 };
@@ -44,6 +44,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("filter") => filter_command(args.collect()),
         Some("export") => export_command(args.collect()),
         Some("edit-save-as") => edit_save_as_command(args.collect()),
+        Some("convert-utf8") => save_copy_command(args.collect(), true),
         Some("replace-all-save-as") => replace_all_save_as_command(args.collect()),
         Some("transform-save-as") => transform_save_as_command(args.collect()),
         Some("sort-save-as") => sort_save_as_command(args.collect()),
@@ -98,8 +99,11 @@ fn print_help() {
          [--temp-dir DIRECTORY] \
          [--delimiter ,] [--header auto|first-row|none] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
+           quarry convert-utf8 <FILE> --output FILE [--edit DATA_ROW COLUMN VALUE]...\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]\n\n\
+         Commands that read an input file accept --encoding auto|utf8|utf16le|utf16be|windows1252|latin1; generate does not.\n\
+         Auto detects Unicode BOMs and otherwise uses UTF-8; no legacy guessing.\n\n\
          Duplicates: count only by default; --output explicitly removes extra occurrences.\n\
          The first row is kept. Matching ignores ASCII case unless --match-case is set.\n\
          Blank and missing selected fields match; whitespace is significant.\n\
@@ -166,6 +170,7 @@ fn parse_and_filter(args: &[String], cursor: &mut usize) -> CliResult<FilterPred
 }
 
 fn filter_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut path = None;
     let mut column = None;
     let mut operator = None;
@@ -178,6 +183,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
             "--operator" => {
                 operator = Some(parse_filter_operator(
@@ -233,7 +239,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     query.predicates[0].upper_bound = upper_bound;
     query.predicates.extend(and_predicates);
     query.validate()?;
-    let session = Session::open(&path, OpenOptions::default())?;
+    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -244,6 +250,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
 
     println!("Quarry filter benchmark\n");
     println!("File: {}", session.path().display());
+    println!("Encoding: {}", session.encoding());
     println!(
         "File size: {} ({} bytes)",
         human_bytes(session.file_size),
@@ -389,6 +396,7 @@ fn wait_for_filter(
 }
 
 fn export_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut path = None;
     let mut destination = None;
     let mut column = None;
@@ -402,6 +410,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
             "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
             "--operator" => {
@@ -459,7 +468,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     query.predicates[0].upper_bound = upper_bound;
     query.predicates.extend(and_predicates);
     query.validate()?;
-    let session = Session::open(&path, OpenOptions::default())?;
+    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -633,6 +642,11 @@ struct RequestedCellEdit {
 }
 
 fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
+    save_copy_command(args, false)
+}
+
+fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
+    let mut encoding = None;
     let mut path = None;
     let mut destination = None;
     let mut requested_edits = Vec::new();
@@ -642,6 +656,7 @@ fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
             "--edit" => {
                 let operands = args
@@ -680,14 +695,14 @@ fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
 
     let path = path.ok_or("edit-save-as requires a file path")?;
     let destination = destination.ok_or("edit-save-as requires --output")?;
-    if requested_edits.is_empty() {
+    if requested_edits.is_empty() && !utf8 {
         return Err("edit-save-as requires at least one --edit".into());
     }
     if cancel_after_bytes == Some(0) {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
-    let session = Session::open(&path, OpenOptions::default())?;
+    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -712,8 +727,11 @@ fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
         }
     }
 
-    let job =
-        session.start_save_as_with_edits(BTreeMap::new(), cell_edits.clone(), &destination)?;
+    let job = if utf8 {
+        session.start_save_as_utf8(BTreeMap::new(), cell_edits.clone(), None, &destination)?
+    } else {
+        session.start_save_as_with_edits(BTreeMap::new(), cell_edits.clone(), &destination)?
+    };
     let (outcome, progress, cancellation) =
         wait_for_save_as(job, cancel_after_bytes, Duration::from_millis(1))?;
     let source_size_after = std::fs::metadata(session.path())?.len();
@@ -731,8 +749,16 @@ fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
             {
                 return Err("published output does not match Save As progress".into());
             }
-            let validation_elapsed =
-                validate_saved_edits(&summary.destination, &cell_edits, session.dialect)?;
+            let validation_elapsed = validate_saved_edits(
+                &summary.destination,
+                &cell_edits,
+                session.dialect,
+                if utf8 {
+                    Encoding::Utf8
+                } else {
+                    session.encoding()
+                },
+            )?;
             (
                 "complete",
                 Some(output_size),
@@ -749,6 +775,15 @@ fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
     };
 
     println!("Quarry direct cell Save As benchmark\n");
+    println!(
+        "Encoding: {} -> {}",
+        session.encoding(),
+        if utf8 {
+            Encoding::Utf8
+        } else {
+            session.encoding()
+        }
+    );
     println!("Source: {}", session.path().display());
     println!(
         "Source size: {} ({} bytes)",
@@ -836,6 +871,7 @@ fn edit_save_as_command(args: Vec<String>) -> CliResult<()> {
 }
 
 fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut path = None;
     let mut destination = None;
     let mut query = None;
@@ -846,6 +882,7 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
             "--query" => query = Some(value(&args, &mut cursor, "--query")?.as_bytes().to_vec()),
             "--replacement" => {
@@ -888,7 +925,7 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
-    let session = Session::open(&path, OpenOptions::default())?;
+    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -1031,6 +1068,7 @@ enum RequestedColumnTransformation {
 }
 
 fn duplicates_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut source = None;
     let mut destination = None;
     let mut temporary_directory = None;
@@ -1043,6 +1081,7 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     let mut cursor = 0;
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--columns" => {
                 let selected = value(&args, &mut cursor, "--columns")?
                     .split(',')
@@ -1088,13 +1127,14 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes == Some(0) {
         return Err("cancel-after-bytes must be non-zero".into());
     }
-    let session = Session::open(
+    let session = Session::open_with_encoding(
         &source,
         OpenOptions {
             delimiter,
             header_mode,
             ..OpenOptions::default()
         },
+        encoding,
     )?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
@@ -1323,6 +1363,7 @@ fn wait_for_duplicates(
 }
 
 fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut source = None;
     let mut destination = None;
     let mut temporary_directory = None;
@@ -1339,6 +1380,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
             "--order" => {
                 direction = Some(parse_sort_direction(value(&args, &mut cursor, "--order")?)?)
@@ -1434,13 +1476,14 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
-    let session = Session::open(
+    let session = Session::open_with_encoding(
         &source,
         OpenOptions {
             delimiter,
             header_mode,
             ..OpenOptions::default()
         },
+        encoding,
     )?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
@@ -1827,7 +1870,7 @@ fn validate_sorted_output(
     const VALIDATION_ROWS: usize = 1_000;
 
     let handoff_started = Instant::now();
-    let output = Session::open(
+    let output = Session::open_with_encoding(
         destination,
         OpenOptions {
             rows: 1,
@@ -1839,6 +1882,7 @@ fn validate_sorted_output(
             },
             ..OpenOptions::default()
         },
+        Some(source.encoding()),
     )?;
     let adopted_index = completed_index
         .map(|index| output.adopt_completed_index(index))
@@ -2011,6 +2055,7 @@ fn fnv1a64_file(path: &Path) -> CliResult<u64> {
 }
 
 fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut path = None;
     let mut destination = None;
     let mut requested = None;
@@ -2021,6 +2066,7 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
             "--split" => {
                 if requested.is_some() {
@@ -2129,7 +2175,7 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
-    let session = Session::open(&path, OpenOptions::default())?;
+    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -2467,7 +2513,7 @@ fn validate_saved_transformation(
     transformation: &ColumnTransformation,
 ) -> CliResult<(usize, u64, Duration)> {
     let started = Instant::now();
-    let output = Session::open(
+    let output = Session::open_with_encoding(
         destination,
         OpenOptions {
             rows: 1,
@@ -2479,6 +2525,7 @@ fn validate_saved_transformation(
             },
             ..OpenOptions::default()
         },
+        Some(source.encoding()),
     )?;
     let source_index = source.start_indexing(IndexConfig::default())?.wait()?;
     let output_index = output.start_indexing(IndexConfig::default())?.wait()?;
@@ -2611,9 +2658,10 @@ fn validate_saved_edits(
     destination: &Path,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     dialect: Dialect,
+    encoding: Encoding,
 ) -> CliResult<Duration> {
     let started = Instant::now();
-    let session = Session::open(
+    let session = Session::open_with_encoding(
         destination,
         OpenOptions {
             delimiter: Some(dialect.delimiter),
@@ -2624,6 +2672,7 @@ fn validate_saved_edits(
             },
             ..OpenOptions::default()
         },
+        Some(encoding),
     )?;
     let index = session.start_indexing(IndexConfig::default())?.wait()?;
     let mut current_row = None;
@@ -2719,6 +2768,7 @@ fn record_filter_sample(samples: &mut FilterSamples, found: &FilterMatch) {
 }
 
 fn search_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut path = None;
     let mut query = None;
     let mut start_row = 1_u64;
@@ -2729,6 +2779,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--query" => query = Some(value(&args, &mut cursor, "--query")?.as_bytes().to_vec()),
             "--start-row" => start_row = value(&args, &mut cursor, "--start-row")?.parse()?,
             "--start-column" => {
@@ -2768,7 +2819,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
         return Err("search cannot be cold because indexing reads the file first".into());
     }
 
-    let session = Session::open(&path, OpenOptions::default())?;
+    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
     let start = data_search_position(start_row, start_column, session.dialect.has_header)?;
     let index_started = Instant::now();
     let index = session.start_indexing(IndexConfig::default())?.wait()?;
@@ -2785,6 +2836,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
 
     println!("Quarry search benchmark\n");
     println!("File: {}", session.path().display());
+    println!("Encoding: {}", session.encoding());
     println!(
         "File size: {} ({} bytes)",
         human_bytes(session.file_size),
@@ -2913,6 +2965,7 @@ fn wait_for_search(
 }
 
 fn viewport_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut path = None;
     let mut iterations = 500_usize;
     let mut rows = 100_usize;
@@ -2925,6 +2978,7 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--iterations" => iterations = value(&args, &mut cursor, "--iterations")?.parse()?,
             "--rows" => rows = value(&args, &mut cursor, "--rows")?.parse()?,
             "--seed" => seed = value(&args, &mut cursor, "--seed")?.parse()?,
@@ -2956,12 +3010,13 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
         return Err("live viewport schedule must not exceed 60 seconds".into());
     }
     let path = path.ok_or("viewport requires a file path")?;
-    let session = Session::open(
+    let session = Session::open_with_encoding(
         &path,
         OpenOptions {
             rows,
             ..OpenOptions::default()
         },
+        encoding,
     )?;
     let index_started = Instant::now();
     let job = session.start_indexing(IndexConfig {
@@ -3013,6 +3068,7 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
 
     println!("Quarry viewport benchmark\n");
     println!("File: {}", session.path().display());
+    println!("Encoding: {}", session.encoding());
     println!("File size: {}", human_bytes(session.file_size));
     println!("Rows indexed: {}", index.indexed_rows());
     println!("Indexing time: {:.3} s", index_elapsed.as_secs_f64());
@@ -3157,6 +3213,7 @@ fn benchmark_live_viewports(
 
     println!("Quarry live viewport benchmark\n");
     println!("File: {}", session.path().display());
+    println!("Encoding: {}", session.encoding());
     println!("File size: {}", human_bytes(session.file_size));
     println!("Cache state: {cache_state}");
     println!("Index chunk: {}", human_bytes(chunk_bytes as u64));
@@ -3230,6 +3287,7 @@ fn print_viewport_stats(pattern: &str, stats: LatencyStats) {
 }
 
 fn open_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
     let mut path = None;
     let mut rows = 100_usize;
     let mut delimiter = None;
@@ -3242,6 +3300,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
 
     while cursor < args.len() {
         match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--rows" => rows = value(&args, &mut cursor, "--rows")?.parse()?,
             "--delimiter" => {
                 delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
@@ -3267,19 +3326,21 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
 
     let path = path.ok_or("open requires a file path")?;
     let memory_before = current_rss_bytes();
-    let session = Session::open(
+    let session = Session::open_with_encoding(
         &path,
         OpenOptions {
             rows,
             delimiter,
             ..OpenOptions::default()
         },
+        encoding,
     )?;
     let job = session.start_indexing(IndexConfig::default())?;
     let memory_at_first_rows = current_rss_bytes();
 
     println!("Quarry\n");
     println!("File: {}", session.path().display());
+    println!("Encoding: {}", session.encoding());
     println!("File size: {}", human_bytes(session.file_size));
     println!(
         "Build: {}",
@@ -3563,6 +3624,13 @@ fn value<'a>(args: &'a [String], cursor: &mut usize, name: &str) -> CliResult<&'
     args.get(*cursor)
         .map(String::as_str)
         .ok_or_else(|| format!("{name} requires a value").into())
+}
+
+fn parse_encoding(value: &str) -> CliResult<Option<Encoding>> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    value.parse::<Encoding>().map(Some).map_err(Into::into)
 }
 
 fn parse_delimiter(value: &str) -> CliResult<u8> {
@@ -5651,5 +5719,38 @@ mod tests {
         assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
         fs::remove_file(first).unwrap();
         fs::remove_file(second).unwrap();
+    }
+    #[test]
+    fn explicit_legacy_encoding_and_utf8_conversion_preserve_source() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("quarry-encoding-{}-{suffix}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.csv");
+        let output = directory.join("unicode.csv");
+        let bytes = b"name,value\r\ncaf\xe9,1\r\n";
+        std::fs::write(&source, bytes).unwrap();
+        super::run(vec![
+            "convert-utf8".into(),
+            source.display().to_string(),
+            "--encoding".into(),
+            "windows-1252".into(),
+            "--output".into(),
+            output.display().to_string(),
+            "--edit".into(),
+            "1".into(),
+            "1".into(),
+            "café 😀".into(),
+        ])
+        .unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            "name,value\r\ncafé 😀,1\r\n".as_bytes()
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

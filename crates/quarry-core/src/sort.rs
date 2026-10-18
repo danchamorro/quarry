@@ -12,15 +12,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use quarry_delimited::{RecordScanner, parse_record};
+use crate::Encoding;
+use crate::encoding::RecordScanner;
+use quarry_delimited::parse_record;
 
 use crate::date_time_sort::date_time_key;
 use crate::estimate_edited_output_bytes;
 use crate::export::{ExportTarget, PrivatePublication, source_matches_stamp};
-use crate::storage::{
-    check_operation_storage, count_records, count_records_with_progress, output_parent,
-    storage_error,
-};
+use crate::storage::{check_operation_storage, output_parent, storage_error};
 use crate::{
     CaseSensitivity, CompletedIndex, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, DateTimeFormat,
     FilterExportOutcome, IndexConfig, QuarryError, Session, SourceStamp, StructuralIndex,
@@ -399,6 +398,7 @@ pub const fn estimate_multi_sort_temporary_bytes(
 
 #[derive(Clone, Copy)]
 struct SortConfig {
+    encoding: Encoding,
     chunk_bytes: usize,
     max_record_bytes: usize,
     run_memory_bytes: usize,
@@ -406,6 +406,7 @@ struct SortConfig {
 }
 
 const DEFAULT_SORT_CONFIG: SortConfig = SortConfig {
+    encoding: Encoding::Utf8,
     chunk_bytes: DEFAULT_READ_CHUNK,
     max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
     run_memory_bytes: DEFAULT_RUN_MEMORY_BYTES,
@@ -623,13 +624,14 @@ impl SortJob {
         if !source_matches_stamp(&source, &source_path, &source_stamp)? {
             return Err(QuarryError::SourceChanged);
         }
-        let bom_present = source_has_bom(&mut source)?;
+        let bom_present = source_has_bom(&mut source, config.encoding)?;
         let mut output = ExportTarget::new_private_guarded(
             &source_path,
             destination.clone(),
             &source,
             source_stamp.clone(),
         )?;
+        output.configure(config.encoding, config.encoding, config.max_record_bytes);
         let publication = output
             .defer_private_publication()
             .expect("sort output is private");
@@ -750,7 +752,10 @@ impl Session {
             spec,
             destination.as_ref().to_path_buf(),
             self.source_stamp.clone(),
-            DEFAULT_SORT_CONFIG,
+            SortConfig {
+                encoding: self.encoding,
+                ..DEFAULT_SORT_CONFIG
+            },
             self.completed_record_count(),
         )
     }
@@ -775,7 +780,10 @@ impl Session {
             spec,
             destination.as_ref().to_path_buf(),
             self.source_stamp.clone(),
-            DEFAULT_SORT_CONFIG,
+            SortConfig {
+                encoding: self.encoding,
+                ..DEFAULT_SORT_CONFIG
+            },
             Some(temporary_directory.as_ref().to_path_buf()),
             self.completed_record_count(),
         )
@@ -854,18 +862,8 @@ fn effective_merge_fan_in(config: SortConfig, max_key_bytes: usize) -> usize {
     config.merge_fan_in.min(key_slots.saturating_sub(1).max(2))
 }
 
-fn source_has_bom(source: &mut File) -> Result<bool, QuarryError> {
-    let mut prefix = [0_u8; 3];
-    let mut read = 0;
-    while read < prefix.len() {
-        let count = source.read(&mut prefix[read..])?;
-        if count == 0 {
-            break;
-        }
-        read += count;
-    }
-    source.seek(SeekFrom::Start(0))?;
-    Ok(read == prefix.len() && prefix == UTF8_BOM)
+fn source_has_bom(source: &mut File, encoding: Encoding) -> Result<bool, QuarryError> {
+    crate::export::source_starts_with_bom(source, encoding)
 }
 
 struct RunWorkspace {
@@ -1216,6 +1214,11 @@ impl<'a> InitialRunBuilder<'a> {
                 limit: self.config.max_record_bytes,
             });
         }
+        let decoded = self
+            .config
+            .encoding
+            .decode(record, self.config.max_record_bytes)?;
+        let record = decoded.as_ref();
         let body = if physical_row == 0 && self.bom_present {
             record.strip_prefix(UTF8_BOM).unwrap_or(record)
         } else {
@@ -1437,8 +1440,8 @@ fn create_initial_runs<'a>(
     shared: &'a SharedState,
 ) -> Result<ScanOutcome, QuarryError> {
     source.seek(SeekFrom::Start(0))?;
-    let mut scanner = RecordScanner::new(delimiter)?;
-    let mut chunk = vec![0_u8; config.chunk_bytes];
+    let mut scanner = RecordScanner::new(delimiter, config.encoding)?;
+    let mut chunk = vec![0_u8; config.encoding.chunk_size(config.chunk_bytes)];
     let mut record = Vec::new();
     let mut absolute_start = 0_u64;
     let mut physical_row = 0_u64;
@@ -1458,7 +1461,7 @@ fn create_initial_runs<'a>(
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(ScanOutcome::Cancelled);
         }
-        let read = source.read(&mut chunk)?;
+        let read = config.encoding.read_chunk(source, &mut chunk)?;
         if read == 0 {
             let mut deferred_error = None;
             let mut cancelled = false;
@@ -1562,9 +1565,10 @@ fn run_sort(
     let records = match completed_record_count {
         Some(records) => records,
         None => {
-            let Some(records) = count_records_with_progress(
+            let Some(records) = crate::storage::count_records_encoded(
                 source,
                 delimiter,
+                config.encoding,
                 &shared.cancel_requested,
                 |bytes| {
                     shared
@@ -1586,6 +1590,11 @@ fn run_sort(
         None,
         None,
     );
+    let output_bytes = if config.encoding == Encoding::Utf8 {
+        output_bytes
+    } else {
+        output_bytes.saturating_mul(3)
+    };
     let temporary_directory = temporary_directory.unwrap_or_else(|| output_parent(&destination));
     check_operation_storage(
         temporary_directory,
@@ -1627,8 +1636,9 @@ fn run_sort(
     match outcome {
         FilterExportOutcome::Complete(summary) => Ok(SortOutcome::Complete(SortSummary {
             destination: summary.destination,
-            output_index: output_stamp
-                .and_then(|stamp| CompletedIndex::from_output(index, stamp, delimiter)),
+            output_index: output_stamp.and_then(|stamp| {
+                CompletedIndex::from_output(index, stamp, delimiter, config.encoding)
+            }),
             rows_sorted: rows,
             bytes_written: summary.bytes_written,
             runs_created: shared.runs_created.load(Ordering::Acquire),
@@ -1697,11 +1707,16 @@ fn run_sort_inner(
     let mut bytes_written = 0_u64;
     if bom_present {
         write_output(output, UTF8_BOM, shared)?;
-        bytes_written = UTF8_BOM.len() as u64;
+        bytes_written = output.bytes_written();
     }
     if let Some(header) = &scan.header {
         write_output(output, header, shared)?;
-        bytes_written = bytes_written.saturating_add(header.len() as u64);
+        bytes_written = output.bytes_written();
+        if bytes_written > output.record_limit() as u64 {
+            return Err(QuarryError::RecordTooLarge {
+                limit: output.record_limit(),
+            });
+        }
         index.record_boundary(bytes_written);
     }
     shared.bytes_written.store(bytes_written, Ordering::Release);
@@ -1714,6 +1729,7 @@ fn run_sort_inner(
         scan.records,
         config.max_record_bytes,
         bytes_written,
+        if has_header { 0 } else { bytes_written },
         shared,
         Some(&mut index),
     )?
@@ -1908,6 +1924,7 @@ fn merge_runs_to_output(
     expected_records: RecordMultisetFingerprint,
     max_record_bytes: usize,
     prior_bytes_written: u64,
+    mut first_record_prefix_bytes: u64,
     shared: &SharedState,
     mut output_index: Option<&mut StructuralIndex>,
 ) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
@@ -1944,9 +1961,11 @@ fn merge_runs_to_output(
                 output,
                 previous,
                 inserted_ending,
+                first_record_prefix_bytes,
                 &mut verifier,
                 shared,
             )?;
+            first_record_prefix_bytes = 0;
             bytes_written = bytes_written.saturating_add(written);
             if let Some(index) = &mut output_index {
                 index.record_boundary(prior_bytes_written.saturating_add(bytes_written));
@@ -1976,7 +1995,14 @@ fn merge_runs_to_output(
         );
     }
     if let Some(last) = pending {
-        let written = write_verified_output_entry(output, last, b"", &mut verifier, shared)?;
+        let written = write_verified_output_entry(
+            output,
+            last,
+            b"",
+            first_record_prefix_bytes,
+            &mut verifier,
+            shared,
+        )?;
         bytes_written = bytes_written.saturating_add(written);
         if let Some(index) = output_index {
             index.record_boundary(prior_bytes_written.saturating_add(bytes_written));
@@ -1990,16 +2016,26 @@ fn write_verified_output_entry(
     output: &mut ExportTarget,
     entry: PendingOutputEntry,
     inserted_ending: &[u8],
+    record_prefix_bytes: u64,
     verifier: &mut OutputVerifier,
     shared: &SharedState,
 ) -> Result<u64, QuarryError> {
     let PendingOutputEntry { record, .. } = entry;
+    let encoded_length = (output.output_encoding().encoded_len(&record)? as u64)
+        .saturating_add(output.output_encoding().encoded_len(inserted_ending)? as u64)
+        .saturating_add(record_prefix_bytes);
+    if encoded_length > output.record_limit() as u64 {
+        return Err(QuarryError::RecordTooLarge {
+            limit: output.record_limit(),
+        });
+    }
+    let before = output.bytes_written();
     write_output(output, &record, shared)?;
     if !inserted_ending.is_empty() {
         write_output(output, inserted_ending, shared)?;
     }
     verifier.observe(&record, inserted_ending)?;
-    Ok((record.len() as u64).saturating_add(inserted_ending.len() as u64))
+    Ok(output.bytes_written().saturating_sub(before))
 }
 
 fn write_output(
@@ -2007,8 +2043,9 @@ fn write_output(
     bytes: &[u8],
     shared: &SharedState,
 ) -> Result<(), QuarryError> {
+    let before = output.bytes_written();
     output.write_all(bytes)?;
-    shared.add_temporary_bytes(bytes.len() as u64);
+    shared.add_temporary_bytes(output.bytes_written().saturating_sub(before));
     Ok(())
 }
 
@@ -2446,6 +2483,7 @@ mod tests {
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             run_memory_bytes: 40,
             merge_fan_in: 2,
+            encoding: Encoding::Utf8,
         }
     }
 
@@ -3401,6 +3439,7 @@ mod tests {
                 max_record_bytes: 6,
                 run_memory_bytes: 1,
                 merge_fan_in: 2,
+                encoding: Encoding::Utf8,
             },
         );
 
@@ -3915,5 +3954,119 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), input.as_bytes());
         assert!(sort_artifacts(&directory).is_empty());
         fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn utf16_header_limit_includes_native_bom_bytes() {
+        for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let directory = case();
+            let path = directory.join("source.csv");
+            let destination = directory.join("sorted.csv");
+            let mut bytes = encoding.bom().to_vec();
+            bytes.extend_from_slice(&encoding.encode(b"abc\nz\na\n", 4096).unwrap());
+            fs::write(&path, &bytes).unwrap();
+            let session = Session::open_with_encoding(
+                &path,
+                crate::OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..Default::default()
+                },
+                Some(encoding),
+            )
+            .unwrap();
+            let job = start_custom(
+                &session,
+                BTreeMap::from([(0, b"abcd".to_vec())]),
+                BTreeMap::new(),
+                SortSpec {
+                    column: 0,
+                    mode: SortMode::Text,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &destination,
+                SortConfig {
+                    max_record_bytes: 10,
+                    encoding,
+                    chunk_bytes: 2,
+                    run_memory_bytes: 4096,
+                    merge_fan_in: 2,
+                },
+            );
+            assert!(matches!(
+                job.wait(),
+                Err(QuarryError::RecordTooLarge { limit: 10 })
+            ));
+            assert!(!destination.exists());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(sort_artifacts(&directory).is_empty());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+    #[test]
+    fn first_native_record_limit_includes_headerless_sort_bom() {
+        for encoding in [Encoding::Utf8, Encoding::Utf16Le, Encoding::Utf16Be] {
+            for fits in [false, true] {
+                let directory = case();
+                let source = directory.join("source.csv");
+                let destination = directory.join("sorted.csv");
+                let first = "z\n";
+                let second = match (encoding, fits) {
+                    (Encoding::Utf8, false) => "a123456\n",
+                    (Encoding::Utf8, true) => "a123\n",
+                    (_, false) => "aab\n",
+                    (_, true) => "ab\n",
+                };
+                let mut bytes = encoding.bom().to_vec();
+                bytes.extend_from_slice(
+                    &encoding
+                        .encode(format!("{first}{second}").as_bytes(), 4096)
+                        .unwrap(),
+                );
+                fs::write(&source, &bytes).unwrap();
+                let session = Session::open_with_encoding(
+                    &source,
+                    crate::OpenOptions {
+                        header_mode: HeaderMode::NoHeader,
+                        ..Default::default()
+                    },
+                    Some(encoding),
+                )
+                .unwrap();
+                let job = start_custom(
+                    &session,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    SortSpec {
+                        column: 0,
+                        mode: SortMode::Text,
+                        direction: SortDirection::Ascending,
+                        case_sensitivity: CaseSensitivity::Sensitive,
+                    },
+                    &destination,
+                    SortConfig {
+                        chunk_bytes: 2,
+                        max_record_bytes: 8,
+                        run_memory_bytes: 4096,
+                        merge_fan_in: 2,
+                        encoding,
+                    },
+                );
+                let result = job.wait();
+                if fits {
+                    assert!(
+                        matches!(result, Ok(SortOutcome::Complete(_))),
+                        "{encoding}: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(QuarryError::RecordTooLarge { limit: 8 })),
+                        "{encoding}: {result:?}"
+                    );
+                    assert!(!destination.exists());
+                }
+                assert_eq!(fs::read(&source).unwrap(), bytes);
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
     }
 }

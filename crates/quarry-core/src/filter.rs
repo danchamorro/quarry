@@ -1,14 +1,15 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use quarry_delimited::RecordScanner;
+use crate::Encoding;
+use crate::encoding::RecordScanner;
 
 use crate::case::ByteMatcher;
 use crate::export::source_matches_stamp;
@@ -16,7 +17,7 @@ use crate::sort::numeric_key;
 use crate::source_stamp::SourceStamp;
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
-    parse_source_record,
+    parse_encoded_record,
 };
 
 /// Immutable sparse working values, keyed by physical source row and column.
@@ -29,6 +30,7 @@ struct FilterSource {
     stamp: SourceStamp,
     delimiter: u8,
     data_start: u64,
+    encoding: Encoding,
 }
 
 impl FilterSource {
@@ -342,6 +344,7 @@ impl FilterJob {
             config,
             Arc::default(),
             None,
+            Encoding::Utf8,
         )
     }
 
@@ -355,6 +358,7 @@ impl FilterJob {
         config: FilterScanConfig,
         edits: FilterEdits,
         expected: Option<SourceStamp>,
+        encoding: Encoding,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
@@ -370,6 +374,7 @@ impl FilterJob {
             stamp: expected.unwrap_or(SourceStamp::from_file(&file)?),
             delimiter,
             data_start,
+            encoding,
         };
         source.check_file(&file)?;
         let guard_file = file.try_clone()?;
@@ -635,6 +640,7 @@ impl Session {
             DEFAULT_FILTER_SCAN_CONFIG,
             edits,
             Some(self.source_stamp.clone()),
+            self.encoding,
         )
     }
 
@@ -645,6 +651,7 @@ impl Session {
                 || source.stamp != self.source_stamp
                 || source.delimiter != self.dialect.delimiter
                 || source.data_start != u64::from(self.dialect.has_header)
+                || source.encoding != self.encoding
             {
                 return Err(QuarryError::SourceChanged);
             }
@@ -836,8 +843,9 @@ pub(crate) fn matching_fields_with_edits<'a>(
     matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
     edits: &FilterEdits,
+    encoding: Encoding,
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
-    let fields = parse_source_record(record, delimiter, physical_row)?;
+    let fields = parse_encoded_record(record, delimiter, physical_row, encoding)?;
     if edits
         .range((physical_row, 0)..=(physical_row, usize::MAX))
         .next_back()
@@ -902,11 +910,17 @@ fn run_filter(
     max_record_bytes: usize,
     shared: &SharedState,
 ) -> Result<(), QuarryError> {
-    let edits = shared.index.read().unwrap().edits.clone();
+    let index = shared.index.read().unwrap();
+    let edits = index.edits.clone();
+    let encoding = index
+        .source
+        .as_ref()
+        .map_or(Encoding::Utf8, |source| source.encoding);
+    drop(index);
     let matchers = compile_matchers(query)?;
     let groups = predicate_groups(query);
-    let mut scanner = RecordScanner::new(delimiter)?;
-    let mut chunk = vec![0; chunk_bytes];
+    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut chunk = vec![0; encoding.chunk_size(chunk_bytes)];
     let mut absolute_start = 0_u64;
     let mut row_number = 0_u64;
     let mut record_start = 0_u64;
@@ -920,7 +934,7 @@ fn run_filter(
             shared.cancelled.store(true, Ordering::Release);
             return Ok(());
         }
-        let read = file.read(&mut chunk)?;
+        let read = encoding.read_chunk(&mut file, &mut chunk)?;
         if read == 0 {
             let mut deferred_error = None;
             let mut cancelled = false;
@@ -935,6 +949,7 @@ fn run_filter(
                     } else {
                         match matching_fields_with_edits(
                             &record, delimiter, row_number, query, &matchers, &groups, &edits,
+                            encoding,
                         ) {
                             Ok(Some(_)) => pending_matches.push((row_number, record_start)),
                             Ok(None) => {}
@@ -991,6 +1006,7 @@ fn run_filter(
                     } else {
                         match matching_fields_with_edits(
                             &record, delimiter, row_number, query, &matchers, &groups, &edits,
+                            encoding,
                         ) {
                             Ok(Some(_)) => {
                                 pending_matches.push((row_number, record_start));
@@ -1144,10 +1160,14 @@ fn run_filtered_read(
     config: FilterReadConfig,
     shared: Option<&FilterReadSharedState>,
 ) -> Result<FilterReadOutcome, QuarryError> {
+    let encoding = plan
+        .source
+        .as_ref()
+        .map_or(Encoding::Utf8, |source| source.encoding);
     let matchers = compile_matchers(&plan.query)?;
     let groups = predicate_groups(&plan.query);
-    let mut scanner = RecordScanner::at_offset(delimiter, plan.checkpoint.offset)?;
-    let mut chunk = vec![0; config.chunk_bytes];
+    let mut scanner = RecordScanner::at_offset(delimiter, plan.checkpoint.offset, encoding)?;
+    let mut chunk = vec![0; encoding.chunk_size(config.chunk_bytes)];
     let mut absolute_start = plan.checkpoint.offset;
     let mut row_number = plan.checkpoint.row;
     let mut record_start = plan.checkpoint.offset;
@@ -1160,7 +1180,7 @@ fn run_filtered_read(
         if filtered_read_cancel_requested(shared) {
             return Ok(FilterReadOutcome::Cancelled);
         }
-        let read = file.read(&mut chunk)?;
+        let read = encoding.read_chunk(&mut file, &mut chunk)?;
         if read == 0 {
             let mut cancelled = false;
             let has_final_record = scanner.finish(absolute_start, |_| {
@@ -1181,6 +1201,7 @@ fn run_filtered_read(
                     &matchers,
                     &groups,
                     &plan.edits,
+                    encoding,
                 )? && match_ordinal >= plan.start_match
                 {
                     rows.push(FilterMatch {
@@ -1222,6 +1243,7 @@ fn run_filtered_read(
                             &matchers,
                             &groups,
                             &plan.edits,
+                            encoding,
                         ) {
                             Ok(Some(fields)) => {
                                 if match_ordinal >= plan.start_match {
@@ -1436,6 +1458,7 @@ mod tests {
             },
             edits,
             Some(session.source_stamp.clone()),
+            session.encoding,
         )
         .unwrap()
         .wait()
