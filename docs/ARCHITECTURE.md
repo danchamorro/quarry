@@ -225,7 +225,8 @@ Save and export staging always remains on the destination volume. Each writer
 keeps unpublished output inside an owner-only directory (0700 on Unix). New
 export and recovery files are owner-readable/writable (0600 on Unix), independent
 of the process umask. On macOS, inherited ACLs are removed from the new staging
-directory and files before writing; failure to establish private staging aborts
+directory and files before writing. Sort and duplicate spill directories and files
+use the same ACL protection. Failure to establish private staging aborts
 the operation. For Unix file-only drop folders, staging may use the user's
 normal temporary directory after verifying it is on the destination filesystem.
 Replacing an existing file preserves its standard permissions and, on macOS,

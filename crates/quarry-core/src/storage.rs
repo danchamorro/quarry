@@ -366,6 +366,51 @@ pub(crate) fn count_records_encoded(
     }
 }
 
+/// Clears staging ACLs, or restores the existing destination ACL just before publication.
+/// Open descriptors keep both operations bound to the intended filesystem objects.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_macos_acl(file: &File, source: Option<&File>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
+        fn acl_set_fd(fd: libc::c_int, acl: *mut libc::c_void) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: source descriptors are live; otherwise zero requests an initialized
+    // empty ACL. Both functions return owned ACL storage and null is checked.
+    let mut acl = unsafe {
+        match source {
+            Some(source) => acl_get_fd(source.as_raw_fd()),
+            None => acl_init(0),
+        }
+    };
+    if acl.is_null() && source.is_some() {
+        let error = io::Error::last_os_error();
+        // Darwin reports ENOENT when a valid descriptor has no extended ACL.
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error);
+        }
+        // SAFETY: no source ACL is equivalent to a new, empty ACL.
+        acl = unsafe { acl_init(0) };
+    }
+    if acl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is live and the ACL remains allocated for this call.
+    let status = unsafe { acl_set_fd(file.as_raw_fd(), acl) };
+    let result = if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    // SAFETY: acl_init or acl_get_fd allocated this object; it has not been freed.
+    unsafe { acl_free(acl) };
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
