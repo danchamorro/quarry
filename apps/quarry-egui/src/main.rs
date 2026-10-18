@@ -1916,12 +1916,17 @@ impl QuarryApp {
                     .as_ref()
                     .and_then(|doc| doc.save_output_encoding)
                     .expect("completed save retains its output encoding");
+                let prior_choice = self.active.encoding_mode;
+                let source_encoding = self.active.document.as_ref().unwrap().session.encoding();
                 match self.replace_document_with_encoding(
                     destination.clone(),
                     options,
                     Some(encoding),
                 ) {
                     Ok(()) => {
+                        if encoding == source_encoding {
+                            self.active.encoding_mode = prior_choice;
+                        }
                         self.active.notice = None;
                         self.active.footer_status = Some(AppMessage::status(if in_place {
                             format!("Saved {}.", destination.display())
@@ -23977,5 +23982,32 @@ mod tests {
         );
         assert_eq!(app.active.encoding_mode, Some(Encoding::Latin1));
         assert_eq!(fs::read(&source).unwrap(), b"name\ncaf\xe9\n");
+    }
+    #[test]
+    fn native_save_keeps_the_requested_auto_encoding_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("unicode.csv");
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend("name\ncafé\n".encode_utf16().flat_map(u16::to_le_bytes));
+        fs::write(&source, bytes).unwrap();
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        let doc = app.active.document.as_mut().unwrap();
+        finish_index(doc);
+        doc.begin_cell_edit(1, 0, "café".as_bytes().to_vec())
+            .unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "new".into();
+        doc.start_save().unwrap();
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.active.document.as_ref().unwrap().save_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_active_document(&ctx, true);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.active.encoding_mode, None);
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.encoding(),
+            Encoding::Utf16Le
+        );
     }
 }

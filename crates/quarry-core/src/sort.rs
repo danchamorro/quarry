@@ -3944,4 +3944,51 @@ mod tests {
         assert!(sort_artifacts(&directory).is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn utf16_header_limit_includes_native_bom_bytes() {
+        for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let directory = case();
+            let path = directory.join("source.csv");
+            let destination = directory.join("sorted.csv");
+            let mut bytes = encoding.bom().to_vec();
+            bytes.extend_from_slice(&encoding.encode(b"abc\nz\na\n", 4096).unwrap());
+            fs::write(&path, &bytes).unwrap();
+            let session = Session::open_with_encoding(
+                &path,
+                crate::OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..Default::default()
+                },
+                Some(encoding),
+            )
+            .unwrap();
+            let job = start_custom(
+                &session,
+                BTreeMap::from([(0, b"abcd".to_vec())]),
+                BTreeMap::new(),
+                SortSpec {
+                    column: 0,
+                    mode: SortMode::Text,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &destination,
+                SortConfig {
+                    max_record_bytes: 10,
+                    encoding,
+                    chunk_bytes: 2,
+                    run_memory_bytes: 4096,
+                    merge_fan_in: 2,
+                },
+            );
+            assert!(matches!(
+                job.wait(),
+                Err(QuarryError::RecordTooLarge { limit: 10 })
+            ));
+            assert!(!destination.exists());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(sort_artifacts(&directory).is_empty());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
 }

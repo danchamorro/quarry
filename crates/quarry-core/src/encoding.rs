@@ -1349,4 +1349,65 @@ mod tests {
             assert_eq!(progress.bytes_written, summary.bytes_written);
         }
     }
+    #[test]
+    fn malformed_tail_and_source_replacement_cannot_publish_native_output() {
+        use std::collections::BTreeMap;
+        for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("malformed.csv");
+            let mut bytes = encoding.bom().to_vec();
+            bytes.extend_from_slice(
+                &encoding
+                    .encode(
+                        ("name\n".to_owned() + &"good\n".repeat(20_000)).as_bytes(),
+                        256 * 1024,
+                    )
+                    .unwrap(),
+            );
+            bytes.extend_from_slice(&if encoding == Encoding::Utf16Le {
+                0xd800_u16.to_le_bytes()
+            } else {
+                0xd800_u16.to_be_bytes()
+            });
+            std::fs::write(&path, &bytes).unwrap();
+            let session = crate::Session::open_with_encoding(
+                &path,
+                crate::OpenOptions {
+                    rows: 2,
+                    delimiter: Some(b','),
+                    ..Default::default()
+                },
+                Some(encoding),
+            )
+            .unwrap();
+            assert!(matches!(
+                session
+                    .start_indexing(crate::IndexConfig::default())
+                    .unwrap()
+                    .wait(),
+                Err(crate::QuarryError::Encoding(_))
+            ));
+            let copy = directory.path().join("copy.csv");
+            assert!(matches!(
+                session
+                    .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &copy)
+                    .unwrap()
+                    .wait(),
+                Err(crate::QuarryError::Encoding(_))
+            ));
+            assert!(!copy.exists());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+            std::fs::write(
+                &path,
+                encoding.encode(b"name\nchanged\n", 4096).unwrap().as_ref(),
+            )
+            .unwrap();
+            assert!(matches!(
+                session.start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &copy),
+                Err(crate::QuarryError::SourceChanged)
+            ));
+            assert!(!copy.exists());
+        }
+    }
 }
