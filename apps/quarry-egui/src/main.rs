@@ -24010,4 +24010,19 @@ mod tests {
             Encoding::Utf16Le
         );
     }
+    #[test]
+    fn opening_an_existing_tab_with_another_encoding_explains_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        fs::write(&source, b"name\ncaf\xe9\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        let error = app
+            .open_document_tab_with_encoding(source, OpenOptions::default(), Some(Encoding::Latin1))
+            .unwrap_err();
+        assert!(error.text.contains("Format"));
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.encoding(),
+            Encoding::Utf8
+        );
+    }
 }

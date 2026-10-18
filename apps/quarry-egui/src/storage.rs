@@ -146,10 +146,15 @@ impl PendingStorageOperation {
                     case_sensitivity: *case_sensitivity,
                 }),
             ),
-            Self::Export(_) => document.session.file_size.saturating_mul(3),
+            Self::Export(_) => document.session.file_size.saturating_mul(
+                if document.session.encoding() == Encoding::Utf8 {
+                    1
+                } else {
+                    3
+                },
+            ),
             Self::SaveUtf8(_) => document
-                .materialization_storage_estimate(document.save_as_transformation().as_ref(), None)
-                .saturating_mul(3),
+                .materialization_storage_estimate(document.save_as_transformation().as_ref(), None),
             Self::Save(Some(_)) => document
                 .materialization_storage_estimate(document.save_as_transformation().as_ref(), None),
             Self::DeleteRows(_) | Self::Save(None) => plain(),
@@ -1315,5 +1320,29 @@ mod tests {
             b"edited"
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn encoding_storage_allowances_apply_expansion_only_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        std::fs::write(&source, b"name\ncaf\xe9\n").unwrap();
+        let document = Document::prepare_with_encoding(
+            &source,
+            OpenOptions::default(),
+            Some(Encoding::Latin1),
+        )
+        .unwrap();
+        assert_eq!(
+            PendingStorageOperation::SaveUtf8(directory.path().join("copy.csv"))
+                .allowance(&document),
+            document.materialization_storage_estimate(None, None)
+        );
+        let utf8_source = directory.path().join("utf8.csv");
+        std::fs::write(&utf8_source, b"name\nvalue\n").unwrap();
+        let utf8 = Document::prepare(&utf8_source, OpenOptions::default()).unwrap();
+        assert_eq!(
+            PendingStorageOperation::Export(directory.path().join("filtered.csv")).allowance(&utf8),
+            utf8.session.file_size
+        );
     }
 }

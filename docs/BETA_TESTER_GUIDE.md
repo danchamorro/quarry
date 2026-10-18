@@ -93,4 +93,6 @@ may predate them. A TUI remains [future work](ROADMAP.md#post-beta-sequence). Th
 
 ## Character encoding checks
 
+These checks require a source build containing #61 / PR #108. The downloadable build 140 described above does not include the encoding controls.
+
 Open UTF-16 files with BOMs using Auto. For BOM-less UTF-16 and Windows-1252 or Latin-1 files, select the encoding under Format or File → Open with Encoding. Check accented values after filtering, editing, saving, and reopening. Try Save As UTF-8 with an emoji added to a legacy file; the original must stay unchanged. Report the selected encoding and whether the file has a BOM, using a synthetic sample.

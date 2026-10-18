@@ -60,9 +60,6 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
 
 fn print_help() {
     println!(
-        "  convert-utf8 <FILE> --output <FILE> [--encoding <NAME>] [--edit <ROW> <COLUMN> <VALUE>]"
-    );
-    println!(
         "Quarry\n\n\
          Usage:\n  \
            quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
@@ -102,8 +99,11 @@ fn print_help() {
          [--temp-dir DIRECTORY] \
          [--delimiter ,] [--header auto|first-row|none] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
+           quarry convert-utf8 <FILE> --output FILE [--edit DATA_ROW COLUMN VALUE]...\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]\n\n\
+         All file commands accept --encoding auto|utf8|utf16le|utf16be|windows1252|latin1.\n\
+         Auto detects Unicode BOMs and otherwise uses UTF-8; no legacy guessing.\n\n\
          Duplicates: count only by default; --output explicitly removes extra occurrences.\n\
          The first row is kept. Matching ignores ASCII case unless --match-case is set.\n\
          Blank and missing selected fields match; whitespace is significant.\n\

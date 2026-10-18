@@ -388,10 +388,15 @@ impl QuarryApp {
                 .filter(|doc| {
                     paths_alias(&path, &doc.logical_path) || paths_alias(&path, doc.session.path())
                 })
-                .map(|_| tab.id)
+                .map(|doc| (tab.id, doc.session.encoding()))
         });
-        if let Some(id) = existing {
+        if let Some((id, current)) = existing {
             self.activate_tab(id);
+            if encoding.is_some_and(|requested| requested != current) {
+                return Err(AppMessage::warning(
+                    "This file is already open. Use Format > Encoding to reopen it with another encoding.",
+                ));
+            }
             return Ok(());
         }
         if self.document_tabs().any(|tab| {

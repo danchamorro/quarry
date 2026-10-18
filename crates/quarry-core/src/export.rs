@@ -4896,6 +4896,7 @@ fn scan_export(
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<ScanOutcome, QuarryError> {
+    let source_had_bom = source_starts_with_bom(source, config.source_encoding)?;
     let matchers = compile_matchers(query)?;
     let groups = predicate_groups(query);
     let mut scanner = crate::encoding::RecordScanner::new(delimiter, config.source_encoding)?;
@@ -4928,6 +4929,7 @@ fn scan_export(
                     &matchers,
                     &groups,
                     config.max_record_bytes,
+                    source_had_bom,
                     output,
                     &mut rows_written,
                     &mut bytes_written,
@@ -4986,6 +4988,7 @@ fn scan_export(
                         &matchers,
                         &groups,
                         config.max_record_bytes,
+                        source_had_bom,
                         output,
                         &mut rows_written,
                         &mut bytes_written,
@@ -5035,6 +5038,7 @@ fn process_record(
     matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
     max_record_bytes: usize,
+    source_had_bom: bool,
     output: &mut ExportTarget,
     rows_written: &mut u64,
     bytes_written: &mut u64,
@@ -5064,7 +5068,7 @@ fn process_record(
         // U+FEFF is data, even if the source's first record was filtered out.
         let guard_first = *bytes_written == 0 && !(row_number == 0 && record.starts_with(UTF8_BOM));
         if guard_first {
-            output.begin_first_record_bom_guard(false);
+            output.begin_first_record_bom_guard(source_had_bom);
         }
         let written = if row_number < data_start && !edits.headers.is_empty() {
             write_rewritten_header(output, record, delimiter, &edits.headers, max_record_bytes)?

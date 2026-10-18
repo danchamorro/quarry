@@ -356,6 +356,11 @@ impl RecordScanner {
                 "UTF-16 record offset must be a whole code unit",
             ));
         }
+        if encoding != Encoding::Utf8 && !delimiter.is_ascii() {
+            return Err(QuarryError::InvalidOption(
+                "non-UTF-8 encodings require an ASCII delimiter",
+            ));
+        }
         let logical = offset / encoding.width() as u64;
         let inner = if encoding == Encoding::Utf8 {
             quarry_delimited::RecordScanner::at_offset(delimiter, logical)?
@@ -416,7 +421,7 @@ impl RecordScanner {
             } else if (0xdc00..=0xdfff).contains(&unit) {
                 return Err(self.encoding.invalid(offset, "unpaired low surrogate"));
             }
-            self.shadow.push(if unit < 128 { unit as u8 } else { b'x' });
+            self.shadow.push(if unit < 128 { unit as u8 } else { 0x80 });
         }
         if self.shadow.is_empty() {
             return Ok(self.record_start());
@@ -1473,6 +1478,72 @@ mod tests {
                         .as_ref()
                 );
             }
+        }
+    }
+    #[test]
+    fn headerless_filtered_export_keeps_source_bom_after_skipping_first_row() {
+        for encoding in [Encoding::Utf8, Encoding::Utf16Le, Encoding::Utf16Be] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.csv");
+            let output = directory.path().join("kept.csv");
+            let mut input = encoding.bom().to_vec();
+            input.extend_from_slice(&encoding.encode(b"skip,0\r\nkeep,1\r\n", 4096).unwrap());
+            std::fs::write(&source, &input).unwrap();
+            let session = crate::Session::open_with_encoding(
+                &source,
+                crate::OpenOptions {
+                    header_mode: crate::HeaderMode::NoHeader,
+                    ..Default::default()
+                },
+                Some(encoding),
+            )
+            .unwrap();
+            session
+                .start_filtered_export(
+                    crate::FilterQuery::single(0, crate::FilterOperator::Equals, b"keep".to_vec()),
+                    &output,
+                )
+                .unwrap()
+                .wait()
+                .unwrap();
+            let mut expected = encoding.bom().to_vec();
+            expected.extend_from_slice(&encoding.encode(b"keep,1\r\n", 4096).unwrap());
+            assert_eq!(std::fs::read(&output).unwrap(), expected, "{encoding}");
+            assert_eq!(
+                crate::Session::open(&output, crate::OpenOptions::default())
+                    .unwrap()
+                    .encoding(),
+                encoding
+            );
+        }
+    }
+
+    #[test]
+    fn non_utf8_delimiters_are_ascii_and_shadow_bytes_do_not_collide() {
+        for encoding in [
+            Encoding::Latin1,
+            Encoding::Windows1252,
+            Encoding::Utf16Le,
+            Encoding::Utf16Be,
+        ] {
+            assert!(RecordScanner::new(0xa6, encoding).is_err());
+        }
+        for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.txt");
+            let text = "é\"bad\"\n";
+            std::fs::write(
+                &source,
+                encoding.encode(text.as_bytes(), 4096).unwrap().as_ref(),
+            )
+            .unwrap();
+            let mut scanner = RecordScanner::new(b'x', encoding).unwrap();
+            assert!(
+                scanner
+                    .scan_chunk(&std::fs::read(&source).unwrap(), 0, |_| {})
+                    .is_err(),
+                "quote inside unquoted field must remain invalid with {encoding}"
+            );
         }
     }
 }
