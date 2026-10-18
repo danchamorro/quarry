@@ -7561,9 +7561,19 @@ impl Document {
             if let Some(query) = self.filter_query.clone() {
                 let viewport = self.filter_viewport_start;
                 let scroll_points = self.scroll_points;
-                self.start_filter(query)?;
+                // Starting a refresh must not commit or discard the next cell's draft.
+                let editor = self.cell_edit.take();
+                let result = self.start_filter(query);
+                self.cell_edit = editor;
+                result?;
                 self.filter_viewport_start = viewport;
                 self.scroll_points = scroll_points;
+                if let Some(edit) = &self.cell_edit {
+                    self.selection = Some(GridSelection::Cell {
+                        row: edit.row,
+                        column: edit.column,
+                    });
+                }
             }
         }
         self.poll_filter_scan()?;
@@ -8284,9 +8294,6 @@ impl Document {
         }
         self.commit_header_edit();
         self.commit_cell_edit();
-        if self.filter_refresh_pending {
-            return Ok(());
-        }
         let draft = self
             .cell_edits
             .get(&(row, column))
@@ -14126,6 +14133,47 @@ mod tests {
 
         document.shutdown();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn switching_filtered_editors_keeps_the_next_activation_during_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-editor-switch.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,keep\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.begin_cell_edit(1, 0, b"Ada".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "Anna".into();
+        document.begin_cell_edit(2, 0, b"Bob".to_vec()).unwrap();
+        assert!(document.filter_refresh_pending);
+        let edit = document
+            .cell_edit
+            .as_ref()
+            .expect("second activation retained");
+        assert_eq!((edit.row, edit.column, edit.draft.as_str()), (2, 0, "Bob"));
+        document.cell_edit.as_mut().unwrap().draft = "Bobby".into();
+        document.poll_filter().unwrap();
+        assert_eq!(document.cell_edit.as_ref().unwrap().draft, "Bobby");
+        assert!(!document.cell_edits.contains_key(&(2, 0)));
+        finish_filter(document);
+        assert_eq!(document.cell_edit.as_ref().unwrap().draft, "Bobby");
+        document.commit_cell_edit();
+        finish_filter(document);
+        assert_eq!(document.effective_cell(1, 0), Some(b"Anna".as_slice()));
+        assert_eq!(document.effective_cell(2, 0), Some(b"Bobby".as_slice()));
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"name,status\nAda,keep\nBob,keep\n"
+        );
+        document.shutdown();
     }
 
     #[test]
