@@ -4581,6 +4581,12 @@ fn process_record(
         )?
         .is_some()
     {
+        // A later source row may become the first output record. Its leading
+        // U+FEFF is data, even if the source's first record was filtered out.
+        let guard_first = *bytes_written == 0 && !(row_number == 0 && record.starts_with(UTF8_BOM));
+        if guard_first {
+            output.begin_first_record_bom_guard(false);
+        }
         let written = if row_number < data_start && !edits.headers.is_empty() {
             write_rewritten_header(output, record, delimiter, &edits.headers, max_record_bytes)?
         } else if let Some((&(_, last_column), _)) = edits
@@ -4606,6 +4612,17 @@ fn process_record(
             output.write_all(record)?;
             record.len() as u64
         };
+        let inserted = if guard_first {
+            output.finish_first_record_bom_guard()?
+        } else {
+            0
+        };
+        let written = written.saturating_add(inserted);
+        if written > max_record_bytes as u64 {
+            return Err(QuarryError::RecordTooLarge {
+                limit: max_record_bytes,
+            });
+        }
         *bytes_written = bytes_written.saturating_add(written);
         if row_number >= data_start {
             *rows_written += 1;
@@ -4672,6 +4689,67 @@ mod tests {
 
     fn remove_case(source: &std::path::Path) {
         fs::remove_dir(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn filtered_first_output_preserves_bom_looking_data_from_later_rows() {
+        for edited in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.csv");
+            let destination = directory.path().join("filtered.csv");
+            let input = if edited {
+                b"skip\nold\n".as_slice()
+            } else {
+                b"skip\n\xef\xbb\xbfkeep\n".as_slice()
+            };
+            fs::write(&source, input).unwrap();
+            let session = Session::open(
+                &source,
+                crate::OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: crate::HeaderMode::NoHeader,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let cells = if edited {
+                BTreeMap::from([((1, 0), Arc::new("\u{feff}keep".as_bytes().to_vec()))])
+            } else {
+                BTreeMap::new()
+            };
+            let result = session
+                .start_filtered_export_with_edits(
+                    crate::FilterQuery::single(
+                        0,
+                        crate::FilterOperator::Contains,
+                        b"keep".to_vec(),
+                    ),
+                    Arc::new(cells),
+                    BTreeMap::new(),
+                    &destination,
+                )
+                .unwrap()
+                .wait()
+                .unwrap();
+            let super::FilterExportOutcome::Complete(summary) = result else {
+                panic!("export cancelled");
+            };
+            let reopened = Session::open(
+                &destination,
+                crate::OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: crate::HeaderMode::NoHeader,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(reopened.first_rows[0].fields[0], "\u{feff}keep".as_bytes());
+            assert_eq!(
+                summary.bytes_written,
+                fs::metadata(&destination).unwrap().len()
+            );
+            assert_eq!(fs::read(&source).unwrap(), input);
+        }
     }
 
     #[test]

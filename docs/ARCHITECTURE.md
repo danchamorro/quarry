@@ -309,7 +309,9 @@ bounded index memory on a 1 GB fixture, with a paired text-filter baseline.
 Filtered export scans the active indexed CSV once with the same decoded-cell
 predicate semantics and sparse edit snapshot as filtered navigation. It copies
 unedited matching records and an unrenamed header byte for byte to a buffered
-temporary file. Edited records and a renamed header are re-serialized with the
+temporary file. If a later record becomes the first output record, a leading
+BOM-looking data value is protected so reopening cannot strip it. Edited records
+and a renamed header are re-serialized with the
 document delimiter and each record's original line ending. Matching rows are
 not retained. The worker publishes scanned bytes, parsed records, written rows,
 written bytes, elapsed time, and cancellation state.
