@@ -221,7 +221,10 @@ accepted while its path is unchanged and its available space covers the
 allowance. The engine repeats the check when the job starts. Smaller jobs use
 the same engine checks without an extra confirmation.
 
-Save and export staging always remains on the destination volume. Sort and
+Save and export staging always remains on the destination volume. Each writer
+keeps unpublished output inside an owner-only directory (0700 on Unix). New
+export and recovery files are owner-readable/writable (0600 on Unix), independent
+of the process umask. Replacing an existing file preserves its standard permissions. Sort and
 duplicates can use a separate scratch folder through additive Session APIs and
 CLI `--temp-dir`. Their preflight checks both scratch and destination, combining
 the allowance when both share a volume. See

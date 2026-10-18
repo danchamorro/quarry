@@ -2255,22 +2255,21 @@ impl ExportTarget {
             | Publication::GuardedReplaceExisting { permissions, .. } => {
                 options.mode(permissions.mode());
             }
-            Publication::CreateNew | Publication::GuardedCreateNew { .. } => {}
+            Publication::CreateNew | Publication::GuardedCreateNew { .. } => {
+                options.mode(0o600);
+            }
         }
-        let private_directory =
-            if matches!(publication, Publication::GuardedCreateWorkingCopy { .. }) {
-                let mut builder = tempfile::Builder::new();
-                #[cfg(unix)]
-                builder.permissions(fs::Permissions::from_mode(0o700));
-                Some(
-                    builder
-                        .prefix(&format!(".quarry-export-{}-", std::process::id()))
-                        .tempdir_in(parent)
-                        .map_err(|error| storage_error(parent, error))?,
-                )
-            } else {
-                None
-            };
+        // A shared destination must not expose uncommitted CSV contents, even
+        // when the eventual destination deliberately retains shared permissions.
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        builder.permissions(fs::Permissions::from_mode(0o700));
+        let private_directory = Some(
+            builder
+                .prefix(&format!(".quarry-export-{}-", std::process::id()))
+                .tempdir_in(parent)
+                .map_err(|error| storage_error(parent, error))?,
+        );
         let staging_parent = private_directory
             .as_ref()
             .map_or(parent, |directory| directory.path());
@@ -2289,7 +2288,9 @@ impl ExportTarget {
                         | Publication::GuardedReplaceExisting { permissions, .. } => {
                             Some(permissions.clone())
                         }
-                        Publication::CreateNew | Publication::GuardedCreateNew { .. } => None,
+                        Publication::CreateNew | Publication::GuardedCreateNew { .. } => {
+                            Some(fs::Permissions::from_mode(0o600))
+                        }
                     };
                     #[cfg(not(unix))]
                     let permissions: Option<fs::Permissions> = match &publication {
@@ -7564,7 +7565,17 @@ mod tests {
         let source_file = File::open(&source).unwrap();
         let stamp = crate::SourceStamp::from_file(&source_file).unwrap();
         let mut output = ExportTarget::replace_source(&source, &source_file, stamp).unwrap();
-        assert_eq!(output.temporary.parent(), source.parent());
+        // Keep the atomic-rename staging on the destination volume, inside
+        // its new private child directory rather than directly beside the CSV.
+        assert_eq!(
+            output.temporary.parent().and_then(|path| path.parent()),
+            source.parent()
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::dev(&fs::metadata(&output.temporary).unwrap()),
+            std::os::unix::fs::MetadataExt::dev(&source_file.metadata().unwrap()),
+        );
         output.write_all(b"replacement").unwrap();
 
         assert_eq!(
@@ -9229,5 +9240,66 @@ mod tests {
             fs::remove_file(&source).unwrap();
             remove_case(&source);
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn export_staging_is_private_in_shared_destination_directories() {
+        for replace in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let source = directory.path().join("private.csv");
+            fs::write(&source, b"id,value\n1,private\n").unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+            let output = if replace {
+                let file = File::open(&source).unwrap();
+                let stamp = crate::SourceStamp::from_file(&file).unwrap();
+                ExportTarget::replace_source(&source, &file, stamp).unwrap()
+            } else {
+                ExportTarget::new(&source, directory.path().join("copy.csv")).unwrap()
+            };
+            let staging_directory = output.temporary.parent().unwrap().to_owned();
+            assert_ne!(
+                staging_directory,
+                directory.path(),
+                "unpublished data must have a private directory"
+            );
+            assert_eq!(
+                fs::metadata(&staging_directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+            );
+            output.discard().unwrap();
+            assert!(!staging_directory.exists());
+            assert_eq!(fs::read(&source).unwrap(), b"id,value\n1,private\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_export_files_do_not_gain_group_or_other_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let source = directory.path().join("private.csv");
+        let destination = directory.path().join("copy.csv");
+        let bytes = b"id,value\n1,private\n";
+        fs::write(&source, bytes).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut output = ExportTarget::new(&source, destination.clone()).unwrap();
+        output.write_raw_all(bytes).unwrap();
+        assert!(matches!(
+            output
+                .publish(2, bytes.len() as u64, &AtomicBool::new(false))
+                .unwrap(),
+            FilterExportOutcome::Complete(_)
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600,
+        );
+        assert_eq!(fs::read(source).unwrap(), bytes);
     }
 }
