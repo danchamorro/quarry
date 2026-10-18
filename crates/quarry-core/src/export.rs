@@ -19,8 +19,8 @@ use quarry_delimited::{
 use crate::case::ByteMatcher;
 use crate::estimate_edited_output_bytes;
 use crate::filter::{
-    FilterQuery, PredicateMatcher, compile_matchers, matching_fields, predicate_groups,
-    validate_query,
+    FilterEdits, FilterQuery, PredicateMatcher, compile_matchers, matching_fields_with_edits,
+    predicate_groups, validate_filter_edits, validate_query,
 };
 use crate::storage::{check_storage, output_parent, storage_error};
 use crate::{
@@ -727,12 +727,19 @@ impl Drop for WorkerCompletion<'_> {
     }
 }
 
+#[derive(Default)]
+struct FilteredEdits {
+    cells: FilterEdits,
+    headers: BTreeMap<usize, Vec<u8>>,
+}
+
 pub struct FilterExportJob {
     shared: Arc<SharedState>,
     handle: Option<JoinHandle<Result<FilterExportOutcome, QuarryError>>>,
 }
 
 impl FilterExportJob {
+    #[cfg(test)]
     fn start(
         source_path: PathBuf,
         file_size: u64,
@@ -742,14 +749,46 @@ impl FilterExportJob {
         destination: PathBuf,
         config: ExportConfig,
     ) -> Result<Self, QuarryError> {
+        Self::start_with_edits(
+            source_path,
+            file_size,
+            delimiter,
+            has_header,
+            query,
+            destination,
+            config,
+            FilteredEdits::default(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_edits(
+        source_path: PathBuf,
+        file_size: u64,
+        delimiter: u8,
+        has_header: bool,
+        query: FilterQuery,
+        destination: PathBuf,
+        config: ExportConfig,
+        edits: FilteredEdits,
+        expected: Option<SourceStamp>,
+    ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
                 "filter export chunk must be non-zero",
             ));
         }
         validate_query(&query)?;
+        validate_filter_edits(&edits.cells, u64::from(has_header), config.max_record_bytes)?;
+        if !has_header && !edits.headers.is_empty() {
+            return Err(QuarryError::InvalidOption(
+                "cannot rename headers in a headerless file",
+            ));
+        }
         let source = File::open(&source_path)?;
-        let output = ExportTarget::new(&source_path, destination)?;
+        let stamp = expected.unwrap_or(SourceStamp::from_file(&source)?);
+        let output = ExportTarget::new_guarded(&source_path, destination, &source, stamp)?;
         let shared = Arc::new(SharedState::new(file_size));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -762,6 +801,7 @@ impl FilterExportJob {
                     delimiter,
                     u64::from(has_header),
                     &query,
+                    &edits,
                     config,
                     &worker_state,
                 );
@@ -1571,7 +1611,19 @@ impl Session {
         query: FilterQuery,
         destination: impl AsRef<Path>,
     ) -> Result<FilterExportJob, QuarryError> {
-        FilterExportJob::start(
+        self.start_filtered_export_with_edits(query, Arc::default(), BTreeMap::new(), destination)
+    }
+
+    /// Exports matching working values and renamed headers, leaving the source unchanged.
+    pub fn start_filtered_export_with_edits(
+        &self,
+        query: FilterQuery,
+        cells: FilterEdits,
+        headers: BTreeMap<usize, Vec<u8>>,
+        destination: impl AsRef<Path>,
+    ) -> Result<FilterExportJob, QuarryError> {
+        self.ensure_source_unchanged()?;
+        FilterExportJob::start_with_edits(
             self.path.clone(),
             self.file_size,
             self.dialect.delimiter,
@@ -1579,6 +1631,8 @@ impl Session {
             query,
             destination.as_ref().to_path_buf(),
             DEFAULT_EXPORT_CONFIG,
+            FilteredEdits { cells, headers },
+            Some(self.source_stamp.clone()),
         )
     }
 
@@ -1996,6 +2050,7 @@ impl ExportTarget {
         Ok(target)
     }
 
+    #[cfg(test)]
     fn new(source: &Path, destination: PathBuf) -> Result<Self, QuarryError> {
         validate_destination(source, &destination)?;
         Self::create(destination, Publication::CreateNew)
@@ -2647,12 +2702,14 @@ enum ScanOutcome {
     Cancelled,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_export(
     mut source: File,
     mut output: ExportTarget,
     delimiter: u8,
     data_start: u64,
     query: &FilterQuery,
+    edits: &FilteredEdits,
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<FilterExportOutcome, QuarryError> {
@@ -2661,7 +2718,20 @@ fn run_export(
     }
     check_storage(
         output_parent(&output.destination),
-        shared.total_bytes.saturating_add(3),
+        crate::estimate_edited_output_bytes_from_values(
+            shared.total_bytes,
+            0,
+            edits
+                .headers
+                .iter()
+                .map(|(&key, value)| (key, value.as_slice())),
+            edits
+                .cells
+                .iter()
+                .map(|(&key, value)| (key, value.as_slice())),
+            None,
+            None,
+        ),
     )?;
     match scan_export(
         &mut source,
@@ -2669,6 +2739,7 @@ fn run_export(
         delimiter,
         data_start,
         query,
+        edits,
         config,
         shared,
     ) {
@@ -4339,12 +4410,14 @@ fn write_delimited_field(
     Ok(bytes_written.saturating_add((field.len() - start) as u64))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_export(
     source: &mut File,
     output: &mut ExportTarget,
     delimiter: u8,
     data_start: u64,
     query: &FilterQuery,
+    edits: &FilteredEdits,
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<ScanOutcome, QuarryError> {
@@ -4376,6 +4449,7 @@ fn scan_export(
                     data_start,
                     delimiter,
                     query,
+                    edits,
                     &matchers,
                     &groups,
                     config.max_record_bytes,
@@ -4401,6 +4475,16 @@ fn scan_export(
                 return Err(error);
             }
             finish_result?;
+            if edits
+                .cells
+                .keys()
+                .next_back()
+                .is_some_and(|(row, _)| *row >= rows_scanned)
+            {
+                return Err(QuarryError::InvalidOption(
+                    "cell edit points beyond the source rows",
+                ));
+            }
             return Ok(ScanOutcome::Complete {
                 rows_written,
                 bytes_written,
@@ -4423,6 +4507,7 @@ fn scan_export(
                         data_start,
                         delimiter,
                         query,
+                        edits,
                         &matchers,
                         &groups,
                         config.max_record_bytes,
@@ -4471,6 +4556,7 @@ fn process_record(
     data_start: u64,
     delimiter: u8,
     query: &FilterQuery,
+    edits: &FilteredEdits,
     matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
     max_record_bytes: usize,
@@ -4484,10 +4570,43 @@ fn process_record(
         });
     }
     if row_number < data_start
-        || matching_fields(record, delimiter, row_number, query, matchers, groups)?.is_some()
+        || matching_fields_with_edits(
+            record,
+            delimiter,
+            row_number,
+            query,
+            matchers,
+            groups,
+            &edits.cells,
+        )?
+        .is_some()
     {
-        output.write_all(record)?;
-        *bytes_written = bytes_written.saturating_add(record.len() as u64);
+        let written = if row_number < data_start && !edits.headers.is_empty() {
+            write_rewritten_header(output, record, delimiter, &edits.headers, max_record_bytes)?
+        } else if let Some((&(_, last_column), _)) = edits
+            .cells
+            .range((row_number, 0)..=(row_number, usize::MAX))
+            .next_back()
+        {
+            write_rewritten_record(
+                output,
+                record,
+                delimiter,
+                Some(last_column),
+                |column| {
+                    edits
+                        .cells
+                        .get(&(row_number, column))
+                        .map(|value| value.as_slice())
+                },
+                Some(row_number),
+                max_record_bytes,
+            )?
+        } else {
+            output.write_all(record)?;
+            record.len() as u64
+        };
+        *bytes_written = bytes_written.saturating_add(written);
         if row_number >= data_start {
             *rows_written += 1;
         }
@@ -4553,6 +4672,57 @@ mod tests {
 
     fn remove_case(source: &std::path::Path) {
         fs::remove_dir(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn filtered_export_uses_working_values_and_headers_without_saving_source() {
+        let source = b"\xef\xbb\xbfid,state,note\r\n1,hit,old\r\n2,miss,old\r\n3,miss,old";
+        let path = fixture(source);
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let dest = path.with_file_name("filtered.csv");
+        let edits = Arc::new(BTreeMap::from([
+            ((1, 1), Arc::new(b"miss".to_vec())),
+            ((2, 1), Arc::new(b"hit".to_vec())),
+            ((2, 2), Arc::new(b"with,\n\"quotes\"".to_vec())),
+            ((3, 1), Arc::new(b"hit".to_vec())),
+        ]));
+        let query = FilterQuery::single(1, FilterOperator::Equals, b"hit".to_vec());
+        let outcome = session
+            .start_filtered_export_with_edits(
+                query.clone(),
+                edits,
+                BTreeMap::from([(1, b"status".to_vec())]),
+                &dest,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        let FilterExportOutcome::Complete(summary) = outcome else {
+            panic!("cancelled");
+        };
+        assert_eq!(summary.rows_written, 2);
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"\xef\xbb\xbfid,status,note\r\n2,hit,\"with,\n\"\"quotes\"\"\"\r\n3,hit,old"
+        );
+        assert_eq!(fs::read(&path).unwrap(), source);
+        assert!(matches!(
+            session.start_filtered_export(query.clone(), &dest),
+            Err(QuarryError::ExportDestinationExists)
+        ));
+        fs::write(&path, b"id,state\n1,new\n").unwrap();
+        assert!(matches!(
+            session.start_filtered_export(query, path.with_file_name("stale.csv")),
+            Err(QuarryError::SourceChanged)
+        ));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

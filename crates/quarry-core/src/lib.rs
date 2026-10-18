@@ -37,8 +37,8 @@ pub use export::{
     SplitAnalysisOutcome, SplitAnalysisProgress, SplitAnalysisSummary,
 };
 pub use filter::{
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
-    FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
+    FilterEdits, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
+    FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
 };
 pub use index::{
     Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, StructuralIndex,

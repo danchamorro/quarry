@@ -422,8 +422,13 @@ button changes to **Filters (N)…**, where N is the number of active rules. Ope
 it to inspect the rules, use **Clear filter** to return to all rows, or use the
 footer's **Cancel filter** button while a scan is running.
 
-Unsaved cell edits must be saved or discarded before filtering. Column
-transformations that have already produced a working file can be filtered.
+Filters use your current working cell values, including unsaved edits. Once
+a scan completes, you can edit cells in the filtered view. Committing an edit
+or using Undo/Redo refreshes the matching rows, so a row can disappear when it
+no longer matches. Clear the filter to find and edit rows outside the results.
+Column transformations that have already produced a working file can be filtered.
+Find/Replace and structural changes require clearing the filter first. Save and
+Save As write the whole working file and clear the filter.
 
 #### Numeric values and bounds
 
@@ -455,8 +460,9 @@ After a filter finishes:
 3. Wait for the export to finish, or click **Cancel Export** in the footer.
 
 The export contains the header, when present, plus every matching row. It
-writes a new file and does not replace the source. Save or discard unsaved
-changes before exporting.
+writes a new file and does not replace the source. Unsaved cell values and
+header renames are included. The document stays unsaved after exporting;
+use Save separately if you want those changes in the original file.
 
 ### Select columns
 
@@ -885,9 +891,9 @@ setting.
 |---|---|
 | The delimiter or header is wrong | Open **Format**, choose the correct delimiter and header, then click **Reopen with Changes**. Save or discard changes first. |
 | Find or Sort is unavailable | Wait for indexing to finish. To open Sort, select exactly one numbered column and right-click its number. Sort also needs the temporary-disk estimate. |
-| Cell editing is unavailable | Clear active filters and wait for the current operation to finish. Missing and non-UTF-8 cells cannot be edited. |
-| Undo or Redo is unavailable | Commit or cancel the inline editor, clear the filter, and wait for conflicting operations to finish. There may be no retained history in that direction. |
-| Filtering is unavailable | Save or discard cell edits, then cancel or finish any active search, filter, export, or structural change. |
+| Cell editing is unavailable | Wait for the current operation to finish. Missing and non-UTF-8 cells cannot be edited. |
+| Undo or Redo is unavailable | Commit or cancel the inline editor and wait for conflicting operations to finish. Clear filters before structural Undo/Redo. There may be no retained history in that direction. |
+| Filtering is unavailable | Cancel or finish any active search, filter, export, save, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |
 | **Delete Selected Rows** is unavailable | Clear the filter, finish the active operation, and select at least one numbered data row. |
 | **Find Duplicates…** is unavailable | Clear the filter, finish the active operation, and select the numbered columns to compare. Accept or cancel an existing duplicate preview before editing. |
