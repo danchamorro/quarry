@@ -2092,20 +2092,36 @@ pub(crate) struct ExportTarget {
     additional_sources: Vec<(PathBuf, SourceStamp)>,
 }
 
-/// Removes inherited macOS ACL grants from newly created staging objects.
-/// The open descriptor keeps this operation bound to the object being written.
+/// Clears staging ACLs, or restores the existing destination ACL just before publication.
+/// Open descriptors keep both operations bound to the intended filesystem objects.
 #[cfg(target_os = "macos")]
-fn clear_inherited_acl(file: &File) -> io::Result<()> {
+fn set_macos_acl(file: &File, source: Option<&File>) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
     unsafe extern "C" {
         fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
         fn acl_set_fd(fd: libc::c_int, acl: *mut libc::c_void) -> libc::c_int;
         fn acl_free(object: *mut libc::c_void) -> libc::c_int;
     }
 
-    // SAFETY: zero requests an initialized, empty ACL. A null result is checked.
-    let acl = unsafe { acl_init(0) };
+    // SAFETY: source descriptors are live; otherwise zero requests an initialized
+    // empty ACL. Both functions return owned ACL storage and null is checked.
+    let mut acl = unsafe {
+        match source {
+            Some(source) => acl_get_fd(source.as_raw_fd()),
+            None => acl_init(0),
+        }
+    };
+    if acl.is_null() && source.is_some() {
+        let error = io::Error::last_os_error();
+        // Darwin reports ENOENT when a valid descriptor has no extended ACL.
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error);
+        }
+        // SAFETY: no source ACL is equivalent to a new, empty ACL.
+        acl = unsafe { acl_init(0) };
+    }
     if acl.is_null() {
         return Err(io::Error::last_os_error());
     }
@@ -2116,7 +2132,7 @@ fn clear_inherited_acl(file: &File) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     };
-    // SAFETY: acl_init allocated this object and it has not been freed.
+    // SAFETY: acl_init or acl_get_fd allocated this object; it has not been freed.
     unsafe { acl_free(acl) };
     result
 }
@@ -2322,8 +2338,9 @@ impl ExportTarget {
             .as_ref()
             .map_or(parent, |directory| directory.path());
         #[cfg(target_os = "macos")]
-        clear_inherited_acl(
+        set_macos_acl(
             &File::open(staging_parent).map_err(|error| storage_error(parent, error))?,
+            None,
         )
         .map_err(|error| storage_error(parent, error))?;
         for _ in 0..100 {
@@ -2356,7 +2373,7 @@ impl ExportTarget {
                         | Publication::GuardedCreateWorkingCopy { .. } => None,
                     };
                     #[cfg(target_os = "macos")]
-                    if let Err(error) = clear_inherited_acl(&file) {
+                    if let Err(error) = set_macos_acl(&file, None) {
                         drop(file);
                         let _ = fs::remove_file(&temporary);
                         return Err(storage_error(parent, error));
@@ -2671,6 +2688,19 @@ impl ExportTarget {
             Publication::CreateNew | Publication::GuardedCreateNew { .. } => {}
             #[cfg(not(unix))]
             Publication::GuardedCreateWorkingCopy { .. } => {}
+        }
+        #[cfg(target_os = "macos")]
+        match &self.publication {
+            Publication::ReplaceSource { source, .. } => {
+                set_macos_acl(&file, Some(source)).map_err(|error| storage_error(parent, error))?;
+            }
+            Publication::GuardedReplaceExisting {
+                destination_file, ..
+            } => {
+                set_macos_acl(&file, Some(destination_file))
+                    .map_err(|error| storage_error(parent, error))?;
+            }
+            _ => {}
         }
         file.sync_all()
             .map_err(|error| storage_error(parent, error))?;
@@ -9461,6 +9491,75 @@ mod tests {
                 0o600
             );
             assert!(!staging_directory.exists());
+        }
+    }
+    /// Replacements retain the destination's sharing ACL without sharing unpublished data.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replacing_shared_files_preserves_acl_only_at_publication() {
+        use std::process::Command;
+        let acl_entries = |path: &std::path::Path| {
+            let out = Command::new("/bin/ls")
+                .arg("-lde")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        for replace_source in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(Command::new("/bin/chmod")
+                .args(["+a", "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
+                .arg(directory.path()).status().unwrap().success());
+            let source = directory.path().join("source.csv");
+            fs::write(&source, b"source").unwrap();
+            let destination = if replace_source {
+                source.clone()
+            } else {
+                directory.path().join("shared.csv")
+            };
+            if !replace_source {
+                fs::write(&destination, b"destination").unwrap();
+            }
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+            let expected_acl = acl_entries(&destination);
+            assert!(!expected_acl.is_empty());
+            let source_file = File::open(&source).unwrap();
+            let source_stamp = crate::SourceStamp::from_file(&source_file).unwrap();
+            let mut output = if replace_source {
+                ExportTarget::replace_source(&source, &source_file, source_stamp).unwrap()
+            } else {
+                let destination_file = File::open(&destination).unwrap();
+                let stamp = crate::SourceStamp::from_file(&destination_file).unwrap();
+                ExportTarget::replace_existing_guarded(
+                    &source,
+                    destination.clone(),
+                    &source_file,
+                    source_stamp,
+                    stamp,
+                )
+                .unwrap()
+            };
+            assert!(acl_entries(output.temporary.parent().unwrap()).is_empty());
+            assert!(acl_entries(&output.temporary).is_empty());
+            output.write_raw_all(b"replacement").unwrap();
+            output.publish(1, 11, &AtomicBool::new(false)).unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+            assert_eq!(acl_entries(&destination), expected_acl);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            if !replace_source {
+                assert_eq!(fs::read(&source).unwrap(), b"source");
+            }
+            assert!(temporary_exports(&destination).is_empty());
         }
     }
 }

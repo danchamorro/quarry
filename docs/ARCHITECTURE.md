@@ -228,7 +228,8 @@ of the process umask. On macOS, inherited ACLs are removed from the new staging
 directory and files before writing; failure to establish private staging aborts
 the operation. For Unix file-only drop folders, staging may use the user's
 normal temporary directory after verifying it is on the destination filesystem.
-Replacing an existing file preserves its standard permissions. Sort and
+Replacing an existing file preserves its standard permissions and, on macOS,
+restores the existing destination ACL inside private staging before publication. Sort and
 duplicates can use a separate scratch folder through additive Session APIs and
 CLI `--temp-dir`. Their preflight checks both scratch and destination, combining
 the allowance when both share a volume. See
@@ -677,8 +678,8 @@ file without changing the previous source. Discard restores the last opened or
 saved file. Structural column operations cannot start from an active filtered
 view.
 
-Rename-based Save preserves standard permission bits but does not explicitly
-preserve ownership, ACLs, extended attributes or resource forks, or hard-link
+Rename-based Save preserves standard permission bits and macOS ACLs but does not
+explicitly preserve ownership, extended attributes or resource forks, or hard-link
 identity; other hard links retain the old contents. The final source-stamp check
 narrows, but does not eliminate, the race before replacement.
 
