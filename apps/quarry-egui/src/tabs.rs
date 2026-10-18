@@ -431,7 +431,9 @@ impl QuarryApp {
                     encoding,
                     message.clone(),
                 );
-                return Err(AppMessage::file_open_error(path, message));
+                return Err(AppMessage::file_open_error(
+                    path, options, encoding, message,
+                ));
             }
         };
         document.working_directory = self.working_directory.clone();

@@ -358,20 +358,42 @@ enum MessageSeverity {
     Status,
 }
 
+/// The attempted format travels with an open failure even when another tab becomes active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedOpen {
+    path: PathBuf,
+    options: OpenOptions,
+    encoding: Option<Encoding>,
+    message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppMessage {
-    inspection_target: Option<PathBuf>,
+    inspection_target: Option<Box<FailedOpen>>,
     diagnostic: Option<Box<quarry_core::Diagnostic>>,
     text: String,
     severity: MessageSeverity,
 }
 
 impl AppMessage {
-    fn file_open_error(path: PathBuf, message: String) -> Self {
+    /// Retains the failed path, attempted format and cause independently of the active tab.
+    fn file_open_error(
+        path: PathBuf,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+        message: String,
+    ) -> Self {
+        let context = FailedOpen {
+            path,
+            options,
+            encoding,
+            message: message.clone(),
+        };
         let mut result = Self::error(message);
-        result.inspection_target = Some(path);
+        result.inspection_target = Some(Box::new(context));
         result
     }
+    /// Attaches structured data locations without losing the original operation message.
     fn core_error(error: impl Into<QuarryError>) -> Self {
         let error = error.into();
         let mut result = Self::error(error.to_string());
@@ -1042,7 +1064,9 @@ impl QuarryApp {
             match path {
                 Some(path) => {
                     if let Err(error) = self.open_new_path(path.clone()) {
-                        inspection_target = error.inspection_target;
+                        if inspection_target.is_none() {
+                            inspection_target = error.inspection_target;
+                        }
                         failures.push(format!("{}: {}", path.display(), error.text));
                     }
                 }
@@ -2291,6 +2315,7 @@ impl eframe::App for QuarryApp {
                 });
             });
 
+        let notice_has_details = self.notice_has_inspection_details();
         let mut show_error_details = false;
         if let Some(notice) = self.active.notice.as_ref() {
             let fill = match notice.severity {
@@ -2307,7 +2332,9 @@ impl eframe::App for QuarryApp {
                         ui.set_opacity(1.0);
                     }
                     dismiss = notice_strip(ui, notice);
-                    show_error_details = ui.small_button("Details / Inspect…").clicked();
+                    if notice_has_details {
+                        show_error_details = ui.small_button("Details / Inspect…").clicked();
+                    }
                 });
             if dismiss {
                 self.active.notice = None;
@@ -5885,6 +5912,7 @@ impl ColumnView {
 
 struct Document {
     pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
+    pending_diagnostic_message: Option<String>,
     working_directory: PathBuf,
     pending_materialization: Option<(ColumnTransformation, BTreeSet<usize>, u64)>,
     session: Arc<Session>,
@@ -5986,10 +6014,13 @@ struct ActiveFilterRead {
 }
 
 impl Document {
+    /// Keeps the typed diagnostic and its exact notice text for later details requests.
     fn diagnostic_error(&mut self, error: impl Into<QuarryError>) -> String {
         let error = error.into();
         self.pending_diagnostic = Some(Box::new(quarry_core::Diagnostic::from_error(&error)));
-        error.to_string()
+        let message = error.to_string();
+        self.pending_diagnostic_message = Some(message.clone());
+        message
     }
 
     #[cfg(test)]
@@ -6049,6 +6080,7 @@ impl Document {
             session: Arc::new(session),
             logical_path: path.to_path_buf(),
             pending_diagnostic: None,
+            pending_diagnostic_message: None,
             working_directory: std::env::temp_dir(),
             pending_materialization: None,
             original_session: None,

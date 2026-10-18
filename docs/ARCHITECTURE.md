@@ -802,3 +802,9 @@ materialized only when a job starts. Edits, working-copy replacement, format
 changes and source changes invalidate actions and late results. Viewport movement
 and switching tabs retain valid reports. Recovery participates in the shared
 writer reservation and close/cancellation policy.
+
+Record-local codec failures carry their logical record in a wrapper before they
+reach an operation reporter. Their local byte offsets are not presented as
+original-file positions. Errors from native stream framing retain their known
+absolute source offsets. Recovery treats an edit outside the source record shape
+as blocking, including edits aimed at a nonexistent record.

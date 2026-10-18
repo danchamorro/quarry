@@ -12,6 +12,7 @@ struct Snapshot {
     cells: BTreeMap<(u64, usize), Arc<Vec<u8>>>,
 }
 impl Snapshot {
+    /// Shares the current source and effective edit values for later freshness checks.
     fn capture(doc: &Document) -> Self {
         Self {
             session: doc.session.clone(),
@@ -19,11 +20,23 @@ impl Snapshot {
             cells: doc.cell_edits.clone(),
         }
     }
+    /// Checks source identity and effective drafts without treating editor focus as an edit.
     fn current(&self, doc: &Document) -> bool {
         Arc::ptr_eq(&self.session, &doc.session)
             && !doc.source_changed
-            && doc.cell_edit.is_none()
-            && doc.header_edit.is_none()
+            && doc.cell_edit.as_ref().is_none_or(|edit| {
+                doc.cell_edits
+                    .get(&(edit.row, edit.column))
+                    .map_or(edit.source.as_slice(), |v| v.as_slice())
+                    == edit.draft.as_bytes()
+            })
+            && doc.header_edit.as_ref().is_none_or(|edit| {
+                doc.header_renames
+                    .get(&edit.column)
+                    .map(|v| v.as_str())
+                    .or_else(|| doc.source_header_name(edit.column))
+                    == Some(edit.draft.as_str())
+            })
             && self.headers.len() == doc.header_renames.len()
             && self.cells.len() == doc.cell_edits.len()
             && self
@@ -35,6 +48,7 @@ impl Snapshot {
                 .iter()
                 .all(|(k, v)| doc.cell_edits.get(k).is_some_and(|n| Arc::ptr_eq(v, n)))
     }
+    /// Materializes the captured edit values once for the background worker.
     fn edits(&self) -> InspectionEdits {
         InspectionEdits {
             headers: self
@@ -71,6 +85,7 @@ pub(super) struct InspectionUi {
     confirm_destination: Option<PathBuf>,
 }
 impl Default for InspectionUi {
+    /// Starts with no target, report, worker, or recovery selection.
     fn default() -> Self {
         Self {
             open: false,
@@ -95,12 +110,15 @@ impl Default for InspectionUi {
     }
 }
 impl InspectionUi {
+    /// Reports whether inspection or recovery still owns a worker.
     pub fn busy(&self) -> bool {
         self.job.is_some() || self.recovery.is_some()
     }
+    /// Reports whether this tab currently reserves a recovery output.
     pub fn recovering(&self) -> bool {
         self.recovery.is_some()
     }
+    /// Requests cancellation while leaving completed reports and edits intact.
     pub fn cancel(&mut self) {
         if let Some(j) = &self.job {
             j.cancel();
@@ -109,6 +127,7 @@ impl InspectionUi {
             j.cancel();
         }
     }
+    /// Retains a failed-open target and a bounded preview without replacing the current document.
     pub fn failed(
         path: PathBuf,
         options: OpenOptions,
@@ -136,6 +155,7 @@ impl InspectionUi {
         s.preview = SourcePreview::prefix(&path, encoding).ok();
         s
     }
+    /// Starts inspection of the retained target and clears previous selections.
     fn start(&mut self) -> Result<(), String> {
         let path = self.path.as_ref().ok_or("Choose a file to inspect.")?;
         self.job = Some(
@@ -158,6 +178,7 @@ impl InspectionUi {
         self.open = true;
         Ok(())
     }
+    /// Cancels stale work and disables actions tied to an old source or edit snapshot.
     fn invalidate(&mut self) {
         self.cancel();
         self.selected.clear();
@@ -168,6 +189,7 @@ impl InspectionUi {
             "The document or source changed. Inspect again before using these findings.".into(),
         );
     }
+    /// Adopts completed work only while its snapshot is current.
     fn poll(&mut self, doc: Option<&Document>) {
         if self.last_poll.elapsed() < POLL_INTERVAL {
             return;
@@ -229,6 +251,7 @@ enum Command {
     Close,
 }
 impl QuarryApp {
+    /// Repeats the visible failed-file target or captures the current document again.
     fn restart_visible_inspection(&mut self) {
         let separate = self.active.inspection.snapshot.is_none()
             && self.active.inspection.path.as_ref().is_some_and(|path| {
@@ -245,6 +268,7 @@ impl QuarryApp {
             self.start_current_inspection();
         }
     }
+    /// Commits current drafts and inspects effective values under document-operation rules.
     pub(super) fn start_current_inspection(&mut self) {
         if self.active.inspection.recovering() {
             return;
@@ -298,26 +322,70 @@ impl QuarryApp {
             self.active.inspection.message = Some(e);
         }
     }
+    /// Advances every tab worker and releases completed recovery reservations immediately.
     pub(super) fn poll_inspections(&mut self, ctx: &egui::Context) {
         for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
+            let was_recovering = tab.inspection.recovering();
             tab.inspection.poll(tab.document.as_ref());
+            if was_recovering && !tab.inspection.recovering() {
+                tab.write_destination = None;
+            }
             if tab.inspection.busy() {
                 ctx.request_repaint_after(POLL_INTERVAL);
             }
         }
     }
+    /// Returns only the diagnostic associated with the currently displayed notice.
+    fn notice_diagnostic(&self) -> Option<Box<quarry_core::Diagnostic>> {
+        let notice = self.active.notice.as_ref()?;
+        notice.diagnostic.clone().or_else(|| {
+            let doc = self.active.document.as_ref()?;
+            let original = doc.pending_diagnostic_message.as_ref()?;
+            if !original.is_empty() && notice.text.contains(original) {
+                doc.pending_diagnostic.clone()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Simple status and selection warnings do not replace an existing report.
+    pub(super) fn notice_has_inspection_details(&self) -> bool {
+        self.active.notice.as_ref().is_some_and(|notice| {
+            notice.inspection_target.is_some() || self.notice_diagnostic().is_some()
+        })
+    }
+
+    /// Opens the notice's source, even if a subsequent successful open changed tabs.
     pub(super) fn show_operation_diagnostic(&mut self) {
-        if self
+        if !self.notice_has_inspection_details() {
+            return;
+        }
+        if let Some(target) = self
             .active
             .notice
             .as_ref()
-            .and_then(|notice| notice.inspection_target.as_ref())
-            .zip(self.active.inspection.path.as_ref())
-            .is_some_and(|(target, current)| paths_alias(target, current))
+            .and_then(|n| n.inspection_target.clone())
         {
+            let target = *target;
+            if !self
+                .active
+                .inspection
+                .path
+                .as_ref()
+                .is_some_and(|path| paths_alias(path, &target.path))
+            {
+                self.active.inspection = InspectionUi::failed(
+                    target.path,
+                    target.options,
+                    target.encoding,
+                    target.message,
+                );
+            }
             self.active.inspection.open = true;
             return;
         }
+        let diagnostic = self.notice_diagnostic();
         let message = self
             .active
             .notice
@@ -342,21 +410,10 @@ impl QuarryApp {
                 ),
             );
         }
-        self.active.inspection.operation_diagnostic = self
-            .active
-            .notice
-            .as_ref()
-            .and_then(|n| n.diagnostic.clone())
-            .or_else(|| {
-                self.active
-                    .document
-                    .as_ref()
-                    .and_then(|doc| doc.pending_diagnostic.as_ref())
-                    .filter(|d| !d.message.is_empty() && message.contains(&d.message))
-                    .cloned()
-            });
+        self.active.inspection.operation_diagnostic = diagnostic;
         self.active.inspection.open = true;
     }
+    /// Renders the active report and dispatches explicit user actions.
     pub(super) fn show_inspection(&mut self, ctx: &egui::Context) {
         if !self.active.inspection.open {
             return;
@@ -471,6 +528,7 @@ impl QuarryApp {
             None => {}
         }
     }
+    /// Retries the selected format without discarding unsaved work on failure.
     fn retry_inspection_format(&mut self) {
         let state = &self.active.inspection;
         let Some(path) = state.path.clone() else {
@@ -543,6 +601,7 @@ impl QuarryApp {
             }
         }
     }
+    /// Selects a known record in its owning document without guessing through filters.
     fn navigate_inspection(&mut self, index: usize) {
         let Some(report) = &self.active.inspection.report else {
             return;
@@ -840,6 +899,7 @@ fn draw_inspection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Builds an indexed synthetic document for desktop-state regression tests.
     fn app(bytes: &[u8]) -> (tempfile::TempDir, QuarryApp) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.csv");
@@ -853,6 +913,7 @@ mod tests {
         }
         (dir, app)
     }
+    /// Polls a test worker until its source-bound report has been adopted.
     fn wait_report(app: &mut QuarryApp) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.active.inspection.job.is_some() {
@@ -863,6 +924,7 @@ mod tests {
         }
     }
     #[test]
+    /// Verifies that inspection uses unsaved values without owning copies each frame.
     fn inspection_uses_unsaved_values_without_owning_copies_each_frame() {
         let (_dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         app.active
@@ -890,6 +952,7 @@ mod tests {
         );
     }
     #[test]
+    /// Verifies that editing invalidates old findings before recovery.
     fn editing_invalidates_old_findings_before_recovery() {
         let (_dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         app.start_current_inspection();
@@ -907,6 +970,7 @@ mod tests {
         assert!(app.active.inspection.preview.is_none());
     }
     #[test]
+    /// Verifies that failed open retains current dirty document and shows bounded prefix.
     fn failed_open_retains_current_dirty_document_and_shows_bounded_prefix() {
         let (dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         app.active
@@ -932,6 +996,7 @@ mod tests {
         );
     }
     #[test]
+    /// Verifies that report stays with owning tab and view changes do not invalidate.
     fn report_stays_with_owning_tab_and_view_changes_do_not_invalidate() {
         let (dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         app.start_current_inspection();
@@ -953,6 +1018,7 @@ mod tests {
         );
     }
     #[test]
+    /// Verifies that source change invalidates preview even without an edit.
     fn source_change_invalidates_preview_even_without_an_edit() {
         let (_dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         app.start_current_inspection();
@@ -964,6 +1030,7 @@ mod tests {
         assert!(app.active.inspection.stale);
     }
     #[test]
+    /// Verifies that failed file can be inspected without becoming the current document.
     fn failed_file_can_be_inspected_without_becoming_the_current_document() {
         let (dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         let bad = dir.path().join("bad.csv");
@@ -985,6 +1052,7 @@ mod tests {
         assert_ne!(app.active.document.as_ref().unwrap().session.path(), bad);
     }
     #[test]
+    /// Verifies that failed file inspect again does not switch to the open document.
     fn failed_file_inspect_again_does_not_switch_to_the_open_document() {
         let (dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         let failed = dir.path().join("failed.csv");
@@ -1004,6 +1072,7 @@ mod tests {
         assert_ne!(app.active.document.as_ref().unwrap().session.path(), failed);
     }
     #[test]
+    /// Verifies that failed open details preserve the failed target.
     fn failed_open_details_preserve_the_failed_target() {
         let (dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         let failed = dir.path().join("failed.csv");
@@ -1015,6 +1084,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that failed format retry preserves current document and report.
     fn failed_format_retry_preserves_current_document_and_report() {
         let (_dir, mut app) = app(b"name,id\nAlice,1\nBob,22\n");
         app.start_current_inspection();
@@ -1037,6 +1107,7 @@ mod tests {
         );
     }
     #[test]
+    /// Verifies that inspection accessibility actions and keyboard close work.
     fn inspection_accessibility_actions_and_keyboard_close_work() {
         let (_dir, mut app) = app(b"name,id\nAlice,1\nBob\n");
         app.start_current_inspection();
@@ -1106,6 +1177,7 @@ mod tests {
         assert!(!app.active.inspection.open);
     }
     #[test]
+    /// Verifies that failed open preview honors a utf16 bom in auto mode.
     fn failed_open_preview_honors_a_utf16_bom_in_auto_mode() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.csv");
@@ -1118,5 +1190,115 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let ui = InspectionUi::failed(path, OpenOptions::default(), None, "bad quoting".into());
         assert!(ui.preview.unwrap().text.contains("name,value[LF]"));
+    }
+    #[test]
+    /// Verifies that unchanged editor keeps findings but changed draft invalidates.
+    fn unchanged_editor_keeps_findings_but_changed_draft_invalidates() {
+        let (_dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
+        app.start_current_inspection();
+        wait_report(&mut app);
+        app.active.document.as_mut().unwrap().cell_edit = Some(CellEdit {
+            row: 1,
+            column: 0,
+            source: b"Alice".to_vec(),
+            draft: "Alice".into(),
+            focus_requested: false,
+        });
+        assert!(
+            app.active
+                .inspection
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .current(app.active.document.as_ref().unwrap())
+        );
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .cell_edit
+            .as_mut()
+            .unwrap()
+            .draft = "Changed".into();
+        assert!(
+            !app.active
+                .inspection
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .current(app.active.document.as_ref().unwrap())
+        );
+        app.active.document.as_mut().unwrap().cell_edit = None;
+        app.active.document.as_mut().unwrap().begin_header_edit(0);
+        assert!(
+            app.active
+                .inspection
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .current(app.active.document.as_ref().unwrap())
+        );
+    }
+
+    #[test]
+    /// Verifies that unrelated notice does not destroy inspection.
+    fn unrelated_notice_does_not_destroy_inspection() {
+        let (_dir, mut app) = app(b"name,id\nAlice,1\nBob\n");
+        app.start_current_inspection();
+        wait_report(&mut app);
+        app.active.inspection.selected.insert(0);
+        app.active.notice = Some(AppMessage::warning("Choose a column first."));
+        app.show_operation_diagnostic();
+        assert!(app.active.inspection.report.is_some());
+        assert!(app.active.inspection.selected.contains(&0));
+    }
+
+    #[test]
+    /// Verifies that failed target survives other opened files.
+    fn failed_target_survives_other_opened_files() {
+        let (dir, mut app) = app(b"name,id\nAlice,1\n");
+        let bad = dir.path().join("bad.csv");
+        let other = dir.path().join("other.csv");
+        std::fs::write(&bad, b"a,b\n1,\"bad\n").unwrap();
+        std::fs::write(&other, b"name,id\nBob,2\n").unwrap();
+        let second = dir.path().join("second-bad.csv");
+        std::fs::write(&second, b"a,b\n1,\"bad\n").unwrap();
+        app.handle_dropped_paths(vec![Some(bad.clone()), Some(other), Some(second), None]);
+        app.show_operation_diagnostic();
+        assert_eq!(app.active.inspection.path, Some(bad));
+    }
+
+    #[test]
+    /// Verifies that recovery releases its reservation in the completion poll.
+    fn recovery_releases_its_reservation_in_the_completion_poll() {
+        let (dir, mut app) = app(b"name,id\nAlice,1\nBob\n");
+        app.start_current_inspection();
+        wait_report(&mut app);
+        let out = dir.path().join("copy.csv");
+        app.active.inspection.recovery = Some(
+            RecoveryJob::start(
+                app.active.inspection.report.as_ref().unwrap(),
+                &BTreeSet::from([0]),
+                &out,
+            )
+            .unwrap(),
+        );
+        app.active.write_destination = Some(out);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .active
+            .inspection
+            .recovery
+            .as_ref()
+            .unwrap()
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        app.active.inspection.last_poll = Instant::now() - POLL_INTERVAL;
+        app.poll_inspections(&egui::Context::default());
+        assert!(app.active.write_destination.is_none());
     }
 }

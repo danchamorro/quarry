@@ -260,6 +260,7 @@ impl Encoding {
         }
     }
 
+    /// Builds a positioned codec error; record callers wrap it before reporting source locations.
     fn invalid(self, offset: u64, reason: &str) -> QuarryError {
         QuarryError::EncodingAt {
             encoding: self,

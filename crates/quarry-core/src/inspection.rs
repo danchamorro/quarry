@@ -27,6 +27,7 @@ pub enum DiagnosticKind {
     Operation,
 }
 impl DiagnosticKind {
+    /// Returns the category label used by desktop and CLI reports.
     pub fn label(self) -> &'static str {
         match self {
             Self::Structure => "Record structure",
@@ -55,6 +56,7 @@ pub struct Diagnostic {
     pub blocking: bool,
 }
 impl Diagnostic {
+    /// Preserves known operation locations without promoting record-local offsets to source offsets.
     pub fn from_error(error: &QuarryError) -> Self {
         let mut d = Self::operation(error.to_string());
         match error {
@@ -79,10 +81,13 @@ impl Diagnostic {
                 }
             }
             QuarryError::EncodingAt {
-                encoding, reason, ..
+                encoding,
+                offset,
+                reason,
             } => {
                 d.kind = DiagnosticKind::Encoding;
                 d.message = encoding_problem(*encoding, reason);
+                d.byte_offset = Some(*offset);
             }
             QuarryError::Encoding(_) => d.kind = DiagnosticKind::Encoding,
             QuarryError::RecordTooLarge { .. } | QuarryError::BootstrapLimitExceeded { .. } => {
@@ -93,12 +98,14 @@ impl Diagnostic {
         }
         d
     }
+    /// Creates an operation failure with an actionable explanation and unknown data location.
     pub fn operation(message: impl Into<String>) -> Self {
         Self { kind: DiagnosticKind::Operation, message: message.into(),
             advice:"The current document is preserved. Correct the cause and retry; Inspect File can locate source-data problems.".into(),
             record:None, data_row:None, column:None, physical_line:None, byte_offset:None,
             record_range:None, edited:false, blocking:true }
     }
+    /// Formats known locations and recovery advice for display or clipboard export.
     pub fn details(&self) -> String {
         let mut s = format!("{}\n{}\n", self.kind.label(), self.message);
         if let Some(v) = self.record {
@@ -139,6 +146,7 @@ pub struct InspectionOptions {
     pub max_record_bytes: usize,
 }
 impl Default for InspectionOptions {
+    /// Uses existing record limits and automatic format selection.
     fn default() -> Self {
         Self {
             delimiter: None,
@@ -178,6 +186,7 @@ struct Progress {
     phase: AtomicU8,
 }
 impl Progress {
+    /// Initializes shared progress counters and cancellation state.
     fn new() -> Self {
         Self {
             bytes: 0.into(),
@@ -188,6 +197,7 @@ impl Progress {
             phase: 0.into(),
         }
     }
+    /// Reads a nonblocking, point-in-time view of worker progress.
     fn snapshot(&self) -> InspectionProgress {
         InspectionProgress {
             bytes_scanned: self.bytes.load(Ordering::Acquire),
@@ -249,15 +259,18 @@ pub struct InspectionReport {
     edits: InspectionEdits,
 }
 impl InspectionReport {
+    /// Checks whether the path still identifies the inspected source version.
     pub fn is_current(&self) -> bool {
         File::open(&self.path)
             .ok()
             .and_then(|f| source_matches_stamp(&f, &self.path, &self.stamp).ok())
             .unwrap_or(false)
     }
+    /// Checks whether the supplied edit snapshot is the one inspected.
     pub fn matches_edits(&self, edits: &InspectionEdits) -> bool {
         self.edits == *edits
     }
+    /// Allows only complete data records from a finished inspection with a known header setting.
     pub fn can_omit(&self, index: usize) -> bool {
         self.status == InspectionStatus::Complete
             && self.header_certain
@@ -265,6 +278,7 @@ impl InspectionReport {
                 d.record_range.is_some() && d.record.is_some_and(|r| r > u64::from(self.has_header))
             })
     }
+    /// Validates finding selections and deduplicates the records they identify.
     pub fn selected_records(
         &self,
         selection: &BTreeSet<usize>,
@@ -289,6 +303,7 @@ impl InspectionReport {
         }
         Ok(records)
     }
+    /// Reads bounded native context, or the unsaved value, without inventing a source position.
     pub fn preview(&self, index: usize) -> Result<SourcePreview, QuarryError> {
         let d = self
             .findings
@@ -344,6 +359,7 @@ impl InspectionReport {
             ),
         })
     }
+    /// Counts every finding while retaining only the bounded detail set.
     fn add(&mut self, diagnostic: Diagnostic) {
         self.total_findings = self.total_findings.saturating_add(1);
         self.blocking_findings += u64::from(diagnostic.blocking);
@@ -358,6 +374,7 @@ pub struct InspectionJob {
     handle: Option<JoinHandle<Result<InspectionReport, QuarryError>>>,
 }
 impl InspectionJob {
+    /// Starts a guarded background operation with its own cancellation and progress state.
     pub fn start(
         path: impl AsRef<Path>,
         options: InspectionOptions,
@@ -389,12 +406,15 @@ impl InspectionJob {
             handle: Some(handle),
         })
     }
+    /// Returns current worker counters without waiting for completion.
     pub fn progress(&self) -> InspectionProgress {
         self.shared.snapshot()
     }
+    /// Requests cancellation at the next bounded processing checkpoint.
     pub fn cancel(&self) {
         self.shared.cancel.store(true, Ordering::Release);
     }
+    /// Joins the worker and returns its report or publication outcome.
     pub fn wait(mut self) -> Result<InspectionReport, QuarryError> {
         self.handle
             .take()
@@ -404,6 +424,7 @@ impl InspectionJob {
     }
 }
 impl Drop for InspectionJob {
+    /// Cancels and joins an owned worker before releasing its resources.
     fn drop(&mut self) {
         self.cancel();
         if let Some(h) = self.handle.take() {
@@ -412,6 +433,7 @@ impl Drop for InspectionJob {
     }
 }
 
+/// Rejects unbounded or invalid inspection buffer settings.
 fn validate_options(o: InspectionOptions) -> Result<(), QuarryError> {
     if o.chunk_bytes == 0
         || o.chunk_bytes > 8 * 1024 * 1024
@@ -427,6 +449,7 @@ fn validate_options(o: InspectionOptions) -> Result<(), QuarryError> {
 type RecordSink<'a> = dyn FnMut(u64, &[u8], Option<&[u8]>) -> Result<(), QuarryError> + 'a;
 
 #[allow(clippy::too_many_arguments)]
+/// Frames native records, checks effective values, and stops before uncertain boundaries.
 fn scan(
     file: &mut File,
     path: &Path,
@@ -612,6 +635,35 @@ fn scan(
         report.has_header = crate::detect_header(&first_rows);
         report.header_certain = true;
     }
+    if report.status == InspectionStatus::Complete {
+        let missing = report
+            .edits
+            .cells
+            .keys()
+            .filter(|(row, _)| *row >= report.records)
+            .copied()
+            .collect::<Vec<_>>();
+        for (row, column) in missing {
+            let mut diagnostic = invalid_edit(
+                row.saturating_add(1),
+                column,
+                None,
+                format!(
+                    "An unsaved edit targets record {}, which does not exist in this file.",
+                    row.saturating_add(1)
+                ),
+            );
+            diagnostic.record = None;
+            report.add(diagnostic);
+        }
+        if report.header_certain && (!report.has_header || report.records == 0) {
+            let columns = report.edits.headers.keys().copied().collect::<Vec<_>>();
+            for column in columns {
+                report.add(invalid_edit(1, column, None,
+                    "An unsaved header edit cannot be applied because this file has no header record.".into()));
+            }
+        }
+    }
     for d in &mut report.findings {
         d.data_row = if report.header_certain {
             d.record
@@ -629,10 +681,12 @@ fn scan(
     }
     Ok(report)
 }
+/// Retains only the prefix that fits within the configured record buffer.
 fn append_bounded(out: &mut Vec<u8>, bytes: &[u8], limit: usize) {
     let n = bytes.len().min(limit.saturating_sub(out.len()));
     out.extend_from_slice(&bytes[..n]);
 }
+/// Counts native line-feed code units for physical-line diagnostics.
 fn count_lines(bytes: &[u8], encoding: Encoding) -> u64 {
     if encoding.is_utf16() {
         bytes
@@ -649,6 +703,7 @@ fn count_lines(bytes: &[u8], encoding: Encoding) -> u64 {
         memchr::memchr_iter(b'\n', bytes).count() as u64
     }
 }
+/// Finds a field number from a structurally valid native prefix.
 fn column_at(bytes: &[u8], delimiter: u8, encoding: Encoding) -> Option<usize> {
     let mut column = 1;
     // States mirror the authoritative record scanner for a known-valid prefix:
@@ -688,10 +743,28 @@ fn column_at(bytes: &[u8], delimiter: u8, encoding: Encoding) -> Option<usize> {
     Some(column)
 }
 
+/// Rejects edits that cannot be represented without changing a record's shape.
+fn invalid_edit(
+    record: u64,
+    column: usize,
+    range: Option<Range<u64>>,
+    message: String,
+) -> Diagnostic {
+    Diagnostic {
+        kind: DiagnosticKind::Operation, message,
+        advice: "Correct or discard this unsaved edit before recovery. A complete data record may instead be explicitly omitted.".into(),
+        record: Some(record), data_row: None, column: Some(column.saturating_add(1)),
+        physical_line: None, byte_offset: None, record_range: range,
+        edited: true, blocking: true,
+    }
+}
+
+/// Describes invalid text independently of offset provenance.
 fn encoding_problem(encoding: Encoding, reason: &str) -> String {
     format!("The selected {encoding} encoding cannot decode this text: {reason}.")
 }
 
+/// Builds a source diagnostic from the framing or decoding context supplied by the caller.
 fn error_diagnostic(
     e: &QuarryError,
     record: Option<u64>,
@@ -769,6 +842,7 @@ fn error_diagnostic(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Checks one complete record and applies edits without silently changing its field count.
 fn process_record(
     report: &mut InspectionReport,
     raw: &[u8],
@@ -862,11 +936,14 @@ fn process_record(
         });
     }
     let mut changed = BTreeSet::new();
+    let mut missing_columns = BTreeSet::new();
     if record == 1 && report.options.header_mode != HeaderMode::NoHeader {
         for (&c, v) in &report.edits.headers {
             if let Some(f) = fields.get_mut(c) {
                 *f = v.clone();
                 changed.insert(c);
+            } else {
+                missing_columns.insert(c);
             }
         }
     }
@@ -875,12 +952,26 @@ fn process_record(
         .cells
         .range((record - 1, 0)..=(record - 1, usize::MAX))
     {
-        if r == record - 1
-            && let Some(f) = fields.get_mut(c)
-        {
-            *f = v.clone();
-            changed.insert(c);
+        if r == record - 1 {
+            if let Some(f) = fields.get_mut(c) {
+                *f = v.clone();
+                changed.insert(c);
+            } else {
+                missing_columns.insert(c);
+            }
         }
+    }
+    for column in missing_columns {
+        report.add(invalid_edit(
+            record,
+            column,
+            Some(range.clone()),
+            format!(
+                "An unsaved edit targets column {}, but this record has only {} fields.",
+                column.saturating_add(1),
+                fields.len()
+            ),
+        ));
     }
     if record == 1 {
         *expected_width = Some(fields.len());
@@ -970,6 +1061,7 @@ fn process_record(
     Ok(())
 }
 
+/// Locates quoted-field starts without confusing escaped quotes with separators.
 fn encoded_field_starts(bytes: &[u8], delimiter: u8) -> Vec<usize> {
     let mut starts = vec![0];
     let mut state = 0;
@@ -995,6 +1087,7 @@ fn encoded_field_starts(bytes: &[u8], delimiter: u8) -> Vec<usize> {
     starts
 }
 
+/// Encodes edited values using the original record ending and BOM rules.
 fn serialize(
     fields: &[Vec<u8>],
     delimiter: u8,
@@ -1056,6 +1149,7 @@ fn serialize(
     out.extend_from_slice(&encoded);
     Ok(out)
 }
+/// Escapes invalid or invisible data in bounded previews and marks one source location.
 fn escape_bytes(bytes: &[u8], encoding: Encoding, highlight: Option<usize>) -> String {
     let mut out = String::new();
     let mut i = 0;
@@ -1115,6 +1209,7 @@ fn escape_bytes(bytes: &[u8], encoding: Encoding, highlight: Option<usize>) -> S
     out
 }
 
+/// Makes control characters visible without changing the underlying data.
 fn push_visible(out: &mut String, c: char) {
     match c {
         '\n' => out.push_str("[LF]\n"),
@@ -1137,6 +1232,7 @@ pub struct RecoveryJob {
     handle: Option<JoinHandle<Result<Option<RecoverySummary>, QuarryError>>>,
 }
 impl RecoveryJob {
+    /// Starts a guarded background operation with its own cancellation and progress state.
     pub fn start(
         report: &InspectionReport,
         selection: &BTreeSet<usize>,
@@ -1185,12 +1281,15 @@ impl RecoveryJob {
             handle: Some(handle),
         })
     }
+    /// Returns current worker counters without waiting for completion.
     pub fn progress(&self) -> InspectionProgress {
         self.shared.snapshot()
     }
+    /// Requests cancellation at the next bounded processing checkpoint.
     pub fn cancel(&self) {
         self.shared.cancel.store(true, Ordering::Release);
     }
+    /// Joins the worker and returns its report or publication outcome.
     pub fn wait(mut self) -> Result<Option<RecoverySummary>, QuarryError> {
         self.handle
             .take()
@@ -1200,6 +1299,7 @@ impl RecoveryJob {
     }
 }
 impl Drop for RecoveryJob {
+    /// Cancels and joins an owned worker before releasing its resources.
     fn drop(&mut self) {
         self.cancel();
         if let Some(h) = self.handle.take() {
@@ -1207,6 +1307,7 @@ impl Drop for RecoveryJob {
         }
     }
 }
+/// Copies retained records, validates staging, and publishes only if all source guards hold.
 fn recover(
     report: InspectionReport,
     omitted: BTreeSet<u64>,
@@ -1333,6 +1434,7 @@ fn recover(
 mod tests {
     use super::*;
     use crate::OpenOptions;
+    /// Creates an explicit comma-and-header test configuration.
     fn options() -> InspectionOptions {
         InspectionOptions {
             delimiter: Some(b','),
@@ -1340,6 +1442,7 @@ mod tests {
             ..Default::default()
         }
     }
+    /// Writes a synthetic fixture and waits for its inspection report.
     fn inspect(
         bytes: &[u8],
         opts: InspectionOptions,
@@ -1356,6 +1459,7 @@ mod tests {
         (dir, report)
     }
     #[test]
+    /// Verifies that quoted multiline and ragged rows have correct locations.
     fn quoted_multiline_and_ragged_rows_have_correct_locations() {
         let raw = b"name,note\r\nA,\"one\r\ntwo\"\r\nB\r\nC,x,y\r\n";
         let (_dir, r) = inspect(raw, options(), InspectionEdits::default());
@@ -1377,6 +1481,7 @@ mod tests {
         );
     }
     #[test]
+    /// Verifies that malformed quoting stops without recovery or guessed ranges.
     fn malformed_quoting_stops_without_recovery_or_guessed_ranges() {
         for raw in [
             b"a,b\n1,2\n3,ba\"d\n4,5\n".as_slice(),
@@ -1393,6 +1498,7 @@ mod tests {
         }
     }
     #[test]
+    /// Verifies that every encoding uses source bytes and multiline positions.
     fn every_encoding_uses_source_bytes_and_multiline_positions() {
         for encoding in Encoding::ALL {
             let text = "a,b\r\n1,\"é\r\nx\"\r\n2,3\r\n";
@@ -1414,6 +1520,7 @@ mod tests {
         }
     }
     #[test]
+    /// Verifies that invalid encodings are located beyond the first rows.
     fn invalid_encodings_are_located_beyond_the_first_rows() {
         for (encoding, bad) in [
             (Encoding::Utf8, vec![0xff]),
@@ -1449,6 +1556,7 @@ mod tests {
         }
     }
     #[test]
+    /// Verifies that report cap does not stop scanning or hide coverage.
     fn report_cap_does_not_stop_scanning_or_hide_coverage() {
         let mut raw = b"a,b\n".to_vec();
         for _ in 0..1100 {
@@ -1462,6 +1570,7 @@ mod tests {
         assert_eq!(r.bytes_scanned, raw.len() as u64);
     }
     #[test]
+    /// Verifies that oversized records are bounded and keep later line locations.
     fn oversized_records_are_bounded_and_keep_later_line_locations() {
         let raw = b"a,b\n12345678901234567890\nx\n";
         let (_dir, r) = inspect(
@@ -1479,6 +1588,7 @@ mod tests {
         assert!(r.can_omit(0));
     }
     #[test]
+    /// Verifies that edited findings do not invent source byte positions.
     fn edited_findings_do_not_invent_source_byte_positions() {
         let edits = InspectionEdits {
             cells: BTreeMap::from([((1, 1), vec![0xff])]),
@@ -1493,6 +1603,7 @@ mod tests {
         assert!(!r.matches_edits(&InspectionEdits::default()));
     }
     #[test]
+    /// Verifies that recovery omits unique rows and preserves native bytes and edits.
     fn recovery_omits_unique_rows_and_preserves_native_bytes_and_edits() {
         for encoding in Encoding::ALL {
             let mut raw = encoding.bom().to_vec();
@@ -1536,6 +1647,7 @@ mod tests {
         }
     }
     #[test]
+    /// Verifies that recovery can remove invalid utf8 but not leave other blocking rows.
     fn recovery_can_remove_invalid_utf8_but_not_leave_other_blocking_rows() {
         let (dir, r) = inspect(
             b"a,b\n1,\xff\n2,\xff\n",
@@ -1559,6 +1671,7 @@ mod tests {
         assert!(RecoveryJob::start(&r, &BTreeSet::from([0]), &destination).is_err());
     }
     #[test]
+    /// Verifies that recovery cannot turn a leading data bom into a signature.
     fn recovery_cannot_turn_a_leading_data_bom_into_a_signature() {
         let (dir, r) = inspect(
             b"\xff\n\xef\xbb\xbfx\n",
@@ -1585,6 +1698,7 @@ mod tests {
         assert_eq!(session.first_rows[0].fields[0], b"\xef\xbb\xbfx");
     }
     #[test]
+    /// Verifies that stale source rejects preview and recovery.
     fn stale_source_rejects_preview_and_recovery() {
         let (dir, r) = inspect(b"a,b\nx\n", options(), InspectionEdits::default());
         std::fs::write(&r.path, b"a,b\n1,2\n").unwrap();
@@ -1593,6 +1707,7 @@ mod tests {
         assert!(RecoveryJob::start(&r, &BTreeSet::from([0]), dir.path().join("out.csv")).is_err());
     }
     #[test]
+    /// Verifies that cancelled scan and recovery do not publish.
     fn cancelled_scan_and_recovery_do_not_publish() {
         let mut raw = b"a,b\nx\n".to_vec();
         for _ in 0..20000 {
@@ -1617,6 +1732,7 @@ mod tests {
         assert_eq!(scan.wait().unwrap().status, InspectionStatus::Cancelled);
     }
     #[test]
+    /// Verifies that preview is bounded escaped and highlights only once.
     fn preview_is_bounded_escaped_and_highlights_only_once() {
         let (dir, r) = inspect(b"a,b\n1,\xff\n", options(), InspectionEdits::default());
         let preview = r.preview(0).unwrap();
@@ -1631,6 +1747,7 @@ mod tests {
 #[cfg(test)]
 mod location_regressions {
     use super::*;
+    /// Inspects a synthetic encoding fixture for location assertions.
     fn report(raw: &[u8], encoding: Encoding) -> InspectionReport {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("bad.csv");
@@ -1650,6 +1767,7 @@ mod location_regressions {
         .unwrap()
     }
     #[test]
+    /// Verifies that odd utf16 tail retains the preceding record locations.
     fn odd_utf16_tail_retains_the_preceding_record_locations() {
         let mut raw = vec![0xff, 0xfe];
         raw.extend_from_slice(
@@ -1668,6 +1786,7 @@ mod location_regressions {
         assert_eq!(d.column, Some(2));
     }
     #[test]
+    /// Verifies that escaped quotes do not shift the error column.
     fn escaped_quotes_do_not_shift_the_error_column() {
         let r = report(b"a,b\n1,\"x\"\"y,z\",u\"v\n", Encoding::Utf8);
         let d = r.findings.last().unwrap();
@@ -1680,6 +1799,7 @@ mod location_regressions {
 mod diagnostic_location_tests {
     use super::*;
     #[test]
+    /// Verifies that invalid byte after escaped quote and line break has original location.
     fn invalid_byte_after_escaped_quote_and_line_break_has_original_location() {
         let raw = b"a,b\n1,\"first \"\"quote\"\"\n\xff\"\n";
         let dir = tempfile::tempdir().unwrap();
@@ -1706,6 +1826,7 @@ mod diagnostic_location_tests {
         );
     }
     #[test]
+    /// Verifies that operation locations never claim generated positions are source offsets.
     fn operation_locations_never_claim_generated_positions_are_source_offsets() {
         let d = Diagnostic::from_error(&QuarryError::InvalidNumericSortValue {
             data_row: 9,
@@ -1714,15 +1835,19 @@ mod diagnostic_location_tests {
         assert_eq!(d.data_row, Some(9));
         assert_eq!(d.column, Some(3));
         assert_eq!(d.byte_offset, None);
-        let d = Diagnostic::from_error(&QuarryError::EncodingAt {
-            encoding: Encoding::Utf16Le,
-            offset: 12,
-            reason: "test".into(),
+        let d = Diagnostic::from_error(&QuarryError::RecordEncoding {
+            record: 1,
+            cause: Box::new(QuarryError::EncodingAt {
+                encoding: Encoding::Utf16Le,
+                offset: 12,
+                reason: "test".into(),
+            }),
         });
         assert_eq!(d.kind, DiagnosticKind::Encoding);
         assert_eq!(d.byte_offset, None);
     }
     #[test]
+    /// Verifies that record decode error keeps known record without claiming a source offset.
     fn record_decode_error_keeps_known_record_without_claiming_a_source_offset() {
         let error =
             crate::parse_encoded_record(&[0, 0xd8], b',', 8, Encoding::Utf16Le).unwrap_err();
@@ -1733,6 +1858,7 @@ mod diagnostic_location_tests {
         assert!(error.to_string().contains("Record 9"));
     }
     #[test]
+    /// Verifies that aligned invalid utf16 records remain recoverable and later rows are scanned.
     fn aligned_invalid_utf16_records_remain_recoverable_and_later_rows_are_scanned() {
         for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
             for chunk in [2, 6, 64] {
@@ -1791,6 +1917,7 @@ mod diagnostic_location_tests {
         }
     }
     #[test]
+    /// Verifies that invalid utf16 inside a multiline quoted record has a safe complete range.
     fn invalid_utf16_inside_a_multiline_quoted_record_has_a_safe_complete_range() {
         for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
             let dir = tempfile::tempdir().unwrap();
@@ -1845,6 +1972,7 @@ mod diagnostic_location_tests {
         }
     }
     #[test]
+    /// Verifies that uncertain header does not claim a data row number.
     fn uncertain_header_does_not_claim_a_data_row_number() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("uncertain.csv");
@@ -1864,5 +1992,79 @@ mod diagnostic_location_tests {
         assert!(!r.header_certain);
         assert_eq!(r.findings[0].record, Some(2));
         assert_eq!(r.findings[0].data_row, None);
+    }
+    #[test]
+    /// Verifies that recovery rejects out of range cell and header edits.
+    fn recovery_rejects_out_of_range_cell_and_header_edits() {
+        for edits in [
+            InspectionEdits {
+                cells: BTreeMap::from([((1, 4), b"keep me".to_vec())]),
+                ..Default::default()
+            },
+            InspectionEdits {
+                headers: BTreeMap::from([(4, b"keep header".to_vec())]),
+                ..Default::default()
+            },
+            InspectionEdits {
+                cells: BTreeMap::from([((99, 0), b"missing row".to_vec())]),
+                ..Default::default()
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.csv");
+            let raw = b"a,b\n1,2\nshort\n";
+            std::fs::write(&path, raw).unwrap();
+            let r = InspectionJob::start(
+                &path,
+                InspectionOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..Default::default()
+                },
+                edits,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+            assert!(r.findings.iter().any(|d| d.edited && d.blocking));
+            let row = r
+                .findings
+                .iter()
+                .position(|d| d.kind == DiagnosticKind::RowWidth)
+                .unwrap();
+            let out = dir.path().join("out.csv");
+            assert!(
+                RecoveryJob::start(&r, &BTreeSet::from([row]), &out)
+                    .unwrap()
+                    .wait()
+                    .is_err()
+            );
+            assert!(!out.exists());
+            assert_eq!(std::fs::read(path).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    /// Verifies that direct stream encoding error keeps its absolute offset.
+    fn direct_stream_encoding_error_keeps_its_absolute_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.csv");
+        let mut raw = vec![0xff, 0xfe];
+        raw.extend_from_slice(&Encoding::Utf16Le.encode(b"a,b\n1,", 1024).unwrap());
+        let offset = raw.len() as u64;
+        raw.extend_from_slice(&[0, 0xdc]);
+        std::fs::write(&path, raw).unwrap();
+        let error = crate::Session::open_with_encoding(
+            &path,
+            crate::OpenOptions::default(),
+            Some(Encoding::Utf16Le),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(Diagnostic::from_error(&error).byte_offset, Some(offset));
+        let wrapped =
+            crate::parse_encoded_record(&[0, 0xdc], b',', 2, Encoding::Utf16Le).unwrap_err();
+        assert!(std::error::Error::source(&wrapped).is_some());
+        assert_eq!(Diagnostic::from_error(&wrapped).byte_offset, None);
     }
 }

@@ -35,6 +35,7 @@ const MAX_LIVE_BENCHMARK_MILLIS: u128 = 60_000;
 const FILTER_SAMPLE_ROWS: usize = 100;
 const RAW_HEADER_COMPARE_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Dispatches a CLI command while preserving typed core failures for diagnostics.
 pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
@@ -59,6 +60,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     }
 }
 
+/// Inspects one file and optionally publishes a validated, explicitly selected recovery copy.
 fn inspect_command(args: Vec<String>) -> CliResult<()> {
     use quarry_core::{
         InspectionEdits, InspectionJob, InspectionOptions, InspectionStatus, RecoveryJob,
@@ -170,14 +172,14 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
     Ok(())
 }
 
+/// Prints supported commands and their options on separate usage lines.
 fn print_help() {
-    println!(
-        "Inspect: quarry inspect <FILE> [--delimiter ,] [--header auto|first-row|none] [--encoding ENCODING] [--details] [--omit-findings 1,2 --output FILE]"
-    );
     println!(
         "Quarry\n\n\
          Usage:\n  \
-           quarry inspect <FILE> [--delimiter ,] [--header auto|first-row|none] [--details] \\\n           [--omit-findings 1,2 --output FILE] [--cancel-after-bytes N]\\n  \\\n           quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
+           quarry inspect <FILE> [--delimiter ,] [--header auto|first-row|none] [--details] \
+         [--omit-findings 1,2 --output FILE] [--cancel-after-bytes N]\n  \
+           quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
          [--jump-count 5] [--cache-state unknown|cold|warm] [--metrics-only] [--no-wait]\n  \
            quarry viewport <FILE> [--iterations 500] [--rows 100] \
          [--seed 1] [--cache-state unknown|cold|warm] [--live] \

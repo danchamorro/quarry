@@ -2347,6 +2347,7 @@ impl ExportTarget {
         self.record_limit = limit;
     }
 
+    /// Flushes the guarded staging file for validation without publishing it.
     pub(crate) fn flush_for_inspection(&mut self) -> Result<PathBuf, QuarryError> {
         self.writer.as_mut().expect("writer is present").flush()?;
         Ok(self.temporary.clone())
@@ -3186,7 +3187,8 @@ impl EncodedSaveState<'_> {
         let decoded = self
             .config
             .source_encoding
-            .decode(raw, self.config.max_record_bytes)?;
+            .decode(raw, self.config.max_record_bytes)
+            .map_err(|error| crate::record_encoding_error(self.row.saturating_add(1), error))?;
         let record = decoded.as_ref();
         let row = self.row;
         self.row += 1;
@@ -3570,7 +3572,9 @@ fn analyze_split_record(
     if row_number < data_start {
         return Ok(false);
     }
-    let decoded = encoding.decode(record, max_record_bytes)?;
+    let decoded = encoding
+        .decode(record, max_record_bytes)
+        .map_err(|error| crate::record_encoding_error(row_number.saturating_add(1), error))?;
     let record = decoded.as_ref();
     let record = if row_number == 0 {
         record.strip_prefix(UTF8_BOM).unwrap_or(record)
@@ -5074,7 +5078,10 @@ fn process_record(
             limit: max_record_bytes,
         });
     }
-    let decoded = output.source_encoding.decode(record, max_record_bytes)?;
+    let decoded = output
+        .source_encoding
+        .decode(record, max_record_bytes)
+        .map_err(|error| crate::record_encoding_error(row_number.saturating_add(1), error))?;
     let record = decoded.as_ref();
     let output_start = output.bytes_written();
     if row_number < data_start

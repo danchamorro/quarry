@@ -1217,7 +1217,8 @@ impl<'a> InitialRunBuilder<'a> {
         let decoded = self
             .config
             .encoding
-            .decode(record, self.config.max_record_bytes)?;
+            .decode(record, self.config.max_record_bytes)
+            .map_err(|error| crate::record_encoding_error(physical_row.saturating_add(1), error))?;
         let record = decoded.as_ref();
         let body = if physical_row == 0 && self.bom_present {
             record.strip_prefix(UTF8_BOM).unwrap_or(record)

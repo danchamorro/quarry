@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct TestDirectory(PathBuf);
 impl TestDirectory {
+    /// Creates a process-unique synthetic fixture directory.
     fn new() -> Self {
         let p = std::env::temp_dir().join(format!(
             "quarry-cli-inspect-{}-{}",
@@ -12,17 +13,20 @@ impl TestDirectory {
         std::fs::create_dir(&p).unwrap();
         Self(p)
     }
+    /// Returns the fixture root for subprocess tests.
     fn path(&self) -> &Path {
         &self.0
     }
 }
 impl Drop for TestDirectory {
+    /// Removes only this test-owned directory.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 use std::process::Command;
 #[test]
+/// Verifies that inspect reports and recovers without replacing source.
 fn inspect_reports_and_recovers_without_replacing_source() {
     let dir = TestDirectory::new();
     let source = dir.path().join("source.csv");
@@ -60,6 +64,7 @@ fn inspect_reports_and_recovers_without_replacing_source() {
     assert_eq!(std::fs::read(output).unwrap(), b"name,id\nAlice,1\nBob,2\n");
 }
 #[test]
+/// Verifies that malformed inspection is partial and never claims a clean file.
 fn malformed_inspection_is_partial_and_never_claims_a_clean_file() {
     let dir = TestDirectory::new();
     let source = dir.path().join("bad.csv");
@@ -76,6 +81,7 @@ fn malformed_inspection_is_partial_and_never_claims_a_clean_file() {
 }
 
 #[test]
+/// Verifies that late sort error reports data location and preserves source.
 fn late_sort_error_reports_data_location_and_preserves_source() {
     let dir = TestDirectory::new();
     let source = dir.path().join("source.csv");
@@ -112,4 +118,19 @@ fn late_sort_error_reports_data_location_and_preserves_source() {
     );
     assert!(!output.exists());
     assert_eq!(std::fs::read(source).unwrap(), bytes);
+}
+
+#[test]
+/// Verifies that help has separate command lines.
+fn help_has_separate_command_lines() {
+    let out = Command::new(env!("CARGO_BIN_EXE_quarry"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l.trim_start().starts_with("quarry open <FILE>"))
+    );
+    assert!(!text.contains("\\n"));
 }

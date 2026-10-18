@@ -83,6 +83,7 @@ pub(crate) fn parse_source_record(
     parse_record(record, delimiter)
 }
 
+/// Parses native record bytes and wraps record-local decoding failures with their logical record.
 pub(crate) fn parse_encoded_record(
     record: &[u8],
     delimiter: u8,
@@ -99,21 +100,26 @@ pub(crate) fn parse_encoded_record(
     };
     let decoded = encoding
         .decode(body, DEFAULT_MAX_RECORD_BYTES)
-        .map_err(|error| match error {
-            error @ (QuarryError::Encoding(_) | QuarryError::EncodingAt { .. }) => {
-                QuarryError::RecordEncoding {
-                    record: physical_row.saturating_add(1),
-                    cause: Box::new(error),
-                }
-            }
-            error => error,
-        })?;
+        .map_err(|error| record_encoding_error(physical_row.saturating_add(1), error))?;
     match decoded {
         Cow::Borrowed(bytes) => parse_record(bytes, delimiter).map_err(Into::into),
         Cow::Owned(bytes) => Ok(parse_record(&bytes, delimiter)?
             .into_iter()
             .map(|field| Cow::Owned(field.into_owned()))
             .collect()),
+    }
+}
+
+/// Retains a logical record while separating decoder-local byte offsets from source positions.
+pub(crate) fn record_encoding_error(record: u64, error: QuarryError) -> QuarryError {
+    match error {
+        error @ (QuarryError::Encoding(_) | QuarryError::EncodingAt { .. }) => {
+            QuarryError::RecordEncoding {
+                record,
+                cause: Box::new(error),
+            }
+        }
+        error => error,
     }
 }
 
@@ -293,6 +299,7 @@ impl Error for QuarryError {
             Self::Io(error) => Some(error),
             Self::Storage { error, .. } => Some(error),
             Self::Parse(error) => Some(error),
+            Self::RecordEncoding { cause, .. } => Some(cause.as_ref()),
             _ => None,
         }
     }
@@ -318,7 +325,7 @@ pub enum HeaderMode {
     NoHeader,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenOptions {
     pub rows: usize,
     pub delimiter: Option<u8>,

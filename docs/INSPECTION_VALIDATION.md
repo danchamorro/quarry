@@ -15,6 +15,9 @@ files.
 - Bounded record buffers, field-count limits and 1,000 retained findings.
   Total finding counts and coverage continue beyond the display cap.
 - Unsaved header/cell values are inspected without invented source offsets.
+  Edits beyond a row's field count, missing records and invalid header addresses
+  block recovery instead of being silently discarded. Merely opening an
+  unchanged editor keeps an existing report current.
   Edits, source replacement and format changes invalidate results.
 - Failed opens preserve the current document and retain the failed target.
   Inspect Again and Details keep that target. Failed format retries retain the
