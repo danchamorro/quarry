@@ -6,6 +6,7 @@ mod encoding;
 mod export;
 mod filter;
 mod index;
+mod inspection;
 mod search;
 mod sort;
 mod source_stamp;
@@ -45,6 +46,11 @@ pub use filter::{
 };
 pub use index::{
     Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, StructuralIndex,
+};
+pub use inspection::{
+    Diagnostic, DiagnosticKind, InspectionEdits, InspectionJob, InspectionOptions,
+    InspectionProgress, InspectionReport, InspectionStatus, RecoveryJob, RecoverySummary,
+    SourcePreview,
 };
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
@@ -94,10 +100,12 @@ pub(crate) fn parse_encoded_record(
     let decoded = encoding
         .decode(body, DEFAULT_MAX_RECORD_BYTES)
         .map_err(|error| match error {
-            QuarryError::Encoding(message) => QuarryError::Encoding(format!(
-                "Record {}: {message}",
-                physical_row.saturating_add(1)
-            )),
+            error @ (QuarryError::Encoding(_) | QuarryError::EncodingAt { .. }) => {
+                QuarryError::RecordEncoding {
+                    record: physical_row.saturating_add(1),
+                    cause: Box::new(error),
+                }
+            }
             error => error,
         })?;
     match decoded {
@@ -128,6 +136,15 @@ pub enum QuarryError {
     },
     Parse(ParseError),
     Encoding(String),
+    RecordEncoding {
+        record: u64,
+        cause: Box<QuarryError>,
+    },
+    EncodingAt {
+        encoding: Encoding,
+        offset: u64,
+        reason: String,
+    },
     BootstrapLimitExceeded {
         limit: usize,
         rows_found: usize,
@@ -175,6 +192,8 @@ pub enum QuarryError {
 impl fmt::Display for QuarryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RecordEncoding { record, cause } => write!(f, "Record {record}: {cause}"),
+
             Self::CombineFile {
                 path,
                 record,
@@ -203,6 +222,14 @@ impl fmt::Display for QuarryError {
             ),
             Self::Parse(error) => error.fmt(f),
             Self::Encoding(message) => f.write_str(message),
+            Self::EncodingAt {
+                encoding,
+                offset,
+                reason,
+            } => write!(
+                f,
+                "Invalid {encoding} at byte {offset}: {reason}. Choose the correct encoding; no text was replaced."
+            ),
             Self::BootstrapLimitExceeded { limit, rows_found } => write!(
                 f,
                 "found only {rows_found} rows within the {limit}-byte bootstrap limit"

@@ -261,10 +261,11 @@ impl Encoding {
     }
 
     fn invalid(self, offset: u64, reason: &str) -> QuarryError {
-        QuarryError::Encoding(format!(
-            "Invalid {} at byte {offset}: {reason}. Choose the correct encoding; no text was replaced.",
-            self.label(),
-        ))
+        QuarryError::EncodingAt {
+            encoding: self,
+            offset,
+            reason: reason.to_owned(),
+        }
     }
 
     pub(crate) fn chunk_size(self, requested: usize) -> usize {
@@ -1399,7 +1400,7 @@ mod tests {
                     .start_indexing(crate::IndexConfig::default())
                     .unwrap()
                     .wait(),
-                Err(crate::QuarryError::Encoding(_))
+                Err(crate::QuarryError::EncodingAt { .. })
             ));
             let copy = directory.path().join("copy.csv");
             assert!(matches!(
@@ -1407,7 +1408,7 @@ mod tests {
                     .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &copy)
                     .unwrap()
                     .wait(),
-                Err(crate::QuarryError::Encoding(_))
+                Err(crate::QuarryError::EncodingAt { .. })
             ));
             assert!(!copy.exists());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);

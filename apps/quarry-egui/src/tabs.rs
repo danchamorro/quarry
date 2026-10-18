@@ -6,6 +6,7 @@ const MAX_WRITE_JOBS: usize = 2;
 /// Owns one document's drafts, feedback, worker reservations and close decisions.
 pub(super) struct DocumentTab {
     pub(super) id: u64,
+    pub(super) inspection: inspection_ui::InspectionUi,
     pub(super) storage_review: Option<StorageReview>,
     pub(super) storage_approved: bool,
     pub(super) jump_input: String,
@@ -42,6 +43,7 @@ impl DocumentTab {
     pub(super) fn new(id: u64) -> Self {
         Self {
             id,
+            inspection: inspection_ui::InspectionUi::default(),
             storage_review: None,
             storage_approved: false,
             jump_input: "1".into(),
@@ -120,27 +122,29 @@ impl DocumentTab {
 
     /// Includes read workers as well as operations that materialize files.
     pub(super) fn busy(&self) -> bool {
-        self.document.as_ref().is_some_and(|document| {
-            document.job.is_some()
-                || document.search_job.is_some()
-                || document.filter_job.is_some()
-                || document.filter_rows_loading()
-                || document.save_job.is_some()
-                || document.export_job.is_some()
-                || document.structural_job.is_some()
-        })
+        self.inspection.busy()
+            || self.document.as_ref().is_some_and(|document| {
+                document.job.is_some()
+                    || document.search_job.is_some()
+                    || document.filter_job.is_some()
+                    || document.filter_rows_loading()
+                    || document.save_job.is_some()
+                    || document.export_job.is_some()
+                    || document.structural_job.is_some()
+            })
     }
 
     /// Counts file operations and structural analysis against the global job limit.
     fn writing(&self) -> bool {
-        self.document.as_ref().is_some_and(|document| {
-            document.save_job.is_some()
-                || document.export_job.is_some()
-                || document
-                    .structural_job
-                    .as_ref()
-                    .is_some_and(|job| !matches!(job, StructuralJob::DuplicatePreview { .. }))
-        })
+        self.inspection.recovering()
+            || self.document.as_ref().is_some_and(|document| {
+                document.save_job.is_some()
+                    || document.export_job.is_some()
+                    || document
+                        .structural_job
+                        .as_ref()
+                        .is_some_and(|job| !matches!(job, StructuralJob::DuplicatePreview { .. }))
+            })
     }
 }
 
@@ -418,8 +422,18 @@ impl QuarryApp {
                 "Quarry supports eight open tabs. Close a tab before opening another file.",
             ));
         }
-        let mut document =
-            Document::prepare_with_encoding(&path, options, encoding).map_err(AppMessage::error)?;
+        let mut document = match Document::prepare_with_encoding(&path, options, encoding) {
+            Ok(d) => d,
+            Err(message) => {
+                self.active.inspection = inspection_ui::InspectionUi::failed(
+                    path.clone(),
+                    options,
+                    encoding,
+                    message.clone(),
+                );
+                return Err(AppMessage::file_open_error(path, message));
+            }
+        };
         document.working_directory = self.working_directory.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
@@ -786,6 +800,7 @@ impl QuarryApp {
         if keep || modal.should_close() {
             self.keep_editing();
         } else if cancel && let Some(document) = self.active.document.as_mut() {
+            self.active.inspection.cancel();
             document.cancel_save();
             document.cancel_filtered_export();
             document.cancel_structural_edit();

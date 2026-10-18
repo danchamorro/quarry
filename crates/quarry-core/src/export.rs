@@ -2112,7 +2112,7 @@ impl ExportTarget {
         Self::create(destination, Publication::CreateNew)
     }
 
-    fn new_guarded(
+    pub(crate) fn new_guarded(
         source_path: &Path,
         destination: PathBuf,
         source: &File,
@@ -2345,6 +2345,11 @@ impl ExportTarget {
         self.source_encoding = source;
         self.output_encoding = output;
         self.record_limit = limit;
+    }
+
+    pub(crate) fn flush_for_inspection(&mut self) -> Result<PathBuf, QuarryError> {
+        self.writer.as_mut().expect("writer is present").flush()?;
+        Ok(self.temporary.clone())
     }
 
     pub(crate) fn bytes_written(&self) -> u64 {

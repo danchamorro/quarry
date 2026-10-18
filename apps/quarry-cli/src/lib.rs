@@ -39,6 +39,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
         Some("open") => open_command(args.collect()),
+        Some("inspect") => inspect_command(args.collect()),
         Some("viewport") => viewport_command(args.collect()),
         Some("search") => search_command(args.collect()),
         Some("filter") => filter_command(args.collect()),
@@ -58,11 +59,121 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     }
 }
 
+fn inspect_command(args: Vec<String>) -> CliResult<()> {
+    use quarry_core::{
+        InspectionEdits, InspectionJob, InspectionOptions, InspectionStatus, RecoveryJob,
+    };
+    let mut options = InspectionOptions::default();
+    let mut path = None;
+    let mut details = false;
+    let mut omitted = BTreeSet::new();
+    let mut output = None;
+    let mut cancel_after = None;
+    let mut cursor = 0;
+    while cursor < args.len() {
+        let arg = &args[cursor];
+        match arg.as_str() {
+            "--details" => details = true,
+            "--delimiter"
+            | "--header"
+            | "--encoding"
+            | "--omit-findings"
+            | "--output"
+            | "--cancel-after-bytes" => {
+                cursor += 1;
+                let value = args.get(cursor).ok_or("missing option value")?;
+                match arg.as_str() {
+                    "--delimiter" => options.delimiter = Some(parse_delimiter(value)?),
+                    "--header" => options.header_mode = parse_header_mode(value)?,
+                    "--encoding" => options.encoding = parse_encoding(value)?,
+                    "--output" => output = Some(PathBuf::from(value)),
+                    "--omit-findings" => {
+                        for item in value.split(',') {
+                            let n: usize = item.parse()?;
+                            if n == 0 {
+                                return Err("finding numbers start at 1".into());
+                            }
+                            omitted.insert(n - 1);
+                        }
+                    }
+                    "--cancel-after-bytes" => cancel_after = Some(value.parse::<u64>()?),
+                    _ => unreachable!(),
+                }
+            }
+            value if !value.starts_with('-') && path.is_none() => path = Some(PathBuf::from(value)),
+            _ => return Err(format!("unexpected inspection argument {arg:?}").into()),
+        }
+        cursor += 1;
+    }
+    if output.is_some() == omitted.is_empty() {
+        return Err("recovery needs both --omit-findings and --output".into());
+    }
+    let path = path.ok_or("inspect requires a file")?;
+    let job = InspectionJob::start(&path, options, InspectionEdits::default())?;
+    loop {
+        let p = job.progress();
+        if cancel_after.is_some_and(|n| p.bytes_scanned >= n) {
+            job.cancel();
+        }
+        if p.done {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let report = job.wait()?;
+    println!(
+        "File: {}\nEncoding: {}\nDelimiter: {:?}\nHeader: {}\nInspection: {:?}\nCoverage: {} of {} source bytes\nRecords: {}\nFindings: {} ({} shown)",
+        path.display(),
+        report.encoding,
+        report.delimiter as char,
+        report.has_header,
+        report.status,
+        report.bytes_scanned,
+        report.total_bytes,
+        report.records,
+        report.total_findings,
+        report.findings.len()
+    );
+    for (i, d) in report.findings.iter().enumerate() {
+        println!("\nFinding {}\n{}", i + 1, d.details());
+        if details {
+            let p = report.preview(i)?;
+            println!("Source preview [{}..{}):\n{}", p.start, p.end, p.text);
+        }
+    }
+    if let Some(output) = output {
+        let job = RecoveryJob::start(&report, &omitted, &output)?;
+        while !job.progress().done {
+            thread::sleep(Duration::from_millis(1));
+        }
+        match job.wait()? {
+            Some(s) => println!(
+                "Recovery copy: {}\nRemoved records: {}\nRetained records: {}",
+                s.destination.display(),
+                s.removed_records,
+                s.retained_records
+            ),
+            None => return Err("recovery cancelled; no output published".into()),
+        }
+        return Ok(());
+    }
+    if report.status != InspectionStatus::Complete {
+        return Err("inspection did not complete; coverage is partial".into());
+    }
+    if report.blocking_findings > 0 {
+        return Err("inspection found blocking data problems; source unchanged".into());
+    }
+    Ok(())
+}
+
 fn print_help() {
+    println!(
+        "Inspect: quarry inspect <FILE> [--delimiter ,] [--header auto|first-row|none] [--encoding ENCODING] [--details] [--omit-findings 1,2 --output FILE]"
+    );
     println!(
         "Quarry\n\n\
          Usage:\n  \
-           quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
+           quarry inspect <FILE> [--delimiter ,] [--header auto|first-row|none] [--details] \\\n           [--omit-findings 1,2 --output FILE] [--cancel-after-bytes N]\\n  \\\n           quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
          [--jump-count 5] [--cache-state unknown|cold|warm] [--metrics-only] [--no-wait]\n  \
            quarry viewport <FILE> [--iterations 500] [--rows 100] \
          [--seed 1] [--cache-state unknown|cold|warm] [--live] \

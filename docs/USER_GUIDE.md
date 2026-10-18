@@ -937,3 +937,64 @@ setting.
 | A long operation appears stuck during sort | Check whether the status says **Merging sorted rows…**. This is a separate merge phase and can take substantial time on very large files. |
 
 Cancelled or failed full-file operations do not publish a partial output file.
+
+## Inspecting file issues and creating recovery copies
+
+Choose **File → Inspect File…** to check the complete current document, including
+unsaved cell and header changes. Inspection is optional; opening a file does not
+wait for a full scan. If opening fails, the issue window retains that file as its
+target and shows a bounded source preview. **Inspect again** examines that failed
+file without replacing a document you already have open.
+
+The report distinguishes record structure, text encoding, uneven row lengths,
+and resource limits. Uneven rows are supported and are informational. Valid
+quoted multiline values and empty fields are not errors. Each finding shows
+known record, data-row, column and physical-line information; source byte offsets
+are zero-based and include an encoding signature when present. Locations for
+unsaved values do not invent positions in the original file.
+
+**Complete** means the configured inspection reached the end. **Stopped** and
+**Cancelled** are partial: the remaining data has not been checked. Inspection
+stops if quoting or encoding makes subsequent record boundaries uncertain. At
+most 1,000 detailed findings and 8 KiB of source context per preview are retained.
+The total count and coverage remain visible when detailed results are limited.
+Inspection uses the existing 64 MiB record limit and 65,536-field structural
+operation limit; a limit finding does not mean the data was silently truncated.
+
+Use **Copy Details** to copy a finding, or **Show Location** to return to a known
+data row. Clear an active filter or show a hidden column when requested.
+**Change Format and Retry** lets you explicitly choose the delimiter, header
+setting and encoding. Save or discard unsaved changes before changing the format
+of an open document. Ordinary editable cells can be corrected in the grid, then
+inspected again. Editing, replacing the source, or changing its format makes old
+findings stale; moving around the grid or switching tabs does not.
+
+To recover selected records:
+
+1. Complete inspection and review the findings.
+2. Select **Omit record…** for complete data records you deliberately want to
+   remove. Multiple findings for a record count as one removal.
+3. Choose **Create Recovery Copy…** and select a new destination.
+4. Review the exact removal count and destination, then choose **Create confirmed
+   copy**.
+5. Wait for validation and the completion message.
+
+The original document and its unsaved changes remain intact. Retained records
+keep their values, encoding, signature and line endings under the normal save
+rules. Headers and records with uncertain boundaries cannot be omitted. A
+recovery copy is not published if retained data still has a blocking problem,
+the source changes, validation fails, or you cancel. An existing destination is
+never overwritten. Quarry does not guess quote repairs, replace invalid bytes,
+or normalize uneven rows automatically.
+
+For terminal use:
+
+```sh
+quarry inspect input.csv --encoding utf8 --header first-row --details
+quarry inspect input.csv --header first-row --omit-findings 2,5 --output recovered.csv
+```
+
+Finding numbers refer to the report produced by that invocation. The second
+command explicitly requests a new recovery file and prints the number of unique
+records removed. A partial inspection or unresolved blocking issue returns an
+error. **--details** includes the bounded source preview.
