@@ -2995,6 +2995,7 @@ fn run_save_as(
         .estimated_output_bytes
         .store(required, Ordering::Release);
     shared.preparing.store(false, Ordering::Release);
+    let source_had_bom = source_starts_with_bom(&mut source, config.source_encoding)?;
     let copied = if config.source_encoding != crate::Encoding::Utf8
         || config.output_encoding != crate::Encoding::Utf8
     {
@@ -3062,7 +3063,17 @@ fn run_save_as(
             source_guard?;
             Ok(SaveWorkerOutcome::NoMatch)
         }
-        Ok(Some(summary)) => {
+        Ok(Some(mut summary)) => {
+            if output.bytes_written() == 0 && source_had_bom {
+                output.finish_first_record_bom_guard()?;
+                if output.bytes_written() == 0 {
+                    output.write_all(UTF8_BOM)?;
+                }
+                summary.bytes_written = output.bytes_written();
+                shared
+                    .bytes_written
+                    .store(summary.bytes_written, Ordering::Release);
+            }
             match output.publish(
                 summary.replacements,
                 summary.bytes_written,
@@ -3270,9 +3281,6 @@ impl EncodedSaveState<'_> {
                 "source does not contain a header row",
             ));
         }
-        if self.row == 0 && self.source_had_bom && !self.inserted {
-            self.output.write_all(UTF8_BOM)?;
-        }
         self.shared
             .bytes_written
             .store(self.output.bytes_written(), Ordering::Release);
@@ -3289,6 +3297,7 @@ pub(crate) fn source_starts_with_bom(
         return Ok(false);
     }
     let position = source.stream_position()?;
+    source.seek(SeekFrom::Start(0))?;
     let mut prefix = vec![0; bom.len()];
     let result = source.read_exact(&mut prefix);
     source.seek(SeekFrom::Start(position))?;
@@ -5669,8 +5678,9 @@ mod tests {
         let SaveAsOutcome::Complete(summary) = job.wait().unwrap() else {
             panic!("row deletion unexpectedly cancelled");
         };
-        assert_eq!(summary.bytes_written, 0);
-        assert!(fs::read(&working_path).unwrap().is_empty());
+        // Removing all records preserves the encoding signature, not a data row.
+        assert_eq!(summary.bytes_written, crate::UTF8_BOM.len() as u64);
+        assert_eq!(fs::read(&working_path).unwrap(), crate::UTF8_BOM);
         assert_eq!(fs::read(&source).unwrap(), bom_only_record);
         fs::remove_file(working_path).unwrap();
         fs::remove_file(&source).unwrap();

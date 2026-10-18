@@ -1598,4 +1598,47 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn deleting_every_row_retains_encoding_signature_and_zero_records() {
+        use std::collections::BTreeMap;
+        for encoding in Encoding::ALL {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.csv");
+            let output = directory.path().join("empty.csv");
+            let mut input = encoding.bom().to_vec();
+            input.extend_from_slice(&encoding.encode(b"one,1\ntwo,2\n", 4096).unwrap());
+            std::fs::write(&source, input).unwrap();
+            let session = crate::Session::open_with_encoding(
+                &source,
+                crate::OpenOptions {
+                    header_mode: crate::HeaderMode::NoHeader,
+                    ..Default::default()
+                },
+                Some(encoding),
+            )
+            .unwrap();
+            session
+                .start_create_working_copy_deleting_rows(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    vec![0..=1],
+                    &output,
+                )
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(
+                std::fs::read(&output).unwrap(),
+                encoding.bom(),
+                "{encoding}"
+            );
+            let reopened = crate::Session::open_with_encoding(
+                &output,
+                crate::OpenOptions::default(),
+                Some(encoding),
+            )
+            .unwrap();
+            assert!(reopened.first_rows.is_empty());
+        }
+    }
 }
