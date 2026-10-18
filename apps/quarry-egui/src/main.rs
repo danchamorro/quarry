@@ -1047,14 +1047,13 @@ impl QuarryApp {
             }
             Action::ChooseFilteredExport => return self.choose_filtered_export(),
             Action::DiscardChanges => {
-                if self
-                    .active
-                    .document
-                    .as_ref()
-                    .is_some_and(|document| document.structural_job.is_some())
-                {
+                if self.active.document.as_ref().is_some_and(|document| {
+                    document.structural_job.is_some()
+                        || document.save_job.is_some()
+                        || document.export_job.is_some()
+                }) {
                     self.active.notice = Some(AppMessage::warning(
-                        "Cancel the active change before discarding changes.",
+                        "Wait for the active file operation before discarding changes.",
                     ));
                     return;
                 }
@@ -3251,9 +3250,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
     });
     let save_ready = document.is_some_and(Document::is_save_ready);
     let save_as_ready = document.is_some_and(Document::is_save_as_ready);
-    let discard_ready = document.is_some_and(|document| {
-        document.is_dirty() && document.save_job.is_none() && document.structural_job.is_none()
-    });
+    let discard_ready = dirty && !file_operation_active;
     let (filename, full_path) = document.map_or_else(
         || ("File".to_owned(), None),
         |document| {
@@ -7868,9 +7865,6 @@ impl Document {
         if !(self.is_dirty() || destination.is_some() && self.has_reordered_columns()) {
             return Err(AppMessage::warning("Make a change before saving."));
         }
-        if self.filter_active() {
-            self.clear_filter().map_err(AppMessage::error)?;
-        }
         let renames = self
             .header_renames
             .iter()
@@ -7910,6 +7904,9 @@ impl Document {
             }
             Err(error) => return Err(AppMessage::error(error.to_string())),
         };
+        if self.filter_active() {
+            self.reset_filter_state();
+        }
         self.save_job = Some(job);
         self.save_status = Some("Saving edited file…".into());
         self.save_cancel_requested = false;
@@ -7996,6 +7993,15 @@ impl Document {
             return Err("Cancel the active export before clearing filters.".into());
         }
         self.commit_edits();
+        self.reset_filter_state();
+        if self.available_data_rows() > 0 {
+            self.navigate(self.viewport_start)?;
+        }
+        Ok(())
+    }
+
+    /// Drop filter state without starting a read while a save is being handed off.
+    fn reset_filter_state(&mut self) {
         self.stop_filter_read();
         if let Some(job) = self.filter_job.take() {
             job.cancel();
@@ -8017,10 +8023,6 @@ impl Document {
         self.selected_rows.clear();
         self.reveal_cell = None;
         self.scroll_points = 0.0;
-        if self.available_data_rows() > 0 {
-            self.navigate(self.viewport_start)?;
-        }
-        Ok(())
     }
 
     fn filter_active(&self) -> bool {
@@ -8406,11 +8408,11 @@ impl Document {
     }
 
     fn discard_edits(&mut self) {
-        if self.save_job.is_some() {
+        if self.save_job.is_some() || self.export_job.is_some() || self.structural_job.is_some() {
             return;
         }
-        if self.filter_active() {
-            let _ = self.clear_filter();
+        if self.filter_active() && self.clear_filter().is_err() {
+            return;
         }
         self.discard_header_edits();
         self.cell_edit = None;
@@ -14139,6 +14141,103 @@ mod tests {
 
         document.shutdown();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_save_start_preserves_completed_filter_and_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("save-filter.csv");
+        let destination = directory.path().join("exists.csv");
+        fs::write(
+            &source,
+            format!(
+                "name,status\n{}",
+                (0..100).map(|i| format!("{i},keep\n")).collect::<String>()
+            ),
+        )
+        .unwrap();
+        fs::write(&destination, b"existing").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        commit_test_cell(document, 1, 0, "changed");
+        document.set_visible_rows(5).unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.navigate_filter(50).unwrap();
+        finish_filter_read(document);
+        let edits = document.cell_edits.clone();
+        let rows = document
+            .visible_filter_rows()
+            .iter()
+            .map(|r| r.row)
+            .collect::<Vec<_>>();
+        assert!(document.start_save_as(destination.clone()).is_err());
+        assert!(document.filter_active());
+        assert_eq!(document.filter_viewport_start, 50);
+        assert_eq!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .map(|r| r.row)
+                .collect::<Vec<_>>(),
+            rows
+        );
+        assert_eq!(document.cell_edits, edits);
+        assert_eq!(fs::read(destination).unwrap(), b"existing");
+        document.shutdown();
+    }
+
+    #[test]
+    fn active_filtered_export_blocks_discard_without_losing_overlays() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("discard-filter.csv");
+        let destination = directory.path().join("export.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,drop\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        commit_test_cell(document, 2, 1, "keep");
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.start_filtered_export(destination).unwrap();
+        let edits = document.cell_edits.clone();
+        app.apply(&egui::Context::default(), Action::DiscardChanges);
+        let document = app.active.document.as_mut().unwrap();
+        assert_eq!(
+            document.cell_edits, edits,
+            "discard action must wait for export"
+        );
+        document.discard_edits();
+        assert_eq!(
+            document.cell_edits, edits,
+            "direct discard must wait for export"
+        );
+        assert!(document.filter_active());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while document.export_job.is_some() {
+            document.poll_filtered_export().unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        document.discard_edits();
+        assert!(document.cell_edits.is_empty());
+        assert!(!document.filter_active());
+        assert_eq!(
+            fs::read(source).unwrap(),
+            b"name,status\nAda,keep\nBob,drop\n"
+        );
+        document.shutdown();
     }
 
     #[test]
