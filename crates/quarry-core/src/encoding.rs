@@ -1163,9 +1163,19 @@ mod tests {
                 assert_eq!(summary.bytes_written, expected.len() as u64);
                 let reopened =
                     crate::Session::open_with_encoding(&output, options, Some(encoding)).unwrap();
-                let index = reopened
-                    .adopt_completed_index(summary.output_index.take().unwrap())
-                    .unwrap();
+                let index = if let Some(completed) = summary.output_index.take() {
+                    reopened.adopt_completed_index(completed).unwrap()
+                } else {
+                    assert!(
+                        !cfg!(target_os = "macos"),
+                        "macOS must preserve output index provenance"
+                    );
+                    reopened
+                        .start_indexing(crate::IndexConfig::default())
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                };
                 assert_eq!(index.indexed_rows(), 4);
                 assert_eq!(index.indexed_bytes(), expected.len() as u64);
                 assert_eq!(
