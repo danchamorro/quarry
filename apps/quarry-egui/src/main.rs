@@ -7584,10 +7584,8 @@ impl Document {
                 .min(progress.matches_found);
             // A partial scan cannot yet clamp a later page against the final match count.
             if progress.done
-                || progress.matches_found
-                    >= self
-                        .filter_viewport_start
-                        .saturating_add(self.visible_rows as u64)
+                || self.filter_viewport_start
+                    <= max_viewport_start(progress.matches_found, self.visible_rows)
             {
                 self.refresh_filter_snapshot_for(required);
                 self.navigate_filter(self.filter_viewport_start)?;
@@ -8646,10 +8644,8 @@ impl Document {
         self.filter_refresh_pending
             || (self.filter_job.is_some()
                 || self.filter_progress.is_some_and(|progress| !progress.done))
-                && self.available_filter_rows()
-                    < self
-                        .filter_viewport_start
-                        .saturating_add(self.visible_rows as u64)
+                && self.filter_viewport_start
+                    > max_viewport_start(self.available_filter_rows(), self.visible_rows)
     }
 
     fn scroll_rows(&mut self, rows: i64) -> Result<(), String> {
@@ -8694,7 +8690,7 @@ impl Document {
         let available = self.available_filter_rows();
         let scan_incomplete = self.filter_job.is_some()
             || self.filter_progress.is_some_and(|progress| !progress.done);
-        if scan_incomplete && requested.saturating_add(self.visible_rows as u64) > available {
+        if scan_incomplete && requested > max_viewport_start(available, self.visible_rows) {
             self.cancel_filter_read_for_navigation();
             self.filter_viewport_start = requested;
             self.clear_hidden_selection();
@@ -14156,6 +14152,58 @@ mod tests {
         assert_eq!(document.available_filter_rows(), 1);
         assert_eq!(app.prepare_filtered_export().unwrap(), source);
         app.active.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn incomplete_filter_can_display_a_partial_first_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-partial-first-page.csv");
+        fs::write(
+            &source,
+            format!(
+                "id,status\n{}",
+                (0..100)
+                    .map(|id| format!("{id},keep\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        let complete = document.filter_progress.unwrap();
+        document.stop_filter_read();
+        document.filter_index = Some(
+            document
+                .session
+                .start_filter(FilterQuery::single(
+                    0,
+                    FilterOperator::LessThan,
+                    b"10".to_vec(),
+                ))
+                .unwrap()
+                .wait()
+                .unwrap(),
+        );
+        document.filter_progress = Some(quarry_core::FilterProgress {
+            done: false,
+            matches_found: 10,
+            ..complete
+        });
+        document.filtered_rows.clear();
+        document.set_visible_rows(64).unwrap();
+        finish_filter_read(document);
+        assert_eq!(document.visible_filter_rows().len(), 10);
+        assert_eq!(document.filter_viewport_start, 0);
+        assert!(!document.filter_progress.unwrap().done);
+        document.shutdown();
     }
 
     #[test]
