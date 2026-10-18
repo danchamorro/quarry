@@ -448,6 +448,7 @@ fn run_duplicates(
             records,
             config.max_record_bytes,
             prefix_bytes,
+            if has_header { 0 } else { prefix_bytes },
             shared,
             None,
         )?
@@ -1094,5 +1095,54 @@ mod tests {
             ),
             Err(QuarryError::ExportDestinationIsSource)
         ));
+    }
+    #[test]
+    fn first_native_record_limit_includes_headerless_duplicate_bom() {
+        for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            for fits in [false, true] {
+                let mut bytes = encoding.bom().to_vec();
+                bytes.extend_from_slice(&encoding.encode(b"x\n", 4096).unwrap());
+                let fixture = Case::new(&bytes);
+                let session = Session::open_with_encoding(
+                    &fixture.source,
+                    QuarryOpenOptions {
+                        header_mode: HeaderMode::NoHeader,
+                        ..Default::default()
+                    },
+                    Some(encoding),
+                )
+                .unwrap();
+                // Keep the duplicate key below the same bound while making the
+                // native UTF-16 record exactly at or above it once the BOM is added.
+                let value = vec![b'x'; if fits { 14 } else { 15 }];
+                let job = DuplicateJob::start(
+                    &session,
+                    BTreeMap::new(),
+                    BTreeMap::from([((0, 0), value)]),
+                    spec(&[0], CaseSensitivity::Sensitive),
+                    fixture.destination.clone(),
+                    SortConfig {
+                        encoding,
+                        max_record_bytes: 32,
+                        ..tiny_config()
+                    },
+                )
+                .unwrap();
+                let result = job.wait();
+                if fits {
+                    assert!(
+                        matches!(result, Ok(DuplicateOutcome::Complete(_))),
+                        "{encoding}: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(QuarryError::RecordTooLarge { limit: 32 })),
+                        "{encoding}: {result:?}"
+                    );
+                    assert!(!fixture.destination.exists());
+                }
+                assert_eq!(fs::read(&fixture.source).unwrap(), bytes);
+            }
+        }
     }
 }

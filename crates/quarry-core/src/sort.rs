@@ -1729,6 +1729,7 @@ fn run_sort_inner(
         scan.records,
         config.max_record_bytes,
         bytes_written,
+        if has_header { 0 } else { bytes_written },
         shared,
         Some(&mut index),
     )?
@@ -1923,6 +1924,7 @@ fn merge_runs_to_output(
     expected_records: RecordMultisetFingerprint,
     max_record_bytes: usize,
     prior_bytes_written: u64,
+    mut first_record_prefix_bytes: u64,
     shared: &SharedState,
     mut output_index: Option<&mut StructuralIndex>,
 ) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
@@ -1959,9 +1961,11 @@ fn merge_runs_to_output(
                 output,
                 previous,
                 inserted_ending,
+                first_record_prefix_bytes,
                 &mut verifier,
                 shared,
             )?;
+            first_record_prefix_bytes = 0;
             bytes_written = bytes_written.saturating_add(written);
             if let Some(index) = &mut output_index {
                 index.record_boundary(prior_bytes_written.saturating_add(bytes_written));
@@ -1991,7 +1995,14 @@ fn merge_runs_to_output(
         );
     }
     if let Some(last) = pending {
-        let written = write_verified_output_entry(output, last, b"", &mut verifier, shared)?;
+        let written = write_verified_output_entry(
+            output,
+            last,
+            b"",
+            first_record_prefix_bytes,
+            &mut verifier,
+            shared,
+        )?;
         bytes_written = bytes_written.saturating_add(written);
         if let Some(index) = output_index {
             index.record_boundary(prior_bytes_written.saturating_add(bytes_written));
@@ -2005,15 +2016,15 @@ fn write_verified_output_entry(
     output: &mut ExportTarget,
     entry: PendingOutputEntry,
     inserted_ending: &[u8],
+    record_prefix_bytes: u64,
     verifier: &mut OutputVerifier,
     shared: &SharedState,
 ) -> Result<u64, QuarryError> {
     let PendingOutputEntry { record, .. } = entry;
-    let encoded_length = output
-        .output_encoding()
-        .encoded_len(&record)?
-        .saturating_add(output.output_encoding().encoded_len(inserted_ending)?);
-    if encoded_length > output.record_limit() {
+    let encoded_length = (output.output_encoding().encoded_len(&record)? as u64)
+        .saturating_add(output.output_encoding().encoded_len(inserted_ending)? as u64)
+        .saturating_add(record_prefix_bytes);
+    if encoded_length > output.record_limit() as u64 {
         return Err(QuarryError::RecordTooLarge {
             limit: output.record_limit(),
         });
@@ -3989,6 +4000,73 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert!(sort_artifacts(&directory).is_empty());
             fs::remove_dir_all(directory).unwrap();
+        }
+    }
+    #[test]
+    fn first_native_record_limit_includes_headerless_sort_bom() {
+        for encoding in [Encoding::Utf8, Encoding::Utf16Le, Encoding::Utf16Be] {
+            for fits in [false, true] {
+                let directory = case();
+                let source = directory.join("source.csv");
+                let destination = directory.join("sorted.csv");
+                let first = "z\n";
+                let second = match (encoding, fits) {
+                    (Encoding::Utf8, false) => "a123456\n",
+                    (Encoding::Utf8, true) => "a123\n",
+                    (_, false) => "aab\n",
+                    (_, true) => "ab\n",
+                };
+                let mut bytes = encoding.bom().to_vec();
+                bytes.extend_from_slice(
+                    &encoding
+                        .encode(format!("{first}{second}").as_bytes(), 4096)
+                        .unwrap(),
+                );
+                fs::write(&source, &bytes).unwrap();
+                let session = Session::open_with_encoding(
+                    &source,
+                    crate::OpenOptions {
+                        header_mode: HeaderMode::NoHeader,
+                        ..Default::default()
+                    },
+                    Some(encoding),
+                )
+                .unwrap();
+                let job = start_custom(
+                    &session,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    SortSpec {
+                        column: 0,
+                        mode: SortMode::Text,
+                        direction: SortDirection::Ascending,
+                        case_sensitivity: CaseSensitivity::Sensitive,
+                    },
+                    &destination,
+                    SortConfig {
+                        chunk_bytes: 2,
+                        max_record_bytes: 8,
+                        run_memory_bytes: 4096,
+                        merge_fan_in: 2,
+                        encoding,
+                    },
+                );
+                let result = job.wait();
+                if fits {
+                    assert!(
+                        matches!(result, Ok(SortOutcome::Complete(_))),
+                        "{encoding}: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(QuarryError::RecordTooLarge { limit: 8 })),
+                        "{encoding}: {result:?}"
+                    );
+                    assert!(!destination.exists());
+                }
+                assert_eq!(fs::read(&source).unwrap(), bytes);
+                fs::remove_dir_all(directory).unwrap();
+            }
         }
     }
 }
