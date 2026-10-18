@@ -8821,7 +8821,14 @@ impl Document {
         let job = self
             .session
             .start_filtered_read(index, window.start_match, window.count)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                    SOURCE_CHANGED_NOTICE.to_owned()
+                } else {
+                    error.to_string()
+                }
+            })?;
         self.filter_read = Some(ActiveFilterRead {
             window,
             job,
@@ -10447,7 +10454,6 @@ fn show_table(
                                         };
                                         let can_filter = source.is_some()
                                             && document.is_filter_ready()
-                                            && !document.has_cell_edits()
                                             && document.search_job.is_none()
                                             && document.filter_job.is_none()
                                             && document.export_job.is_none();
@@ -14982,6 +14988,37 @@ mod tests {
     }
 
     #[test]
+    fn filtered_page_start_freezes_a_changed_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-source-change.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,keep\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.stop_filter_read();
+        fs::write(&source, b"name,status\nChanged,keep\n").unwrap();
+        assert!(
+            document
+                .start_filter_read(super::FilterReadWindow {
+                    start_match: 0,
+                    count: 1
+                })
+                .is_err()
+        );
+        assert!(document.source_changed);
+        assert!(document.filter_index.is_none());
+        assert!(document.filtered_rows.is_empty());
+        assert!(!document.filter_active());
+    }
+
+    #[test]
     fn source_change_conflict_freezes_stale_navigation_until_reopen() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -18884,14 +18921,10 @@ mod tests {
     }
 
     #[test]
-    fn data_cell_context_menu_copies_and_filters_the_full_clicked_value() {
+    fn data_cell_context_menu_copies_and_filters_the_full_clicked_unsaved_value() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("cell-context-menu.csv");
-        fs::write(
-            &source,
-            b"name,note\nalpha,\"line one\nline two\"\nbeta,other\n",
-        )
-        .unwrap();
+        fs::write(&source, b"name,note\nalpha,source\nbeta,other\n").unwrap();
         let mut document = Document::open(
             &source,
             OpenOptions {
@@ -18901,6 +18934,7 @@ mod tests {
         )
         .unwrap();
         finish_index(&mut document);
+        commit_test_cell(&mut document, 1, 1, "line one\nline two");
 
         let _ = click_grid_control("Select row 2, column 1 (name): beta", &mut document);
         assert!(matches!(
