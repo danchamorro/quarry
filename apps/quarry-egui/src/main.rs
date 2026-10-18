@@ -10578,8 +10578,14 @@ fn show_table(
                                                 input.key_pressed(egui::Key::Enter)
                                                     || input.key_pressed(egui::Key::F2)
                                             });
+                                        // Keep a click to the next cell from being swallowed by
+                                        // the refresh triggered when the current editor commits.
+                                        let continue_filtered_edit = document.filter_active()
+                                            && active_cell_edit.is_some()
+                                            && response.clicked();
                                         if document.cell_is_editable(source)
-                                            && (response.double_clicked() || keyboard_activate)
+                                            && (response.double_clicked() || keyboard_activate
+                                                || continue_filtered_edit)
                                         {
                                             begin_cell_edit = source.map(|source| {
                                                 (record_row, column, source.to_vec())
@@ -14133,6 +14139,75 @@ mod tests {
 
         document.shutdown();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clicking_another_filtered_cell_continues_editing_after_committing_the_old_cell() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-click-switch.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,keep\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        for _ in 0..3 {
+            let _ = render_grid(&ctx, document);
+            finish_filter_read(document);
+        }
+        document.begin_cell_edit(1, 0, b"Ada".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "Anna".into();
+        let output = render_grid(&ctx, document);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let target = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.contains("column 1") && label.ends_with(": Bob"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing second cell: {:?}",
+                    nodes
+                        .iter()
+                        .filter_map(|(_, node)| node.label())
+                        .collect::<Vec<_>>()
+                )
+            })
+            .0;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, document).unwrap();
+                });
+            },
+        );
+        let edit = document
+            .cell_edit
+            .as_ref()
+            .expect("clicked cell retains its editor");
+        assert_eq!((edit.row, edit.column, edit.draft.as_str()), (2, 0, "Bob"));
+        assert_eq!(document.cell_edits[&(1, 0)].as_slice(), b"Anna");
+        finish_filter(document);
+        assert_eq!(document.cell_edit.as_ref().unwrap().row, 2);
+        document.shutdown();
     }
 
     #[test]
