@@ -21,7 +21,8 @@ files.
   Edits, source replacement and format changes invalidate results.
 - Failed opens preserve the current document and retain the failed target.
   Inspect Again and Details keep that target. Failed format retries retain the
-  old session and report.
+  old session and report. A failed external open also preserves an active
+  inspection/recovery job and its completion result.
 - Recovery deduplicates selected records, protects headers, preserves native
   retained bytes and edits, validates staging, rejects existing destinations
   and stale sources, and cancels without publication.

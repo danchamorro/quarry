@@ -1856,6 +1856,7 @@ mod diagnostic_location_tests {
         assert_eq!(d.record, Some(9));
         assert_eq!(d.byte_offset, None);
         assert!(error.to_string().contains("Record 9"));
+        assert!(!error.to_string().contains(" at byte "));
     }
     #[test]
     /// Verifies that aligned invalid utf16 records remain recoverable and later rows are scanned.

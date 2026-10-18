@@ -425,12 +425,14 @@ impl QuarryApp {
         let mut document = match Document::prepare_with_encoding(&path, options, encoding) {
             Ok(d) => d,
             Err(message) => {
-                self.active.inspection = inspection_ui::InspectionUi::failed(
-                    path.clone(),
-                    options,
-                    encoding,
-                    message.clone(),
-                );
+                if !self.active.inspection.busy() {
+                    self.active.inspection = inspection_ui::InspectionUi::failed(
+                        path.clone(),
+                        options,
+                        encoding,
+                        message.clone(),
+                    );
+                }
                 return Err(AppMessage::file_open_error(
                     path, options, encoding, message,
                 ));

@@ -358,7 +358,7 @@ impl QuarryApp {
 
     /// Opens the notice's source, even if a subsequent successful open changed tabs.
     pub(super) fn show_operation_diagnostic(&mut self) {
-        if !self.notice_has_inspection_details() {
+        if self.active.inspection.busy() || !self.notice_has_inspection_details() {
             return;
         }
         if let Some(target) = self
@@ -1300,5 +1300,48 @@ mod tests {
         app.active.inspection.last_poll = Instant::now() - POLL_INTERVAL;
         app.poll_inspections(&egui::Context::default());
         assert!(app.active.write_destination.is_none());
+    }
+    /// A failed external open and its details action must not cancel recovery or discard its result.
+    #[test]
+    fn failed_external_open_preserves_active_recovery() {
+        let (dir, mut app) = app(b"name,id\nAlice,1\nBob\n");
+        app.start_current_inspection();
+        wait_report(&mut app);
+        let original = app.active.inspection.path.clone();
+        let output = dir.path().join("recovered.csv");
+        app.active.inspection.selected.insert(0);
+        app.active.inspection.recovery = Some(
+            RecoveryJob::start(
+                app.active.inspection.report.as_ref().unwrap(),
+                &BTreeSet::from([0]),
+                &output,
+            )
+            .unwrap(),
+        );
+        app.active.write_destination = Some(output.clone());
+        let bad = dir.path().join("bad.csv");
+        std::fs::write(&bad, b"a,b\n1,\"bad\n").unwrap();
+        app.open_path_and_report(bad);
+        assert!(app.active.inspection.recovering());
+        assert_eq!(app.active.inspection.path, original);
+        app.show_operation_diagnostic();
+        assert!(app.active.inspection.recovering());
+        assert_eq!(app.active.inspection.path, original);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.active.inspection.recovering() {
+            assert!(Instant::now() < deadline);
+            app.active.inspection.last_poll = Instant::now() - POLL_INTERVAL;
+            app.poll_inspections(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert_eq!(std::fs::read(output).unwrap(), b"name,id\nAlice,1\n");
+        assert!(
+            app.active
+                .inspection
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Recovery copy created")
+        );
     }
 }

@@ -198,7 +198,15 @@ pub enum QuarryError {
 impl fmt::Display for QuarryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RecordEncoding { record, cause } => write!(f, "Record {record}: {cause}"),
+            Self::RecordEncoding { record, cause } => match cause.as_ref() {
+                Self::EncodingAt {
+                    encoding, reason, ..
+                } => write!(
+                    f,
+                    "Record {record}: invalid {encoding} text: {reason}. Choose the correct encoding; no text was replaced."
+                ),
+                cause => write!(f, "Record {record}: {cause}"),
+            },
 
             Self::CombineFile {
                 path,
