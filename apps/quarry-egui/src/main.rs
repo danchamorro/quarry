@@ -8641,9 +8641,23 @@ impl Document {
         self.scroll_rows(rows)
     }
 
+    /// Keep controls from clamping a restored page against an incomplete match count.
+    fn filter_waiting_for_page(&self) -> bool {
+        self.filter_refresh_pending
+            || (self.filter_job.is_some()
+                || self.filter_progress.is_some_and(|progress| !progress.done))
+                && self.available_filter_rows()
+                    < self
+                        .filter_viewport_start
+                        .saturating_add(self.visible_rows as u64)
+    }
+
     fn scroll_rows(&mut self, rows: i64) -> Result<(), String> {
         if self.filter_active() {
             self.commit_edits();
+            if self.filter_waiting_for_page() {
+                return Ok(());
+            }
             let available = self.available_filter_rows();
             let maximum = max_viewport_start(available, self.visible_rows);
             let current = self.filter_viewport_start;
@@ -8678,6 +8692,14 @@ impl Document {
             return Ok(());
         }
         let available = self.available_filter_rows();
+        let scan_incomplete = self.filter_job.is_some()
+            || self.filter_progress.is_some_and(|progress| !progress.done);
+        if scan_incomplete && requested.saturating_add(self.visible_rows as u64) > available {
+            self.cancel_filter_read_for_navigation();
+            self.filter_viewport_start = requested;
+            self.clear_hidden_selection();
+            return Ok(());
+        }
         if available == 0 {
             self.cancel_filter_read_for_navigation();
             self.filter_viewport_start = 0;
@@ -9116,6 +9138,9 @@ impl Document {
     fn navigate_grid_position(&mut self, position: u64) -> Result<(), String> {
         self.commit_edits();
         if self.filter_active() {
+            if self.filter_waiting_for_page() {
+                return Ok(());
+            }
             self.navigate_filter(position)
         } else {
             self.navigate(self.data_start.saturating_add(position))
@@ -14131,6 +14156,71 @@ mod tests {
         assert_eq!(document.available_filter_rows(), 1);
         assert_eq!(app.prepare_filtered_export().unwrap(), source);
         app.active.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn resizing_during_a_partial_filter_refresh_keeps_the_requested_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-resize.csv");
+        fs::write(
+            &source,
+            format!(
+                "id,status\n{}",
+                (0..1000)
+                    .map(|id| format!("{id},keep\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document.set_visible_rows(5).unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.navigate_filter(500).unwrap();
+        finish_filter_read(document);
+        let index = document.filter_index.take().unwrap();
+        let complete = document.filter_progress.unwrap();
+        document.filter_index = Some(
+            document
+                .session
+                .start_filter(FilterQuery::single(
+                    0,
+                    FilterOperator::LessThan,
+                    b"10".to_vec(),
+                ))
+                .unwrap()
+                .wait()
+                .unwrap(),
+        );
+        document.stop_filter_read();
+        document.filtered_rows.clear();
+        document.filter_progress = Some(quarry_core::FilterProgress {
+            done: false,
+            matches_found: 10,
+            ..complete
+        });
+        document.scroll_rows(1).unwrap();
+        assert_eq!(document.filter_viewport_start, 500);
+        document.navigate_grid_position(1).unwrap();
+        assert_eq!(document.filter_viewport_start, 500);
+        document.set_visible_rows(6).unwrap();
+        assert_eq!(document.filter_viewport_start, 500);
+        document.filter_index = Some(index);
+        document.filter_progress = Some(complete);
+        document
+            .navigate_filter(document.filter_viewport_start)
+            .unwrap();
+        finish_filter_read(document);
+        assert_eq!(document.filter_viewport_start, 500);
+        assert_eq!(document.visible_filter_rows()[0].row, 501);
+        document.shutdown();
     }
 
     #[test]
