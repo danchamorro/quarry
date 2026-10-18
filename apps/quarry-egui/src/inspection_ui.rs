@@ -1344,4 +1344,93 @@ mod tests {
                 .contains("Recovery copy created")
         );
     }
+    /// Starts a real recovery job through the file-only inspector.
+    fn standalone_recovery() -> (tempfile::TempDir, QuarryApp, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.csv");
+        std::fs::write(&source, b"name,id\nAlice,1\nBob\n").unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.active.inspection =
+            InspectionUi::failed(source, OpenOptions::default(), None, String::new());
+        app.start_current_inspection();
+        wait_report(&mut app);
+        let output = dir.path().join("recovered.csv");
+        app.active.inspection.recovery = Some(
+            RecoveryJob::start(
+                app.active.inspection.report.as_ref().unwrap(),
+                &BTreeSet::from([0]),
+                &output,
+            )
+            .unwrap(),
+        );
+        app.active.write_destination = Some(output.clone());
+        (dir, app, output)
+    }
+
+    /// Opening a valid external file cannot replace a documentless recovery owner.
+    #[test]
+    fn standalone_recovery_survives_successful_external_open() {
+        let (dir, mut app, output) = standalone_recovery();
+        let owner = app.active.id;
+        let other = dir.path().join("other.csv");
+        std::fs::write(&other, b"name,id\nOther,2\n").unwrap();
+        assert!(app.open_new_path(other.clone()).is_err());
+        assert_eq!(app.active.id, owner);
+        assert!(app.active.document.is_none());
+        assert!(app.active.inspection.recovering());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.active.inspection.recovering() {
+            assert!(Instant::now() < deadline);
+            app.active.inspection.last_poll = Instant::now() - POLL_INTERVAL;
+            app.poll_inspections(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert_eq!(std::fs::read(output).unwrap(), b"name,id\nAlice,1\n");
+        assert!(
+            app.active
+                .inspection
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Recovery copy created")
+        );
+        app.open_new_path(other).unwrap();
+        assert!(app.active.document.is_some());
+    }
+
+    /// Native quit waits for a file-only recovery to complete before authorizing close.
+    #[test]
+    fn standalone_recovery_defers_application_quit() {
+        let (_dir, mut app, output) = standalone_recovery();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let _ = ctx.run(input, |ctx| app.intercept_dirty_close(ctx));
+        assert!(app.quit_pending);
+        assert!(app.active.close_after_jobs);
+        assert!(!app.quit_authorized);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.active.inspection.recovering() {
+            assert!(Instant::now() < deadline);
+            app.active.inspection.last_poll = Instant::now() - POLL_INTERVAL;
+            app.poll_inspections(&ctx);
+            std::thread::yield_now();
+        }
+        assert_eq!(std::fs::read(output).unwrap(), b"name,id\nAlice,1\n");
+        assert!(
+            app.active
+                .inspection
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Recovery copy created")
+        );
+        app.poll_document_tabs(&ctx);
+        assert!(app.quit_authorized);
+    }
 }

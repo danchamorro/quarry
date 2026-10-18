@@ -22,7 +22,9 @@ files.
 - Failed opens preserve the current document and retain the failed target.
   Inspect Again and Details keep that target. Failed format retries retain the
   old session and report. A failed external open also preserves an active
-  inspection/recovery job and its completion result.
+  inspection/recovery job and its completion result. A standalone inspector
+  also blocks external opens while busy, and quitting waits for its recovery
+  unless the user explicitly cancels the operation.
 - Recovery deduplicates selected records, protects headers, preserves native
   retained bytes and edits, validates staging, rejects existing destinations
   and stale sources, and cancels without publication.

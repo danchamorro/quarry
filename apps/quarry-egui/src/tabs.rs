@@ -386,6 +386,11 @@ impl QuarryApp {
                 "Finish closing the document, or keep editing, before opening another file.",
             ));
         }
+        if self.active.document.is_none() && self.active.inspection.busy() {
+            return Err(AppMessage::warning(
+                "Wait for file inspection or recovery to finish before opening another file.",
+            ));
+        }
         let existing = self.document_tabs().find_map(|tab| {
             tab.document
                 .as_ref()
@@ -567,19 +572,19 @@ impl QuarryApp {
                 self.active.close_after_save = true;
                 return;
             }
-            if self.active.writing() {
-                self.active.close_after_jobs = true;
-                return;
-            }
-            if self
-                .active
-                .document
-                .as_ref()
-                .is_some_and(Document::is_dirty)
-            {
-                self.active.close_confirmation_open = true;
-                return;
-            }
+        }
+        if self.active.writing() {
+            self.active.close_after_jobs = true;
+            return;
+        }
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::is_dirty)
+        {
+            self.active.close_confirmation_open = true;
+            return;
         }
         self.finish_document_close(ctx);
     }
@@ -803,11 +808,13 @@ impl QuarryApp {
         });
         if keep || modal.should_close() {
             self.keep_editing();
-        } else if cancel && let Some(document) = self.active.document.as_mut() {
+        } else if cancel {
             self.active.inspection.cancel();
-            document.cancel_save();
-            document.cancel_filtered_export();
-            document.cancel_structural_edit();
+            if let Some(document) = self.active.document.as_mut() {
+                document.cancel_save();
+                document.cancel_filtered_export();
+                document.cancel_structural_edit();
+            }
         }
     }
 }
