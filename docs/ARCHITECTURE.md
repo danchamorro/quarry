@@ -251,11 +251,18 @@ in the existing one-level change history. No match, cancellation, record-limit
 failure, or source conflict publishes a result. Exact core and desktop
 regressions cover these semantics and the accessible controls.
 
-Filtering still scans the active indexed CSV without the sparse data-cell
-overlay, so the viewer requires those edits to be saved or discarded before a
-new filter begins. An active filter must be cleared before editing or using
-Find/Replace. Overlay-aware filtering remains deferred and is tracked in
-[issue #78](https://github.com/danchamorro/quarry/issues/78).
+Filtering scans an immutable snapshot of sparse data-cell edits over the active
+CSV. Filter indexes share the snapshot without copying cell bytes and retain
+physical source row identities and offsets. Page reads use the same snapshot
+for predicates, while returning original field values as edit/undo baselines.
+The viewer overlays current values for display. Committed cell edits and value
+Undo/Redo invalidate pending reads and asynchronously rebuild the match set.
+Find/Replace and structural operations still require clearing the filter.
+Scans and page reads bind to the session source identity and dialect, checking
+both file descriptor and path before adopting results. Filtered export applies
+the same cell snapshot and header renames through the bounded rewrite path,
+with guarded, create-new publication. Save/Save As writes the whole working
+file and clears filtering.
 
 A `FilterQuery` owns the Filters tool's case setting and one or more
 `FilterPredicate` values. Each predicate stores a source column, operator,
@@ -300,12 +307,14 @@ bounded index memory on a 1 GB fixture, with a paired text-filter baseline.
 
 ## Filtered export
 Filtered export scans the active indexed CSV once with the same decoded-cell
-predicate semantics as filtered navigation, but copies each matching raw
-record to a buffered temporary file. This preserves the active header,
-delimiter, quoting,
-line endings, and multiline records byte for byte without retaining matching
-rows. The worker publishes scanned bytes, parsed records, written rows, written
-bytes, elapsed time, and cancellation state.
+predicate semantics and sparse edit snapshot as filtered navigation. It copies
+unedited matching records and an unrenamed header byte for byte to a buffered
+temporary file. If a later record becomes the first output record, a leading
+BOM-looking data value is protected so reopening cannot strip it. Edited records
+and a renamed header are re-serialized with the
+document delimiter and each record's original line ending. Matching rows are
+not retained. The worker publishes scanned bytes, parsed records, written rows,
+written bytes, elapsed time, and cancellation state.
 
 The temporary file is created beside the destination. A successful worker
 flushes and syncs it before publishing the destination without overwriting an
@@ -494,7 +503,8 @@ then crosses the structural boundary, then exposes earlier individual edits.
 Redo restores those earlier individual edits before crossing the boundary.
 The toolbar and Command/Ctrl shortcuts share these commands. Focused text
 fields keep native text Undo/Redo, and committed-history commands are disabled
-during inline editing, filters, conflicting jobs, or source conflict.
+during inline editing, conflicting jobs, or source conflict. Active filters
+allow value history but block crossing a structural history boundary.
 
 Successful Save or Save As reopening, Discard, and opening or reopening a
 document reset both histories. Failed or cancelled operations preserve history

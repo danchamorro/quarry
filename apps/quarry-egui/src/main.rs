@@ -736,33 +736,35 @@ impl QuarryApp {
         }
     }
 
-    /// Commits this tab's drafts and chooses an export path only for a clean document.
-    fn choose_filtered_export(&mut self) {
-        if let Some(document) = self.active.document.as_mut() {
-            if document.save_job.is_some() {
-                self.active.notice = Some(AppMessage::warning(
-                    "Cancel the active save before exporting filtered rows.",
-                ));
-                return;
-            }
-            document.commit_edits();
-            if document.is_dirty() {
-                self.active.notice = Some(AppMessage::warning(
-                    "Save or discard your changes before exporting filtered rows.",
-                ));
-                return;
-            }
-        }
-        let Some(source) = self
+    /// Commits this tab's drafts before the native export picker takes over polling.
+    fn prepare_filtered_export(&mut self) -> Result<PathBuf, AppMessage> {
+        let document = self
             .active
             .document
-            .as_ref()
-            .map(|document| document.logical_path.clone())
-        else {
-            self.active.notice = Some(AppMessage::warning(
-                "Open and filter a file before exporting.",
+            .as_mut()
+            .ok_or_else(|| AppMessage::warning("Open and filter a file before exporting."))?;
+        if document.save_job.is_some() {
+            return Err(AppMessage::warning(
+                "Cancel the active save before exporting filtered rows.",
             ));
-            return;
+        }
+        document.commit_edits();
+        if document.filter_refresh_pending {
+            return Err(AppMessage::warning(
+                "Wait for matches to refresh, then choose Export Filtered Rows again.",
+            ));
+        }
+        Ok(document.logical_path.clone())
+    }
+
+    /// Chooses a destination only after the working filter is ready to export.
+    fn choose_filtered_export(&mut self) {
+        let source = match self.prepare_filtered_export() {
+            Ok(source) => source,
+            Err(error) => {
+                self.active.notice = Some(error);
+                return;
+            }
         };
         let mut dialog = rfd::FileDialog::new()
             .set_title("Export filtered rows")
@@ -1045,14 +1047,13 @@ impl QuarryApp {
             }
             Action::ChooseFilteredExport => return self.choose_filtered_export(),
             Action::DiscardChanges => {
-                if self
-                    .active
-                    .document
-                    .as_ref()
-                    .is_some_and(|document| document.structural_job.is_some())
-                {
+                if self.active.document.as_ref().is_some_and(|document| {
+                    document.structural_job.is_some()
+                        || document.save_job.is_some()
+                        || document.export_job.is_some()
+                }) {
                     self.active.notice = Some(AppMessage::warning(
-                        "Cancel the active change before discarding changes.",
+                        "Wait for the active file operation before discarding changes.",
                     ));
                     return;
                 }
@@ -1505,7 +1506,7 @@ impl QuarryApp {
             return Err(AppMessage::warning(if current.source_changed {
                 SOURCE_CHANGED_NOTICE
             } else {
-                "Finish editing, clear filters, and wait for active operations before Undo or Redo."
+                "Finish editing and wait for active operations before Undo or Redo."
             }));
         }
         match current.session.ensure_source_unchanged() {
@@ -1522,6 +1523,11 @@ impl QuarryApp {
             current.edit_history.undo.pop_back()
         };
         let Some(edit) = edit else {
+            if current.filter_active() {
+                return Err(AppMessage::warning(
+                    "Clear the filter before undoing structural changes.",
+                ));
+            }
             return self.swap_structural_history(redo);
         };
         current.set_edit_value(
@@ -2061,7 +2067,7 @@ impl eframe::App for QuarryApp {
                     let undo = ui
                         .add_enabled(can_undo, egui::Button::new("Undo"))
                         .on_disabled_hover_text(
-                            "No retained change to undo. Finish editing and clear filters before using history. Edits beyond the history limit can block whole-file Undo. Save to keep changes or discard to restore the source; both reset history.",
+                            "No retained change to undo. Finish editing before using history, and clear filters before whole-file Undo. Edits beyond the history limit can block whole-file Undo. Save to keep changes or discard to restore the source; both reset history.",
                         )
                         .on_hover_text("Undo the last edit or whole-file change (Command/Ctrl+Z).");
                     undo.widget_info(|| {
@@ -3244,9 +3250,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
     });
     let save_ready = document.is_some_and(Document::is_save_ready);
     let save_as_ready = document.is_some_and(Document::is_save_as_ready);
-    let discard_ready = document.is_some_and(|document| {
-        document.is_dirty() && document.save_job.is_none() && document.structural_job.is_none()
-    });
+    let discard_ready = dirty && !file_operation_active;
     let (filename, full_path) = document.map_or_else(
         || ("File".to_owned(), None),
         |document| {
@@ -4896,6 +4900,7 @@ fn show_filter_manager(
                         }
                     }
                     egui::CollapsingHeader::new("Details").show(ui, |ui| {
+                        ui.label("Filters include unsaved edits. Committing a cell edit refreshes matching rows.");
                         ui.label("Rows must match every filtered column. Inclusion rules in the same column are alternatives. Does not equal rules exclude matches.");
                         ui.label("Use Between for a numeric range. Blank, missing and invalid numbers do not match numeric rules.");
                         ui.label("Text values are literal, including spaces and line breaks. Equals and Does not equal can compare empty cells. Match case applies to text only.");
@@ -4925,9 +4930,7 @@ fn show_filter_manager(
                 });
             });
             ui.separator();
-            if document.has_cell_edits() {
-                ui.label("Save or discard cell edits before filtering the source file.");
-            } else if document.search_job.is_some() {
+            if document.search_job.is_some() {
                 ui.label("Cancel the active search before filtering.");
             } else if document.total_columns == 0 {
                 ui.label("Open a file with at least one column to filter rows.");
@@ -4940,7 +4943,6 @@ fn show_filter_manager(
                     if document.filter_job.is_some() { " · Filtering…" } else { "" }));
             }
             let can_apply = document.is_filter_ready()
-                && !document.has_cell_edits()
                 && document.search_job.is_none()
                 && document.filter_job.is_none()
                 && document.export_job.is_none()
@@ -4950,8 +4952,8 @@ fn show_filter_manager(
                     action = Some(Action::ClearFilter);
                 }
                 if document.filter_active()
-                    && ui.add_enabled(document.is_filtered_export_ready() && !document.is_dirty(), egui::Button::new("Export Filtered Rows…"))
-                        .on_hover_text(if document.is_dirty() { "Save or discard your changes before exporting filtered rows." } else { "Export all matching rows to a new file" }).clicked()
+                    && ui.add_enabled(document.is_filtered_export_ready(), egui::Button::new("Export Filtered Rows…"))
+                        .on_hover_text("Export all matching rows with your current edits to a new file").clicked()
                 {
                     action = Some(Action::ChooseFilteredExport);
                 }
@@ -5708,6 +5710,7 @@ struct Document {
     filter_job: Option<FilterJob>,
     filter_index: Option<FilterIndex>,
     filter_query: Option<FilterQuery>,
+    filter_refresh_pending: bool,
     filter_progress: Option<FilterProgress>,
     filter_status: Option<String>,
     export_job: Option<FilterExportJob>,
@@ -5851,6 +5854,7 @@ impl Document {
             filter_job: None,
             filter_index: None,
             filter_query: None,
+            filter_refresh_pending: false,
             filter_progress: None,
             filter_status: None,
             export_job: None,
@@ -5918,7 +5922,8 @@ impl Document {
             Some("Reopen the changed source before editing the document.")
         } else if self.filter_active() {
             Some("Clear the filter before editing the document.")
-        } else if self.save_job.is_some()
+        } else if self.filter_refresh_pending
+            || self.save_job.is_some()
             || self.export_job.is_some()
             || self.structural_job.is_some()
             || self.search_job.is_some()
@@ -7478,9 +7483,6 @@ impl Document {
         if self.search_job.is_some() {
             return Err("Cancel the active search before filtering.".into());
         }
-        if self.has_cell_edits() {
-            return Err("Save or discard cell edits before filtering the source file.".into());
-        }
         if !self.is_filter_ready() {
             return Err("Open a file with at least one column before filtering.".into());
         }
@@ -7502,13 +7504,19 @@ impl Document {
         self.commit_edits();
         let job = self
             .session
-            .start_filter(query.clone())
-            .map_err(|error| error.to_string())?;
+            .start_filter_with_edits(query.clone(), Arc::new(self.cell_edits.clone()))
+            .map_err(|error| {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                }
+                error.to_string()
+            })?;
         self.stop_filter_read();
         self.filter_progress = Some(job.progress());
         self.filter_index = Some(job.snapshot());
         self.filter_job = Some(job);
         self.filter_query = Some(query);
+        self.filter_refresh_pending = false;
         self.filter_status = Some("Filtering rows…".into());
         self.export_progress = None;
         self.export_status = None;
@@ -7524,7 +7532,47 @@ impl Document {
         Ok(())
     }
 
+    /// Drop rows from the old snapshot before scheduling a scan of committed values.
+    fn queue_filter_refresh(&mut self) {
+        if !self.filter_active() {
+            return;
+        }
+        self.stop_filter_read();
+        if let Some(job) = self.filter_job.take() {
+            job.cancel();
+        }
+        self.filter_index = None;
+        self.filter_progress = None;
+        self.filtered_rows.clear();
+        self.whitespace.invalidate_rows();
+        self.selection = None;
+        self.selected_rows.clear();
+        self.reveal_cell = None;
+        self.filter_refresh_pending = true;
+        self.filter_status = Some("Refreshing matches after edits…".into());
+    }
+
     fn poll_filter(&mut self) -> Result<(), String> {
+        if self.filter_refresh_pending {
+            self.filter_refresh_pending = false;
+            if let Some(query) = self.filter_query.clone() {
+                let viewport = self.filter_viewport_start;
+                let scroll_points = self.scroll_points;
+                // Starting a refresh must not commit or discard the next cell's draft.
+                let editor = self.cell_edit.take();
+                let result = self.start_filter(query);
+                self.cell_edit = editor;
+                result?;
+                self.filter_viewport_start = viewport;
+                self.scroll_points = scroll_points;
+                if let Some(edit) = &self.cell_edit {
+                    self.selection = Some(GridSelection::Cell {
+                        row: edit.row,
+                        column: edit.column,
+                    });
+                }
+            }
+        }
         self.poll_filter_scan()?;
         self.poll_filter_read()
     }
@@ -7541,12 +7589,20 @@ impl Document {
                 .filter_viewport_start
                 .saturating_add(self.visible_rows as u64)
                 .min(progress.matches_found);
-            self.refresh_filter_snapshot_for(required);
-            self.navigate_filter(self.filter_viewport_start)?;
+            // A partial scan cannot yet clamp a later page against the final match count.
+            if progress.done
+                || self.filter_viewport_start
+                    <= max_viewport_start(progress.matches_found, self.visible_rows)
+            {
+                self.refresh_filter_snapshot_for(required);
+                self.navigate_filter(self.filter_viewport_start)?;
+            }
         } else {
             self.filtered_rows.clear();
             self.filter_buffer_start = 0;
-            self.filter_viewport_start = 0;
+            if progress.done {
+                self.filter_viewport_start = 0;
+            }
         }
         if !progress.done {
             return Ok(());
@@ -7570,9 +7626,14 @@ impl Document {
                 Ok(())
             }
             Err(error) => {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                    return Err(SOURCE_CHANGED_NOTICE.into());
+                }
                 self.stop_filter_read();
                 self.filter_index = None;
                 self.filter_query = None;
+                self.filter_refresh_pending = false;
                 self.filter_progress = None;
                 self.filter_status = None;
                 self.whitespace.invalidate_rows();
@@ -7612,6 +7673,10 @@ impl Document {
             }
             Ok(FilterReadOutcome::Complete(_) | FilterReadOutcome::Cancelled) => {}
             Err(error) => {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                    return Err(SOURCE_CHANGED_NOTICE.into());
+                }
                 self.pending_filter_read = None;
                 return Err(error.to_string());
             }
@@ -7627,9 +7692,9 @@ impl Document {
             ));
         }
         self.commit_edits();
-        if self.is_dirty() {
+        if self.filter_refresh_pending {
             return Err(AppMessage::warning(
-                "Save or discard your changes before exporting filtered rows.",
+                "Wait for matches to refresh before exporting.",
             ));
         }
         if self.export_job.is_some() {
@@ -7655,8 +7720,21 @@ impl Document {
 
         let job = self
             .session
-            .start_filtered_export(query, destination)
-            .map_err(|error| AppMessage::error(error.to_string()))?;
+            .start_filtered_export_with_edits(
+                query,
+                Arc::new(self.cell_edits.clone()),
+                self.header_renames
+                    .iter()
+                    .map(|(&column, name)| (column, name.as_bytes().to_vec()))
+                    .collect(),
+                destination,
+            )
+            .map_err(|error| {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                }
+                AppMessage::error(error.to_string())
+            })?;
         self.export_progress = Some(job.progress());
         self.export_job = Some(job);
         self.export_status = Some(
@@ -7697,6 +7775,10 @@ impl Document {
                 Ok(())
             }
             Err(error) => {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                    return Err(SOURCE_CHANGED_NOTICE.into());
+                }
                 self.export_status = Some("Export failed. No output file was created.".into());
                 Err(error.to_string())
             }
@@ -7715,8 +7797,9 @@ impl Document {
     }
 
     fn is_filtered_export_ready(&self) -> bool {
-        self.filter_query.is_some()
-            && !self.has_cell_edits()
+        !self.source_changed
+            && self.filter_query.is_some()
+            && !self.filter_refresh_pending
             && self.filter_job.is_none()
             && self.export_job.is_none()
             && self.save_job.is_none()
@@ -7821,6 +7904,9 @@ impl Document {
             }
             Err(error) => return Err(AppMessage::error(error.to_string())),
         };
+        if self.filter_active() {
+            self.reset_filter_state();
+        }
         self.save_job = Some(job);
         self.save_status = Some("Saving edited file…".into());
         self.save_cancel_requested = false;
@@ -7872,6 +7958,7 @@ impl Document {
         self.index = None;
         self.filter_index = None;
         self.filter_query = None;
+        self.filter_refresh_pending = false;
         self.filter_progress = None;
         self.whitespace.invalidate_rows();
         self.buffered_rows.clear();
@@ -7905,6 +7992,16 @@ impl Document {
         if self.export_job.is_some() {
             return Err("Cancel the active export before clearing filters.".into());
         }
+        self.commit_edits();
+        self.reset_filter_state();
+        if self.available_data_rows() > 0 {
+            self.navigate(self.viewport_start)?;
+        }
+        Ok(())
+    }
+
+    /// Drop filter state without starting a read while a save is being handed off.
+    fn reset_filter_state(&mut self) {
         self.stop_filter_read();
         if let Some(job) = self.filter_job.take() {
             job.cancel();
@@ -7912,6 +8009,7 @@ impl Document {
         }
         self.filter_index = None;
         self.filter_query = None;
+        self.filter_refresh_pending = false;
         self.filter_progress = None;
         self.filter_status = None;
         self.export_progress = None;
@@ -7925,10 +8023,6 @@ impl Document {
         self.selected_rows.clear();
         self.reveal_cell = None;
         self.scroll_points = 0.0;
-        if self.available_data_rows() > 0 {
-            self.navigate(self.viewport_start)?;
-        }
-        Ok(())
     }
 
     fn filter_active(&self) -> bool {
@@ -7936,7 +8030,10 @@ impl Document {
     }
 
     fn is_filter_ready(&self) -> bool {
-        self.total_columns > 0 && self.structural_job.is_none()
+        !self.source_changed
+            && self.total_columns > 0
+            && self.structural_job.is_none()
+            && self.save_job.is_none()
     }
 
     fn filter_progress(&self) -> Option<FilterProgress> {
@@ -8177,8 +8274,6 @@ impl Document {
     fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
         if self.source_changed {
             Some("Reopen the changed source before editing data cells.")
-        } else if self.filter_active() {
-            Some("Clear the filter before editing data cells.")
         } else if self.save_job.is_some()
             || self.export_job.is_some()
             || self.search_job.is_some()
@@ -8196,9 +8291,6 @@ impl Document {
     }
 
     fn begin_cell_edit(&mut self, row: u64, column: usize, source: Vec<u8>) -> Result<(), String> {
-        if self.filter_active() {
-            return Err("Clear the filter before editing data cells.".into());
-        }
         if let Some(reason) = self.cell_edit_disabled_reason(Some(&source)) {
             return Err(reason.into());
         }
@@ -8295,6 +8387,7 @@ impl Document {
                 } else {
                     self.cell_edits.remove(&(row, column));
                 }
+                self.queue_filter_refresh();
             }
         }
     }
@@ -8315,7 +8408,10 @@ impl Document {
     }
 
     fn discard_edits(&mut self) {
-        if self.save_job.is_some() {
+        if self.save_job.is_some() || self.export_job.is_some() || self.structural_job.is_some() {
+            return;
+        }
+        if self.filter_active() && self.clear_filter().is_err() {
             return;
         }
         self.discard_header_edits();
@@ -8369,7 +8465,7 @@ impl Document {
 
     fn history_ready(&self) -> bool {
         !self.source_changed
-            && !self.filter_active()
+            && !self.filter_refresh_pending
             && self.header_edit.is_none()
             && self.cell_edit.is_none()
             && self.search_job.is_none()
@@ -8388,9 +8484,11 @@ impl Document {
     }
 
     fn can_undo_structural(&self) -> bool {
-        self.working_copy
-            .as_ref()
-            .is_some_and(|state| state.undo.is_some())
+        !self.filter_active()
+            && self
+                .working_copy
+                .as_ref()
+                .is_some_and(|state| state.undo.is_some())
             && self.header_renames.is_empty()
             && !self.has_cell_edits()
             && self.header_edit.is_none()
@@ -8401,9 +8499,11 @@ impl Document {
     }
 
     fn can_redo_structural(&self) -> bool {
-        self.working_copy
-            .as_ref()
-            .is_some_and(|state| state.redo.is_some())
+        !self.filter_active()
+            && self
+                .working_copy
+                .as_ref()
+                .is_some_and(|state| state.redo.is_some())
             && self.header_edit.is_none()
             && self.cell_edit.is_none()
             && self.save_job.is_none()
@@ -8548,8 +8648,21 @@ impl Document {
         self.scroll_rows(rows)
     }
 
+    /// Keep controls from clamping a restored page against an incomplete match count.
+    fn filter_waiting_for_page(&self) -> bool {
+        self.filter_refresh_pending
+            || (self.filter_job.is_some()
+                || self.filter_progress.is_some_and(|progress| !progress.done))
+                && self.filter_viewport_start
+                    > max_viewport_start(self.available_filter_rows(), self.visible_rows)
+    }
+
     fn scroll_rows(&mut self, rows: i64) -> Result<(), String> {
         if self.filter_active() {
+            self.commit_edits();
+            if self.filter_waiting_for_page() {
+                return Ok(());
+            }
             let available = self.available_filter_rows();
             let maximum = max_viewport_start(available, self.visible_rows);
             let current = self.filter_viewport_start;
@@ -8580,7 +8693,18 @@ impl Document {
     }
 
     fn navigate_filter(&mut self, requested: u64) -> Result<(), String> {
+        if self.filter_refresh_pending {
+            return Ok(());
+        }
         let available = self.available_filter_rows();
+        let scan_incomplete = self.filter_job.is_some()
+            || self.filter_progress.is_some_and(|progress| !progress.done);
+        if scan_incomplete && requested > max_viewport_start(available, self.visible_rows) {
+            self.cancel_filter_read_for_navigation();
+            self.filter_viewport_start = requested;
+            self.clear_hidden_selection();
+            return Ok(());
+        }
         if available == 0 {
             self.cancel_filter_read_for_navigation();
             self.filter_viewport_start = 0;
@@ -8749,7 +8873,14 @@ impl Document {
         let job = self
             .session
             .start_filtered_read(index, window.start_match, window.count)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                    SOURCE_CHANGED_NOTICE.to_owned()
+                } else {
+                    error.to_string()
+                }
+            })?;
         self.filter_read = Some(ActiveFilterRead {
             window,
             job,
@@ -8816,6 +8947,15 @@ impl Document {
     }
 
     fn source_cell(&self, row: u64, column: usize) -> Option<&[u8]> {
+        if self.filter_active() {
+            return self
+                .filtered_rows
+                .iter()
+                .find(|value| value.row == row)?
+                .fields
+                .get(column)
+                .map(Vec::as_slice);
+        }
         let index = usize::try_from(row.checked_sub(self.buffer_start)?).ok()?;
         self.buffered_rows
             .get(index)?
@@ -9003,6 +9143,9 @@ impl Document {
     fn navigate_grid_position(&mut self, position: u64) -> Result<(), String> {
         self.commit_edits();
         if self.filter_active() {
+            if self.filter_waiting_for_page() {
+                return Ok(());
+            }
             self.navigate_filter(position)
         } else {
             self.navigate(self.data_start.saturating_add(position))
@@ -10366,7 +10509,6 @@ fn show_table(
                                         };
                                         let can_filter = source.is_some()
                                             && document.is_filter_ready()
-                                            && !document.has_cell_edits()
                                             && document.search_job.is_none()
                                             && document.filter_job.is_none()
                                             && document.export_job.is_none();
@@ -10438,8 +10580,14 @@ fn show_table(
                                                 input.key_pressed(egui::Key::Enter)
                                                     || input.key_pressed(egui::Key::F2)
                                             });
+                                        // Keep a click to the next cell from being swallowed by
+                                        // the refresh triggered when the current editor commits.
+                                        let continue_filtered_edit = document.filter_active()
+                                            && active_cell_edit.is_some()
+                                            && response.clicked();
                                         if document.cell_is_editable(source)
-                                            && (response.double_clicked() || keyboard_activate)
+                                            && (response.double_clicked() || keyboard_activate
+                                                || continue_filtered_edit)
                                         {
                                             begin_cell_edit = source.map(|source| {
                                                 (record_row, column, source.to_vec())
@@ -13170,7 +13318,7 @@ mod tests {
             &[
                 ("Apply filters", true),
                 ("Clear filter", false),
-                ("Export Filtered Rows…", true),
+                ("Export Filtered Rows…", false),
             ],
         );
 
@@ -13180,18 +13328,6 @@ mod tests {
         let _ = filter_manager_frame(&mut app, &ctx, vec![], size);
         let (_, output) = filter_manager_frame(&mut app, &ctx, vec![], size);
         check_footer(&output, &[("Apply filters", true), ("Clear filter", true)]);
-        assert!(
-            output
-                .platform_output
-                .accesskit_update
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| {
-                    node.value()
-                        == Some("Save or discard cell edits before filtering the source file.")
-                })
-        );
         app.active.document.as_mut().unwrap().shutdown();
     }
 
@@ -14008,6 +14144,493 @@ mod tests {
     }
 
     #[test]
+    fn failed_save_start_preserves_completed_filter_and_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("save-filter.csv");
+        let destination = directory.path().join("exists.csv");
+        fs::write(
+            &source,
+            format!(
+                "name,status\n{}",
+                (0..100).map(|i| format!("{i},keep\n")).collect::<String>()
+            ),
+        )
+        .unwrap();
+        fs::write(&destination, b"existing").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        commit_test_cell(document, 1, 0, "changed");
+        document.set_visible_rows(5).unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.navigate_filter(50).unwrap();
+        finish_filter_read(document);
+        let edits = document.cell_edits.clone();
+        let rows = document
+            .visible_filter_rows()
+            .iter()
+            .map(|r| r.row)
+            .collect::<Vec<_>>();
+        assert!(document.start_save_as(destination.clone()).is_err());
+        assert!(document.filter_active());
+        assert_eq!(document.filter_viewport_start, 50);
+        assert_eq!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .map(|r| r.row)
+                .collect::<Vec<_>>(),
+            rows
+        );
+        assert_eq!(document.cell_edits, edits);
+        assert_eq!(fs::read(destination).unwrap(), b"existing");
+        document.shutdown();
+    }
+
+    #[test]
+    fn active_filtered_export_blocks_discard_without_losing_overlays() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("discard-filter.csv");
+        let destination = directory.path().join("export.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,drop\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        commit_test_cell(document, 2, 1, "keep");
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.start_filtered_export(destination).unwrap();
+        let edits = document.cell_edits.clone();
+        app.apply(&egui::Context::default(), Action::DiscardChanges);
+        let document = app.active.document.as_mut().unwrap();
+        assert_eq!(
+            document.cell_edits, edits,
+            "discard action must wait for export"
+        );
+        document.discard_edits();
+        assert_eq!(
+            document.cell_edits, edits,
+            "direct discard must wait for export"
+        );
+        assert!(document.filter_active());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while document.export_job.is_some() {
+            document.poll_filtered_export().unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        document.discard_edits();
+        assert!(document.cell_edits.is_empty());
+        assert!(!document.filter_active());
+        assert_eq!(
+            fs::read(source).unwrap(),
+            b"name,status\nAda,keep\nBob,drop\n"
+        );
+        document.shutdown();
+    }
+
+    #[test]
+    fn clicking_another_filtered_cell_continues_editing_after_committing_the_old_cell() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-click-switch.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,keep\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        for _ in 0..3 {
+            let _ = render_grid(&ctx, document);
+            finish_filter_read(document);
+        }
+        document.begin_cell_edit(1, 0, b"Ada".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "Anna".into();
+        let output = render_grid(&ctx, document);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let target = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.contains("column 1") && label.ends_with(": Bob"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing second cell: {:?}",
+                    nodes
+                        .iter()
+                        .filter_map(|(_, node)| node.label())
+                        .collect::<Vec<_>>()
+                )
+            })
+            .0;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target,
+                        data: None,
+                    },
+                )],
+                ..grid_input()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_grid(ui, document).unwrap();
+                });
+            },
+        );
+        let edit = document
+            .cell_edit
+            .as_ref()
+            .expect("clicked cell retains its editor");
+        assert_eq!((edit.row, edit.column, edit.draft.as_str()), (2, 0, "Bob"));
+        assert_eq!(document.cell_edits[&(1, 0)].as_slice(), b"Anna");
+        finish_filter(document);
+        assert_eq!(document.cell_edit.as_ref().unwrap().row, 2);
+        document.shutdown();
+    }
+
+    #[test]
+    fn switching_filtered_editors_keeps_the_next_activation_during_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-editor-switch.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,keep\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.begin_cell_edit(1, 0, b"Ada".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "Anna".into();
+        document.begin_cell_edit(2, 0, b"Bob".to_vec()).unwrap();
+        assert!(document.filter_refresh_pending);
+        let edit = document
+            .cell_edit
+            .as_ref()
+            .expect("second activation retained");
+        assert_eq!((edit.row, edit.column, edit.draft.as_str()), (2, 0, "Bob"));
+        document.cell_edit.as_mut().unwrap().draft = "Bobby".into();
+        document.poll_filter().unwrap();
+        assert_eq!(document.cell_edit.as_ref().unwrap().draft, "Bobby");
+        assert!(!document.cell_edits.contains_key(&(2, 0)));
+        finish_filter(document);
+        assert_eq!(document.cell_edit.as_ref().unwrap().draft, "Bobby");
+        document.commit_cell_edit();
+        finish_filter(document);
+        assert_eq!(document.effective_cell(1, 0), Some(b"Anna".as_slice()));
+        assert_eq!(document.effective_cell(2, 0), Some(b"Bobby".as_slice()));
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"name,status\nAda,keep\nBob,keep\n"
+        );
+        document.shutdown();
+    }
+
+    #[test]
+    fn filtered_export_waits_for_draft_refresh_before_opening_the_picker() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-export-draft.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,keep\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.begin_cell_edit(1, 1, b"keep".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "drop".into();
+        assert!(app.prepare_filtered_export().is_err());
+        let document = app.active.document.as_mut().unwrap();
+        assert!(document.filter_refresh_pending);
+        finish_filter(document);
+        assert_eq!(document.available_filter_rows(), 1);
+        assert_eq!(app.prepare_filtered_export().unwrap(), source);
+        app.active.document.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn incomplete_filter_can_display_a_partial_first_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-partial-first-page.csv");
+        fs::write(
+            &source,
+            format!(
+                "id,status\n{}",
+                (0..100)
+                    .map(|id| format!("{id},keep\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        let complete = document.filter_progress.unwrap();
+        document.stop_filter_read();
+        document.filter_index = Some(
+            document
+                .session
+                .start_filter(FilterQuery::single(
+                    0,
+                    FilterOperator::LessThan,
+                    b"10".to_vec(),
+                ))
+                .unwrap()
+                .wait()
+                .unwrap(),
+        );
+        document.filter_progress = Some(quarry_core::FilterProgress {
+            done: false,
+            matches_found: 10,
+            ..complete
+        });
+        document.filtered_rows.clear();
+        document.set_visible_rows(64).unwrap();
+        finish_filter_read(document);
+        assert_eq!(document.visible_filter_rows().len(), 10);
+        assert_eq!(document.filter_viewport_start, 0);
+        assert!(!document.filter_progress.unwrap().done);
+        document.shutdown();
+    }
+
+    #[test]
+    fn resizing_during_a_partial_filter_refresh_keeps_the_requested_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-resize.csv");
+        fs::write(
+            &source,
+            format!(
+                "id,status\n{}",
+                (0..1000)
+                    .map(|id| format!("{id},keep\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document.set_visible_rows(5).unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.navigate_filter(500).unwrap();
+        finish_filter_read(document);
+        let index = document.filter_index.take().unwrap();
+        let complete = document.filter_progress.unwrap();
+        document.filter_index = Some(
+            document
+                .session
+                .start_filter(FilterQuery::single(
+                    0,
+                    FilterOperator::LessThan,
+                    b"10".to_vec(),
+                ))
+                .unwrap()
+                .wait()
+                .unwrap(),
+        );
+        document.stop_filter_read();
+        document.filtered_rows.clear();
+        document.filter_progress = Some(quarry_core::FilterProgress {
+            done: false,
+            matches_found: 10,
+            ..complete
+        });
+        document.scroll_rows(1).unwrap();
+        assert_eq!(document.filter_viewport_start, 500);
+        document.navigate_grid_position(1).unwrap();
+        assert_eq!(document.filter_viewport_start, 500);
+        document.set_visible_rows(6).unwrap();
+        assert_eq!(document.filter_viewport_start, 500);
+        document.filter_index = Some(index);
+        document.filter_progress = Some(complete);
+        document
+            .navigate_filter(document.filter_viewport_start)
+            .unwrap();
+        finish_filter_read(document);
+        assert_eq!(document.filter_viewport_start, 500);
+        assert_eq!(document.visible_filter_rows()[0].row, 501);
+        document.shutdown();
+    }
+
+    #[test]
+    fn editing_a_later_filtered_page_preserves_its_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-position.csv");
+        fs::write(
+            &source,
+            format!(
+                "id,status\n{}",
+                (0..1000)
+                    .map(|id| format!("{id},keep\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document.set_visible_rows(5).unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.navigate_filter(500).unwrap();
+        finish_filter_read(document);
+        commit_test_cell(document, 501, 0, "edited");
+        finish_filter(document);
+        assert_eq!(document.filter_viewport_start, 500);
+        assert_eq!(document.visible_filter_rows()[0].row, 501);
+        commit_test_cell(document, 501, 1, "drop");
+        finish_filter(document);
+        assert_eq!(document.filter_viewport_start, 500);
+        assert_eq!(document.visible_filter_rows()[0].row, 502);
+        document.navigate_filter(999).unwrap();
+        finish_filter_read(document);
+        let row = document.visible_filter_rows()[0].row;
+        commit_test_cell(document, row, 1, "drop");
+        finish_filter(document);
+        assert_eq!(
+            document.filter_viewport_start,
+            document.available_filter_rows() - 5
+        );
+        document.shutdown();
+    }
+
+    #[test]
+    fn edited_filtered_rows_refresh_and_history_keeps_source_row_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("working-filter.csv");
+        let original = b"id,state\n1,keep\n2,drop\n3,keep\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.active.header_mode = HeaderMode::FirstRow;
+        app.open_path(source.clone()).unwrap();
+        let document = app.active.document.as_mut().unwrap();
+        commit_test_cell(document, 2, 1, "keep");
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        assert_eq!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .map(|row| row.row)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(document.source_cell(2, 1), Some(b"drop".as_slice()));
+        assert_eq!(document.effective_cell(2, 1), Some(b"keep".as_slice()));
+        commit_test_cell(document, 2, 1, "drop");
+        assert!(document.filtered_rows.is_empty()); // old rows cannot be adopted during refresh
+        assert!(!document.is_filtered_export_ready());
+        finish_filter(document);
+        assert_eq!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .map(|row| row.row)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(document.start_find_next(b"keep").is_err());
+        app.swap_edit_history(false).unwrap();
+        let document = app.active.document.as_mut().unwrap();
+        finish_filter(document);
+        assert_eq!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .map(|row| row.row)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        app.swap_edit_history(true).unwrap();
+        let document = app.active.document.as_mut().unwrap();
+        finish_filter(document);
+        assert_eq!(
+            document
+                .visible_filter_rows()
+                .iter()
+                .map(|row| row.row)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        commit_test_cell(document, 3, 0, "changed-id");
+        finish_filter(document);
+        document.rename_header(0, "identifier".into()).unwrap();
+        let export = directory.path().join("filtered.csv");
+        document.start_filtered_export(export.clone()).unwrap();
+        finish_filtered_export(document);
+        assert_eq!(
+            fs::read(export).unwrap(),
+            b"identifier,state\n1,keep\nchanged-id,keep\n"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(document.is_dirty());
+        let saved = directory.path().join("saved.csv");
+        document.start_save_as(saved.clone()).unwrap();
+        assert!(!document.filter_active());
+        while document.poll_save().unwrap().is_none() {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            fs::read(saved).unwrap(),
+            b"identifier,state\n1,keep\n2,drop\nchanged-id,keep\n"
+        );
+        assert_eq!(fs::read(source).unwrap(), original);
+        document.shutdown();
+    }
+
+    #[test]
     fn filtered_export_control_is_accessible_only_for_a_completed_active_filter() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -14379,16 +15002,16 @@ mod tests {
         finish_search(&mut document);
         let found = document.last_match.as_ref().unwrap();
         assert_eq!((found.row, found.column), (1, 0));
-        assert_eq!(
-            document
-                .start_filter(FilterQuery::single(
-                    0,
-                    FilterOperator::Contains,
-                    b"first".to_vec(),
-                ))
-                .unwrap_err(),
-            "Save or discard cell edits before filtering the source file."
-        );
+        document
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Contains,
+                b"first".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(&mut document);
+        assert_eq!(document.available_filter_rows(), 1);
+        document.clear_filter().unwrap();
 
         document.set_column_shown(1, false).unwrap();
         document.set_column_shown(1, true).unwrap();
@@ -14505,8 +15128,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap_err(),
-            "Clear the filter before editing data cells."
+            "Wait for the active file operation before editing data cells."
         );
+        finish_filter(&mut document);
+        document.begin_cell_edit(1, 1, b"1".to_vec()).unwrap();
 
         document.shutdown();
         fs::remove_file(path).unwrap();
@@ -14821,6 +15446,37 @@ mod tests {
     }
 
     #[test]
+    fn filtered_page_start_freezes_a_changed_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-source-change.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,keep\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.stop_filter_read();
+        fs::write(&source, b"name,status\nChanged,keep\n").unwrap();
+        assert!(
+            document
+                .start_filter_read(super::FilterReadWindow {
+                    start_match: 0,
+                    count: 1
+                })
+                .is_err()
+        );
+        assert!(document.source_changed);
+        assert!(document.filter_index.is_none());
+        assert!(document.filtered_rows.is_empty());
+        assert!(!document.filter_active());
+    }
+
+    #[test]
     fn source_change_conflict_freezes_stale_navigation_until_reopen() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -14950,7 +15606,7 @@ mod tests {
                 .unwrap()
                 .start_filtered_export(destination.clone())
                 .unwrap_err(),
-            "Save or discard your changes before exporting filtered rows."
+            "Apply a filter before exporting rows."
         );
 
         app.active
@@ -18723,14 +19379,10 @@ mod tests {
     }
 
     #[test]
-    fn data_cell_context_menu_copies_and_filters_the_full_clicked_value() {
+    fn data_cell_context_menu_copies_and_filters_the_full_clicked_unsaved_value() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("cell-context-menu.csv");
-        fs::write(
-            &source,
-            b"name,note\nalpha,\"line one\nline two\"\nbeta,other\n",
-        )
-        .unwrap();
+        fs::write(&source, b"name,note\nalpha,source\nbeta,other\n").unwrap();
         let mut document = Document::open(
             &source,
             OpenOptions {
@@ -18740,6 +19392,7 @@ mod tests {
         )
         .unwrap();
         finish_index(&mut document);
+        commit_test_cell(&mut document, 1, 1, "line one\nline two");
 
         let _ = click_grid_control("Select row 2, column 1 (name): beta", &mut document);
         assert!(matches!(
