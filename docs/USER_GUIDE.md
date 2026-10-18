@@ -479,13 +479,18 @@ to all data rows in the selected columns.
 
 Choose one operation:
 
-- **Trim whitespace** removes surrounding Unicode whitespace, including spaces,
-  tabs, non-breaking spaces and line breaks. Internal spacing is unchanged.
+- **Trim leading/trailing whitespace** removes surrounding Unicode whitespace,
+  including spaces, tabs, non-breaking spaces and line breaks. Internal spacing
+  is unchanged.
+- **Collapse repeated spaces** replaces each run of two or more ordinary spaces
+  with one space: `Los  Angeles` becomes `Los Angeles`. Tabs, line breaks and
+  special spaces are unchanged. Runs at the beginning or end become one space;
+  use **Trim leading/trailing whitespace** to remove those edge spaces completely.
 - **Uppercase** and **Lowercase** use Unicode case conversion without language
   inference or transliteration.
 - **Fill Empty Cells** fills existing zero-length fields with the entered value.
   Fields containing only spaces and missing fields in short rows are unchanged.
-  To fill whitespace-only fields too, run Trim first.
+  To fill whitespace-only fields too, run **Trim leading/trailing whitespace** first.
 
 The before/after preview is a bounded sample of loaded rows, not a scan of the
 whole file. Large values can be omitted from the preview; Apply still processes

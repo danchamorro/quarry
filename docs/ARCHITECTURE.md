@@ -536,7 +536,9 @@ previous logical source unchanged.
 
 Cleanup shares the guarded streaming save worker and private working-copy
 handoff. A selected-column request carries sorted physical column identities and
-one operation: Unicode Trim, Uppercase, Lowercase or Fill Empty Cells. Missing
+one operation: Unicode Trim, Collapse repeated spaces, Uppercase, Lowercase or
+Fill Empty Cells. Collapse replaces runs of U+0020 with one U+0020, retaining
+other whitespace and requiring no allocation for unchanged fields. Missing
 fields stay absent; the header is never cleaned. Pending cell values are applied
 before transformation.
 

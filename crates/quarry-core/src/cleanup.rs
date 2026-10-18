@@ -4,15 +4,18 @@ use crate::{MAX_TRANSFORMATION_COLUMNS, QuarryError};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CleanupOperation {
     Trim,
+    CollapseSpaces,
     Uppercase,
     Lowercase,
     FillEmpty(Vec<u8>),
 }
 
 impl CleanupOperation {
+    /// Human-readable operation name shared by cleanup controls and messages.
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Trim => "Trim whitespace",
+            Self::Trim => "Trim leading/trailing whitespace",
+            Self::CollapseSpaces => "Collapse repeated spaces",
             Self::Uppercase => "Uppercase",
             Self::Lowercase => "Lowercase",
             Self::FillEmpty(_) => "Fill Empty Cells",
@@ -41,6 +44,26 @@ impl CleanupOperation {
         if matches!(self, Self::Trim) {
             let trimmed = text.trim();
             return Ok((trimmed.len() != value.len()).then(|| trimmed.as_bytes().to_vec()));
+        }
+        if matches!(self, Self::CollapseSpaces) {
+            // Only U+0020 spaces collapse. Keep all other UTF-8 bytes unchanged,
+            // and avoid allocating at all for values without repeated spaces.
+            let Some(first) = value.windows(2).position(|pair| pair == b"  ") else {
+                return Ok(None);
+            };
+            let mut result = Vec::with_capacity(value.len() - 1);
+            result.extend_from_slice(&value[..=first]);
+            let mut previous_space = true;
+            for &byte in &value[first + 1..] {
+                if byte != b' ' || !previous_space {
+                    result.push(byte);
+                }
+                previous_space = byte == b' ';
+            }
+            if result.len() > limit {
+                return Err(QuarryError::RecordTooLarge { limit });
+            }
+            return Ok(Some(result));
         }
         // str::to_lowercase includes contextual mappings such as Greek final sigma.
         // Unicode case mapping expands at most three scalars per input scalar;
@@ -155,6 +178,56 @@ mod tests {
                 .unwrap(),
             Some("ος".as_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn collapse_spaces_preserves_other_whitespace_and_collapses_each_run() {
+        let operation = CleanupOperation::CollapseSpaces;
+        assert_eq!(operation.label(), "Collapse repeated spaces");
+        for (input, expected) in [
+            ("Los  Angeles", "Los Angeles"),
+            ("  New   York  ", " New York "),
+            ("   ", " "),
+            (
+                "é  界\t\tA\r\n  B\u{a0}\u{a0}C\u{2003}\u{2003}D",
+                "é 界\t\tA\r\n B\u{a0}\u{a0}C\u{2003}\u{2003}D",
+            ),
+        ] {
+            assert_eq!(
+                operation.clean_value(input.as_bytes(), 1, 1, 1024).unwrap(),
+                Some(expected.as_bytes().to_vec())
+            );
+        }
+        for input in ["", " ", "New York", "\t\t\r\n", "\u{a0}\u{a0}", " \t "] {
+            assert_eq!(
+                operation.clean_value(input.as_bytes(), 1, 1, 1024).unwrap(),
+                None
+            );
+        }
+        assert!(matches!(
+            operation.clean_value(b"a  \xff", 7, 3, 1024),
+            Err(QuarryError::InvalidCleanupText {
+                data_row: 7,
+                column: 3
+            })
+        ));
+        assert!(matches!(
+            operation.clean_value(b"long  value", 1, 1, 3),
+            Err(QuarryError::RecordTooLarge { limit: 3 })
+        ));
+        let mut huge = vec![b' '; 1024 * 1024];
+        huge.extend_from_slice(b"x  y");
+        assert_eq!(
+            operation.clean_value(&huge, 1, 1, huge.len()).unwrap(),
+            Some(b" x y".to_vec())
+        );
+        let cleanup = ColumnCleanup {
+            columns: vec![0, 1, 2],
+            operation,
+        };
+        let mut fields = vec![b"a   b  c".to_vec(), vec![]];
+        assert_eq!(cleanup.apply_to_fields(&mut fields, 1, 1024).unwrap(), 1);
+        assert_eq!(fields, vec![b"a b c".to_vec(), vec![]]);
     }
 
     #[test]

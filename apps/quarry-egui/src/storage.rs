@@ -24,10 +24,12 @@ pub(super) enum PendingStorageOperation {
 }
 
 impl PendingStorageOperation {
+    /// Describes the pending action in the temporary-storage review.
     fn action_name(&self) -> &'static str {
         match self {
             Self::Structural(dialog) => match dialog.request {
                 StructuralRequest::CleanupTrim
+                | StructuralRequest::CleanupCollapseSpaces
                 | StructuralRequest::CleanupUppercase
                 | StructuralRequest::CleanupLowercase
                 | StructuralRequest::CleanupFill => "clean up columns",
@@ -52,11 +54,13 @@ impl PendingStorageOperation {
         !matches!(self, Self::Save(_) | Self::Export(_))
     }
 
+    /// Conservatively estimates additional disk space for the pending action.
     fn allowance(&self, document: &Document) -> u64 {
         let plain = || document.materialization_storage_estimate(None, None);
         match self {
             Self::Structural(dialog) => match dialog.request {
                 StructuralRequest::CleanupTrim
+                | StructuralRequest::CleanupCollapseSpaces
                 | StructuralRequest::CleanupUppercase
                 | StructuralRequest::CleanupLowercase
                 | StructuralRequest::CleanupFill => document.materialization_storage_estimate(

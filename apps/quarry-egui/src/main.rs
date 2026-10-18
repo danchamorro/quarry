@@ -414,6 +414,7 @@ struct FilterRuleDraft {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StructuralRequest {
     CleanupTrim,
+    CleanupCollapseSpaces,
     CleanupUppercase,
     CleanupLowercase,
     CleanupFill,
@@ -427,10 +428,15 @@ enum StructuralRequest {
 }
 
 impl StructuralRequest {
+    /// Identifies operations using the selected-column cleanup workflow.
     fn is_cleanup(self) -> bool {
         matches!(
             self,
-            Self::CleanupTrim | Self::CleanupUppercase | Self::CleanupLowercase | Self::CleanupFill
+            Self::CleanupTrim
+                | Self::CleanupCollapseSpaces
+                | Self::CleanupUppercase
+                | Self::CleanupLowercase
+                | Self::CleanupFill
         )
     }
 }
@@ -462,11 +468,13 @@ impl StructuralDialog {
             ..Self::sort(0)
         }
     }
+    /// Builds the selected cleanup operation for the physical file columns.
     fn cleanup(&self) -> ColumnCleanup {
         ColumnCleanup {
             columns: self.columns.clone(),
             operation: match self.request {
                 StructuralRequest::CleanupTrim => CleanupOperation::Trim,
+                StructuralRequest::CleanupCollapseSpaces => CleanupOperation::CollapseSpaces,
                 StructuralRequest::CleanupUppercase => CleanupOperation::Uppercase,
                 StructuralRequest::CleanupLowercase => CleanupOperation::Lowercase,
                 StructuralRequest::CleanupFill => {
@@ -1254,6 +1262,7 @@ impl QuarryApp {
             .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
             .and_then(|document| match dialog.request {
                 StructuralRequest::CleanupTrim
+                | StructuralRequest::CleanupCollapseSpaces
                 | StructuralRequest::CleanupUppercase
                 | StructuralRequest::CleanupLowercase
                 | StructuralRequest::CleanupFill => document.start_cleanup(dialog.cleanup()),
@@ -3853,6 +3862,7 @@ fn parse_insertion_position(input: &str, size: u64) -> Result<u64, String> {
         .ok_or_else(|| format!("Enter a position between 1 and {last}."))
 }
 
+/// Shows cleanup controls and a bounded sample without starting the write job.
 fn show_cleanup_dialog(
     ctx: &egui::Context,
     dialog: &mut StructuralDialog,
@@ -3877,7 +3887,8 @@ fn show_cleanup_dialog(
             ui.label("Operation");
             ui.horizontal_wrapped(|ui| {
                 for (request, name) in [
-                    (StructuralRequest::CleanupTrim, "Trim whitespace"),
+                    (StructuralRequest::CleanupTrim, "Trim leading/trailing whitespace"),
+                    (StructuralRequest::CleanupCollapseSpaces, "Collapse repeated spaces"),
                     (StructuralRequest::CleanupUppercase, "Uppercase"),
                     (StructuralRequest::CleanupLowercase, "Lowercase"),
                     (StructuralRequest::CleanupFill, "Fill Empty Cells"),
@@ -3893,7 +3904,9 @@ fn show_cleanup_dialog(
                 let _ = ctx.accesskit_node_builder(input.id, |node| node.set_label("Fill value"));
                 ui.weak("Only existing empty fields are filled. Spaces and missing fields stay unchanged.");
             } else if dialog.request == StructuralRequest::CleanupTrim {
-                ui.weak("Remove surrounding spaces, tabs and line breaks. Keep internal spacing.");
+                ui.weak("Remove whitespace at the beginning and end of each cell. Keep spaces, tabs and line breaks inside.");
+            } else if dialog.request == StructuralRequest::CleanupCollapseSpaces {
+                ui.weak("Replace two or more ordinary spaces with one space. Keep tabs, line breaks and special spaces.");
             } else {
                 ui.weak("Unicode case conversion. No language-specific rules or transliteration.");
             }
@@ -4051,7 +4064,7 @@ fn show_structural_dialog(
         }
         ui.add_space(6.0);
         match dialog.request {
-            StructuralRequest::CleanupTrim | StructuralRequest::CleanupUppercase | StructuralRequest::CleanupLowercase | StructuralRequest::CleanupFill => unreachable!("cleanup rendered separately"),
+            StructuralRequest::CleanupTrim | StructuralRequest::CleanupCollapseSpaces | StructuralRequest::CleanupUppercase | StructuralRequest::CleanupLowercase | StructuralRequest::CleanupFill => unreachable!("cleanup rendered separately"),
             StructuralRequest::InsertRows | StructuralRequest::InsertColumns => {
                 let rows = dialog.request == StructuralRequest::InsertRows;
                 let position_label = if rows { "Insert before data row" } else { "Insert before file column" };
@@ -21664,7 +21677,8 @@ mod tests {
         });
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         for label in [
-            "Trim whitespace",
+            "Trim leading/trailing whitespace",
+            "Collapse repeated spaces",
             "Uppercase",
             "Lowercase",
             "Fill Empty Cells",
@@ -21707,6 +21721,146 @@ mod tests {
         );
         assert!(document.structural_job.is_none());
         assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn cleanup_dialog_collapse_spaces_updates_values_history_and_indicators() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("collapse.csv");
+        let original = b"city,other\nLos  Angeles,keep  this\nNew York,\n";
+        fs::write(&path, original).unwrap();
+        let mut app = individual_edit_app(&path);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        commit_test_cell(app.active.document.as_mut().unwrap(), 1, 0, "Los   Angeles");
+        settle_whitespace(&ctx, app.active.document.as_mut().unwrap());
+        app.open_structural_dialog(StructuralDialog::cleanup_columns(vec![0]));
+        let render = |app: &mut QuarryApp, events| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    ..grid_input()
+                },
+                |ctx| {
+                    let _ = super::show_cleanup_dialog(
+                        ctx,
+                        app.active.structural_dialog.as_mut().unwrap(),
+                        app.active.document.as_ref().unwrap(),
+                    );
+                },
+            )
+        };
+        let output = render(&mut app, vec![]);
+        let target = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Collapse repeated spaces"))
+            .expect("cleanup must expose Collapse repeated spaces")
+            .0;
+        let _ = render(
+            &mut app,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target,
+                    data: None,
+                },
+            )],
+        );
+        let dialog = app.active.structural_dialog.as_ref().unwrap();
+        assert_eq!(
+            dialog.cleanup().operation.label(),
+            "Collapse repeated spaces"
+        );
+        let preview =
+            super::cleanup_preview(app.active.document.as_ref().unwrap(), &dialog.cleanup());
+        assert!(
+            preview
+                .lines
+                .iter()
+                .any(|line| line.contains("before \"Los   Angeles\"; after \"Los Angeles\""))
+        );
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let expected = b"city,other\nLos Angeles,keep  this\nNew York,\n";
+        let document = app.active.document.as_mut().unwrap();
+        assert_eq!(fs::read(document.session.path()).unwrap(), expected);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            app.active
+                .footer_status
+                .as_ref()
+                .unwrap()
+                .contains("Cleaned 1 cell")
+        );
+        let output = settle_whitespace(&ctx, document);
+        let description = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.starts_with("Select row 1, column 1"))
+            })
+            .unwrap()
+            .1
+            .description()
+            .unwrap()
+            .to_owned();
+        assert!(
+            description.contains("Ordinary single spaces"),
+            "{description}"
+        );
+        let summary = document
+            .whitespace
+            .get(
+                super::whitespace::CellId {
+                    row: Some(1),
+                    column: 0,
+                },
+                11,
+                || panic!("expected completed inspection"),
+            )
+            .unwrap();
+        assert!(
+            !summary.indicated(false),
+            "the subtle whitespace triangle must clear"
+        );
+        assert!(
+            summary.indicated(true),
+            "Show All still marks the remaining single space"
+        );
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .cell_edits
+                .get(&(1, 0))
+                .unwrap()
+                .as_slice(),
+            b"Los   Angeles",
+        );
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let saved = directory.path().join("saved.csv");
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_save_as(saved.clone())
+            .unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        finish_app_save(&mut app, &ctx, &mut frame);
+        assert_eq!(fs::read(saved).unwrap(), expected);
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 
     #[test]
