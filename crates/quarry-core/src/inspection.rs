@@ -1649,6 +1649,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    /// Recovery preserves confidentiality when copying an owner-only source.
     fn recovery_copy_does_not_widen_source_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

@@ -2092,6 +2092,35 @@ pub(crate) struct ExportTarget {
     additional_sources: Vec<(PathBuf, SourceStamp)>,
 }
 
+/// Removes inherited macOS ACL grants from newly created staging objects.
+/// The open descriptor keeps this operation bound to the object being written.
+#[cfg(target_os = "macos")]
+fn clear_inherited_acl(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+        fn acl_set_fd(fd: libc::c_int, acl: *mut libc::c_void) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: zero requests an initialized, empty ACL. A null result is checked.
+    let acl = unsafe { acl_init(0) };
+    if acl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is live and the ACL remains allocated for this call.
+    let status = unsafe { acl_set_fd(file.as_raw_fd(), acl) };
+    let result = if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    // SAFETY: acl_init allocated this object and it has not been freed.
+    unsafe { acl_free(acl) };
+    result
+}
+
 impl ExportTarget {
     pub(crate) fn new_combined(
         sources: Vec<(PathBuf, SourceStamp)>,
@@ -2236,6 +2265,7 @@ impl ExportTarget {
         }
     }
 
+    /// Reserves private staging on the destination volume before writing any CSV data.
     fn create(destination: PathBuf, publication: Publication) -> Result<Self, QuarryError> {
         let parent = destination
             .parent()
@@ -2273,6 +2303,11 @@ impl ExportTarget {
         let staging_parent = private_directory
             .as_ref()
             .map_or(parent, |directory| directory.path());
+        #[cfg(target_os = "macos")]
+        clear_inherited_acl(
+            &File::open(staging_parent).map_err(|error| storage_error(parent, error))?,
+        )
+        .map_err(|error| storage_error(parent, error))?;
         for _ in 0..100 {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let temporary =
@@ -2302,6 +2337,12 @@ impl ExportTarget {
                         | Publication::GuardedCreateNew { .. }
                         | Publication::GuardedCreateWorkingCopy { .. } => None,
                     };
+                    #[cfg(target_os = "macos")]
+                    if let Err(error) = clear_inherited_acl(&file) {
+                        drop(file);
+                        let _ = fs::remove_file(&temporary);
+                        return Err(storage_error(parent, error));
+                    }
                     if let Some(permissions) = permissions
                         && let Err(error) = file.set_permissions(permissions)
                     {
@@ -7560,6 +7601,7 @@ mod tests {
     }
 
     #[test]
+    /// Cancellation removes private staging without changing the original file.
     fn cancelled_save_before_publication_preserves_the_source() {
         let source = fixture(b"original");
         let source_file = File::open(&source).unwrap();
@@ -9243,6 +9285,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    /// Shared destination folders must not expose new or replacement staging files.
     fn export_staging_is_private_in_shared_destination_directories() {
         for replace in [false, true] {
             let directory = tempfile::tempdir().unwrap();
@@ -9279,6 +9322,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    /// New exports remain owner-only even when the destination directory is shared.
     fn new_export_files_do_not_gain_group_or_other_permissions() {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
@@ -9301,5 +9345,45 @@ mod tests {
             0o600,
         );
         assert_eq!(fs::read(source).unwrap(), bytes);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    /// Inherited macOS access grants cannot override private staging or output modes.
+    fn inherited_acl_cannot_share_staging_or_new_output() {
+        use std::process::Command;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("private.csv");
+        fs::write(&source, b"name,id\nAlice,1\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Command::new("/bin/chmod")
+            .args(["+a", "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
+            .arg(directory.path()).status().unwrap().success());
+        let acl_listing = |path: &std::path::Path| {
+            let output = Command::new("/bin/ls")
+                .arg("-lde")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert!(acl_listing(directory.path()).contains("group:everyone"));
+        let destination = directory.path().join("copy.csv");
+        let mut output = ExportTarget::new(&source, destination.clone()).unwrap();
+        let staging_directory = output.temporary.parent().unwrap();
+        assert!(
+            !acl_listing(staging_directory).contains("group:everyone"),
+            "private staging inherited an access grant from the shared folder"
+        );
+        assert!(!acl_listing(&output.temporary).contains("group:everyone"));
+        output.write_raw_all(b"name,id\nAlice,1\n").unwrap();
+        output.publish(2, 16, &AtomicBool::new(false)).unwrap();
+        assert!(!acl_listing(&destination).contains("group:everyone"));
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&destination).unwrap(), fs::read(&source).unwrap());
+        assert!(temporary_exports(&destination).is_empty());
     }
 }
