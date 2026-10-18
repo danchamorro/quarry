@@ -92,6 +92,13 @@ impl RecordScanner {
         })
     }
 
+    /// Scan bytes whose encoding has no UTF-8 signature (for example a legacy code page).
+    pub fn at_offset_without_bom(delimiter: u8, record_start: u64) -> Result<Self, ParseError> {
+        let mut scanner = Self::at_offset(delimiter, record_start)?;
+        scanner.bom_checked = true;
+        Ok(scanner)
+    }
+
     pub fn record_start(&self) -> u64 {
         self.record_start
     }

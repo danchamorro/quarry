@@ -1,13 +1,11 @@
 //! Capacity checks are advisory; every writer still cleans up on a later error.
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-use quarry_delimited::RecordScanner;
 
 use crate::{ColumnTransformation, LiteralReplacement, QuarryError};
 
@@ -319,6 +317,7 @@ pub const fn estimate_duplicate_temporary_bytes(
 
 /// Count logical records without retaining them, then rewind for the operation.
 /// This avoids assuming a byte is a row and rejecting ordinary large files.
+#[cfg(test)]
 pub(crate) fn count_records(
     source: &mut File,
     delimiter: u8,
@@ -327,22 +326,33 @@ pub(crate) fn count_records(
     count_records_with_progress(source, delimiter, cancel, |_| {})
 }
 
+#[cfg(test)]
 pub(crate) fn count_records_with_progress(
     source: &mut File,
     delimiter: u8,
     cancel: &AtomicBool,
+    progress: impl FnMut(u64),
+) -> Result<Option<u64>, QuarryError> {
+    count_records_encoded(source, delimiter, crate::Encoding::Utf8, cancel, progress)
+}
+
+pub(crate) fn count_records_encoded(
+    source: &mut File,
+    delimiter: u8,
+    encoding: crate::Encoding,
+    cancel: &AtomicBool,
     mut progress: impl FnMut(u64),
 ) -> Result<Option<u64>, QuarryError> {
     source.seek(SeekFrom::Start(0))?;
-    let mut scanner = RecordScanner::new(delimiter)?;
-    let mut chunk = vec![0; crate::DEFAULT_READ_CHUNK];
+    let mut scanner = crate::encoding::RecordScanner::new(delimiter, encoding)?;
+    let mut chunk = vec![0; encoding.chunk_size(crate::DEFAULT_READ_CHUNK)];
     let mut offset = 0;
     let mut records = 0_u64;
     loop {
         if cancel.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let read = source.read(&mut chunk)?;
+        let read = encoding.read_chunk(source, &mut chunk)?;
         if read == 0 {
             scanner.finish(offset, |_| records = records.saturating_add(1))?;
             source.seek(SeekFrom::Start(0))?;

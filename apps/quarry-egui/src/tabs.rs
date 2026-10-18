@@ -23,7 +23,8 @@ pub(super) struct DocumentTab {
     pub(super) filters_open: bool,
     pub(super) delimiter_mode: DelimiterMode,
     pub(super) header_mode: HeaderMode,
-    pub(super) format_draft: Option<(DelimiterMode, HeaderMode)>,
+    pub(super) encoding_mode: Option<Encoding>,
+    pub(super) format_draft: Option<(DelimiterMode, HeaderMode, Option<Encoding>)>,
     pub(super) document: Option<Document>,
     pub(super) notice: Option<AppMessage>,
     pub(super) footer_status: Option<AppMessage>,
@@ -58,6 +59,7 @@ impl DocumentTab {
             filters_open: false,
             delimiter_mode: DelimiterMode::Auto,
             header_mode: HeaderMode::Auto,
+            encoding_mode: None,
             format_draft: None,
             document: None,
             notice: None,
@@ -362,6 +364,15 @@ impl QuarryApp {
         path: PathBuf,
         options: OpenOptions,
     ) -> Result<(), AppMessage> {
+        self.open_document_tab_with_encoding(path, options, None)
+    }
+
+    pub(super) fn open_document_tab_with_encoding(
+        &mut self,
+        path: PathBuf,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+    ) -> Result<(), AppMessage> {
         if self.quit_pending
             || self.active.close_confirmation_open
             || self.active.close_after_save
@@ -402,7 +413,8 @@ impl QuarryApp {
                 "Quarry supports eight open tabs. Close a tab before opening another file.",
             ));
         }
-        let mut document = Document::prepare(&path, options).map_err(AppMessage::error)?;
+        let mut document =
+            Document::prepare_with_encoding(&path, options, encoding).map_err(AppMessage::error)?;
         document.working_directory = self.working_directory.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
@@ -415,6 +427,7 @@ impl QuarryApp {
             .find(|mode| mode.delimiter() == options.delimiter)
             .unwrap_or(DelimiterMode::Auto);
         tab.header_mode = options.header_mode;
+        tab.encoding_mode = encoding;
         tab.document = Some(document);
         let previous = std::mem::replace(&mut self.active, tab);
         self.pending_tab_focus = true;

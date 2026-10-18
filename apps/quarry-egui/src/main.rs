@@ -33,14 +33,14 @@ use quarry_core::SearchProgress;
 use quarry_core::{
     CaseSensitivity, CleanupJob, CleanupOperation, CleanupOutcome, ColumnCleanup,
     ColumnTransformation, CompletedIndex, DateTimeFormat, DuplicateJob, DuplicateOutcome,
-    DuplicateSpec, DuplicateSummary, FilterExportJob, FilterExportOutcome, FilterExportProgress,
-    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
-    FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob,
-    IndexProgress, LiteralReplacement, MAX_SORT_KEYS, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
-    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome,
-    SaveAsProgress, SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection,
-    SortJob, SortMode, SortOutcome, SortPlan, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
-    StructuralIndex,
+    DuplicateSpec, DuplicateSummary, Encoding, FilterExportJob, FilterExportOutcome,
+    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
+    FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
+    IndexJob, IndexProgress, LiteralReplacement, MAX_SORT_KEYS, MAX_TRANSFORMATION_COLUMNS,
+    OpenOptions, QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob,
+    SaveAsOutcome, SaveAsProgress, SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session,
+    SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SortSpec, SplitAnalysisJob,
+    SplitAnalysisOutcome, StructuralIndex,
 };
 use tempfile::TempDir;
 
@@ -692,7 +692,22 @@ impl QuarryApp {
         path: PathBuf,
         options: OpenOptions,
     ) -> Result<(), AppMessage> {
-        let mut document = Document::prepare(&path, options).map_err(AppMessage::error)?;
+        let encoding = self
+            .active
+            .document
+            .as_ref()
+            .map(|doc| doc.session.encoding());
+        self.replace_document_with_encoding(path, options, encoding)
+    }
+
+    fn replace_document_with_encoding(
+        &mut self,
+        path: PathBuf,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+    ) -> Result<(), AppMessage> {
+        let mut document =
+            Document::prepare_with_encoding(&path, options, encoding).map_err(AppMessage::error)?;
         document.working_directory = self.working_directory.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
@@ -707,6 +722,7 @@ impl QuarryApp {
         self.active.filter_rules = vec![FilterRuleDraft::default()];
         self.active.filters_open = false;
         self.active.format_draft = None;
+        self.active.encoding_mode = encoding;
         self.active.document = Some(document);
         self.active.footer_status = None;
         Ok(())
@@ -727,6 +743,23 @@ impl QuarryApp {
     }
 
     /// Sends all selected native file-picker paths through the multi-file open policy.
+    fn choose_file_with_encoding(&mut self, encoding: Encoding) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .set_title(format!("Open as {}", encoding.label()))
+            .pick_files()
+        {
+            for path in paths {
+                if let Err(error) = self.open_document_tab_with_encoding(
+                    path,
+                    OpenOptions::default(),
+                    Some(encoding),
+                ) {
+                    self.active.notice = Some(error);
+                }
+            }
+        }
+    }
+
     fn choose_file(&mut self) {
         if let Some(paths) = rfd::FileDialog::new()
             .set_title("Open delimited files")
@@ -777,12 +810,20 @@ impl QuarryApp {
 
     /// Chooses a destination for this tab; false means no save or review was started.
     fn choose_save_as(&mut self) -> bool {
+        self.choose_save_as_format(false)
+    }
+
+    fn choose_save_as_utf8(&mut self) -> bool {
+        self.choose_save_as_format(true)
+    }
+
+    fn choose_save_as_format(&mut self, utf8: bool) -> bool {
         let Some(document) = self.active.document.as_mut() else {
             self.active.notice = Some(AppMessage::warning("Open a file before using Save As."));
             return false;
         };
         document.commit_edits();
-        if !document.is_save_as_ready() {
+        if !(document.is_save_as_ready() || utf8 && document.save_operations_ready()) {
             self.active.notice = Some(AppMessage::warning(if document.save_job.is_some() {
                 "A save operation is already running."
             } else if document.export_job.is_some() {
@@ -796,12 +837,16 @@ impl QuarryApp {
         }
         let source = document.logical_path.clone();
         let mut dialog = rfd::FileDialog::new()
-            .set_title("Save edited file as")
+            .set_title(if utf8 {
+                "Save a UTF-8 copy"
+            } else {
+                "Save edited file as"
+            })
             .set_file_name(save_as_file_name(&source));
         if let Some(parent) = source.parent() {
             dialog = dialog.set_directory(parent);
         }
-        self.save_as_picker_result(dialog.save_file())
+        self.save_as_picker_result_format(dialog.save_file(), utf8)
     }
 
     /// Starts an in-place save or storage review on the active tab, subject to job limits.
@@ -824,6 +869,10 @@ impl QuarryApp {
 
     /// Rejects cross-tab destinations, then starts or reviews this tab's Save As.
     fn save_as_picker_result(&mut self, destination: Option<PathBuf>) -> bool {
+        self.save_as_picker_result_format(destination, false)
+    }
+
+    fn save_as_picker_result_format(&mut self, destination: Option<PathBuf>, utf8: bool) -> bool {
         let Some(destination) = destination else {
             return false;
         };
@@ -833,7 +882,12 @@ impl QuarryApp {
             ));
             return false;
         }
-        if self.defer_storage(PendingStorageOperation::Save(Some(destination.clone()))) {
+        let operation = if utf8 {
+            PendingStorageOperation::SaveUtf8(destination.clone())
+        } else {
+            PendingStorageOperation::Save(Some(destination.clone()))
+        };
+        if self.defer_storage(operation) {
             return self.active.storage_review.is_some();
         }
         let result = self
@@ -841,7 +895,13 @@ impl QuarryApp {
             .document
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before using Save As."))
-            .and_then(|document| document.start_save_as(destination.clone()));
+            .and_then(|document| {
+                if utf8 {
+                    document.start_save_operation_format(Some(destination.clone()), true)
+                } else {
+                    document.start_save_as(destination.clone())
+                }
+            });
         self.active.notice = result.err();
         if self.active.notice.is_none() {
             self.active.write_destination = Some(destination);
@@ -878,7 +938,17 @@ impl QuarryApp {
     }
 
     /// Applies a format draft by guarded replacement of only the active document.
+    #[cfg(test)]
     fn reopen_document(&mut self, delimiter_mode: DelimiterMode, header_mode: HeaderMode) {
+        self.reopen_document_with_encoding(delimiter_mode, header_mode, self.active.encoding_mode);
+    }
+
+    fn reopen_document_with_encoding(
+        &mut self,
+        delimiter_mode: DelimiterMode,
+        header_mode: HeaderMode,
+        encoding: Option<Encoding>,
+    ) {
         self.active.format_draft = None;
         let Some(path) = self
             .active
@@ -889,13 +959,14 @@ impl QuarryApp {
             self.active.notice = Some(AppMessage::warning("Open a file first."));
             return;
         };
-        let result = self.reopen_current_path(
+        let result = self.reopen_current_path_with_encoding(
             path,
             OpenOptions {
                 delimiter: delimiter_mode.delimiter(),
                 header_mode,
                 ..OpenOptions::default()
             },
+            encoding,
         );
         if result.is_ok() {
             self.active.delimiter_mode = delimiter_mode;
@@ -924,6 +995,15 @@ impl QuarryApp {
         path: PathBuf,
         options: OpenOptions,
     ) -> Result<(), AppMessage> {
+        self.reopen_current_path_with_encoding(path, options, self.active.encoding_mode)
+    }
+
+    fn reopen_current_path_with_encoding(
+        &mut self,
+        path: PathBuf,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+    ) -> Result<(), AppMessage> {
         if let Some(document) = self.active.document.as_mut() {
             document.commit_edits();
             if document.save_job.is_some()
@@ -940,7 +1020,7 @@ impl QuarryApp {
                 ));
             }
         }
-        self.replace_document_with_options(path, options)
+        self.replace_document_with_encoding(path, options, encoding)
     }
 
     /// Attempts every local path and collects failures without evicting open documents.
@@ -1033,12 +1113,19 @@ impl QuarryApp {
                 }
             }
             Action::Choose => return self.choose_file(),
-            Action::ReopenWithFormat(delimiter, header) => {
-                return self.reopen_document(delimiter, header);
+            Action::ChooseWithEncoding(encoding) => {
+                return self.choose_file_with_encoding(encoding);
+            }
+            Action::ReopenWithFormat(delimiter, header, encoding) => {
+                return self.reopen_document_with_encoding(delimiter, header, encoding);
             }
             Action::ReloadFromDisk => return self.reload_document(),
             Action::ChooseSaveAs => {
                 self.choose_save_as();
+                return;
+            }
+            Action::ChooseSaveAsUtf8 => {
+                self.choose_save_as_utf8();
                 return;
             }
             Action::Save => {
@@ -1123,15 +1210,17 @@ impl QuarryApp {
         }
         let result = match action {
             Action::Choose
+            | Action::ChooseWithEncoding(_)
             | Action::CloseTab
             | Action::TemporaryStorage
             | Action::About
             | Action::ShowAllWhitespace(_)
             | Action::CombineFiles
-            | Action::ReopenWithFormat(_, _)
+            | Action::ReopenWithFormat(_, _, _)
             | Action::ReloadFromDisk
             | Action::Save
             | Action::ChooseSaveAs
+            | Action::ChooseSaveAsUtf8
             | Action::ChooseFilteredExport
             | Action::DiscardChanges
             | Action::OpenColumns
@@ -1394,7 +1483,11 @@ impl QuarryApp {
             return Err("The document closed before the change finished.".into());
         };
         let options = current.current_open_options();
-        let mut replacement = Document::prepare(&ready.path, options)?;
+        let mut replacement = Document::prepare_with_encoding(
+            &ready.path,
+            options,
+            Some(current.session.encoding()),
+        )?;
         if let Some(index) = ready.output_index.take() {
             let index = replacement
                 .session
@@ -1453,9 +1546,12 @@ impl QuarryApp {
             return Ok(());
         };
         // Prepare the candidate before consuming history so a reopen failure is harmless.
-        let mut replacement =
-            Document::prepare(&summary.destination, document.current_open_options())
-                .map_err(AppMessage::error)?;
+        let mut replacement = Document::prepare_with_encoding(
+            &summary.destination,
+            document.current_open_options(),
+            Some(document.session.encoding()),
+        )
+        .map_err(AppMessage::error)?;
         replacement.start_indexing().map_err(AppMessage::error)?;
         let document = self
             .active
@@ -1611,8 +1707,12 @@ impl QuarryApp {
             },
             edit_history: current.edit_history.clone(),
         };
-        let mut replacement =
-            Document::prepare(&target.path, options).map_err(AppMessage::error)?;
+        let mut replacement = Document::prepare_with_encoding(
+            &target.path,
+            options,
+            Some(current.session.encoding()),
+        )
+        .map_err(AppMessage::error)?;
         replacement.header_renames = target.overlay.header_renames.clone();
         replacement.cell_edits = target.overlay.cell_edits.clone();
         replacement.edit_history = target.edit_history;
@@ -1810,7 +1910,17 @@ impl QuarryApp {
                     },
                     ..OpenOptions::default()
                 };
-                match self.replace_document_with_options(destination.clone(), options) {
+                let encoding = self
+                    .active
+                    .document
+                    .as_ref()
+                    .and_then(|doc| doc.save_output_encoding)
+                    .expect("completed save retains its output encoding");
+                match self.replace_document_with_encoding(
+                    destination.clone(),
+                    options,
+                    Some(encoding),
+                ) {
                     Ok(()) => {
                         self.active.notice = None;
                         self.active.footer_status = Some(AppMessage::status(if in_place {
@@ -2024,8 +2134,7 @@ impl eframe::App for QuarryApp {
                     if let Some(format_action) = format_menu(
                         ui,
                         document,
-                        self.active.delimiter_mode,
-                        self.active.header_mode,
+                        (self.active.delimiter_mode, self.active.header_mode, self.active.encoding_mode),
                         &mut self.active.format_draft,
                         compact,
                         if compact {
@@ -2617,8 +2726,9 @@ enum Action {
     About,
     CombineFiles,
     Choose,
+    ChooseWithEncoding(Encoding),
     TemporaryStorage,
-    ReopenWithFormat(DelimiterMode, HeaderMode),
+    ReopenWithFormat(DelimiterMode, HeaderMode, Option<Encoding>),
     ReloadFromDisk,
     Save,
     PageUp,
@@ -2631,6 +2741,7 @@ enum Action {
     Redo,
     OpenFilters,
     ChooseSaveAs,
+    ChooseSaveAsUtf8,
     CancelSave,
     CancelStructuralEdit,
     ChooseFilteredExport,
@@ -3043,15 +3154,19 @@ fn menu_button_with_arrow(
     rendered.response
 }
 
+fn encoding_choice_label(encoding: Option<Encoding>) -> &'static str {
+    encoding.map_or("Auto (BOM or UTF-8)", Encoding::label)
+}
+
 fn format_menu(
     ui: &mut egui::Ui,
     document: Option<&Document>,
-    applied_delimiter: DelimiterMode,
-    applied_header: HeaderMode,
-    draft: &mut Option<(DelimiterMode, HeaderMode)>,
+    applied: (DelimiterMode, HeaderMode, Option<Encoding>),
+    draft: &mut Option<(DelimiterMode, HeaderMode, Option<Encoding>)>,
     compact: bool,
     width: f32,
 ) -> Option<Action> {
+    let (applied_delimiter, applied_header, applied_encoding) = applied;
     let document_open = document.is_some();
     let accessibility_label = if document_open {
         format!(
@@ -3108,7 +3223,7 @@ fn format_menu(
     let mut popup_open = draft.is_some();
     if response.clicked() {
         popup_open = !popup_open;
-        *draft = popup_open.then_some((applied_delimiter, applied_header));
+        *draft = popup_open.then_some((applied_delimiter, applied_header, applied_encoding));
     }
 
     // This panel owns its open state; egui memory tracks its nested choosers.
@@ -3144,10 +3259,14 @@ fn format_menu(
                     "No header"
                 }
             ));
+            ui.weak(format!(
+                "Encoding: {}",
+                document.unwrap().session.encoding().label()
+            ));
             ui.separator();
 
-            let (draft_delimiter, draft_header) =
-                draft.get_or_insert((applied_delimiter, applied_header));
+            let (draft_delimiter, draft_header, draft_encoding) =
+                draft.get_or_insert((applied_delimiter, applied_header, applied_encoding));
             egui::Grid::new("quarry-format-fields")
                 .spacing(egui::vec2(14.0, 8.0))
                 .show(ui, |ui| {
@@ -3189,6 +3308,23 @@ fn format_menu(
                         .response
                         .labelled_by(label.id);
                     ui.end_row();
+                    let label = ui.label("Encoding");
+                    egui::ComboBox::from_id_salt("quarry-format-encoding")
+                        .selected_text(encoding_choice_label(*draft_encoding))
+                        .width(238.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(draft_encoding, None, "Auto (BOM or UTF-8)");
+                            for encoding in Encoding::ALL {
+                                ui.selectable_value(
+                                    draft_encoding,
+                                    Some(encoding),
+                                    encoding.label(),
+                                );
+                            }
+                        })
+                        .response
+                        .labelled_by(label.id);
+                    ui.end_row();
                 });
             if chooser_was_open {
                 ui.input_mut(|input| {
@@ -3197,8 +3333,8 @@ fn format_menu(
             }
             ui.separator();
 
-            let selected = (*draft_delimiter, *draft_header);
-            let changed = selected != (applied_delimiter, applied_header);
+            let selected = (*draft_delimiter, *draft_header, *draft_encoding);
+            let changed = selected != (applied_delimiter, applied_header, applied_encoding);
             let dirty = document.is_some_and(Document::is_dirty);
             let operation_active = document.is_some_and(|document| {
                 document.save_job.is_some()
@@ -3216,14 +3352,14 @@ fn format_menu(
                         .fill(QUARRY_YELLOW),
                     )
                     .on_disabled_hover_text(if !changed {
-                        "Choose a different delimiter or header mode first."
+                        "Choose a different delimiter, header mode, or encoding first."
                     } else if dirty {
                         "Discard or save your changes before reopening the file."
                     } else {
                         "Cancel the active file operation and wait for it to finish first."
                     });
                 if reopen.clicked() {
-                    action = Some(Action::ReopenWithFormat(selected.0, selected.1));
+                    action = Some(Action::ReopenWithFormat(selected.0, selected.1, selected.2));
                     discard_draft = true;
                     ui.close();
                 }
@@ -3287,6 +3423,14 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
         if open.clicked() {
             action = Some(Action::Choose);
         }
+        ui.menu_button("Open with Encoding…", |ui| {
+            for encoding in Encoding::ALL {
+                if ui.button(encoding.label()).clicked() {
+                    action = Some(Action::ChooseWithEncoding(encoding));
+                    ui.close();
+                }
+            }
+        });
         if ui
             .add_enabled(!file_operation_active, egui::Button::new("Combine Files…"))
             .clicked()
@@ -3337,6 +3481,14 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             });
         if save_as.clicked() {
             action = Some(Action::ChooseSaveAs);
+        }
+        if ui.add_enabled(
+            document.is_some_and(|doc| doc.session.encoding() != Encoding::Utf8 && doc.save_operations_ready()),
+            egui::Button::new("Save As UTF-8…"),
+        ).on_hover_text("Create a UTF-8 copy with the current edits and column order. The source stays unchanged.")
+            .clicked()
+        {
+            action = Some(Action::ChooseSaveAsUtf8);
         }
         let discard = ui
             .add_enabled(discard_ready, egui::Button::new("Discard Changes"))
@@ -5718,6 +5870,7 @@ struct Document {
     export_status: Option<String>,
     export_cancel_requested: bool,
     save_job: Option<SaveAsJob>,
+    save_output_encoding: Option<Encoding>,
     save_status: Option<String>,
     save_cancel_requested: bool,
     saving_in_place: bool,
@@ -5797,14 +5950,24 @@ impl Document {
         Ok(document)
     }
 
+    #[cfg(test)]
     fn prepare(path: &Path, options: OpenOptions) -> Result<Self, String> {
+        Self::prepare_with_encoding(path, options, None)
+    }
+
+    fn prepare_with_encoding(
+        path: &Path,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+    ) -> Result<Self, String> {
         let buffer_rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS;
-        let session = Session::open(
+        let session = Session::open_with_encoding(
             path,
             OpenOptions {
                 rows: buffer_rows + 1,
                 ..options
             },
+            encoding,
         )
         .map_err(|error| error.to_string())?;
         let data_start = u64::from(session.dialect.has_header);
@@ -5862,6 +6025,7 @@ impl Document {
             export_status: None,
             export_cancel_requested: false,
             save_job: None,
+            save_output_encoding: None,
             save_status: None,
             save_cancel_requested: false,
             saving_in_place: false,
@@ -6439,7 +6603,13 @@ impl Document {
         }
         Some(quarry_core::estimate_multi_sort_temporary_bytes(
             quarry_core::estimate_edited_output_bytes_from_values(
-                self.session.file_size,
+                self.session.file_size.saturating_mul(
+                    if self.session.encoding() == Encoding::Utf8 {
+                        1
+                    } else {
+                        3
+                    },
+                ),
                 records,
                 headers,
                 cells,
@@ -6461,7 +6631,11 @@ impl Document {
                 }
                 Err(error) => return Err(AppMessage::error(error.to_string())),
             }
-            let original = match Session::open(&self.logical_path, self.current_open_options()) {
+            let original = match Session::open_with_encoding(
+                &self.logical_path,
+                self.current_open_options(),
+                Some(self.session.encoding()),
+            ) {
                 Ok(original) => original,
                 Err(QuarryError::SourceChanged) => {
                     self.invalidate_changed_source();
@@ -7845,6 +8019,14 @@ impl Document {
     }
 
     fn start_save_operation(&mut self, destination: Option<PathBuf>) -> Result<(), AppMessage> {
+        self.start_save_operation_format(destination, false)
+    }
+
+    fn start_save_operation_format(
+        &mut self,
+        destination: Option<PathBuf>,
+        utf8: bool,
+    ) -> Result<(), AppMessage> {
         if self.source_changed {
             return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
         }
@@ -7862,7 +8044,7 @@ impl Document {
             ));
         }
         self.commit_edits();
-        if !(self.is_dirty() || destination.is_some() && self.has_reordered_columns()) {
+        if !(self.is_dirty() || destination.is_some() && (self.has_reordered_columns() || utf8)) {
             return Err(AppMessage::warning("Make a change before saving."));
         }
         let renames = self
@@ -7872,6 +8054,12 @@ impl Document {
             .collect();
         let saving_in_place = destination.is_none();
         let result = match destination {
+            Some(destination) if utf8 => self.session.start_save_as_utf8(
+                renames,
+                self.owned_cell_edits(),
+                self.save_as_transformation(),
+                destination,
+            ),
             Some(destination) => match self.save_as_transformation() {
                 Some(transformation) => self.session.start_save_as_with_transformation(
                     renames,
@@ -7907,6 +8095,11 @@ impl Document {
         if self.filter_active() {
             self.reset_filter_state();
         }
+        self.save_output_encoding = Some(if utf8 {
+            Encoding::Utf8
+        } else {
+            self.session.encoding()
+        });
         self.save_job = Some(job);
         self.save_status = Some("Saving edited file…".into());
         self.save_cancel_requested = false;
@@ -10863,6 +11056,7 @@ std::thread_local! {
 
 #[cfg(test)]
 mod tests {
+    use quarry_core::Encoding;
     fn individual_edit_app(path: &Path) -> QuarryApp {
         let mut app = QuarryApp::new(None, Instant::now());
         app.active.header_mode = HeaderMode::FirstRow;
@@ -12006,7 +12200,7 @@ mod tests {
         );
         assert_eq!(
             app.active.format_draft,
-            Some((DelimiterMode::Auto, HeaderMode::Auto))
+            Some((DelimiterMode::Auto, HeaderMode::Auto, None))
         );
         assert!(
             !egui::Popup::is_any_open(&ctx),
@@ -12055,7 +12249,7 @@ mod tests {
         let output = render(&mut app, vec![]);
         assert_eq!(
             app.active.format_draft,
-            Some((DelimiterMode::Tab, HeaderMode::Auto))
+            Some((DelimiterMode::Tab, HeaderMode::Auto, None))
         );
         assert!(
             !egui::Popup::is_any_open(&ctx),
@@ -12088,7 +12282,7 @@ mod tests {
         let output = render(&mut app, vec![]);
         assert_eq!(
             app.active.format_draft,
-            Some((DelimiterMode::Tab, HeaderMode::NoHeader))
+            Some((DelimiterMode::Tab, HeaderMode::NoHeader, None))
         );
         assert!(
             !egui::Popup::is_any_open(&ctx),
@@ -17581,7 +17775,7 @@ mod tests {
 
         app.open_structural_dialog(dialog);
         app.apply_structural_dialog_action(StructuralDialogAction::Apply);
-        app.active.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader));
+        app.active.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader, None));
         finish_structural_edit(&mut app);
         assert_eq!(app.active.format_draft, None);
         let document = app.active.document.as_ref().unwrap();
@@ -21907,7 +22101,7 @@ mod tests {
                 .has_header
         );
 
-        app.active.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader));
+        app.active.format_draft = Some((DelimiterMode::Tab, HeaderMode::NoHeader, None));
         fs::write(&path, b"name\tvalue\nsecond\t2\n").unwrap();
         app.reload_document();
         let document = app.active.document.as_ref().unwrap();
@@ -23636,5 +23830,152 @@ mod tests {
                 "secondary controls must identify their level"
             );
         }
+    }
+    #[test]
+    fn encoding_choice_survives_structural_history_and_native_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("latin.csv");
+        let copy = directory.path().join("copy.csv");
+        let input = b"first,last,age\r\nAndr\xe9,M\xfcller,36\r\n";
+        fs::write(&source, input).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_document_tab_with_encoding(
+            source.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Latin1),
+        )
+        .unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_combine(vec![0, 1], b" ".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.encoding(),
+            Encoding::Latin1
+        );
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.first_rows[1].fields[0],
+            "André".as_bytes()
+        );
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_save_as(copy.clone())
+            .unwrap();
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.active.document.as_ref().unwrap().save_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_active_document(&ctx, true);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            fs::read(&copy).unwrap(),
+            b"first,age\r\nAndr\xe9 M\xfcller,36\r\n"
+        );
+        assert_eq!(fs::read(&source).unwrap(), input);
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.encoding(),
+            Encoding::Latin1
+        );
+        assert_eq!(app.active.encoding_mode, Some(Encoding::Latin1));
+        app.reload_document();
+        assert!(app.active.notice.is_none());
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.first_rows[1].fields[0],
+            "André Müller".as_bytes()
+        );
+    }
+
+    #[test]
+    fn utf8_copy_retains_edits_after_native_encoding_rejects_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("windows.csv");
+        let copy = directory.path().join("unicode.csv");
+        let input = b"name\r\ncaf\xe9\r\n";
+        fs::write(&source, input).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_document_tab_with_encoding(
+            source.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Windows1252),
+        )
+        .unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        let doc = app.active.document.as_mut().unwrap();
+        doc.begin_cell_edit(1, 0, "café".as_bytes().to_vec())
+            .unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "café 😀".into();
+        doc.start_save().unwrap();
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.active.document.as_ref().unwrap().save_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_active_document(&ctx, true);
+            std::thread::yield_now();
+        }
+        assert_eq!(fs::read(&source).unwrap(), input);
+        assert!(app.active.document.as_ref().unwrap().is_dirty());
+        assert!(
+            app.active
+                .notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("Save As UTF-8")
+        );
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_save_operation_format(Some(copy.clone()), true)
+            .unwrap();
+        while app.active.document.as_ref().unwrap().save_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_active_document(&ctx, true);
+            std::thread::yield_now();
+        }
+        assert_eq!(fs::read(&copy).unwrap(), "name\r\ncafé 😀\r\n".as_bytes());
+        assert_eq!(fs::read(&source).unwrap(), input);
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.encoding(),
+            Encoding::Utf8
+        );
+        assert!(!app.active.document.as_ref().unwrap().is_dirty());
+    }
+
+    #[test]
+    fn changing_encoding_reopens_values_without_changing_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("legacy.csv");
+        fs::write(&source, b"name\ncaf\xe9\n").unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        app.reopen_document_with_encoding(
+            DelimiterMode::Comma,
+            HeaderMode::FirstRow,
+            Some(Encoding::Latin1),
+        );
+        assert!(app.active.notice.is_none());
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.first_rows[1].fields[0],
+            "café".as_bytes()
+        );
+        assert_eq!(app.active.encoding_mode, Some(Encoding::Latin1));
+        assert_eq!(fs::read(&source).unwrap(), b"name\ncaf\xe9\n");
     }
 }

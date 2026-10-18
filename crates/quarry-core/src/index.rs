@@ -1,11 +1,11 @@
 use std::fs::File;
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use quarry_delimited::RecordScanner;
+use crate::Encoding;
+use crate::encoding::RecordScanner;
 
 use crate::export::source_matches_stamp;
 use crate::{CompletedRecordCount, QuarryError, Session, SourceStamp};
@@ -129,6 +129,7 @@ pub struct CompletedIndex {
     index: StructuralIndex,
     source_stamp: Box<SourceStamp>,
     delimiter: u8,
+    encoding: Encoding,
 }
 
 impl CompletedIndex {
@@ -136,11 +137,13 @@ impl CompletedIndex {
         index: StructuralIndex,
         source_stamp: SourceStamp,
         delimiter: u8,
+        encoding: Encoding,
     ) -> Option<Self> {
         (index.indexed_bytes == source_stamp.file_size()).then_some(Self {
             index,
             source_stamp: Box::new(source_stamp),
             delimiter,
+            encoding,
         })
     }
 }
@@ -151,9 +154,9 @@ impl Session {
         &self,
         completed: CompletedIndex,
     ) -> Result<StructuralIndex, QuarryError> {
-        if completed.delimiter != self.dialect.delimiter {
+        if completed.delimiter != self.dialect.delimiter || completed.encoding != self.encoding {
             return Err(QuarryError::InvalidOption(
-                "completed index delimiter differs from the open document",
+                "completed index format differs from the open document",
             ));
         }
         if completed.index.indexed_bytes != self.file_size
@@ -164,6 +167,7 @@ impl Session {
         self.ensure_source_unchanged()?;
         *self.completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
             delimiter: completed.delimiter,
+            encoding: completed.encoding,
             file_size: completed.index.indexed_bytes,
             records: completed.index.indexed_rows,
         });
@@ -216,6 +220,7 @@ impl IndexJob {
         let path = session.path.clone();
         let file_size = session.file_size;
         let delimiter = session.dialect.delimiter;
+        let encoding = session.encoding;
         let source_stamp = session.source_stamp.clone();
         let completed_record_count = Arc::clone(&session.completed_record_count);
         let file = File::open(&path)?;
@@ -238,22 +243,24 @@ impl IndexJob {
             .name("quarry-index".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
-                let result = run_indexer(&file, delimiter, config, &worker_state).and_then(|()| {
-                    if !source_matches_stamp(&file, &path, &source_stamp)? {
-                        return Err(QuarryError::SourceChanged);
-                    }
-                    if !worker_state.cancelled.load(Ordering::Acquire)
-                        && worker_state.bytes_scanned.load(Ordering::Acquire)
-                            == source_stamp.file_size()
-                    {
-                        *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
-                            delimiter,
-                            file_size: source_stamp.file_size(),
-                            records: worker_state.index.read().unwrap().indexed_rows,
-                        });
-                    }
-                    Ok(())
-                });
+                let result = run_indexer(&file, delimiter, encoding, config, &worker_state)
+                    .and_then(|()| {
+                        if !source_matches_stamp(&file, &path, &source_stamp)? {
+                            return Err(QuarryError::SourceChanged);
+                        }
+                        if !worker_state.cancelled.load(Ordering::Acquire)
+                            && worker_state.bytes_scanned.load(Ordering::Acquire)
+                                == source_stamp.file_size()
+                        {
+                            *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
+                                delimiter,
+                                encoding,
+                                file_size: source_stamp.file_size(),
+                                records: worker_state.index.read().unwrap().indexed_rows,
+                            });
+                        }
+                        Ok(())
+                    });
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
                 }
@@ -319,18 +326,19 @@ impl Drop for IndexJob {
 fn run_indexer(
     mut file: &File,
     delimiter: u8,
+    encoding: Encoding,
     config: IndexConfig,
     shared: &SharedState,
 ) -> Result<(), QuarryError> {
-    let mut scanner = RecordScanner::new(delimiter)?;
-    let mut chunk = vec![0; config.chunk_bytes];
+    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut chunk = vec![0; encoding.chunk_size(config.chunk_bytes)];
     let mut absolute_start = 0;
 
     loop {
         if shared.cancelled.load(Ordering::Acquire) {
             return Ok(());
         }
-        let read = file.read(&mut chunk)?;
+        let read = encoding.read_chunk(&mut file, &mut chunk)?;
         if read == 0 {
             let mut index = shared.index.write().unwrap();
             scanner.finish(absolute_start, |end| index.record_boundary(end))?;

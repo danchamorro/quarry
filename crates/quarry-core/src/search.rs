@@ -1,18 +1,19 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use quarry_delimited::RecordScanner;
+use crate::Encoding;
+use crate::encoding::RecordScanner;
 
 use crate::case::ByteMatcher;
 use crate::{
     CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError,
-    Session, StructuralIndex, parse_source_record,
+    Session, StructuralIndex, parse_encoded_record,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,7 @@ impl SearchJob {
         checkpoint: Checkpoint,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
         max_record_bytes: usize,
+        encoding: Encoding,
     ) -> Result<Self, QuarryError> {
         if cell_edits
             .values()
@@ -128,6 +130,7 @@ impl SearchJob {
                     checkpoint,
                     &cell_edits,
                     max_record_bytes,
+                    encoding,
                     &worker_state,
                 );
                 if let Err(error) = &result {
@@ -264,6 +267,7 @@ impl Session {
             checkpoint,
             cell_edits,
             DEFAULT_MAX_RECORD_BYTES,
+            self.encoding,
         )
     }
 }
@@ -278,11 +282,12 @@ fn run_search(
     checkpoint: Checkpoint,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     max_record_bytes: usize,
+    encoding: Encoding,
     shared: &SharedState,
 ) -> Result<SearchOutcome, QuarryError> {
     let matcher = ByteMatcher::new(needle, case_sensitivity);
-    let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset)?;
-    let mut chunk = vec![0; DEFAULT_READ_CHUNK];
+    let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset, encoding)?;
+    let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut absolute_start = checkpoint.offset;
     let mut row_number = checkpoint.row;
     let mut record_start = checkpoint.offset;
@@ -293,7 +298,7 @@ fn run_search(
         if shared.cancelled.load(Ordering::Acquire) {
             return Ok(SearchOutcome::Cancelled);
         }
-        let read = file.read(&mut chunk)?;
+        let read = encoding.read_chunk(&mut file, &mut chunk)?;
         if read == 0 {
             let has_final_record = scanner.finish(absolute_start, |_| {})?;
             if has_final_record {
@@ -315,6 +320,7 @@ fn run_search(
                         record_start,
                         start,
                         cell_edits,
+                        encoding,
                     )? {
                         return Ok(SearchOutcome::Match(found));
                     }
@@ -350,6 +356,7 @@ fn run_search(
                             record_start,
                             start,
                             cell_edits,
+                            encoding,
                         ) {
                             Ok(result) => found = result,
                             Err(error) => deferred_error = Some(error),
@@ -393,6 +400,7 @@ fn run_search(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_record(
     matcher: &ByteMatcher<'_>,
     record: &[u8],
@@ -401,9 +409,10 @@ fn find_record(
     record_offset: u64,
     start: SearchPosition,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    encoding: Encoding,
 ) -> Result<Option<SearchMatch>, QuarryError> {
     let first_column = if row == start.row { start.column } else { 0 };
-    let fields = parse_source_record(record, delimiter, row)?;
+    let fields = parse_encoded_record(record, delimiter, row, encoding)?;
     Ok(fields
         .iter()
         .enumerate()
@@ -728,6 +737,7 @@ mod tests {
             Checkpoint { row: 0, offset: 0 },
             &BTreeMap::new(),
             DEFAULT_MAX_RECORD_BYTES,
+            crate::Encoding::Utf8,
             &shared,
         )
         .unwrap();
@@ -778,6 +788,7 @@ mod tests {
             checkpoint,
             BTreeMap::new(),
             8,
+            session.encoding,
         )
         .unwrap();
         while !job.progress().done {
@@ -801,6 +812,7 @@ mod tests {
                 checkpoint,
                 BTreeMap::from([((0, 0), vec![b'x'; 9])]),
                 8,
+                session.encoding,
             ),
             Err(QuarryError::RecordTooLarge { limit: 8 })
         ));

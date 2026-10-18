@@ -57,9 +57,36 @@ Each file opens in a tab. Selecting multiple files in **Open…** opens all of t
 Opening the same file again selects its existing tab and preserves its state.
 
 Quarry detects the delimiter and header row automatically. If the result is
-wrong, open **Format**, choose the correct delimiter and header settings, then
+wrong, open **Format**, choose the correct delimiter, header, and encoding settings, then
 click **Reopen with Changes**. You must save or discard unsaved changes before
 reopening the file with different settings.
+
+### Character encodings
+
+Quarry supports UTF-8, UTF-16 LE, UTF-16 BE, Windows-1252, and ISO-8859-1
+(Latin-1). **Auto** recognizes Unicode byte-order marks (BOMs); without a BOM,
+it uses UTF-8. It does not guess legacy encodings.
+
+If accented characters look wrong, choose the encoding in **Format** and
+click **Reopen with Changes**. For a file that cannot open with Auto, use
+**File → Open with Encoding…**. UTF-16 without a BOM needs an explicit
+little-endian or big-endian choice. The Format panel shows the resolved encoding.
+
+**Save**, **Save As…**, working changes, and filtered exports retain the source
+encoding and its BOM policy. Untouched records retain their original bytes.
+If a character cannot be represented in that encoding, the save fails without
+replacing the source or publishing a partial copy. Choose **Save As UTF-8…**
+to save all current changes in a Unicode copy instead. This option is also
+available for an unchanged non-UTF-8 file.
+
+Malformed UTF-16 and undefined Windows-1252 bytes produce errors rather than
+replacement characters. Existing invalid UTF-8 bytes remain read-only.
+UTF-32 and other legacy encodings are not supported.
+
+The CLI accepts **--encoding** on file commands: **auto**, **utf-8**,
+**utf-16le**, **utf-16be**, **windows-1252**, or **iso-8859-1**. For example:
+
+    quarry convert-utf8 legacy.csv --encoding windows-1252 --output unicode.csv
 
 ### 3. Understand the grid
 
@@ -74,7 +101,7 @@ reopening the file with different settings.
   and the menu contains **Open…**, **Reload from Disk**, **Save**, **Save As…**,
   and **Discard Changes**.
 - **Format** shows the applied delimiter and header mode. Opening it also shows
-  what Quarry originally detected.
+  what Quarry originally detected and the resolved character encoding.
 - The footer keeps the visible row range in view, adds file and selection
   metadata when space allows, and reserves its right side for status, progress,
   and the active operation's cancel button.
@@ -152,7 +179,7 @@ rows from two or more matching files into one new file.
    available space, then choose **Combine and Save**.
 6. When complete, choose **Open Combined File** to inspect or edit the result.
 
-All files must have the same delimiter and number of columns in every record.
+All files must have the same encoding, delimiter, and number of columns in every record. Choose an explicit encoding in Combine Files for legacy or BOM-less UTF-16 inputs. Convert mixed encodings to UTF-8 first.
 For files with headers, the decoded column names must match exactly in the
 same order, including case and spaces. Quarry identifies the input and record
 when a mismatch or malformed record is found. Empty files and repeated
@@ -817,7 +844,7 @@ and **Modified (not saved)** in the footer identify unsaved work.
 
 **Reload from Disk** rereads the current path with the applied format.
 **Reopen with Changes** in the Format menu applies a confirmed delimiter or
-header change instead.
+header or encoding change instead.
 
 - **Save** safely replaces the current file after the complete write succeeds.
 - **Save As…** writes to a new unused path, preserves the previous source, and
@@ -826,6 +853,7 @@ header change instead.
   active), and includes any cell, header, or structural edits. Reordering
   columns alone is enough to enable it. Use **Export Filtered Rows…** to save
   only matching rows instead.
+- **Save As UTF-8…** creates a Unicode copy of a non-UTF-8 file, including current changes, without changing the source.
 - **Discard Changes** restores the last opened or saved file and removes all
   unsaved cell, header, Replace All, Split, Combine, Move Selected Columns,
   Delete Selected Columns, Delete Selected Rows, duplicate removal, and Sort changes.
@@ -891,7 +919,7 @@ setting.
 |---|---|
 | The delimiter or header is wrong | Open **Format**, choose the correct delimiter and header, then click **Reopen with Changes**. Save or discard changes first. |
 | Find or Sort is unavailable | Wait for indexing to finish. To open Sort, select exactly one numbered column and right-click its number. Sort also needs the temporary-disk estimate. |
-| Cell editing is unavailable | Wait for the current operation to finish. Missing and non-UTF-8 cells cannot be edited. |
+| Cell editing is unavailable | Wait for the current operation to finish. Missing and invalidly encoded cells cannot be edited. For legacy files, select the correct encoding in Format. |
 | Undo or Redo is unavailable | Commit or cancel the inline editor and wait for conflicting operations to finish. Clear filters before structural Undo/Redo. There may be no retained history in that direction. |
 | Filtering is unavailable | Cancel or finish any active search, filter, export, save, or structural change. |
 | A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |

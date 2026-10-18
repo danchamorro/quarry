@@ -50,6 +50,34 @@ remain modules in core until their APIs or dependencies justify separate
 crates. See
 [ADR 0001](adr/0001-initial-engine.md).
 
+## Character encoding boundaries
+
+Session resolves Auto from a Unicode BOM, otherwise UTF-8. Explicit options
+cover UTF-8, UTF-16 LE/BE, Windows-1252 and ISO-8859-1. No legacy heuristic is
+applied. Physical file offsets remain the unit of the structural index and
+source guards. The encoding-aware scanner maps UTF-16 code units to structural
+tokens without confusing low bytes of non-ASCII characters with CSV syntax;
+legacy streams bypass UTF-8 BOM recognition.
+
+Each bounded record is decoded to UTF-8 before field parsing, filter/search
+matching, sort keys, cleanup, or edit overlays. UTF-16 validation rejects
+unpaired surrogates and odd trailing bytes; Windows-1252 rejects its five
+undefined bytes. UTF-8 retains the existing raw-byte/read-only-invalid-value
+behavior. Both native and decoded record sizes are bounded.
+
+ExportTarget strictly encodes generated UTF-8 records to the selected native
+encoding, tracks actual output bytes, and publishes only after source checks.
+Unrepresentable edits leave the original and unpublished destination untouched.
+Save As UTF-8 explicitly changes the output encoding. Sort runs contain
+normalized UTF-8 records and keys; completed output indexes carry encoding
+provenance. Combine validates matching resolved encodings and decoded headers,
+then copies native records while encoding any inserted line ending.
+
+The desktop keeps an explicit encoding choice through reload and opens native
+working copies with their resolved encoding. Save completion reopens with the
+actual output encoding. Every file-oriented CLI command accepts --encoding;
+convert-utf8 provides the explicit conversion path.
+
 ## File access
 
 The egui app owns up to eight independent document tabs. Each tab retains its

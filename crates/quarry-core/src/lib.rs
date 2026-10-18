@@ -2,6 +2,7 @@ mod case;
 mod cleanup;
 mod combine;
 mod date_time_sort;
+mod encoding;
 mod export;
 mod filter;
 mod index;
@@ -26,9 +27,11 @@ pub use case::CaseSensitivity;
 pub use cleanup::{CleanupOperation, ColumnCleanup};
 pub use combine::{
     CombineInput, CombineJob, CombineOptions, CombinePlan, CombineProgress, CombineSummary,
-    check_combine_files,
+    check_combine_files, check_combine_files_with_encoding,
 };
 pub use date_time_sort::DateTimeFormat;
+pub use encoding::Encoding;
+use encoding::RecordScanner;
 pub use export::{
     CleanupJob, CleanupOutcome, CleanupSummary, ColumnTransformation, FilterExportJob,
     FilterExportOutcome, FilterExportProgress, FilterExportSummary, LiteralReplacement,
@@ -43,7 +46,7 @@ pub use filter::{
 pub use index::{
     Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, StructuralIndex,
 };
-use quarry_delimited::{ParseError, RecordScanner, parse_record};
+use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
 pub use sort::{
     DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
@@ -74,6 +77,38 @@ pub(crate) fn parse_source_record(
     parse_record(record, delimiter)
 }
 
+pub(crate) fn parse_encoded_record(
+    record: &[u8],
+    delimiter: u8,
+    physical_row: u64,
+    encoding: Encoding,
+) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
+    if encoding == Encoding::Utf8 {
+        return parse_source_record(record, delimiter, physical_row).map_err(Into::into);
+    }
+    let body = if physical_row == 0 {
+        encoding.strip_bom(record).1
+    } else {
+        record
+    };
+    let decoded = encoding
+        .decode(body, DEFAULT_MAX_RECORD_BYTES)
+        .map_err(|error| match error {
+            QuarryError::Encoding(message) => QuarryError::Encoding(format!(
+                "Record {}: {message}",
+                physical_row.saturating_add(1)
+            )),
+            error => error,
+        })?;
+    match decoded {
+        Cow::Borrowed(bytes) => parse_record(bytes, delimiter).map_err(Into::into),
+        Cow::Owned(bytes) => Ok(parse_record(&bytes, delimiter)?
+            .into_iter()
+            .map(|field| Cow::Owned(field.into_owned()))
+            .collect()),
+    }
+}
+
 #[derive(Debug)]
 pub enum QuarryError {
     CombineFile {
@@ -92,6 +127,7 @@ pub enum QuarryError {
         available_bytes: u64,
     },
     Parse(ParseError),
+    Encoding(String),
     BootstrapLimitExceeded {
         limit: usize,
         rows_found: usize,
@@ -166,6 +202,7 @@ impl fmt::Display for QuarryError {
                 directory.display()
             ),
             Self::Parse(error) => error.fmt(f),
+            Self::Encoding(message) => f.write_str(message),
             Self::BootstrapLimitExceeded { limit, rows_found } => write!(
                 f,
                 "found only {rows_found} rows within the {limit}-byte bootstrap limit"
@@ -298,6 +335,7 @@ pub struct Row {
 pub struct Session {
     path: PathBuf,
     source_stamp: SourceStamp,
+    encoding: Encoding,
     completed_record_count: Arc<Mutex<Option<CompletedRecordCount>>>,
     pub file_size: u64,
     pub dialect: Dialect,
@@ -308,12 +346,22 @@ pub struct Session {
 #[derive(Debug, Clone, Copy)]
 struct CompletedRecordCount {
     delimiter: u8,
+    encoding: Encoding,
     file_size: u64,
     records: u64,
 }
 
 impl Session {
     pub fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self, QuarryError> {
+        Self::open_with_encoding(path, options, None)
+    }
+
+    /// Open using an explicit encoding, or detect only Unicode BOMs when None.
+    pub fn open_with_encoding(
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+        requested_encoding: Option<Encoding>,
+    ) -> Result<Self, QuarryError> {
         if options.rows == 0 || options.sample_bytes == 0 || options.bootstrap_limit == 0 {
             return Err(QuarryError::InvalidOption(
                 "rows, sample bytes, and bootstrap limit must be non-zero",
@@ -331,10 +379,16 @@ impl Session {
         let file_open = open_started.elapsed();
         let source_stamp = SourceStamp::from_file(&file)?;
         let file_size = source_stamp.file_size();
+        let encoding = Encoding::detect(&mut file, requested_encoding)?;
+        if encoding.is_utf16() && options.bootstrap_limit < 2 {
+            return Err(QuarryError::InvalidOption(
+                "UTF-16 bootstrap limit must fit a code unit",
+            ));
+        }
 
         let delimiter = match options.delimiter {
             Some(delimiter) => {
-                RecordScanner::new(delimiter)?;
+                RecordScanner::new(delimiter, encoding)?;
                 delimiter
             }
             None => detect_file_delimiter(
@@ -342,6 +396,7 @@ impl Session {
                 file_size,
                 options.sample_bytes,
                 options.bootstrap_limit,
+                encoding,
             )?,
         };
 
@@ -352,9 +407,14 @@ impl Session {
             delimiter,
             options.rows,
             options.bootstrap_limit,
+            encoding,
         )?;
-        let first_rows =
-            materialize_rows(&bootstrap, &ends[..ends.len().min(options.rows)], delimiter)?;
+        let first_rows = materialize_rows(
+            &bootstrap,
+            &ends[..ends.len().min(options.rows)],
+            delimiter,
+            encoding,
+        )?;
         let has_header = match options.header_mode {
             HeaderMode::Auto => detect_header(&first_rows),
             HeaderMode::FirstRow => true,
@@ -364,6 +424,7 @@ impl Session {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             source_stamp,
+            encoding,
             completed_record_count: Arc::new(Mutex::new(None)),
             file_size,
             dialect: Dialect {
@@ -383,6 +444,10 @@ impl Session {
         &self.path
     }
 
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
     pub fn start_indexing(&self, config: IndexConfig) -> Result<IndexJob, QuarryError> {
         IndexJob::start(self, config)
     }
@@ -392,7 +457,9 @@ impl Session {
             .lock()
             .unwrap()
             .filter(|count| {
-                count.delimiter == self.dialect.delimiter && count.file_size == self.file_size
+                count.delimiter == self.dialect.delimiter
+                    && count.encoding == self.encoding
+                    && count.file_size == self.file_size
             })
             .map(|count| count.records)
     }
@@ -410,6 +477,7 @@ impl Session {
             start,
             count,
             DEFAULT_MAX_RECORD_BYTES,
+            self.encoding,
         )
     }
 }
@@ -420,15 +488,22 @@ fn read_initial_records(
     delimiter: u8,
     wanted: usize,
     limit: usize,
+    encoding: Encoding,
 ) -> Result<(Vec<u8>, Vec<u64>), QuarryError> {
-    let mut scanner = RecordScanner::new(delimiter)?;
+    let mut scanner = RecordScanner::new(delimiter, encoding)?;
     let mut bytes = Vec::with_capacity(DEFAULT_READ_CHUNK.min(limit));
-    let mut chunk = vec![0; DEFAULT_READ_CHUNK.min(limit)];
+    let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK.min(limit))];
     let mut ends = Vec::with_capacity(wanted);
 
     while ends.len() < wanted && bytes.len() < limit {
-        let allowed = (limit - bytes.len()).min(chunk.len());
-        let read = file.read(&mut chunk[..allowed])?;
+        let mut allowed = (limit - bytes.len()).min(chunk.len());
+        if encoding.is_utf16() {
+            allowed &= !1;
+        }
+        if allowed == 0 {
+            break;
+        }
+        let read = encoding.read_chunk(file, &mut chunk[..allowed])?;
         if read == 0 {
             break;
         }
@@ -454,15 +529,21 @@ fn read_initial_records(
     Ok((bytes, ends))
 }
 
-fn materialize_rows(bytes: &[u8], ends: &[u64], delimiter: u8) -> Result<Vec<Row>, QuarryError> {
+fn materialize_rows(
+    bytes: &[u8],
+    ends: &[u64],
+    delimiter: u8,
+    encoding: Encoding,
+) -> Result<Vec<Row>, QuarryError> {
     let mut rows = Vec::with_capacity(ends.len());
     let mut start = 0;
     for (physical_row, &end) in ends.iter().enumerate() {
         let end = end as usize;
-        let fields = parse_source_record(&bytes[start..end], delimiter, physical_row as u64)?
-            .into_iter()
-            .map(|field| field.into_owned())
-            .collect();
+        let fields =
+            parse_encoded_record(&bytes[start..end], delimiter, physical_row as u64, encoding)?
+                .into_iter()
+                .map(|field| field.into_owned())
+                .collect();
         rows.push(Row {
             offset: start as u64,
             fields,
@@ -477,15 +558,19 @@ fn detect_file_delimiter(
     file_size: u64,
     sample_bytes: usize,
     limit: usize,
+    encoding: Encoding,
 ) -> Result<u8, QuarryError> {
     let mut sample = Vec::new();
     let mut target = sample_bytes.min(limit);
+    if encoding.is_utf16() {
+        target = encoding.chunk_size(target).min(limit & !1);
+    }
     loop {
         file.by_ref()
             .take((target - sample.len()) as u64)
             .read_to_end(&mut sample)?;
         let at_eof = sample.len() as u64 == file_size;
-        if let Some(delimiter) = detect_delimiter(&sample, at_eof) {
+        if let Some(delimiter) = detect_delimiter(&sample, at_eof, encoding) {
             return Ok(delimiter);
         }
         if sample.len() >= limit {
@@ -499,15 +584,22 @@ fn detect_file_delimiter(
         }
         // A partial first record is not evidence for a one-column comma file.
         // Grow only until a complete record is available, within the caller's cap.
-        target = target.saturating_mul(2).min(limit);
+        let next = target.saturating_mul(2).min(limit);
+        target = if encoding.is_utf16() { next & !1 } else { next };
+        if target <= sample.len() {
+            return Err(QuarryError::BootstrapLimitExceeded {
+                limit,
+                rows_found: 0,
+            });
+        }
     }
 }
 
-fn detect_delimiter(sample: &[u8], at_eof: bool) -> Option<u8> {
+fn detect_delimiter(sample: &[u8], at_eof: bool, encoding: Encoding) -> Option<u8> {
     let mut best = (0_usize, 0_usize, b',');
     let mut has_record = false;
     for delimiter in *b",\t|;" {
-        let Ok(mut scanner) = RecordScanner::new(delimiter) else {
+        let Ok(mut scanner) = RecordScanner::new(delimiter, encoding) else {
             continue;
         };
         let mut ends = Vec::new();
@@ -541,9 +633,12 @@ fn detect_delimiter(sample: &[u8], at_eof: bool) -> Option<u8> {
         let mut frequencies = HashMap::new();
         for (physical_row, end) in ends.into_iter().enumerate() {
             let end = end as usize;
-            let Ok(fields) =
-                parse_source_record(&sample[start..end], delimiter, physical_row as u64)
-            else {
+            let Ok(fields) = parse_encoded_record(
+                &sample[start..end],
+                delimiter,
+                physical_row as u64,
+                encoding,
+            ) else {
                 frequencies.clear();
                 break;
             };
@@ -639,6 +734,7 @@ fn read_rows_from_index(
     start: u64,
     count: usize,
     max_record_bytes: usize,
+    encoding: Encoding,
 ) -> Result<Vec<Row>, QuarryError> {
     if count == 0 {
         return Ok(Vec::new());
@@ -654,8 +750,8 @@ fn read_rows_from_index(
     let checkpoint = index.nearest_checkpoint(start);
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(checkpoint.offset))?;
-    let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset)?;
-    let mut chunk = vec![0; DEFAULT_READ_CHUNK];
+    let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset, encoding)?;
+    let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut absolute_start = checkpoint.offset;
     let mut row_number = checkpoint.row;
     let mut record_start = checkpoint.offset;
@@ -663,10 +759,10 @@ fn read_rows_from_index(
     let mut rows = Vec::with_capacity(count);
 
     while row_number < target_end {
-        let read = file.read(&mut chunk)?;
+        let read = encoding.read_chunk(&mut file, &mut chunk)?;
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
-                let fields = parse_source_record(&record, delimiter, row_number)?
+                let fields = parse_encoded_record(&record, delimiter, row_number, encoding)?
                     .into_iter()
                     .map(|field| field.into_owned())
                     .collect();
@@ -688,12 +784,12 @@ fn read_rows_from_index(
                         limit: max_record_bytes,
                     });
                 } else if deferred_error.is_none() {
-                    match parse_source_record(&record, delimiter, row_number) {
+                    match parse_encoded_record(&record, delimiter, row_number, encoding) {
                         Ok(fields) => rows.push(Row {
                             offset: record_start,
                             fields: fields.into_iter().map(|field| field.into_owned()).collect(),
                         }),
-                        Err(error) => deferred_error = Some(error.into()),
+                        Err(error) => deferred_error = Some(error),
                     }
                 }
                 record.clear();

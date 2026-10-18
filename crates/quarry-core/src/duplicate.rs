@@ -166,13 +166,14 @@ impl DuplicateJob {
         if !source_matches_stamp(&source, &source_path, &source_stamp)? {
             return Err(QuarryError::SourceChanged);
         }
-        let bom_present = source_has_bom(&mut source)?;
+        let bom_present = source_has_bom(&mut source, config.encoding)?;
         let mut output = ExportTarget::new_private_guarded(
             &source_path,
             destination.clone(),
             &source,
             source_stamp.clone(),
         )?;
+        output.configure(config.encoding, config.encoding, config.max_record_bytes);
         let publication = output
             .defer_private_publication()
             .expect("duplicate output is private");
@@ -291,7 +292,10 @@ impl Session {
             cell_edits,
             spec,
             destination.as_ref().to_path_buf(),
-            DEFAULT_SORT_CONFIG,
+            SortConfig {
+                encoding: self.encoding,
+                ..DEFAULT_SORT_CONFIG
+            },
         )
     }
 
@@ -309,7 +313,10 @@ impl Session {
             cell_edits,
             spec,
             destination.as_ref().to_path_buf(),
-            DEFAULT_SORT_CONFIG,
+            SortConfig {
+                encoding: self.encoding,
+                ..DEFAULT_SORT_CONFIG
+            },
             Some(temporary_directory.as_ref().to_path_buf()),
         )
     }
@@ -333,7 +340,14 @@ fn run_duplicates(
     temporary_directory: Option<&Path>,
 ) -> Result<DuplicateOutcome, QuarryError> {
     let shared = &state.sort;
-    let Some(records) = count_records(source, delimiter, &shared.cancel_requested)? else {
+    let Some(records) = crate::storage::count_records_encoded(
+        source,
+        delimiter,
+        config.encoding,
+        &shared.cancel_requested,
+        |_| {},
+    )?
+    else {
         return Ok(DuplicateOutcome::Cancelled);
     };
     let output_bytes = estimate_edited_output_bytes(
@@ -344,6 +358,11 @@ fn run_duplicates(
         None,
         None,
     );
+    let output_bytes = if config.encoding == Encoding::Utf8 {
+        output_bytes
+    } else {
+        output_bytes.saturating_mul(3)
+    };
     let temporary_directory = temporary_directory.unwrap_or_else(|| output_parent(&destination));
     check_operation_storage(
         temporary_directory,
@@ -410,11 +429,16 @@ fn run_duplicates(
         let mut prefix_bytes = 0;
         if bom_present {
             write_output(&mut output, UTF8_BOM, shared)?;
-            prefix_bytes += UTF8_BOM.len() as u64;
+            prefix_bytes = output.bytes_written();
         }
         if let Some(header) = &scan.header {
             write_output(&mut output, header, shared)?;
-            prefix_bytes += header.len() as u64;
+            prefix_bytes = output.bytes_written();
+            if prefix_bytes > output.record_limit() as u64 {
+                return Err(QuarryError::RecordTooLarge {
+                    limit: output.record_limit(),
+                });
+            }
         }
         let Some((retained, data_bytes, _)) = merge_runs_to_output(
             &survivors,
@@ -644,6 +668,7 @@ mod tests {
 
     fn tiny_config() -> SortConfig {
         SortConfig {
+            encoding: Encoding::Utf8,
             chunk_bytes: 7,
             max_record_bytes: 1024,
             run_memory_bytes: 96,

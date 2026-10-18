@@ -1,13 +1,15 @@
 //! Two-pass, source-preserving combination of equally shaped delimited files.
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 
-use quarry_delimited::{RecordScanner, parse_record_with_field_limit};
+use crate::Encoding;
+use crate::encoding::RecordScanner;
+use quarry_delimited::parse_record_with_field_limit;
 
 use crate::export::{ExportTarget, source_matches_stamp};
 use crate::storage::output_parent;
@@ -15,8 +17,6 @@ use crate::{
     DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, DEFAULT_SAMPLE_BYTES, FilterExportOutcome,
     MAX_TRANSFORMATION_COLUMNS, QuarryError, SourceStamp, check_storage, detect_file_delimiter,
 };
-
-const BOM: &[u8] = b"\xef\xbb\xbf";
 
 #[derive(Clone, Copy, Debug)]
 pub struct CombineOptions {
@@ -41,6 +41,7 @@ pub struct CombineInput {
     pub bytes: u64,
     pub data_rows: u64,
     stamp: SourceStamp,
+    encoding: Encoding,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +50,7 @@ pub struct CombinePlan {
     pub columns: usize,
     pub delimiter: u8,
     pub has_header: bool,
+    pub encoding: Encoding,
     pub data_rows: u64,
     /// Exact output length, including terminators added to unterminated records.
     pub output_bytes: u64,
@@ -177,6 +179,15 @@ pub fn check_combine_files(
     paths: Vec<PathBuf>,
     options: CombineOptions,
 ) -> Result<CombineJob<CombinePlan>, QuarryError> {
+    check_combine_files_with_encoding(paths, options, None)
+}
+
+/// Validate compatible encodings without guessing a legacy code page.
+pub fn check_combine_files_with_encoding(
+    paths: Vec<PathBuf>,
+    options: CombineOptions,
+    requested_encoding: Option<Encoding>,
+) -> Result<CombineJob<CombinePlan>, QuarryError> {
     if paths.len() < 2 {
         return Err(QuarryError::InvalidOption(
             "select at least two files to combine",
@@ -186,6 +197,7 @@ pub fn check_combine_files(
         let mut unique = HashSet::new();
         let mut inputs = Vec::with_capacity(paths.len());
         let mut delimiter = None;
+        let mut common_encoding = None;
         let mut header: Option<Vec<Vec<u8>>> = None;
         let mut width = None;
         let mut total_rows = 0_u64;
@@ -212,8 +224,18 @@ pub fn check_combine_files(
                 return Err(input_error(&path, None, "Select a regular file."));
             }
             let stamp = SourceStamp::from_file(&file)?;
+            let encoding = Encoding::detect(&mut file, requested_encoding)
+                .map_err(|error| input_error(&path, None, error))?;
+            if common_encoding.is_some_and(|expected| expected != encoding) {
+                return Err(input_error(
+                    &path,
+                    None,
+                    "Encoding differs from the first file. Use Save As UTF-8 on each file before combining mixed encodings.",
+                ));
+            }
+            common_encoding = Some(encoding);
             let observed_delimiter = if let Some(delimiter) = options.delimiter {
-                RecordScanner::new(delimiter)?;
+                RecordScanner::new(delimiter, encoding)?;
                 delimiter
             } else {
                 detect_file_delimiter(
@@ -221,6 +243,7 @@ pub fn check_combine_files(
                     stamp.file_size(),
                     DEFAULT_SAMPLE_BYTES,
                     DEFAULT_MAX_RECORD_BYTES,
+                    encoding,
                 )
                 .map_err(|error| input_error(&path, Some(1), error))?
             };
@@ -240,6 +263,7 @@ pub fn check_combine_files(
                 bytes: stamp.file_size(),
                 data_rows: 0,
                 stamp,
+                encoding,
             };
             file.seek(SeekFrom::Start(0))?;
             drop(file);
@@ -253,12 +277,15 @@ pub fn check_combine_files(
                 state,
                 |record, row| {
                     let content = if row == 0 {
-                        record.strip_prefix(BOM).unwrap_or(record)
+                        encoding.strip_bom(record).1
                     } else {
                         record
                     };
+                    let decoded = encoding
+                        .decode(content, DEFAULT_MAX_RECORD_BYTES)
+                        .map_err(|error| input_error(&input.path, Some(row + 1), error))?;
                     let fields = parse_record_with_field_limit(
-                        content,
+                        &decoded,
                         delimiter.unwrap(),
                         MAX_TRANSFORMATION_COLUMNS,
                     )
@@ -296,9 +323,24 @@ pub fn check_combine_files(
                     }
                     records += 1;
                     if included_record(options.has_header, index, row) {
-                        let raw = output_record(record, index, row);
+                        let raw = output_record(record, index, row, encoding);
+                        if raw
+                            .len()
+                            .saturating_add(output_ending(raw, encoding).len() * encoding.width())
+                            > DEFAULT_MAX_RECORD_BYTES
+                        {
+                            return Err(input_error(
+                                &input.path,
+                                Some(row + 1),
+                                "Adding the record ending would exceed the 64 MiB limit.",
+                            ));
+                        }
                         output_bytes = output_bytes
-                            .checked_add(raw.len() as u64 + output_ending(raw).len() as u64)
+                            .checked_add(
+                                raw.len() as u64
+                                    + (output_ending(raw, encoding).len() * encoding.width())
+                                        as u64,
+                            )
                             .ok_or(QuarryError::InvalidOption(
                                 "combined output size exceeds the supported limit",
                             ))?;
@@ -337,6 +379,7 @@ pub fn check_combine_files(
             columns: width.unwrap(),
             delimiter: delimiter.unwrap(),
             has_header: options.has_header,
+            encoding: common_encoding.expect("at least two inputs"),
             data_rows: total_rows,
             output_bytes,
         }))
@@ -349,6 +392,15 @@ impl CombinePlan {
         self,
         destination: PathBuf,
     ) -> Result<CombineJob<CombineSummary>, QuarryError> {
+        if self
+            .inputs
+            .iter()
+            .any(|input| input.encoding != self.encoding)
+        {
+            return Err(QuarryError::InvalidOption(
+                "combine plan encoding changed after validation",
+            ));
+        }
         let total = self
             .inputs
             .iter()
@@ -364,6 +416,7 @@ impl CombinePlan {
                 .map(|input| (input.path.clone(), input.stamp.clone()))
                 .collect();
             let mut output = ExportTarget::new_combined(guards, destination.clone())?;
+            output.configure(self.encoding, self.encoding, DEFAULT_MAX_RECORD_BYTES);
             let mut bytes_written = 0_u64;
             for (index, input) in self.inputs.iter().enumerate() {
                 if state.cancel.load(Ordering::Acquire) {
@@ -373,12 +426,12 @@ impl CombinePlan {
                 let mut source = check_source(input)?;
                 if !scan(&mut source, input, self.delimiter, state, |record, row| {
                     if included_record(self.has_header, index, row) {
-                        let raw = output_record(record, index, row);
-                        output.write_all(raw)?;
+                        let raw = output_record(record, index, row, self.encoding);
+                        output.write_raw_all(raw)?;
                         bytes_written += raw.len() as u64;
-                        let ending = output_ending(raw);
+                        let ending = output_ending(raw, self.encoding);
                         output.write_all(ending)?;
-                        bytes_written += ending.len() as u64;
+                        bytes_written += (ending.len() * self.encoding.width()) as u64;
                     }
                     Ok(())
                 })? {
@@ -404,18 +457,18 @@ impl CombinePlan {
 fn included_record(has_header: bool, file: usize, row: u64) -> bool {
     !has_header || file == 0 || row != 0
 }
-fn output_record(record: &[u8], file: usize, row: u64) -> &[u8] {
+fn output_record(record: &[u8], file: usize, row: u64, encoding: Encoding) -> &[u8] {
     if file != 0 && row == 0 {
-        record.strip_prefix(BOM).unwrap_or(record)
+        encoding.strip_bom(record).1
     } else {
         record
     }
 }
 
-fn output_ending(record: &[u8]) -> &[u8] {
-    if record.ends_with(b"\n") {
+fn output_ending(record: &[u8], encoding: Encoding) -> &'static [u8] {
+    if encoding.ends_with_ascii(record, b'\n') {
         b""
-    } else if record.ends_with(b"\r") {
+    } else if encoding.ends_with_ascii(record, b'\r') {
         // The existing CR is field data. A separate CRLF terminator preserves it.
         b"\r\n"
     } else {
@@ -432,8 +485,8 @@ fn scan(
     state: &Progress,
     mut record_fn: impl FnMut(&[u8], u64) -> Result<(), QuarryError>,
 ) -> Result<bool, QuarryError> {
-    let mut scanner = RecordScanner::new(delimiter)?;
-    let mut chunk = vec![0; DEFAULT_READ_CHUNK];
+    let mut scanner = RecordScanner::new(delimiter, input.encoding)?;
+    let mut chunk = vec![0; input.encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut record = Vec::new();
     let mut offset = 0_u64;
     let mut row = 0_u64;
@@ -441,8 +494,9 @@ fn scan(
         if state.cancel.load(Ordering::Acquire) {
             return Ok(false);
         }
-        let read = file
-            .read(&mut chunk)
+        let read = input
+            .encoding
+            .read_chunk(file, &mut chunk)
             .map_err(|error| input_error(&input.path, Some(row + 1), error))?;
         if read == 0 {
             let mut last = false;

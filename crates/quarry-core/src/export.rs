@@ -32,11 +32,15 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct ExportConfig {
+    source_encoding: crate::Encoding,
+    output_encoding: crate::Encoding,
     chunk_bytes: usize,
     max_record_bytes: usize,
 }
 
 const DEFAULT_EXPORT_CONFIG: ExportConfig = ExportConfig {
+    source_encoding: crate::Encoding::Utf8,
+    output_encoding: crate::Encoding::Utf8,
     chunk_bytes: DEFAULT_READ_CHUNK,
     max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
 };
@@ -788,7 +792,12 @@ impl FilterExportJob {
         }
         let source = File::open(&source_path)?;
         let stamp = expected.unwrap_or(SourceStamp::from_file(&source)?);
-        let output = ExportTarget::new_guarded(&source_path, destination, &source, stamp)?;
+        let mut output = ExportTarget::new_guarded(&source_path, destination, &source, stamp)?;
+        output.configure(
+            config.source_encoding,
+            config.output_encoding,
+            config.max_record_bytes,
+        );
         let shared = Arc::new(SharedState::new(file_size));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -1428,6 +1437,11 @@ impl SaveAsJob {
                 destination_expected,
             )?,
         };
+        output.configure(
+            config.source_encoding,
+            config.output_encoding,
+            config.max_record_bytes,
+        );
         let publication = output.defer_private_publication();
         let shared = Arc::new(SharedState::new(file_size));
         let worker_state = Arc::clone(&shared);
@@ -1591,6 +1605,43 @@ impl CleanupJob {
 }
 
 impl Session {
+    fn export_config(&self) -> ExportConfig {
+        ExportConfig {
+            source_encoding: self.encoding,
+            output_encoding: self.encoding,
+            ..DEFAULT_EXPORT_CONFIG
+        }
+    }
+
+    /// Save a UTF-8 copy of working values without changing the source file.
+    pub fn start_save_as_utf8(
+        &self,
+        headers: BTreeMap<usize, Vec<u8>>,
+        cells: BTreeMap<(u64, usize), Vec<u8>>,
+        transformation: Option<ColumnTransformation>,
+        destination: impl AsRef<Path>,
+    ) -> Result<SaveAsJob, QuarryError> {
+        SaveAsJob::start_with_edits(
+            self.path.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.dialect.has_header,
+            SaveEdits {
+                headers,
+                cells,
+                transformation,
+            },
+            SaveTarget::New(
+                destination.as_ref().to_path_buf(),
+                self.source_stamp.clone(),
+            ),
+            ExportConfig {
+                output_encoding: crate::Encoding::Utf8,
+                ..self.export_config()
+            },
+        )
+    }
+
     pub fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
         let source = File::open(&self.path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -1630,7 +1681,7 @@ impl Session {
             self.dialect.has_header,
             query,
             destination.as_ref().to_path_buf(),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
             FilteredEdits { cells, headers },
             Some(self.source_stamp.clone()),
         )
@@ -1653,7 +1704,7 @@ impl Session {
             separator,
             max_pieces,
             self.source_stamp.clone(),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )
     }
 
@@ -1715,7 +1766,7 @@ impl Session {
                 destination.as_ref().to_path_buf(),
                 self.source_stamp.clone(),
             ),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )
     }
 
@@ -1740,7 +1791,7 @@ impl Session {
                 destination.as_ref().to_path_buf(),
                 self.source_stamp.clone(),
             ),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )
     }
 
@@ -1769,7 +1820,7 @@ impl Session {
                 destination.as_ref().to_path_buf(),
                 self.source_stamp.clone(),
             ),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )
     }
 
@@ -1801,7 +1852,7 @@ impl Session {
                 destination.as_ref().to_path_buf(),
                 self.source_stamp.clone(),
             ),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )
     }
 
@@ -1828,7 +1879,7 @@ impl Session {
                 destination.as_ref().to_path_buf(),
                 self.source_stamp.clone(),
             ),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )?;
         Ok(CleanupJob { inner })
     }
@@ -1855,7 +1906,7 @@ impl Session {
                 destination.as_ref().to_path_buf(),
                 self.source_stamp.clone(),
             ),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )?;
         Ok(ReplaceAllJob { inner })
     }
@@ -1881,7 +1932,7 @@ impl Session {
                 source_expected: self.source_stamp.clone(),
                 destination_expected: original.source_stamp.clone(),
             },
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )
         .map_err(|error| match error {
             QuarryError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1936,7 +1987,7 @@ impl Session {
                 transformation,
             },
             SaveTarget::Source(self.source_stamp.clone()),
-            DEFAULT_EXPORT_CONFIG,
+            self.export_config(),
         )
         .map_err(|error| match error {
             QuarryError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2026,6 +2077,11 @@ impl PrivatePublication {
 
 pub(crate) struct ExportTarget {
     writer: Option<BufWriter<File>>,
+    source_encoding: crate::Encoding,
+    output_encoding: crate::Encoding,
+    encoded_bytes_written: u64,
+    record_limit: usize,
+    suppress_next_source_bom: bool,
     // Keeps private staging owned until publication or cleanup, on the destination volume.
     _private_directory: Option<tempfile::TempDir>,
     private_publication: Option<Arc<PrivatePublication>>,
@@ -2254,6 +2310,11 @@ impl ExportTarget {
                     }
                     return Ok(Self {
                         writer: Some(BufWriter::new(file)),
+                        source_encoding: crate::Encoding::Utf8,
+                        output_encoding: crate::Encoding::Utf8,
+                        encoded_bytes_written: 0,
+                        record_limit: DEFAULT_MAX_RECORD_BYTES,
+                        suppress_next_source_bom: false,
                         _private_directory: private_directory,
                         private_publication: None,
                         temporary,
@@ -2274,7 +2335,55 @@ impl ExportTarget {
         .into())
     }
 
+    pub(crate) fn configure(
+        &mut self,
+        source: crate::Encoding,
+        output: crate::Encoding,
+        limit: usize,
+    ) {
+        debug_assert_eq!(self.encoded_bytes_written, 0);
+        self.source_encoding = source;
+        self.output_encoding = output;
+        self.record_limit = limit;
+    }
+
+    pub(crate) fn bytes_written(&self) -> u64 {
+        self.encoded_bytes_written
+    }
+
+    pub(crate) fn output_encoding(&self) -> crate::Encoding {
+        self.output_encoding
+    }
+
+    pub(crate) fn record_limit(&self) -> usize {
+        self.record_limit
+    }
+
+    /// Copy already encoded source bytes, used by same-encoding Combine Files.
+    pub(crate) fn write_raw_all(&mut self, bytes: &[u8]) -> Result<(), QuarryError> {
+        self.writer
+            .as_mut()
+            .expect("export writer is present")
+            .write_all(bytes)
+            .map_err(|error| storage_error(output_parent(&self.destination), error))?;
+        self.encoded_bytes_written = self
+            .encoded_bytes_written
+            .saturating_add(bytes.len() as u64);
+        Ok(())
+    }
+
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), QuarryError> {
+        let bytes = if self.suppress_next_source_bom && !bytes.is_empty() {
+            self.suppress_next_source_bom = false;
+            bytes
+                .strip_prefix(UTF8_BOM)
+                .ok_or(QuarryError::InvalidOption(
+                    "expected source byte-order mark while inserting before record zero",
+                ))?
+        } else {
+            bytes
+        };
+
         self.write_all_inner(bytes).map_err(|error| match error {
             QuarryError::Io(error) => storage_error(output_parent(&self.destination), error),
             error => error,
@@ -2283,16 +2392,29 @@ impl ExportTarget {
 
     fn write_all_inner(&mut self, bytes: &[u8]) -> Result<(), QuarryError> {
         let writer = self.writer.as_mut().expect("export writer is present");
+        let encoding = self.output_encoding;
+        let limit = self.record_limit;
+        let count = &mut self.encoded_bytes_written;
+        let mut write = |bytes: &[u8]| -> Result<(), QuarryError> {
+            let encoded = if encoding == crate::Encoding::Utf8 {
+                std::borrow::Cow::Borrowed(bytes)
+            } else {
+                encoding.encode(bytes, limit)?
+            };
+            writer.write_all(&encoded)?;
+            *count = count.saturating_add(encoded.len() as u64);
+            Ok(())
+        };
         match &mut self.first_record_bom_guard {
             FirstRecordBomGuard::Inactive | FirstRecordBomGuard::Complete => {
-                writer.write_all(bytes)?;
+                write(bytes)?;
             }
             FirstRecordBomGuard::Probing {
                 source_had_bom: true,
                 ..
             } if !bytes.is_empty() => {
-                writer.write_all(UTF8_BOM)?;
-                writer.write_all(bytes)?;
+                write(UTF8_BOM)?;
+                write(bytes)?;
                 self.first_record_bom_guard = FirstRecordBomGuard::Passthrough {
                     inserted_bytes: UTF8_BOM.len() as u64,
                 };
@@ -2310,23 +2432,23 @@ impl ExportTarget {
                     prefix.push(bytes[consumed]);
                     consumed += 1;
                     if !UTF8_BOM.starts_with(prefix) {
-                        writer.write_all(prefix)?;
-                        writer.write_all(&bytes[consumed..])?;
+                        write(prefix)?;
+                        write(&bytes[consumed..])?;
                         self.first_record_bom_guard =
                             FirstRecordBomGuard::Passthrough { inserted_bytes: 0 };
                         return Ok(());
                     }
                 }
                 if prefix.len() == UTF8_BOM.len() {
-                    writer.write_all(UTF8_BOM)?;
-                    writer.write_all(prefix)?;
-                    writer.write_all(&bytes[consumed..])?;
+                    write(UTF8_BOM)?;
+                    write(prefix)?;
+                    write(&bytes[consumed..])?;
                     self.first_record_bom_guard = FirstRecordBomGuard::Passthrough {
                         inserted_bytes: UTF8_BOM.len() as u64,
                     };
                 }
             }
-            FirstRecordBomGuard::Passthrough { .. } => writer.write_all(bytes)?,
+            FirstRecordBomGuard::Passthrough { .. } => write(bytes)?,
         }
         Ok(())
     }
@@ -2349,11 +2471,19 @@ impl ExportTarget {
         );
         match guard {
             FirstRecordBomGuard::Probing { prefix, .. } => {
+                let encoded = if self.output_encoding == crate::Encoding::Utf8 {
+                    std::borrow::Cow::Borrowed(prefix.as_slice())
+                } else {
+                    self.output_encoding.encode(&prefix, self.record_limit)?
+                };
                 self.writer
                     .as_mut()
                     .expect("export writer is present")
-                    .write_all(&prefix)
+                    .write_all(&encoded)
                     .map_err(|error| storage_error(output_parent(&self.destination), error))?;
+                self.encoded_bytes_written = self
+                    .encoded_bytes_written
+                    .saturating_add(encoded.len() as u64);
                 Ok(0)
             }
             FirstRecordBomGuard::Passthrough { inserted_bytes } => Ok(inserted_bytes),
@@ -2433,10 +2563,11 @@ impl ExportTarget {
     fn publish_inner(
         mut self,
         rows_written: u64,
-        bytes_written: u64,
+        _bytes_written: u64,
         cancel_requested: &AtomicBool,
         capture_stamp: bool,
     ) -> Result<(FilterExportOutcome, Option<SourceStamp>), QuarryError> {
+        let bytes_written = self.encoded_bytes_written;
         if cancel_requested.load(Ordering::Acquire) {
             drop(self.writer.take());
             self.remove_temporary()?;
@@ -2731,7 +2862,12 @@ fn run_export(
                 .map(|(&key, value)| (key, value.as_slice())),
             None,
             None,
-        ),
+        )
+        .saturating_mul(if config.output_encoding == crate::Encoding::Utf8 {
+            1
+        } else {
+            3
+        }),
     )?;
     match scan_export(
         &mut source,
@@ -2780,9 +2916,10 @@ fn run_save_as(
         || edits.inserted_rows.is_some()
     {
         shared.preparing.store(true, Ordering::Release);
-        let Some(records) = crate::storage::count_records_with_progress(
+        let Some(records) = crate::storage::count_records_encoded(
             &mut source,
             delimiter,
+            config.source_encoding,
             &shared.cancel_requested,
             |bytes| {
                 shared
@@ -2817,7 +2954,7 @@ fn run_save_as(
     } else {
         0
     };
-    let required = estimate_edited_output_bytes(
+    let raw_bound = estimate_edited_output_bytes(
         shared.total_bytes,
         serialized_records,
         &edits.headers,
@@ -2833,12 +2970,34 @@ fn run_save_as(
             .inserted_rows
             .map_or(0, RowInsertion::additional_output_bytes),
     );
+    let base = if config.source_encoding == config.output_encoding {
+        shared.total_bytes
+    } else {
+        shared.total_bytes.saturating_mul(3)
+    };
+    let required = base.saturating_add(
+        raw_bound
+            .saturating_sub(shared.total_bytes)
+            .saturating_mul(config.output_encoding.width() as u64),
+    );
     check_storage(output_parent(&output.destination), required)?;
     shared
         .estimated_output_bytes
         .store(required, Ordering::Release);
     shared.preparing.store(false, Ordering::Release);
-    let copied = if let Some(insertion) = edits.inserted_rows {
+    let copied = if config.source_encoding != crate::Encoding::Utf8
+        || config.output_encoding != crate::Encoding::Utf8
+    {
+        copy_encoded_records(
+            &mut source,
+            &mut output,
+            delimiter,
+            has_header,
+            edits,
+            config,
+            shared,
+        )
+    } else if let Some(insertion) = edits.inserted_rows {
         copy_with_inserted_rows(
             &mut source,
             &mut output,
@@ -2920,6 +3079,307 @@ fn run_save_as(
     }
 }
 
+struct EncodedSaveState<'a> {
+    output: &'a mut ExportTarget,
+    edits: &'a PreparedSaveEdits,
+    config: ExportConfig,
+    shared: &'a SharedState,
+    delimiter: u8,
+    has_header: bool,
+    source_had_bom: bool,
+    row: u64,
+    inserted: bool,
+    ending: Vec<u8>,
+    last_terminated: bool,
+    last_trailing_cr: bool,
+    last_record_bytes: u64,
+    replacements: u64,
+}
+
+impl EncodedSaveState<'_> {
+    fn insert(&mut self) -> Result<bool, QuarryError> {
+        let Some(insertion) = self.edits.inserted_rows else {
+            return Ok(true);
+        };
+        if !self.last_terminated {
+            let ending = if self.last_trailing_cr && self.ending == b"\n" {
+                b"\r\n".as_slice()
+            } else {
+                &self.ending
+            };
+            let extra = self.config.output_encoding.encoded_len(ending)? as u64;
+            if self.last_record_bytes.saturating_add(extra) > self.config.max_record_bytes as u64 {
+                return Err(QuarryError::RecordTooLarge {
+                    limit: self.config.max_record_bytes,
+                });
+            }
+            self.output.write_all(ending)?;
+        }
+        let prefix = if self.output.bytes_written() == 0 && self.source_had_bom {
+            UTF8_BOM
+        } else {
+            &[]
+        };
+        let row_length = (insertion.width - 1).saturating_add(self.ending.len());
+        if row_length
+            .saturating_mul(self.config.output_encoding.width())
+            .saturating_add(self.config.output_encoding.encoded_len(prefix)?)
+            > self.config.max_record_bytes
+        {
+            return Err(QuarryError::RecordTooLarge {
+                limit: self.config.max_record_bytes,
+            });
+        }
+        if write_blank_rows(
+            self.output,
+            insertion,
+            self.delimiter,
+            &self.ending,
+            prefix,
+            self.shared,
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+        self.shared
+            .bytes_written
+            .store(self.output.bytes_written(), Ordering::Release);
+        self.inserted = true;
+        self.last_terminated = true;
+        self.last_trailing_cr = false;
+        self.last_record_bytes =
+            row_length.saturating_mul(self.config.output_encoding.width()) as u64;
+        Ok(true)
+    }
+
+    fn record(&mut self, raw: &[u8]) -> Result<bool, QuarryError> {
+        if self.shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let decoded = self
+            .config
+            .source_encoding
+            .decode(raw, self.config.max_record_bytes)?;
+        let record = decoded.as_ref();
+        let row = self.row;
+        self.row += 1;
+        if row == 0 {
+            self.ending = if record.ends_with(b"\r\n") {
+                b"\r\n".to_vec()
+            } else {
+                b"\n".to_vec()
+            };
+        }
+        if self
+            .edits
+            .inserted_rows
+            .is_some_and(|insertion| insertion.position == row)
+            && !self.insert()?
+        {
+            return Ok(false);
+        }
+        if row_in_deleted_ranges(&self.edits.deleted_rows, row) {
+            return Ok(true);
+        }
+        let before = self.output.bytes_written();
+        let guard_first = before == 0 && !(row == 0 && self.source_had_bom);
+        if guard_first {
+            self.output
+                .begin_first_record_bom_guard(self.source_had_bom);
+        }
+        if row == 0
+            && self.source_had_bom
+            && self
+                .edits
+                .inserted_rows
+                .is_some_and(|insertion| insertion.position == 0)
+        {
+            // The marker already precedes the inserted rows; keep the source record's data.
+            self.output.suppress_next_source_bom = true;
+        }
+        let written = write_saved_record(
+            self.output,
+            record,
+            row,
+            self.delimiter,
+            self.has_header,
+            self.edits,
+            self.config.max_record_bytes,
+        )?;
+        if guard_first {
+            self.output.finish_first_record_bom_guard()?;
+        }
+        let actual = self.output.bytes_written().saturating_sub(before);
+        if actual > self.config.max_record_bytes as u64 {
+            return Err(QuarryError::RecordTooLarge {
+                limit: self.config.max_record_bytes,
+            });
+        }
+        self.replacements = self.replacements.saturating_add(written.replacements);
+        self.last_record_bytes = actual;
+        self.last_terminated = record.ends_with(b"\n");
+        self.last_trailing_cr = record.ends_with(b"\r");
+        self.shared
+            .bytes_written
+            .store(self.output.bytes_written(), Ordering::Release);
+        Ok(true)
+    }
+
+    fn finish(&mut self) -> Result<bool, QuarryError> {
+        if self
+            .edits
+            .cells
+            .keys()
+            .next_back()
+            .is_some_and(|(row, _)| *row >= self.row)
+            || self
+                .edits
+                .deleted_rows
+                .last()
+                .is_some_and(|range| *range.end() >= self.row)
+        {
+            return Err(QuarryError::InvalidOption(
+                "edit row is outside the source data",
+            ));
+        }
+        if let Some(insertion) = self.edits.inserted_rows
+            && !self.inserted
+        {
+            if insertion.position != self.row {
+                return Err(QuarryError::InvalidOption(
+                    "row insertion position is outside the source data",
+                ));
+            }
+            if !self.insert()? {
+                return Ok(false);
+            }
+        }
+        if self.row == 0 && self.has_header {
+            return Err(QuarryError::InvalidOption(
+                "source does not contain a header row",
+            ));
+        }
+        if self.row == 0 && self.source_had_bom && !self.inserted {
+            self.output.write_all(UTF8_BOM)?;
+        }
+        self.shared
+            .bytes_written
+            .store(self.output.bytes_written(), Ordering::Release);
+        Ok(true)
+    }
+}
+
+pub(crate) fn source_starts_with_bom(
+    source: &mut File,
+    encoding: crate::Encoding,
+) -> Result<bool, QuarryError> {
+    let bom = encoding.bom();
+    if bom.is_empty() {
+        return Ok(false);
+    }
+    let position = source.stream_position()?;
+    let mut prefix = vec![0; bom.len()];
+    let result = source.read_exact(&mut prefix);
+    source.seek(SeekFrom::Start(position))?;
+    match result {
+        Ok(()) => Ok(prefix == bom),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn copy_encoded_records(
+    source: &mut File,
+    output: &mut ExportTarget,
+    delimiter: u8,
+    has_header: bool,
+    edits: &PreparedSaveEdits,
+    config: ExportConfig,
+    shared: &SharedState,
+) -> Result<Option<SaveCopySummary>, QuarryError> {
+    let source_had_bom = source_starts_with_bom(source, config.source_encoding)?;
+    let mut scanner = crate::encoding::RecordScanner::new(delimiter, config.source_encoding)?;
+    let mut state = EncodedSaveState {
+        output,
+        edits,
+        config,
+        shared,
+        delimiter,
+        has_header,
+        source_had_bom,
+        row: 0,
+        inserted: false,
+        ending: b"\n".to_vec(),
+        last_terminated: true,
+        last_trailing_cr: false,
+        last_record_bytes: 0,
+        replacements: 0,
+    };
+    let mut chunk = vec![0; config.source_encoding.chunk_size(config.chunk_bytes)];
+    let mut record = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        if shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let read = config.source_encoding.read_chunk(source, &mut chunk)?;
+        let mut error = None;
+        let mut cancelled = false;
+        if read == 0 {
+            scanner.finish(offset, |_| match state.record(&record) {
+                Ok(true) => {}
+                Ok(false) => cancelled = true,
+                Err(failure) => error = Some(failure),
+            })?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if cancelled || !state.finish()? {
+                return Ok(None);
+            }
+            return Ok(Some(SaveCopySummary {
+                bytes_written: state.output.bytes_written(),
+                replacements: state.replacements,
+            }));
+        }
+        let mut start = 0;
+        scanner.scan_chunk(&chunk[..read], offset, |end| {
+            let end = (end - offset) as usize;
+            if error.is_none() && !cancelled {
+                if record.len().saturating_add(end - start) > config.max_record_bytes {
+                    error = Some(QuarryError::RecordTooLarge {
+                        limit: config.max_record_bytes,
+                    });
+                } else {
+                    record.extend_from_slice(&chunk[start..end]);
+                    match state.record(&record) {
+                        Ok(true) => {}
+                        Ok(false) => cancelled = true,
+                        Err(failure) => error = Some(failure),
+                    }
+                }
+            }
+            record.clear();
+            start = end;
+        })?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if cancelled {
+            return Ok(None);
+        }
+        if record.len().saturating_add(read - start) > config.max_record_bytes {
+            return Err(QuarryError::RecordTooLarge {
+                limit: config.max_record_bytes,
+            });
+        }
+        record.extend_from_slice(&chunk[start..read]);
+        offset += read as u64;
+        shared.bytes_scanned.store(offset, Ordering::Release);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_split_analysis(
     mut source: File,
@@ -2934,8 +3394,8 @@ fn run_split_analysis(
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<SplitAnalysisOutcome, QuarryError> {
-    let mut scanner = RecordScanner::new(delimiter)?;
-    let mut chunk = vec![0; config.chunk_bytes];
+    let mut scanner = crate::encoding::RecordScanner::new(delimiter, config.source_encoding)?;
+    let mut chunk = vec![0; config.source_encoding.chunk_size(config.chunk_bytes)];
     let mut record = Vec::new();
     let mut absolute_start = 0_u64;
     let mut row_number = 0_u64;
@@ -2948,7 +3408,7 @@ fn run_split_analysis(
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(SplitAnalysisOutcome::Cancelled);
         }
-        let read = source.read(&mut chunk)?;
+        let read = config.source_encoding.read_chunk(&mut source, &mut chunk)?;
         if read == 0 {
             let mut deferred_error = None;
             let mut cancelled = false;
@@ -2967,6 +3427,7 @@ fn run_split_analysis(
                         separator.len(),
                         max_pieces,
                         config.max_record_bytes,
+                        config.source_encoding,
                         &mut observed_max_pieces,
                     ) {
                         Ok(true) => rows_scanned = rows_scanned.saturating_add(1),
@@ -3031,6 +3492,7 @@ fn run_split_analysis(
                             separator.len(),
                             max_pieces,
                             config.max_record_bytes,
+                            config.source_encoding,
                             &mut observed_max_pieces,
                         ) {
                             Ok(true) => rows_scanned = rows_scanned.saturating_add(1),
@@ -3078,11 +3540,14 @@ fn analyze_split_record(
     separator_len: usize,
     max_pieces: usize,
     max_record_bytes: usize,
+    encoding: crate::Encoding,
     observed_max_pieces: &mut usize,
 ) -> Result<bool, QuarryError> {
     if row_number < data_start {
         return Ok(false);
     }
+    let decoded = encoding.decode(record, max_record_bytes)?;
+    let record = decoded.as_ref();
     let record = if row_number == 0 {
         record.strip_prefix(UTF8_BOM).unwrap_or(record)
     } else {
@@ -4423,8 +4888,8 @@ fn scan_export(
 ) -> Result<ScanOutcome, QuarryError> {
     let matchers = compile_matchers(query)?;
     let groups = predicate_groups(query);
-    let mut scanner = RecordScanner::new(delimiter)?;
-    let mut chunk = vec![0; config.chunk_bytes];
+    let mut scanner = crate::encoding::RecordScanner::new(delimiter, config.source_encoding)?;
+    let mut chunk = vec![0; config.source_encoding.chunk_size(config.chunk_bytes)];
     let mut absolute_start = 0_u64;
     let mut row_number = 0_u64;
     let mut rows_scanned = 0_u64;
@@ -4436,7 +4901,7 @@ fn scan_export(
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(ScanOutcome::Cancelled);
         }
-        let read = source.read(&mut chunk)?;
+        let read = config.source_encoding.read_chunk(source, &mut chunk)?;
         if read == 0 {
             let mut deferred_error = None;
             let mut cancelled = false;
@@ -4569,6 +5034,9 @@ fn process_record(
             limit: max_record_bytes,
         });
     }
+    let decoded = output.source_encoding.decode(record, max_record_bytes)?;
+    let record = decoded.as_ref();
+    let output_start = output.bytes_written();
     if row_number < data_start
         || matching_fields_with_edits(
             record,
@@ -4578,6 +5046,7 @@ fn process_record(
             matchers,
             groups,
             &edits.cells,
+            crate::Encoding::Utf8,
         )?
         .is_some()
     {
@@ -4623,7 +5092,12 @@ fn process_record(
                 limit: max_record_bytes,
             });
         }
-        *bytes_written = bytes_written.saturating_add(written);
+        if output.bytes_written().saturating_sub(output_start) > max_record_bytes as u64 {
+            return Err(QuarryError::RecordTooLarge {
+                limit: max_record_bytes,
+            });
+        }
+        *bytes_written = output.bytes_written();
         if row_number >= data_start {
             *rows_written += 1;
         }
@@ -5196,6 +5670,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 64,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5243,6 +5719,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 64,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5286,6 +5764,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 64,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5325,6 +5805,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 3,
                 max_record_bytes: 16,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5362,6 +5844,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 16,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5400,6 +5884,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 16,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5477,6 +5963,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 3,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5580,6 +6068,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 12,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5622,6 +6112,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5728,6 +6220,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5950,6 +6444,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 64,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -5997,6 +6493,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -6153,6 +6651,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 2,
                 max_record_bytes: 8,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -6257,6 +6757,8 @@ mod tests {
                 ExportConfig {
                     chunk_bytes: 2,
                     max_record_bytes: 8,
+                    source_encoding: crate::Encoding::Utf8,
+                    output_encoding: crate::Encoding::Utf8,
                 },
             );
             assert!(
@@ -6300,6 +6802,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 8,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -6332,6 +6836,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 8,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -6422,6 +6928,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 3,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -6474,6 +6982,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 2,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -6687,6 +7197,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 3,
                 max_record_bytes: 8,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -6723,6 +7235,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 3,
                 max_record_bytes: 8,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -7374,6 +7888,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 4,
                 max_record_bytes: 8,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         );
         assert!(matches!(
@@ -7412,6 +7928,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -7458,6 +7976,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -7666,6 +8186,8 @@ mod tests {
                 ExportConfig {
                     chunk_bytes: 1,
                     max_record_bytes: crate::DEFAULT_MAX_RECORD_BYTES,
+                    source_encoding: crate::Encoding::Utf8,
+                    output_encoding: crate::Encoding::Utf8,
                 },
             )
             .unwrap();
@@ -7703,6 +8225,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 4,
                 max_record_bytes: 8,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -8253,6 +8777,8 @@ mod tests {
                             ExportConfig {
                                 chunk_bytes,
                                 max_record_bytes: 8,
+                                source_encoding: crate::Encoding::Utf8,
+                                output_encoding: crate::Encoding::Utf8,
                             },
                         )
                         .unwrap()
@@ -8538,6 +9064,8 @@ mod tests {
             ExportConfig {
                 chunk_bytes: 1,
                 max_record_bytes: 32,
+                source_encoding: crate::Encoding::Utf8,
+                output_encoding: crate::Encoding::Utf8,
             },
         )
         .unwrap();
@@ -8589,6 +9117,8 @@ mod tests {
                 ExportConfig {
                     chunk_bytes,
                     max_record_bytes: 1024,
+                    source_encoding: crate::Encoding::Utf8,
+                    output_encoding: crate::Encoding::Utf8,
                 },
             )
             .unwrap();
