@@ -2275,18 +2275,7 @@ impl ExportTarget {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        match &publication {
-            Publication::GuardedCreateWorkingCopy { .. } => {
-                options.mode(0o600);
-            }
-            Publication::ReplaceSource { permissions, .. }
-            | Publication::GuardedReplaceExisting { permissions, .. } => {
-                options.mode(permissions.mode());
-            }
-            Publication::CreateNew | Publication::GuardedCreateNew { .. } => {
-                options.mode(0o600);
-            }
-        }
+        options.mode(0o600);
         // A shared destination must not expose uncommitted CSV contents, even
         // when the eventual destination deliberately retains shared permissions.
         let private_directory =
@@ -2307,18 +2296,7 @@ impl ExportTarget {
             match options.open(&temporary) {
                 Ok(file) => {
                     #[cfg(unix)]
-                    let permissions = match &publication {
-                        Publication::GuardedCreateWorkingCopy { .. } => {
-                            Some(fs::Permissions::from_mode(0o600))
-                        }
-                        Publication::ReplaceSource { permissions, .. }
-                        | Publication::GuardedReplaceExisting { permissions, .. } => {
-                            Some(permissions.clone())
-                        }
-                        Publication::CreateNew | Publication::GuardedCreateNew { .. } => {
-                            Some(fs::Permissions::from_mode(0o600))
-                        }
-                    };
+                    let permissions = Some(fs::Permissions::from_mode(0o600));
                     #[cfg(not(unix))]
                     let permissions: Option<fs::Permissions> = match &publication {
                         Publication::ReplaceSource { permissions, .. }
@@ -7361,7 +7339,7 @@ mod tests {
                     .permissions()
                     .mode()
                     & 0o777,
-                0o640
+                0o600
             );
             output.discard().unwrap();
         }

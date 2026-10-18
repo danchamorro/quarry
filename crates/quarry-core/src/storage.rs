@@ -366,6 +366,32 @@ pub(crate) fn count_records_encoded(
     }
 }
 
+/// Identifies filesystems that cannot store extended ACLs.
+#[cfg(target_os = "macos")]
+fn unsupported_acl(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+    )
+}
+
+/// Uses private POSIX modes when ACLs are unavailable; never masks access errors.
+#[cfg(target_os = "macos")]
+fn validate_acl_update(file: &File, private: bool, result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => {}
+        Err(error) if unsupported_acl(&error) => {}
+        Err(error) => return Err(error),
+    }
+    if private && file.metadata()?.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "filesystem cannot enforce private file permissions",
+        ));
+    }
+    Ok(())
+}
+
 /// Clears staging ACLs, or restores the existing destination ACL just before publication.
 /// Open descriptors keep both operations bound to the intended filesystem objects.
 #[cfg(target_os = "macos")]
@@ -389,8 +415,8 @@ pub(crate) fn set_macos_acl(file: &File, source: Option<&File>) -> io::Result<()
     };
     if acl.is_null() && source.is_some() {
         let error = io::Error::last_os_error();
-        // Darwin reports ENOENT when a valid descriptor has no extended ACL.
-        if error.raw_os_error() != Some(libc::ENOENT) {
+        // ENOENT means no extended ACL; unsupported filesystems have no ACL to copy.
+        if error.raw_os_error() != Some(libc::ENOENT) && !unsupported_acl(&error) {
             return Err(error);
         }
         // SAFETY: no source ACL is equivalent to a new, empty ACL.
@@ -408,7 +434,7 @@ pub(crate) fn set_macos_acl(file: &File, source: Option<&File>) -> io::Result<()
     };
     // SAFETY: acl_init or acl_get_fd allocated this object; it has not been freed.
     unsafe { acl_free(acl) };
-    result
+    validate_acl_update(file, source.is_none(), result)
 }
 
 #[cfg(test)]
@@ -689,5 +715,45 @@ mod tests {
             ),
             u64::MAX
         );
+    }
+    /// Unsupported ACLs are safe only with private POSIX modes; other failures remain errors.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsupported_acl_requires_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private.csv");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let file = File::open(&path).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        for code in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(
+                validate_acl_update(&file, true, Err(io::Error::from_raw_os_error(code))).is_ok()
+            );
+        }
+        assert!(
+            validate_acl_update(&file, true, Err(io::Error::from_raw_os_error(libc::EPERM)))
+                .is_err()
+        );
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(
+            validate_acl_update(
+                &file,
+                true,
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_acl_update(
+                &file,
+                false,
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            )
+            .is_ok()
+        );
+        assert!(validate_acl_update(&file, true, Ok(())).is_err());
     }
 }
