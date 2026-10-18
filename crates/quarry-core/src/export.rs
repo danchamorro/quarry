@@ -2416,7 +2416,7 @@ impl ExportTarget {
                 write(UTF8_BOM)?;
                 write(bytes)?;
                 self.first_record_bom_guard = FirstRecordBomGuard::Passthrough {
-                    inserted_bytes: UTF8_BOM.len() as u64,
+                    inserted_bytes: encoding.bom().len() as u64,
                 };
             }
             FirstRecordBomGuard::Probing {
@@ -2439,7 +2439,7 @@ impl ExportTarget {
                         write(prefix)?;
                         write(&bytes[consumed..])?;
                         self.first_record_bom_guard = FirstRecordBomGuard::Passthrough {
-                            inserted_bytes: UTF8_BOM.len() as u64,
+                            inserted_bytes: encoding.bom().len() as u64,
                         };
                         return Ok(());
                     }
@@ -9169,6 +9169,51 @@ mod tests {
             );
             assert_eq!(fs::read(&source).unwrap(), source_bytes);
             fs::remove_file(&out).unwrap();
+            fs::remove_file(&source).unwrap();
+            remove_case(&source);
+        }
+    }
+    #[test]
+    fn filtered_utf16_record_at_limit_counts_a_two_byte_bom() {
+        for encoding in [crate::Encoding::Utf16Le, crate::Encoding::Utf16Be] {
+            let encode = |text: &str| {
+                text.encode_utf16()
+                    .flat_map(|unit| {
+                        if encoding == crate::Encoding::Utf16Le {
+                            unit.to_le_bytes()
+                        } else {
+                            unit.to_be_bytes()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut bytes = encoding.bom().to_vec();
+            bytes.extend(encode("z\n€a"));
+            let source = fixture(&bytes);
+            let output = destination(&source, "exact-native-limit.csv");
+            let job = FilterExportJob::start(
+                source.clone(),
+                bytes.len() as u64,
+                b',',
+                false,
+                FilterQuery::single(0, FilterOperator::Equals, "€a".as_bytes().to_vec()),
+                output.clone(),
+                ExportConfig {
+                    chunk_bytes: 2,
+                    max_record_bytes: 6,
+                    source_encoding: encoding,
+                    output_encoding: encoding,
+                },
+            )
+            .unwrap();
+            let FilterExportOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("cancelled")
+            };
+            let mut expected = encoding.bom().to_vec();
+            expected.extend(encode("€a"));
+            assert_eq!(fs::read(&output).unwrap(), expected);
+            assert_eq!(summary.bytes_written, 6);
+            fs::remove_file(&output).unwrap();
             fs::remove_file(&source).unwrap();
             remove_case(&source);
         }
