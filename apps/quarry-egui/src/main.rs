@@ -692,12 +692,7 @@ impl QuarryApp {
         path: PathBuf,
         options: OpenOptions,
     ) -> Result<(), AppMessage> {
-        let encoding = self
-            .active
-            .document
-            .as_ref()
-            .map(|doc| doc.session.encoding());
-        self.replace_document_with_encoding(path, options, encoding)
+        self.replace_document_with_encoding(path, options, self.active.encoding_mode)
     }
 
     fn replace_document_with_encoding(
@@ -24020,6 +24015,36 @@ mod tests {
             .open_document_tab_with_encoding(source, OpenOptions::default(), Some(Encoding::Latin1))
             .unwrap_err();
         assert!(error.text.contains("Format"));
+        assert_eq!(
+            app.active.document.as_ref().unwrap().session.encoding(),
+            Encoding::Utf8
+        );
+    }
+    #[test]
+    fn discarding_structural_changes_keeps_auto_encoding_for_later_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(
+            "first,last\nAda,Lovelace\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        fs::write(&source, bytes).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_combine(vec![0, 1], b" ".to_vec())
+            .unwrap();
+        finish_structural_edit(&mut app);
+        app.apply(&egui::Context::default(), Action::DiscardChanges);
+        assert_eq!(app.active.encoding_mode, None);
+        fs::write(&source, "first,last\nGrace,Hopper\n").unwrap();
+        app.reload_document();
+        assert!(app.active.notice.is_none());
         assert_eq!(
             app.active.document.as_ref().unwrap().session.encoding(),
             Encoding::Utf8

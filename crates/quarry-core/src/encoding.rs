@@ -1546,4 +1546,41 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn zero_match_headerless_export_retains_bom_without_adding_a_record() {
+        for encoding in [Encoding::Utf8, Encoding::Utf16Le, Encoding::Utf16Be] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.csv");
+            let output = directory.path().join("empty.csv");
+            let mut input = encoding.bom().to_vec();
+            input.extend_from_slice(&encoding.encode(b"drop,0\n", 4096).unwrap());
+            std::fs::write(&source, input).unwrap();
+            let session = crate::Session::open_with_encoding(
+                &source,
+                crate::OpenOptions {
+                    header_mode: crate::HeaderMode::NoHeader,
+                    ..Default::default()
+                },
+                Some(encoding),
+            )
+            .unwrap();
+            let crate::FilterExportOutcome::Complete(summary) = session
+                .start_filtered_export(
+                    crate::FilterQuery::single(0, crate::FilterOperator::Equals, b"keep".to_vec()),
+                    &output,
+                )
+                .unwrap()
+                .wait()
+                .unwrap()
+            else {
+                panic!("cancelled")
+            };
+            assert_eq!(std::fs::read(&output).unwrap(), encoding.bom());
+            assert_eq!(summary.rows_written, 0);
+            assert_eq!(summary.bytes_written, encoding.bom().len() as u64);
+            let reopened = crate::Session::open(&output, crate::OpenOptions::default()).unwrap();
+            assert_eq!(reopened.encoding(), encoding);
+            assert!(reopened.first_rows.is_empty());
+        }
+    }
 }

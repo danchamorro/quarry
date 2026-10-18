@@ -102,7 +102,7 @@ fn print_help() {
            quarry convert-utf8 <FILE> --output FILE [--edit DATA_ROW COLUMN VALUE]...\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]\n\n\
-         All file commands accept --encoding auto|utf8|utf16le|utf16be|windows1252|latin1.\n\
+         Commands that read an input file accept --encoding auto|utf8|utf16le|utf16be|windows1252|latin1; generate does not.\n\
          Auto detects Unicode BOMs and otherwise uses UTF-8; no legacy guessing.\n\n\
          Duplicates: count only by default; --output explicitly removes extra occurrences.\n\
          The first row is kept. Matching ignores ASCII case unless --match-case is set.\n\

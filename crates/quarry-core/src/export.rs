@@ -4962,6 +4962,18 @@ fn scan_export(
                     "cell edit points beyond the source rows",
                 ));
             }
+            if bytes_written == 0 && source_had_bom {
+                // An empty selection still retains the file's Unicode signature.
+                output.write_all(UTF8_BOM)?;
+                bytes_written = output.bytes_written();
+                publish_progress(
+                    shared,
+                    absolute_start,
+                    rows_scanned,
+                    rows_written,
+                    bytes_written,
+                );
+            }
             return Ok(ScanOutcome::Complete {
                 rows_written,
                 bytes_written,
@@ -8378,14 +8390,15 @@ mod tests {
             (b"A,B".as_slice(), true, 1, 2, b"A,B\n,\n".as_slice()),
             (b"".as_slice(), false, 0, 1, b"\n".as_slice()),
             (
+                // A BOM is file metadata, so one inserted row creates one newline.
                 b"\xef\xbb\xbf".as_slice(),
                 false,
                 0,
                 1,
-                b"\xef\xbb\xbf\n\n".as_slice(),
+                b"\xef\xbb\xbf\n".as_slice(),
             ),
             (
-                b"\xef\xbb\xbf".as_slice(),
+                b"\xef\xbb\xbf\n".as_slice(),
                 false,
                 1,
                 1,

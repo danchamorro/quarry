@@ -150,6 +150,7 @@ impl RecordScanner {
         }
 
         self.bom_checked = true;
+        self.record_start = UTF8_BOM.len() as u64;
         self.scan_data_chunk(
             &bytes[index..],
             absolute_start + index as u64,
@@ -566,5 +567,20 @@ mod tests {
             scanner.finish(11, |_| {}).unwrap_err().kind,
             ParseErrorKind::UnterminatedQuote
         );
+    }
+    #[test]
+    fn a_bom_only_file_has_no_csv_record() {
+        for chunk_bytes in 1..=3 {
+            let mut scanner = RecordScanner::new(b',').unwrap();
+            let mut ends = Vec::new();
+            let bytes = b"\xef\xbb\xbf";
+            for (chunk, offset) in bytes.chunks(chunk_bytes).zip((0..).step_by(chunk_bytes)) {
+                scanner
+                    .scan_chunk(chunk, offset as u64, |end| ends.push(end))
+                    .unwrap();
+            }
+            assert!(!scanner.finish(3, |end| ends.push(end)).unwrap());
+            assert!(ends.is_empty());
+        }
     }
 }

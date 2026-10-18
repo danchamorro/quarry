@@ -73,7 +73,7 @@ click **Reopen with Changes**. For a file that cannot open with Auto, use
 little-endian or big-endian choice. The Format panel shows the resolved encoding.
 
 **Save**, **Save As…**, working changes, and filtered exports retain the source
-encoding and its BOM policy. Untouched records retain their original bytes.
+encoding and its BOM policy, including a BOM-only file when a headerless filtered export has no matches. Untouched records retain their original bytes.
 If a character cannot be represented in that encoding, the save fails without
 replacing the source or publishing a partial copy. Choose **Save As UTF-8…**
 to save all current changes in a Unicode copy instead. This option is also
