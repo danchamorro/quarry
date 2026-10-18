@@ -38,6 +38,8 @@ const DEFAULT_MERGE_FAN_IN: usize = 32;
 // A numeric key adds a sign, an eight-byte decimal order, and a terminator.
 const NUMERIC_KEY_OVERHEAD: usize = 10;
 const MAX_NUMERIC_EXPONENT: i64 = 1_000_000;
+/// Maximum number of distinct columns in one ordered sort.
+pub const MAX_SORT_KEYS: usize = 16;
 // At minimum fan-in, retain two heap keys, a pending key, and one record.
 const MERGE_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024 + 3 * NUMERIC_KEY_OVERHEAD;
 static NEXT_SORT_ID: AtomicU64 = AtomicU64::new(0);
@@ -121,6 +123,129 @@ impl SortSpec {
             SortMode::Reverse => Ok((!ordinal).to_be_bytes().to_vec()),
         }
     }
+}
+
+/// Ordered sort levels. Single-level plans also support Shuffle and Reverse.
+/// All levels must name distinct columns; equal keys retain source row order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortPlan {
+    pub keys: Vec<SortSpec>,
+}
+
+impl From<SortSpec> for SortPlan {
+    /// Preserve the existing single-level comparison and whole-row operation semantics.
+    fn from(key: SortSpec) -> Self {
+        Self { keys: vec![key] }
+    }
+}
+
+impl SortPlan {
+    /// Reject unbounded, duplicate, or incompatible levels before any output is staged.
+    pub fn validate(&self) -> Result<(), QuarryError> {
+        if self.keys.is_empty() || self.keys.len() > MAX_SORT_KEYS {
+            return Err(QuarryError::InvalidOption(
+                "choose between 1 and 16 sort levels",
+            ));
+        }
+        for (index, key) in self.keys.iter().enumerate() {
+            if !key.mode.uses_column() {
+                if self.keys.len() != 1 {
+                    return Err(QuarryError::InvalidOption(
+                        "Shuffle and Reverse must be used alone",
+                    ));
+                }
+                if key.direction != SortDirection::Ascending {
+                    return Err(QuarryError::InvalidOption(
+                        "Shuffle and Reverse do not accept a sort direction",
+                    ));
+                }
+            } else if self.keys[..index]
+                .iter()
+                .any(|prior| prior.column == key.column)
+            {
+                return Err(QuarryError::InvalidOption(
+                    "each sort level must use a different column",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Composite keys already encode direction; legacy single keys retain their ordering.
+    fn direction(&self) -> SortDirection {
+        if self.keys.len() == 1 {
+            self.keys[0].direction
+        } else {
+            SortDirection::Ascending
+        }
+    }
+
+    /// Build an unambiguous lexicographic tuple without changing source field bytes.
+    fn key<'a>(
+        &self,
+        value_at: impl Fn(usize) -> &'a [u8],
+        ordinal: u64,
+    ) -> Result<Vec<u8>, QuarryError> {
+        let mut combined = Vec::new();
+        for spec in &self.keys {
+            let value = if spec.mode.uses_column() {
+                value_at(spec.column)
+            } else {
+                &[]
+            };
+            let key = spec.key(value, ordinal).map_err(|error| match spec.mode {
+                SortMode::Number => QuarryError::InvalidNumericSortValue {
+                    data_row: ordinal.saturating_add(1),
+                    column: spec.column.saturating_add(1),
+                },
+                SortMode::DateTime { format } => QuarryError::InvalidDateTimeSortValue {
+                    data_row: ordinal.saturating_add(1),
+                    column: spec.column.saturating_add(1),
+                    format,
+                    reason: match error {
+                        QuarryError::InvalidOption(reason) => reason,
+                        _ => "value does not match the selected date/time format",
+                    },
+                },
+                SortMode::CharacterCount | SortMode::WordCount => {
+                    QuarryError::InvalidUtf8SortValue {
+                        data_row: ordinal.saturating_add(1),
+                        column: spec.column.saturating_add(1),
+                    }
+                }
+                _ => error,
+            })?;
+            if self.keys.len() == 1 {
+                return Ok(key);
+            }
+            // Escape NUL as 00 FF; 00 00 terminates a component. Complement the
+            // entire component for descending order, including its terminator,
+            // so shorter prefix values reverse correctly too.
+            let start = combined.len();
+            for byte in key {
+                combined.push(byte);
+                if byte == 0 {
+                    combined.push(255);
+                }
+            }
+            combined.extend_from_slice(&[0, 0]);
+            if spec.direction == SortDirection::Descending {
+                for byte in &mut combined[start..] {
+                    *byte = !*byte;
+                }
+            }
+        }
+        Ok(combined)
+    }
+}
+
+/// Upper bound for encoded tuples: each distinct field appears once, and NUL
+/// escaping can double it. Numeric metadata and tuple terminators are bounded.
+fn maximum_sort_key_bytes(max_record_bytes: usize) -> usize {
+    max_record_bytes
+        .saturating_add(MAX_SORT_KEYS * NUMERIC_KEY_OVERHEAD)
+        .saturating_mul(2)
+        .saturating_add(MAX_SORT_KEYS * 2)
 }
 
 pub(crate) fn numeric_key(value: &[u8]) -> Result<Vec<u8>, QuarryError> {
@@ -245,6 +370,7 @@ pub enum SortOutcome {
     Cancelled,
 }
 
+/// Allow space for two generations of framed single-key runs, including numeric metadata.
 pub const fn estimate_sort_temporary_bytes(
     effective_bytes_upper_bound: u64,
     data_rows: u64,
@@ -252,6 +378,23 @@ pub const fn estimate_sort_temporary_bytes(
     effective_bytes_upper_bound
         .saturating_mul(4)
         .saturating_add(data_rows.saturating_mul(48 + 2 * NUMERIC_KEY_OVERHEAD as u64))
+}
+
+/// Conservative disk allowance for one or several ordered levels, including
+/// simultaneous old/new runs, tuple escaping, and numeric key metadata.
+pub const fn estimate_multi_sort_temporary_bytes(
+    effective_bytes_upper_bound: u64,
+    data_rows: u64,
+    key_count: usize,
+) -> u64 {
+    if key_count <= 1 {
+        return estimate_sort_temporary_bytes(effective_bytes_upper_bound, data_rows);
+    }
+    effective_bytes_upper_bound
+        .saturating_mul(6)
+        .saturating_add(data_rows.saturating_mul(48_u64.saturating_add(
+            (key_count as u64).saturating_mul(4 * NUMERIC_KEY_OVERHEAD as u64 + 4),
+        )))
 }
 
 #[derive(Clone, Copy)]
@@ -418,6 +561,7 @@ pub struct SortJob {
 }
 
 impl SortJob {
+    /// Start a guarded private sort with scratch files beside the destination.
     #[allow(clippy::too_many_arguments)]
     fn start(
         source_path: PathBuf,
@@ -426,7 +570,7 @@ impl SortJob {
         has_header: bool,
         header_renames: BTreeMap<usize, Vec<u8>>,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
-        spec: SortSpec,
+        spec: impl Into<SortPlan>,
         destination: PathBuf,
         source_stamp: SourceStamp,
         config: SortConfig,
@@ -448,6 +592,7 @@ impl SortJob {
         )
     }
 
+    /// Validate the plan and source before spawning the worker; publish only in wait().
     #[allow(clippy::too_many_arguments)]
     fn start_with_temp_directory(
         source_path: PathBuf,
@@ -456,7 +601,7 @@ impl SortJob {
         has_header: bool,
         header_renames: BTreeMap<usize, Vec<u8>>,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
-        spec: SortSpec,
+        spec: impl Into<SortPlan>,
         destination: PathBuf,
         source_stamp: SourceStamp,
         config: SortConfig,
@@ -464,11 +609,8 @@ impl SortJob {
         completed_record_count: Option<u64>,
     ) -> Result<Self, QuarryError> {
         validate_config(config)?;
-        if !spec.mode.uses_column() && spec.direction != SortDirection::Ascending {
-            return Err(QuarryError::InvalidOption(
-                "Shuffle and Reverse do not accept a sort direction",
-            ));
-        }
+        let spec = spec.into();
+        spec.validate()?;
         validate_overlays(has_header, &header_renames, &cell_edits, config)?;
 
         let mut source = File::open(&source_path).map_err(|error| {
@@ -505,7 +647,7 @@ impl SortJob {
                     has_header,
                     &header_renames,
                     &cell_edits,
-                    spec,
+                    &spec,
                     destination,
                     output,
                     bom_present,
@@ -589,11 +731,13 @@ impl Drop for SortJob {
 }
 
 impl Session {
+    /// Sort effective values into a new private working copy, preserving headers and stable ties.
+    /// Accepts a single SortSpec or an ordered SortPlan; the source is never overwritten.
     pub fn start_create_sorted_working_copy(
         &self,
         header_renames: BTreeMap<usize, Vec<u8>>,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
-        spec: SortSpec,
+        spec: impl Into<SortPlan>,
         destination: impl AsRef<Path>,
     ) -> Result<SortJob, QuarryError> {
         SortJob::start(
@@ -611,11 +755,13 @@ impl Session {
         )
     }
 
+    /// Create a sorted working copy using the chosen directory for temporary merge runs.
+    /// Final output staging remains beside the destination and is accepted by wait().
     pub fn start_create_sorted_working_copy_with_temp_directory(
         &self,
         header_renames: BTreeMap<usize, Vec<u8>>,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
-        spec: SortSpec,
+        spec: impl Into<SortPlan>,
         destination: impl AsRef<Path>,
         temporary_directory: impl AsRef<Path>,
     ) -> Result<SortJob, QuarryError> {
@@ -669,6 +815,7 @@ fn validate_overlays(
     Ok(())
 }
 
+/// Reject zero budgets and record limits that cannot fit a two-way merge.
 fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
     if config.chunk_bytes == 0 || config.run_memory_bytes == 0 || config.max_record_bytes == 0 {
         return Err(QuarryError::InvalidOption(
@@ -693,9 +840,17 @@ fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
     Ok(())
 }
 
+/// Limit retained merge heads using observed key width and the minimum safe payload budget.
 fn effective_merge_fan_in(config: SortConfig, max_key_bytes: usize) -> usize {
     let key_bytes = max_key_bytes.max(1);
-    let key_slots = MERGE_MEMORY_BUDGET_BYTES.saturating_sub(config.max_record_bytes) / key_bytes;
+    // At least two heads plus a pending key and record must fit. Escaped
+    // tuples may need a larger, still file-size-independent minimum budget.
+    let budget = MERGE_MEMORY_BUDGET_BYTES.max(
+        config
+            .max_record_bytes
+            .saturating_add(key_bytes.saturating_mul(3)),
+    );
+    let key_slots = budget.saturating_sub(config.max_record_bytes) / key_bytes;
     config.merge_fan_in.min(key_slots.saturating_sub(1).max(2))
 }
 
@@ -962,25 +1117,37 @@ enum BuilderStep {
 #[derive(Clone, Copy)]
 enum RunOrder<'a> {
     Sort(SortSpec),
+    MultiSort(&'a SortPlan),
     Duplicates(&'a DuplicateSpec),
 }
 
 impl From<SortSpec> for RunOrder<'_> {
+    /// Adapt a legacy single-key scan without changing its key representation.
     fn from(spec: SortSpec) -> Self {
         Self::Sort(spec)
     }
 }
 
+impl<'a> From<&'a SortPlan> for RunOrder<'a> {
+    /// Borrow the validated plan for all rows in the streaming scan.
+    fn from(spec: &'a SortPlan) -> Self {
+        Self::MultiSort(spec)
+    }
+}
+
 impl<'a> From<&'a DuplicateSpec> for RunOrder<'a> {
+    /// Share run storage with duplicate detection while preserving its equality keys.
     fn from(spec: &'a DuplicateSpec) -> Self {
         Self::Duplicates(spec)
     }
 }
 
 impl RunOrder<'_> {
+    /// Composite keys embed their per-level directions; duplicates always merge ascending.
     fn direction(self) -> SortDirection {
         match self {
             Self::Sort(spec) => spec.direction,
+            Self::MultiSort(spec) => spec.direction(),
             Self::Duplicates(_) => SortDirection::Ascending,
         }
     }
@@ -1042,6 +1209,7 @@ impl<'a> InitialRunBuilder<'a> {
         }
     }
 
+    /// Apply overlays, retain the header, and append a size-checked keyed data row.
     fn process(&mut self, record: &[u8], physical_row: u64) -> Result<BuilderStep, QuarryError> {
         if record.len() > self.config.max_record_bytes {
             return Err(QuarryError::RecordTooLarge {
@@ -1108,50 +1276,50 @@ impl<'a> InitialRunBuilder<'a> {
                 "cell edit column is out of range",
             ));
         }
+        // The BTreeMap range above produces edits in ascending column order.
         let value_at = |column| {
             row_edits
-                .iter()
-                .find(|(edited_column, _)| *edited_column == column)
-                .map(|(_, value)| *value)
+                .binary_search_by_key(&column, |(edited_column, _)| *edited_column)
+                .ok()
+                .map(|index| row_edits[index].1)
                 .or_else(|| fields.get(column).map(|field| field.as_ref()))
                 .unwrap_or_default()
         };
+        if !row_edits.is_empty() {
+            // Bound the entire effective row before allocating keys or cloning
+            // fields. Individually valid edits can exceed the aggregate limit.
+            let mut serialized_bytes = ending
+                .len()
+                .saturating_add(fields.len().saturating_sub(1))
+                .saturating_add(
+                    usize::from(physical_row == 0 && self.bom_present) * UTF8_BOM.len(),
+                );
+            for column in 0..fields.len() {
+                if self.shared.cancel_requested.load(Ordering::Acquire) {
+                    return Ok(BuilderStep::Cancelled);
+                }
+                let value = value_at(column);
+                serialized_bytes = serialized_bytes.saturating_add(delimited_field_len(
+                    value,
+                    self.delimiter,
+                    column == 0 && value.starts_with(UTF8_BOM)
+                        || fields.len() == 1 && value.is_empty() && ending.is_empty(),
+                ));
+                if serialized_bytes > self.config.max_record_bytes {
+                    return Err(QuarryError::RecordTooLarge {
+                        limit: self.config.max_record_bytes,
+                    });
+                }
+            }
+        }
         let key = match self.order {
             RunOrder::Duplicates(spec) => spec.key(value_at, self.config.max_record_bytes)?,
-            RunOrder::Sort(spec) => {
-                let value = if spec.mode.uses_column() {
-                    value_at(spec.column)
-                } else {
-                    &[]
-                };
-                spec.key(value, self.rows)
-                    .map_err(|error| match spec.mode {
-                        SortMode::Number => QuarryError::InvalidNumericSortValue {
-                            data_row: self.rows.saturating_add(1),
-                            column: spec.column.saturating_add(1),
-                        },
-                        SortMode::DateTime { format } => QuarryError::InvalidDateTimeSortValue {
-                            data_row: self.rows.saturating_add(1),
-                            column: spec.column.saturating_add(1),
-                            format,
-                            reason: match error {
-                                QuarryError::InvalidOption(reason) => reason,
-                                _ => "value does not match the selected date/time format",
-                            },
-                        },
-                        SortMode::CharacterCount | SortMode::WordCount => {
-                            QuarryError::InvalidUtf8SortValue {
-                                data_row: self.rows.saturating_add(1),
-                                column: spec.column.saturating_add(1),
-                            }
-                        }
-                        _ => error,
-                    })?
-            }
+            RunOrder::Sort(spec) => SortPlan::from(spec).key(value_at, self.rows)?,
+            RunOrder::MultiSort(spec) => spec.key(value_at, self.rows)?,
         };
         self.max_key_bytes = self.max_key_bytes.max(key.len());
         let effective_record = if row_edits.is_empty()
-            && !(matches!(self.order, RunOrder::Sort(_))
+            && !(matches!(self.order, RunOrder::Sort(_) | RunOrder::MultiSort(_))
                 && physical_row > 0
                 && body.starts_with(UTF8_BOM))
         {
@@ -1187,7 +1355,7 @@ impl<'a> InitialRunBuilder<'a> {
         {
             return Ok(BuilderStep::Cancelled);
         }
-        if matches!(self.order, RunOrder::Sort(_)) {
+        if matches!(self.order, RunOrder::Sort(_) | RunOrder::MultiSort(_)) {
             self.records.observe(&effective_record);
         }
         self.entries.push(RunEntry {
@@ -1255,6 +1423,7 @@ enum ScanOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Stream source records into bounded sorted runs, stopping promptly on cancellation.
 fn create_initial_runs<'a>(
     source: &mut File,
     delimiter: u8,
@@ -1369,6 +1538,7 @@ fn create_initial_runs<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Check storage and produce a verified candidate for guarded publication.
 fn run_sort(
     source: &mut File,
     source_path: &Path,
@@ -1377,7 +1547,7 @@ fn run_sort(
     has_header: bool,
     header_renames: &BTreeMap<usize, Vec<u8>>,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
-    spec: SortSpec,
+    spec: &SortPlan,
     destination: PathBuf,
     mut output: ExportTarget,
     bom_present: bool,
@@ -1420,7 +1590,11 @@ fn run_sort(
     check_operation_storage(
         temporary_directory,
         &destination,
-        estimate_sort_temporary_bytes(output_bytes, records.saturating_sub(u64::from(has_header))),
+        estimate_multi_sort_temporary_bytes(
+            output_bytes,
+            records.saturating_sub(u64::from(has_header)),
+            spec.keys.len(),
+        ),
         output_bytes,
     )?;
     let workspace = RunWorkspace::create_in(temporary_directory)?;
@@ -1470,6 +1644,7 @@ fn run_sort(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Scan effective rows, merge sorted runs, and build the output index while writing.
 fn run_sort_inner(
     source: &mut File,
     source_path: &Path,
@@ -1478,7 +1653,7 @@ fn run_sort_inner(
     has_header: bool,
     header_renames: &BTreeMap<usize, Vec<u8>>,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
-    spec: SortSpec,
+    spec: &SortPlan,
     output: &mut ExportTarget,
     bom_present: bool,
     config: SortConfig,
@@ -1509,7 +1684,7 @@ fn run_sort_inner(
 
     if !reduce_runs(
         &mut scan.runs,
-        spec.direction,
+        spec.direction(),
         scan.max_key_bytes,
         config,
         workspace,
@@ -1534,7 +1709,7 @@ fn run_sort_inner(
     let Some((rows_written, data_bytes, verification)) = merge_runs_to_output(
         &scan.runs,
         output,
-        spec.direction,
+        spec.direction(),
         &scan.preferred_ending,
         scan.records,
         config.max_record_bytes,
@@ -1613,6 +1788,7 @@ fn write_entry_parts(
         .saturating_add(record.len() as u64))
 }
 
+/// Reject oversized run frames before allocating a comparison key or record payload.
 fn read_head(
     reader: &mut BufReader<File>,
     max_record_bytes: usize,
@@ -1628,7 +1804,7 @@ fn read_head(
     let ordinal = u64::from_le_bytes(header[16..24].try_into().unwrap());
     let key_len = usize::try_from(key_len)
         .ok()
-        .filter(|length| *length <= max_record_bytes.saturating_add(NUMERIC_KEY_OVERHEAD))
+        .filter(|length| *length <= maximum_sort_key_bytes(max_record_bytes))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid sort key length"))?;
     let record_len = usize::try_from(record_len)
         .ok()
@@ -1955,11 +2131,12 @@ mod tests {
         .unwrap()
     }
 
+    /// Exercise production sorting under custom budgets, including forced multi-pass merges.
     fn start_custom(
         session: &Session,
         header_renames: BTreeMap<usize, Vec<u8>>,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
-        spec: SortSpec,
+        spec: impl Into<SortPlan>,
         destination: &Path,
         config: SortConfig,
     ) -> SortJob {
@@ -2874,7 +3051,7 @@ mod tests {
         let (path, mut writer) = workspace.create_run().unwrap();
         write_entry_parts(
             &mut writer,
-            &vec![0; config.max_record_bytes + NUMERIC_KEY_OVERHEAD + 1],
+            &vec![0; maximum_sort_key_bytes(config.max_record_bytes) + 1],
             b"1\n",
             0,
         )
@@ -3267,12 +3444,12 @@ mod tests {
             true,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            SortSpec {
+            &SortPlan::from(SortSpec {
                 mode: SortMode::Text,
                 column: 1,
                 direction: SortDirection::Ascending,
                 case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            }),
             destination.clone(),
             output,
             false,
@@ -3402,5 +3579,341 @@ mod tests {
             .saturating_add(pending_key)
             .saturating_add(pending_record);
         assert_eq!(retained_payload, MERGE_MEMORY_BUDGET_BYTES);
+    }
+
+    /// Build exact-case levels for tests whose expected order is computed independently.
+    fn level(column: usize, mode: SortMode, direction: SortDirection) -> SortSpec {
+        SortSpec {
+            column,
+            mode,
+            direction,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        }
+    }
+
+    #[test]
+    fn composite_encoding_matches_independent_tuple_comparisons() {
+        let values: &[&[u8]] = &[b"", b"a", b"ab", b"a\0", b"\0", b"\xff"];
+        for first in [SortDirection::Ascending, SortDirection::Descending] {
+            for second in [SortDirection::Ascending, SortDirection::Descending] {
+                let plan = SortPlan {
+                    keys: vec![
+                        level(0, SortMode::Text, first),
+                        level(1, SortMode::Text, second),
+                    ],
+                };
+                for &a in values {
+                    for &b in values {
+                        for &c in values {
+                            for &d in values {
+                                let left = [a, b];
+                                let right = [c, d];
+                                let expected_first = if first == SortDirection::Ascending {
+                                    a.cmp(c)
+                                } else {
+                                    c.cmp(a)
+                                };
+                                let expected = expected_first.then_with(|| {
+                                    if second == SortDirection::Ascending {
+                                        b.cmp(d)
+                                    } else {
+                                        d.cmp(b)
+                                    }
+                                });
+                                assert_eq!(
+                                    plan.key(|i| left[i], 0)
+                                        .unwrap()
+                                        .cmp(&plan.key(|i| right[i], 0).unwrap()),
+                                    expected,
+                                    "{first:?}, {second:?}, {left:?}, {right:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_sort_spills_stably_with_edits_against_an_independent_oracle() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        let mut rows: Vec<Vec<Vec<u8>>> = (0..360)
+            .map(|id| {
+                vec![
+                    id.to_string().into_bytes(),
+                    (if id % 2 == 0 {
+                        ["B", "A", "C"][id % 3]
+                    } else {
+                        ["b", "a", "c"][id % 3]
+                    })
+                    .as_bytes()
+                    .to_vec(),
+                    (if id % 13 == 0 {
+                        String::new()
+                    } else {
+                        ((id * 7) % 11).to_string()
+                    })
+                    .into_bytes(),
+                    format!("2026-10-{:02}", id % 4 + 1).into_bytes(),
+                    b"quoted, note\nnext line".to_vec(),
+                ]
+            })
+            .collect();
+        let mut input = UTF8_BOM.to_vec();
+        input.extend_from_slice(b"id,group,amount,date,note\r\n");
+        for row in &rows {
+            input.extend(serialize_fields(row, b',', b"\r\n", 4096).unwrap());
+        }
+        fs::write(&source, &input).unwrap();
+        let session = session(&source, HeaderMode::FirstRow);
+        let mut group = level(1, SortMode::Text, SortDirection::Ascending);
+        group.case_sensitivity = CaseSensitivity::Insensitive;
+        let plan = SortPlan {
+            keys: vec![
+                group,
+                level(2, SortMode::Number, SortDirection::Descending),
+                level(
+                    3,
+                    SortMode::DateTime {
+                        format: DateTimeFormat::YearMonthDay,
+                    },
+                    SortDirection::Ascending,
+                ),
+            ],
+        };
+        rows[41][2] = b"100".to_vec();
+        let job = start_custom(
+            &session,
+            BTreeMap::from([(0, b"ID".to_vec())]),
+            BTreeMap::from([((42, 2), b"100".to_vec())]),
+            plan,
+            &destination,
+            SortConfig {
+                run_memory_bytes: 2048,
+                ..tiny_config()
+            },
+        );
+        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("cancelled");
+        };
+        // Compare decoded fields directly; do not use the implementation's encoded keys.
+        rows.sort_by(|a, b| {
+            a[1].to_ascii_lowercase()
+                .cmp(&b[1].to_ascii_lowercase())
+                .then_with(|| {
+                    let number =
+                        |value: &[u8]| std::str::from_utf8(value).unwrap().parse::<i64>().ok();
+                    number(&b[2]).cmp(&number(&a[2]))
+                })
+                .then_with(|| a[3].cmp(&b[3]))
+        });
+        let mut expected = UTF8_BOM.to_vec();
+        expected.extend_from_slice(b"ID,group,amount,date,note\r\n");
+        for row in rows {
+            expected.extend(serialize_fields(&row, b',', b"\r\n", 4096).unwrap());
+        }
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        assert_eq!(fs::read(&source).unwrap(), input);
+        assert!(summary.runs_created > 2 && summary.merge_passes > 1);
+        assert!(summary.stable_ties_verified && summary.record_multiset_verified);
+        assert!(
+            summary.peak_temporary_bytes
+                <= estimate_multi_sort_temporary_bytes(input.len() as u64 + 200, 360, 3)
+        );
+        assert!(sort_artifacts(&directory).is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn multi_sort_handles_exact_numbers_missing_fields_and_secondary_errors() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        let bytes =
+            b"id,group,number\n1,a,9007199254740993\n2,a,9007199254740992\n3,a\n4,a,\n5,b,1\n";
+        fs::write(&source, bytes).unwrap();
+        let plan = SortPlan {
+            keys: vec![
+                level(1, SortMode::Text, SortDirection::Ascending),
+                level(2, SortMode::Number, SortDirection::Ascending),
+            ],
+        };
+        let SortOutcome::Complete(_) = session(&source, HeaderMode::FirstRow)
+            .start_create_sorted_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                plan.clone(),
+                &destination,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("cancelled");
+        };
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"id,group,number\n3,a\n4,a,\n2,a,9007199254740992\n1,a,9007199254740993\n5,b,1\n"
+        );
+        fs::remove_file(&destination).unwrap();
+        let error = session(&source, HeaderMode::FirstRow)
+            .start_create_sorted_working_copy(
+                BTreeMap::new(),
+                BTreeMap::from([((2, 2), b"bad".to_vec())]),
+                plan,
+                &destination,
+            )
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            QuarryError::InvalidNumericSortValue {
+                data_row: 2,
+                column: 3
+            }
+        ));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert!(sort_artifacts(&directory).is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn multi_sort_validation_and_cancellation_preserve_the_source() {
+        let ascending = level(0, SortMode::Text, SortDirection::Ascending);
+        assert!(SortPlan { keys: vec![] }.validate().is_err());
+        assert!(
+            SortPlan {
+                keys: vec![ascending; MAX_SORT_KEYS + 1]
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SortPlan {
+                keys: vec![ascending, ascending]
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SortPlan {
+                keys: vec![
+                    ascending,
+                    level(1, SortMode::Reverse, SortDirection::Ascending)
+                ]
+            }
+            .validate()
+            .is_err()
+        );
+        let directory = case();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        let input = format!("a,b\n{}", "z,a\n".repeat(100_000)).into_bytes();
+        fs::write(&source, &input).unwrap();
+        let plan = SortPlan {
+            keys: vec![
+                ascending,
+                level(1, SortMode::Text, SortDirection::Descending),
+            ],
+        };
+        let job = start_custom(
+            &session(&source, HeaderMode::FirstRow),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            plan,
+            &destination,
+            SortConfig {
+                chunk_bytes: 1024,
+                run_memory_bytes: 32768,
+                ..tiny_config()
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while job.progress().bytes_scanned == 0 && !job.progress().done {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        job.cancel();
+        assert_eq!(job.wait().unwrap(), SortOutcome::Cancelled);
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&source).unwrap(), input);
+        assert!(sort_artifacts(&directory).is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn composite_key_payloads_and_disk_estimates_are_bounded() {
+        let plan = SortPlan {
+            keys: (0..MAX_SORT_KEYS)
+                .map(|column| level(column, SortMode::Text, SortDirection::Descending))
+                .collect(),
+        };
+        plan.validate().unwrap();
+        let field = vec![0; 1024];
+        let key = plan.key(|_| field.as_slice(), 0).unwrap();
+        let record_bound = MAX_SORT_KEYS * (field.len() + 1);
+        assert!(key.len() <= maximum_sort_key_bytes(record_bound));
+        let widest = maximum_sort_key_bytes(DEFAULT_SORT_CONFIG.max_record_bytes);
+        let fan_in = effective_merge_fan_in(DEFAULT_SORT_CONFIG, widest);
+        assert_eq!(fan_in, 2);
+        assert!((fan_in + 1) * widest + DEFAULT_SORT_CONFIG.max_record_bytes < 449 * 1024 * 1024);
+        assert_eq!(
+            estimate_multi_sort_temporary_bytes(123, 7, 1),
+            estimate_sort_temporary_bytes(123, 7)
+        );
+        assert_eq!(
+            estimate_multi_sort_temporary_bytes(u64::MAX, 1, MAX_SORT_KEYS),
+            u64::MAX
+        );
+        assert_eq!(
+            estimate_multi_sort_temporary_bytes(1, u64::MAX, MAX_SORT_KEYS),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn oversized_edited_rows_are_rejected_before_building_sort_keys() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        let input = format!(
+            "{}\n{}\n",
+            vec!["h"; MAX_SORT_KEYS].join(","),
+            vec!["x"; MAX_SORT_KEYS].join(",")
+        );
+        fs::write(&source, &input).unwrap();
+        let mut edits: BTreeMap<_, _> = (0..MAX_SORT_KEYS)
+            .map(|column| ((1, column), vec![b'x'; 16]))
+            .collect();
+        // This invalid key would fail first if key construction preceded aggregate validation.
+        edits.insert((1, 0), b"not numeric".to_vec());
+        let mut keys: Vec<_> = (0..MAX_SORT_KEYS)
+            .map(|column| level(column, SortMode::Text, SortDirection::Ascending))
+            .collect();
+        keys[0].mode = SortMode::Number;
+        let job = start_custom(
+            &session(&source, HeaderMode::FirstRow),
+            BTreeMap::new(),
+            edits,
+            SortPlan { keys },
+            &destination,
+            SortConfig {
+                max_record_bytes: 64,
+                ..tiny_config()
+            },
+        );
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::RecordTooLarge { limit: 64 })
+        ));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&source).unwrap(), input.as_bytes());
+        assert!(sort_artifacts(&directory).is_empty());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -602,10 +602,14 @@ unchanged until **Save**.
 
 ### Sort rows
 
-Only Text, Number, Date / time, Character count, and Word count use the selected column's
-values. Shuffle and Reverse reorder all data rows and ignore the selected
-column. The current **Sort Rows…** menu still requires one selected column to
-open the window, including when choosing Shuffle or Reverse.
+Sort whole rows by one column or by several columns in priority order. For
+example, sort by **Account** first, then **Date** newest first, then **Amount**
+largest first. Each additional level breaks ties from the levels above it.
+
+Text, Number, Date / time, Character count, and Word count compare column values.
+Shuffle and Reverse reorder all data rows and ignore the selected column; they
+are used alone. Select one numbered column to open **Sort Rows…**, then choose
+any additional columns inside the window.
 
 1. Select exactly one numbered column: the column to sort by for Text, Number, Date / time,
    Character count, or Word count, or any column for Shuffle or Reverse.
@@ -628,11 +632,15 @@ open the window, including when choosing Shuffle or Reverse.
    selected column, so they have no direction control.
 5. For Text, leave **Match case** off to ignore ASCII letter case, or turn it
    on for exact case ordering. This option applies only to Text.
-6. Review the temporary-disk allowance, then click **Sort**.
+6. Click **Add sort level** for each tie-breaker. Choose its **Then by** column,
+   comparison type, direction, and case or date format independently.
+   **Move up** and **Move down** change priority; **Remove** deletes a level.
+   Up to 16 distinct columns can be used. A duplicate column must be changed or
+   removed before sorting.
+7. Review the temporary-disk allowance, then click **Sort**.
 
-The summary identifies the selected column by number and name. Hover a truncated
-summary to read it in full. Expand **Details** for the selected mode's value
-interpretation and ordering rules. The temporary-disk allowance stays above the
+Column choices show their file number and name, including hidden columns.
+Expand **Details** for the first level's value interpretation and ordering rules. The temporary-disk allowance stays above the
 footer while the options scroll. **Cancel** closes the dialog without starting
 a sort.
 
@@ -664,15 +672,17 @@ and missing values sort first ascending and last descending. Other text,
 currency symbols, grouping commas, NaN, and infinity stop the sort with an error
 identifying the data row and column, leaving the current document unchanged.
 
-Every mode keeps the header fixed. Text, Number, Character count, and Word
-count keep equal keys in their original order, including equivalent numbers
-such as `2`, `02`, and `2.00`. Missing fields sort as empty cells. Large sorts can take time
+Every mode keeps the header fixed and includes unsaved cell values. Rows that
+compare equal at every level keep their original order, including equivalent
+numbers such as 2, 02, and 2.00. Missing fields sort as empty cells.
+Each level keeps the same blank and invalid-value rules described above. An
+invalid value at any level stops the whole operation without changing the file. Large sorts can take time
 and require substantial temporary disk space. During the merge phase,
 **Merging sorted rows…** is a phase indicator rather than an exact completion
 percentage.
 
 The sorted grid is an unsaved working version. You can continue editing it,
-undo the sort, save it, or discard it.
+undo the entire multi-level sort in one step, save it, or discard it.
 
 #### Date and time formats
 

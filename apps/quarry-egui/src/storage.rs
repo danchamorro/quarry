@@ -80,9 +80,9 @@ impl PendingStorageOperation {
                     }),
                 // Read-only analysis determines the actual padded width before its review.
                 StructuralRequest::Split => 0,
-                StructuralRequest::Sort => {
-                    document.sort_temporary_disk_estimate().unwrap_or(u64::MAX)
-                }
+                StructuralRequest::Sort => document
+                    .sort_plan_disk_estimate(dialog.sort_plan(false).keys.len())
+                    .unwrap_or(u64::MAX),
                 StructuralRequest::Duplicates => estimate_duplicate_temporary_bytes(
                     document.reordered_storage_estimate(),
                     document
