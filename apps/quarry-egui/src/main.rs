@@ -1,3 +1,5 @@
+#[cfg(test)]
+use quarry_core::estimate_sort_temporary_bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -34,11 +36,11 @@ use quarry_core::{
     DuplicateSpec, DuplicateSummary, FilterExportJob, FilterExportOutcome, FilterExportProgress,
     FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
     FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob,
-    IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError,
-    ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress,
-    SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection, SortJob,
-    SortMode, SortOutcome, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
-    estimate_sort_temporary_bytes,
+    IndexProgress, LiteralReplacement, MAX_SORT_KEYS, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
+    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome,
+    SaveAsProgress, SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection,
+    SortJob, SortMode, SortOutcome, SortPlan, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
+    StructuralIndex,
 };
 use tempfile::TempDir;
 
@@ -457,6 +459,7 @@ struct StructuralDialog {
     position: String,
     sort_direction: SortDirection,
     sort_mode: SortMode,
+    sort_levels: Vec<SortSpec>,
     match_case: bool,
 }
 
@@ -511,6 +514,7 @@ impl StructuralDialog {
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
+            sort_levels: Vec::new(),
             match_case: false,
         }
     }
@@ -524,6 +528,7 @@ impl StructuralDialog {
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
+            sort_levels: Vec::new(),
             match_case: false,
         }
     }
@@ -540,6 +545,7 @@ impl StructuralDialog {
             position,
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
+            sort_levels: Vec::new(),
             match_case: false,
         }
     }
@@ -553,8 +559,35 @@ impl StructuralDialog {
             position: String::new(),
             sort_direction: SortDirection::Ascending,
             sort_mode: SortMode::Text,
+            sort_levels: Vec::new(),
             match_case: false,
         }
+    }
+
+    /// Combine the primary level and tie-breakers without copying document edits.
+    fn sort_plan(&self, match_case: bool) -> SortPlan {
+        let mut keys = vec![SortSpec {
+            column: self.columns[0],
+            mode: self.sort_mode,
+            direction: self.sort_direction,
+            case_sensitivity: case_sensitivity(match_case),
+        }];
+        if self.sort_mode.uses_column() {
+            keys.extend_from_slice(&self.sort_levels);
+        } else {
+            keys[0].direction = SortDirection::Ascending;
+        }
+        SortPlan { keys }
+    }
+
+    /// Apply a level reorder, including the primary level's remembered case option.
+    fn set_sort_keys(&mut self, keys: Vec<SortSpec>, match_case: &mut bool) {
+        let first = keys[0];
+        self.columns[0] = first.column;
+        self.sort_mode = first.mode;
+        self.sort_direction = first.direction;
+        *match_case = first.case_sensitivity == CaseSensitivity::Sensitive;
+        self.sort_levels = keys[1..].to_vec();
     }
 
     fn duplicates(columns: Vec<usize>) -> Self {
@@ -1281,12 +1314,9 @@ impl QuarryApp {
                 )
                 .map_err(AppMessage::warning)
                 .and_then(|position| document.start_move_columns(dialog.columns, position)),
-                StructuralRequest::Sort => document.start_sort_rows(
-                    dialog.columns[0],
-                    dialog.sort_direction,
-                    dialog.sort_mode,
-                    case_sensitivity(self.active.sort_match_case),
-                ),
+                StructuralRequest::Sort => {
+                    document.start_sort_plan(dialog.sort_plan(self.active.sort_match_case))
+                }
                 StructuralRequest::Duplicates => document
                     .start_find_duplicates(dialog.columns, case_sensitivity(dialog.match_case)),
             });
@@ -4006,6 +4036,179 @@ fn cleanup_preview(document: &Document, cleanup: &ColumnCleanup) -> CleanupPrevi
     result
 }
 
+/// Pick a physical column with virtualized rows so wide files do not build a huge popup.
+fn show_sort_column(ui: &mut egui::Ui, document: &Document, column: &mut usize, index: usize) {
+    let label = if index == 0 {
+        "Sort by".to_owned()
+    } else {
+        format!("Then by (level {})", index + 1)
+    };
+    ui.weak(&label);
+    let selected = format!(
+        "{}: {}",
+        column.saturating_add(1),
+        document.column_name(*column)
+    );
+    let response = egui::ComboBox::from_id_salt(("sort-column", index))
+        .width(ui.available_width())
+        .selected_text(selected)
+        .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
+        .show_ui(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(240.0).show_rows(
+                ui,
+                ui.text_style_height(&egui::TextStyle::Body),
+                document.total_columns,
+                |ui, rows| {
+                    for candidate in rows {
+                        let name =
+                            format!("{}: {}", candidate + 1, document.column_name(candidate));
+                        if ui.selectable_value(column, candidate, name).clicked() {
+                            ui.close();
+                        }
+                    }
+                },
+            );
+        })
+        .response;
+    let _ = ui
+        .ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(label));
+}
+
+/// Give repeated level actions distinct accessible names while keeping the visual labels short.
+fn sort_level_action(ui: &mut egui::Ui, label: &str, accessible: String, enabled: bool) -> bool {
+    let response = ui
+        .add_enabled(enabled, egui::Button::new(label))
+        .on_hover_text(&accessible);
+    let _ = ui
+        .ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(accessible));
+    response.clicked()
+}
+
+/// Draw independent type, direction, case, and date-format options for a tie-breaker.
+fn show_additional_sort_level(
+    ui: &mut egui::Ui,
+    document: &Document,
+    key: &mut SortSpec,
+    index: usize,
+) {
+    ui.push_id(("sort-level", index), |ui| {
+        show_sort_column(ui, document, &mut key.column, index);
+        let mode_label = ui.weak("Sort as");
+        let mode_response = egui::ComboBox::from_id_salt("mode")
+            .width(ui.available_width())
+            .selected_text(sort_mode_label(key.mode))
+            .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
+            .show_ui(ui, |ui| {
+                for mode in [
+                    SortMode::Text,
+                    SortMode::Number,
+                    SortMode::DateTime {
+                        format: DateTimeFormat::YearMonthDay,
+                    },
+                    SortMode::CharacterCount,
+                    SortMode::WordCount,
+                ] {
+                    let selected = key.mode == mode
+                        || matches!(
+                            (key.mode, mode),
+                            (SortMode::DateTime { .. }, SortMode::DateTime { .. })
+                        );
+                    if ui
+                        .selectable_label(selected, sort_mode_label(mode))
+                        .clicked()
+                    {
+                        if !selected {
+                            key.mode = mode;
+                        }
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .labelled_by(mode_label.id);
+        let _ = ui.ctx().accesskit_node_builder(mode_response.id, |node| {
+            node.set_label(format!("Sort as (level {})", index + 1))
+        });
+        if let SortMode::DateTime { format } = &mut key.mode {
+            let format_label = ui.weak("Date / time format");
+            let format_response = egui::ComboBox::from_id_salt("date-format")
+                .width(ui.available_width())
+                .selected_text(format.label())
+                .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
+                .show_ui(ui, |ui| {
+                    for choice in DateTimeFormat::ALL {
+                        if ui
+                            .selectable_value(format, choice, choice.label())
+                            .clicked()
+                        {
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .labelled_by(format_label.id);
+            let _ = ui.ctx().accesskit_node_builder(format_response.id, |node| {
+                node.set_label(format!("Date / time format (level {})", index + 1))
+            });
+            ui.small(format.description());
+        }
+        ui.horizontal(|ui| {
+            for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                ui.selectable_value(
+                    &mut key.direction,
+                    direction,
+                    sort_direction_label(key.mode, direction),
+                );
+            }
+        });
+        if key.mode == SortMode::Text {
+            let mut sensitive = key.case_sensitivity == CaseSensitivity::Sensitive;
+            ui.checkbox(&mut sensitive, "Match case");
+            key.case_sensitivity = case_sensitivity(sensitive);
+        }
+    });
+}
+
+/// Describe ties for column sorts and whole-row operations separately.
+fn sort_ordering_description(mode: SortMode) -> &'static str {
+    if mode.uses_column() {
+        "Rows equal at every level keep their original order (stable sort). Missing values sort as empty cells."
+    } else {
+        "All cells stay with their row."
+    }
+}
+
+/// Describe comparison semantics without allocating or inspecting document values.
+fn sort_value_description(mode: SortMode, match_case: bool) -> &'static str {
+    match mode {
+        SortMode::Text => {
+            if match_case {
+                "Uppercase and lowercase letters sort separately."
+            } else {
+                "Uppercase and lowercase letters sort together."
+            }
+        }
+        SortMode::Number => {
+            "Signed numbers, decimals and scientific notation. Blank cells sort first ascending, last descending. Other values stop the sort."
+        }
+        SortMode::DateTime { format } => format.description(),
+        SortMode::CharacterCount => {
+            "Count Unicode characters, including spaces. Combining marks count separately. Invalid UTF-8 stops the sort."
+        }
+        SortMode::WordCount => {
+            "Count words separated by Unicode whitespace. Invalid UTF-8 stops the sort."
+        }
+        SortMode::Shuffle { .. } => {
+            "Randomize the entire data row order. The selected column is ignored."
+        }
+        SortMode::Reverse => {
+            "Reverse the entire current data row order. The selected column is ignored."
+        }
+    }
+}
+
 fn show_structural_dialog(
     ctx: &egui::Context,
     dialog: &mut StructuralDialog,
@@ -4016,9 +4219,6 @@ fn show_structural_dialog(
         return show_cleanup_dialog(ctx, dialog, document);
     }
     let mut action = None;
-    let sort_disk = (dialog.request == StructuralRequest::Sort)
-        .then(|| document.sort_temporary_disk_estimate())
-        .flatten();
     let mut sort_description = None;
     let mut disk_description = None;
     let title = match dialog.request {
@@ -4059,7 +4259,7 @@ fn show_structural_dialog(
             "Selected column{}: {columns}",
             if dialog.columns.len() == 1 { "" } else { "s" }
         );
-        if !matches!(dialog.request, StructuralRequest::InsertRows | StructuralRequest::InsertColumns) {
+        if !matches!(dialog.request, StructuralRequest::InsertRows | StructuralRequest::InsertColumns | StructuralRequest::Sort) {
             ui.add(egui::Label::new(&selected).truncate()).on_hover_text(&selected);
         }
         ui.add_space(6.0);
@@ -4167,6 +4367,17 @@ fn show_structural_dialog(
                 (reason.is_none(), position.has_focus(), reason)
             }
             StructuralRequest::Sort => {
+                ui.small("Sort by the first level, then use each following level to break ties.");
+                let ordering = sort_ordering_description(dialog.sort_mode);
+                let description = sort_value_description(dialog.sort_mode, *sort_match_case);
+                egui::CollapsingHeader::new("Details").id_salt("sort-details").show(ui, |ui| {
+                    ui.label(description);
+                    ui.label(ordering);
+                    ui.label("The header stays fixed. Unsaved cell values are included.");
+                });
+                if dialog.sort_mode.uses_column() {
+                    show_sort_column(ui, document, &mut dialog.columns[0], 0);
+                }
                 let label = ui.weak("Sort as");
                 let response = egui::ComboBox::from_id_salt("quarry-sort-mode")
                     .width(ui.available_width())
@@ -4212,40 +4423,51 @@ fn show_structural_dialog(
                         }
                     });
                 }
-                let values = match dialog.sort_mode {
-                    SortMode::Text => {
-                        ui.checkbox(sort_match_case, "Match case");
-                        if *sort_match_case {
-                            "Uppercase and lowercase letters sort separately."
-                        } else {
-                            "Uppercase and lowercase letters sort together."
+                if dialog.sort_mode == SortMode::Text { ui.checkbox(sort_match_case, "Match case"); }
+                let values = sort_value_description(dialog.sort_mode, *sort_match_case);
+                if dialog.sort_mode.uses_column() {
+                    let mut keys = dialog.sort_plan(*sort_match_case).keys;
+                    let mut move_level = None;
+                    let mut remove_level = None;
+                    for index in 0..keys.len() {
+                        if index > 0 {
+                            ui.separator();
+                            show_additional_sort_level(ui, document, &mut keys[index], index);
                         }
+                        ui.horizontal(|ui| {
+                            ui.weak(format!("Level {}", index + 1));
+                            if sort_level_action(ui, "Move up", format!("Move level {} up", index + 1), index > 0) {
+                                move_level = Some((index, index - 1));
+                            }
+                            if sort_level_action(ui, "Move down", format!("Move level {} down", index + 1), index + 1 < keys.len()) {
+                                move_level = Some((index, index + 1));
+                            }
+                            if sort_level_action(ui, "Remove", format!("Remove level {}", index + 1), keys.len() > 1) {
+                                remove_level = Some(index);
+                            }
+                        });
                     }
-                    SortMode::Number => "Signed numbers, decimals and scientific notation. Blank cells sort first ascending, last descending. Other values stop the sort.",
-                    SortMode::DateTime { format } => format.description(),
-                    SortMode::CharacterCount => "Count Unicode characters, including spaces. Combining marks count separately. Invalid UTF-8 stops the sort.",
-                    SortMode::WordCount => "Count words separated by Unicode whitespace. Invalid UTF-8 stops the sort.",
-                    SortMode::Shuffle { .. } => "Randomize the entire data row order. The selected column is ignored.",
-                    SortMode::Reverse => "Reverse the entire current data row order. The selected column is ignored.",
-                };
-                let ordering = if dialog.sort_mode.uses_column() {
-                    "Equal values keep their original order (stable sort). Missing values sort as empty cells."
-                } else {
-                    "All cells stay with their row."
-                };
-                ui.weak(if dialog.sort_mode.uses_column() {
-                    "Equal values keep their order. The header stays fixed."
-                } else {
-                    "All cells stay with their row. The header stays fixed."
-                });
-                egui::CollapsingHeader::new("Details").id_salt("sort-details").show(ui, |ui| {
-                    ui.label(values);
-                    ui.label(ordering);
-                });
-                let reason = sort_disk.is_none().then(|| {
+                    if let Some((from, to)) = move_level { keys.swap(from, to); }
+                    if let Some(index) = remove_level { keys.remove(index); }
+                    let next_column = (0..document.total_columns)
+                        .find(|column| !keys.iter().any(|key| key.column == *column));
+                    if ui.add_enabled(keys.len() < MAX_SORT_KEYS && next_column.is_some(),
+                        egui::Button::new("Add sort level")).clicked() {
+                        keys.push(SortSpec {
+                            column: next_column.unwrap(), mode: SortMode::Text,
+                            direction: SortDirection::Ascending, case_sensitivity: CaseSensitivity::Insensitive,
+                        });
+                    }
+                    dialog.set_sort_keys(keys, sort_match_case);
+                }
+                let ordering = sort_ordering_description(dialog.sort_mode);
+                let sort_disk = document.sort_plan_disk_estimate(dialog.sort_plan(*sort_match_case).keys.len());
+                let reason = dialog.sort_plan(*sort_match_case).validate().err()
+                    .map(|error| error.to_string()).or_else(|| sort_disk.is_none().then(|| {
                     "Wait for indexing to finish so Quarry can calculate temporary disk space."
                         .to_owned()
-                });
+                }));
+                if let Some(reason) = &reason { ui.colored_label(ERROR_TEXT, reason); }
                 let disk = sort_disk.map_or_else(
                     || reason.clone().unwrap_or_default(),
                     |bytes| format!(
@@ -5235,9 +5457,7 @@ enum StructuralJob {
         destination: PathBuf,
         selected_columns: BTreeSet<usize>,
         undo: WorkingCopySnapshot,
-        column: usize,
-        direction: SortDirection,
-        mode: SortMode,
+        plan: SortPlan,
     },
     InsertingRows {
         job: SaveAsJob,
@@ -6039,6 +6259,7 @@ impl Document {
         )
     }
 
+    #[cfg(test)]
     fn start_sort_rows(
         &mut self,
         column: usize,
@@ -6046,27 +6267,39 @@ impl Document {
         mode: SortMode,
         case_sensitivity: CaseSensitivity,
     ) -> Result<(), AppMessage> {
+        self.start_sort_plan(SortPlan::from(SortSpec {
+            column,
+            direction,
+            mode,
+            case_sensitivity,
+        }))
+    }
+
+    /// Run all levels as one structural edit, retaining one undo snapshot.
+    fn start_sort_plan(&mut self, mut plan: SortPlan) -> Result<(), AppMessage> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
             return Err(AppMessage::warning(reason));
         }
-        if self.sort_temporary_disk_estimate().is_none() {
+        // Whole-row operations have no user-selectable direction or deterministic seed.
+        if plan.keys.len() == 1 && !plan.keys[0].mode.uses_column() {
+            plan.keys[0].direction = SortDirection::Ascending;
+            if matches!(plan.keys[0].mode, SortMode::Shuffle { .. }) {
+                plan.keys[0].mode = SortMode::shuffle();
+            }
+        }
+        plan.validate()
+            .map_err(|error| AppMessage::warning(error.to_string()))?;
+        if self.sort_plan_disk_estimate(plan.keys.len()).is_none() {
             return Err(AppMessage::warning(
                 "Wait for indexing to finish so Quarry can calculate temporary disk space.",
             ));
         }
-        if mode.uses_column() {
-            self.validate_column(column).map_err(AppMessage::warning)?;
+        for key in &plan.keys {
+            if key.mode.uses_column() {
+                self.validate_column(key.column)
+                    .map_err(AppMessage::warning)?;
+            }
         }
-        let direction = if mode.uses_column() {
-            direction
-        } else {
-            SortDirection::Ascending
-        };
-        let mode = if matches!(mode, SortMode::Shuffle { .. }) {
-            SortMode::shuffle()
-        } else {
-            mode
-        };
         self.commit_edits();
         self.cancel_search();
         let MaterializationPreparation {
@@ -6077,12 +6310,7 @@ impl Document {
         let job = match self.session.start_create_sorted_working_copy(
             renames,
             self.owned_cell_edits(),
-            SortSpec {
-                column,
-                direction,
-                mode,
-                case_sensitivity,
-            },
+            plan.clone(),
             &destination,
         ) {
             Ok(job) => job,
@@ -6104,11 +6332,9 @@ impl Document {
         self.structural_job = Some(StructuralJob::Sorting {
             job,
             destination,
-            selected_columns: BTreeSet::from([column]),
+            selected_columns: plan.keys.iter().map(|key| key.column).collect(),
             undo,
-            column,
-            direction,
-            mode,
+            plan,
         });
         self.structural_status = Some("Sorting rows…".into());
         self.structural_cancel_requested = false;
@@ -6172,7 +6398,13 @@ impl Document {
     }
 
     /// Dialog frames borrow effective values; only actual core jobs need owned snapshots.
+    #[cfg(test)]
     fn sort_temporary_disk_estimate(&self) -> Option<u64> {
+        self.sort_plan_disk_estimate(1)
+    }
+
+    /// Include all comparison levels while borrowing the current edit overlay.
+    fn sort_plan_disk_estimate(&self, key_count: usize) -> Option<u64> {
         let records = self.index.as_ref()?.indexed_rows();
         let mut headers: BTreeMap<_, _> = self
             .header_renames
@@ -6190,7 +6422,7 @@ impl Document {
         if let Some(edit) = &self.cell_edit {
             cells.insert((edit.row, edit.column), edit.draft.as_bytes());
         }
-        Some(estimate_sort_temporary_bytes(
+        Some(quarry_core::estimate_multi_sort_temporary_bytes(
             quarry_core::estimate_edited_output_bytes_from_values(
                 self.session.file_size,
                 records,
@@ -6200,6 +6432,7 @@ impl Document {
                 None,
             ),
             records.saturating_sub(self.data_start),
+            key_count,
         ))
     }
 
@@ -6773,19 +7006,24 @@ impl Document {
                 destination,
                 selected_columns,
                 undo,
-                column,
-                direction,
-                mode,
+                plan,
             } => match job.wait() {
                 Ok(SortOutcome::Complete(summary)) => {
                     debug_assert_eq!(summary.destination, destination);
-                    let operation = match mode {
+                    let operation = match plan.keys[0].mode {
                         SortMode::Shuffle { .. } => "Shuffled rows.".to_owned(),
                         SortMode::Reverse => "Reversed row order.".to_owned(),
                         _ => format!(
-                            "Sorted rows by column {} {}.",
-                            column.saturating_add(1),
-                            sort_direction_label(mode, direction).to_lowercase()
+                            "Sorted rows by {}.",
+                            plan.keys
+                                .iter()
+                                .map(|key| format!(
+                                    "column {} {}",
+                                    key.column.saturating_add(1),
+                                    sort_direction_label(key.mode, key.direction).to_lowercase()
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", then ")
                         ),
                     };
                     Ok(Some(MaterializedWorkingCopy {
@@ -17562,7 +17800,7 @@ mod tests {
         let mut dialog = StructuralDialog::sort(0);
         let _ = render(&mut dialog, vec![]);
         let (_, output) = render(&mut dialog, vec![]);
-        let detail = "Equal values keep their original order (stable sort). Missing values sort as empty cells.";
+        let detail = "Rows equal at every level keep their original order (stable sort). Missing values sort as empty cells.";
         assert!(
             !visible(&output, detail),
             "advanced details start collapsed"
@@ -18051,10 +18289,8 @@ mod tests {
                         .unwrap()
                         .structural_job
                         .as_ref(),
-                    Some(super::StructuralJob::Sorting {
-                        direction: super::SortDirection::Ascending,
-                        ..
-                    })
+                    Some(super::StructuralJob::Sorting { plan, .. })
+                        if plan.keys[0].direction == super::SortDirection::Ascending
                 ));
             }
             finish_structural_edit(&mut app);
@@ -22611,5 +22847,85 @@ mod tests {
             "effective draft"
         );
         assert_eq!(fs::read(path).unwrap(), b"name,value\nrow,x\n");
+    }
+
+    #[test]
+    fn multi_column_sort_controls_reorder_levels_and_keep_independent_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("levels.csv");
+        fs::write(&source, b"account,amount,date\nb,3,2026-10-18\n").unwrap();
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        finish_index(app.active.document.as_mut().unwrap());
+        let mut dialog = StructuralDialog::sort(0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        assert_eq!(
+            click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Add sort level").0,
+            None
+        );
+        assert_eq!(dialog.sort_levels.len(), 1);
+        assert_eq!(dialog.sort_levels[0].column, 1);
+        dialog.sort_levels[0].mode = SortMode::Number;
+        dialog.sort_levels[0].direction = super::SortDirection::Descending;
+        assert_eq!(
+            click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Move level 1 down").0,
+            None
+        );
+        assert_eq!(dialog.columns, vec![1]);
+        assert_eq!(dialog.sort_mode, SortMode::Number);
+        assert_eq!(dialog.sort_direction, super::SortDirection::Descending);
+        assert_eq!(dialog.sort_levels[0].column, 0);
+        assert_eq!(dialog.sort_levels[0].mode, SortMode::Text);
+        assert_eq!(
+            click_sort_dialog_control(&ctx, &mut dialog, &mut app, "Remove level 1").0,
+            None
+        );
+        assert!(dialog.sort_levels.is_empty());
+        assert_eq!(dialog.columns, vec![0]);
+    }
+
+    #[test]
+    fn multi_column_sort_includes_pending_edits_and_has_one_history_step() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("multi.csv");
+        let original = b"id,account,amount\n1,b,1\n2,a,2\n3,a,10\n4,a,2\n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        let document = app.active.document.as_mut().unwrap();
+        finish_index(document);
+        commit_test_cell(document, 1, 1, "a");
+        let mut dialog = StructuralDialog::sort(1);
+        dialog.sort_levels.push(super::SortSpec {
+            column: 2,
+            mode: SortMode::Number,
+            direction: super::SortDirection::Descending,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        });
+        app.active.structural_dialog = Some(dialog);
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let document = app.active.document.as_ref().unwrap();
+        let sorted = fs::read(document.session.path()).unwrap();
+        assert_eq!(sorted, b"id,account,amount\n3,a,10\n2,a,2\n4,a,2\n1,a,1\n");
+        assert!(document.is_dirty());
+        app.swap_structural_history(false).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            app.active.document.as_ref().unwrap().cell_edits[&(1, 1)].as_slice(),
+            b"a"
+        );
+        app.swap_structural_history(true).unwrap();
+        finish_index(app.active.document.as_mut().unwrap());
+        assert_eq!(
+            fs::read(app.active.document.as_ref().unwrap().session.path()).unwrap(),
+            sorted
+        );
+        let saved = directory.path().join("saved.csv");
+        assert!(app.save_as_picker_result(Some(saved.clone())));
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        finish_app_save(&mut app, &ctx, &mut frame);
+        assert_eq!(fs::read(saved).unwrap(), sorted);
+        assert_eq!(fs::read(source).unwrap(), original);
     }
 }

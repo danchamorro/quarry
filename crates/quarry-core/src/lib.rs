@@ -47,8 +47,8 @@ use quarry_delimited::{ParseError, RecordScanner, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
 pub use sort::{
     DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
-    SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec, SortSummary,
-    estimate_sort_temporary_bytes,
+    MAX_SORT_KEYS, SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SortProgress, SortSpec,
+    SortSummary, estimate_multi_sort_temporary_bytes, estimate_sort_temporary_bytes,
 };
 pub use storage::{
     StorageSpace, check_storage, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
