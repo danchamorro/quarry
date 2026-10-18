@@ -559,6 +559,7 @@ pub struct SortJob {
 }
 
 impl SortJob {
+    /// Start a guarded private sort with scratch files beside the destination.
     #[allow(clippy::too_many_arguments)]
     fn start(
         source_path: PathBuf,
@@ -589,6 +590,7 @@ impl SortJob {
         )
     }
 
+    /// Validate the plan and source before spawning the worker; publish only in wait().
     #[allow(clippy::too_many_arguments)]
     fn start_with_temp_directory(
         source_path: PathBuf,
@@ -727,6 +729,8 @@ impl Drop for SortJob {
 }
 
 impl Session {
+    /// Sort effective values into a new private working copy, preserving headers and stable ties.
+    /// Accepts a single SortSpec or an ordered SortPlan; the source is never overwritten.
     pub fn start_create_sorted_working_copy(
         &self,
         header_renames: BTreeMap<usize, Vec<u8>>,
@@ -749,6 +753,8 @@ impl Session {
         )
     }
 
+    /// Create a sorted working copy using the chosen directory for temporary merge runs.
+    /// Final output staging remains beside the destination and is accepted by wait().
     pub fn start_create_sorted_working_copy_with_temp_directory(
         &self,
         header_renames: BTreeMap<usize, Vec<u8>>,
@@ -831,6 +837,7 @@ fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
     Ok(())
 }
 
+/// Limit retained merge heads using observed key width and the minimum safe payload budget.
 fn effective_merge_fan_in(config: SortConfig, max_key_bytes: usize) -> usize {
     let key_bytes = max_key_bytes.max(1);
     // At least two heads plus a pending key and record must fit. Escaped
@@ -1130,6 +1137,7 @@ impl<'a> From<&'a DuplicateSpec> for RunOrder<'a> {
 }
 
 impl RunOrder<'_> {
+    /// Composite keys embed their per-level directions; duplicates always merge ascending.
     fn direction(self) -> SortDirection {
         match self {
             Self::Sort(spec) => spec.direction,
@@ -1522,6 +1530,7 @@ fn create_initial_runs<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Check storage and produce a verified candidate for guarded publication.
 fn run_sort(
     source: &mut File,
     source_path: &Path,
@@ -1627,6 +1636,7 @@ fn run_sort(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Scan effective rows, merge sorted runs, and build the output index while writing.
 fn run_sort_inner(
     source: &mut File,
     source_path: &Path,
@@ -1770,6 +1780,7 @@ fn write_entry_parts(
         .saturating_add(record.len() as u64))
 }
 
+/// Reject oversized run frames before allocating a comparison key or record payload.
 fn read_head(
     reader: &mut BufReader<File>,
     max_record_bytes: usize,

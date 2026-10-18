@@ -505,6 +505,7 @@ impl StructuralDialog {
         }
     }
 
+    /// Open split settings for one physical source column.
     fn split(column: usize) -> Self {
         Self {
             request: StructuralRequest::Split,
@@ -519,6 +520,7 @@ impl StructuralDialog {
         }
     }
 
+    /// Open combine settings while retaining the selected column order.
     fn combine(columns: Vec<usize>) -> Self {
         Self {
             request: StructuralRequest::Combine,
@@ -533,6 +535,7 @@ impl StructuralDialog {
         }
     }
 
+    /// Start with the current first selected column as the destination position.
     fn move_columns(columns: Vec<usize>) -> Self {
         let position = columns
             .first()
@@ -550,6 +553,7 @@ impl StructuralDialog {
         }
     }
 
+    /// Start a text sort using the clicked physical column as the primary level.
     fn sort(column: usize) -> Self {
         Self {
             request: StructuralRequest::Sort,
@@ -1276,6 +1280,7 @@ impl QuarryApp {
         }
     }
 
+    /// Validate and dispatch the selected operation through the shared storage and history flow.
     fn apply_structural_dialog_action(&mut self, action: StructuralDialogAction) {
         if action == StructuralDialogAction::Cancel {
             self.active.structural_dialog = None;
@@ -4156,16 +4161,19 @@ fn show_additional_sort_level(
         }
         ui.horizontal(|ui| {
             for direction in [SortDirection::Ascending, SortDirection::Descending] {
-                ui.selectable_value(
-                    &mut key.direction,
-                    direction,
-                    sort_direction_label(key.mode, direction),
-                );
+                let label = sort_direction_label(key.mode, direction);
+                let response = ui.selectable_value(&mut key.direction, direction, label);
+                let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                    node.set_label(format!("{label} (level {})", index + 1));
+                });
             }
         });
         if key.mode == SortMode::Text {
             let mut sensitive = key.case_sensitivity == CaseSensitivity::Sensitive;
-            ui.checkbox(&mut sensitive, "Match case");
+            let response = ui.checkbox(&mut sensitive, "Match case");
+            let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_label(format!("Match case (level {})", index + 1));
+            });
             key.case_sensitivity = case_sensitivity(sensitive);
         }
     });
@@ -4209,6 +4217,7 @@ fn sort_value_description(mode: SortMode, match_case: bool) -> &'static str {
     }
 }
 
+/// Keep actions and disk allowance outside the scrollable operation settings.
 fn show_structural_dialog(
     ctx: &egui::Context,
     dialog: &mut StructuralDialog,
@@ -22927,5 +22936,51 @@ mod tests {
         finish_app_save(&mut app, &ctx, &mut frame);
         assert_eq!(fs::read(saved).unwrap(), sorted);
         assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn secondary_sort_levels_have_distinct_accessible_direction_and_case_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("accessible-levels.csv");
+        fs::write(&source, b"a,b,c\nx,y,z\n").unwrap();
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        finish_index(app.active.document.as_mut().unwrap());
+        let document = app.active.document.as_ref().unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for index in 1..=2 {
+                    let mut key = super::SortSpec {
+                        column: index,
+                        mode: SortMode::Text,
+                        direction: super::SortDirection::Ascending,
+                        case_sensitivity: CaseSensitivity::Insensitive,
+                    };
+                    super::show_additional_sort_level(ui, document, &mut key, index);
+                }
+            });
+        });
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let labels: Vec<_> = tree
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label())
+            .collect();
+        for level in 2..=3 {
+            for control in ["Ascending", "Descending", "Match case"] {
+                let expected = format!("{control} (level {level})");
+                assert!(
+                    labels.contains(&expected.as_str()),
+                    "missing {expected}: {labels:?}"
+                );
+            }
+        }
+        for control in ["Ascending", "Descending", "Match case"] {
+            assert!(
+                !labels.contains(&control),
+                "secondary controls must identify their level"
+            );
+        }
     }
 }
