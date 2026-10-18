@@ -6269,6 +6269,7 @@ impl Document {
     }
 
     #[cfg(test)]
+    /// Keep the existing single-column regression paths on the same plan-based implementation.
     fn start_sort_rows(
         &mut self,
         column: usize,

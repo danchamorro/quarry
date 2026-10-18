@@ -133,6 +133,7 @@ pub struct SortPlan {
 }
 
 impl From<SortSpec> for SortPlan {
+    /// Preserve the existing single-level comparison and whole-row operation semantics.
     fn from(key: SortSpec) -> Self {
         Self { keys: vec![key] }
     }
@@ -369,6 +370,7 @@ pub enum SortOutcome {
     Cancelled,
 }
 
+/// Allow space for two generations of framed single-key runs, including numeric metadata.
 pub const fn estimate_sort_temporary_bytes(
     effective_bytes_upper_bound: u64,
     data_rows: u64,
@@ -813,6 +815,7 @@ fn validate_overlays(
     Ok(())
 }
 
+/// Reject zero budgets and record limits that cannot fit a two-way merge.
 fn validate_config(config: SortConfig) -> Result<(), QuarryError> {
     if config.chunk_bytes == 0 || config.run_memory_bytes == 0 || config.max_record_bytes == 0 {
         return Err(QuarryError::InvalidOption(
@@ -1119,18 +1122,21 @@ enum RunOrder<'a> {
 }
 
 impl From<SortSpec> for RunOrder<'_> {
+    /// Adapt a legacy single-key scan without changing its key representation.
     fn from(spec: SortSpec) -> Self {
         Self::Sort(spec)
     }
 }
 
 impl<'a> From<&'a SortPlan> for RunOrder<'a> {
+    /// Borrow the validated plan for all rows in the streaming scan.
     fn from(spec: &'a SortPlan) -> Self {
         Self::MultiSort(spec)
     }
 }
 
 impl<'a> From<&'a DuplicateSpec> for RunOrder<'a> {
+    /// Share run storage with duplicate detection while preserving its equality keys.
     fn from(spec: &'a DuplicateSpec) -> Self {
         Self::Duplicates(spec)
     }
@@ -1203,6 +1209,7 @@ impl<'a> InitialRunBuilder<'a> {
         }
     }
 
+    /// Apply overlays, retain the header, and append a size-checked keyed data row.
     fn process(&mut self, record: &[u8], physical_row: u64) -> Result<BuilderStep, QuarryError> {
         if record.len() > self.config.max_record_bytes {
             return Err(QuarryError::RecordTooLarge {
@@ -1416,6 +1423,7 @@ enum ScanOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Stream source records into bounded sorted runs, stopping promptly on cancellation.
 fn create_initial_runs<'a>(
     source: &mut File,
     delimiter: u8,
@@ -2123,6 +2131,7 @@ mod tests {
         .unwrap()
     }
 
+    /// Exercise production sorting under custom budgets, including forced multi-pass merges.
     fn start_custom(
         session: &Session,
         header_renames: BTreeMap<usize, Vec<u8>>,
@@ -3572,6 +3581,7 @@ mod tests {
         assert_eq!(retained_payload, MERGE_MEMORY_BUDGET_BYTES);
     }
 
+    /// Build exact-case levels for tests whose expected order is computed independently.
     fn level(column: usize, mode: SortMode, direction: SortDirection) -> SortSpec {
         SortSpec {
             column,
