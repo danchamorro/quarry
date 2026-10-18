@@ -119,7 +119,7 @@ descending order, and apply. Account ascending / amount descending produced
 IDs 3,2,4,1,5; equal amount rows 2 and 4 remained stable. Undo restored IDs
 1,2,3,4,5 and Redo restored the sorted order.
 
-The full workspace suite passed 427 tests; Clippy passed with warnings denied.
+The full workspace suite passed 428 tests; Clippy passed with warnings denied.
 Coverage includes per-key controls and reordering, pending edits, one-step
 undo/redo, Save As source preservation, exact numbers, explicit dates, NUL and
 prefix key ordering, missing fields, invalid secondary values, cancellation,

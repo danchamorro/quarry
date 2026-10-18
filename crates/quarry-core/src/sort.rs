@@ -1261,14 +1261,42 @@ impl<'a> InitialRunBuilder<'a> {
                 "cell edit column is out of range",
             ));
         }
+        // The BTreeMap range above produces edits in ascending column order.
         let value_at = |column| {
             row_edits
-                .iter()
-                .find(|(edited_column, _)| *edited_column == column)
-                .map(|(_, value)| *value)
+                .binary_search_by_key(&column, |(edited_column, _)| *edited_column)
+                .ok()
+                .map(|index| row_edits[index].1)
                 .or_else(|| fields.get(column).map(|field| field.as_ref()))
                 .unwrap_or_default()
         };
+        if !row_edits.is_empty() {
+            // Bound the entire effective row before allocating keys or cloning
+            // fields. Individually valid edits can exceed the aggregate limit.
+            let mut serialized_bytes = ending
+                .len()
+                .saturating_add(fields.len().saturating_sub(1))
+                .saturating_add(
+                    usize::from(physical_row == 0 && self.bom_present) * UTF8_BOM.len(),
+                );
+            for column in 0..fields.len() {
+                if self.shared.cancel_requested.load(Ordering::Acquire) {
+                    return Ok(BuilderStep::Cancelled);
+                }
+                let value = value_at(column);
+                serialized_bytes = serialized_bytes.saturating_add(delimited_field_len(
+                    value,
+                    self.delimiter,
+                    column == 0 && value.starts_with(UTF8_BOM)
+                        || fields.len() == 1 && value.is_empty() && ending.is_empty(),
+                ));
+                if serialized_bytes > self.config.max_record_bytes {
+                    return Err(QuarryError::RecordTooLarge {
+                        limit: self.config.max_record_bytes,
+                    });
+                }
+            }
+        }
         let key = match self.order {
             RunOrder::Duplicates(spec) => spec.key(value_at, self.config.max_record_bytes)?,
             RunOrder::Sort(spec) => SortPlan::from(spec).key(value_at, self.rows)?,
@@ -3825,5 +3853,46 @@ mod tests {
             estimate_multi_sort_temporary_bytes(1, u64::MAX, MAX_SORT_KEYS),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn oversized_edited_rows_are_rejected_before_building_sort_keys() {
+        let directory = case();
+        let source = directory.join("source.csv");
+        let destination = directory.join("sorted.csv");
+        let input = format!(
+            "{}\n{}\n",
+            vec!["h"; MAX_SORT_KEYS].join(","),
+            vec!["x"; MAX_SORT_KEYS].join(",")
+        );
+        fs::write(&source, &input).unwrap();
+        let mut edits: BTreeMap<_, _> = (0..MAX_SORT_KEYS)
+            .map(|column| ((1, column), vec![b'x'; 16]))
+            .collect();
+        // This invalid key would fail first if key construction preceded aggregate validation.
+        edits.insert((1, 0), b"not numeric".to_vec());
+        let mut keys: Vec<_> = (0..MAX_SORT_KEYS)
+            .map(|column| level(column, SortMode::Text, SortDirection::Ascending))
+            .collect();
+        keys[0].mode = SortMode::Number;
+        let job = start_custom(
+            &session(&source, HeaderMode::FirstRow),
+            BTreeMap::new(),
+            edits,
+            SortPlan { keys },
+            &destination,
+            SortConfig {
+                max_record_bytes: 64,
+                ..tiny_config()
+            },
+        );
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::RecordTooLarge { limit: 64 })
+        ));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&source).unwrap(), input.as_bytes());
+        assert!(sort_artifacts(&directory).is_empty());
+        fs::remove_dir_all(directory).unwrap();
     }
 }
