@@ -76,7 +76,13 @@ include elapsed time, memory, available disk, and the displayed operation phase.
 GitHub reports are public: redact paths, screenshots, logs, and values. Share
 only synthetic reproductions, never private datasets or credentials.
 
-Filters include unsaved cell values. After a filter completes, editing a cell or using value Undo/Redo refreshes the results while preserving your page where possible. Clear filters before structural changes or Find/Replace.
+In the published build 140, clear active filters before editing; save or discard
+cell edits before filtering. **Current source builds after
+[#78](https://github.com/danchamorro/quarry/issues/78)** include unsaved cell
+values in filters. In those builds, editing a cell or using value Undo/Redo
+refreshes completed results while preserving your page where possible. Clear
+filters before structural changes or Find/Replace. These changes are not in
+the build 140 download linked above.
 Undo history is bounded, and case-insensitive matching folds ASCII letters only.
 Read the [documented limits](USER_GUIDE.md#undo-and-redo-changes) and
 [filter rules](USER_GUIDE.md#filter-rows). Current source builds also include

@@ -736,27 +736,35 @@ impl QuarryApp {
         }
     }
 
-    /// Commits this tab's drafts and chooses a destination for the filtered working values.
-    fn choose_filtered_export(&mut self) {
-        if let Some(document) = self.active.document.as_mut() {
-            if document.save_job.is_some() {
-                self.active.notice = Some(AppMessage::warning(
-                    "Cancel the active save before exporting filtered rows.",
-                ));
-                return;
-            }
-            document.commit_edits();
-        }
-        let Some(source) = self
+    /// Commits this tab's drafts before the native export picker takes over polling.
+    fn prepare_filtered_export(&mut self) -> Result<PathBuf, AppMessage> {
+        let document = self
             .active
             .document
-            .as_ref()
-            .map(|document| document.logical_path.clone())
-        else {
-            self.active.notice = Some(AppMessage::warning(
-                "Open and filter a file before exporting.",
+            .as_mut()
+            .ok_or_else(|| AppMessage::warning("Open and filter a file before exporting."))?;
+        if document.save_job.is_some() {
+            return Err(AppMessage::warning(
+                "Cancel the active save before exporting filtered rows.",
             ));
-            return;
+        }
+        document.commit_edits();
+        if document.filter_refresh_pending {
+            return Err(AppMessage::warning(
+                "Wait for matches to refresh, then choose Export Filtered Rows again.",
+            ));
+        }
+        Ok(document.logical_path.clone())
+    }
+
+    /// Chooses a destination only after the working filter is ready to export.
+    fn choose_filtered_export(&mut self) {
+        let source = match self.prepare_filtered_export() {
+            Ok(source) => source,
+            Err(error) => {
+                self.active.notice = Some(error);
+                return;
+            }
         };
         let mut dialog = rfd::FileDialog::new()
             .set_title("Export filtered rows")
@@ -14097,6 +14105,32 @@ mod tests {
 
         document.shutdown();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filtered_export_waits_for_draft_refresh_before_opening_the_picker() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("filter-export-draft.csv");
+        fs::write(&source, b"name,status\nAda,keep\nBob,keep\n").unwrap();
+        let mut app = individual_edit_app(&source);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Equals,
+                b"keep".to_vec(),
+            ))
+            .unwrap();
+        finish_filter(document);
+        document.begin_cell_edit(1, 1, b"keep".to_vec()).unwrap();
+        document.cell_edit.as_mut().unwrap().draft = "drop".into();
+        assert!(app.prepare_filtered_export().is_err());
+        let document = app.active.document.as_mut().unwrap();
+        assert!(document.filter_refresh_pending);
+        finish_filter(document);
+        assert_eq!(document.available_filter_rows(), 1);
+        assert_eq!(app.prepare_filtered_export().unwrap(), source);
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
