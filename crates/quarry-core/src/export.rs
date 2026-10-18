@@ -2121,6 +2121,31 @@ fn clear_inherited_acl(file: &File) -> io::Result<()> {
     result
 }
 
+/// Reserves private staging on the output volume, including file-only drop folders.
+fn private_staging_directory(parent: &Path) -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    let prefix = format!(".quarry-export-{}-", std::process::id());
+    builder.prefix(&prefix);
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o700));
+    match builder.tempdir_in(parent) {
+        Ok(directory) => Ok(directory),
+        Err(error) => {
+            // Unix file-only ACLs can deny subdirectories while allowing the final
+            // rename. Use the user's temporary directory only on the same volume.
+            #[cfg(unix)]
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                use std::os::unix::fs::MetadataExt;
+                let directory = builder.tempdir()?;
+                if fs::metadata(directory.path())?.dev() == fs::metadata(parent)?.dev() {
+                    return Ok(directory);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 impl ExportTarget {
     pub(crate) fn new_combined(
         sources: Vec<(PathBuf, SourceStamp)>,
@@ -2291,15 +2316,8 @@ impl ExportTarget {
         }
         // A shared destination must not expose uncommitted CSV contents, even
         // when the eventual destination deliberately retains shared permissions.
-        let mut builder = tempfile::Builder::new();
-        #[cfg(unix)]
-        builder.permissions(fs::Permissions::from_mode(0o700));
-        let private_directory = Some(
-            builder
-                .prefix(&format!(".quarry-export-{}-", std::process::id()))
-                .tempdir_in(parent)
-                .map_err(|error| storage_error(parent, error))?,
-        );
+        let private_directory =
+            Some(private_staging_directory(parent).map_err(|error| storage_error(parent, error))?);
         let staging_parent = private_directory
             .as_ref()
             .map_or(parent, |directory| directory.path());
@@ -9385,5 +9403,64 @@ mod tests {
         );
         assert_eq!(fs::read(&destination).unwrap(), fs::read(&source).unwrap());
         assert!(temporary_exports(&destination).is_empty());
+    }
+    /// File-only destination grants use private staging elsewhere on the same volume.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_only_destination_grants_keep_export_staging_private() {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Command;
+        for replace in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("private.csv");
+            let bytes = b"name,id\nAlice,1\n";
+            fs::write(&source, bytes).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", "everyone deny add_subdirectory"])
+                    .arg(directory.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(fs::create_dir(directory.path().join("blocked-subdirectory")).is_err());
+            let destination = if replace {
+                source.clone()
+            } else {
+                directory.path().join("copy.csv")
+            };
+            let mut output = if replace {
+                let file = File::open(&source).unwrap();
+                let stamp = crate::SourceStamp::from_file(&file).unwrap();
+                ExportTarget::replace_source(&source, &file, stamp).unwrap()
+            } else {
+                ExportTarget::new(&source, destination.clone()).unwrap()
+            };
+            let staging_directory = output.temporary.parent().unwrap().to_owned();
+            assert_ne!(staging_directory.parent(), Some(directory.path()));
+            assert_eq!(
+                fs::metadata(&staging_directory).unwrap().dev(),
+                fs::metadata(directory.path()).unwrap().dev()
+            );
+            assert_eq!(
+                fs::metadata(&staging_directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            output.write_raw_all(bytes).unwrap();
+            output
+                .publish(2, bytes.len() as u64, &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), bytes);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!staging_directory.exists());
+        }
     }
 }
