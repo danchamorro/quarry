@@ -260,11 +260,13 @@ impl Encoding {
         }
     }
 
+    /// Builds a positioned codec error; record callers wrap it before reporting source locations.
     fn invalid(self, offset: u64, reason: &str) -> QuarryError {
-        QuarryError::Encoding(format!(
-            "Invalid {} at byte {offset}: {reason}. Choose the correct encoding; no text was replaced.",
-            self.label(),
-        ))
+        QuarryError::EncodingAt {
+            encoding: self,
+            offset,
+            reason: reason.to_owned(),
+        }
     }
 
     pub(crate) fn chunk_size(self, requested: usize) -> usize {
@@ -338,12 +340,24 @@ pub(crate) struct RecordScanner {
     delimiter: u8,
     at_start: bool,
     high_surrogate: Option<u64>,
+    validate_utf16: bool,
     shadow: Vec<u8>,
 }
 
 impl RecordScanner {
     pub(crate) fn new(delimiter: u8, encoding: Encoding) -> Result<Self, QuarryError> {
         Self::at_offset(delimiter, 0, encoding)
+    }
+
+    /// Frame aligned UTF-16 code units without conflating text validity with
+    /// CSV structure. Inspection decodes each complete record separately.
+    pub(crate) fn new_for_inspection(
+        delimiter: u8,
+        encoding: Encoding,
+    ) -> Result<Self, QuarryError> {
+        let mut scanner = Self::new(delimiter, encoding)?;
+        scanner.validate_utf16 = false;
+        Ok(scanner)
     }
 
     pub(crate) fn at_offset(
@@ -373,6 +387,7 @@ impl RecordScanner {
             delimiter,
             at_start: offset == 0,
             high_surrogate: None,
+            validate_utf16: true,
             shadow: Vec::new(),
         })
     }
@@ -412,14 +427,16 @@ impl RecordScanner {
                     continue;
                 }
             }
-            if let Some(high) = self.high_surrogate.take() {
-                if !(0xdc00..=0xdfff).contains(&unit) {
-                    return Err(self.encoding.invalid(high, "unpaired high surrogate"));
+            if self.validate_utf16 {
+                if let Some(high) = self.high_surrogate.take() {
+                    if !(0xdc00..=0xdfff).contains(&unit) {
+                        return Err(self.encoding.invalid(high, "unpaired high surrogate"));
+                    }
+                } else if (0xd800..=0xdbff).contains(&unit) {
+                    self.high_surrogate = Some(offset);
+                } else if (0xdc00..=0xdfff).contains(&unit) {
+                    return Err(self.encoding.invalid(offset, "unpaired low surrogate"));
                 }
-            } else if (0xd800..=0xdbff).contains(&unit) {
-                self.high_surrogate = Some(offset);
-            } else if (0xdc00..=0xdfff).contains(&unit) {
-                return Err(self.encoding.invalid(offset, "unpaired low surrogate"));
             }
             self.shadow.push(if unit < 128 { unit as u8 } else { 0x80 });
         }
@@ -1399,7 +1416,7 @@ mod tests {
                     .start_indexing(crate::IndexConfig::default())
                     .unwrap()
                     .wait(),
-                Err(crate::QuarryError::Encoding(_))
+                Err(crate::QuarryError::EncodingAt { .. })
             ));
             let copy = directory.path().join("copy.csv");
             assert!(matches!(
@@ -1407,7 +1424,7 @@ mod tests {
                     .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &copy)
                     .unwrap()
                     .wait(),
-                Err(crate::QuarryError::Encoding(_))
+                Err(crate::QuarryError::EncodingAt { .. })
             ));
             assert!(!copy.exists());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);

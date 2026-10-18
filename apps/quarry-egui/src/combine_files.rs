@@ -18,6 +18,7 @@ pub(super) struct CombineDialog {
     space: Option<StorageSpace>,
     result: Option<CombineSummary>,
     message: Option<String>,
+    problem_path: Option<PathBuf>,
     cancel_requested: bool,
     protected_paths: Vec<PathBuf>,
 }
@@ -37,6 +38,7 @@ impl Default for CombineDialog {
             space: None,
             result: None,
             message: None,
+            problem_path: None,
             cancel_requested: false,
             protected_paths: Vec::new(),
         }
@@ -69,6 +71,15 @@ impl CombineDialog {
         self.destination = None;
         self.space = None;
         self.message = None;
+        self.problem_path = None;
+    }
+
+    fn record_error(&mut self, error: QuarryError) {
+        self.problem_path = match &error {
+            QuarryError::CombineFile { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        self.message = Some(quarry_core::Diagnostic::from_error(&error).details());
     }
 
     fn start_check(&mut self) {
@@ -83,7 +94,7 @@ impl CombineDialog {
             self.encoding,
         ) {
             Ok(job) => self.checking = Some(job),
-            Err(error) => self.message = Some(error.to_string()),
+            Err(error) => self.record_error(error),
         }
     }
 
@@ -108,7 +119,7 @@ impl CombineDialog {
                 Ok(None) => {
                     self.message = Some("File check cancelled. No output was written.".into())
                 }
-                Err(error) => self.message = Some(error.to_string()),
+                Err(error) => self.record_error(error),
             }
             self.cancel_requested = false;
         }
@@ -133,7 +144,7 @@ impl CombineDialog {
                         Some("Combination cancelled. No combined file was published.".into())
                 }
                 Err(error) => {
-                    self.message = Some(error.to_string());
+                    self.record_error(error);
                     self.plan = None;
                     self.space = None;
                 }
@@ -209,7 +220,7 @@ impl CombineDialog {
                 self.message = None;
                 self.cancel_requested = false;
             }
-            Err(error) => self.message = Some(error.to_string()),
+            Err(error) => self.record_error(error),
         }
     }
 
@@ -313,7 +324,11 @@ impl CombineDialog {
                     ui.add(egui::Label::new(format!("Output: {}", destination.display())).truncate()).on_hover_text(destination.display().to_string());
                 }
                 if let Some(space) = &self.space { ui.label(format!("Available space: {}", format_bytes(space.available_bytes))); }
-                if let Some(message) = &self.message { ui.add(egui::Label::new(RichText::new(message).color(ERROR_TEXT)).wrap()); }
+                if let Some(message) = &self.message {
+                    ui.add(egui::Label::new(RichText::new(message).color(ERROR_TEXT)).wrap());
+                    if ui.button("Copy Details").clicked() { ui.ctx().copy_text(message.clone()); }
+                    if ui.add_enabled(!busy && self.problem_path.is_some(), egui::Button::new("Inspect problem file…")).clicked() { action = DialogAction::Inspect; }
+                }
                 if let Some(progress) = self.checking.as_ref().map(CombineJob::progress).or_else(|| self.writing.as_ref().map(CombineJob::progress)) {
                     ui.horizontal(|ui| { ui.spinner(); ui.label(format!("{} file {} of {}…", if self.checking.is_some() { "Checking" } else { "Combining" }, progress.file_index + 1, progress.files)); });
                     if self.writing.is_some() { ui.add(egui::ProgressBar::new(progress_fraction(progress.bytes_scanned, progress.total_bytes, progress.done)).show_percentage()); }
@@ -350,6 +365,7 @@ impl CombineDialog {
 
 enum DialogAction {
     None,
+    Inspect,
     Close,
     Open(PathBuf, u8, bool, Encoding),
 }
@@ -381,12 +397,40 @@ impl QuarryApp {
     }
 
     /// Handles dialog actions; opening a saved result creates a tab and retains old work.
+    fn inspect_combine_problem(&mut self) {
+        let Some(dialog) = self.combine_files.as_ref() else {
+            return;
+        };
+        let Some(path) = dialog.problem_path.clone() else {
+            return;
+        };
+        self.active.inspection = inspection_ui::InspectionUi::failed(
+            path,
+            OpenOptions {
+                delimiter: dialog.delimiter.delimiter(),
+                header_mode: if dialog.has_header {
+                    HeaderMode::FirstRow
+                } else {
+                    HeaderMode::NoHeader
+                },
+                ..Default::default()
+            },
+            dialog.encoding,
+            dialog.message.clone().unwrap_or_default(),
+        );
+    }
+
     pub(super) fn show_combine_files(&mut self, ctx: &egui::Context) {
+        // Suspend this modal while inspecting its input, retaining the combine draft.
+        if self.active.inspection.open {
+            return;
+        }
         let Some(dialog) = self.combine_files.as_mut() else {
             return;
         };
         match dialog.show(ctx) {
             DialogAction::None => {}
+            DialogAction::Inspect => self.inspect_combine_problem(),
             DialogAction::Close => {
                 self.combine_files = None;
             }
@@ -658,5 +702,35 @@ mod tests {
         assert!(dialog.plan.is_none());
         assert!(dialog.result.is_none());
         assert!(!out.exists());
+    }
+    #[test]
+    fn late_combine_error_retains_the_failing_input_and_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("good.csv");
+        let b = dir.path().join("bad.csv");
+        fs::write(&a, b"a,b\n1,2\n").unwrap();
+        let mut data = b"a,b\n".to_vec();
+        for _ in 0..30 {
+            data.extend_from_slice(b"1,2\n");
+        }
+        data.extend_from_slice(b"bad\n");
+        fs::write(&b, data).unwrap();
+        let mut dialog = CombineDialog {
+            paths: vec![a, b.clone()],
+            delimiter: DelimiterMode::Comma,
+            ..Default::default()
+        };
+        dialog.start_check();
+        finish(&mut dialog);
+        let details = dialog.message.as_ref().unwrap();
+        assert!(details.contains(&b.display().to_string()));
+        assert!(details.contains("Record: 32"), "{details}");
+        assert_eq!(dialog.problem_path, Some(fs::canonicalize(&b).unwrap()));
+        let paths = dialog.paths.clone();
+        let mut app = QuarryApp::new(Some(b), Instant::now());
+        app.combine_files = Some(dialog);
+        app.inspect_combine_problem();
+        assert!(app.active.inspection.open);
+        assert_eq!(app.combine_files.as_ref().unwrap().paths, paths);
     }
 }

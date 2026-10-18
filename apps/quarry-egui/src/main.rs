@@ -1,3 +1,4 @@
+mod inspection_ui;
 #[cfg(test)]
 use quarry_core::estimate_sort_temporary_bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -357,13 +358,48 @@ enum MessageSeverity {
     Status,
 }
 
+/// The attempted format travels with an open failure even when another tab becomes active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedOpen {
+    path: PathBuf,
+    options: OpenOptions,
+    encoding: Option<Encoding>,
+    message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppMessage {
+    inspection_target: Option<Box<FailedOpen>>,
+    diagnostic: Option<Box<quarry_core::Diagnostic>>,
     text: String,
     severity: MessageSeverity,
 }
 
 impl AppMessage {
+    /// Retains the failed path, attempted format and cause independently of the active tab.
+    fn file_open_error(
+        path: PathBuf,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+        message: String,
+    ) -> Self {
+        let context = FailedOpen {
+            path,
+            options,
+            encoding,
+            message: message.clone(),
+        };
+        let mut result = Self::error(message);
+        result.inspection_target = Some(Box::new(context));
+        result
+    }
+    /// Attaches structured data locations without losing the original operation message.
+    fn core_error(error: impl Into<QuarryError>) -> Self {
+        let error = error.into();
+        let mut result = Self::error(error.to_string());
+        result.diagnostic = Some(Box::new(quarry_core::Diagnostic::from_error(&error)));
+        result
+    }
     fn error(text: impl Into<String>) -> Self {
         Self::new(text, MessageSeverity::Error)
     }
@@ -378,6 +414,8 @@ impl AppMessage {
 
     fn new(text: impl Into<String>, severity: MessageSeverity) -> Self {
         Self {
+            inspection_target: None,
+            diagnostic: None,
             text: text.into(),
             severity,
         }
@@ -1021,10 +1059,14 @@ impl QuarryApp {
     /// Attempts every local path and collects failures without evicting open documents.
     fn handle_dropped_paths(&mut self, dropped: Vec<Option<PathBuf>>) {
         let mut failures = Vec::new();
+        let mut inspection_target = None;
         for path in dropped {
             match path {
                 Some(path) => {
                     if let Err(error) = self.open_new_path(path.clone()) {
+                        if inspection_target.is_none() {
+                            inspection_target = error.inspection_target;
+                        }
                         failures.push(format!("{}: {}", path.display(), error.text));
                     }
                 }
@@ -1033,7 +1075,9 @@ impl QuarryApp {
             }
         }
         if !failures.is_empty() {
-            self.active.notice = Some(AppMessage::warning(failures.join("\n")));
+            let mut notice = AppMessage::warning(failures.join("\n"));
+            notice.inspection_target = inspection_target;
+            self.active.notice = Some(notice);
         }
     }
 
@@ -1052,6 +1096,9 @@ impl QuarryApp {
 
     /// Dispatches document actions to the active tab and application actions to shared state.
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        if self.active.inspection.recovering() {
+            return;
+        }
         if action == Action::CloseTab {
             self.request_tab_close(ctx);
             return;
@@ -1106,6 +1153,10 @@ impl QuarryApp {
                 }) {
                     return;
                 }
+            }
+            Action::InspectFile => {
+                self.start_current_inspection();
+                return;
             }
             Action::Choose => return self.choose_file(),
             Action::ChooseWithEncoding(encoding) => {
@@ -1204,6 +1255,7 @@ impl QuarryApp {
             return;
         }
         let result = match action {
+            Action::InspectFile => unreachable!("inspection handled before document dispatch"),
             Action::Choose
             | Action::ChooseWithEncoding(_)
             | Action::CloseTab
@@ -1606,7 +1658,7 @@ impl QuarryApp {
                 current.invalidate_changed_source();
                 return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
-            Err(error) => return Err(AppMessage::error(error.to_string())),
+            Err(error) => return Err(AppMessage::core_error(error)),
         }
         let edit = if redo {
             current.edit_history.redo.pop()
@@ -1688,7 +1740,7 @@ impl QuarryApp {
                     current.invalidate_changed_source();
                     return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
-                Err(error) => return Err(AppMessage::error(error.to_string())),
+                Err(error) => return Err(AppMessage::core_error(error)),
             }
         }
 
@@ -2055,11 +2107,13 @@ impl eframe::App for QuarryApp {
 
         self.reset_tab_focus(ctx);
         self.poll_document_tabs(ctx);
+        self.poll_inspections(ctx);
 
         if self.active.close_confirmation_open {
             self.about.open = false;
         }
-        let tabs_blocked = self.active.storage_review.is_some()
+        let tabs_blocked = self.active.inspection.recovering()
+            || self.active.storage_review.is_some()
             || self.about.open
             || self.combine_files.is_some()
             || self.active.close_confirmation_open
@@ -2068,7 +2122,8 @@ impl eframe::App for QuarryApp {
             || self.active.structural_dialog.is_some();
         self.show_document_tabs(ctx, tabs_blocked);
         let storage_review_open = self.active.storage_review.is_some();
-        let interaction_blocked = storage_review_open
+        let interaction_blocked = self.active.inspection.recovering()
+            || storage_review_open
             || self.about.open
             || self.combine_files.is_some()
             || self.active.close_after_save
@@ -2260,6 +2315,8 @@ impl eframe::App for QuarryApp {
                 });
             });
 
+        let notice_has_details = self.notice_has_inspection_details();
+        let mut show_error_details = false;
         if let Some(notice) = self.active.notice.as_ref() {
             let fill = match notice.severity {
                 MessageSeverity::Error => ERROR_FILL,
@@ -2275,10 +2332,17 @@ impl eframe::App for QuarryApp {
                         ui.set_opacity(1.0);
                     }
                     dismiss = notice_strip(ui, notice);
+                    if notice_has_details {
+                        show_error_details = ui.small_button("Details / Inspect…").clicked();
+                    }
                 });
             if dismiss {
                 self.active.notice = None;
             }
+        }
+
+        if show_error_details {
+            self.show_operation_diagnostic();
         }
 
         if self.active.find_bar_open {
@@ -2651,6 +2715,7 @@ impl eframe::App for QuarryApp {
         if self.combine_files.is_some() {
             self.show_combine_files(ctx);
         }
+        self.show_inspection(ctx);
     }
 }
 
@@ -2721,6 +2786,7 @@ fn detected_delimiter_label(delimiter: u8) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
+    InspectFile,
     ShowAllWhitespace(bool),
     CloseTab,
     About,
@@ -3513,6 +3579,9 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             action = Some(Action::TemporaryStorage);
         }
         ui.separator();
+        if ui.add_enabled(!file_operation_active, egui::Button::new("Inspect File…")).clicked() {
+            action = Some(Action::InspectFile);
+        }
         if ui.button("About & Feedback…").clicked() {
             action = Some(Action::About);
         }
@@ -5842,6 +5911,8 @@ impl ColumnView {
 }
 
 struct Document {
+    pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
+    pending_diagnostic_message: Option<String>,
     working_directory: PathBuf,
     pending_materialization: Option<(ColumnTransformation, BTreeSet<usize>, u64)>,
     session: Arc<Session>,
@@ -5943,6 +6014,15 @@ struct ActiveFilterRead {
 }
 
 impl Document {
+    /// Keeps the typed diagnostic and its exact notice text for later details requests.
+    fn diagnostic_error(&mut self, error: impl Into<QuarryError>) -> String {
+        let error = error.into();
+        self.pending_diagnostic = Some(Box::new(quarry_core::Diagnostic::from_error(&error)));
+        let message = error.to_string();
+        self.pending_diagnostic_message = Some(message.clone());
+        message
+    }
+
     #[cfg(test)]
     fn open(path: &Path, options: OpenOptions) -> Result<Self, String> {
         let mut document = Self::prepare(path, options)?;
@@ -5999,6 +6079,8 @@ impl Document {
         Ok(Self {
             session: Arc::new(session),
             logical_path: path.to_path_buf(),
+            pending_diagnostic: None,
+            pending_diagnostic_message: None,
             working_directory: std::env::temp_dir(),
             pending_materialization: None,
             original_session: None,
@@ -6209,7 +6291,7 @@ impl Document {
             }
             Err(error) => {
                 self.cleanup_empty_working_copy();
-                return Err(AppMessage::error(error.to_string()));
+                return Err(AppMessage::core_error(error));
             }
         };
         self.structural_job = Some(StructuralJob::InsertingRows {
@@ -6258,7 +6340,7 @@ impl Document {
                 self.invalidate_changed_source();
                 return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
-            Err(error) => return Err(AppMessage::error(error.to_string())),
+            Err(error) => return Err(AppMessage::core_error(error)),
         };
         self.structural_job = Some(StructuralJob::AnalyzingSplit {
             job,
@@ -6397,7 +6479,7 @@ impl Document {
             }
             Err(error) => {
                 self.cleanup_empty_working_copy();
-                return Err(AppMessage::error(error.to_string()));
+                return Err(AppMessage::core_error(error));
             }
         };
         self.structural_job = Some(StructuralJob::DeletingRows {
@@ -6505,7 +6587,7 @@ impl Document {
             }
             Err(error) => {
                 self.cleanup_empty_working_copy();
-                return Err(AppMessage::error(error.to_string()));
+                return Err(AppMessage::core_error(error));
             }
         };
         self.structural_job = Some(StructuralJob::Sorting {
@@ -6562,7 +6644,7 @@ impl Document {
                     self.invalidate_changed_source();
                     return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
-                return Err(AppMessage::error(error.to_string()));
+                return Err(AppMessage::core_error(error));
             }
         };
         self.structural_job = Some(StructuralJob::FindingDuplicates {
@@ -6629,7 +6711,7 @@ impl Document {
                     self.invalidate_changed_source();
                     return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
-                Err(error) => return Err(AppMessage::error(error.to_string())),
+                Err(error) => return Err(AppMessage::core_error(error)),
             }
             let original = match Session::open_with_encoding(
                 &self.logical_path,
@@ -6645,7 +6727,7 @@ impl Document {
                     self.invalidate_changed_source();
                     return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
-                Err(error) => return Err(AppMessage::error(error.to_string())),
+                Err(error) => return Err(AppMessage::core_error(error)),
             };
             self.original_session = Some(original);
         }
@@ -6710,7 +6792,7 @@ impl Document {
             }
             Err(error) => {
                 self.cleanup_empty_working_copy();
-                return Err(AppMessage::error(error.to_string()));
+                return Err(AppMessage::core_error(error));
             }
         };
         self.structural_job = Some(StructuralJob::Materializing {
@@ -6761,7 +6843,7 @@ impl Document {
                     self.invalidate_changed_source();
                     return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                 }
-                return Err(AppMessage::error(error.to_string()));
+                return Err(AppMessage::core_error(error));
             }
         };
         self.structural_job = Some(StructuralJob::Cleaning {
@@ -6824,7 +6906,7 @@ impl Document {
             }
             Err(error) => {
                 self.cleanup_empty_working_copy();
-                return Err(AppMessage::error(error.to_string()));
+                return Err(AppMessage::core_error(error));
             }
         };
         self.structural_job = Some(StructuralJob::Replacing {
@@ -6925,7 +7007,7 @@ impl Document {
                             self.invalidate_changed_source();
                             return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                         }
-                        return Err(AppMessage::error(error.to_string()));
+                        return Err(AppMessage::core_error(error));
                     }
                 }
                 Ok(None)
@@ -6951,7 +7033,7 @@ impl Document {
                         summary.max_pieces,
                         source_header,
                     )
-                    .map_err(|error| AppMessage::error(error.to_string()))?;
+                    .map_err(AppMessage::core_error)?;
                     let selected_columns =
                         (source_column..source_column.saturating_add(summary.max_pieces)).collect();
                     let records = summary.rows_scanned.saturating_add(self.data_start);
@@ -6986,7 +7068,7 @@ impl Document {
                 Err(error) => {
                     self.structural_status =
                         Some("Split failed. The document was not changed.".into());
-                    Err(AppMessage::error(error.to_string()))
+                    Err(AppMessage::core_error(error))
                 }
             },
             StructuralJob::Cleaning {
@@ -7026,7 +7108,7 @@ impl Document {
                         self.invalidate_changed_source();
                         return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                     }
-                    Err(AppMessage::error(error.to_string()))
+                    Err(AppMessage::core_error(error))
                 }
             },
             StructuralJob::Materializing {
@@ -7062,7 +7144,7 @@ impl Document {
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Column edit failed. The document was not changed.".into());
-                    Err(AppMessage::error(error.to_string()))
+                    Err(AppMessage::core_error(error))
                 }
             },
             StructuralJob::InsertingRows {
@@ -7101,7 +7183,7 @@ impl Document {
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Row insertion failed. The document was not changed.".into());
-                    Err(AppMessage::error(error.to_string()))
+                    Err(AppMessage::core_error(error))
                 }
             },
             StructuralJob::DeletingRows {
@@ -7140,7 +7222,7 @@ impl Document {
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Row deletion failed. The document was not changed.".into());
-                    Err(AppMessage::error(error.to_string()))
+                    Err(AppMessage::core_error(error))
                 }
             },
             StructuralJob::Replacing {
@@ -7187,7 +7269,7 @@ impl Document {
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Replace All failed. The document was not changed.".into());
-                    Err(AppMessage::error(error.to_string()))
+                    Err(AppMessage::core_error(error))
                 }
             },
             StructuralJob::Sorting {
@@ -7237,7 +7319,7 @@ impl Document {
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Sort failed. The document was not changed.".into());
-                    Err(AppMessage::error(error.to_string()))
+                    Err(AppMessage::core_error(error))
                 }
             },
         }
@@ -7395,7 +7477,7 @@ impl Document {
         let job = self
             .session
             .start_indexing(IndexConfig::default())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| self.diagnostic_error(error))?;
         self.progress = job.progress();
         self.job = Some(job);
         self.last_poll = Instant::now() - POLL_INTERVAL;
@@ -7414,7 +7496,7 @@ impl Document {
         self.progress = progress;
         if self.progress.done {
             let job = self.job.take().expect("index job is present");
-            self.index = Some(job.wait().map_err(|error| error.to_string())?);
+            self.index = Some(job.wait().map_err(|error| self.diagnostic_error(error))?);
             self.load_buffer(self.viewport_start)?;
         }
         Ok(())
@@ -7477,7 +7559,7 @@ impl Document {
                     self.owned_cell_edits(),
                     case_sensitivity,
                 )
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| self.diagnostic_error(error))?,
         );
         self.search_status = None;
         self.reveal_cell = None;
@@ -7623,7 +7705,7 @@ impl Document {
             return Ok(());
         }
         let job = self.search_job.take().expect("search job is present");
-        match job.wait().map_err(|error| error.to_string())? {
+        match job.wait().map_err(|error| self.diagnostic_error(error))? {
             SearchOutcome::Match(found) => {
                 if let Some(index) = self.search_history_index {
                     self.search_history.truncate(index + 1);
@@ -7673,7 +7755,9 @@ impl Document {
                 ));
             }
         }
-        query.validate().map_err(|error| error.to_string())?;
+        query
+            .validate()
+            .map_err(|error| self.diagnostic_error(error))?;
 
         self.commit_edits();
         let job = self
@@ -7683,7 +7767,7 @@ impl Document {
                 if matches!(error, QuarryError::SourceChanged) {
                     self.invalidate_changed_source();
                 }
-                error.to_string()
+                self.diagnostic_error(error)
             })?;
         self.stop_filter_read();
         self.filter_progress = Some(job.progress());
@@ -7814,7 +7898,7 @@ impl Document {
                 self.filtered_rows.clear();
                 self.filter_viewport_start = 0;
                 self.filter_buffer_start = 0;
-                Err(error.to_string())
+                Err(self.diagnostic_error(error))
             }
         }
     }
@@ -7852,7 +7936,7 @@ impl Document {
                     return Err(SOURCE_CHANGED_NOTICE.into());
                 }
                 self.pending_filter_read = None;
-                return Err(error.to_string());
+                return Err(self.diagnostic_error(error));
             }
         }
 
@@ -7907,7 +7991,7 @@ impl Document {
                 if matches!(error, QuarryError::SourceChanged) {
                     self.invalidate_changed_source();
                 }
-                AppMessage::error(error.to_string())
+                AppMessage::core_error(error)
             })?;
         self.export_progress = Some(job.progress());
         self.export_job = Some(job);
@@ -7954,7 +8038,7 @@ impl Document {
                     return Err(SOURCE_CHANGED_NOTICE.into());
                 }
                 self.export_status = Some("Export failed. No output file was created.".into());
-                Err(error.to_string())
+                Err(self.diagnostic_error(error))
             }
         }
     }
@@ -8090,7 +8174,7 @@ impl Document {
                 self.invalidate_changed_source();
                 return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             }
-            Err(error) => return Err(AppMessage::error(error.to_string())),
+            Err(error) => return Err(AppMessage::core_error(error)),
         };
         if self.filter_active() {
             self.reset_filter_state();
@@ -8140,7 +8224,7 @@ impl Document {
                 } else {
                     "Save As failed. No output file was created.".into()
                 });
-                Err(AppMessage::error(error.to_string()))
+                Err(AppMessage::core_error(error))
             }
         }
     }
@@ -8964,11 +9048,11 @@ impl Document {
         } else if let Some(index) = &self.index {
             self.session
                 .read_rows(index, start, count)
-                .map_err(|error| error.to_string())?
+                .map_err(|error| self.diagnostic_error(error))?
         } else if let Some(job) = &self.job {
             self.session
                 .read_rows(&job.snapshot(), start, count)
-                .map_err(|error| error.to_string())?
+                .map_err(|error| self.diagnostic_error(error))?
         } else {
             return Err("No structural index is available.".into());
         };
@@ -9071,7 +9155,7 @@ impl Document {
                     self.invalidate_changed_source();
                     SOURCE_CHANGED_NOTICE.to_owned()
                 } else {
-                    error.to_string()
+                    self.diagnostic_error(error)
                 }
             })?;
         self.filter_read = Some(ActiveFilterRead {
@@ -21779,6 +21863,14 @@ mod tests {
         let error = document.poll().unwrap_err();
 
         assert!(error.contains("unterminated quoted field"));
+        let diagnostic = document.pending_diagnostic.as_ref().unwrap();
+        assert_eq!(diagnostic.kind, quarry_core::DiagnosticKind::Structure);
+        assert_eq!(diagnostic.byte_offset, None);
+        assert!(
+            diagnostic
+                .details()
+                .contains("Original-file byte position: unavailable")
+        );
         assert!(document.job.is_none());
         assert!(document.index.is_none());
         assert_eq!(document.index_status(), "Index failed");

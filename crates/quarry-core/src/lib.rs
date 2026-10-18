@@ -6,6 +6,7 @@ mod encoding;
 mod export;
 mod filter;
 mod index;
+mod inspection;
 mod search;
 mod sort;
 mod source_stamp;
@@ -46,6 +47,11 @@ pub use filter::{
 pub use index::{
     Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, StructuralIndex,
 };
+pub use inspection::{
+    Diagnostic, DiagnosticKind, InspectionEdits, InspectionJob, InspectionOptions,
+    InspectionProgress, InspectionReport, InspectionStatus, RecoveryJob, RecoverySummary,
+    SourcePreview,
+};
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
 pub use sort::{
@@ -77,6 +83,7 @@ pub(crate) fn parse_source_record(
     parse_record(record, delimiter)
 }
 
+/// Parses native record bytes and wraps record-local decoding failures with their logical record.
 pub(crate) fn parse_encoded_record(
     record: &[u8],
     delimiter: u8,
@@ -93,19 +100,26 @@ pub(crate) fn parse_encoded_record(
     };
     let decoded = encoding
         .decode(body, DEFAULT_MAX_RECORD_BYTES)
-        .map_err(|error| match error {
-            QuarryError::Encoding(message) => QuarryError::Encoding(format!(
-                "Record {}: {message}",
-                physical_row.saturating_add(1)
-            )),
-            error => error,
-        })?;
+        .map_err(|error| record_encoding_error(physical_row.saturating_add(1), error))?;
     match decoded {
         Cow::Borrowed(bytes) => parse_record(bytes, delimiter).map_err(Into::into),
         Cow::Owned(bytes) => Ok(parse_record(&bytes, delimiter)?
             .into_iter()
             .map(|field| Cow::Owned(field.into_owned()))
             .collect()),
+    }
+}
+
+/// Retains a logical record while separating decoder-local byte offsets from source positions.
+pub(crate) fn record_encoding_error(record: u64, error: QuarryError) -> QuarryError {
+    match error {
+        error @ (QuarryError::Encoding(_) | QuarryError::EncodingAt { .. }) => {
+            QuarryError::RecordEncoding {
+                record,
+                cause: Box::new(error),
+            }
+        }
+        error => error,
     }
 }
 
@@ -128,6 +142,15 @@ pub enum QuarryError {
     },
     Parse(ParseError),
     Encoding(String),
+    RecordEncoding {
+        record: u64,
+        cause: Box<QuarryError>,
+    },
+    EncodingAt {
+        encoding: Encoding,
+        offset: u64,
+        reason: String,
+    },
     BootstrapLimitExceeded {
         limit: usize,
         rows_found: usize,
@@ -175,6 +198,16 @@ pub enum QuarryError {
 impl fmt::Display for QuarryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RecordEncoding { record, cause } => match cause.as_ref() {
+                Self::EncodingAt {
+                    encoding, reason, ..
+                } => write!(
+                    f,
+                    "Record {record}: invalid {encoding} text: {reason}. Choose the correct encoding; no text was replaced."
+                ),
+                cause => write!(f, "Record {record}: {cause}"),
+            },
+
             Self::CombineFile {
                 path,
                 record,
@@ -203,6 +236,14 @@ impl fmt::Display for QuarryError {
             ),
             Self::Parse(error) => error.fmt(f),
             Self::Encoding(message) => f.write_str(message),
+            Self::EncodingAt {
+                encoding,
+                offset,
+                reason,
+            } => write!(
+                f,
+                "Invalid {encoding} at byte {offset}: {reason}. Choose the correct encoding; no text was replaced."
+            ),
             Self::BootstrapLimitExceeded { limit, rows_found } => write!(
                 f,
                 "found only {rows_found} rows within the {limit}-byte bootstrap limit"
@@ -266,6 +307,7 @@ impl Error for QuarryError {
             Self::Io(error) => Some(error),
             Self::Storage { error, .. } => Some(error),
             Self::Parse(error) => Some(error),
+            Self::RecordEncoding { cause, .. } => Some(cause.as_ref()),
             _ => None,
         }
     }
@@ -291,7 +333,7 @@ pub enum HeaderMode {
     NoHeader,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenOptions {
     pub rows: usize,
     pub delimiter: Option<u8>,

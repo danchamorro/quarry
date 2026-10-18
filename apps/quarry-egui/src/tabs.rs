@@ -6,6 +6,7 @@ const MAX_WRITE_JOBS: usize = 2;
 /// Owns one document's drafts, feedback, worker reservations and close decisions.
 pub(super) struct DocumentTab {
     pub(super) id: u64,
+    pub(super) inspection: inspection_ui::InspectionUi,
     pub(super) storage_review: Option<StorageReview>,
     pub(super) storage_approved: bool,
     pub(super) jump_input: String,
@@ -42,6 +43,7 @@ impl DocumentTab {
     pub(super) fn new(id: u64) -> Self {
         Self {
             id,
+            inspection: inspection_ui::InspectionUi::default(),
             storage_review: None,
             storage_approved: false,
             jump_input: "1".into(),
@@ -120,27 +122,29 @@ impl DocumentTab {
 
     /// Includes read workers as well as operations that materialize files.
     pub(super) fn busy(&self) -> bool {
-        self.document.as_ref().is_some_and(|document| {
-            document.job.is_some()
-                || document.search_job.is_some()
-                || document.filter_job.is_some()
-                || document.filter_rows_loading()
-                || document.save_job.is_some()
-                || document.export_job.is_some()
-                || document.structural_job.is_some()
-        })
+        self.inspection.busy()
+            || self.document.as_ref().is_some_and(|document| {
+                document.job.is_some()
+                    || document.search_job.is_some()
+                    || document.filter_job.is_some()
+                    || document.filter_rows_loading()
+                    || document.save_job.is_some()
+                    || document.export_job.is_some()
+                    || document.structural_job.is_some()
+            })
     }
 
     /// Counts file operations and structural analysis against the global job limit.
     fn writing(&self) -> bool {
-        self.document.as_ref().is_some_and(|document| {
-            document.save_job.is_some()
-                || document.export_job.is_some()
-                || document
-                    .structural_job
-                    .as_ref()
-                    .is_some_and(|job| !matches!(job, StructuralJob::DuplicatePreview { .. }))
-        })
+        self.inspection.recovering()
+            || self.document.as_ref().is_some_and(|document| {
+                document.save_job.is_some()
+                    || document.export_job.is_some()
+                    || document
+                        .structural_job
+                        .as_ref()
+                        .is_some_and(|job| !matches!(job, StructuralJob::DuplicatePreview { .. }))
+            })
     }
 }
 
@@ -382,6 +386,11 @@ impl QuarryApp {
                 "Finish closing the document, or keep editing, before opening another file.",
             ));
         }
+        if self.active.document.is_none() && self.active.inspection.busy() {
+            return Err(AppMessage::warning(
+                "Wait for file inspection or recovery to finish before opening another file.",
+            ));
+        }
         let existing = self.document_tabs().find_map(|tab| {
             tab.document
                 .as_ref()
@@ -418,8 +427,22 @@ impl QuarryApp {
                 "Quarry supports eight open tabs. Close a tab before opening another file.",
             ));
         }
-        let mut document =
-            Document::prepare_with_encoding(&path, options, encoding).map_err(AppMessage::error)?;
+        let mut document = match Document::prepare_with_encoding(&path, options, encoding) {
+            Ok(d) => d,
+            Err(message) => {
+                if !self.active.inspection.busy() {
+                    self.active.inspection = inspection_ui::InspectionUi::failed(
+                        path.clone(),
+                        options,
+                        encoding,
+                        message.clone(),
+                    );
+                }
+                return Err(AppMessage::file_open_error(
+                    path, options, encoding, message,
+                ));
+            }
+        };
         document.working_directory = self.working_directory.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
@@ -549,19 +572,19 @@ impl QuarryApp {
                 self.active.close_after_save = true;
                 return;
             }
-            if self.active.writing() {
-                self.active.close_after_jobs = true;
-                return;
-            }
-            if self
-                .active
-                .document
-                .as_ref()
-                .is_some_and(Document::is_dirty)
-            {
-                self.active.close_confirmation_open = true;
-                return;
-            }
+        }
+        if self.active.writing() {
+            self.active.close_after_jobs = true;
+            return;
+        }
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::is_dirty)
+        {
+            self.active.close_confirmation_open = true;
+            return;
         }
         self.finish_document_close(ctx);
     }
@@ -785,10 +808,13 @@ impl QuarryApp {
         });
         if keep || modal.should_close() {
             self.keep_editing();
-        } else if cancel && let Some(document) = self.active.document.as_mut() {
-            document.cancel_save();
-            document.cancel_filtered_export();
-            document.cancel_structural_edit();
+        } else if cancel {
+            self.active.inspection.cancel();
+            if let Some(document) = self.active.document.as_mut() {
+                document.cancel_save();
+                document.cancel_filtered_export();
+                document.cancel_structural_edit();
+            }
         }
     }
 }

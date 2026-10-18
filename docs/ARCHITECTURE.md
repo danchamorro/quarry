@@ -766,3 +766,45 @@ needed before appended rows. Column insertion is a normal bounded field
 transformation and pads short records without dropping late fields. Neither
 keeps inserted rows in memory. Existing temporary-storage, source guards,
 publication, working-copy history and save boundaries apply.
+
+## File inspection and recovery
+
+Inspection is a separate bounded job over the existing encoding-aware record
+scanner. It does not change ordinary opening/indexing into a full validation
+pass. A report retains source identity, delimiter, header interpretation,
+encoding and a snapshot of effective sparse edits. Reports distinguish complete,
+stopped and cancelled coverage, retain at most 1,000 detailed findings, and read
+at most 8 KiB for an on-demand source preview.
+
+The scanner certifies complete logical record boundaries. Quoting ambiguity
+stops inspection; no newline-based resynchronization is attempted. Text is
+checked across all supported encodings. Uneven widths are informational and
+relative to the first logical record; no global schema or full-column discovery
+is inferred. Native and decoded record bounds are enforced, and field
+materialization has an explicit bounded count. Oversized records are framed
+without accumulating the entire record.
+
+Known locations distinguish logical records, data rows, physical lines and
+encoded source offsets. Edits have no invented source byte positions. Typed
+encoding errors retain their native offsets, while generic operation diagnostics
+do not reinterpret generated or record-relative offsets as original-file bytes.
+
+Recovery uses the report's effective edit snapshot and explicitly selected
+complete data records. The writer de-duplicates selections, rejects header
+removal and stale sources, and preserves untouched retained bytes, native
+encoding, BOM and record endings. Output is staged through the existing guarded
+ExportTarget, fully inspected before publication, then atomically created without
+overwriting another path. Cancellation or failed validation drops staging output.
+
+Each desktop tab owns its report and workers. Inspection snapshots share the
+session and edit Arcs for cheap freshness comparisons; owned edit values are
+materialized only when a job starts. Edits, working-copy replacement, format
+changes and source changes invalidate actions and late results. Viewport movement
+and switching tabs retain valid reports. Recovery participates in the shared
+writer reservation and close/cancellation policy.
+
+Record-local codec failures carry their logical record in a wrapper before they
+reach an operation reporter. Their local byte offsets are not presented as
+original-file positions. Errors from native stream framing retain their known
+absolute source offsets. Recovery treats an edit outside the source record shape
+as blocking, including edits aimed at a nonexistent record.
