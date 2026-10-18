@@ -11,6 +11,7 @@ pub enum CleanupOperation {
 }
 
 impl CleanupOperation {
+    /// Human-readable operation name shared by cleanup controls and messages.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Trim => "Trim leading/trailing whitespace",

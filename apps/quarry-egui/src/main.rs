@@ -428,6 +428,7 @@ enum StructuralRequest {
 }
 
 impl StructuralRequest {
+    /// Identifies operations using the selected-column cleanup workflow.
     fn is_cleanup(self) -> bool {
         matches!(
             self,
@@ -467,6 +468,7 @@ impl StructuralDialog {
             ..Self::sort(0)
         }
     }
+    /// Builds the selected cleanup operation for the physical file columns.
     fn cleanup(&self) -> ColumnCleanup {
         ColumnCleanup {
             columns: self.columns.clone(),
@@ -3860,6 +3862,7 @@ fn parse_insertion_position(input: &str, size: u64) -> Result<u64, String> {
         .ok_or_else(|| format!("Enter a position between 1 and {last}."))
 }
 
+/// Shows cleanup controls and a bounded sample without starting the write job.
 fn show_cleanup_dialog(
     ctx: &egui::Context,
     dialog: &mut StructuralDialog,
