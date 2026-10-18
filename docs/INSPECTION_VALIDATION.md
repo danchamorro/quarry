@@ -50,6 +50,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Inspected unsaved cell edits, then edited another cell with the report visible.
   The report became stale and recovery was disabled; unsaved values remained.
 - Multiple synthetic tabs retained separate reports and documents.
+- A quoted UTF-16 LE record with an isolated low surrogate was explicitly
+  selected after choosing the header setting. Native recovery preserved the
+  expected BOM and CRLF bytes and left the source unchanged.
+- Combine Files identified the failing input and logical record. Inspecting
+  that input and closing the inspector restored the selected-file draft.
 - Native inspection of the 4.06 GB file displayed live progress; Cancel operation
   returned a partial report after 2,247,098,368 bytes and 18,571,061 records.
   Recovery stayed disabled and the already-open grid remained usable.

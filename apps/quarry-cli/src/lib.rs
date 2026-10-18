@@ -126,7 +126,11 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
         path.display(),
         report.encoding,
         report.delimiter as char,
-        report.has_header,
+        if report.header_certain {
+            report.has_header.to_string()
+        } else {
+            "not determined".into()
+        },
         report.status,
         report.bytes_scanned,
         report.total_bytes,

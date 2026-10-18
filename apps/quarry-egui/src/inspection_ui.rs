@@ -695,7 +695,13 @@ fn draw_inspection(
         ));
         ui.label(format!(
             "Encoding: {} · delimiter: {:?} · header: {}",
-            report.encoding, report.delimiter as char, report.has_header
+            report.encoding,
+            report.delimiter as char,
+            if report.header_certain {
+                report.has_header.to_string()
+            } else {
+                "not determined".into()
+            }
         ));
         if report.status != InspectionStatus::Complete {
             ui.strong("Coverage is partial. Uninspected data is not known to be valid.");

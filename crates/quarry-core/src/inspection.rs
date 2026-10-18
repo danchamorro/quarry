@@ -68,13 +68,23 @@ impl Diagnostic {
                 d.column = Some(*column);
             }
             QuarryError::CombineFile { record, .. } => d.record = *record,
-            QuarryError::RecordEncoding { record, .. } => {
+            QuarryError::RecordEncoding { record, cause } => {
                 d.kind = DiagnosticKind::Encoding;
                 d.record = Some(*record);
+                if let QuarryError::EncodingAt {
+                    encoding, reason, ..
+                } = cause.as_ref()
+                {
+                    d.message = encoding_problem(*encoding, reason);
+                }
             }
-            QuarryError::Encoding(_) | QuarryError::EncodingAt { .. } => {
-                d.kind = DiagnosticKind::Encoding
+            QuarryError::EncodingAt {
+                encoding, reason, ..
+            } => {
+                d.kind = DiagnosticKind::Encoding;
+                d.message = encoding_problem(*encoding, reason);
             }
+            QuarryError::Encoding(_) => d.kind = DiagnosticKind::Encoding,
             QuarryError::RecordTooLarge { .. } | QuarryError::BootstrapLimitExceeded { .. } => {
                 d.kind = DiagnosticKind::Limit
             }
@@ -603,10 +613,13 @@ fn scan(
         report.header_certain = true;
     }
     for d in &mut report.findings {
-        d.data_row = d
-            .record
-            .and_then(|r| r.checked_sub(u64::from(report.has_header)))
-            .filter(|r| *r > 0);
+        d.data_row = if report.header_certain {
+            d.record
+                .and_then(|r| r.checked_sub(u64::from(report.has_header)))
+                .filter(|r| *r > 0)
+        } else {
+            None
+        };
         if report.has_header && d.record == Some(1) {
             d.data_row = None;
         }
@@ -675,6 +688,10 @@ fn column_at(bytes: &[u8], delimiter: u8, encoding: Encoding) -> Option<usize> {
     Some(column)
 }
 
+fn encoding_problem(encoding: Encoding, reason: &str) -> String {
+    format!("The selected {encoding} encoding cannot decode this text: {reason}.")
+}
+
 fn error_diagnostic(
     e: &QuarryError,
     record: Option<u64>,
@@ -699,14 +716,21 @@ fn error_diagnostic(
                 ParseErrorKind::ExpectedLfAfterCr => {
                     "A quoted record has an incomplete line ending.".into()
                 }
+                ParseErrorKind::FieldLimitExceeded(limit) => {
+                    format!("This record has more than {limit} fields.")
+                }
                 _ => p.to_string(),
             },
             Some(p.offset),
             "Check the delimiter and quoting, correct the source, then retry. Record boundaries after this error are not assumed.",
         ),
-        QuarryError::EncodingAt { offset, .. } => (
+        QuarryError::EncodingAt {
+            encoding,
+            offset,
+            reason,
+        } => (
             DiagnosticKind::Encoding,
-            e.to_string(),
+            encoding_problem(*encoding, reason),
             Some(*offset),
             "Choose the correct encoding and retry. No characters were replaced.",
         ),
@@ -1418,6 +1442,10 @@ mod tests {
             assert_eq!(d.record, Some(3), "{encoding}: {d:?}");
             assert_eq!(d.column, Some(2), "{encoding}: {d:?}");
             assert_eq!(d.byte_offset, Some(offset), "{encoding}: {d:?}");
+            assert!(
+                !d.message.contains(" at byte "),
+                "relative decoder offsets must not conflict with the original-file location: {d:?}"
+            );
         }
     }
     #[test]
@@ -1815,5 +1843,26 @@ mod diagnostic_location_tests {
             expected.extend_from_slice(&encoding.encode(b"a,b\r\n2,ok\r\n", 1024).unwrap());
             assert_eq!(std::fs::read(out).unwrap(), expected);
         }
+    }
+    #[test]
+    fn uncertain_header_does_not_claim_a_data_row_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uncertain.csv");
+        std::fs::write(&path, b"name,value\n1,\"bad\n").unwrap();
+        let r = InspectionJob::start(
+            &path,
+            InspectionOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::Auto,
+                ..Default::default()
+            },
+            InspectionEdits::default(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert!(!r.header_certain);
+        assert_eq!(r.findings[0].record, Some(2));
+        assert_eq!(r.findings[0].data_row, None);
     }
 }
