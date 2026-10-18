@@ -1420,4 +1420,59 @@ mod tests {
             assert!(!copy.exists());
         }
     }
+    #[test]
+    fn bomless_native_outputs_preserve_a_non_ascii_first_character() {
+        use std::collections::BTreeMap;
+        for encoding in [
+            Encoding::Utf16Le,
+            Encoding::Utf16Be,
+            Encoding::Windows1252,
+            Encoding::Latin1,
+        ] {
+            for leading in ["éclair", "€clair", "😀clair"] {
+                let text = format!("{leading},1\r\nété,2\r\n");
+                let Ok(bytes) = encoding.encode(text.as_bytes(), 4096) else {
+                    continue;
+                };
+                let directory = tempfile::tempdir().unwrap();
+                let source = directory.path().join("source.csv");
+                let native = directory.path().join("native.csv");
+                let filtered = directory.path().join("filtered.csv");
+                std::fs::write(&source, bytes.as_ref()).unwrap();
+                let session = crate::Session::open_with_encoding(
+                    &source,
+                    crate::OpenOptions {
+                        header_mode: crate::HeaderMode::NoHeader,
+                        ..Default::default()
+                    },
+                    Some(encoding),
+                )
+                .unwrap();
+                session
+                    .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &native)
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read(&native).unwrap(),
+                    bytes.as_ref(),
+                    "{encoding} {leading}"
+                );
+                let query =
+                    crate::FilterQuery::single(1, crate::FilterOperator::Equals, b"1".to_vec());
+                session
+                    .start_filtered_export(query, &filtered)
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read(&filtered).unwrap(),
+                    encoding
+                        .encode(format!("{leading},1\r\n").as_bytes(), 4096)
+                        .unwrap()
+                        .as_ref()
+                );
+            }
+        }
+    }
 }

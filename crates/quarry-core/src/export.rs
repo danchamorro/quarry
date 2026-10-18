@@ -2428,24 +2428,34 @@ impl ExportTarget {
                 prefix,
             } => {
                 let mut consumed = 0_usize;
-                while consumed < bytes.len() && prefix.len() < UTF8_BOM.len() {
+                while consumed < bytes.len() {
                     prefix.push(bytes[consumed]);
                     consumed += 1;
-                    if !UTF8_BOM.starts_with(prefix) {
+                    if UTF8_BOM.starts_with(prefix) {
+                        if prefix.len() < UTF8_BOM.len() {
+                            continue;
+                        }
+                        write(UTF8_BOM)?;
                         write(prefix)?;
                         write(&bytes[consumed..])?;
-                        self.first_record_bom_guard =
-                            FirstRecordBomGuard::Passthrough { inserted_bytes: 0 };
+                        self.first_record_bom_guard = FirstRecordBomGuard::Passthrough {
+                            inserted_bytes: UTF8_BOM.len() as u64,
+                        };
                         return Ok(());
                     }
-                }
-                if prefix.len() == UTF8_BOM.len() {
-                    write(UTF8_BOM)?;
+                    // Native encoders must receive a whole UTF-8 scalar. A failed
+                    // BOM probe may hold only its first byte, across write calls.
+                    if encoding != crate::Encoding::Utf8
+                        && std::str::from_utf8(prefix)
+                            .is_err_and(|error| error.error_len().is_none())
+                    {
+                        continue;
+                    }
                     write(prefix)?;
                     write(&bytes[consumed..])?;
-                    self.first_record_bom_guard = FirstRecordBomGuard::Passthrough {
-                        inserted_bytes: UTF8_BOM.len() as u64,
-                    };
+                    self.first_record_bom_guard =
+                        FirstRecordBomGuard::Passthrough { inserted_bytes: 0 };
+                    return Ok(());
                 }
             }
             FirstRecordBomGuard::Passthrough { .. } => write(bytes)?,
