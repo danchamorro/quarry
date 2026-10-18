@@ -467,7 +467,7 @@ fn scan(
         .unwrap_or(b',');
     }
     let delimiter = report.delimiter;
-    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut scanner = RecordScanner::new_for_inspection(delimiter, encoding)?;
     file.seek(SeekFrom::Start(0))?;
     let mut chunk = vec![0; encoding.chunk_size(options.chunk_bytes)];
     let mut raw = Vec::new();
@@ -509,7 +509,6 @@ fn scan(
             }
         };
         let mut ends = Vec::new();
-        let before = scanner.clone();
         let mut result = if count == 0 && read_error.is_some() {
             Ok(())
         } else if count == 0 {
@@ -523,17 +522,6 @@ fn scan(
             && let Some(error) = read_error
         {
             result = Err(error);
-        }
-        // The UTF-16 scanner validates a whole chunk before emitting boundaries.
-        // Replay only the known-valid prefix so location labels do not point at
-        // an earlier record when invalid text occurs late in a chunk.
-        if let Err(QuarryError::EncodingAt { offset, .. }) = &result {
-            if count > 0 && *offset >= absolute {
-                let prefix = ((*offset - absolute) as usize).min(count) & !1;
-                let mut valid = before;
-                ends.clear();
-                let _ = valid.scan_chunk(&chunk[..prefix], absolute, |end| ends.push(end));
-            }
         }
         let mut segment = 0usize;
         for end in ends {
@@ -1715,5 +1703,117 @@ mod diagnostic_location_tests {
         assert_eq!(d.record, Some(9));
         assert_eq!(d.byte_offset, None);
         assert!(error.to_string().contains("Record 9"));
+    }
+    #[test]
+    fn aligned_invalid_utf16_records_remain_recoverable_and_later_rows_are_scanned() {
+        for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            for chunk in [2, 6, 64] {
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("bad-utf16.csv");
+                let mut bytes = encoding.bom().to_vec();
+                bytes.extend_from_slice(&encoding.encode(b"a,b\n1,", 1024).unwrap());
+                let invalid_offset = bytes.len() as u64;
+                bytes.extend_from_slice(if encoding == Encoding::Utf16Le {
+                    &[0x00, 0xd8]
+                } else {
+                    &[0xd8, 0x00]
+                });
+                bytes.extend_from_slice(&encoding.encode(b"\n2,ok\n3\n", 1024).unwrap());
+                std::fs::write(&source, &bytes).unwrap();
+                let r = InspectionJob::start(
+                    &source,
+                    InspectionOptions {
+                        delimiter: Some(b','),
+                        header_mode: HeaderMode::FirstRow,
+                        encoding: Some(encoding),
+                        chunk_bytes: chunk,
+                        ..Default::default()
+                    },
+                    InspectionEdits::default(),
+                )
+                .unwrap()
+                .wait()
+                .unwrap();
+                assert_eq!(
+                    r.status,
+                    InspectionStatus::Complete,
+                    "{encoding} chunk {chunk}"
+                );
+                assert_eq!(r.records, 4);
+                let bad = r
+                    .findings
+                    .iter()
+                    .position(|d| d.kind == DiagnosticKind::Encoding)
+                    .unwrap();
+                assert_eq!(r.findings[bad].byte_offset, Some(invalid_offset));
+                assert_eq!(r.findings[bad].record, Some(2));
+                assert!(r.can_omit(bad));
+                assert!(r.findings.iter().any(|d| d.record == Some(4)));
+                let destination = dir.path().join("recovered.csv");
+                RecoveryJob::start(&r, &BTreeSet::from([bad]), &destination)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                let mut expected = encoding.bom().to_vec();
+                expected.extend_from_slice(&encoding.encode(b"a,b\n2,ok\n3\n", 1024).unwrap());
+                assert_eq!(std::fs::read(destination).unwrap(), expected);
+                assert_eq!(std::fs::read(source).unwrap(), bytes);
+            }
+        }
+    }
+    #[test]
+    fn invalid_utf16_inside_a_multiline_quoted_record_has_a_safe_complete_range() {
+        for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("quoted.csv");
+            let mut raw = encoding.bom().to_vec();
+            raw.extend_from_slice(&encoding.encode(b"a,b\r\n1,\"x,", 1024).unwrap());
+            let offset = raw.len() as u64;
+            raw.extend_from_slice(if encoding == Encoding::Utf16Le {
+                &[0, 0xdc]
+            } else {
+                &[0xdc, 0]
+            });
+            raw.extend_from_slice(&encoding.encode(b"\r\ntail\"\r\n2,ok\r\n", 1024).unwrap());
+            std::fs::write(&path, &raw).unwrap();
+            assert!(
+                crate::Session::open_with_encoding(
+                    &path,
+                    crate::OpenOptions::default(),
+                    Some(encoding)
+                )
+                .is_err()
+            );
+            let report = InspectionJob::start(
+                &path,
+                InspectionOptions {
+                    encoding: Some(encoding),
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    chunk_bytes: 2,
+                    ..Default::default()
+                },
+                InspectionEdits::default(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+            assert_eq!(report.status, InspectionStatus::Complete);
+            assert_eq!(report.records, 3);
+            assert_eq!(report.findings[0].column, Some(2));
+            assert_eq!(report.findings[0].physical_line, Some(2));
+            assert_eq!(report.findings[0].byte_offset, Some(offset));
+            assert!(report.can_omit(0));
+            let out = dir.path().join("recovered.csv");
+            RecoveryJob::start(&report, &BTreeSet::from([0]), &out)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            let mut expected = encoding.bom().to_vec();
+            expected.extend_from_slice(&encoding.encode(b"a,b\r\n2,ok\r\n", 1024).unwrap());
+            assert_eq!(std::fs::read(out).unwrap(), expected);
+        }
     }
 }

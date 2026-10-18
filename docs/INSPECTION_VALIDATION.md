@@ -8,7 +8,9 @@ files.
 
 - All five encodings: logical-record/native-byte positions, BOM handling,
   quoted multiline data, escaped quotes and empty fields.
-- Broken quoting stops at uncertain boundaries. Invalid UTF-8 stays read-only;
+- Broken quoting and incomplete UTF-16 code units stop at uncertain boundaries.
+  Aligned invalid UTF-16 characters retain complete record ranges for recovery,
+  while ordinary opening remains strict. Invalid UTF-8 stays read-only;
   complete affected records can be explicitly omitted.
 - Bounded record buffers, field-count limits and 1,000 retained findings.
   Total finding counts and coverage continue beyond the display cap.

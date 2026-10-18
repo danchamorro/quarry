@@ -955,7 +955,9 @@ unsaved values do not invent positions in the original file.
 
 **Complete** means the configured inspection reached the end. **Stopped** and
 **Cancelled** are partial: the remaining data has not been checked. Inspection
-stops if quoting or encoding makes subsequent record boundaries uncertain. At
+stops if quoting or an incomplete encoded code unit makes subsequent record
+boundaries uncertain. Invalid UTF-16 characters with intact two-byte alignment
+are reported within their complete records; later records are still inspected. At
 most 1,000 detailed findings and 8 KiB of source context per preview are retained.
 The total count and coverage remain visible when detailed results are limited.
 Inspection uses the existing 64 MiB record limit and 65,536-field structural
