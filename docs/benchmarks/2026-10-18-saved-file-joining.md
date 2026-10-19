@@ -59,3 +59,5 @@ All 565 workspace tests, all-target/all-feature Clippy, formatting and the works
 Further review regressions bind the selected column ordinals to an opaque file-version token from the header probe. Replacing or editing a source before analysis now requires selecting it again, so a reordered header cannot silently change the join key. Analysis/writing failures and successful-write cleanup warnings cancel deferred close/quit and remain visible for review. The non-Unix storage fallback now reuses the shared helper that inspects both temporary and output locations.
 
 The stale-schema and worker-cleanup regressions failed before these fixes and pass afterward. All 567 workspace tests, formatting, all-target/all-feature Clippy and the release build passed in the macOS VM. The non-Unix storage branch was reviewed against the existing shared helper; no Windows runtime check is claimed.
+
+Structured diagnostics now preserve the logical record number from JoinFile errors, matching the existing CombineFile handling. The new regression failed before the fix and passed afterward; all 568 base-branch workspace tests and all-target/all-feature Clippy passed.
