@@ -712,21 +712,30 @@ fn disk_full_after_real_staging_writes_removes_partial_private_output() {
         }
         for entry in std::fs::read_dir(&root).unwrap() {
             let entry = entry.unwrap();
-            if !entry.file_type().unwrap().is_file() || entry.metadata().unwrap().len() < 8192 {
+            if !entry.file_type().unwrap().is_file() {
+                continue;
+            }
+            // Measure the opened staging file, independently of cached directory metadata.
+            let mut staged_file = std::fs::File::open(entry.path()).unwrap();
+            if staged_file.metadata().unwrap().len() < 8192 {
                 continue;
             }
             let mut prefix = [0_u8; 10];
-            std::fs::File::open(entry.path())
-                .unwrap()
-                .read_exact(&mut prefix)
-                .unwrap();
+            staged_file.read_exact(&mut prefix).unwrap();
             if &prefix == b"key (Main)" {
                 staged = Some((root.clone(), entry.path()));
             }
         }
     }
     let (root, file) = staged.expect("partial CSV data must have reached real private staging");
-    assert!(std::fs::metadata(&file).unwrap().len() >= 8192);
+    assert!(
+        std::fs::File::open(&file)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len()
+            >= 8192
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
