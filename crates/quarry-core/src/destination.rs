@@ -122,20 +122,37 @@ impl Directory {
     }
 
     pub(crate) fn current_path(&self) -> io::Result<PathBuf> {
-        #[cfg(target_os = "macos")]
-        let path = {
-            use std::os::unix::ffi::OsStringExt;
-            PathBuf::from(OsString::from_vec(
-                rustix::fs::getpath(&self.file)?.into_bytes(),
-            ))
-        };
-        #[cfg(target_os = "linux")]
-        let path = {
-            use std::os::fd::AsRawFd;
-            fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))?
-        };
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let path = self.path.clone();
+        self.current_path_using(|| {
+            #[cfg(target_os = "macos")]
+            let path = {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(OsString::from_vec(
+                    rustix::fs::getpath(&self.file)?.into_bytes(),
+                ))
+            };
+            #[cfg(target_os = "linux")]
+            let path = {
+                use std::os::fd::AsRawFd;
+                fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))?
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let path = self.path.clone();
+            Ok(path)
+        })
+    }
+
+    fn current_path_using(
+        &self,
+        locate: impl FnOnce() -> io::Result<PathBuf>,
+    ) -> io::Result<PathBuf> {
+        // Ordinary cleanup must not require procfs or a platform name locator.
+        // The captured leaf itself must remain a directory, not a new symlink.
+        if fs::symlink_metadata(&self.path).is_ok_and(|metadata| metadata.is_dir())
+            && self.still_named_by(&self.path)
+        {
+            return Ok(self.path.clone());
+        }
+        let path = locate()?;
         if self.still_named_by(&path) {
             Ok(path)
         } else {
@@ -582,5 +599,70 @@ mod unix_tests {
             !destination.exists(),
             "unrelated rename errors must not trigger a fallback"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_directory_uses_existing_name_without_a_platform_locator() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("owned");
+        fs::create_dir(&path).unwrap();
+        let directory = Directory::open(&path).unwrap();
+        let resolved = directory
+            .current_path_using(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "platform locator unavailable",
+                ))
+            })
+            .unwrap();
+        assert_eq!(resolved, path.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn replaced_directory_name_requires_a_matching_platform_location() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("owned");
+        fs::create_dir(&path).unwrap();
+        let directory = Directory::open(&path).unwrap();
+        let moved = parent.path().join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(
+            directory
+                .current_path_using(|| {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "platform locator unavailable",
+                    ))
+                })
+                .is_err()
+        );
+        assert!(directory.current_path_using(|| Ok(path.clone())).is_err());
+        assert_eq!(
+            directory.current_path_using(|| Ok(moved.clone())).unwrap(),
+            moved
+        );
+        assert!(path.is_dir(), "the unrelated replacement is preserved");
+    }
+    #[test]
+    fn a_symlink_replacing_the_canonical_leaf_uses_the_platform_location() {
+        use std::os::unix::fs::symlink;
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("owned");
+        fs::create_dir(&path).unwrap();
+        let directory = Directory::open(&path).unwrap();
+        let moved = parent.path().join("moved");
+        fs::rename(&path, &moved).unwrap();
+        symlink(&moved, &path).unwrap();
+        assert_eq!(
+            directory.current_path_using(|| Ok(moved.clone())).unwrap(),
+            moved
+        );
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
     }
 }
