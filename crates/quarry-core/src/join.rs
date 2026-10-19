@@ -1,5 +1,4 @@
-//! Bounded, source-preserving joins of saved, headered UTF-8 inputs.
-//! One key per side supports all matching pairs and a source-ordered left join.
+//! Bounded, source-preserving joins with explicit source formats and output layouts.
 use crate::source_stamp::open_regular_file;
 
 use std::borrow::Cow;
@@ -8,8 +7,8 @@ use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use quarry_delimited::parse_record_with_field_limit;
@@ -41,6 +40,23 @@ pub struct JoinInput {
     pub require_unique: bool,
 }
 
+/// Independent interpretation of a saved source; Auto detects Unicode BOMs only.
+#[derive(Clone, Copy, Debug)]
+pub struct JoinFormat {
+    pub delimiter: Option<u8>,
+    pub has_header: bool,
+    pub encoding: Option<Encoding>,
+}
+impl Default for JoinFormat {
+    fn default() -> Self {
+        Self {
+            delimiter: None,
+            has_header: true,
+            encoding: None,
+        }
+    }
+}
+
 /// Opaque identity of the file whose column labels were presented to the user.
 #[derive(Clone, Debug)]
 pub struct JoinSourceVersion(SourceStamp);
@@ -48,6 +64,8 @@ pub struct JoinSourceVersion(SourceStamp);
 /// Bounded labels for selecting a saved input's key column.
 pub struct JoinHeader {
     pub delimiter: u8,
+    pub encoding: Encoding,
+    pub has_header: bool,
     pub columns: Vec<String>,
     pub source_version: JoinSourceVersion,
 }
@@ -79,7 +97,7 @@ impl<R: Seek> Seek for HeaderReader<'_, R> {
     }
 }
 
-fn header_info(path: &Path, state: &Progress) -> JResult<JoinHeader> {
+fn header_info(path: &Path, format: JoinFormat, state: &Progress) -> JResult<JoinHeader> {
     state.check()?;
     state.phase(JoinPhase::Inspecting);
     if !fs::metadata(path)?.is_file() {
@@ -90,20 +108,26 @@ fn header_info(path: &Path, state: &Progress) -> JResult<JoinHeader> {
         return Err(input_error(path, None, "Select a regular file.").into());
     }
     let stamp = SourceStamp::from_file(&file)?;
-    Encoding::detect(&mut file, Some(Encoding::Utf8))?;
+    let encoding =
+        Encoding::detect(&mut file, format.encoding).map_err(|e| input_error(path, None, e))?;
     state.check()?;
     let mut reader = HeaderReader {
         inner: &mut file,
         state,
     };
     let result = (|| -> Result<JoinHeader, QuarryError> {
-        let delimiter = crate::detect_file_delimiter(
-            &mut reader,
-            stamp.file_size(),
-            crate::DEFAULT_SAMPLE_BYTES,
-            crate::DEFAULT_BOOTSTRAP_LIMIT,
-            Encoding::Utf8,
-        )?;
+        let delimiter = if let Some(delimiter) = format.delimiter {
+            RecordScanner::new(delimiter, encoding)?;
+            delimiter
+        } else {
+            crate::detect_file_delimiter(
+                &mut reader,
+                stamp.file_size(),
+                crate::DEFAULT_SAMPLE_BYTES,
+                crate::DEFAULT_BOOTSTRAP_LIMIT,
+                encoding,
+            )?
+        };
         reader.seek(SeekFrom::Start(0))?;
         let (bytes, ends) = crate::read_initial_records(
             &mut reader,
@@ -111,41 +135,41 @@ fn header_info(path: &Path, state: &Progress) -> JResult<JoinHeader> {
             delimiter,
             1,
             crate::DEFAULT_BOOTSTRAP_LIMIT,
-            Encoding::Utf8,
+            encoding,
         )?;
-        let end = *ends
-            .first()
-            .ok_or_else(|| input_error(path, None, "The file is empty and has no header."))?
-            as usize;
-        let parsed = fields(
-            &bytes[..end],
-            delimiter,
-            true,
-            path,
-            0,
-            JoinConfig::default(),
-        )
-        .map_err(|failure| match failure {
-            Failure::Error(e) => e,
-            Failure::Cancelled => error("Header reading cancelled."),
-        })?;
+        let end = *ends.first().ok_or_else(|| {
+            input_error(
+                path,
+                None,
+                "The file is empty and has no usable column schema.",
+            )
+        })? as usize;
+        let (_, native) = encoding.strip_bom(&bytes[..end]);
+        let decoded = encoding
+            .decode(native, RECORD_LIMIT)
+            .map_err(|e| input_error(path, Some(1), e))?;
+        let parsed = fields(&decoded, delimiter, false, path, 0, JoinConfig::default()).map_err(
+            |failure| match failure {
+                Failure::Error(e) => e,
+                Failure::Cancelled => error("Header reading cancelled."),
+            },
+        )?;
         if parsed.is_empty() {
-            return Err(input_error(path, None, "The file has no header columns."));
+            return Err(input_error(path, None, "The file has no usable columns."));
         }
         let each = (512 * 1024 / parsed.len()).clamp(1, 256);
-        let columns = parsed
-            .iter()
-            .map(|field| {
-                let text = std::str::from_utf8(field).expect("validated UTF-8");
-                let mut end = text.len().min(each);
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                text[..end].to_string()
-            })
-            .collect();
+        let columns = if format.has_header {
+            parsed
+                .iter()
+                .map(|field| clip_label(std::str::from_utf8(field).expect("validated UTF-8"), each))
+                .collect()
+        } else {
+            vec![String::new(); parsed.len()]
+        };
         Ok(JoinHeader {
             delimiter,
+            encoding,
+            has_header: format.has_header,
             columns,
             source_version: JoinSourceVersion(stamp.clone()),
         })
@@ -160,7 +184,40 @@ fn header_info(path: &Path, state: &Progress) -> JResult<JoinHeader> {
 
 /// Read only bounded key-picker metadata with the same cancellable job lifecycle as analysis.
 pub fn read_join_header(path: PathBuf) -> Result<JoinJob<JoinHeader>, QuarryError> {
-    JoinJob::spawn(move |state| header_info(&path, state))
+    read_join_header_with_format(path, JoinFormat::default())
+}
+
+/// Read bounded picker metadata using explicit source interpretation.
+pub fn read_join_header_with_format(
+    path: PathBuf,
+    format: JoinFormat,
+) -> Result<JoinJob<JoinHeader>, QuarryError> {
+    JoinJob::spawn(move |state| header_info(&path, format, state))
+}
+
+fn clip_label(text: &str, limit: usize) -> String {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+fn discovered_header(input: &Inspected, config: JoinConfig) -> JoinHeader {
+    let budget = config.max_record_bytes.min(512 * 1024);
+    let each = (budget / input.info.columns.len().max(1)).min(256);
+    JoinHeader {
+        delimiter: input.info.delimiter,
+        encoding: input.info.encoding,
+        has_header: input.info.has_header,
+        columns: input
+            .info
+            .columns
+            .iter()
+            .map(|s| clip_label(s, each))
+            .collect(),
+        source_version: JoinSourceVersion(input.stamp.clone()),
+    }
 }
 
 /// Case comparison affects keys only; stored and emitted field values are unchanged.
@@ -248,6 +305,7 @@ impl Default for JoinConfig {
 pub struct JoinInputInfo {
     pub path: PathBuf,
     pub delimiter: u8,
+    pub encoding: Encoding,
     pub columns: Vec<String>,
     pub has_header: bool,
     pub data_rows: u64,
@@ -287,6 +345,8 @@ pub struct JoinOutputColumn {
 /// Output choices are owned by the immutable analysis, separate from resource policy.
 #[derive(Clone, Debug, Default)]
 pub struct JoinOutputOptions {
+    /// Widths presented before full analysis. Newly discovered fields are included.
+    pub known_widths: Option<[usize; 2]>,
     pub columns: Option<Vec<JoinOutputColumn>>,
     pub include_header: Option<bool>,
 }
@@ -302,6 +362,7 @@ struct OutputLayout {
     headers: Arc<[String]>,
     include_header: bool,
     duplicate_headers: bool,
+    new_columns: [usize; 2],
 }
 
 /// Counts describe the entire input; only preview values are sampled and clipped.
@@ -323,6 +384,8 @@ pub struct JoinAnalysis {
     pub output_headers: Arc<[String]>,
     pub include_header: bool,
     pub duplicate_headers: bool,
+    /// Columns found beyond the caller's presented widths; require layout review.
+    pub new_columns: [usize; 2],
 }
 
 /// Bounded examples identify duplicate groups without retaining their records.
@@ -394,6 +457,7 @@ struct Progress {
     group_peak: AtomicUsize,
     cancel: AtomicBool,
     done: AtomicBool,
+    discovered: Mutex<Option<[JoinHeader; 2]>>,
 }
 
 impl Progress {
@@ -407,6 +471,7 @@ impl Progress {
             group_peak: AtomicUsize::new(0),
             cancel: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            discovered: Mutex::new(None),
         }
     }
 
@@ -481,6 +546,11 @@ impl<T: Send + 'static> JoinJob<T> {
 }
 
 impl<T> JoinJob<T> {
+    /// Take bounded full-scan schema metadata, even if the requested layout failed.
+    pub fn take_discovered_headers(&self) -> Option<[JoinHeader; 2]> {
+        self.state.discovered.lock().ok()?.take()
+    }
+
     /// Request cooperative cancellation; a published result remains successful.
     pub fn cancel(&self) {
         self.state.cancel.store(true, Ordering::Release);
@@ -600,6 +670,7 @@ impl JoinConfig {
             .saturating_add(self.run_memory_bytes)
             .saturating_add(self.group_memory_bytes)
             .saturating_add(self.preview_bytes)
+            .saturating_add(self.max_record_bytes.min(512 * 1024).saturating_mul(2))
             .saturating_add(self.max_columns.saturating_mul(384))
             .saturating_add(
                 MAX_RUN_LEVELS
@@ -920,6 +991,7 @@ fn scan(
     path: &Path,
     stamp: &SourceStamp,
     delimiter: u8,
+    encoding: Encoding,
     config: JoinConfig,
     state: &Progress,
     mut visit: impl FnMut(&[u8], u64) -> JResult<()>,
@@ -928,28 +1000,56 @@ fn scan(
     if !source_matches_stamp(&file, path, stamp)? {
         return Err(QuarryError::SourceChanged.into());
     }
-    let mut scanner = RecordScanner::new(delimiter, Encoding::Utf8)?;
-    let mut chunk = vec![0; READ_CHUNK.min(config.max_record_bytes)];
+    // Frame UTF-16 structurally, then decode each complete record for an exact
+    // record diagnostic rather than validating an entire read before callbacks.
+    let mut scanner = RecordScanner::new_for_inspection(delimiter, encoding)?;
+    let chunk_size = if encoding.is_utf16() {
+        READ_CHUNK.min(config.max_record_bytes).max(2) / 2 * 2
+    } else {
+        READ_CHUNK.min(config.max_record_bytes)
+    };
+    let mut chunk = vec![0; chunk_size];
     let mut record = Vec::new();
     let mut offset = 0_u64;
     let mut row = 0_u64;
+    let mut decoded_visit = |record: &[u8], row: u64| -> JResult<()> {
+        let native = if row == 0 {
+            encoding.strip_bom(record).1
+        } else {
+            record
+        };
+        let decoded = encoding
+            .decode(native, config.max_record_bytes)
+            .map_err(|e| input_error(path, Some(row + 1), e))?;
+        visit(&decoded, row)
+    };
     loop {
         state.check()?;
-        let read = file.read(&mut chunk)?;
-        if read == 0 {
+        let mut native_read = 0;
+        while native_read < chunk.len() {
+            state.check()?;
+            let count = file.read(&mut chunk[native_read..])?;
+            if count == 0 {
+                break;
+            }
+            native_read += count;
+        }
+        let incomplete_unit = encoding.is_utf16() && native_read % 2 != 0;
+        let read = native_read - usize::from(incomplete_unit);
+        if native_read == 0 {
             let mut last = false;
             scanner
                 .finish(offset, |_| last = true)
                 .map_err(|e| input_error(path, Some(row + 1), e))?;
             if last {
-                visit(&record, row)?;
+                decoded_visit(&record, row)?;
             }
             if !source_matches_stamp(&file, path, stamp)? {
                 return Err(QuarryError::SourceChanged.into());
             }
             return Ok(());
         }
-        if add(offset, read as u64)? > stamp.file_size() {
+        if add(offset, native_read as u64)? > stamp.file_size() {
             return Err(QuarryError::SourceChanged.into());
         }
         let mut start = 0;
@@ -971,7 +1071,7 @@ fn scan(
                 return;
             }
             record.extend_from_slice(&chunk[start..end]);
-            if let Err(error) = visit(&record, row) {
+            if let Err(error) = decoded_visit(&record, row) {
                 failed = Some(error);
             }
             record.clear();
@@ -983,6 +1083,14 @@ fn scan(
         }
         state.check()?;
         scanned.map_err(|e| input_error(path, Some(row + 1), e))?;
+        if incomplete_unit {
+            return Err(input_error(
+                path,
+                Some(row + 1),
+                "Incomplete UTF-16 code unit. Choose the correct encoding; no text was replaced.",
+            )
+            .into());
+        }
         if record.len().saturating_add(read - start) > config.max_record_bytes {
             return Err(input_error(
                 path,
@@ -1184,25 +1292,6 @@ struct Inspected {
 /// Scan the complete source to validate text and size its private frames.
 fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<Inspected> {
     state.phase(JoinPhase::Inspecting);
-    if !input.has_header {
-        return Err(input_error(
-            &input.path,
-            None,
-            "This first join version requires a header row in both files.",
-        )
-        .into());
-    }
-    if input
-        .encoding
-        .is_some_and(|encoding| encoding != Encoding::Utf8)
-    {
-        return Err(input_error(
-            &input.path,
-            None,
-            "This first join version requires UTF-8 inputs.",
-        )
-        .into());
-    }
     let path = if input.path.is_absolute() {
         input.path
     } else {
@@ -1224,17 +1313,9 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
 
     let encoding =
         Encoding::detect(&mut file, input.encoding).map_err(|e| input_error(&path, None, e))?;
-    if encoding != Encoding::Utf8 {
-        return Err(input_error(
-            &path,
-            None,
-            "This first join version requires UTF-8 inputs.",
-        )
-        .into());
-    }
     let delimiter = match input.delimiter {
         Some(value) => {
-            RecordScanner::new(value, Encoding::Utf8)?;
+            RecordScanner::new(value, encoding).map_err(|e| input_error(&path, None, e))?;
             value
         }
         None => crate::detect_file_delimiter(
@@ -1242,8 +1323,9 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
             stamp.file_size(),
             crate::DEFAULT_SAMPLE_BYTES,
             crate::DEFAULT_BOOTSTRAP_LIMIT,
-            Encoding::Utf8,
-        )?,
+            encoding,
+        )
+        .map_err(|e| input_error(&path, None, e))?,
     };
     drop(file);
     let mut columns = None;
@@ -1251,29 +1333,31 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
     let mut empty_key_rows = 0;
     let mut frame_bytes = 0;
     let mut max_key_bytes = 0;
-    scan(&path, &stamp, delimiter, config, state, |record, row| {
-        let parsed = fields(record, delimiter, row == 0, &path, row, config)?;
-        if row == 0 {
-            let names: Vec<_> = parsed
-                .iter()
-                .map(|field| String::from_utf8(field.to_vec()).expect("validated UTF-8"))
-                .collect();
-            if input
-                .key_columns
-                .iter()
-                .any(|&column| column >= names.len())
-            {
-                return Err(input_error(
-                    &path,
-                    Some(1),
-                    "The selected key column is outside the header.",
-                )
-                .into());
+    scan(
+        &path,
+        &stamp,
+        delimiter,
+        encoding,
+        config,
+        state,
+        |record, row| {
+            let parsed = fields(record, delimiter, false, &path, row, config)?;
+            if row == 0 {
+                columns = Some(if input.has_header {
+                    parsed
+                        .iter()
+                        .map(|field| String::from_utf8(field.to_vec()).expect("validated UTF-8"))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![String::new(); parsed.len()]
+                });
             }
-            columns = Some(names);
-        } else {
-            if parsed.len() > columns.as_ref().map_or(0, Vec::len) {
-                return Err(input_error(&path, Some(row+1), "A row contains more columns than its header. This join version requires named columns.").into());
+            if input.has_header && row == 0 {
+                return Ok(());
+            }
+            let names = columns.as_mut().expect("first record creates schema");
+            if parsed.len() > names.len() {
+                names.resize(parsed.len(), String::new());
             }
             let key =
                 key(&parsed, &input.key_columns, data_rows, config).map_err(
@@ -1294,15 +1378,33 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
             )?;
             data_rows = add(data_rows, 1)?;
             state.records.store(data_rows, Ordering::Release);
-        }
-        Ok(())
+            Ok(())
+        },
+    )?;
+    let columns = columns.ok_or_else(|| {
+        input_error(
+            &path,
+            None,
+            "The file is empty and has no usable column schema.",
+        )
     })?;
-    let columns = columns
-        .ok_or_else(|| input_error(&path, None, "The file is empty and has no header schema."))?;
+    if input
+        .key_columns
+        .iter()
+        .any(|&column| column >= columns.len())
+    {
+        return Err(input_error(
+            &path,
+            None,
+            "A selected key column is outside the complete source schema.",
+        )
+        .into());
+    }
     Ok(Inspected {
         info: JoinInputInfo {
             path,
             delimiter,
+            encoding,
             columns,
             has_header: input.has_header,
             data_rows,
@@ -1352,10 +1454,11 @@ fn prepare(
         &input.info.path,
         &input.stamp,
         input.info.delimiter,
+        input.info.encoding,
         config,
         state,
         |record, row| {
-            if row == 0 {
+            if input.info.has_header && row == 0 {
                 return Ok(());
             }
             let parsed = fields(
@@ -1452,7 +1555,7 @@ impl OutputLayout {
         state: &Progress,
     ) -> JResult<Self> {
         use std::collections::{HashMap, HashSet};
-        let requested = if let Some(columns) = options.columns {
+        let mut requested = if let Some(columns) = options.columns {
             columns
         } else {
             let count = inputs[0]
@@ -1474,6 +1577,30 @@ impl OutputLayout {
                 })
                 .collect()
         };
+        let new_columns = options.known_widths.map_or([0, 0], |known| {
+            std::array::from_fn(|side| inputs[side].columns.len().saturating_sub(known[side]))
+        });
+        if let Some(known) = options.known_widths {
+            let mut included: std::collections::HashSet<_> = requested
+                .iter()
+                .map(|column| (column.source, column.column))
+                .collect();
+            for source in [JoinSource::Main, JoinSource::Additional] {
+                for column in known[source.index()]..inputs[source.index()].columns.len() {
+                    state.check()?;
+                    if included.insert((source, column)) {
+                        if requested.len() >= config.max_columns {
+                            return Err(error("Newly discovered columns exceed the output column limit. Review the complete source columns and select fewer fields.").into());
+                        }
+                        requested.push(JoinOutputColumn {
+                            source,
+                            column,
+                            name: None,
+                        });
+                    }
+                }
+            }
+        }
         if requested.is_empty() || requested.len() > config.max_columns {
             return Err(error(
                 "Select between one and the supported maximum number of output columns.",
@@ -1570,6 +1697,7 @@ impl OutputLayout {
             headers: headers.into(),
             include_header,
             duplicate_headers,
+            new_columns,
         };
         if include_header {
             output_header(&layout, inputs[0].delimiter, config)?;
@@ -2281,6 +2409,7 @@ fn analyze_prepared(
         output_headers: Arc::clone(&output.headers),
         include_header: output.include_header,
         duplicate_headers: output.duplicate_headers,
+        new_columns: output.new_columns,
     })
 }
 
@@ -2341,6 +2470,13 @@ pub fn analyze_join_with_output(
                 error("Choose two different input files. Self joins are not supported.").into(),
             );
         }
+        *state
+            .discovered
+            .lock()
+            .map_err(|_| error("Cannot publish discovered source metadata."))? = Some([
+            discovered_header(&left, config),
+            discovered_header(&right, config),
+        ]);
         let output = OutputLayout::resolve(
             [&left.info, &right.info],
             output_options,
@@ -2432,10 +2568,25 @@ impl JoinPlan {
 
     /// Acknowledgement is tied to this immutable, fully analyzed plan.
     pub fn start_write_acknowledged(
-        mut self,
+        self,
         destination: PathBuf,
         acknowledge_expansion: bool,
     ) -> Result<JoinJob<JoinSummary>, QuarryError> {
+        self.start_write_reviewed(destination, acknowledge_expansion, false)
+    }
+
+    pub fn start_write_reviewed(
+        mut self,
+        destination: PathBuf,
+        acknowledge_expansion: bool,
+        acknowledge_layout: bool,
+    ) -> Result<JoinJob<JoinSummary>, QuarryError> {
+        if self.analysis.new_columns != [0, 0] && !acknowledge_layout {
+            self.release()?;
+            return Err(error(
+                "Review the newly discovered output columns before creating the result.",
+            ));
+        }
         if self.analysis.many_to_many_groups > 0 && !acknowledge_expansion {
             self.release()?;
             return Err(error(
@@ -2973,10 +3124,9 @@ mod tests {
 
     #[test]
     /// Reject malformed data before creating any output, including unused values.
-    fn invalid_unselected_text_and_late_extra_fields_block_analysis() {
+    fn invalid_unselected_text_and_malformed_records_block_analysis() {
         let dir = tempfile::tempdir().unwrap();
         assert!(failure(dir.path(), b"id,label\nx,\xff\n", b"id\nx\n").contains("Invalid UTF-8"));
-        assert!(failure(dir.path(), b"id\nx\nx,late\n", b"id\nx\n").contains("more columns"));
         assert!(failure(dir.path(), b"id\n\"unfinished", b"id\nx\n").contains("quote"));
         assert!(failure(dir.path(), b"", b"id\nx\n").contains("empty"));
         assert!(workspaces(dir.path()).is_empty());
@@ -3097,24 +3247,27 @@ mod tests {
 
     #[test]
     /// Fail unsupported requests before creating scratch storage.
-    fn unsupported_formats_self_joins_and_inadequate_budgets_are_explicit() {
+    fn explicit_formats_self_joins_and_inadequate_budgets_are_explicit() {
         let dir = tempfile::tempdir().unwrap();
         let mut args = inputs(dir.path(), b"id\nx\n", b"id\nx\n");
         args[1].has_header = false;
-        assert!(
-            analyze_join(args, dir.path().to_path_buf(), config())
-                .unwrap()
-                .wait()
-                .is_err()
-        );
+        let p = analyze_join(args, dir.path().to_path_buf(), config())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert!(!p.inputs()[1].has_header);
+        assert_eq!(p.inputs()[1].data_rows, 2);
+        p.release().unwrap();
         let mut args = inputs(dir.path(), b"id\nx\n", b"id\nx\n");
         args[1].encoding = Some(Encoding::Latin1);
-        assert!(
-            analyze_join(args, dir.path().to_path_buf(), config())
-                .unwrap()
-                .wait()
-                .is_err()
-        );
+        let p = analyze_join(args, dir.path().to_path_buf(), config())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.inputs()[1].encoding, Encoding::Latin1);
+        p.release().unwrap();
         let mut args = inputs(dir.path(), b"id\nx\n", b"id\nx\n");
         args[1].path = args[0].path.clone();
         assert!(
@@ -3297,7 +3450,7 @@ mod tests {
         assert!(reader.seek(SeekFrom::Start(0)).is_err());
         assert_eq!(reader.inner.position(), position);
         assert!(matches!(
-            header_info(Path::new("not-opened.csv"), &state),
+            header_info(Path::new("not-opened.csv"), JoinFormat::default(), &state),
             Err(Failure::Cancelled)
         ));
     }
@@ -4325,6 +4478,7 @@ mod tests {
                         dir.path().to_path_buf(),
                         cfg,
                         JoinOutputOptions {
+                            known_widths: None,
                             columns: Some(columns),
                             include_header: Some(include_header),
                         },
@@ -4461,6 +4615,7 @@ mod tests {
             dir.path().to_path_buf(),
             config(),
             JoinOutputOptions {
+                known_widths: None,
                 columns: Some(columns),
                 include_header: Some(true),
             },
@@ -4493,6 +4648,7 @@ mod tests {
                     ..config()
                 },
                 JoinOutputOptions {
+                    known_widths: None,
                     columns: Some(columns),
                     include_header: None,
                 },
@@ -4509,6 +4665,7 @@ mod tests {
                 ..config()
             },
             JoinOutputOptions {
+                known_widths: None,
                 columns: Some(vec![output_column(1, None), output_column(3, None)]),
                 include_header: None,
             },
@@ -4525,6 +4682,7 @@ mod tests {
             dir.path().to_path_buf(),
             config(),
             JoinOutputOptions {
+                known_widths: None,
                 columns: Some(vec![JoinOutputColumn {
                     source: JoinSource::Main,
                     column: 2,
@@ -4555,6 +4713,7 @@ mod tests {
             dir.path().to_path_buf(),
             cfg,
             JoinOutputOptions {
+                known_widths: None,
                 columns: Some(vec![output_column(1, None)]),
                 include_header: None,
             },
@@ -4574,6 +4733,7 @@ mod tests {
                     ..config()
                 },
                 JoinOutputOptions {
+                    known_widths: None,
                     columns: Some(columns),
                     include_header: Some(true)
                 }
@@ -4593,6 +4753,7 @@ mod tests {
             dir.path().to_path_buf(),
             config(),
             JoinOutputOptions {
+                known_widths: None,
                 columns: None,
                 include_header: Some(false),
             },
@@ -4611,6 +4772,372 @@ mod tests {
             .unwrap();
         assert!(!summary.include_header);
         assert_eq!(fs::read(output).unwrap(), b"");
+        assert!(workspaces(dir.path()).is_empty());
+    }
+    /// Independent fixture encoder: no Quarry decoding/serialization functions.
+    fn source_bytes(text: &str, encoding: Encoding) -> Vec<u8> {
+        match encoding {
+            Encoding::Utf8 => text.as_bytes().to_vec(),
+            Encoding::Utf16Le | Encoding::Utf16Be => {
+                let mut bytes = if encoding == Encoding::Utf16Le {
+                    vec![0xff, 0xfe]
+                } else {
+                    vec![0xfe, 0xff]
+                };
+                for unit in text.encode_utf16() {
+                    bytes.extend_from_slice(&if encoding == Encoding::Utf16Le {
+                        unit.to_le_bytes()
+                    } else {
+                        unit.to_be_bytes()
+                    });
+                }
+                bytes
+            }
+            Encoding::Latin1 | Encoding::Windows1252 => text
+                .chars()
+                .map(|ch| {
+                    if ch == '€' && encoding == Encoding::Windows1252 {
+                        0x80
+                    } else {
+                        u8::try_from(u32::from(ch)).expect("single-byte fixture")
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn delimited_fixture(rows: &[Vec<String>], delimiter: u8) -> String {
+        let mut result = String::new();
+        for row in rows {
+            for (index, value) in row.iter().enumerate() {
+                if index != 0 {
+                    result.push(char::from(delimiter));
+                }
+                let quote = value
+                    .bytes()
+                    .any(|b| [delimiter, b'"', b'\r', b'\n'].contains(&b))
+                    || (index == 0 && value.starts_with('\u{feff}'));
+                if quote {
+                    result.push('"');
+                }
+                result.push_str(&value.replace('"', "\"\""));
+                if quote {
+                    result.push('"');
+                }
+            }
+            result.push('\n');
+        }
+        result
+    }
+
+    #[test]
+    fn mixed_encodings_delimiters_and_header_modes_preserve_exact_values() {
+        let row = |a: &str, b: &str| vec![a.to_owned(), b.to_owned()];
+        for ae in Encoding::ALL {
+            for be in Encoding::ALL {
+                for ah in [false, true] {
+                    for bh in [false, true] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let a = vec![row("é", "Left,; \"quoted\"\r\nline"), row("z", "alone")];
+                        let b = vec![row("é", "café"), row("q", "extra")];
+                        let mut ar = if ah { vec![row("id", "left")] } else { vec![] };
+                        ar.extend(a.clone());
+                        let mut br = if bh {
+                            vec![row("key", "right")]
+                        } else {
+                            vec![]
+                        };
+                        br.extend(b.clone());
+                        let ab = source_bytes(&delimited_fixture(&ar, b';'), ae);
+                        let bb = source_bytes(&delimited_fixture(&br, b'\t'), be);
+                        let mut args = inputs(dir.path(), &ab, &bb);
+                        args[0].delimiter = Some(b';');
+                        args[1].delimiter = Some(b'\t');
+                        args[0].encoding = Some(ae);
+                        args[1].encoding = Some(be);
+                        args[0].has_header = ah;
+                        args[1].has_header = bh;
+                        let p = analyze_join(
+                            args,
+                            dir.path().to_path_buf(),
+                            JoinConfig {
+                                mode: JoinMode::Full,
+                                ..config()
+                            },
+                        )
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(p.analysis.input_rows, [2, 2]);
+                        assert_eq!([p.inputs()[0].encoding, p.inputs()[1].encoding], [ae, be]);
+                        let mut wanted = Vec::new();
+                        if ah || bh {
+                            wanted.push(vec![
+                                if ah { "id" } else { "Main column 1" }.into(),
+                                if ah { "left" } else { "Main column 2" }.into(),
+                                if bh { "key" } else { "Additional column 1" }.into(),
+                                if bh { "right" } else { "Additional column 2" }.into(),
+                            ]);
+                        }
+                        wanted.extend(oracle_rows(JoinMode::Full, &a, &b));
+                        let expected = delimited_fixture(&wanted, b';').into_bytes();
+                        assert_eq!(p.analysis.output_bytes, expected.len() as u64);
+                        let output = dir.path().join("mixed.csv");
+                        p.start_write(output.clone())
+                            .unwrap()
+                            .wait()
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            fs::read(output).unwrap(),
+                            expected,
+                            "{ae:?}/{be:?},headers={ah}/{bh}"
+                        );
+                        assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), ab);
+                        assert_eq!(fs::read(dir.path().join("additional.csv")).unwrap(), bb);
+                        assert!(workspaces(dir.path()).is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_columns_are_included_reviewed_and_use_stable_source_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = || {
+            let mut args = inputs(dir.path(), b"a\nb,x\n", b"id\nx\n");
+            args[0].has_header = false;
+            args[0].key_columns = vec![1];
+            analyze_join_with_output(
+                args,
+                dir.path().to_path_buf(),
+                config(),
+                JoinOutputOptions {
+                    known_widths: Some([1, 1]),
+                    columns: Some(vec![
+                        JoinOutputColumn {
+                            source: JoinSource::Main,
+                            column: 0,
+                            name: None,
+                        },
+                        JoinOutputColumn {
+                            source: JoinSource::Additional,
+                            column: 0,
+                            name: None,
+                        },
+                    ]),
+                    include_header: None,
+                },
+            )
+            .unwrap()
+        };
+        let job = make();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !job.progress().done {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "schema analysis timed out"
+            );
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let headers = job.take_discovered_headers().unwrap();
+        assert_eq!(headers[0].columns.len(), 2);
+        assert!(!headers[0].has_header);
+        let p = job.wait().unwrap().unwrap();
+        assert_eq!(p.analysis.new_columns, [1, 0]);
+        assert_eq!(p.analysis.empty_key_rows, [1, 0]);
+        assert_eq!(p.analysis.preview, [vec!["a", "", ""], vec!["b", "x", "x"]]);
+        let output = dir.path().join("late.csv");
+        assert!(
+            p.start_write(output.clone()).is_err(),
+            "new layout needs explicit review"
+        );
+        assert!(!output.exists());
+        let p = make().wait().unwrap().unwrap();
+        p.start_write_reviewed(output.clone(), false, true)
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(output).unwrap(),
+            b"Main column 1,id,Main column 2\na,,\nb,x,x\n"
+        );
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn discovered_schema_is_available_when_new_columns_exceed_output_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = inputs(dir.path(), b"id\nx,late\n", b"id\nx,more\n");
+        let job = analyze_join_with_output(
+            args,
+            dir.path().to_path_buf(),
+            JoinConfig {
+                max_columns: 2,
+                ..config()
+            },
+            JoinOutputOptions {
+                known_widths: Some([1, 1]),
+                columns: Some(vec![
+                    JoinOutputColumn {
+                        source: JoinSource::Main,
+                        column: 0,
+                        name: None,
+                    },
+                    JoinOutputColumn {
+                        source: JoinSource::Additional,
+                        column: 0,
+                        name: None,
+                    },
+                ]),
+                include_header: None,
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !job.progress().done {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "schema analysis timed out"
+            );
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let headers = job.take_discovered_headers().unwrap();
+        assert_eq!([headers[0].columns.len(), headers[1].columns.len()], [2, 2]);
+        assert!(job.wait().is_err());
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn format_probe_decodes_labels_and_rejects_malformed_unselected_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf16.tsv");
+        fs::write(
+            &path,
+            source_bytes("clé\tname\nx\tvalue\n", Encoding::Utf16Be),
+        )
+        .unwrap();
+        let h = read_join_header_with_format(path, JoinFormat::default())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.encoding, Encoding::Utf16Be);
+        assert_eq!(h.delimiter, b'\t');
+        assert_eq!(h.columns, ["clé", "name"]);
+        let mut args = inputs(dir.path(), b"id,other\nx,\x81\n", b"id\nx\n");
+        args[0].encoding = Some(Encoding::Windows1252);
+        assert!(
+            analyze_join(args, dir.path().to_path_buf(), config())
+                .unwrap()
+                .wait()
+                .is_err()
+        );
+        let mut args = inputs(dir.path(), b"\xff\xfe\0\0", b"id\nx\n");
+        args[0].encoding = None;
+        assert!(
+            analyze_join(args, dir.path().to_path_buf(), config())
+                .unwrap()
+                .wait()
+                .is_err()
+        );
+        assert!(workspaces(dir.path()).is_empty());
+    }
+    #[test]
+    fn malformed_excluded_values_keep_source_and_record_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_utf16 = {
+            let mut b = source_bytes("id,other\nx,", Encoding::Utf16Le);
+            b.extend_from_slice(&[0x00, 0xd8, 0x0a, 0x00]);
+            b
+        };
+        let mut odd_utf16 = source_bytes("id,other\nx,", Encoding::Utf16Le);
+        odd_utf16.push(0);
+        for (encoding, bytes) in [
+            (Encoding::Utf8, b"id,other\nx,\xff\n".to_vec()),
+            (Encoding::Windows1252, b"id,other\nx,\x81\n".to_vec()),
+            (Encoding::Utf16Le, bad_utf16),
+            (Encoding::Utf16Le, odd_utf16),
+        ] {
+            let mut args = inputs(dir.path(), &bytes, b"id\nx\n");
+            args[0].encoding = Some(encoding);
+            let result = analyze_join_with_output(
+                args,
+                dir.path().to_path_buf(),
+                config(),
+                JoinOutputOptions {
+                    known_widths: None,
+                    columns: Some(vec![JoinOutputColumn {
+                        source: JoinSource::Main,
+                        column: 0,
+                        name: None,
+                    }]),
+                    include_header: None,
+                },
+            )
+            .unwrap()
+            .wait();
+            let err = result
+                .err()
+                .expect("excluded malformed text must block analysis");
+            assert!(
+                matches!(err,QuarryError::JoinFile{path:Some(ref p),record:Some(2),..}
+                if p == &dir.path().join("main.csv")),
+                "{err:?}"
+            );
+            assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), bytes);
+            assert!(workspaces(dir.path()).is_empty());
+        }
+    }
+    #[test]
+    fn mixed_header_only_sources_and_empty_schema_cases_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = source_bytes("id;left\n", Encoding::Utf16Be);
+        let b = source_bytes("key;right\né;ré\n", Encoding::Latin1);
+        let mut args = inputs(dir.path(), &a, &b);
+        args[0].encoding = None;
+        args[1].encoding = Some(Encoding::Latin1);
+        for input in &mut args {
+            input.delimiter = Some(b';');
+        }
+        let p = analyze_join(
+            args,
+            dir.path().to_path_buf(),
+            JoinConfig {
+                mode: JoinMode::Full,
+                ..config()
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.analysis.input_rows, [0, 1]);
+        assert_eq!(p.analysis.output_rows, 1);
+        let output = dir.path().join("header-only.csv");
+        p.start_write(output.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(output).unwrap(),
+            "id;left;key;right\n;;é;ré\n".as_bytes()
+        );
+        for empty in [Vec::new(), vec![0xfe, 0xff]] {
+            let mut args = inputs(dir.path(), &empty, b"id\nx\n");
+            args[0].encoding = None;
+            args[0].has_header = false;
+            assert!(
+                analyze_join(args, dir.path().to_path_buf(), config())
+                    .unwrap()
+                    .wait()
+                    .is_err()
+            );
+        }
         assert!(workspaces(dir.path()).is_empty());
     }
 }

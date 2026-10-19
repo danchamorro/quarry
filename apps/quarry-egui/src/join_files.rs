@@ -1,8 +1,9 @@
 use super::*;
 use quarry_core::JoinHeader as HeaderInfo;
 use quarry_core::{
-    JoinCase, JoinConfig, JoinInput, JoinJob, JoinMode, JoinOutputColumn, JoinOutputOptions,
-    JoinPlan, JoinSource, JoinSummary, analyze_join_with_output, read_join_header,
+    JoinCase, JoinConfig, JoinFormat, JoinInput, JoinJob, JoinMode, JoinOutputColumn,
+    JoinOutputOptions, JoinPlan, JoinSource, JoinSummary, analyze_join_with_output,
+    read_join_header_with_format,
 };
 use std::thread::{self, JoinHandle};
 
@@ -17,6 +18,7 @@ struct OutputColumnDraft {
 pub(super) struct JoinDialog {
     paths: [Option<PathBuf>; 2],
     headers: [Option<HeaderInfo>; 2],
+    formats: [JoinFormat; 2],
     keys: Vec<[usize; 2]>,
     ignore_ascii_case: bool,
     output_columns: Vec<OutputColumnDraft>,
@@ -24,6 +26,7 @@ pub(super) struct JoinDialog {
     output_has_header: bool,
     require_unique: [bool; 2],
     acknowledge_expansion: bool,
+    acknowledge_layout: bool,
     mode: JoinMode,
     temporary: PathBuf,
     header_job: Option<(usize, JoinJob<HeaderInfo>)>,
@@ -43,6 +46,7 @@ pub(super) struct JoinDialog {
 enum DialogAction {
     None,
     Select(usize),
+    ReadFormat(usize),
     Analyze,
     ChooseOutput,
     Create,
@@ -56,6 +60,7 @@ impl JoinDialog {
         Self {
             paths: [None, None],
             headers: [None, None],
+            formats: [JoinFormat::default(); 2],
             keys: vec![[0, 0]],
             ignore_ascii_case: false,
             output_columns: Vec::new(),
@@ -63,6 +68,7 @@ impl JoinDialog {
             output_has_header: true,
             require_unique: [false, false],
             acknowledge_expansion: false,
+            acknowledge_layout: false,
             mode: JoinMode::Left,
             temporary,
             header_job: None,
@@ -111,6 +117,7 @@ impl JoinDialog {
     /// Release a retained plan off-thread before allowing another analysis.
     fn reset(&mut self) {
         self.acknowledge_expansion = false;
+        self.acknowledge_layout = false;
         if let Some(plan) = self.plan.take() {
             self.cleanup = Some(thread::spawn(move || {
                 plan.release().map_err(|e| e.to_string())
@@ -184,7 +191,13 @@ impl JoinDialog {
             .as_ref()
             .is_some_and(|job| job.progress().done)
         {
-            match self.checking.take().unwrap().wait() {
+            let job = self.checking.take().unwrap();
+            if !self.closing && !self.cancel_requested {
+                if let Some(headers) = job.take_discovered_headers() {
+                    self.adopt_discovered_headers(headers);
+                }
+            }
+            match job.wait() {
                 Ok(Some(plan)) => {
                     self.output_delimiter = plan.inputs()[0].delimiter;
                     if self.closing {
@@ -245,7 +258,7 @@ impl JoinDialog {
         self.result = None;
         self.destination = None;
         self.cancel_requested = false;
-        match read_join_header(path) {
+        match read_join_header_with_format(path, self.formats[side]) {
             Ok(job) => self.header_job = Some((side, job)),
             Err(error) => self.message = Some(error.to_string()),
         }
@@ -254,11 +267,12 @@ impl JoinDialog {
     /// Capture explicit saved-file settings for the full analysis worker.
     fn start_analysis(&mut self) {
         self.acknowledge_expansion = false;
+        self.acknowledge_layout = false;
         let inputs = std::array::from_fn(|side| JoinInput {
             path: self.paths[side].as_ref().unwrap().clone(),
             delimiter: Some(self.headers[side].as_ref().unwrap().delimiter),
-            has_header: true,
-            encoding: Some(Encoding::Utf8),
+            has_header: self.formats[side].has_header,
+            encoding: Some(self.headers[side].as_ref().unwrap().encoding),
             key_columns: self.keys.iter().map(|pair| pair[side]).collect(),
             expected_version: Some(self.headers[side].as_ref().unwrap().source_version.clone()),
             require_unique: self.require_unique[side],
@@ -267,6 +281,9 @@ impl JoinDialog {
         self.result = None;
         self.cancel_requested = false;
         let output = JoinOutputOptions {
+            known_widths: Some(std::array::from_fn(|side| {
+                self.headers[side].as_ref().unwrap().columns.len()
+            })),
             columns: Some(
                 self.output_columns
                     .iter()
@@ -305,6 +322,15 @@ impl JoinDialog {
 
     /// Consume the retained plan only after application-level guards pass.
     fn start_write(&mut self) {
+        if self
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.analysis().new_columns != [0, 0])
+            && !self.acknowledge_layout
+        {
+            self.message = Some("Review the newly discovered output columns first.".into());
+            return;
+        }
         let Some(plan) = self.plan.take() else {
             return;
         };
@@ -314,7 +340,11 @@ impl JoinDialog {
         };
         self.message = None;
         self.cancel_requested = false;
-        match plan.start_write_acknowledged(destination, self.acknowledge_expansion) {
+        match plan.start_write_reviewed(
+            destination,
+            self.acknowledge_expansion,
+            self.acknowledge_layout,
+        ) {
             Ok(job) => self.writing = Some(job),
             Err(error) => self.message = Some(error.to_string()),
         }
@@ -337,7 +367,66 @@ impl JoinDialog {
             })
             .collect();
         self.output_selected = (!self.output_columns.is_empty()).then_some(0);
-        self.output_has_header = true;
+        self.output_has_header = self
+            .headers
+            .iter()
+            .flatten()
+            .any(|header| header.has_header);
+    }
+
+    /// Merge late columns by original identity, preserving the user's chosen order.
+    fn adopt_discovered_headers(&mut self, headers: [HeaderInfo; 2]) {
+        for (side, header) in headers.into_iter().enumerate() {
+            let previous = self.headers[side].as_ref().map_or(0, |h| h.columns.len());
+            let source = if side == 0 {
+                JoinSource::Main
+            } else {
+                JoinSource::Additional
+            };
+            for column in previous..header.columns.len() {
+                self.output_columns.push(OutputColumnDraft {
+                    source,
+                    column,
+                    included: true,
+                    name: String::new(),
+                });
+            }
+            self.headers[side] = Some(header);
+        }
+    }
+
+    /// Format changes use the same asynchronous, version-bound metadata path.
+    fn show_input_format(&mut self, ui: &mut egui::Ui, side: usize) -> bool {
+        let role = if side == 0 { "Main" } else { "Additional" };
+        let format = &mut self.formats[side];
+        let previous = *format;
+        ui.push_id(("join-format", side), |ui| {
+            ui.checkbox(&mut format.has_header, format!("{role} has a header row"));
+            let selected = DelimiterMode::ALL
+                .into_iter()
+                .find(|mode| mode.delimiter() == format.delimiter)
+                .unwrap_or(DelimiterMode::Auto);
+            egui::ComboBox::from_id_salt("delimiter")
+                .selected_text(format!("{role} delimiter: {}", selected.label()))
+                .show_ui(ui, |ui| {
+                    for mode in DelimiterMode::ALL {
+                        ui.selectable_value(&mut format.delimiter, mode.delimiter(), mode.label());
+                    }
+                });
+            egui::ComboBox::from_id_salt("encoding")
+                .selected_text(format!(
+                    "{role} encoding: {}",
+                    encoding_choice_label(format.encoding)
+                ))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut format.encoding, None, "Auto (BOM or UTF-8)");
+                    for encoding in Encoding::ALL {
+                        ui.selectable_value(&mut format.encoding, Some(encoding), encoding.label());
+                    }
+                });
+        });
+        (previous.delimiter, previous.encoding, previous.has_header)
+            != (format.delimiter, format.encoding, format.has_header)
     }
 
     fn show_output_columns(&mut self, ui: &mut egui::Ui) {
@@ -406,6 +495,11 @@ impl JoinDialog {
                     let role = column.source.label();
                     let original =
                         &headers[column.source.index()].as_ref().unwrap().columns[column.column];
+                    let original = if original.is_empty() {
+                        format!("Column {}", column.column + 1)
+                    } else {
+                        original.clone()
+                    };
                     ui.horizontal(|ui| {
                         let included = ui.checkbox(
                             &mut column.included,
@@ -415,12 +509,15 @@ impl JoinDialog {
                             self.output_selected = Some(i);
                         }
                         if ui
-                            .selectable_label(
-                                self.output_selected == Some(i),
-                                format!(
-                                    "Output from {role} column {}: {original}",
-                                    column.column + 1
-                                ),
+                            .add(
+                                egui::Button::selectable(
+                                    self.output_selected == Some(i),
+                                    format!(
+                                        "Output from {role} column {}: {original}",
+                                        column.column + 1
+                                    ),
+                                )
+                                .truncate(),
                             )
                             .clicked()
                         {
@@ -486,7 +583,17 @@ impl JoinDialog {
                             let label = header
                                 .columns
                                 .get(pair[side])
-                                .map(|name| format!("{role} {}: {name}", pair[side] + 1))
+                                .map(|name| {
+                                    format!(
+                                        "{role} {}: {}",
+                                        pair[side] + 1,
+                                        if name.is_empty() {
+                                            format!("Column {}", pair[side] + 1)
+                                        } else {
+                                            name.clone()
+                                        }
+                                    )
+                                })
                                 .unwrap_or_else(|| format!("{role}: choose a column"));
                             egui::ComboBox::from_id_salt(("column", side))
                                 .selected_text(format!("Pair {} · {label}", index + 1))
@@ -584,7 +691,7 @@ impl JoinDialog {
             .open(&mut open).default_width(680.0).min_width(480.0)
             .show(ctx,|ui|{
                 ui.label("Match key columns and create a separate joined file.");
-                ui.small("Saved UTF-8 files with headers. Retain every matching pair. Empty keys never match.");
+                ui.small("Saved files with independent formats. Retain every matching pair. Empty keys never match.");
                 ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant.");
                 egui::ScrollArea::vertical().max_height((ui.available_height()-70.0).min(ctx.content_rect().height()-180.0).max(40.0)).show(ui,|ui|{
                     ui.add_enabled_ui(editable, |ui| {
@@ -602,10 +709,11 @@ impl JoinDialog {
                             column.strong(if side==0{"Main file"}else{"Additional file"});
                             column.add(egui::Label::new(self.paths[side].as_ref().and_then(|p|p.file_name()).map_or_else(||"No file selected".into(),|n|n.to_string_lossy().into_owned())).truncate());
                             if column.add_enabled(editable && can_start,egui::Button::new(if side==0{"Choose Main…"}else{"Choose Additional…"})).clicked(){action=DialogAction::Select(side);}
-                            column.add_enabled_ui(editable,|ui|{
+                            column.add_enabled_ui(editable && can_start,|ui|{
+                                if self.show_input_format(ui, side) { action = DialogAction::ReadFormat(side); }
                                 ui.checkbox(&mut self.require_unique[side], if side == 0 { "Require unique Main key" } else { "Require unique Additional key" });
                                 if let Some(header)=&self.headers[side]{
-                                    ui.small(format!("{} columns · UTF-8 · header row",header.columns.len()));
+                                    ui.small(format!("{} columns · {} · {}",header.columns.len(),header.encoding.label(),if header.has_header {"header row"} else {"no header"}));
                                 }else{ui.label("Key column: choose a file first");}
                             });
                         }
@@ -620,6 +728,11 @@ impl JoinDialog {
                         ui.label(format!("Unmatched: {} Main, {} Additional",a.unmatched_rows[0],a.unmatched_rows[1]));
                         ui.label(format!("Empty keys: {} Main, {} Additional",a.empty_key_rows[0],a.empty_key_rows[1]));
                         ui.label(format!("Duplicate-key groups: {} Main, {} Additional",a.duplicate_groups[0],a.duplicate_groups[1]));
+                        if a.new_columns != [0, 0] {
+                            ui.label(format!("Full scan found {} new Main columns and {} new Additional columns. They are included in the output.", a.new_columns[0], a.new_columns[1]));
+                            ui.small("Review the output columns above. Use Reset Analysis to change their selection, order or headings.");
+                            ui.checkbox(&mut self.acknowledge_layout, "I reviewed the newly discovered output columns.");
+                        }
                         if a.many_to_many_groups > 0 {
                             ui.label(RichText::new(format!("{} many-to-many groups produce {} matching pairs.",a.many_to_many_groups,a.many_to_many_pairs)).strong());
                             ui.checkbox(&mut self.acknowledge_expansion,format!("I understand this will create {} rows.",a.output_rows));
@@ -658,7 +771,7 @@ impl JoinDialog {
                     }else if self.plan.is_some(){
                         if ui.button("Reset Analysis").clicked(){self.reset();}
                         if ui.button("Choose Output…").clicked(){action=DialogAction::ChooseOutput;}
-                        if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion),egui::Button::new("Create Joined File")).clicked(){action=DialogAction::Create;}
+                        if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| (plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion) && (plan.analysis().new_columns == [0, 0] || self.acknowledge_layout)),egui::Button::new("Create Joined File")).clicked(){action=DialogAction::Create;}
                     }else if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some) && self.output_columns.iter().any(|column|column.included),egui::Button::new("Analyze & Preview")).clicked(){
                         action=DialogAction::Analyze;
                     }
@@ -768,12 +881,19 @@ impl QuarryApp {
             }
             DialogAction::Select(side) => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose a saved UTF-8 file")
+                    .set_title("Choose a saved delimited file")
                     .pick_file()
                 {
                     if self.join_input_is_open(&path) {
                         self.join_files.as_mut().unwrap().message=Some("This file is open in Quarry. The first join version uses saved files only. Close that document before selecting it.".into());
                     } else if self.write_slot_available() {
+                        self.join_files.as_mut().unwrap().read_header(side, path);
+                    }
+                }
+            }
+            DialogAction::ReadFormat(side) => {
+                if self.write_slot_available() {
+                    if let Some(path) = self.join_files.as_ref().unwrap().paths[side].clone() {
                         self.join_files.as_mut().unwrap().read_header(side, path);
                     }
                 }
@@ -1745,5 +1865,214 @@ value
             assert!(!app.join_destination_is_available(&alias.join("nested/joined.csv")));
         }
         assert!(app.join_destination_is_available(&directory.path().join("normal-result.csv")));
+    }
+
+    #[test]
+    fn format_controls_join_utf16_headerless_and_windows1252_by_composite_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "é;EU;Left\né;US;Other\n";
+        let mut a = vec![0xfe, 0xff];
+        for unit in text.encode_utf16() {
+            a.extend_from_slice(&unit.to_be_bytes());
+        }
+        let b = b"acct\tarea\tcity\n\xe9\tEU\t\x80\n";
+        let ap = fixture(dir.path(), "main.csv", &a);
+        let bp = fixture(dir.path(), "additional.csv", b);
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        app.open_join_files();
+        app.join_files.as_mut().unwrap().temporary = dir.path().to_path_buf();
+        app.join_files.as_mut().unwrap().read_header(0, ap.clone());
+        finish(&mut app);
+        click(&mut app, &ctx, "Main has a header row");
+        finish(&mut app);
+        click(&mut app, &ctx, "Main delimiter: Auto");
+        click(&mut app, &ctx, "Semicolon");
+        finish(&mut app);
+        app.join_files.as_mut().unwrap().read_header(1, bp.clone());
+        finish(&mut app);
+        assert_eq!(
+            app.join_files.as_ref().unwrap().headers[1]
+                .as_ref()
+                .unwrap()
+                .encoding,
+            Encoding::Utf8,
+            "Auto does not guess a legacy encoding from an ASCII header"
+        );
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert!(app.join_files.as_ref().unwrap().plan.is_none());
+        assert!(
+            app.join_files
+                .as_ref()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Invalid UTF-8")
+        );
+        click(&mut app, &ctx, "Additional encoding: Auto (BOM or UTF-8)");
+        click(&mut app, &ctx, "Windows-1252");
+        finish(&mut app);
+        click(&mut app, &ctx, "Additional delimiter: Auto");
+        click(&mut app, &ctx, "Tab");
+        finish(&mut app);
+        let d = app.join_files.as_ref().unwrap();
+        assert_eq!(d.headers[0].as_ref().unwrap().encoding, Encoding::Utf16Be);
+        assert_eq!(
+            d.headers[1].as_ref().unwrap().encoding,
+            Encoding::Windows1252
+        );
+        assert!(!d.formats[0].has_header);
+        assert!(
+            d.output_has_header,
+            "either source header enables the output header"
+        );
+        click(&mut app, &ctx, "Add key pair");
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let p = app.join_files.as_ref().unwrap().plan.as_ref().unwrap();
+        assert_eq!(p.analysis().matching_pairs, 1);
+        let output = dir.path().join("mixed.csv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(fs::read(&output).unwrap(),
+            "Main column 1;Main column 2;Main column 3;acct;area;city\né;EU;Left;é;EU;€\né;US;Other;;;\n".as_bytes());
+        click(&mut app, &ctx, "Open Joined File");
+        assert_eq!(app.active.document.as_ref().unwrap().data_start, 1);
+        assert_eq!(fs::read(ap).unwrap(), a);
+        assert_eq!(fs::read(bp).unwrap(), b);
+    }
+
+    #[test]
+    fn late_columns_require_review_and_can_be_excluded_after_reset() {
+        for review_current in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ap = fixture(dir.path(), "main.csv", b"id\nx,late\n");
+            let bp = fixture(dir.path(), "additional.csv", b"id\nx\n");
+            let mut app = QuarryApp::new(None, Instant::now());
+            let ctx = context();
+            app.open_join_files();
+            app.join_files.as_mut().unwrap().temporary = dir.path().to_path_buf();
+            app.join_files.as_mut().unwrap().read_header(0, ap);
+            finish(&mut app);
+            app.join_files.as_mut().unwrap().read_header(1, bp);
+            finish(&mut app);
+            click(&mut app, &ctx, "Analyze & Preview");
+            finish(&mut app);
+            let d = app.join_files.as_ref().unwrap();
+            assert_eq!(d.headers[0].as_ref().unwrap().columns.len(), 2);
+            assert_eq!(d.output_columns.len(), 3);
+            assert!(d.output_columns[2].included);
+            assert_eq!(d.output_columns[2].source, JoinSource::Main);
+            assert_eq!(d.output_columns[2].column, 1);
+            let output = dir.path().join("late.csv");
+            app.join_files.as_mut().unwrap().destination = Some(output.clone());
+            click(&mut app, &ctx, "Create Joined File");
+            finish(&mut app);
+            assert!(!output.exists());
+            assert!(app.join_files.as_ref().unwrap().plan.is_some());
+            if review_current {
+                click(
+                    &mut app,
+                    &ctx,
+                    "I reviewed the newly discovered output columns.",
+                );
+            } else {
+                click(&mut app, &ctx, "Reset Analysis");
+                finish(&mut app);
+                click(&mut app, &ctx, "Include Main 2");
+                click(&mut app, &ctx, "Analyze & Preview");
+                finish(&mut app);
+                assert_eq!(
+                    app.join_files
+                        .as_ref()
+                        .unwrap()
+                        .plan
+                        .as_ref()
+                        .unwrap()
+                        .analysis()
+                        .new_columns,
+                    [0, 0]
+                );
+                app.join_files.as_mut().unwrap().destination = Some(output.clone());
+            }
+            click(&mut app, &ctx, "Create Joined File");
+            finish(&mut app);
+            let wanted = if review_current {
+                b"id (Main),id (Additional),Main column 2\nx,x,late\n".as_slice()
+            } else {
+                b"id (Main),id (Additional)\nx,x\n".as_slice()
+            };
+            assert_eq!(fs::read(output).unwrap(), wanted);
+        }
+    }
+
+    #[test]
+    fn failed_layout_analysis_still_reveals_fields_for_a_new_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let ap = fixture(dir.path(), "main.csv", b"id\nx,late\n");
+        let bp = fixture(dir.path(), "additional.csv", b"id\nx,more\n");
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        app.open_join_files();
+        app.join_files.as_mut().unwrap().temporary = dir.path().to_path_buf();
+        app.join_files.as_mut().unwrap().read_header(0, ap.clone());
+        finish(&mut app);
+        app.join_files.as_mut().unwrap().read_header(1, bp.clone());
+        finish(&mut app);
+        let args = std::array::from_fn(|side| JoinInput {
+            path: if side == 0 { ap.clone() } else { bp.clone() },
+            delimiter: Some(b','),
+            has_header: true,
+            encoding: Some(Encoding::Utf8),
+            key_columns: vec![0],
+            expected_version: None,
+            require_unique: false,
+        });
+        // Force the same public limit path with two columns instead of 65,536.
+        app.join_files.as_mut().unwrap().checking = Some(
+            analyze_join_with_output(
+                args,
+                dir.path().to_path_buf(),
+                JoinConfig {
+                    max_columns: 2,
+                    ..JoinConfig::default()
+                },
+                JoinOutputOptions {
+                    known_widths: Some([1, 1]),
+                    columns: Some(vec![
+                        JoinOutputColumn {
+                            source: JoinSource::Main,
+                            column: 0,
+                            name: None,
+                        },
+                        JoinOutputColumn {
+                            source: JoinSource::Additional,
+                            column: 0,
+                            name: None,
+                        },
+                    ]),
+                    include_header: None,
+                },
+            )
+            .unwrap(),
+        );
+        finish(&mut app);
+        let d = app.join_files.as_ref().unwrap();
+        assert!(d.plan.is_none());
+        assert!(d.message.as_ref().unwrap().contains("column limit"));
+        assert_eq!(d.output_columns.len(), 4);
+        click(&mut app, &ctx, "Select no Main columns");
+        click(&mut app, &ctx, "Select no Additional columns");
+        click(&mut app, &ctx, "Include Additional 2");
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let output = dir.path().join("recovered.csv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(fs::read(output).unwrap(), b"Additional column 2\nmore\n");
     }
 }

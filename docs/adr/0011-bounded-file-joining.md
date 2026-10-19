@@ -108,3 +108,35 @@ The header switch is captured by the plan and completion result. Opening the
 result passes the same header mode explicitly, so a header-free first record
 remains data. The saved file always remains independent of source headers and
 source edit history.
+
+## Source formats and complete-width discovery
+
+Each saved input carries independent delimiter, encoding and header choices.
+Auto detects Unicode BOMs or uses UTF-8; it does not guess legacy encodings.
+Picker metadata remains bounded and version-bound. Full analysis validates every
+decoded field, including fields omitted from the output.
+
+The join scanner frames native source records and decodes each record into UTF-8
+before comparison, size accounting and private framing. UTF-16 uses the existing
+structural inspection scanner and aligned reads; validity is checked per complete
+record so an invalid surrogate in a later row does not acquire an earlier row's
+number. Native BOM removal happens once, before decoding. Quoted BOM-looking
+values, embedded CR/LF and quote contents remain data. No shared codec or scanner
+behavior is changed.
+
+Private frame sizes are measured from actual decoded records and comparison keys,
+rather than native file sizes or sampled expansion. Native and decoded records
+remain bounded. The resource reserve includes bounded discovered-column labels
+and their bookkeeping in addition to retained headers and result headings.
+
+The full scan grows source schemas by original column index. A layout captures
+the widths previously shown to its caller, appends newly discovered columns
+selected by default, and requires explicit review before creation. Resetting an
+analysis preserves these discovered identities so users can exclude, reorder or
+rename them before analyzing again. The immutable plan carries the review
+requirement through the core creation boundary, not only a disabled UI button.
+
+Analysis workers expose bounded discovered-schema metadata even if the requested
+result exceeds its column limit. The dialog can therefore reveal all fields and
+allow a smaller selection after that error. Releasing the failed job releases
+its private data; schema metadata alone does not reserve a running-operation slot.

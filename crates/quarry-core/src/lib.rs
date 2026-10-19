@@ -56,12 +56,13 @@ pub use inspection::{
     SourcePreview,
 };
 pub use join::{
-    JoinAnalysis, JoinCase, JoinConfig, JoinDuplicateExample, JoinHeader, JoinInput, JoinInputInfo,
-    JoinJob, JoinMode, JoinPhase, JoinPlan, JoinProgress, JoinSourceVersion, JoinSummary,
-    analyze_join,
+    JoinAnalysis, JoinCase, JoinConfig, JoinDuplicateExample, JoinFormat, JoinHeader, JoinInput,
+    JoinInputInfo, JoinJob, JoinMode, JoinPhase, JoinPlan, JoinProgress, JoinSourceVersion,
+    JoinSummary, analyze_join,
 };
 pub use join::{
     JoinOutputColumn, JoinOutputOptions, JoinSource, analyze_join_with_output, read_join_header,
+    read_join_header_with_format,
 };
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
