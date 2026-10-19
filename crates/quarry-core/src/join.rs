@@ -1488,6 +1488,16 @@ impl JoinPlan {
     ) -> JResult<JoinSummary> {
         state.phase(JoinPhase::Creating);
         state.check()?;
+        // Successful publication must outlive cleanup, including when the
+        // chosen folder reaches our workspace through a symbolic-link alias.
+        let workspace_root = workspace.path.canonicalize()?;
+        let destination_parent = output_parent(destination).canonicalize()?;
+        if destination_parent.starts_with(&workspace_root) {
+            return Err(error(
+                "Choose an output folder outside the join's private temporary workspace.",
+            )
+            .into());
+        }
         let retained = add(self.inputs[0].frame_bytes, self.inputs[1].frame_bytes)?;
         state.add_disk(retained)?;
         for input in &self.inputs {
@@ -2065,5 +2075,43 @@ mod tests {
                 .len(),
             2049
         );
+    }
+    /// A published output must never be removed with the operation's scratch directory.
+    #[test]
+    fn rejects_public_output_inside_the_owned_spill_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = plan(dir.path(), b"id\nx\n", b"id\nx\n");
+        let destination = p.workspace.as_ref().unwrap().path.join("joined.csv");
+        let rejected = match p.start_write(destination.clone()) {
+            Ok(job) => job.wait().is_err(),
+            Err(_) => true,
+        };
+        assert!(
+            rejected,
+            "an output in the owned workspace must be rejected, not reported as saved"
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), b"id\nx\n");
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_output_through_an_alias_to_the_owned_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = plan(dir.path(), b"id\nx\n", b"id\nx\n");
+        let alias = dir.path().join("chosen-folder");
+        std::os::unix::fs::symlink(&p.workspace.as_ref().unwrap().path, &alias).unwrap();
+        let destination = alias.join("joined.csv");
+        let rejected = match p.start_write(destination.clone()) {
+            Ok(job) => job.wait().is_err(),
+            Err(_) => true,
+        };
+        assert!(
+            rejected,
+            "an alias must not evade the workspace output guard"
+        );
+        assert!(!destination.exists());
+        assert!(workspaces(dir.path()).is_empty());
     }
 }

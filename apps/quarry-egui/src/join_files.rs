@@ -181,10 +181,12 @@ impl JoinDialog {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     self.closing = false;
+                    self.quit_after_close = false;
                     self.message = Some(format!("Could not remove private join files: {error}"));
                 }
                 Err(_) => {
                     self.closing = false;
+                    self.quit_after_close = false;
                     self.message = Some("Join cleanup failed.".into());
                 }
             }
@@ -752,5 +754,39 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".quarry-")
         }));
+    }
+    #[test]
+    /// A failed cleanup cancels quitting, so a later dialog Close stays local.
+    fn failed_cleanup_does_not_keep_an_old_quit_request() {
+        for panic in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut dialog = JoinDialog::new(dir.path().to_path_buf());
+            dialog.request_close(true);
+            dialog.cleanup = Some(thread::spawn(move || {
+                if panic {
+                    panic!("synthetic cleanup worker failure");
+                }
+                Err("synthetic cleanup error".to_owned())
+            }));
+            while !dialog.cleanup.as_ref().unwrap().is_finished() {
+                thread::yield_now();
+            }
+            dialog.poll();
+            assert!(!dialog.closing);
+            assert!(
+                dialog.message.as_ref().unwrap().contains("cleanup")
+                    || dialog
+                        .message
+                        .as_ref()
+                        .unwrap()
+                        .contains("private join files")
+            );
+            dialog.request_close(false);
+            assert!(dialog.closing);
+            assert!(
+                !dialog.quit_after_close,
+                "closing the dialog must not retry the cancelled quit"
+            );
+        }
     }
 }

@@ -45,3 +45,9 @@ The candidate app (build 162, revision 8a08066377b10e9f27b1fb0ac20d861f518dd757,
 All 559 workspace tests, formatting, all-target/all-feature Clippy and the workspace release build passed. After the final UI explanatory text change, all 5 focused GUI workflow tests passed again. The 12 core join tests include a nested-loop oracle with forced small spills, repeated header names, empty/missing keys, strict text, source changes, corrupt frames, cancellation, hard-link rejection and private file permissions. GUI tests cover full-tab behavior, input/output reservations, the operation limit and close cleanup.
 
 These checks establish the first saved-file workflow only. No installed production join feature or full #71 acceptance is claimed by this report.
+
+## Review regressions
+
+Two review findings were reproduced by failing tests before their fixes. A destination inside the owned spill workspace could be reported as saved and then removed during workspace cleanup; creation now rejects such destinations, including a symbolic-link alias to that directory. A failed cleanup could preserve an old app-quit request; both ordinary cleanup errors and a panicked cleanup worker now cancel that request, so a later dialog Close remains local.
+
+After these fixes, all 562 workspace tests, formatting, all-target/all-feature Clippy and the release build passed. The earlier native workflow and release measurements above describe the stated candidate revision; these additional checks exercise the review fixes at the core and dialog-state boundaries.
