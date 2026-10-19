@@ -278,6 +278,7 @@ impl JoinDialog {
             .show(ctx,|ui|{
                 ui.label("Match key columns and create a separate joined file.");
                 ui.small("First version: two saved UTF-8 files with headers, unique keys, and all Main rows. Empty keys never match.");
+                ui.small("Keys match exactly, including case and whitespace.");
                 egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-210.0).max(180.0)).show(ui,|ui|{
                     ui.columns(2,|columns|{
                         for (side,column) in columns.iter_mut().enumerate(){
