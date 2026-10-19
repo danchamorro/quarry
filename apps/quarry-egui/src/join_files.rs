@@ -375,6 +375,13 @@ impl QuarryApp {
 
     /// Recheck all live document and writer paths before starting output.
     fn join_destination_is_available(&self, path: &Path) -> bool {
+        // Keep the retained analysis when a picker chooses an existing output.
+        // symlink_metadata also rejects dangling links; only absence is writable.
+        if !matches!(std::fs::symlink_metadata(path), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return false;
+        }
         !self.document_tabs().any(|tab| {
             tab.document.as_ref().is_some_and(|doc| {
                 tabs::paths_alias(path, &doc.logical_path)
@@ -452,7 +459,7 @@ impl QuarryApp {
                     if self.join_destination_is_available(&path) {
                         self.join_files.as_mut().unwrap().destination = Some(path);
                     } else {
-                        self.join_files.as_mut().unwrap().message=Some("This path belongs to an open document or another file operation. Choose a new output.".into());
+                        self.join_files.as_mut().unwrap().message=Some("Choose a new output path. Existing files, open documents and active output destinations cannot be replaced.".into());
                     }
                 }
             }
@@ -860,5 +867,40 @@ mod tests {
             "a cleanup failure must remain visible instead of closing the dialog"
         );
         assert!(!dialog.quit_after_close);
+    }
+    #[test]
+    fn existing_output_keeps_analysis_and_existing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let output = fixture(dir.path(), "existing.csv", b"keep,this\n");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(
+            dialog.plan.is_some(),
+            "an existing output must not consume the analyzed plan"
+        );
+        assert!(dialog.writing.is_none());
+        assert_eq!(fs::read(&output).unwrap(), b"keep,this\n");
+        assert!(!app.join_destination_is_available(&output));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("dangling.csv");
+            std::os::unix::fs::symlink(dir.path().join("missing.csv"), &link).unwrap();
+            assert!(!app.join_destination_is_available(&link));
+        }
+        let fresh = dir.path().join("new.csv");
+        app.join_files.as_mut().unwrap().destination = Some(fresh.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(
+            fs::read(fresh).unwrap(),
+            b"id (Main),name,id (Additional),city\nb,Bob,b,LA\na,Alice,a,Seattle\nz,Last,,\n"
+        );
     }
 }
