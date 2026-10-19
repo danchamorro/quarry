@@ -38,6 +38,7 @@ enum DialogAction {
 }
 
 impl JoinDialog {
+    /// Initialize an empty draft without opening files or allocating private data.
     fn new(temporary: PathBuf) -> Self {
         Self {
             paths: [None, None],
@@ -59,14 +60,17 @@ impl JoinDialog {
         }
     }
 
+    /// Count header, analysis and creation work against the shared operation limit.
     pub(super) fn running_operation(&self) -> bool {
         self.header_job.is_some() || self.checking.is_some() || self.writing.is_some()
     }
 
+    /// Keep the dialog alive until both workers and explicit cleanup have finished.
     fn busy(&self) -> bool {
         self.running_operation() || self.cleanup.is_some()
     }
 
+    /// Protect selected paths only while a worker or valid preview uses them.
     pub(super) fn reserved_inputs(&self) -> impl Iterator<Item = &Path> {
         let retained = self.busy() || self.plan.is_some();
         self.paths
@@ -75,6 +79,7 @@ impl JoinDialog {
             .filter_map(|path| path.as_deref())
     }
 
+    /// Reserve the chosen destination until the retained plan is released.
     pub(super) fn reserved_output(&self) -> Option<&Path> {
         if self.plan.is_some() || self.writing.is_some() {
             self.destination.as_deref()
@@ -83,6 +88,7 @@ impl JoinDialog {
         }
     }
 
+    /// Release a retained plan off-thread before allowing another analysis.
     fn reset(&mut self) {
         if let Some(plan) = self.plan.take() {
             self.cleanup = Some(thread::spawn(move || {
@@ -94,6 +100,7 @@ impl JoinDialog {
         self.message = None;
     }
 
+    /// Cancel active work and defer close or quit until cleanup completes.
     pub(super) fn request_close(&mut self, quit: bool) {
         self.closing = true;
         self.quit_after_close |= quit;
@@ -104,6 +111,7 @@ impl JoinDialog {
         self.message = Some("Finishing join cleanup before closing…".into());
     }
 
+    /// Request worker cancellation without dropping a running writer on the UI thread.
     fn cancel(&mut self) {
         if let Some(job) = &self.checking {
             job.cancel();
@@ -114,6 +122,7 @@ impl JoinDialog {
         self.cancel_requested = true;
     }
 
+    /// Adopt completed workers and retain published results even after cancellation.
     fn poll(&mut self) {
         if self
             .header_job
@@ -182,6 +191,7 @@ impl JoinDialog {
         }
     }
 
+    /// Read picker metadata off-thread with a separate bounded label budget.
     fn read_header(&mut self, side: usize, path: PathBuf) {
         self.paths[side] = Some(path.clone());
         self.headers[side] = None;
@@ -231,6 +241,7 @@ impl JoinDialog {
         ));
     }
 
+    /// Capture explicit saved-file settings for the full analysis worker.
     fn start_analysis(&mut self) {
         let inputs = std::array::from_fn(|side| JoinInput {
             path: self.paths[side].as_ref().unwrap().clone(),
@@ -248,6 +259,7 @@ impl JoinDialog {
         }
     }
 
+    /// Consume the retained plan only after application-level guards pass.
     fn start_write(&mut self) {
         let Some(plan) = self.plan.take() else {
             return;
@@ -264,6 +276,7 @@ impl JoinDialog {
         }
     }
 
+    /// Render the modeless workflow while leaving unrelated documents usable.
     fn show(&mut self, ctx: &egui::Context, can_start: bool) -> DialogAction {
         self.poll();
         if self.closing && !self.busy() && self.plan.is_none() {
@@ -354,6 +367,7 @@ impl JoinDialog {
 }
 
 impl QuarryApp {
+    /// Apply the existing alias rules to live join input and output reservations.
     pub(super) fn join_reserves_path(&self, path: &Path) -> bool {
         self.join_files.as_ref().is_some_and(|join| {
             join.reserved_inputs()
@@ -362,6 +376,7 @@ impl QuarryApp {
         })
     }
 
+    /// Refuse saved-file input that would silently omit an open document’s edits.
     fn join_input_is_open(&self, path: &Path) -> bool {
         self.document_tabs().any(|tab| {
             tab.document.as_ref().is_some_and(|doc| {
@@ -374,6 +389,7 @@ impl QuarryApp {
         })
     }
 
+    /// Recheck all live document and writer paths before starting output.
     fn join_destination_is_available(&self, path: &Path) -> bool {
         !self.document_tabs().any(|tab| {
             tab.document.as_ref().is_some_and(|doc| {
@@ -390,12 +406,14 @@ impl QuarryApp {
             .is_some_and(|destination| tabs::paths_alias(path, destination))
     }
 
+    /// Keep one join draft, using the configured private-storage location.
     pub(super) fn open_join_files(&mut self) {
         if self.join_files.is_none() {
             self.join_files = Some(JoinDialog::new(self.working_directory.clone()));
         }
     }
 
+    /// Route UI actions through fresh capacity and path-reservation checks.
     pub(super) fn show_join_files(&mut self, ctx: &egui::Context) {
         let can_start = self.write_slot_available();
         let Some(dialog) = self.join_files.as_mut() else {
@@ -494,6 +512,7 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Render the real workflow with synthetic accessibility input.
     fn frame(
         app: &mut QuarryApp,
         ctx: &egui::Context,
@@ -511,6 +530,7 @@ mod tests {
             |ctx| app.show_join_files(ctx),
         )
     }
+    /// Activate a visible control through its AccessKit action.
     fn click(app: &mut QuarryApp, ctx: &egui::Context, label: &str) {
         frame(app, ctx, vec![]);
         let output = frame(app, ctx, vec![]);
@@ -532,6 +552,7 @@ mod tests {
             )],
         );
     }
+    /// Poll real worker completion for deterministic integration assertions.
     fn finish(app: &mut QuarryApp) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while app.join_files.as_ref().is_some_and(JoinDialog::busy) {
@@ -540,11 +561,13 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
     }
+    /// Create synthetic CSV sources isolated from user data.
     fn fixture(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, body).unwrap();
         path
     }
+    /// Select both sources through the same asynchronous header path as the picker.
     fn prepare(app: &mut QuarryApp, dir: &Path) -> (PathBuf, PathBuf) {
         let a = fixture(dir, "main.csv", b"id,name\nb,Bob\na,Alice\nz,Last\n");
         let b = fixture(dir, "additional.csv", b"id,city\na,Seattle\nb,LA\n");
@@ -556,6 +579,7 @@ mod tests {
         finish(app);
         (a, b)
     }
+    /// Enable accessibility actions on the production visual style.
     fn context() -> egui::Context {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -564,6 +588,7 @@ mod tests {
     }
 
     #[test]
+    /// Check the complete create/open flow while another document retains edits.
     fn complete_workflow_opens_result_and_preserves_other_dirty_documents() {
         let dir = tempfile::tempdir().unwrap();
         let other = fixture(dir.path(), "other.csv", b"name,id\nOther,1\n");
@@ -605,6 +630,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify reservations follow retained analysis rather than dialog visibility alone.
     fn analysis_rechecks_open_inputs_and_reset_releases_reservations() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = QuarryApp::new(None, Instant::now());
@@ -640,6 +666,7 @@ mod tests {
     }
 
     #[test]
+    /// Keep an idle preview cheap while preventing a third active file operation.
     fn operation_limit_is_rechecked_and_idle_preview_does_not_take_a_slot() {
         let dir = tempfile::tempdir().unwrap();
         let other = fixture(dir.path(), "other.csv", b"name,id\none,1\n");
@@ -674,6 +701,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve the published file and all existing tabs when opening is refused.
     fn full_tab_strip_keeps_saved_result_available() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = QuarryApp::new(None, Instant::now());
@@ -698,6 +726,7 @@ mod tests {
     }
 
     #[test]
+    /// Exercise deferred close without discarding unrelated unsaved state.
     fn closing_during_analysis_waits_for_cleanup_and_retains_other_work() {
         let dir = tempfile::tempdir().unwrap();
         let other = fixture(dir.path(), "other.csv", b"name,id\nBefore,1\n");

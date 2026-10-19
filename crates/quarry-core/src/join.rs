@@ -111,6 +111,7 @@ pub enum JoinPhase {
 }
 
 impl JoinPhase {
+    /// Provide a stable user-facing name for each background phase.
     pub fn label(self) -> &'static str {
         match self {
             Self::Inspecting => "Inspecting inputs",
@@ -154,6 +155,7 @@ impl Progress {
         }
     }
 
+    /// Stop at bounded work checkpoints when cancellation is requested.
     fn check(&self) -> JResult<()> {
         if self.cancel.load(Ordering::Acquire) {
             Err(Failure::Cancelled)
@@ -162,11 +164,13 @@ impl Progress {
         }
     }
 
+    /// Change the visible phase and reset its phase-local row counter.
     fn phase(&self, phase: JoinPhase) {
         self.phase.store(phase as usize, Ordering::Release);
         self.records.store(0, Ordering::Release);
     }
 
+    /// Track logical spill and staging bytes with checked arithmetic.
     fn add_disk(&self, bytes: u64) -> JResult<()> {
         let current = self.temporary.load(Ordering::Acquire);
         let next = add(current, bytes)?;
@@ -183,6 +187,7 @@ pub struct JoinJob<T> {
 }
 
 impl<T: Send + 'static> JoinJob<T> {
+    /// Mark completion even during unwinding so UI polling cannot wait forever.
     fn spawn(
         work: impl FnOnce(&Progress) -> JResult<T> + Send + 'static,
     ) -> Result<Self, QuarryError> {
@@ -221,10 +226,12 @@ impl<T: Send + 'static> JoinJob<T> {
 }
 
 impl<T> JoinJob<T> {
+    /// Request cooperative cancellation; a published result remains successful.
     pub fn cancel(&self) {
         self.state.cancel.store(true, Ordering::Release);
     }
 
+    /// Read progress without joining or blocking the UI thread.
     pub fn progress(&self) -> JoinProgress {
         let phase = match self.state.phase.load(Ordering::Acquire) {
             0 => JoinPhase::Inspecting,
@@ -268,6 +275,7 @@ impl From<io::Error> for Failure {
     }
 }
 
+/// Report an operation-wide failure without inventing a source location.
 fn error(reason: impl ToString) -> QuarryError {
     QuarryError::JoinFile {
         path: None,
@@ -275,6 +283,7 @@ fn error(reason: impl ToString) -> QuarryError {
         reason: reason.to_string(),
     }
 }
+/// Retain the input path and physical record in user-facing failures.
 fn input_error(path: &Path, record: Option<u64>, reason: impl ToString) -> QuarryError {
     QuarryError::JoinFile {
         path: Some(path.to_path_buf()),
@@ -282,16 +291,19 @@ fn input_error(path: &Path, record: Option<u64>, reason: impl ToString) -> Quarr
         reason: reason.to_string(),
     }
 }
+/// Reject cardinality or byte-count overflow instead of wrapping.
 fn add(left: u64, right: u64) -> JResult<u64> {
     left.checked_add(right)
         .ok_or_else(|| error("Join size or row count exceeds the supported range.").into())
 }
+/// Reject expansion or allocation overflow before any output is created.
 fn mul(left: u64, right: u64) -> JResult<u64> {
     left.checked_mul(right)
         .ok_or_else(|| error("Join size or row count exceeds the supported range.").into())
 }
 
 impl JoinConfig {
+    /// Require the configured live payloads and bookkeeping to fit the memory ceiling.
     fn validate(self, temporary: &Path) -> Result<(), QuarryError> {
         if self.memory_bytes > 512 * 1024 * 1024
             || self.max_record_bytes == 0
@@ -330,6 +342,7 @@ impl JoinConfig {
         Ok(())
     }
 
+    /// Derive a bounded merge width from observed keys and reserved live memory.
     fn fan_in(self, max_key: usize) -> usize {
         // Headers and one record remain live while merging. Keep an additional
         // head allowance for advancing a stream, plus fixed I/O and path state.
@@ -346,6 +359,7 @@ impl JoinConfig {
             .max(2)
     }
 
+    /// Keep every private frame within the input record and key limits.
     fn frame_limits(self) -> FrameLimits {
         FrameLimits {
             max_key_bytes: self.max_record_bytes.saturating_add(9),
@@ -414,6 +428,7 @@ impl<R: Read> Read for CancelRead<'_, R> {
     }
 }
 
+/// Preserve I/O failures while translating cancellation and malformed frames.
 fn frame_error(failure: FrameReadError, state: &Progress) -> Failure {
     if state.cancel.load(Ordering::Acquire) {
         return Failure::Cancelled;
@@ -425,6 +440,7 @@ fn frame_error(failure: FrameReadError, state: &Progress) -> Failure {
     }
 }
 
+/// Read one bounded key while retaining its payload on disk.
 fn read_head(
     reader: &mut impl Read,
     config: JoinConfig,
@@ -433,6 +449,7 @@ fn read_head(
     spill::read_head(&mut CancelRead { reader, state }, config.frame_limits())
         .map_err(|error| frame_error(error, state))
 }
+/// Read a bounded payload with cancellation checkpoints inside large records.
 fn read_record(
     reader: &mut impl Read,
     length: usize,
@@ -477,6 +494,7 @@ impl<'a> Runs<'a> {
         }
     }
 
+    /// Flush accumulated rows before admitting another record beyond the run target.
     fn push(&mut self, entry: Entry) -> JResult<()> {
         self.state.check()?;
         let size = entry
@@ -494,6 +512,7 @@ impl<'a> Runs<'a> {
         Ok(())
     }
 
+    /// Write a sorted private run, breaking equal keys by source ordinal.
     fn flush(&mut self) -> JResult<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -515,6 +534,7 @@ impl<'a> Runs<'a> {
         self.carry(Run { path, bytes }, 0)
     }
 
+    /// Compact full levels so run-path bookkeeping stays bounded.
     fn carry(&mut self, run: Run, mut level: usize) -> JResult<()> {
         let mut pending = run;
         loop {
@@ -534,6 +554,7 @@ impl<'a> Runs<'a> {
         }
     }
 
+    /// Keep one key per input stream and one payload live during a merge.
     fn merge(&self, runs: Vec<Run>) -> JResult<Run> {
         self.state.check()?;
         let mut readers: Vec<_> = runs
@@ -576,6 +597,7 @@ impl<'a> Runs<'a> {
         Ok(Run { path, bytes })
     }
 
+    /// Collapse all retained levels into a single ordered private stream.
     fn finish(mut self) -> JResult<Run> {
         self.flush()?;
         let mut runs: Vec<_> = self.levels.drain(..).flatten().collect();
@@ -700,6 +722,7 @@ fn scan(
     }
 }
 
+/// Validate all text, including unselected columns, before parsing field values.
 fn fields<'a>(
     record: &'a [u8],
     delimiter: u8,
@@ -724,6 +747,7 @@ fn fields<'a>(
         .map_err(|e| input_error(path, Some(row + 1), e).into())
 }
 
+/// Distinguish matchable values from ordinal-tagged empty or missing keys.
 fn key(fields: &[Cow<'_, [u8]>], column: usize, ordinal: u64) -> Vec<u8> {
     match fields.get(column).filter(|field| !field.is_empty()) {
         Some(value) => {
@@ -748,6 +772,7 @@ struct Inspected {
     max_key_bytes: usize,
 }
 
+/// Scan the complete source to validate text and size its private frames.
 fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<Inspected> {
     state.phase(JoinPhase::Inspecting);
     if !input.has_header {
@@ -860,6 +885,7 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
     })
 }
 
+/// Reject canonical aliases and Unix hard links as self joins.
 fn same_input(left: &Inspected, right: &Inspected) -> JResult<bool> {
     if left.info.path.canonicalize()? == right.info.path.canonicalize()? {
         return Ok(true);
@@ -879,6 +905,7 @@ fn same_input(left: &Inspected, right: &Inspected) -> JResult<bool> {
     }
 }
 
+/// Recheck the inspected source while producing its ordered private stream.
 fn prepare(
     input: Inspected,
     workspace: &SpillWorkspace,
@@ -980,6 +1007,7 @@ fn encode<'a>(
     Ok(output)
 }
 
+/// Assign deterministic unique names without quadratic suffix searches.
 fn output_header(
     inputs: &[PreparedInput; 2],
     config: JoinConfig,
@@ -1036,6 +1064,7 @@ fn output_header(
     )
 }
 
+/// Pad absent fields and serialize values without changing their contents.
 fn output_record(
     inputs: &[PreparedInput; 2],
     left: &[u8],
@@ -1094,6 +1123,7 @@ impl<'a> Stream<'a> {
             state,
         })
     }
+    /// Verify the comparison key against its payload before releasing key memory.
     fn record(&mut self) -> JResult<(Vec<u8>, u64)> {
         let head = self.head.take().expect("stream head");
         let record = read_record(&mut self.reader, head.record_len, self.config, self.state)?;
@@ -1123,6 +1153,7 @@ impl<'a> Stream<'a> {
         drop(parsed);
         Ok((record, head.ordinal))
     }
+    /// Load the next head only after the previous callback releases its payload.
     fn advance(&mut self) -> JResult<()> {
         self.head = read_head(&mut self.reader, self.config, self.state)?;
         Ok(())
@@ -1176,6 +1207,7 @@ fn walk(
     Ok(())
 }
 
+/// Reject duplicate keys and malformed ordering before retaining a plan.
 fn validate_keys(input: &PreparedInput, config: JoinConfig, state: &Progress) -> JResult<()> {
     let mut reader = BufReader::new(File::open(&input.sorted)?);
     let mut previous: Option<FrameHead> = None;
@@ -1223,6 +1255,7 @@ fn validate_keys(input: &PreparedInput, config: JoinConfig, state: &Progress) ->
     Ok(())
 }
 
+/// Bound displayed columns and text independently of full result values.
 fn preview_row(
     record: &[u8],
     delimiter: u8,
@@ -1252,6 +1285,7 @@ fn preview_row(
     Ok(output)
 }
 
+/// Count the full join while retaining only a bounded preview in source order.
 fn analyze_prepared(
     inputs: &[PreparedInput; 2],
     config: JoinConfig,
@@ -1322,6 +1356,7 @@ fn analyze_prepared(
     })
 }
 
+/// Keep the original failure visible when private-file cleanup also fails.
 fn cleanup_failure(workspace: SpillWorkspace, failure: Failure) -> Failure {
     match workspace.cleanup() {
         Ok(()) => failure,
@@ -1386,6 +1421,7 @@ pub fn analyze_join(
     })
 }
 
+/// Account for simultaneous staging and ordering files on their actual volumes.
 fn check_creation_space(
     temporary: &Path,
     destination: &Path,
@@ -1443,6 +1479,7 @@ impl JoinPlan {
         })
     }
 
+    /// Validate count, shape and byte size before guarded atomic publication.
     fn write_inner(
         &self,
         workspace: &SpillWorkspace,
@@ -1578,6 +1615,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// Exercise multiple spill passes with small but valid resource budgets.
     fn config() -> JoinConfig {
         JoinConfig {
             memory_bytes: 512 * 1024,
@@ -1601,6 +1639,7 @@ mod tests {
             key_column: 0,
         })
     }
+    /// Exercise analysis through the public worker boundary with synthetic files.
     fn plan(dir: &Path, a: &[u8], b: &[u8]) -> JoinPlan {
         analyze_join(inputs(dir, a, b), dir.to_path_buf(), config())
             .unwrap()
@@ -1608,6 +1647,7 @@ mod tests {
             .unwrap()
             .unwrap()
     }
+    /// Require failed analysis to return an error through the public boundary.
     fn failure(dir: &Path, a: &[u8], b: &[u8]) -> String {
         match analyze_join(inputs(dir, a, b), dir.to_path_buf(), config())
             .unwrap()
@@ -1617,6 +1657,7 @@ mod tests {
             _ => panic!("expected failure"),
         }
     }
+    /// Identify owned scratch artifacts without including fixture files.
     fn workspaces(dir: &Path) -> Vec<PathBuf> {
         fs::read_dir(dir)
             .unwrap()
@@ -1631,6 +1672,7 @@ mod tests {
     }
 
     #[test]
+    /// Compare exact bytes with a handwritten oracle for quoting, padding and row order.
     fn left_join_preserves_values_missing_fields_and_original_order() {
         let dir = tempfile::tempdir().unwrap();
         let a=b"key,label\nb,\"B, \"\"quoted\"\"\"\na,\"line one\nline two\"\n,empty\n01,leading zero\n1,number text\n ,space\nz\n";
@@ -1663,6 +1705,7 @@ mod tests {
     }
 
     #[test]
+    /// Use a separate nested-loop oracle while forcing leveled external merges.
     fn independent_nested_loop_oracle_matches_many_forced_spill_passes() {
         let dir = tempfile::tempdir().unwrap();
         let left: Vec<_> = (0..257)
@@ -1704,6 +1747,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve the Main-side contract even when no records can match.
     fn header_only_and_no_matches_are_valid_left_joins() {
         let dir = tempfile::tempdir().unwrap();
         let p = plan(dir.path(), b"key,x\n", b"key,y\nz,extra\n");
@@ -1732,6 +1776,7 @@ mod tests {
     }
 
     #[test]
+    /// Separate unmatchable empty values from repeated valid comparison keys.
     fn duplicate_keys_fail_but_empty_keys_never_match_or_fail_uniqueness() {
         let dir = tempfile::tempdir().unwrap();
         assert!(failure(dir.path(), b"id\nx\nx\n", b"id\nx\n").contains("Repeated key"));
@@ -1753,6 +1798,7 @@ mod tests {
     }
 
     #[test]
+    /// Reject malformed data before creating any output, including unused values.
     fn invalid_unselected_text_and_late_extra_fields_block_analysis() {
         let dir = tempfile::tempdir().unwrap();
         assert!(failure(dir.path(), b"id,label\nx,\xff\n", b"id\nx\n").contains("Invalid UTF-8"));
@@ -1763,6 +1809,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify serialization preserves literal BOM-looking values and distinct headings.
     fn leading_bom_values_and_duplicate_header_names_survive_reopening() {
         let dir = tempfile::tempdir().unwrap();
         let p = plan(
@@ -1823,6 +1870,7 @@ mod tests {
     }
 
     #[test]
+    /// Exercise the publication boundary against source, destination and private-data conflicts.
     fn changed_sources_existing_destinations_and_bad_frames_never_publish() {
         let dir = tempfile::tempdir().unwrap();
         let p = plan(dir.path(), b"id\nx\n", b"id\nx\n");
@@ -1844,6 +1892,7 @@ mod tests {
     }
 
     #[test]
+    /// Keep matching independent of presentation and avoid implicit text cleanup.
     fn exact_case_and_whitespace_are_significant_and_key_can_be_later_column() {
         let dir = tempfile::tempdir().unwrap();
         let mut args = inputs(
@@ -1872,6 +1921,7 @@ mod tests {
     }
 
     #[test]
+    /// Fail unsupported requests before creating scratch storage.
     fn unsupported_formats_self_joins_and_inadequate_budgets_are_explicit() {
         let dir = tempfile::tempdir().unwrap();
         let mut args = inputs(dir.path(), b"id\nx\n", b"id\nx\n");
@@ -1909,6 +1959,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    /// Verify alias rejection and permissions on a retained real analysis plan.
     fn hardlink_inputs_are_rejected_and_retained_spills_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -1940,6 +1991,7 @@ mod tests {
     }
 
     #[test]
+    /// Cancel after actual row generation begins and verify owned-file cleanup.
     fn cancelling_a_running_writer_releases_spills_and_keeps_sources() {
         let dir = tempfile::tempdir().unwrap();
         let a = format!(
@@ -1979,6 +2031,7 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), a.as_bytes());
     }
     #[test]
+    /// Exercise repeated-name disambiguation without restarting suffix scans.
     fn many_identical_headers_have_unique_bounded_names() {
         let dir = tempfile::tempdir().unwrap();
         let header = format!("{}\n", vec!["same"; 2048].join(","));

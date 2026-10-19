@@ -5,15 +5,15 @@ Date: 2026-10-18. Initial saved-file slice of [#71](https://github.com/danchamor
 ## Release probe
 
 - VMPal macOS VM, Apple M3 Max (Virtual), 16 GiB RAM; macOS 27.0.1 (26A434); Rust 1.88.0.
-- Release build of the public engine example, source revision 7cea944a91475764f05327131fd3994c0d574d0a.
+- Release build of the public engine example, source revision 8a08066377b10e9f27b1fb0ac20d861f518dd757.
 - Main: 200,000 rows with a six-digit key in permuted source order and a 251-byte text field. Additional: 100,000 odd-numbered keys with a 71-byte text field. Both are headered UTF-8 comma-delimited files with LF separators.
 - Inputs total 59,700,017 bytes. Expected matches: 99,999. Expected result: 200,000 rows and 59,899,960 bytes in original Main order.
 - Two sequential warm runs. Inputs were hashed before measurement; no cache eviction or concurrent build/test load. Timing includes the example's polling. RSS comes from /usr/bin/time -l. Temporary disk is the engine's tracked logical file-byte peak, including output staging, rather than an independent filesystem allocation sampler.
 
 | Run | Total seconds | Maximum RSS bytes | Tracked peak temporary bytes |
 | --- | ---: | ---: | ---: |
-| 1 | 1.046636 | 52,117,504 | 201,599,883 |
-| 2 | 0.977959 | 52,101,120 | 201,599,883 |
+| 1 | 0.930623 | 52,084,736 | 201,599,883 |
+| 2 | 0.852696 | 52,068,352 | 201,599,883 |
 
 Both output files match this independently generated SHA-256:
 
@@ -31,4 +31,17 @@ This probe exercises only the first saved-file slice: headered UTF-8 files, one 
 
 It is smaller than VM RAM and has no duplicate expansion. It does not establish the full #71 large-file acceptance. The larger-than-RAM, skewed-key, mixed-encoding, composite-key and complete lifecycle matrix remains required under the linked implementation tickets.
 
-Native desktop evidence and the final regression count will be added before submitting #120.
+## Native desktop and regression checks
+
+The candidate app (build 162, revision 8a08066377b10e9f27b1fb0ac20d861f518dd757, clean source) was packaged and driven through VMPal on the same VM. The installed main app remained build 157.
+
+- Opened a separate document and made an unsaved cell edit.
+- Opened Join Files, selected two saved inputs through native file dialogs, and selected their first-column keys.
+- Analyze & Preview reported 3 Main rows, 2 Additional rows, 2 matching pairs, 1 unmatched Main row and 0 empty keys. The preview retained Main order.
+- Chose a new destination through the native save dialog and created a 3-row, 73-byte output.
+- Verified the complete output bytes against a handwritten oracle and confirmed both inputs and the separate document's on-disk bytes were unchanged.
+- Opened the result in a new tab, edited a cell and undid the edit. The other tab retained its earlier unsaved value. Restored the synthetic edits with Undo and quit normally.
+
+All 559 workspace tests, formatting, all-target/all-feature Clippy and the workspace release build passed. After the final UI explanatory text change, all 5 focused GUI workflow tests passed again. The 12 core join tests include a nested-loop oracle with forced small spills, repeated header names, empty/missing keys, strict text, source changes, corrupt frames, cancellation, hard-link rejection and private file permissions. GUI tests cover full-tab behavior, input/output reservations, the operation limit and close cleanup.
+
+These checks establish the first saved-file workflow only. No installed production join feature or full #71 acceptance is claimed by this report.
