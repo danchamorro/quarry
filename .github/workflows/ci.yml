@@ -34,6 +34,8 @@ jobs:
 
   windows-core:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
