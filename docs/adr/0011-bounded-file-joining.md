@@ -34,6 +34,10 @@ Keep logical-source, working-generation, format and overlay provenance with the 
 
 Every workspace and spill file must be owner-only and clear inherited macOS ACLs before writing values. Reuse the same protection as #118. The final output is independently staged on its destination filesystem and published with create-new semantics only after source, output-count/schema, and cancellation checks. Report cleanup errors without deleting unrelated files. After atomic publication, cancellation retains the completed result.
 
+For join and append-combine create-new outputs, capture the destination directory before checking its workspace membership. On Unix, retain a directory descriptor and use descriptor-relative private staging, no-replace publication and owned-file cleanup. A later symbolic-link retarget must neither redirect publication into a workspace nor strand its staging in the original folder. The membership check walks the captured directory's ancestry by identity. On Windows, retain non-delete-sharing handles for each resolved ancestor and reject changed/reparse-point components; no new Windows application work is implied.
+
+A successful write reports the path of the captured directory if the requested alias no longer names it. Report post-publication staging cleanup failures alongside completion and retain the output. Cleanup removes only the owned data file and its empty staging directory; unrelated entries prevent directory removal and remain untouched. The same-filesystem private fallback for a macOS file-only drop folder remains supported. Existing Save As, source replacement and structural-edit publication constructors retain their established behavior.
+
 Comparison normalization never changes emitted values. Validate UTF-8 explicitly because the existing decoder's UTF-8 branch intentionally returns raw bytes. Keep full-width source identities and output projection separate from the grid's visible columns. Sort's one-input record-multiset verifier is not a join verifier; verify pair cardinality, required unmatched records, projection, and the specified ordinal order instead.
 
 ## Alternatives

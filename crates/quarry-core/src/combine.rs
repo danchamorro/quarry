@@ -443,8 +443,8 @@ impl CombinePlan {
                 return Err(QuarryError::SourceChanged);
             }
             match output.publish(self.data_rows, bytes_written, &state.cancel)? {
-                FilterExportOutcome::Complete(_) => Ok(Some(CombineSummary {
-                    destination,
+                FilterExportOutcome::Complete(summary) => Ok(Some(CombineSummary {
+                    destination: summary.destination,
                     data_rows: self.data_rows,
                     bytes_written,
                 })),

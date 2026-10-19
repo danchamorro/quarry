@@ -2086,6 +2086,7 @@ pub(crate) struct ExportTarget {
     suppress_next_source_bom: bool,
     // Keeps private staging owned until publication or cleanup, on the destination volume.
     _private_directory: Option<tempfile::TempDir>,
+    pinned_staging: Option<crate::destination::StagedDestination>,
     private_publication: Option<Arc<PrivatePublication>>,
     temporary: PathBuf,
     destination: PathBuf,
@@ -2095,7 +2096,7 @@ pub(crate) struct ExportTarget {
 }
 
 /// Reserves private staging on the output volume, including file-only drop folders.
-fn private_staging_directory(parent: &Path) -> io::Result<tempfile::TempDir> {
+pub(crate) fn private_staging_directory(parent: &Path) -> io::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     let prefix = format!(".quarry-export-{}-", std::process::id());
     builder.prefix(&prefix);
@@ -2124,10 +2125,40 @@ impl ExportTarget {
         sources: Vec<(PathBuf, SourceStamp)>,
         destination: PathBuf,
     ) -> Result<Self, QuarryError> {
+        Self::new_combined_at(
+            sources,
+            crate::destination::PreparedDestination::new(destination)?,
+        )
+    }
+
+    pub(crate) fn new_combined_at(
+        sources: Vec<(PathBuf, SourceStamp)>,
+        destination: crate::destination::PreparedDestination,
+    ) -> Result<Self, QuarryError> {
+        let physical = destination.physical_path();
         for (path, _) in &sources {
-            validate_destination(path, &destination)?;
+            validate_destination(path, &physical)?;
         }
-        let mut target = Self::create(destination, Publication::CreateNew)?;
+        let (staging, file) = destination
+            .stage()
+            .map_err(|error| storage_error(output_parent(&physical), error))?;
+        let temporary = staging.temporary().to_path_buf();
+        let mut target = Self {
+            writer: Some(BufWriter::new(file)),
+            source_encoding: crate::Encoding::Utf8,
+            output_encoding: crate::Encoding::Utf8,
+            encoded_bytes_written: 0,
+            record_limit: DEFAULT_MAX_RECORD_BYTES,
+            suppress_next_source_bom: false,
+            _private_directory: None,
+            destination: staging.reported_path(),
+            pinned_staging: Some(staging),
+            private_publication: None,
+            temporary,
+            publication: Publication::CreateNew,
+            first_record_bom_guard: FirstRecordBomGuard::Inactive,
+            additional_sources: Vec::new(),
+        };
         target.additional_sources = sources;
         target.ensure_source_unchanged()?;
         Ok(target)
@@ -2328,6 +2359,7 @@ impl ExportTarget {
                         record_limit: DEFAULT_MAX_RECORD_BYTES,
                         suppress_next_source_bom: false,
                         _private_directory: private_directory,
+                        pinned_staging: None,
                         private_publication: None,
                         temporary,
                         destination,
@@ -2576,7 +2608,7 @@ impl ExportTarget {
         cancel_requested: &AtomicBool,
     ) -> Result<FilterExportOutcome, QuarryError> {
         self.publish_inner(rows_written, bytes_written, cancel_requested, false)
-            .map(|(outcome, _)| outcome)
+            .map(|(outcome, _, _)| outcome)
     }
 
     pub(crate) fn publish_with_stamp(
@@ -2586,6 +2618,18 @@ impl ExportTarget {
         cancel_requested: &AtomicBool,
     ) -> Result<(FilterExportOutcome, Option<SourceStamp>), QuarryError> {
         self.publish_inner(rows_written, bytes_written, cancel_requested, true)
+            .map(|(outcome, stamp, _)| (outcome, stamp))
+    }
+
+    /// Report post-publication staging cleanup without hiding the saved file.
+    pub(crate) fn publish_with_cleanup(
+        self,
+        rows_written: u64,
+        bytes_written: u64,
+        cancel_requested: &AtomicBool,
+    ) -> Result<(FilterExportOutcome, Option<String>), QuarryError> {
+        self.publish_inner(rows_written, bytes_written, cancel_requested, false)
+            .map(|(outcome, _, warning)| (outcome, warning))
     }
 
     /// Restores replacement permissions inside private staging, then publishes atomically.
@@ -2595,12 +2639,12 @@ impl ExportTarget {
         _bytes_written: u64,
         cancel_requested: &AtomicBool,
         capture_stamp: bool,
-    ) -> Result<(FilterExportOutcome, Option<SourceStamp>), QuarryError> {
+    ) -> Result<(FilterExportOutcome, Option<SourceStamp>, Option<String>), QuarryError> {
         let bytes_written = self.encoded_bytes_written;
         if cancel_requested.load(Ordering::Acquire) {
             drop(self.writer.take());
             self.remove_temporary()?;
-            return Ok((FilterExportOutcome::Cancelled, None));
+            return Ok((FilterExportOutcome::Cancelled, None, None));
         }
         let mut writer = self.writer.take().expect("export writer is present");
         let parent = output_parent(&self.destination);
@@ -2650,11 +2694,11 @@ impl ExportTarget {
         if let Some(publication) = &self.private_publication
             && !publication.wait()
         {
-            return Ok((FilterExportOutcome::Cancelled, None));
+            return Ok((FilterExportOutcome::Cancelled, None, None));
         }
         if cancel_requested.load(Ordering::Acquire) {
             self.remove_temporary()?;
-            return Ok((FilterExportOutcome::Cancelled, None));
+            return Ok((FilterExportOutcome::Cancelled, None, None));
         }
         if let Err(error) = self.ensure_source_unchanged() {
             self.remove_temporary()?;
@@ -2662,19 +2706,23 @@ impl ExportTarget {
         }
         let publish_result = match &self.publication {
             Publication::CreateNew | Publication::GuardedCreateNew { .. } => {
-                publish_no_replace(&self.temporary, &self.destination)
+                if let Some(staging) = &self.pinned_staging {
+                    staging.publish()
+                } else {
+                    publish_no_replace(&self.temporary, &self.destination)
+                }
             }
             Publication::GuardedCreateWorkingCopy { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {
                     self.remove_temporary()?;
-                    return Ok((FilterExportOutcome::Cancelled, None));
+                    return Ok((FilterExportOutcome::Cancelled, None, None));
                 }
                 publish_no_replace(&self.temporary, &self.destination)
             }
             Publication::ReplaceSource { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {
                     self.remove_temporary()?;
-                    return Ok((FilterExportOutcome::Cancelled, None));
+                    return Ok((FilterExportOutcome::Cancelled, None, None));
                 }
                 fs::rename(&self.temporary, &self.destination)
             }
@@ -2698,7 +2746,7 @@ impl ExportTarget {
                 }
                 if cancel_requested.load(Ordering::Acquire) {
                     self.remove_temporary()?;
-                    return Ok((FilterExportOutcome::Cancelled, None));
+                    return Ok((FilterExportOutcome::Cancelled, None, None));
                 }
                 fs::rename(&self.temporary, &self.destination)
             }
@@ -2711,7 +2759,13 @@ impl ExportTarget {
                 storage_error(output_parent(&self.destination), error)
             });
         }
-        let _ = self.remove_temporary();
+        if let Some(staging) = &self.pinned_staging {
+            self.destination = staging.reported_path();
+        }
+        let cleanup_warning = self
+            .remove_temporary()
+            .err()
+            .map(|error| format!("Could not remove private output staging: {error}"));
         // Keep the original output descriptor. A replacement at the destination
         // must never provide the provenance for an index built from our bytes.
         // Filesystems without metadata-only change verification safely re-index.
@@ -2738,6 +2792,7 @@ impl ExportTarget {
                 bytes_written,
             }),
             published_stamp,
+            cleanup_warning,
         ))
     }
 
@@ -2747,6 +2802,11 @@ impl ExportTarget {
     }
 
     fn remove_temporary(&self) -> Result<(), QuarryError> {
+        if let Some(staging) = &self.pinned_staging {
+            return staging
+                .cleanup()
+                .map_err(|error| storage_error(output_parent(staging.temporary()), error));
+        }
         match fs::remove_file(&self.temporary) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -2758,7 +2818,7 @@ impl ExportTarget {
 impl Drop for ExportTarget {
     fn drop(&mut self) {
         drop(self.writer.take());
-        let _ = fs::remove_file(&self.temporary);
+        let _ = self.remove_temporary();
     }
 }
 
@@ -2822,7 +2882,7 @@ fn normalize_path(path: &Path, current_dir: &Path) -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn publish_no_replace(temporary: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn publish_no_replace(temporary: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt;
@@ -2863,7 +2923,7 @@ fn publish_no_replace(temporary: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn publish_no_replace(temporary: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn publish_no_replace(temporary: &Path, destination: &Path) -> io::Result<()> {
     fs::hard_link(temporary, destination)
 }
 
@@ -9496,6 +9556,97 @@ mod tests {
                 assert_eq!(fs::read(&source).unwrap(), b"source");
             }
             assert!(temporary_exports(&destination).is_empty());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn pinned_publication_reports_cleanup_failure_without_removing_unrelated_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.csv");
+        fs::write(&source, b"id\none\n").unwrap();
+        let stamp = crate::SourceStamp::from_file(&File::open(&source).unwrap()).unwrap();
+        let destination = dir.path().join("result.csv");
+        let mut target =
+            ExportTarget::new_combined(vec![(source.clone(), stamp)], destination.clone()).unwrap();
+        target.write_all(b"id\none\n").unwrap();
+        let other = target.temporary.parent().unwrap().join("unrelated");
+        fs::write(&other, b"preserve").unwrap();
+        let (outcome, warning) = target
+            .publish_with_cleanup(1, 7, &AtomicBool::new(false))
+            .unwrap();
+        assert!(matches!(outcome, FilterExportOutcome::Complete(_)));
+        assert!(
+            warning.is_some(),
+            "a saved output must still report failed private-directory cleanup"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"id\none\n");
+        assert_eq!(
+            fs::read(other).unwrap(),
+            b"preserve",
+            "cleanup must not recurse into unrelated data"
+        );
+        assert_eq!(fs::read(source).unwrap(), b"id\none\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_combined_staging_keeps_acl_privacy_and_file_only_drop_support() {
+        use std::process::Command;
+        for file_only in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.csv");
+            fs::write(&source, b"id\none\n").unwrap();
+            let acl = if file_only {
+                "everyone deny add_subdirectory"
+            } else {
+                "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit"
+            };
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", acl])
+                    .arg(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let stamp = crate::SourceStamp::from_file(&File::open(&source).unwrap()).unwrap();
+            let destination = dir.path().join("result.csv");
+            let mut target =
+                ExportTarget::new_combined(vec![(source.clone(), stamp)], destination.clone())
+                    .unwrap();
+            let staged = target.temporary.clone();
+            let parent = staged.parent().unwrap().to_path_buf();
+            for path in [&staged, &parent] {
+                let output = Command::new("/bin/ls")
+                    .arg("-lde")
+                    .arg(path)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert!(
+                    !String::from_utf8(output.stdout)
+                        .unwrap()
+                        .contains("group:everyone")
+                );
+            }
+            target.write_all(b"id\none\n").unwrap();
+            let (outcome, warning) = target
+                .publish_with_cleanup(1, 7, &AtomicBool::new(false))
+                .unwrap();
+            assert!(matches!(outcome, FilterExportOutcome::Complete(_)));
+            assert!(warning.is_none());
+            assert!(!parent.exists());
+            assert_eq!(fs::read(&destination).unwrap(), b"id\none\n");
+            let output = Command::new("/bin/ls")
+                .arg("-le")
+                .arg(&destination)
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("group:everyone")
+            );
         }
     }
 }

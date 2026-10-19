@@ -1613,7 +1613,10 @@ impl JoinPlan {
             match result {
                 Ok(mut summary) => {
                     if let Err(error) = workspace.cleanup() {
-                        summary.cleanup_warning = Some(error.to_string());
+                        summary.cleanup_warning = Some(match summary.cleanup_warning.take() {
+                            Some(previous) => format!("{previous}; {error}"),
+                            None => error.to_string(),
+                        });
                     }
                     Ok(summary)
                 }
@@ -1631,16 +1634,9 @@ impl JoinPlan {
     ) -> JResult<JoinSummary> {
         state.phase(JoinPhase::Creating);
         state.check()?;
-        // Successful publication must outlive cleanup, including when the
-        // chosen folder reaches our workspace through a symbolic-link alias.
-        let workspace_root = workspace.path.canonicalize()?;
-        let destination_parent = output_parent(destination).canonicalize()?;
-        if destination_parent.starts_with(&workspace_root) {
-            return Err(error(
-                "Choose an output folder outside the join's private temporary workspace.",
-            )
-            .into());
-        }
+        let prepared_destination =
+            crate::destination::PreparedDestination::new(destination.to_path_buf())?;
+        prepared_destination.ensure_outside(&workspace.path)?;
         let retained = add(self.inputs[0].frame_bytes, self.inputs[1].frame_bytes)?;
         state.add_disk(retained)?;
         for input in &self.inputs {
@@ -1653,7 +1649,7 @@ impl JoinPlan {
         )?;
         check_creation_space(
             &workspace.path,
-            destination,
+            &prepared_destination.physical_path(),
             mul(frame_bytes, 2)?,
             self.analysis.output_bytes,
         )?;
@@ -1662,7 +1658,7 @@ impl JoinPlan {
             .iter()
             .map(|input| (input.info.path.clone(), input.stamp.clone()))
             .collect();
-        let mut output = ExportTarget::new_combined(sources, destination.to_path_buf())?;
+        let mut output = ExportTarget::new_combined_at(sources, prepared_destination)?;
         output.configure(Encoding::Utf8, Encoding::Utf8, self.config.max_record_bytes);
         let prepared = (|| {
             output.write_all(&header)?;
@@ -1746,18 +1742,19 @@ impl JoinPlan {
             });
         }
         state.phase(JoinPhase::Publishing);
-        match output.publish(
+        let (outcome, cleanup_warning) = output.publish_with_cleanup(
             self.analysis.output_rows,
             self.analysis.output_bytes,
             &state.cancel,
-        )? {
+        )?;
+        match outcome {
             FilterExportOutcome::Cancelled => Err(Failure::Cancelled),
-            FilterExportOutcome::Complete(_) => Ok(JoinSummary {
-                destination: destination.to_path_buf(),
+            FilterExportOutcome::Complete(summary) => Ok(JoinSummary {
+                destination: summary.destination,
                 data_rows: self.analysis.output_rows,
                 bytes_written: self.analysis.output_bytes,
                 peak_temporary_bytes: state.peak.load(Ordering::Acquire),
-                cleanup_warning: None,
+                cleanup_warning,
             }),
         }
     }
@@ -2302,5 +2299,136 @@ mod tests {
                 .wait()
                 .is_err()
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn review_regression_parent_retarget_after_validation_preserves_published_result() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&outside, &alias).unwrap();
+        let source = dir.path().join("source.csv");
+        fs::write(&source, b"id\none\n").unwrap();
+        let stamp = SourceStamp::from_file(&File::open(&source).unwrap()).unwrap();
+        let workspace = SpillWorkspace::create_in(dir.path(), "join").unwrap();
+        let prepared =
+            crate::destination::PreparedDestination::new(alias.join("joined.csv")).unwrap();
+        prepared.ensure_outside(&workspace.path).unwrap();
+        // Deterministically schedule the symlink change after validation.
+        fs::remove_file(&alias).unwrap();
+        symlink(&workspace.path, &alias).unwrap();
+        let mut target =
+            ExportTarget::new_combined_at(vec![(source.clone(), stamp)], prepared).unwrap();
+        target.write_all(b"id\none\n").unwrap();
+        let outcome = target.publish(1, 7, &AtomicBool::new(false)).unwrap();
+        assert!(matches!(outcome, FilterExportOutcome::Complete(_)));
+        workspace.cleanup().unwrap();
+        assert_eq!(
+            fs::read(outside.join("joined.csv")).unwrap(),
+            b"id\none\n",
+            "successful output must survive private-workspace cleanup"
+        );
+        assert_eq!(fs::read(source).unwrap(), b"id\none\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_regression_parent_retarget_after_staging_uses_original_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let other = dir.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&outside, &alias).unwrap();
+        let source = dir.path().join("source.csv");
+        fs::write(&source, b"id\none\n").unwrap();
+        let stamp = SourceStamp::from_file(&File::open(&source).unwrap()).unwrap();
+        let mut target =
+            ExportTarget::new_combined(vec![(source.clone(), stamp)], alias.join("joined.csv"))
+                .unwrap();
+        target.write_all(b"id\none\n").unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        let result = target.publish(1, 7, &AtomicBool::new(false));
+        assert!(
+            matches!(result, Ok(FilterExportOutcome::Complete(_))),
+            "retargeting a parent alias must not redirect or strand staged data: {result:?}"
+        );
+        assert_eq!(fs::read(outside.join("joined.csv")).unwrap(), b"id\none\n");
+        assert!(
+            fs::read_dir(&other).unwrap().next().is_none(),
+            "unrelated folder must be untouched"
+        );
+        assert_eq!(
+            fs::read_dir(&outside).unwrap().count(),
+            1,
+            "only the result may remain"
+        );
+        assert_eq!(fs::read(source).unwrap(), b"id\none\n");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn pinned_workspace_guard_uses_identity_after_alias_moves_outside() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = SpillWorkspace::create_in(dir.path(), "join").unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&workspace.path, &alias).unwrap();
+        let prepared =
+            crate::destination::PreparedDestination::new(alias.join("joined.csv")).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&outside, &alias).unwrap();
+        assert!(
+            prepared.ensure_outside(&workspace.path).is_err(),
+            "moving the alias cannot change the selected directory's workspace membership"
+        );
+        workspace.cleanup().unwrap();
+        assert!(fs::read_dir(outside).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_publication_cancellation_and_destination_races_preserve_other_files() {
+        use std::os::unix::fs::symlink;
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = dir.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            let other = dir.path().join("other");
+            fs::create_dir(&other).unwrap();
+            fs::write(other.join("marker"), b"preserve").unwrap();
+            let alias = dir.path().join("alias");
+            symlink(&outside, &alias).unwrap();
+            let source = dir.path().join("source.csv");
+            fs::write(&source, b"id\none\n").unwrap();
+            let stamp = SourceStamp::from_file(&File::open(&source).unwrap()).unwrap();
+            let mut target =
+                ExportTarget::new_combined(vec![(source.clone(), stamp)], alias.join("joined.csv"))
+                    .unwrap();
+            target.write_all(b"id\none\n").unwrap();
+            if !cancel {
+                fs::write(outside.join("joined.csv"), b"existing").unwrap();
+            }
+            fs::remove_file(&alias).unwrap();
+            symlink(&other, &alias).unwrap();
+            let result = target.publish(1, 7, &AtomicBool::new(cancel));
+            if cancel {
+                assert!(matches!(result, Ok(FilterExportOutcome::Cancelled)));
+                assert!(fs::read_dir(&outside).unwrap().next().is_none());
+            } else {
+                assert!(matches!(result, Err(QuarryError::ExportDestinationExists)));
+                assert_eq!(fs::read(outside.join("joined.csv")).unwrap(), b"existing");
+                assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+            }
+            assert_eq!(fs::read(other.join("marker")).unwrap(), b"preserve");
+            assert_eq!(fs::read_dir(other).unwrap().count(), 1);
+            assert_eq!(fs::read(source).unwrap(), b"id\none\n");
+        }
     }
 }

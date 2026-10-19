@@ -2,6 +2,7 @@ mod case;
 mod cleanup;
 mod combine;
 mod date_time_sort;
+mod destination;
 mod encoding;
 mod export;
 mod filter;
