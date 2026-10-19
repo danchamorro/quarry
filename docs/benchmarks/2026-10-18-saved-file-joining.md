@@ -107,3 +107,10 @@ All 585 macOS workspace tests, formatting, all-target/all-feature Clippy and the
 Review identified that ordinary unmoved spill cleanup unnecessarily required /proc/self/fd on Linux. A regression using a real retained directory and an injected unavailable platform locator failed before the fix and passes afterward. Resolution now uses the captured canonical path when its leaf remains the same directory. Replaced names and symlink leaves require a verified relocated path; unavailable or mismatched relocation still fails safely. Existing renamed-directory, source-preservation and nonrecursive-cleanup tests remain green.
 
 All 588 base macOS workspace tests, formatting, all-target/all-feature Clippy and the workspace release build passed in VMPal. The locator failure is injected at the platform boundary; this is not a live proc-less Linux chroot measurement. Native Linux CI remains a required gate.
+
+
+## Failed private reservations
+
+Review identified that rejecting a directory without enforceable private permissions leaked an empty reservation and reported a misleading source-change error. A regression changing the real captured directory to a non-private mode failed before the fix because that directory remained. Both tested mode variants now return an actionable storage error and leave no empty reservation. Additional checks cover identity-bound cleanup after a name replacement and cleanup failure with unregistered nested data; unrelated data is preserved and cleanup failure is reported.
+
+All 591 base macOS workspace tests, formatting, all-target/all-feature Clippy and the workspace release build passed in VMPal. The mode condition is injected on real directory handles; no native measurement of a specific unsupported filesystem is claimed. The approved owner-only privacy requirement remains a hard failure with an explicit recovery action.

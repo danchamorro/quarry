@@ -278,9 +278,28 @@ fn remove_empty_directory(directory: Directory) -> io::Result<()> {
     }
 }
 
+fn preparation_error(parent: &Path, error: io::Error, cleanup: io::Result<()>) -> QuarryError {
+    let error = match cleanup {
+        Err(cleanup) if cleanup.kind() != io::ErrorKind::NotFound => io::Error::new(
+            error.kind(),
+            format!("{error} Could not remove temporary folder: {cleanup}"),
+        ),
+        _ => error,
+    };
+    storage_error(parent, error)
+}
+
 impl SpillWorkspace {
     /// Reserve owner-only storage before writing any source values.
     pub(crate) fn create_in(parent: &Path, namespace: &str) -> Result<Self, QuarryError> {
+        Self::create_in_with(parent, namespace, |_| Ok(()))
+    }
+
+    fn create_in_with(
+        parent: &Path,
+        namespace: &str,
+        after_pin: impl FnOnce(&Directory) -> io::Result<()>,
+    ) -> Result<Self, QuarryError> {
         if namespace.is_empty()
             || !namespace
                 .bytes()
@@ -298,25 +317,45 @@ impl SpillWorkspace {
             builder.mode(0o700);
             match builder.create(&path) {
                 Ok(()) => {
-                    let directory =
-                        Directory::open(&path).map_err(|error| storage_error(parent, error))?;
-                    if !fs::symlink_metadata(&path)?.is_dir() || !directory.still_named_by(&path) {
-                        return Err(changed_file().into());
-                    }
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        let metadata = directory.file.metadata()?;
-                        if metadata.mode() & 0o077 != 0
-                            || metadata.uid() != rustix::process::geteuid().as_raw()
-                        {
-                            return Err(changed_file().into());
+                    let directory = match Directory::open(&path) {
+                        Ok(directory) => directory,
+                        Err(error) => {
+                            // No data has been written. Never recurse through this name.
+                            return Err(preparation_error(parent, error, fs::remove_dir(&path)));
                         }
-                    }
-                    #[cfg(target_os = "macos")]
-                    if let Err(error) = crate::storage::set_macos_acl(&directory.file, None) {
-                        let _ = remove_empty_directory(directory);
-                        return Err(storage_error(parent, error));
+                    };
+                    let prepared = (|| -> io::Result<()> {
+                        after_pin(&directory)?;
+                        if !fs::symlink_metadata(&path)?.is_dir()
+                            || !directory.still_named_by(&path)
+                        {
+                            return Err(io::Error::other(
+                                "The temporary folder changed while it was being reserved. Try again or choose another folder.",
+                            ));
+                        }
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            let metadata = directory.file.metadata()?;
+                            if metadata.mode() & 0o077 != 0
+                                || metadata.uid() != rustix::process::geteuid().as_raw()
+                            {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "This folder cannot hold private temporary files. Choose another temporary folder on a disk that supports owner-only permissions.",
+                                ));
+                            }
+                        }
+                        #[cfg(target_os = "macos")]
+                        crate::storage::set_macos_acl(&directory.file, None)?;
+                        Ok(())
+                    })();
+                    if let Err(error) = prepared {
+                        return Err(preparation_error(
+                            parent,
+                            error,
+                            remove_empty_directory(directory),
+                        ));
                     }
                     return Ok(Self {
                         path,
@@ -823,5 +862,95 @@ mod tests {
         );
         drop(writer);
         workspace.cleanup().unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_mode_failure_reclaims_the_reservation_and_explains_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o755, 0o777] {
+            let parent = tempfile::tempdir().unwrap();
+            let error = SpillWorkspace::create_in_with(parent.path(), "join", |directory| {
+                directory
+                    .file
+                    .set_permissions(fs::Permissions::from_mode(mode))
+            })
+            .err()
+            .expect("non-private modes must be rejected before data is written");
+            assert_eq!(
+                fs::read_dir(parent.path()).unwrap().count(),
+                0,
+                "failed reservations must not leak empty folders"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("private") && message.contains("Choose another"),
+                "{message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renamed_reservation_is_cleaned_without_touching_its_replacement() {
+        let parent = tempfile::tempdir().unwrap();
+        let moved = parent.path().join("moved");
+        let replacement = Mutex::new(None);
+        let error = SpillWorkspace::create_in_with(parent.path(), "join", |directory| {
+            let original = directory.current_path()?;
+            fs::rename(&original, &moved)?;
+            fs::create_dir_all(original.join("unrelated"))?;
+            fs::write(original.join("unrelated/keep.csv"), b"untouched")?;
+            *replacement.lock().unwrap() = Some(original);
+            Ok(())
+        })
+        .err()
+        .expect("a replaced reservation must be rejected");
+        assert!(!moved.exists(), "clean the captured empty reservation");
+        assert_eq!(
+            fs::read(
+                replacement
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .join("unrelated/keep.csv")
+            )
+            .unwrap(),
+            b"untouched",
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparation_failure_reports_cleanup_failure_and_preserves_foreign_data() {
+        let parent = tempfile::tempdir().unwrap();
+        let error = SpillWorkspace::create_in_with(parent.path(), "join", |directory| {
+            let path = directory.current_path()?;
+            fs::create_dir(path.join("unrelated"))?;
+            fs::write(path.join("unrelated/keep.csv"), b"untouched")?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected preparation failure",
+            ))
+        })
+        .err()
+        .expect("failed preparation must return an error");
+        let root = fs::read_dir(parent.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::read(root.join("unrelated/keep.csv")).unwrap(),
+            b"untouched"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Could not remove temporary folder"),
+            "{error}"
+        );
     }
 }

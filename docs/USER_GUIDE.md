@@ -795,6 +795,10 @@ and click **Check again**. **Use folder** applies the choice for this app
 session. **Use system temporary folder** restores the default. Quarry checks
 that the folder is available and can create, write, and remove a private file.
 
+Temporary data must stay private. If Quarry reports that the folder cannot
+keep temporary data private, choose another folder or use **Use system
+temporary folder**.
+
 New working versions, sort runs, and duplicate-search runs use the chosen
 folder. Changing the folder does not move or delete the current working version
 or its Undo/Redo files. Keep their original drive connected. Quarry removes
