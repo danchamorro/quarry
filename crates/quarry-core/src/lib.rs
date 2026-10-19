@@ -9,6 +9,7 @@ mod filter;
 mod index;
 mod inspection;
 mod join;
+
 mod search;
 mod sort;
 mod source_stamp;
@@ -59,6 +60,10 @@ pub use join::{
     JoinAnalysis, JoinCase, JoinConfig, JoinDuplicateExample, JoinFormat, JoinHeader, JoinInput,
     JoinInputInfo, JoinJob, JoinMode, JoinPhase, JoinPlan, JoinProgress, JoinSourceVersion,
     JoinSummary, analyze_join,
+};
+pub use join::{
+    JoinCellEdits, JoinHeaderEdits, JoinInputOwner, JoinWorkingSource, analyze_join_with_working,
+    read_join_working_header,
 };
 pub use join::{
     JoinOutputColumn, JoinOutputOptions, JoinSource, analyze_join_with_output, read_join_header,

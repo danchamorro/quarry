@@ -1,5 +1,10 @@
 //! Bounded, source-preserving joins with explicit source formats and output layouts.
 use crate::source_stamp::open_regular_file;
+#[path = "join_working.rs"]
+mod working;
+pub use working::{
+    JoinCellEdits, JoinHeaderEdits, JoinInputOwner, JoinWorkingSource, read_join_working_header,
+};
 
 use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
@@ -26,7 +31,7 @@ const MAX_RUN_LEVELS: usize = 64;
 const MAX_KEY_PAIRS: usize = 16;
 const KEY_FRAME_OVERHEAD: usize = 1 + 8 * MAX_KEY_PAIRS;
 
-/// Explicit interpretation of one saved input. Column positions are zero based.
+/// Interpretation and key selection for one input. Working sources inherit their format.
 #[derive(Clone, Debug)]
 pub struct JoinInput {
     pub path: PathBuf,
@@ -97,7 +102,23 @@ impl<R: Seek> Seek for HeaderReader<'_, R> {
     }
 }
 
+fn header_read_error(failure: Failure) -> QuarryError {
+    match failure {
+        Failure::Error(error) => error,
+        Failure::Cancelled => error("Header reading cancelled."),
+    }
+}
+
 fn header_info(path: &Path, format: JoinFormat, state: &Progress) -> JResult<JoinHeader> {
+    header_info_using(path, format, None, state)
+}
+
+fn header_info_using(
+    path: &Path,
+    format: JoinFormat,
+    working: Option<&JoinWorkingSource>,
+    state: &Progress,
+) -> JResult<JoinHeader> {
     state.check()?;
     state.phase(JoinPhase::Inspecting);
     if !fs::metadata(path)?.is_file() {
@@ -148,12 +169,14 @@ fn header_info(path: &Path, format: JoinFormat, state: &Progress) -> JResult<Joi
         let decoded = encoding
             .decode(native, RECORD_LIMIT)
             .map_err(|e| input_error(path, Some(1), e))?;
-        let parsed = fields(&decoded, delimiter, false, path, 0, JoinConfig::default()).map_err(
-            |failure| match failure {
-                Failure::Error(e) => e,
-                Failure::Cancelled => error("Header reading cancelled."),
-            },
-        )?;
+        let effective = match working {
+            Some(source) => source
+                .record(&decoded, 0, JoinConfig::default(), state)
+                .map_err(header_read_error)?,
+            None => Cow::Borrowed(decoded.as_ref()),
+        };
+        let parsed = fields(&effective, delimiter, false, path, 0, JoinConfig::default())
+            .map_err(header_read_error)?;
         if parsed.is_empty() {
             return Err(input_error(path, None, "The file has no usable columns."));
         }
@@ -304,6 +327,7 @@ impl Default for JoinConfig {
 #[derive(Debug)]
 pub struct JoinInputInfo {
     pub path: PathBuf,
+    pub working_values: bool,
     pub delimiter: u8,
     pub encoding: Encoding,
     pub columns: Vec<String>,
@@ -713,6 +737,8 @@ impl JoinConfig {
 #[derive(Debug)]
 struct PreparedInput {
     info: JoinInputInfo,
+    physical_path: PathBuf,
+    working: Option<JoinWorkingSource>,
     stamp: SourceStamp,
     key_columns: Vec<usize>,
     require_unique: bool,
@@ -972,9 +998,12 @@ impl<'a> Runs<'a> {
 }
 
 fn check_source(input: &PreparedInput) -> JResult<File> {
-    let file =
-        open_regular_file(&input.info.path).map_err(|e| input_error(&input.info.path, None, e))?;
-    if !source_matches_stamp(&file, &input.info.path, &input.stamp)? {
+    if let Some(working) = &input.working {
+        working.validate()?;
+    }
+    let file = open_regular_file(&input.physical_path)
+        .map_err(|e| input_error(&input.info.path, None, e))?;
+    if !source_matches_stamp(&file, &input.physical_path, &input.stamp)? {
         return Err(input_error(
             &input.info.path,
             None,
@@ -987,16 +1016,27 @@ fn check_source(input: &PreparedInput) -> JResult<File> {
 
 /// Scan complete records without retaining the file or assuming the first chunk
 /// describes its width, text validity, or number of rows.
+struct ScanSource<'a> {
+    path: &'a Path,
+    stamp: &'a SourceStamp,
+    working: Option<&'a JoinWorkingSource>,
+}
+
 fn scan(
-    path: &Path,
-    stamp: &SourceStamp,
+    source: ScanSource<'_>,
     delimiter: u8,
     encoding: Encoding,
     config: JoinConfig,
     state: &Progress,
     mut visit: impl FnMut(&[u8], u64) -> JResult<()>,
 ) -> JResult<()> {
-    let mut file = open_regular_file(path).map_err(|e| input_error(path, None, e))?;
+    let path = source.path;
+    let stamp = source.stamp;
+    let display_path = source.working.map_or(path, JoinWorkingSource::logical_path);
+    if let Some(working) = source.working {
+        working.validate()?;
+    }
+    let mut file = open_regular_file(path).map_err(|e| input_error(display_path, None, e))?;
     if !source_matches_stamp(&file, path, stamp)? {
         return Err(QuarryError::SourceChanged.into());
     }
@@ -1020,8 +1060,12 @@ fn scan(
         };
         let decoded = encoding
             .decode(native, config.max_record_bytes)
-            .map_err(|e| input_error(path, Some(row + 1), e))?;
-        visit(&decoded, row)
+            .map_err(|e| input_error(display_path, Some(row + 1), e))?;
+        let effective = match source.working {
+            Some(working) => working.record(&decoded, row, config, state)?,
+            None => Cow::Borrowed(decoded.as_ref()),
+        };
+        visit(&effective, row)
     };
     loop {
         state.check()?;
@@ -1040,12 +1084,16 @@ fn scan(
             let mut last = false;
             scanner
                 .finish(offset, |_| last = true)
-                .map_err(|e| input_error(path, Some(row + 1), e))?;
+                .map_err(|e| input_error(display_path, Some(row + 1), e))?;
             if last {
                 decoded_visit(&record, row)?;
             }
             if !source_matches_stamp(&file, path, stamp)? {
                 return Err(QuarryError::SourceChanged.into());
+            }
+            if let Some(working) = source.working {
+                working.validate()?;
+                working.check_rows(row + u64::from(last))?;
             }
             return Ok(());
         }
@@ -1062,7 +1110,7 @@ fn scan(
             if record.len().saturating_add(end - start) > config.max_record_bytes {
                 failed = Some(
                     input_error(
-                        path,
+                        display_path,
                         Some(row + 1),
                         "Record exceeds the configured size limit.",
                     )
@@ -1082,10 +1130,10 @@ fn scan(
             return Err(error);
         }
         state.check()?;
-        scanned.map_err(|e| input_error(path, Some(row + 1), e))?;
+        scanned.map_err(|e| input_error(display_path, Some(row + 1), e))?;
         if incomplete_unit {
             return Err(input_error(
-                path,
+                display_path,
                 Some(row + 1),
                 "Incomplete UTF-16 code unit. Choose the correct encoding; no text was replaced.",
             )
@@ -1093,7 +1141,7 @@ fn scan(
         }
         if record.len().saturating_add(read - start) > config.max_record_bytes {
             return Err(input_error(
-                path,
+                display_path,
                 Some(row + 1),
                 "Record exceeds the configured size limit.",
             )
@@ -1281,6 +1329,8 @@ fn key_label(key: &[u8]) -> JResult<String> {
 
 struct Inspected {
     info: JoinInputInfo,
+    physical_path: PathBuf,
+    working: Option<JoinWorkingSource>,
     stamp: SourceStamp,
     key_columns: Vec<usize>,
     require_unique: bool,
@@ -1290,14 +1340,36 @@ struct Inspected {
 }
 
 /// Scan the complete source to validate text and size its private frames.
-fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<Inspected> {
+fn inspect(
+    input: JoinInput,
+    mut working: Option<JoinWorkingSource>,
+    config: JoinConfig,
+    state: &Progress,
+) -> JResult<Inspected> {
     state.phase(JoinPhase::Inspecting);
+    if let Some(source) = &mut working {
+        source.accepts(&input)?;
+        source.pin_private_directory()?;
+    }
     let path = if input.path.is_absolute() {
         input.path
     } else {
         std::env::current_dir()?.join(input.path)
     };
-    let mut file = open_regular_file(&path).map_err(|e| input_error(&path, None, e))?;
+    let path = if let Some(source) = &working {
+        let logical = source.logical_path();
+        if logical.is_absolute() {
+            logical.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(logical)
+        }
+    } else {
+        path
+    };
+    let physical_path = working
+        .as_ref()
+        .map_or_else(|| path.clone(), |source| source.session.path.clone());
+    let mut file = open_regular_file(&physical_path).map_err(|e| input_error(&path, None, e))?;
     if !file.metadata()?.is_file() {
         return Err(input_error(&path, None, "Select a regular file.").into());
     }
@@ -1311,9 +1383,17 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
             "The selected file changed after its columns were loaded. Choose that file again before analyzing.").into());
     }
 
-    let encoding =
-        Encoding::detect(&mut file, input.encoding).map_err(|e| input_error(&path, None, e))?;
-    let delimiter = match input.delimiter {
+    let encoding = Encoding::detect(
+        &mut file,
+        working
+            .as_ref()
+            .map_or(input.encoding, |source| source.format().encoding),
+    )
+    .map_err(|e| input_error(&path, None, e))?;
+    let delimiter = match working
+        .as_ref()
+        .map_or(input.delimiter, |source| source.format().delimiter)
+    {
         Some(value) => {
             RecordScanner::new(value, encoding).map_err(|e| input_error(&path, None, e))?;
             value
@@ -1334,8 +1414,11 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
     let mut frame_bytes = 0;
     let mut max_key_bytes = 0;
     scan(
-        &path,
-        &stamp,
+        ScanSource {
+            path: &physical_path,
+            stamp: &stamp,
+            working: working.as_ref(),
+        },
         delimiter,
         encoding,
         config,
@@ -1403,6 +1486,7 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
     Ok(Inspected {
         info: JoinInputInfo {
             path,
+            working_values: working.is_some(),
             delimiter,
             encoding,
             columns,
@@ -1411,6 +1495,8 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
             empty_key_rows,
             bytes: stamp.file_size(),
         },
+        physical_path,
+        working,
         stamp,
         key_columns: input.key_columns,
         require_unique: input.require_unique,
@@ -1422,21 +1508,38 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
 
 /// Reject canonical aliases and Unix hard links as self joins.
 fn same_input(left: &Inspected, right: &Inspected) -> JResult<bool> {
-    if left.info.path.canonicalize()? == right.info.path.canonicalize()? {
+    let left_path = left
+        .working
+        .as_ref()
+        .map_or(left.info.path.as_path(), JoinWorkingSource::logical_path);
+    let right_path = right
+        .working
+        .as_ref()
+        .map_or(right.info.path.as_path(), JoinWorkingSource::logical_path);
+    if left_path.canonicalize()? == right_path.canonicalize()? {
         return Ok(true);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let a = fs::metadata(&left.info.path)?;
-        let b = fs::metadata(&right.info.path)?;
+        let a = fs::metadata(left_path)?;
+        let b = fs::metadata(right_path)?;
         Ok(a.dev() == b.dev() && a.ino() == b.ino())
     }
     #[cfg(not(unix))]
     {
         // Conservatively refuse indistinguishable saved identities on platforms
         // without the Unix inode guard; never risk a same-source join.
-        Ok(left.stamp.matches(&right.stamp))
+        Ok(left
+            .working
+            .as_ref()
+            .map_or(&left.stamp, JoinWorkingSource::logical_stamp)
+            .matches(
+                right
+                    .working
+                    .as_ref()
+                    .map_or(&right.stamp, JoinWorkingSource::logical_stamp),
+            ))
     }
 }
 
@@ -1451,8 +1554,11 @@ fn prepare(
     let mut runs = Runs::new(workspace, config, state, input.max_key_bytes);
     let mut rows = 0;
     scan(
-        &input.info.path,
-        &input.stamp,
+        ScanSource {
+            path: &input.physical_path,
+            stamp: &input.stamp,
+            working: input.working.as_ref(),
+        },
         input.info.delimiter,
         input.info.encoding,
         config,
@@ -1489,6 +1595,8 @@ fn prepare(
     }
     Ok(PreparedInput {
         info: input.info,
+        physical_path: input.physical_path,
+        working: input.working,
         stamp: input.stamp,
         key_columns: input.key_columns,
         require_unique: input.require_unique,
@@ -2446,6 +2554,17 @@ pub fn analyze_join_with_output(
     config: JoinConfig,
     output_options: JoinOutputOptions,
 ) -> Result<JoinJob<JoinPlan>, QuarryError> {
+    analyze_join_with_working(inputs, [None, None], temporary, config, output_options)
+}
+
+/// Analyze saved files and/or frozen current document values through one worker contract.
+pub fn analyze_join_with_working(
+    inputs: [JoinInput; 2],
+    working: [Option<JoinWorkingSource>; 2],
+    temporary: PathBuf,
+    config: JoinConfig,
+    output_options: JoinOutputOptions,
+) -> Result<JoinJob<JoinPlan>, QuarryError> {
     config.validate(&temporary)?;
     let pair_count = inputs[0].key_columns.len();
     if !(1..=MAX_KEY_PAIRS).contains(&pair_count) || inputs[1].key_columns.len() != pair_count {
@@ -2462,8 +2581,9 @@ pub fn analyze_join_with_output(
     }
     JoinJob::spawn(move |state| {
         let [left, right] = inputs;
-        let left = inspect(left, config, state)?;
-        let mut right = inspect(right, config, state)?;
+        let [left_working, right_working] = working;
+        let left = inspect(left, left_working, config, state)?;
+        let mut right = inspect(right, right_working, config, state)?;
         right.output_delimiter = left.info.delimiter;
         if same_input(&left, &right)? {
             return Err(
@@ -2623,6 +2743,11 @@ impl JoinPlan {
         let prepared_destination =
             crate::destination::PreparedDestination::new(destination.to_path_buf())?;
         workspace.ensure_output_outside(&prepared_destination)?;
+        for input in &self.inputs {
+            if let Some(source) = &input.working {
+                source.ensure_output_outside(&prepared_destination)?;
+            }
+        }
         let retained = add(self.inputs[0].frame_bytes, self.inputs[1].frame_bytes)?;
         state.add_disk(retained)?;
         for input in &self.inputs {
@@ -2642,7 +2767,13 @@ impl JoinPlan {
         let sources = self
             .inputs
             .iter()
-            .map(|input| (input.info.path.clone(), input.stamp.clone()))
+            .flat_map(|input| {
+                let mut guards = vec![(input.physical_path.clone(), input.stamp.clone())];
+                if let Some(working) = &input.working {
+                    guards.extend(working.guards());
+                }
+                guards
+            })
             .collect();
         let mut output = ExportTarget::new_combined_at(sources, prepared_destination)?;
         output.configure(Encoding::Utf8, Encoding::Utf8, self.config.max_record_bytes);

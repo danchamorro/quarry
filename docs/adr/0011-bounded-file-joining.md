@@ -140,3 +140,13 @@ Analysis workers expose bounded discovered-schema metadata even if the requested
 result exceeds its column limit. The dialog can therefore reveal all fields and
 allow a smaller selection after that error. Releasing the failed job releases
 its private data; schema metadata alone does not reserve a running-operation slot.
+
+
+### Frozen working-source contract
+
+Working-source capture shares an Arc<Session> and immutable Arc edit maps, retaining logical-source provenance and an opaque lifetime owner. It does no filesystem I/O or row/map copying on the UI thread. Analysis validates both saved-source and physical-generation versions, inherits the applied format, overlays one bounded record at a time, and retains those owners through preview and creation. It never treats saved bytes as the current values of a structurally changed document. Header probing is a separate bounded worker; source-version binding identifies the physical generation whose columns were shown.
+
+When the physical generation differs from the saved source, analysis pins its private parent directory. Creation excludes that directory as well as its own spill directory, preventing a result from being published inside data later removed by a generation owner. Directory pins drop before the final generation owner, including on Windows. Application lease counters and mutation/close guards are the remaining desktop integration in #126; exposing this core API alone does not complete that ticket.
+
+
+Working overlays are applied before UTF-8 validation of effective field values. A current cell/header edit can repair invalid UTF-8 in the replaced saved value; every remaining current field, including excluded columns, must still validate. Structural CSV errors and malformed native encoding remain errors. Header probing uses the same effective values as analysis, with bounded labels and logical-source diagnostics. Source bytes remain unchanged.
