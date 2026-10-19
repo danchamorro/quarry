@@ -1419,6 +1419,7 @@ mod tests {
                 .contains("Recovery copy created")
         );
         app.poll_document_tabs(&ctx);
+        crate::tests::finish_document_cleanup(&mut app, &ctx);
         assert!(app.quit_authorized);
     }
 }

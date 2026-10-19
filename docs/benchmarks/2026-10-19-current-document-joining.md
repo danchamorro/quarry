@@ -58,3 +58,22 @@ result retained its original bytes.
 This proves the small native workflow. Background final-document cleanup and its
 fault/quit coordination, platform lifecycle coverage, and the full large-file
 acceptance matrix remain separate gates.
+
+
+## Final document cleanup regression
+
+The new quit regression failed before the lifecycle change with `quit must wait
+for final document cleanup`: native close had been authorized before final
+private-storage destruction. It passes with the background retirement worker.
+A real foreign file is preserved, the cleanup warning remains visible, and
+application quit is not authorized when cleanup fails.
+
+Additional checks gate the real retirement closure to verify visible progress
+until completion, final removal before native close, stale close/Keep Editing
+actions, source and moved-root path reservations, independent editing in another
+tab, and preservation of both dirty tabs when thread creation fails. Existing
+save/close, recovery, filtered-tab and structural-working-file checks now wait for
+the real retirement worker and retain their exact data/removal assertions.
+These checks extend the initial 651-test evidence; final combined counts and CI
+are recorded after integration. They do not replace native testing of the new
+cleanup UI or the remaining full failure and scale matrix.

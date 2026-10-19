@@ -206,3 +206,26 @@ saved inputs.
 Application close/quit finalization still needs the dedicated background
 cleanup coordination and failure matrix in #127. These picker/lease checks do
 not replace that acceptance gate or the final native/large-file checks in #128.
+
+
+### Approved document close and quit cleanup
+
+An approved tab close transfers that complete tab to one background retirement
+worker. Normal quit retains every tab and its Undo state until all unsaved-work
+reviews are approved; only then does it transfer the approved session. The UI
+shows cleanup progress and does not authorize native termination until the worker
+finishes. Cleanup errors cancel automatic termination and remain visible.
+Thread-start failure restores the tabs, including unrelated unsaved values.
+
+Retirement reservations hold bounded path/identity metadata rather than storage
+owners, so inspecting reservations cannot cause final file cleanup on the UI
+thread. Saved sources, current/history generations and working directories remain
+protected from opening or join/output reuse until retirement completes; Unix
+identity checks retain protection after directory moves and for hard links.
+Other tabs can still be edited. A second close waits for the existing retirement
+worker. Reports retain at most sixteen warnings.
+
+The complete fault/scale matrix remains a release gate. In particular, native
+Windows final-owner/drop ordering and filtered readers detached before closing
+still require explicit coverage; the macOS close checks do not establish that
+platform contract.

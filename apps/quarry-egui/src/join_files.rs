@@ -1076,20 +1076,22 @@ impl QuarryApp {
     }
 
     fn join_input_writer_busy(&self, path: &Path) -> bool {
-        self.document_tabs().any(|tab| {
-            tab.write_destination
-                .as_ref()
-                .is_some_and(|destination| tabs::paths_alias(path, destination))
-                || tab
-                    .document
+        self.cleanup_reserves_path(path)
+            || self.document_tabs().any(|tab| {
+                tab.write_destination
                     .as_ref()
-                    .and_then(Document::reserved_working_destination)
                     .is_some_and(|destination| tabs::paths_alias(path, destination))
-        }) || self
-            .combine_files
-            .as_ref()
-            .and_then(combine_files::CombineDialog::reserved_output)
-            .is_some_and(|destination| tabs::paths_alias(path, destination))
+                    || tab
+                        .document
+                        .as_ref()
+                        .and_then(Document::reserved_working_destination)
+                        .is_some_and(|destination| tabs::paths_alias(path, destination))
+            })
+            || self
+                .combine_files
+                .as_ref()
+                .and_then(combine_files::CombineDialog::reserved_output)
+                .is_some_and(|destination| tabs::paths_alias(path, destination))
     }
 
     fn join_tab_for_capture(&mut self, id: u64) -> Result<&mut DocumentTab, String> {
@@ -1143,7 +1145,11 @@ impl QuarryApp {
         Ok(())
     }
 
-    fn select_join_input_path(&mut self, side: usize, path: PathBuf) -> Result<(), String> {
+    pub(super) fn select_join_input_path(
+        &mut self,
+        side: usize,
+        path: PathBuf,
+    ) -> Result<(), String> {
         if !self.join_files.as_ref().unwrap().inputs_editable() {
             return Err("Reset the retained analysis before changing inputs.".into());
         }
@@ -1238,7 +1244,7 @@ impl QuarryApp {
     }
 
     /// Recheck all live document and writer paths before starting output.
-    fn join_destination_is_available(&self, path: &Path) -> bool {
+    pub(super) fn join_destination_is_available(&self, path: &Path) -> bool {
         // Keep the retained analysis when a picker chooses an existing output.
         // symlink_metadata also rejects dangling links; only absence is writable.
         if !matches!(std::fs::symlink_metadata(path), Err(error)
@@ -1246,23 +1252,25 @@ impl QuarryApp {
         {
             return false;
         }
-        !self.document_tabs().any(|tab| {
-            tab.document.as_ref().is_some_and(|doc| {
-                tabs::paths_alias(path, &doc.logical_path)
-                    || tabs::paths_alias(path, doc.session.path())
-                    || private_working_path(doc, path)
-                    || doc
-                        .reserved_working_destination()
-                        .is_some_and(|destination| tabs::paths_alias(path, destination))
-            }) || tab
-                .write_destination
+        !self.cleanup_reserves_path(path)
+            && !self.document_tabs().any(|tab| {
+                tab.document.as_ref().is_some_and(|doc| {
+                    tabs::paths_alias(path, &doc.logical_path)
+                        || tabs::paths_alias(path, doc.session.path())
+                        || private_working_path(doc, path)
+                        || doc
+                            .reserved_working_destination()
+                            .is_some_and(|destination| tabs::paths_alias(path, destination))
+                }) || tab
+                    .write_destination
+                    .as_ref()
+                    .is_some_and(|destination| tabs::paths_alias(path, destination))
+            })
+            && !self
+                .combine_files
                 .as_ref()
+                .and_then(combine_files::CombineDialog::reserved_output)
                 .is_some_and(|destination| tabs::paths_alias(path, destination))
-        }) && !self
-            .combine_files
-            .as_ref()
-            .and_then(combine_files::CombineDialog::reserved_output)
-            .is_some_and(|destination| tabs::paths_alias(path, destination))
     }
 
     /// Keep one join draft, using the configured private-storage location.

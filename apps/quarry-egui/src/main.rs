@@ -334,6 +334,7 @@ fn main() -> eframe::Result<()> {
 
 struct QuarryApp {
     working_cleanup: quarry_core::WorkingCopyCleanup,
+    document_cleanup: Option<tabs::DocumentCleanup>,
     whitespace_preferences: whitespace::Preferences,
     about: about::About,
     combine_files: Option<combine_files::CombineDialog>,
@@ -672,6 +673,7 @@ impl QuarryApp {
             combine_files: None,
             join_files: None,
             working_cleanup: quarry_core::WorkingCopyCleanup::default(),
+            document_cleanup: None,
             working_directory: std::env::temp_dir(),
             active: DocumentTab::new(1),
             tabs: Vec::new(),
@@ -2144,16 +2146,13 @@ impl eframe::App for QuarryApp {
 
         self.reset_tab_focus(ctx);
         self.poll_document_tabs(ctx);
-        let cleanup_errors = self.working_cleanup.take_errors();
-        if !cleanup_errors.is_empty() {
-            self.active.notice = Some(AppMessage::warning(cleanup_errors.join("\n")));
-        }
         self.poll_inspections(ctx);
 
         if self.active.close_confirmation_open {
             self.about.open = false;
         }
-        let tabs_blocked = self.active.inspection.recovering()
+        let tabs_blocked = self.quitting_cleanup()
+            || self.active.inspection.recovering()
             || self.active.storage_review.is_some()
             || self.about.open
             || self.combine_files.is_some()
@@ -2163,7 +2162,8 @@ impl eframe::App for QuarryApp {
             || self.active.structural_dialog.is_some();
         self.show_document_tabs(ctx, tabs_blocked);
         let storage_review_open = self.active.storage_review.is_some();
-        let interaction_blocked = self.active.inspection.recovering()
+        let interaction_blocked = self.quitting_cleanup()
+            || self.active.inspection.recovering()
             || storage_review_open
             || self.about.open
             || self.combine_files.is_some()
@@ -2758,6 +2758,7 @@ impl eframe::App for QuarryApp {
         }
         self.show_join_files(ctx);
         self.show_inspection(ctx);
+        self.show_document_cleanup(ctx);
     }
 }
 
@@ -13371,6 +13372,24 @@ mod tests {
         }
     }
 
+    /// Wait for the real document retirement worker and return its final frame.
+    pub(super) fn finish_document_cleanup(
+        app: &mut QuarryApp,
+        ctx: &egui::Context,
+    ) -> egui::FullOutput {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "document cleanup timed out");
+            let output = ctx.run(grid_input(), |ctx| {
+                app.poll_document_tabs(ctx);
+            });
+            if app.document_cleanup.is_none() {
+                return output;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     fn finish_app_save(
         app: &mut QuarryApp,
         ctx: &egui::Context,
@@ -13389,9 +13408,14 @@ mod tests {
             assert!(Instant::now() < deadline, "save timed out");
             std::thread::yield_now();
         }
-        ctx.run(grid_input(), |ctx| {
+        let output = ctx.run(grid_input(), |ctx| {
             eframe::App::update(app, ctx, frame);
-        })
+        });
+        if app.document_cleanup.is_some() {
+            finish_document_cleanup(app, ctx)
+        } else {
+            output
+        }
     }
 
     #[test]
@@ -15789,15 +15813,24 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Close))
         );
-        let document = app.active.document.as_ref().unwrap();
-        assert_eq!(document.column_name(0), "close_name");
-        assert!(!document.is_dirty());
+        assert!(app.quit_authorized);
+        assert!(app.document_tabs().all(|tab| tab.document.is_none()));
+        let reopened = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.column_name(0), "close_name");
+        assert!(!reopened.is_dirty());
+        drop(reopened);
         assert_eq!(
             fs::read(&path).unwrap(),
             b"close_name,value\nfirst,\"line one\nline two\"\n"
         );
 
-        app.active.document.as_mut().unwrap().shutdown();
         fs::remove_file(path).unwrap();
     }
 
@@ -16182,9 +16215,26 @@ mod tests {
             assert!(Instant::now() < deadline, "Save As timed out");
             std::thread::yield_now();
         }
-        let saved_output = ctx.run(grid_input(), |ctx| {
+        // Inspect the saved/reopened tab before the approved quit retires it.
+        app.poll_active_document(&ctx, true);
+        let saved_tab = app
+            .document_tabs()
+            .find(|tab| {
+                tab.document
+                    .as_ref()
+                    .is_some_and(|doc| doc.logical_path == destination)
+            })
+            .unwrap();
+        let saved_document = saved_tab.document.as_ref().unwrap();
+        assert_eq!(saved_document.session.path(), destination);
+        assert_eq!(saved_document.column_name(0), "renamed");
+        assert!(!saved_document.is_dirty());
+        assert_eq!(saved_tab.delimiter_mode, DelimiterMode::Auto);
+        assert_eq!(saved_tab.header_mode, HeaderMode::FirstRow);
+        let _ = ctx.run(grid_input(), |ctx| {
             eframe::App::update(&mut app, ctx, &mut frame);
         });
+        let saved_output = finish_document_cleanup(&mut app, &ctx);
         assert!(
             saved_output
                 .viewport_output
@@ -16194,20 +16244,7 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Close))
         );
-        let saved_tab = app
-            .document_tabs()
-            .find(|tab| {
-                tab.document
-                    .as_ref()
-                    .is_some_and(|doc| doc.logical_path == destination)
-            })
-            .unwrap();
-        let document = saved_tab.document.as_ref().unwrap();
-        assert_eq!(document.session.path(), destination);
-        assert_eq!(document.column_name(0), "renamed");
-        assert!(!document.is_dirty());
-        assert_eq!(saved_tab.delimiter_mode, DelimiterMode::Auto);
-        assert_eq!(saved_tab.header_mode, HeaderMode::FirstRow);
+        assert!(app.document_tabs().all(|tab| tab.document.is_none()));
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
         assert_eq!(
             fs::read(&destination).unwrap(),
@@ -16218,7 +16255,7 @@ mod tests {
             "report-edited.csv"
         );
 
-        app.active.document.as_mut().unwrap().shutdown();
+        assert!(app.document_tabs().all(|tab| tab.document.is_none()));
         for path in [source, other, destination] {
             fs::remove_file(path).unwrap();
         }
@@ -16273,6 +16310,7 @@ mod tests {
         );
 
         assert!(app.active.document.is_none());
+        finish_document_cleanup(&mut app, &ctx);
         assert!(!working_directory.exists());
         assert_eq!(fs::read(&source).unwrap(), b"name\noriginal\n");
         assert!(
@@ -22361,7 +22399,9 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Close))
         );
-        assert!(!app.active.document.as_ref().unwrap().is_dirty());
+        assert!(app.quit_authorized);
+        assert!(app.document_tabs().all(|tab| tab.document.is_none()));
+        assert!(!working_path.exists());
         assert_eq!(fs::read(&destination).unwrap(), b"value\n3\n2\n");
         assert_eq!(fs::read(&source).unwrap(), b"value\n2\n1\n");
         assert_eq!(
