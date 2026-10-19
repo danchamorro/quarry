@@ -66,6 +66,14 @@ impl WorkingCopyStorage {
         })
     }
 
+    /// Metadata-only ownership lookup for internally unique generation names.
+    /// This does not validate a pathname or authorize deletion.
+    pub fn has_generation_name(&self, name: &std::ffi::OsStr) -> bool {
+        self.files
+            .lock()
+            .is_ok_and(|files| files.contains_key(name))
+    }
+
     pub fn contains(&self, path: &Path) -> bool {
         let Some(parent) = path.parent() else {
             return false;

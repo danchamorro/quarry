@@ -582,6 +582,15 @@ impl QuarryApp {
 
     /// Commits drafts, waits for file operations, then prompts for unsaved changes.
     fn review_document_close(&mut self, ctx: &egui::Context) {
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            self.active.notice = Some(AppMessage::warning(join_files::INPUT_RESERVED));
+            return;
+        }
         if let Some(document) = self.active.document.as_mut() {
             document.commit_edits();
             if document.save_job.is_some() {
@@ -608,6 +617,15 @@ impl QuarryApp {
     /// Removes an approved tab, or records a quit approval while retaining every tab.
     /// Quit releases documents only after the entire session has been approved.
     fn finish_document_close(&mut self, ctx: &egui::Context) {
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            self.active.notice = Some(AppMessage::warning(join_files::INPUT_RESERVED));
+            return;
+        }
         self.active.close_confirmation_open = false;
         self.active.close_after_save = false;
         self.active.close_after_jobs = false;

@@ -236,6 +236,15 @@ impl QuarryApp {
     /// Enforces the shared worker limit and defers large writes for this tab's review.
     /// Returns true when the caller must not start the operation immediately.
     pub(super) fn defer_storage(&mut self, operation: PendingStorageOperation) -> bool {
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            self.active.notice = Some(AppMessage::warning(join_files::INPUT_RESERVED));
+            return true;
+        }
         if !self.write_slot_available() {
             self.active.notice = Some(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish or cancel it before starting another.",

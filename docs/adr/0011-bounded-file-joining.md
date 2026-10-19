@@ -179,3 +179,30 @@ output choices.
 This ownership foundation does not complete the unsaved-input desktop workflow.
 Source selection, input reservations, invalidation, and close/quit cleanup
 coordination still require the remaining #126/#127 integration and validation.
+
+
+### Open-document selection and leases
+
+The egui picker resolves an open document or an alias to its current applied
+format, structural generation, header edits, and cell edits. It commits valid
+drafts before capture, rejects busy or filtered inputs, and retains one owned
+generation by its internally unique name. Capture shares immutable maps and a
+session reference; it does not copy rows or edit maps.
+
+Header workers hold an input lease only while reading. Idle picker state keeps
+weak metadata signatures, allowing later edits without retaining old payloads.
+Analysis captures fresh data edits. A changed session, format, header map, or
+header-row cell overlay requires refreshing the shown columns before analysis;
+data-only edits retain the chosen layout and use current key/value contents.
+
+An atomic per-document lease count guards edits, saves, history, replacement,
+and close through analysis, retained preview, and creation. Unrelated tabs
+remain usable. Releasing a plan runs its cleanup off-thread and releases its
+leases; successful or failed workers release theirs on completion. Current
+generation aliases use the document's current values. Private history files
+must be selected through their current document rather than as independent
+saved inputs.
+
+Application close/quit finalization still needs the dedicated background
+cleanup coordination and failure matrix in #127. These picker/lease checks do
+not replace that acceptance gate or the final native/large-file checks in #128.

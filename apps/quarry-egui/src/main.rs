@@ -743,6 +743,14 @@ impl QuarryApp {
         options: OpenOptions,
         encoding: Option<Encoding>,
     ) -> Result<(), AppMessage> {
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            return Err(AppMessage::warning(join_files::INPUT_RESERVED));
+        }
         let mut document =
             Document::prepare_with_encoding(&path, options, encoding).map_err(AppMessage::error)?;
         document.working_directory = self.working_directory.clone();
@@ -987,6 +995,15 @@ impl QuarryApp {
         header_mode: HeaderMode,
         encoding: Option<Encoding>,
     ) {
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            self.active.notice = Some(AppMessage::warning(join_files::INPUT_RESERVED));
+            return;
+        }
         self.active.format_draft = None;
         let Some(path) = self
             .active
@@ -1042,6 +1059,14 @@ impl QuarryApp {
         options: OpenOptions,
         encoding: Option<Encoding>,
     ) -> Result<(), AppMessage> {
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            return Err(AppMessage::warning(join_files::INPUT_RESERVED));
+        }
         if let Some(document) = self.active.document.as_mut() {
             document.commit_edits();
             if document.save_job.is_some()
@@ -5955,6 +5980,7 @@ impl ColumnView {
 type SharedCellEdits = Arc<BTreeMap<(u64, usize), Arc<Vec<u8>>>>;
 
 struct Document {
+    join_reservations: Arc<std::sync::atomic::AtomicUsize>,
     pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
     pending_diagnostic_message: Option<String>,
     working_directory: PathBuf,
@@ -6128,6 +6154,7 @@ impl Document {
             pending_diagnostic_message: None,
             working_directory: std::env::temp_dir(),
             working_cleanup: quarry_core::WorkingCopyCleanup::default(),
+            join_reservations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_materialization: None,
             original_session: None,
             working_copy: None,
@@ -6210,6 +6237,10 @@ impl Document {
     }
 
     fn structural_edit_disabled_reason(&self) -> Option<&'static str> {
+        if self.join_reserved() {
+            return Some(join_files::INPUT_RESERVED);
+        }
+
         if self.source_changed {
             Some("Reopen the changed source before editing the document.")
         } else if self.filter_active() {
@@ -6833,6 +6864,7 @@ impl Document {
         state
             .use_directory(&self.working_directory)
             .map_err(AppMessage::error)?;
+        state.prune_directories(self.session.path());
         let destination = state.next_path().map_err(AppMessage::error)?;
         let renames = self
             .header_renames
@@ -8214,7 +8246,8 @@ impl Document {
     }
 
     fn save_operations_ready(&self) -> bool {
-        !self.source_changed
+        !self.join_reserved()
+            && !self.source_changed
             && self.save_job.is_none()
             && self.export_job.is_none()
             && self.structural_job.is_none()
@@ -8237,6 +8270,9 @@ impl Document {
         destination: Option<PathBuf>,
         utf8: bool,
     ) -> Result<(), AppMessage> {
+        if self.join_reserved() {
+            return Err(AppMessage::warning(join_files::INPUT_RESERVED));
+        }
         if self.source_changed {
             return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
         }
@@ -8603,7 +8639,8 @@ impl Document {
     }
 
     fn header_is_editable(&self, column: usize) -> bool {
-        self.save_job.is_none()
+        !self.join_reserved()
+            && self.save_job.is_none()
             && self.export_job.is_none()
             && self.search_job.is_none()
             && self.structural_job.is_none()
@@ -8639,6 +8676,10 @@ impl Document {
     }
 
     fn rename_header(&mut self, column: usize, name: String) -> Result<(), String> {
+        if self.join_reserved() {
+            return Err(join_files::INPUT_RESERVED.into());
+        }
+
         if self.save_job.is_some() {
             return Err("Wait for the save to finish before editing headers.".into());
         }
@@ -8662,6 +8703,10 @@ impl Document {
     }
 
     fn commit_header_edit(&mut self) {
+        if self.join_reserved() {
+            return;
+        }
+
         if self.save_job.is_some() {
             return;
         }
@@ -8675,6 +8720,10 @@ impl Document {
     }
 
     fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
+        if self.join_reserved() {
+            return Some(join_files::INPUT_RESERVED);
+        }
+
         if self.source_changed {
             Some("Reopen the changed source before editing data cells.")
         } else if self.save_job.is_some()
@@ -8719,6 +8768,10 @@ impl Document {
     }
 
     fn commit_cell_edit(&mut self) {
+        if self.join_reserved() {
+            return;
+        }
+
         if self.save_job.is_some() {
             return;
         }
@@ -8745,6 +8798,10 @@ impl Document {
     }
 
     fn record_value_edit(&mut self, target: EditTarget, after: Option<Vec<u8>>) {
+        if self.join_reserved() {
+            return;
+        }
+
         let after = after.map(|value| value.into_boxed_slice().into_vec());
         let before = match target {
             EditTarget::Header(column) => self
@@ -8769,6 +8826,10 @@ impl Document {
     }
 
     fn set_edit_value(&mut self, target: EditTarget, value: Option<Vec<u8>>) {
+        if self.join_reserved() {
+            return;
+        }
+
         self.whitespace.invalidate();
         match target {
             EditTarget::Header(column) => {
@@ -8801,6 +8862,10 @@ impl Document {
     }
 
     fn discard_header_edits(&mut self) {
+        if self.join_reserved() {
+            return;
+        }
+
         if self.save_job.is_some() {
             return;
         }
@@ -8811,6 +8876,10 @@ impl Document {
     }
 
     fn discard_edits(&mut self) {
+        if self.join_reserved() {
+            return;
+        }
+
         if self.save_job.is_some() || self.export_job.is_some() || self.structural_job.is_some() {
             return;
         }
@@ -8867,7 +8936,8 @@ impl Document {
     }
 
     fn history_ready(&self) -> bool {
-        !self.source_changed
+        !self.join_reserved()
+            && !self.source_changed
             && !self.filter_refresh_pending
             && self.header_edit.is_none()
             && self.cell_edit.is_none()

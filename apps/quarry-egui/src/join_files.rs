@@ -1,11 +1,190 @@
 use super::*;
 use quarry_core::JoinHeader as HeaderInfo;
+#[cfg(test)]
+use quarry_core::analyze_join_with_output;
 use quarry_core::{
     JoinCase, JoinConfig, JoinFormat, JoinInput, JoinJob, JoinMode, JoinOutputColumn,
-    JoinOutputOptions, JoinPlan, JoinSource, JoinSummary, analyze_join_with_output,
-    read_join_header_with_format,
+    JoinOutputOptions, JoinPlan, JoinSource, JoinSummary, JoinWorkingSource,
+    analyze_join_with_working, read_join_header_with_format, read_join_working_header,
 };
 use std::thread::{self, JoinHandle};
+
+pub(super) const INPUT_RESERVED: &str =
+    "This document is being used by Join Files. Reset or close the join before changing it.";
+
+struct DocumentLease {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+    generation: Option<Arc<quarry_core::WorkingCopyStorage>>,
+}
+impl Drop for DocumentLease {
+    fn drop(&mut self) {
+        // Release generation ownership before allowing another document action.
+        drop(self.generation.take());
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+type CellEditMap = BTreeMap<(u64, usize), Arc<Vec<u8>>>;
+
+/// Weak metadata signatures detect changed drafts without retaining idle input data.
+struct DocumentProbe {
+    tab_id: u64,
+    session: std::sync::Weak<Session>,
+    headers: std::sync::Weak<BTreeMap<usize, Arc<String>>>,
+    cells: std::sync::Weak<CellEditMap>,
+    header_cells: bool,
+}
+impl DocumentProbe {
+    fn capture(tab_id: u64, document: &Document) -> Self {
+        Self {
+            tab_id,
+            session: Arc::downgrade(&document.session),
+            headers: Arc::downgrade(&document.header_renames),
+            cells: Arc::downgrade(&document.cell_edits),
+            header_cells: Self::has_header_cells(document),
+        }
+    }
+    fn has_header_cells(document: &Document) -> bool {
+        document.session.dialect.has_header
+            && document
+                .cell_edits
+                .first_key_value()
+                .is_some_and(|((row, _), _)| *row == 0)
+    }
+
+    fn matches(&self, tab_id: u64, document: &Document) -> bool {
+        self.tab_id == tab_id
+            && !document.source_changed
+            && self.session.ptr_eq(&Arc::downgrade(&document.session))
+            && self
+                .headers
+                .ptr_eq(&Arc::downgrade(&document.header_renames))
+            && (self.cells.ptr_eq(&Arc::downgrade(&document.cell_edits))
+                || !self.header_cells && !Self::has_header_cells(document))
+    }
+}
+
+struct CapturedDocument {
+    path: PathBuf,
+    source: JoinWorkingSource,
+    probe: DocumentProbe,
+    columns: usize,
+}
+
+struct OpenDocumentChoice {
+    tab_id: u64,
+    label: String,
+    path: PathBuf,
+}
+
+impl Document {
+    pub(super) fn join_reserved(&self) -> bool {
+        self.join_reservations
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+
+    fn join_capture_disabled_reason(&self) -> Option<&'static str> {
+        if self.join_reserved() {
+            return Some(INPUT_RESERVED);
+        }
+        if self.filter_active() || self.filter_refresh_pending {
+            return Some("Clear this document's filters before using it in a join.");
+        }
+        if self.source_changed {
+            return Some("Reopen this changed document before using it in a join.");
+        }
+        if self.job.is_some()
+            || self.pending_materialization.is_some()
+            || self.save_job.is_some()
+            || self.export_job.is_some()
+            || self.structural_job.is_some()
+            || self.search_job.is_some()
+            || self.filter_job.is_some()
+        {
+            return Some("Wait for this document's active operation to finish before joining.");
+        }
+        None
+    }
+
+    fn commit_join_drafts(&mut self) -> Result<(), String> {
+        if let Some(reason) = self.join_capture_disabled_reason() {
+            return Err(reason.into());
+        }
+        let limit = JoinConfig::default().max_record_bytes;
+        if self
+            .header_edit
+            .as_ref()
+            .is_some_and(|edit| edit.draft.len() > limit)
+            || self
+                .cell_edit
+                .as_ref()
+                .is_some_and(|edit| edit.draft.len() > limit)
+        {
+            return Err(
+                "An editor draft exceeds the record limit. Shorten it before joining.".into(),
+            );
+        }
+        if self
+            .header_edit
+            .as_ref()
+            .is_some_and(|edit| !self.header_is_editable(edit.column))
+        {
+            return Err("Finish or cancel the invalid header draft before joining.".into());
+        }
+        if let Some(edit) = &self.cell_edit
+            && self.cell_edit_disabled_reason(Some(&edit.source)).is_some()
+        {
+            return Err("Finish or cancel the invalid cell draft before joining.".into());
+        }
+        self.commit_edits();
+        Ok(())
+    }
+
+    fn capture_join_document(&mut self, tab_id: u64) -> Result<CapturedDocument, String> {
+        self.commit_join_drafts()?;
+        if self.has_structural_edits() && self.original_session.is_none() {
+            return Err("The original source cannot be identified. Save a copy and reopen it before joining.".into());
+        }
+        let generation =
+            if self.has_structural_edits() {
+                let name = self
+                    .session
+                    .path()
+                    .file_name()
+                    .ok_or("Missing private generation name.")?;
+                Some(self.working_copy.as_ref()
+                .and_then(|state| std::iter::once(&state.directory)
+                    .chain(state.previous_directories.iter())
+                    .find(|directory| directory.has_generation_name(name)))
+                .cloned()
+                .ok_or("The current working generation is no longer owned. Reopen this document.")?)
+            } else {
+                None
+            };
+        let probe = DocumentProbe::capture(tab_id, self);
+        self.join_reservations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let owner = Arc::new(DocumentLease {
+            counter: Arc::clone(&self.join_reservations),
+            generation,
+        });
+        let source = JoinWorkingSource::capture(
+            Arc::clone(&self.session),
+            self.original_session.as_ref().unwrap_or(&self.session),
+            Arc::clone(&self.header_renames),
+            Arc::clone(&self.cell_edits),
+            owner,
+        );
+        Ok(CapturedDocument {
+            path: self.logical_path.clone(),
+            source,
+            probe,
+            columns: self.total_columns,
+        })
+    }
+}
 
 struct OutputColumnDraft {
     source: JoinSource,
@@ -17,6 +196,7 @@ struct OutputColumnDraft {
 /// Modeless join draft; source and destination reservations live with this state.
 pub(super) struct JoinDialog {
     paths: [Option<PathBuf>; 2],
+    document_inputs: [Option<DocumentProbe>; 2],
     headers: [Option<HeaderInfo>; 2],
     formats: [JoinFormat; 2],
     keys: Vec<[usize; 2]>,
@@ -46,6 +226,7 @@ pub(super) struct JoinDialog {
 enum DialogAction {
     None,
     Select(usize),
+    SelectDocument(usize, u64),
     ReadFormat(usize),
     Analyze,
     ChooseOutput,
@@ -59,6 +240,7 @@ impl JoinDialog {
     fn new(temporary: PathBuf) -> Self {
         Self {
             paths: [None, None],
+            document_inputs: [None, None],
             headers: [None, None],
             formats: [JoinFormat::default(); 2],
             keys: vec![[0, 0]],
@@ -94,6 +276,10 @@ impl JoinDialog {
     /// Keep the dialog alive until both workers and explicit cleanup have finished.
     fn busy(&self) -> bool {
         self.running_operation() || self.cleanup.is_some()
+    }
+
+    fn inputs_editable(&self) -> bool {
+        !self.busy() && !self.closing && self.plan.is_none() && self.result.is_none()
     }
 
     /// Protect selected paths only while a worker or valid preview uses them.
@@ -251,6 +437,7 @@ impl JoinDialog {
 
     /// Read picker metadata off-thread with a separate bounded label budget.
     fn read_header(&mut self, side: usize, path: PathBuf) {
+        self.document_inputs[side] = None;
         self.paths[side] = Some(path.clone());
         self.headers[side] = None;
         self.refresh_output_columns();
@@ -264,8 +451,30 @@ impl JoinDialog {
         }
     }
 
+    fn read_document_header(&mut self, side: usize, captured: CapturedDocument) {
+        let CapturedDocument {
+            path,
+            source,
+            probe,
+            columns,
+        } = captured;
+        self.paths[side] = Some(path);
+        self.formats[side] = source.format();
+        self.document_inputs[side] = Some(probe);
+        self.headers[side] = None;
+        self.refresh_output_columns();
+        self.message = None;
+        self.result = None;
+        self.destination = None;
+        self.cancel_requested = false;
+        match read_join_working_header(source, columns) {
+            Ok(job) => self.header_job = Some((side, job)),
+            Err(error) => self.message = Some(error.to_string()),
+        }
+    }
+
     /// Capture explicit saved-file settings for the full analysis worker.
-    fn start_analysis(&mut self) {
+    fn start_analysis(&mut self, working: [Option<JoinWorkingSource>; 2]) {
         self.acknowledge_expansion = false;
         self.acknowledge_layout = false;
         let inputs = std::array::from_fn(|side| JoinInput {
@@ -301,8 +510,9 @@ impl JoinDialog {
             ),
             include_header: Some(self.output_has_header),
         };
-        match analyze_join_with_output(
+        match analyze_join_with_working(
             inputs,
+            working,
             self.temporary.clone(),
             JoinConfig {
                 mode: self.mode,
@@ -678,21 +888,26 @@ impl JoinDialog {
     }
 
     /// Render the modeless workflow while leaving unrelated documents usable.
-    fn show(&mut self, ctx: &egui::Context, can_start: bool) -> DialogAction {
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        can_start: bool,
+        documents: &[OpenDocumentChoice],
+    ) -> DialogAction {
         self.poll();
         if self.closing && !self.busy() && self.plan.is_none() {
             return DialogAction::Closed(self.quit_after_close);
         }
         let busy = self.busy();
-        let editable = !busy && self.plan.is_none() && self.result.is_none();
+        let editable = self.inputs_editable();
         let mut action = DialogAction::None;
         let mut open = true;
         egui::Window::new("Join Files").id(egui::Id::new("join-files"))
             .open(&mut open).default_width(680.0).min_width(480.0)
             .show(ctx,|ui|{
                 ui.label("Match key columns and create a separate joined file.");
-                ui.small("Saved files with independent formats. Retain every matching pair. Empty keys never match.");
-                ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant.");
+                ui.small("Use current open documents or saved files. Retain every matching pair. Empty keys never match.");
+                ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant. Joins use all current rows; clear source filters first.");
                 egui::ScrollArea::vertical().max_height((ui.available_height()-70.0).min(ctx.content_rect().height()-180.0).max(40.0)).show(ui,|ui|{
                     ui.add_enabled_ui(editable, |ui| {
                         ui.horizontal(|ui| {
@@ -709,8 +924,28 @@ impl JoinDialog {
                             column.strong(if side==0{"Main file"}else{"Additional file"});
                             column.add(egui::Label::new(self.paths[side].as_ref().and_then(|p|p.file_name()).map_or_else(||"No file selected".into(),|n|n.to_string_lossy().into_owned())).truncate());
                             if column.add_enabled(editable && can_start,egui::Button::new(if side==0{"Choose Main…"}else{"Choose Additional…"})).clicked(){action=DialogAction::Select(side);}
+                            column.add_enabled_ui(editable && can_start, |ui| {
+                                let role = if side == 0 { "Main" } else { "Additional" };
+                                egui::ComboBox::from_id_salt(("join-open-document", side))
+                                    .selected_text(format!("Open {role} document…"))
+                                    .show_ui(ui, |ui| {
+                                        ui.set_max_width(320.0);
+                                        if documents.is_empty() { ui.label("No open documents"); }
+                                        for choice in documents {
+                                            if ui.selectable_label(false, format!("Use {role} document: {}", choice.label))
+                                                .on_hover_text(choice.path.display().to_string()).clicked() {
+                                                action = DialogAction::SelectDocument(side, choice.tab_id);
+                                            }
+                                        }
+                                    });
+                            });
+                            if self.document_inputs[side].is_some() {
+                                column.small("Open document · current values · inherited format");
+                            } else { column.small("Saved file"); }
                             column.add_enabled_ui(editable && can_start,|ui|{
-                                if self.show_input_format(ui, side) { action = DialogAction::ReadFormat(side); }
+                                ui.add_enabled_ui(self.document_inputs[side].is_none(), |ui| {
+                                    if self.show_input_format(ui, side) { action = DialogAction::ReadFormat(side); }
+                                });
                                 ui.checkbox(&mut self.require_unique[side], if side == 0 { "Require unique Main key" } else { "Require unique Additional key" });
                                 if let Some(header)=&self.headers[side]{
                                     ui.small(format!("{} columns · {} · {}",header.columns.len(),header.encoding.label(),if header.has_header {"header row"} else {"no header"}));
@@ -800,6 +1035,25 @@ fn output_is_inside_working_directory(path: &Path, directory: &Path) -> bool {
         .is_some_and(|(parent, directory)| parent.starts_with(directory))
 }
 
+fn private_working_path(document: &Document, path: &Path) -> bool {
+    document.working_copy.as_ref().is_some_and(|state| {
+        state.owns(path)
+            || std::iter::once(&state.directory)
+                .chain(state.previous_directories.iter())
+                .any(|directory| {
+                    output_is_inside_working_directory(path, directory.path())
+                        || directory
+                            .current_path()
+                            .is_ok_and(|current| output_is_inside_working_directory(path, &current))
+                })
+            || state
+                .undo
+                .iter()
+                .chain(state.redo.iter())
+                .any(|snapshot| tabs::paths_alias(path, &snapshot.path))
+    })
+}
+
 impl QuarryApp {
     /// Apply the existing alias rules to live join input and output reservations.
     pub(super) fn join_reserves_path(&self, path: &Path) -> bool {
@@ -810,17 +1064,177 @@ impl QuarryApp {
         })
     }
 
-    /// Refuse saved-file input that would silently omit an open document’s edits.
-    fn join_input_is_open(&self, path: &Path) -> bool {
+    fn join_document_for_path(&self, path: &Path) -> Option<u64> {
+        self.document_tabs()
+            .find(|tab| {
+                tab.document.as_ref().is_some_and(|doc| {
+                    tabs::paths_alias(path, &doc.logical_path)
+                        || tabs::paths_alias(path, doc.session.path())
+                })
+            })
+            .map(|tab| tab.id)
+    }
+
+    fn join_input_writer_busy(&self, path: &Path) -> bool {
         self.document_tabs().any(|tab| {
-            tab.document.as_ref().is_some_and(|doc| {
-                tabs::paths_alias(path, &doc.logical_path)
-                    || tabs::paths_alias(path, doc.session.path())
-            }) || tab
-                .write_destination
+            tab.write_destination
                 .as_ref()
                 .is_some_and(|destination| tabs::paths_alias(path, destination))
-        })
+                || tab
+                    .document
+                    .as_ref()
+                    .and_then(Document::reserved_working_destination)
+                    .is_some_and(|destination| tabs::paths_alias(path, destination))
+        }) || self
+            .combine_files
+            .as_ref()
+            .and_then(combine_files::CombineDialog::reserved_output)
+            .is_some_and(|destination| tabs::paths_alias(path, destination))
+    }
+
+    fn join_tab_for_capture(&mut self, id: u64) -> Result<&mut DocumentTab, String> {
+        let tab = std::iter::once(&mut self.active)
+            .chain(self.tabs.iter_mut())
+            .find(|tab| tab.id == id && tab.document.is_some())
+            .ok_or("This document is no longer open. Choose the input again.")?;
+        if tab.close_confirmation_open
+            || tab.close_ready
+            || tab.close_after_jobs
+            || tab.close_after_save
+            || tab.storage_review.is_some()
+            || tab.inspection.recovering()
+        {
+            return Err(
+                "Finish this document's pending dialog or close request before joining.".into(),
+            );
+        }
+        Ok(tab)
+    }
+
+    fn select_join_document(&mut self, side: usize, id: u64) -> Result<(), String> {
+        if !self.join_files.as_ref().unwrap().inputs_editable() {
+            return Err("Reset the retained analysis before changing inputs.".into());
+        }
+        if !self.write_slot_available() || self.join_files.as_ref().is_some_and(JoinDialog::busy) {
+            return Err("Wait for an operation slot before reading this input.".into());
+        }
+        if self.join_files.as_ref().unwrap().document_inputs[1 - side]
+            .as_ref()
+            .is_some_and(|probe| probe.tab_id == id)
+        {
+            return Err("Choose two different inputs. Self joins are not supported.".into());
+        }
+        let captured = self
+            .join_tab_for_capture(id)?
+            .document
+            .as_mut()
+            .unwrap()
+            .capture_join_document(id)?;
+        if self.join_files.as_ref().unwrap().paths[1 - side]
+            .as_ref()
+            .is_some_and(|path| tabs::paths_alias(path, &captured.path))
+        {
+            return Err("Choose two different inputs. Self joins are not supported.".into());
+        }
+        self.join_files
+            .as_mut()
+            .unwrap()
+            .read_document_header(side, captured);
+        Ok(())
+    }
+
+    fn select_join_input_path(&mut self, side: usize, path: PathBuf) -> Result<(), String> {
+        if !self.join_files.as_ref().unwrap().inputs_editable() {
+            return Err("Reset the retained analysis before changing inputs.".into());
+        }
+        if self.join_input_writer_busy(&path) {
+            return Err("Wait for the writer using this input to finish.".into());
+        }
+        if let Some(id) = self.join_document_for_path(&path) {
+            self.select_join_document(side, id)
+        } else if self.document_tabs().any(|tab| {
+            tab.document
+                .as_ref()
+                .is_some_and(|document| private_working_path(document, &path))
+        }) {
+            Err("This is a private history file. Select the current document from the open-document menu instead.".into())
+        } else if self.write_slot_available() && !self.join_files.as_ref().unwrap().busy() {
+            self.join_files.as_mut().unwrap().read_header(side, path);
+            Ok(())
+        } else {
+            Err("Wait for an operation slot before reading this input.".into())
+        }
+    }
+
+    /// Bind current values to the schema shown by the picker, then acquire leases.
+    fn analyze_join_draft(&mut self) -> Result<(), String> {
+        if !self.join_files.as_ref().unwrap().inputs_editable() {
+            return Err("Reset the retained analysis before analyzing again.".into());
+        }
+        if !self.write_slot_available() || self.join_files.as_ref().unwrap().busy() {
+            return Err("Wait for an operation slot before analyzing.".into());
+        }
+        let paths: [PathBuf; 2] = std::array::from_fn(|side| {
+            self.join_files.as_ref().unwrap().paths[side]
+                .clone()
+                .unwrap()
+        });
+        let ids = paths
+            .each_ref()
+            .map(|path| self.join_document_for_path(path));
+        if ids[0].is_some() && ids[0] == ids[1] {
+            return Err("Choose two different inputs. Self joins are not supported.".into());
+        }
+        for side in 0..2 {
+            if self.join_input_writer_busy(&paths[side]) {
+                return Err("Wait for the writer using a selected input to finish.".into());
+            }
+            if let Some(id) = ids[side] {
+                self.join_tab_for_capture(id)?
+                    .document
+                    .as_mut()
+                    .unwrap()
+                    .commit_join_drafts()?;
+                let unchanged = self.join_files.as_ref().unwrap().document_inputs[side]
+                    .as_ref()
+                    .is_some_and(|probe| {
+                        self.document_tabs().any(|tab| {
+                            tab.id == id
+                                && tab
+                                    .document
+                                    .as_ref()
+                                    .is_some_and(|doc| probe.matches(id, doc))
+                        })
+                    });
+                if !unchanged {
+                    self.select_join_document(side, id)?;
+                    return Err("An input's current values or format changed. Review its refreshed columns and analyze again.".into());
+                }
+            } else if self.join_files.as_ref().unwrap().document_inputs[side].is_some() {
+                self.join_files
+                    .as_mut()
+                    .unwrap()
+                    .read_header(side, paths[side].clone());
+                return Err("An input document was closed. Review the saved file's columns and analyze again.".into());
+            }
+        }
+        let mut working = [None, None];
+        for side in 0..2 {
+            if let Some(id) = ids[side] {
+                let captured = self
+                    .join_tab_for_capture(id)?
+                    .document
+                    .as_mut()
+                    .unwrap()
+                    .capture_join_document(id)?;
+                working[side] = Some(captured.source);
+            }
+        }
+        if !self.write_slot_available() {
+            return Err("Wait for an operation slot before analyzing.".into());
+        }
+        self.join_files.as_mut().unwrap().start_analysis(working);
+        Ok(())
     }
 
     /// Recheck all live document and writer paths before starting output.
@@ -836,17 +1250,7 @@ impl QuarryApp {
             tab.document.as_ref().is_some_and(|doc| {
                 tabs::paths_alias(path, &doc.logical_path)
                     || tabs::paths_alias(path, doc.session.path())
-                    || doc.working_copy.as_ref().is_some_and(|state| {
-                        state.owns(path)
-                            || std::iter::once(&state.directory)
-                                .chain(state.previous_directories.iter())
-                                .any(|directory| {
-                                    output_is_inside_working_directory(path, directory.path())
-                                        || directory.current_path().is_ok_and(|current| {
-                                            output_is_inside_working_directory(path, &current)
-                                        })
-                                })
-                    })
+                    || private_working_path(doc, path)
                     || doc
                         .reserved_working_destination()
                         .is_some_and(|destination| tabs::paths_alias(path, destination))
@@ -871,10 +1275,35 @@ impl QuarryApp {
     /// Route UI actions through fresh capacity and path-reservation checks.
     pub(super) fn show_join_files(&mut self, ctx: &egui::Context) {
         let can_start = self.write_slot_available();
+        let documents: Vec<_> = self
+            .document_tabs()
+            .filter_map(|tab| {
+                let document = tab.document.as_ref()?;
+                let path = document.logical_path.clone();
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                let folder = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy());
+                Some(OpenDocumentChoice {
+                    tab_id: tab.id,
+                    label: format!(
+                        "{}{}{}",
+                        name,
+                        if document.is_dirty() { " ●" } else { "" },
+                        folder.map_or(String::new(), |folder| format!(" — {folder}"))
+                    ),
+                    path,
+                })
+            })
+            .collect();
         let Some(dialog) = self.join_files.as_mut() else {
             return;
         };
-        let action = dialog.show(ctx, can_start);
+        let action = dialog.show(ctx, can_start, &documents);
         match action {
             DialogAction::None => {}
             DialogAction::Closed(quit) => {
@@ -885,38 +1314,28 @@ impl QuarryApp {
             }
             DialogAction::Select(side) => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose a saved delimited file")
+                    .set_title("Choose a delimited file")
                     .pick_file()
+                    && let Err(error) = self.select_join_input_path(side, path)
                 {
-                    if self.join_input_is_open(&path) {
-                        self.join_files.as_mut().unwrap().message=Some("This file is open in Quarry. The first join version uses saved files only. Close that document before selecting it.".into());
-                    } else if self.write_slot_available() {
-                        self.join_files.as_mut().unwrap().read_header(side, path);
-                    }
+                    self.join_files.as_mut().unwrap().message = Some(error);
+                }
+            }
+            DialogAction::SelectDocument(side, id) => {
+                if let Err(error) = self.select_join_document(side, id) {
+                    self.join_files.as_mut().unwrap().message = Some(error);
                 }
             }
             DialogAction::ReadFormat(side) => {
-                if self.write_slot_available() {
-                    if let Some(path) = self.join_files.as_ref().unwrap().paths[side].clone() {
-                        self.join_files.as_mut().unwrap().read_header(side, path);
-                    }
+                if let Some(path) = self.join_files.as_ref().unwrap().paths[side].clone()
+                    && let Err(error) = self.select_join_input_path(side, path)
+                {
+                    self.join_files.as_mut().unwrap().message = Some(error);
                 }
             }
             DialogAction::Analyze => {
-                let reserved = self
-                    .join_files
-                    .as_ref()
-                    .unwrap()
-                    .paths
-                    .iter()
-                    .flatten()
-                    .any(|path| self.join_input_is_open(path));
-                if reserved {
-                    self.join_files.as_mut().unwrap().message = Some(
-                        "An input is now open or being written. Close it and analyze again.".into(),
-                    );
-                } else if self.write_slot_available() {
-                    self.join_files.as_mut().unwrap().start_analysis();
+                if let Err(error) = self.analyze_join_draft() {
+                    self.join_files.as_mut().unwrap().message = Some(error);
                 }
             }
             DialogAction::ChooseOutput => {
@@ -1087,6 +1506,67 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
     }
+    fn finish_document(app: &mut QuarryApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .structural_job
+            .is_some()
+        {
+            let ready = app
+                .active
+                .document
+                .as_mut()
+                .unwrap()
+                .poll_structural_edit()
+                .unwrap();
+            if let Some(ready) = ready {
+                app.install_materialized_working_copy(ready).unwrap();
+            }
+            assert!(Instant::now() < deadline, "document operation stalled");
+            std::thread::yield_now();
+        }
+        let document = app.active.document.as_mut().unwrap();
+        if let Some(job) = document.job.take() {
+            document.index = Some(job.wait().unwrap());
+            document.progress.done = true;
+            document.progress.bytes_scanned = document.session.file_size;
+        }
+    }
+
+    fn choose_open_document(app: &mut QuarryApp, ctx: &egui::Context, side: usize, filename: &str) {
+        let role = if side == 0 { "Main" } else { "Additional" };
+        click(app, ctx, &format!("Open {role} document…"));
+        let output = frame(app, ctx, vec![]);
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let prefix = format!("Use {role} document: {filename}");
+        let (id, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label().is_some_and(|label| label.starts_with(&prefix)))
+            .unwrap_or_else(|| panic!("missing open-document choice {prefix}"));
+        frame(
+            app,
+            ctx,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: *id,
+                    data: None,
+                },
+            )],
+        );
+        finish(app);
+        assert!(
+            app.join_files.as_ref().unwrap().headers[side].is_some(),
+            "{:?}",
+            app.join_files.as_ref().unwrap().message
+        );
+    }
+
     /// Create synthetic CSV sources isolated from user data.
     fn fixture(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         let path = dir.join(name);
@@ -1163,6 +1643,7 @@ mod tests {
         let ctx = context();
         let (a, _) = prepare(&mut app, dir.path());
         app.open_new_path(a.clone()).unwrap();
+        finish_document(&mut app);
         click(&mut app, &ctx, "Analyze & Preview");
         assert!(app.join_files.as_ref().unwrap().checking.is_none());
         assert!(
@@ -1172,11 +1653,11 @@ mod tests {
                 .message
                 .as_ref()
                 .unwrap()
-                .contains("now open")
+                .contains("Review its refreshed columns")
         );
-        // Start with fresh documents so the selected saved inputs can be analyzed.
-        let mut app = QuarryApp::new(None, Instant::now());
-        prepare(&mut app, dir.path());
+        finish(&mut app);
+        assert!(app.join_files.as_ref().unwrap().document_inputs[0].is_some());
+        assert!(!app.active.document.as_ref().unwrap().join_reserved());
         click(&mut app, &ctx, "Analyze & Preview");
         finish(&mut app);
         assert!(app.join_reserves_path(&a));
@@ -1265,7 +1746,10 @@ mod tests {
             .rename_header(0, "Unsaved".into())
             .unwrap();
         prepare(&mut app, dir.path());
-        app.join_files.as_mut().unwrap().start_analysis();
+        app.join_files
+            .as_mut()
+            .unwrap()
+            .start_analysis([None, None]);
         app.join_files.as_mut().unwrap().request_close(true);
         finish(&mut app);
         frame(&mut app, &ctx, vec![]);
@@ -1613,7 +2097,10 @@ mod tests {
         let ctx = context();
         prepare(&mut app, dir.path());
         app.join_files.as_mut().unwrap().keys = vec![[0, 0], [1, 1]];
-        app.join_files.as_mut().unwrap().start_analysis();
+        app.join_files
+            .as_mut()
+            .unwrap()
+            .start_analysis([None, None]);
         finish(&mut app);
         let mut output = None;
         for _ in 0..3 {
@@ -2078,5 +2565,547 @@ value
         click(&mut app, &ctx, "Create Joined File");
         finish(&mut app);
         assert_eq!(fs::read(output).unwrap(), b"Additional column 2\nmore\n");
+    }
+    #[test]
+    fn current_document_picker_joins_structural_generations_and_both_unsaved_overlays() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "current-main.csv", b"id,name\nb,Bob\na,Alice\n");
+        let b = fixture(
+            dir.path(),
+            "current-additional.csv",
+            b"id,city\nb,LA\na,Seattle\n",
+        );
+        let original_a = fs::read(&a).unwrap();
+        let original_b = fs::read(&b).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path_with_options(
+            a.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_document(&mut app);
+        let main_id = app.active.id;
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_sort_rows(
+                0,
+                SortDirection::Ascending,
+                SortMode::Reverse,
+                CaseSensitivity::Sensitive,
+            )
+            .unwrap();
+        finish_document(&mut app);
+        let generation = app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .path()
+            .to_owned();
+        assert_ne!(generation, a);
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            doc.rename_header(1, "customer".into()).unwrap();
+            doc.columns.order.reverse();
+            doc.begin_cell_edit(1, 1, b"Alice".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "Current Alice".into();
+        }
+        let ctx = context();
+        app.open_join_files();
+        choose_open_document(&mut app, &ctx, 0, "current-main.csv");
+        assert!(app.active.document.as_ref().unwrap().cell_edit.is_none());
+        assert!(
+            !app.active.document.as_ref().unwrap().join_reserved(),
+            "idle selection holds no lease"
+        );
+        app.open_document_tab_with_encoding(
+            b.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Utf8),
+        )
+        .unwrap();
+        finish_document(&mut app);
+        let additional_id = app.active.id;
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            doc.rename_header(1, "place".into()).unwrap();
+            doc.begin_cell_edit(1, 1, b"LA".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "Current LA".into();
+        }
+        choose_open_document(&mut app, &ctx, 1, "current-additional.csv");
+        let histories: Vec<_> = app
+            .document_tabs()
+            .filter_map(|tab| {
+                tab.document
+                    .as_ref()
+                    .map(|doc| (tab.id, doc.edit_history.clone()))
+            })
+            .collect();
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert!(app.join_files.as_ref().unwrap().plan.is_some());
+        for tab in app.document_tabs() {
+            let doc = tab.document.as_ref().unwrap();
+            assert!(doc.join_reserved());
+            assert!(!doc.can_undo());
+            assert!(!doc.save_operations_ready());
+        }
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            let edits = Arc::clone(&doc.cell_edits);
+            assert!(doc.begin_cell_edit(1, 1, b"LA".to_vec()).is_err());
+            assert!(doc.rename_header(1, "blocked".into()).is_err());
+            assert!(doc.start_save().is_err());
+            assert!(
+                doc.start_cleanup(ColumnCleanup {
+                    columns: vec![1],
+                    operation: CleanupOperation::Trim
+                })
+                .is_err()
+            );
+            doc.discard_edits();
+            assert!(Arc::ptr_eq(&edits, &doc.cell_edits));
+        }
+        app.reload_document();
+        assert!(
+            app.active
+                .notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("Join Files")
+        );
+        app.request_tab_close(&ctx);
+        assert_eq!(app.active.id, additional_id);
+        assert!(!app.active.close_confirmation_open);
+        app.discard_and_close(&ctx);
+        assert_eq!(app.active.id, additional_id);
+        let unrelated = fixture(
+            dir.path(),
+            "unrelated-current.csv",
+            b"id,value\nu,unchanged\n",
+        );
+        app.open_new_path(unrelated).unwrap();
+        finish_document(&mut app);
+        let unrelated_id = app.active.id;
+        assert!(
+            app.select_join_document(0, unrelated_id)
+                .unwrap_err()
+                .contains("Reset")
+        );
+        assert_eq!(app.join_files.as_ref().unwrap().paths[0].as_ref(), Some(&a));
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .begin_cell_edit(1, 1, b"unchanged".to_vec())
+            .unwrap();
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .cell_edit
+            .as_mut()
+            .unwrap()
+            .draft = "Unrelated edit".into();
+        assert!(
+            !app.join_destination_is_available(&generation.parent().unwrap().join("joined.csv"))
+        );
+        let output = dir.path().join("joined-current.csv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(fs::read(&output).unwrap(),
+            b"id (Main),customer,id (Additional),place\na,Current Alice,a,Seattle\nb,Bob,b,Current LA\n");
+        assert_eq!(fs::read(&a).unwrap(), original_a);
+        assert_eq!(fs::read(&b).unwrap(), original_b);
+        for (id, history) in histories {
+            let doc = app
+                .document_tabs()
+                .find(|tab| tab.id == id)
+                .unwrap()
+                .document
+                .as_ref()
+                .unwrap();
+            assert_eq!(doc.edit_history, history);
+            assert!(!doc.join_reserved());
+        }
+        assert_eq!(
+            app.active
+                .document
+                .as_ref()
+                .unwrap()
+                .cell_edit
+                .as_ref()
+                .unwrap()
+                .draft,
+            "Unrelated edit"
+        );
+        assert_ne!(app.active.id, main_id);
+        click(&mut app, &ctx, "Open Joined File");
+        assert_eq!(app.active.document.as_ref().unwrap().logical_path, output);
+        assert!(
+            app.active
+                .document
+                .as_mut()
+                .unwrap()
+                .begin_cell_edit(1, 1, b"Current Alice".to_vec())
+                .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browse_alias_uses_current_values_and_stale_picker_metadata_is_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "alias-main.csv", b"id,name\nx,saved\n");
+        let b = fixture(dir.path(), "alias-additional.csv", b"id,value\nx,match\n");
+        let alias = dir.path().join("alias.csv");
+        std::os::unix::fs::symlink(&a, &alias).unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path_with_options(
+            a.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_document(&mut app);
+        let ctx = context();
+        app.open_join_files();
+        app.select_join_input_path(0, alias).unwrap();
+        finish(&mut app);
+        assert_eq!(app.join_files.as_ref().unwrap().paths[0].as_ref(), Some(&a));
+        assert!(app.join_files.as_ref().unwrap().document_inputs[0].is_some());
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            assert!(!doc.join_reserved());
+            doc.begin_cell_edit(1, 1, b"saved".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "current".into();
+            doc.rename_header(1, "current name".into()).unwrap();
+        }
+        app.select_join_input_path(1, b).unwrap();
+        finish(&mut app);
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert!(app.join_files.as_ref().unwrap().plan.is_none());
+        assert!(
+            app.join_files
+                .as_ref()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("refreshed columns")
+        );
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert!(app.active.document.as_ref().unwrap().join_reserved());
+        click(&mut app, &ctx, "Reset Analysis");
+        finish(&mut app);
+        assert!(!app.active.document.as_ref().unwrap().join_reserved());
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .rename_header(1, "allowed again".into())
+            .unwrap();
+        assert_eq!(fs::read(a).unwrap(), b"id,name\nx,saved\n");
+    }
+
+    #[test]
+    fn an_oversized_editor_draft_blocks_capture_without_losing_the_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "draft.csv", b"id,value\nx,saved\n");
+        let mut app = QuarryApp::new(Some(a), Instant::now());
+        finish_document(&mut app);
+        let id = app.active.id;
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            doc.begin_cell_edit(1, 1, b"saved".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft =
+                "x".repeat(JoinConfig::default().max_record_bytes + 1);
+        }
+        app.open_join_files();
+        assert!(
+            app.select_join_document(0, id)
+                .unwrap_err()
+                .contains("record limit")
+        );
+        let doc = app.active.document.as_ref().unwrap();
+        assert!(!doc.join_reserved());
+        assert_eq!(
+            doc.cell_edit.as_ref().unwrap().draft.len(),
+            JoinConfig::default().max_record_bytes + 1
+        );
+        assert!(doc.cell_edits.is_empty());
+        assert!(app.join_files.as_ref().unwrap().header_job.is_none());
+    }
+    #[test]
+    fn current_native_encoding_and_unrepresentable_unsaved_values_join_as_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"id\tname\n\xe9\tsaved\n";
+        let a = fixture(dir.path(), "current-native.tsv", original);
+        let b = fixture(
+            dir.path(),
+            "utf8-other.csv",
+            "id,city\né,Paris\n".as_bytes(),
+        );
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_document_tab_with_encoding(
+            a.clone(),
+            OpenOptions {
+                delimiter: Some(b'\t'),
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Windows1252),
+        )
+        .unwrap();
+        finish_document(&mut app);
+        let id = app.active.id;
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            doc.rename_header(1, "λ result".into()).unwrap();
+            doc.begin_cell_edit(1, 1, b"saved".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "λ".into();
+        }
+        app.open_join_files();
+        app.select_join_document(0, id).unwrap();
+        finish(&mut app);
+        assert_eq!(
+            app.join_files.as_ref().unwrap().formats[0].encoding,
+            Some(Encoding::Windows1252)
+        );
+        assert_eq!(
+            app.join_files.as_ref().unwrap().formats[0].delimiter,
+            Some(b'\t')
+        );
+        app.select_join_input_path(1, b).unwrap();
+        finish(&mut app);
+        let ctx = context();
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let output = dir.path().join("current-utf8.tsv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(
+            fs::read(output).unwrap(),
+            "id (Main)\tλ result\tid (Additional)\tcity\né\tλ\té\tParis\n".as_bytes()
+        );
+        assert_eq!(fs::read(a).unwrap(), original);
+        assert!(app.active.document.as_ref().unwrap().is_dirty());
+        assert!(!app.active.document.as_ref().unwrap().join_reserved());
+    }
+
+    #[test]
+    fn current_input_requires_idle_unfiltered_documents_and_rejects_self_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "idle.csv", b"id,value\nx,one\n");
+        let mut app = QuarryApp::new(Some(a), Instant::now());
+        let id = app.active.id;
+        app.open_join_files();
+        assert!(
+            app.select_join_document(0, id)
+                .unwrap_err()
+                .contains("active operation")
+        );
+        assert!(!app.active.document.as_ref().unwrap().join_reserved());
+        finish_document(&mut app);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_filter(FilterQuery::single(
+                0,
+                FilterOperator::Equals,
+                b"x".to_vec(),
+            ))
+            .unwrap();
+        assert!(
+            app.select_join_document(0, id)
+                .unwrap_err()
+                .contains("filters")
+        );
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .clear_filter()
+            .unwrap();
+        app.select_join_document(0, id).unwrap();
+        finish(&mut app);
+        assert!(
+            app.select_join_document(1, id)
+                .unwrap_err()
+                .contains("Self joins")
+        );
+        assert!(!app.active.document.as_ref().unwrap().join_reserved());
+        assert!(app.join_files.as_ref().unwrap().paths[1].is_none());
+    }
+
+    #[test]
+    fn closing_a_current_input_preview_releases_leases_and_preserves_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "close-current.csv", b"id,value\nx,saved\n");
+        let b = fixture(dir.path(), "close-other.csv", b"id,city\nx,Paris\n");
+        let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
+        finish_document(&mut app);
+        let id = app.active.id;
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            doc.begin_cell_edit(1, 1, b"saved".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "kept".into();
+        }
+        app.open_join_files();
+        app.select_join_document(0, id).unwrap();
+        finish(&mut app);
+        app.select_join_input_path(1, b).unwrap();
+        finish(&mut app);
+        let ctx = context();
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let history = app.active.document.as_ref().unwrap().edit_history.clone();
+        assert!(app.active.document.as_ref().unwrap().join_reserved());
+        app.join_files.as_mut().unwrap().request_close(false);
+        finish(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.join_files.is_none());
+        let doc = app.active.document.as_ref().unwrap();
+        assert!(!doc.join_reserved());
+        assert_eq!(doc.edit_history, history);
+        assert_eq!(doc.cell_edits.get(&(1, 1)).unwrap().as_slice(), b"kept");
+        assert!(doc.is_dirty());
+        assert_eq!(fs::read(a).unwrap(), b"id,value\nx,saved\n");
+    }
+    #[test]
+    fn data_edits_after_column_selection_use_current_keys_without_resetting_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "data-change.csv", b"id,value\nx,saved\n");
+        let b = fixture(dir.path(), "data-match.csv", b"id,city\ny,Paris\n");
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path_with_options(
+            a.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_document(&mut app);
+        let id = app.active.id;
+        app.open_join_files();
+        app.select_join_document(0, id).unwrap();
+        finish(&mut app);
+        app.select_join_input_path(1, b).unwrap();
+        finish(&mut app);
+        app.join_files.as_mut().unwrap().output_columns[1].name = "current value".into();
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            doc.begin_cell_edit(1, 0, b"x".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "y".into();
+            doc.begin_cell_edit(1, 1, b"saved".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "current".into();
+        }
+        let ctx = context();
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert!(
+            app.join_files.as_ref().unwrap().plan.is_some(),
+            "{:?}",
+            app.join_files.as_ref().unwrap().message
+        );
+        assert_eq!(
+            app.join_files.as_ref().unwrap().output_columns[1].name,
+            "current value"
+        );
+        let output = dir.path().join("data-current-result.csv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(
+            fs::read(output).unwrap(),
+            b"id (Main),current value,id (Additional),city\ny,current,y,Paris\n"
+        );
+        assert_eq!(fs::read(a).unwrap(), b"id,value\nx,saved\n");
+    }
+    #[test]
+    fn browsing_private_history_requires_the_current_document_instead() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(
+            dir.path(),
+            "history-source.csv",
+            b"id,value\nb,Bob\na,Alice\n",
+        );
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path_with_options(
+            a.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_document(&mut app);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_sort_rows(
+                0,
+                SortDirection::Ascending,
+                SortMode::Reverse,
+                CaseSensitivity::Sensitive,
+            )
+            .unwrap();
+        finish_document(&mut app);
+        let previous = app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .path()
+            .to_owned();
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_cleanup(ColumnCleanup {
+                columns: vec![1],
+                operation: CleanupOperation::Uppercase,
+            })
+            .unwrap();
+        finish_document(&mut app);
+        let current = app
+            .active
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .path()
+            .to_owned();
+        assert_ne!(previous, current);
+        app.open_join_files();
+        assert!(
+            app.select_join_input_path(0, previous)
+                .unwrap_err()
+                .contains("private history")
+        );
+        app.select_join_input_path(0, current).unwrap();
+        finish(&mut app);
+        assert_eq!(app.join_files.as_ref().unwrap().paths[0].as_ref(), Some(&a));
+        assert!(app.join_files.as_ref().unwrap().document_inputs[0].is_some());
     }
 }
