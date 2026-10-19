@@ -1296,9 +1296,7 @@ mod tests {
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
         finish(&mut app);
         let document = app.active.document.as_mut().unwrap();
-        document
-            .cell_edits
-            .insert((1, 0), b"edited".to_vec().into());
+        Arc::make_mut(&mut document.cell_edits).insert((1, 0), b"edited".to_vec().into());
         // Simulate large metadata without writing a large fixture. No worker starts here.
         document.whitespace.invalidate();
         std::sync::Arc::get_mut(&mut document.session)

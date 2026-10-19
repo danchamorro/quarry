@@ -1757,8 +1757,8 @@ impl QuarryApp {
         let current_snapshot = WorkingCopySnapshot {
             path: current.session.path().to_path_buf(),
             overlay: StructuralOverlay {
-                header_renames: current.header_renames.clone(),
-                cell_edits: current.cell_edits.clone(),
+                header_renames: current.header_renames.as_ref().clone(),
+                cell_edits: current.cell_edits.as_ref().clone(),
             },
             edit_history: current.edit_history.clone(),
         };
@@ -1768,8 +1768,8 @@ impl QuarryApp {
             Some(current.session.encoding()),
         )
         .map_err(AppMessage::error)?;
-        replacement.header_renames = target.overlay.header_renames.clone();
-        replacement.cell_edits = target.overlay.cell_edits.clone();
+        replacement.header_renames = Arc::new(target.overlay.header_renames.clone());
+        replacement.cell_edits = Arc::new(target.overlay.cell_edits.clone());
         replacement.edit_history = target.edit_history;
         replacement.refresh_column_headers();
         replacement.start_indexing().map_err(AppMessage::error)?;
@@ -5929,6 +5929,11 @@ impl ColumnView {
     }
 }
 
+// Join captures can retain edit metadata and values without copying them on
+// the UI thread. Existing structural/filter snapshots keep their eager map
+// copies, so later ordinary edits retain their established allocation behavior.
+type SharedCellEdits = Arc<BTreeMap<(u64, usize), Arc<Vec<u8>>>>;
+
 struct Document {
     pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
     pending_diagnostic_message: Option<String>,
@@ -5979,9 +5984,9 @@ struct Document {
     selected_columns: BTreeSet<usize>,
     column_selection_anchor: Option<usize>,
     headers: Vec<String>,
-    header_renames: BTreeMap<usize, Arc<String>>,
+    header_renames: Arc<BTreeMap<usize, Arc<String>>>,
     header_edit: Option<HeaderEdit>,
-    cell_edits: BTreeMap<(u64, usize), Arc<Vec<u8>>>,
+    cell_edits: SharedCellEdits,
     cell_edit: Option<CellEdit>,
     cell_focus_requested: Option<(u64, usize)>,
     column_focus_requested: Option<usize>,
@@ -6145,9 +6150,9 @@ impl Document {
             selected_columns: BTreeSet::new(),
             column_selection_anchor: None,
             headers,
-            header_renames: BTreeMap::new(),
+            header_renames: Arc::default(),
             header_edit: None,
-            cell_edits: BTreeMap::new(),
+            cell_edits: Arc::default(),
             cell_edit: None,
             cell_focus_requested: None,
             column_focus_requested: None,
@@ -6757,8 +6762,8 @@ impl Document {
         let undo = WorkingCopySnapshot {
             path: self.session.path().to_path_buf(),
             overlay: StructuralOverlay {
-                header_renames: self.header_renames.clone(),
-                cell_edits: self.cell_edits.clone(),
+                header_renames: self.header_renames.as_ref().clone(),
+                cell_edits: self.cell_edits.as_ref().clone(),
             },
             edit_history: self.edit_history.clone(),
         };
@@ -7781,7 +7786,7 @@ impl Document {
         self.commit_edits();
         let job = self
             .session
-            .start_filter_with_edits(query.clone(), Arc::new(self.cell_edits.clone()))
+            .start_filter_with_edits(query.clone(), Arc::new(self.cell_edits.as_ref().clone()))
             .map_err(|error| {
                 if matches!(error, QuarryError::SourceChanged) {
                     self.invalidate_changed_source();
@@ -7999,7 +8004,7 @@ impl Document {
             .session
             .start_filtered_export_with_edits(
                 query,
-                Arc::new(self.cell_edits.clone()),
+                Arc::new(self.cell_edits.as_ref().clone()),
                 self.header_renames
                     .iter()
                     .map(|(&column, name)| (column, name.as_bytes().to_vec()))
@@ -8482,7 +8487,7 @@ impl Document {
             .first()
             .map(|row| row.fields.clone())
             .unwrap_or_default();
-        for (column, name) in &self.header_renames {
+        for (column, name) in self.header_renames.iter() {
             if let Some(field) = fields.get_mut(*column) {
                 *field = name.as_bytes().to_vec();
             }
@@ -8666,22 +8671,22 @@ impl Document {
         match target {
             EditTarget::Header(column) => {
                 if let Some(value) = value {
-                    self.header_renames.insert(
+                    Arc::make_mut(&mut self.header_renames).insert(
                         column,
                         Arc::new(
                             String::from_utf8(value).expect("header history contains valid UTF-8"),
                         ),
                     );
                 } else {
-                    self.header_renames.remove(&column);
+                    Arc::make_mut(&mut self.header_renames).remove(&column);
                 }
                 self.refresh_column_headers();
             }
             EditTarget::Cell(row, column) => {
                 if let Some(value) = value {
-                    self.cell_edits.insert((row, column), Arc::new(value));
+                    Arc::make_mut(&mut self.cell_edits).insert((row, column), Arc::new(value));
                 } else {
-                    self.cell_edits.remove(&(row, column));
+                    Arc::make_mut(&mut self.cell_edits).remove(&(row, column));
                 }
                 self.queue_filter_refresh();
             }
@@ -8699,7 +8704,7 @@ impl Document {
         }
         self.header_edit = None;
         self.whitespace.invalidate();
-        self.header_renames.clear();
+        self.header_renames = Arc::default();
         self.refresh_column_headers();
     }
 
@@ -8712,7 +8717,7 @@ impl Document {
         }
         self.discard_header_edits();
         self.cell_edit = None;
-        self.cell_edits.clear();
+        self.cell_edits = Arc::default();
         self.edit_history = EditHistory::default();
         self.selection = None;
         self.selected_rows.clear();
@@ -11160,6 +11165,7 @@ std::thread_local! {
 #[cfg(test)]
 mod tests {
     use quarry_core::Encoding;
+    use std::sync::Arc;
     fn individual_edit_app(path: &Path) -> QuarryApp {
         let mut app = QuarryApp::new(None, Instant::now());
         app.active.header_mode = HeaderMode::FirstRow;
@@ -18252,9 +18258,7 @@ mod tests {
         finish_index(app.active.document.as_mut().unwrap());
         {
             let document = app.active.document.as_mut().unwrap();
-            document
-                .cell_edits
-                .insert((3, 1), b"Edited".to_vec().into());
+            Arc::make_mut(&mut document.cell_edits).insert((3, 1), b"Edited".to_vec().into());
             document.selected_rows.ranges = vec![2..=2, 4..=4];
             document.selected_rows.anchor = Some(2);
             document.selection = Some(GridSelection::Row { row: 2 });
@@ -21296,9 +21300,7 @@ mod tests {
             record_offset: 0,
         });
         document.selection = Some(GridSelection::Cell { row: 1, column: 1 });
-        document
-            .cell_edits
-            .insert((1, 1), b"needle".to_vec().into());
+        Arc::make_mut(&mut document.cell_edits).insert((1, 1), b"needle".to_vec().into());
 
         assert!(document.can_replace_current(b"needle"));
         assert_eq!(
@@ -24160,5 +24162,40 @@ mod tests {
             app.active.document.as_ref().unwrap().session.encoding(),
             Encoding::Utf8
         );
+    }
+    #[test]
+    fn shared_join_overlays_retain_captured_values_after_edits_and_tab_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("join-capture.csv");
+        fs::write(&path, b"name,value\nrow,x\n").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        let pending = "pending".repeat(16 * 1024);
+        commit_test_cell(&mut document, 1, 1, &pending);
+        document.rename_header(1, "Captured value".into()).unwrap();
+        let captured_cells = Arc::clone(&document.cell_edits);
+        let captured_headers = Arc::clone(&document.header_renames);
+        assert!(Arc::ptr_eq(&captured_cells, &document.cell_edits));
+        assert!(Arc::ptr_eq(&captured_headers, &document.header_renames));
+        let captured_payload = Arc::clone(&captured_cells[&(1, 1)]);
+        commit_test_cell(&mut document, 1, 1, "later value");
+        document.rename_header(1, "Later header".into()).unwrap();
+        assert_eq!(document.cell_edits[&(1, 1)].as_slice(), b"later value");
+        assert_eq!(document.header_renames[&1].as_str(), "Later header");
+        drop(document);
+        let reader = std::thread::spawn(move || {
+            assert!(Arc::ptr_eq(&captured_payload, &captured_cells[&(1, 1)]));
+            assert_eq!(captured_headers[&1].as_str(), "Captured value");
+            assert_eq!(captured_cells[&(1, 1)].as_slice(), pending.as_bytes());
+        });
+        reader.join().unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"name,value\nrow,x\n");
     }
 }
