@@ -1,0 +1,47 @@
+# ADR 0011: Bounded file joining
+
+## Status and scope
+
+Accepted implementation direction for [#71](https://github.com/danchamorro/quarry/issues/71), beginning with [#119](https://github.com/danchamorro/quarry/issues/119). This records the algorithm and resource obligations before extracting shared code. The join itself and its large-file acceptance remain unimplemented; existing sort measurements are not join measurements.
+
+## Context
+
+Joining two files can multiply records: a shared key with m rows on one side and n on the other produces m * n rows. Neither all keys, a duplicate group, nor all results can live in memory. The approved contract also requires source-row order, current working values, explicit analysis, private temporary storage, and atomic create-new publication. Sorting and duplicate removal already use bounded external runs, but their comparator and preservation verifier are operation-specific.
+
+## Decision
+
+Use external sort/merge on unambiguous framed comparison keys and original source ordinals. Prepare each source independently, sort its runs, analyze matching groups, and stream their matching pairs. Spool oversized duplicate groups to private disk and enumerate them in bounded blocks. Restore the approved output order through an external ordinal sort; key order must not escape into the result. No new database or sorting dependency is required for this direction.
+
+The first extraction shares only private workspace ownership, the existing run frame, and bounded streaming frame I/O. Keep sort/duplicate comparison, numeric/date keys, fan-in calculations, progress, preservation checks and public APIs with their current operation. Preserve existing sort directory/file naming and the frame bytes. A generic reader must reject declared key or record lengths before allocating; callers supply their operation-specific limits and retain useful error context. Every frame body is consumed or skipped before another head is read.
+
+### Memory
+
+- Plan a maximum 512 MiB tracked working-payload budget per join. This is a ceiling, not a target allocation or a measured process-RSS promise. Buffer sizes and merge fan-in are derived from the remaining budget and checked before each phase; refuse a configuration that cannot fit its minimum live set rather than silently expanding the ceiling.
+- Prepare and merge-sort the two inputs sequentially. During matching, read from completed sorted streams, not two concurrent multipass merge trees. Use bounded duplicate blocks and explicit limits for live keys, decoded records, output records, reader buffers, run buffers and previews.
+- Preserve the 64 MiB serialized/decoded record bound and 65,536 output-column bound. Comparison-key framing adds bounded metadata for at most sixteen pairs; validate its total before allocation. A source-sized key does not justify keeping an unbounded duplicate group.
+- Account for metadata and buffer capacity as well as logical lengths in implementation checks. Existing user-driven edit overlays and application view state are separate costs; share immutable payloads and keep snapshot preparation off the render thread. Two active operations must not be mistaken for one join's memory budget.
+- Cancellation is checked during scans, spill/merge work, each bounded duplicate block, result generation, and before publication.
+
+### Disk and analysis
+
+Run a full cancellable analysis before creating a public result. Compute exact row cardinalities with checked arithmetic; for each matching group use checked m * n and accumulate all unmatched rows required by the selected join mode. Compute conservative serialized-byte allowances from actual group data, quoting, field separators, UTF-8 expansion, headers, and first-field BOM protection rather than a sampled average.
+
+Use a per-volume allocation ledger. Include prepared snapshots, key and payload frames for both inputs, old/new merge generations, worst-live duplicate spools, ordinal-ordering generations, and final output staging. Do not count existing retained files again as new allocations; they already reduce available space. Release obsolete runs promptly and include allocations that coexist across phase transitions. Tests must compare observed peak temporary bytes to the advertised allowance. Recheck available space at start and before new phases; write/flush/sync failures remain possible after a successful check.
+
+### Ownership, fidelity and publication
+
+Keep logical-source, working-generation, format and overlay provenance with the analyzed plan. An Arc<Session> or copied path does not own a document's temporary directory; selected inputs need an explicit lifetime lease/reservation until the plan is consumed or released. Extend live application reservations and worker/quit handling before exposing the join.
+
+Every workspace and spill file must be owner-only and clear inherited macOS ACLs before writing values. Reuse the same protection as #118. The final output is independently staged on its destination filesystem and published with create-new semantics only after source, output-count/schema, and cancellation checks. Report cleanup errors without deleting unrelated files. After atomic publication, cancellation retains the completed result.
+
+Comparison normalization never changes emitted values. Validate UTF-8 explicitly because the existing decoder's UTF-8 branch intentionally returns raw bytes. Keep full-width source identities and output projection separate from the grid's visible columns. Sort's one-input record-multiset verifier is not a join verifier; verify pair cardinality, required unmatched records, projection, and the specified ordinal order instead.
+
+## Alternatives
+
+A file-sized in-memory hash table violates the source-size-independent memory contract. Partitioned disk hashing is viable but needs skew handling and an extra source-order restoration mechanism; the existing external-run approach offers more reusable, already tested infrastructure. A SQL engine adds dependency, collation, type-coercion and resource-policy decisions without removing the ordering and source-safety obligations. Neither alternative is selected. Revisit only if measured join acceptance fails, without silently changing product semantics.
+
+## Validation and consequences
+
+The extraction must leave existing sort and duplicate outputs, error categories, private naming, cancellation and cleanup unchanged. Run their existing regression coverage, forced small-budget/multipass tests, malformed frames and inherited-ACL checks. Frame-level tests cover exact byte compatibility, empty/truncated frames, oversize lengths before allocation, and bounded body handling.
+
+Subsequent tickets prove joining separately with a small independent oracle and complete native workflows. Large-file acceptance must include data larger than RAM, a duplicate group larger than the join's in-memory block, long/composite keys, mostly unmatched data, and failure/cancellation in each phase. Record release-build RSS, peak temporary disk, elapsed time, cancellation latency and exact results; do not infer join performance from existing sort evidence.

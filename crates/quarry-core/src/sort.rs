@@ -1,11 +1,9 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::collections::{BTreeMap, BinaryHeap};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::hash::{BuildHasher, Hasher};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +17,9 @@ use quarry_delimited::parse_record;
 use crate::date_time_sort::date_time_key;
 use crate::estimate_edited_output_bytes;
 use crate::export::{ExportTarget, PrivatePublication, source_matches_stamp};
+use crate::spill::{
+    self, FrameHead as RunHead, FrameLimits, FrameReadError, SpillWorkspace as RunWorkspace,
+};
 use crate::storage::{check_operation_storage, output_parent, storage_error};
 use crate::{
     CaseSensitivity, CompletedIndex, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, DateTimeFormat,
@@ -41,7 +42,6 @@ const MAX_NUMERIC_EXPONENT: i64 = 1_000_000;
 pub const MAX_SORT_KEYS: usize = 16;
 // At minimum fan-in, retain two heap keys, a pending key, and one record.
 const MERGE_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024 + 3 * NUMERIC_KEY_OVERHEAD;
-static NEXT_SORT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SortDirection {
@@ -866,106 +866,10 @@ fn source_has_bom(source: &mut File, encoding: Encoding) -> Result<bool, QuarryE
     crate::export::source_starts_with_bom(source, encoding)
 }
 
-struct RunWorkspace {
-    path: PathBuf,
-    next_run: AtomicU64,
-    active: bool,
-}
-
-impl RunWorkspace {
-    #[cfg(test)]
-    fn create(destination: &Path) -> Result<Self, QuarryError> {
-        Self::create_in(output_parent(destination))
-    }
-
-    /// Reserves private scratch storage before any sort or duplicate values are written.
-    fn create_in(parent: &Path) -> Result<Self, QuarryError> {
-        for _ in 0..100 {
-            let id = NEXT_SORT_ID.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!(".quarry-sort-{}-{id}", std::process::id()));
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            builder.mode(0o700);
-            match builder.create(&path) {
-                Ok(()) => {
-                    #[cfg(target_os = "macos")]
-                    if let Err(error) = File::open(&path)
-                        .and_then(|directory| crate::storage::set_macos_acl(&directory, None))
-                    {
-                        let _ = fs::remove_dir(&path);
-                        return Err(storage_error(parent, error));
-                    }
-                    return Ok(Self {
-                        path,
-                        next_run: AtomicU64::new(0),
-                        active: true,
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(storage_error(parent, error)),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not reserve a temporary sort directory",
-        )
-        .into())
-    }
-
-    /// Creates an owner-only spill file without inherited macOS access grants.
-    fn create_run(&self) -> Result<(PathBuf, BufWriter<File>), QuarryError> {
-        let id = self.next_run.fetch_add(1, Ordering::Relaxed);
-        let path = self.path.join(format!("run-{id}.bin"));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options
-            .open(&path)
-            .map_err(|error| storage_error(&self.path, error))?;
-        #[cfg(target_os = "macos")]
-        if let Err(error) = crate::storage::set_macos_acl(&file, None) {
-            drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(storage_error(&self.path, error));
-        }
-        Ok((path, BufWriter::new(file)))
-    }
-
-    fn cleanup(mut self) -> Result<(), QuarryError> {
-        match fs::remove_dir_all(&self.path) {
-            Ok(()) => {
-                self.active = false;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.active = false;
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-}
-
-impl Drop for RunWorkspace {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct RunEntry {
     key: Vec<u8>,
     record: Vec<u8>,
-    ordinal: u64,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct RunHead {
-    key: Vec<u8>,
-    record_len: usize,
     ordinal: u64,
 }
 
@@ -1622,7 +1526,7 @@ fn run_sort(
         ),
         output_bytes,
     )?;
-    let workspace = RunWorkspace::create_in(temporary_directory)?;
+    let workspace = RunWorkspace::create_in(temporary_directory, "sort")?;
     let built = run_sort_inner(
         source,
         source_path,
@@ -1810,51 +1714,42 @@ fn write_entry_parts(
     record: &[u8],
     ordinal: u64,
 ) -> Result<u64, QuarryError> {
-    writer.write_all(&(key.len() as u64).to_le_bytes())?;
-    writer.write_all(&(record.len() as u64).to_le_bytes())?;
-    writer.write_all(&ordinal.to_le_bytes())?;
-    writer.write_all(key)?;
-    writer.write_all(record)?;
-    Ok(24_u64
-        .saturating_add(key.len() as u64)
-        .saturating_add(record.len() as u64))
+    Ok(spill::write_frame(writer, key, record, ordinal)?)
 }
 
-/// Reject oversized run frames before allocating a comparison key or record payload.
+fn frame_error(error: FrameReadError) -> QuarryError {
+    match error {
+        FrameReadError::Io(error) => error.into(),
+        FrameReadError::KeyLength => {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid sort key length").into()
+        }
+        FrameReadError::RecordLength => {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid sort record length").into()
+        }
+    }
+}
+
+/// Keep operation-specific key limits and diagnostics with the sort contract.
 fn read_head(
     reader: &mut BufReader<File>,
     max_record_bytes: usize,
 ) -> Result<Option<RunHead>, QuarryError> {
-    let mut header = [0_u8; 24];
-    let read = reader.read(&mut header[..1])?;
-    if read == 0 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut header[1..])?;
-    let key_len = u64::from_le_bytes(header[0..8].try_into().unwrap());
-    let record_len = u64::from_le_bytes(header[8..16].try_into().unwrap());
-    let ordinal = u64::from_le_bytes(header[16..24].try_into().unwrap());
-    let key_len = usize::try_from(key_len)
-        .ok()
-        .filter(|length| *length <= maximum_sort_key_bytes(max_record_bytes))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid sort key length"))?;
-    let record_len = usize::try_from(record_len)
-        .ok()
-        .filter(|length| *length <= max_record_bytes)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid sort record length"))?;
-    let mut key = vec![0_u8; key_len];
-    reader.read_exact(&mut key)?;
-    Ok(Some(RunHead {
-        key,
-        record_len,
-        ordinal,
-    }))
+    spill::read_head(
+        reader,
+        FrameLimits {
+            max_key_bytes: maximum_sort_key_bytes(max_record_bytes),
+            max_record_bytes,
+        },
+    )
+    .map_err(frame_error)
 }
 
-fn read_record(reader: &mut BufReader<File>, length: usize) -> Result<Vec<u8>, QuarryError> {
-    let mut record = vec![0_u8; length];
-    reader.read_exact(&mut record)?;
-    Ok(record)
+fn read_record(
+    reader: &mut BufReader<File>,
+    length: usize,
+    max_record_bytes: usize,
+) -> Result<Vec<u8>, QuarryError> {
+    spill::read_record(reader, length, max_record_bytes).map_err(frame_error)
 }
 
 fn open_run_readers(paths: &[PathBuf]) -> Result<Vec<BufReader<File>>, QuarryError> {
@@ -1904,7 +1799,11 @@ fn merge_runs_to_run(
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(false);
         }
-        let record = read_record(&mut readers[item.run_index], item.head.record_len)?;
+        let record = read_record(
+            &mut readers[item.run_index],
+            item.head.record_len,
+            max_record_bytes,
+        )?;
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(false);
         }
@@ -1990,7 +1889,11 @@ fn merge_runs_to_output(
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let record = read_record(&mut readers[item.run_index], item.head.record_len)?;
+        let record = read_record(
+            &mut readers[item.run_index],
+            item.head.record_len,
+            max_record_bytes,
+        )?;
         let run_index = item.run_index;
         pending = Some(PendingOutputEntry {
             key: item.head.key,
@@ -3101,7 +3004,7 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"1\n2\n8\n9\n");
         assert!(summary.merge_passes > 1);
         assert!(summary.peak_temporary_bytes <= estimate_sort_temporary_bytes(8, 4));
-        let workspace = RunWorkspace::create(&destination).unwrap();
+        let workspace = RunWorkspace::create_in(output_parent(&destination), "sort").unwrap();
         let (path, mut writer) = workspace.create_run().unwrap();
         write_entry_parts(
             &mut writer,
@@ -3318,7 +3221,7 @@ mod tests {
     fn initial_run_flush_cancellation_propagates_as_cancelled() {
         let directory = case();
         let destination = directory.join("sorted.csv");
-        let workspace = RunWorkspace::create(&destination).unwrap();
+        let workspace = RunWorkspace::create_in(output_parent(&destination), "sort").unwrap();
         let shared = SharedState::new(4);
         let header_renames = BTreeMap::new();
         let cell_edits = BTreeMap::new();
@@ -3358,7 +3261,7 @@ mod tests {
         let destination = directory.join("sorted.csv");
         fs::write(&source, b"id,key\n1,x\n2,\"long,key\"\n").unwrap();
         let mut source_file = File::open(&source).unwrap();
-        let workspace = RunWorkspace::create(&destination).unwrap();
+        let workspace = RunWorkspace::create_in(output_parent(&destination), "sort").unwrap();
         let shared = SharedState::new(fs::metadata(&source).unwrap().len());
 
         let outcome = create_initial_runs(
@@ -3529,7 +3432,7 @@ mod tests {
         let directory = case();
         let source = directory.join("source.csv");
         let destination = directory.join("sorted.csv");
-        let workspace = RunWorkspace::create(&destination).unwrap();
+        let workspace = RunWorkspace::create_in(output_parent(&destination), "sort").unwrap();
         assert_eq!(
             fs::metadata(&workspace.path).unwrap().permissions().mode() & 0o777,
             0o700
@@ -4094,7 +3997,7 @@ mod tests {
         assert!(Command::new("/bin/chmod")
             .args(["+a", "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
             .arg(directory.path()).status().unwrap().success());
-        let workspace = RunWorkspace::create_in(directory.path()).unwrap();
+        let workspace = RunWorkspace::create_in(directory.path(), "sort").unwrap();
         let (run_path, mut run) = workspace.create_run().unwrap();
         run.write_all(b"synthetic CSV values").unwrap();
         run.flush().unwrap();

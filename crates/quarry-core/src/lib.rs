@@ -10,6 +10,7 @@ mod inspection;
 mod search;
 mod sort;
 mod source_stamp;
+mod spill;
 mod storage;
 
 use std::borrow::Cow;
