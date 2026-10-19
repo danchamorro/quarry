@@ -1143,3 +1143,6 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 }
+
+mod working_storage;
+pub use working_storage::{WorkingCopyCleanup, WorkingCopyStorage};

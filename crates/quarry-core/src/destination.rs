@@ -162,6 +162,17 @@ impl Directory {
         }
     }
 
+    pub(crate) fn same_directory(&self, other: &Self) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            Ok(identity(&self.file)? == identity(&other.file)?)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(self.path == other.path)
+        }
+    }
+
     pub(crate) fn still_named_by(&self, path: &Path) -> bool {
         #[cfg(unix)]
         {
@@ -417,6 +428,14 @@ pub(crate) struct StagedDestination {
     destination: PreparedDestination,
 }
 impl StagedDestination {
+    pub(crate) fn is_in_directory(&self, directory: &Directory) -> io::Result<bool> {
+        self.destination.parent.same_directory(directory)
+    }
+
+    pub(crate) fn file_name(&self) -> &std::ffi::OsStr {
+        &self.destination.name
+    }
+
     pub(crate) fn temporary(&self) -> &Path {
         &self.temporary
     }

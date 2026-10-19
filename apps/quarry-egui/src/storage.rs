@@ -639,7 +639,7 @@ impl Document {
 impl WorkingCopyState {
     pub(super) fn use_directory(&mut self, parent: &Path) -> Result<(), String> {
         if self.directory.path().parent() != Some(parent) {
-            let replacement = Self::new_in(parent)?;
+            let replacement = Self::new_in_with_cleanup(parent, self.cleanup.clone())?;
             self.previous_directories.push(std::mem::replace(
                 &mut self.directory,
                 replacement.directory,
@@ -650,21 +650,29 @@ impl WorkingCopyState {
 
     pub(super) fn prune_directories(&mut self, current: &Path) {
         self.previous_directories.retain(|directory| {
-            current.starts_with(directory.path())
+            directory.contains(current)
                 || self
                     .undo
                     .iter()
                     .chain(self.redo.iter())
-                    .any(|snapshot| snapshot.path.starts_with(directory.path()))
+                    .any(|snapshot| directory.contains(&snapshot.path))
         });
     }
 
+    pub(super) fn remove(&self, path: &Path) -> std::io::Result<()> {
+        let directory = std::iter::once(&self.directory)
+            .chain(self.previous_directories.iter())
+            .find(|directory| directory.contains(path))
+            .ok_or_else(|| std::io::Error::other("No private working owner for this file."))?;
+        directory.remove(path)
+    }
+
     pub(super) fn owns(&self, path: &Path) -> bool {
-        path.starts_with(self.directory.path())
+        self.directory.contains(path)
             || self
                 .previous_directories
                 .iter()
-                .any(|directory| path.starts_with(directory.path()))
+                .any(|directory| directory.contains(path))
     }
 }
 
@@ -1343,6 +1351,39 @@ mod tests {
             utf8.session.file_size
         );
     }
+    fn publish_test_generation(
+        state: &mut WorkingCopyState,
+        parent: &Path,
+        value: &str,
+    ) -> PathBuf {
+        let source = parent.join("generation-fixture.csv");
+        std::fs::write(&source, format!("id,value\nx, {value} \n")).unwrap();
+        let session = Session::open(
+            &source,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = state.next_path().unwrap();
+        let job = session
+            .start_create_cleaned_working_copy(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                ColumnCleanup {
+                    columns: vec![1],
+                    operation: CleanupOperation::Trim,
+                },
+                path.clone(),
+            )
+            .unwrap();
+        job.retain_working_storage(Arc::clone(&state.directory))
+            .unwrap();
+        assert!(matches!(job.wait().unwrap(), CleanupOutcome::Complete(_)));
+        path
+    }
+
     #[test]
     fn join_generation_lease_keeps_pruned_files_until_worker_finishes() {
         let parent = tempfile::tempdir().unwrap();
@@ -1350,8 +1391,7 @@ mod tests {
         let source = parent.path().join("original.csv");
         std::fs::write(&source, b"id,value\nx,saved\n").unwrap();
         let mut state = WorkingCopyState::new_in(parent.path()).unwrap();
-        let working = state.next_path();
-        std::fs::write(&working, b"id,value\nx,working\n").unwrap();
+        let working = publish_test_generation(&mut state, parent.path(), "working");
         let lease = Arc::clone(&state.directory);
         let private_root = lease.path().to_path_buf();
         let start = Arc::new(std::sync::Barrier::new(2));
@@ -1372,7 +1412,7 @@ mod tests {
             session.first_rows[1].fields[1].clone()
         });
         state.use_directory(next_parent.path()).unwrap();
-        let current = state.next_path();
+        let current = state.next_path().unwrap();
         state.prune_directories(&current);
         assert!(state.previous_directories.is_empty());
         drop(state);
@@ -1389,5 +1429,68 @@ mod tests {
             "last capture release removes owned private storage"
         );
         assert_eq!(std::fs::read(source).unwrap(), b"id,value\nx,saved\n");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn working_generation_cleanup_never_follows_a_replaced_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut state = WorkingCopyState::new_in(parent.path()).unwrap();
+        let root = state.directory.path().to_owned();
+        let capture = Arc::clone(&state.directory);
+        let _working = publish_test_generation(&mut state, parent.path(), "current");
+        let moved = parent.path().join("moved-working");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir_all(root.join("unrelated")).unwrap();
+        std::fs::write(
+            root.join("unrelated/keep.csv"),
+            b"unrelated,data\nkeep,me\n",
+        )
+        .unwrap();
+        drop(state);
+        assert!(moved.join("generation-1.csv").exists());
+        drop(capture);
+        assert_eq!(
+            std::fs::read(root.join("unrelated/keep.csv")).unwrap(),
+            b"unrelated,data\nkeep,me\n",
+            "last lease cleanup must preserve the replacement tree"
+        );
+        assert!(
+            !moved.exists(),
+            "the actual owned generation root must be cleaned"
+        );
+    }
+    #[test]
+    fn cancelling_a_private_writer_preserves_a_foreign_destination_and_reports_cleanup() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("source.csv");
+        let original = b"id,value\nx, needs trim \n";
+        std::fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish(&mut app);
+        let document = app.active.document.as_mut().unwrap();
+        document
+            .start_cleanup(ColumnCleanup {
+                columns: vec![1],
+                operation: CleanupOperation::Trim,
+            })
+            .unwrap();
+        let destination = match document.structural_job.as_ref().unwrap() {
+            StructuralJob::Cleaning { destination, .. } => destination.clone(),
+            _ => panic!("cleanup job expected"),
+        };
+        let foreign = b"foreign,data\npreserve,me\n";
+        std::fs::write(&destination, foreign).unwrap();
+        document.cancel_structural_edit();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while document.structural_job.is_some() {
+            assert!(document.poll_structural_edit().unwrap().is_none());
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(std::fs::read(&destination).unwrap(), foreign);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert!(!document.working_cleanup.take_errors().is_empty());
     }
 }

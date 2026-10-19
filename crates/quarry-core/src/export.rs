@@ -1276,6 +1276,20 @@ fn row_in_deleted_ranges(deleted_rows: &[RangeInclusive<u64>], row: u64) -> bool
 }
 
 impl SaveAsJob {
+    /// Retain the owning private directory until publication or cancellation.
+    /// Call before wait; publication verifies the captured destination identity.
+    pub fn retain_working_storage(
+        &self,
+        storage: Arc<crate::WorkingCopyStorage>,
+    ) -> Result<(), QuarryError> {
+        self.publication
+            .as_ref()
+            .ok_or(QuarryError::InvalidOption(
+                "this job does not create a private working copy",
+            ))?
+            .retain_storage(storage)
+    }
+
     fn start_with_edits(
         source_path: PathBuf,
         file_size: u64,
@@ -1550,6 +1564,15 @@ impl Drop for SaveAsJob {
 }
 
 impl ReplaceAllJob {
+    /// Retain the owning private directory until publication or cancellation.
+    /// Call before wait; publication verifies the captured destination identity.
+    pub fn retain_working_storage(
+        &self,
+        storage: Arc<crate::WorkingCopyStorage>,
+    ) -> Result<(), QuarryError> {
+        self.inner.retain_working_storage(storage)
+    }
+
     pub fn progress(&self) -> SaveAsProgress {
         self.inner.progress()
     }
@@ -1581,6 +1604,15 @@ impl ReplaceAllJob {
 }
 
 impl CleanupJob {
+    /// Retain the owning private directory until publication or cancellation.
+    /// Call before wait; publication verifies the captured destination identity.
+    pub fn retain_working_storage(
+        &self,
+        storage: Arc<crate::WorkingCopyStorage>,
+    ) -> Result<(), QuarryError> {
+        self.inner.retain_working_storage(storage)
+    }
+
     pub fn progress(&self) -> SaveAsProgress {
         self.inner.progress()
     }
@@ -2045,10 +2077,31 @@ enum FirstRecordBomGuard {
 pub(crate) struct PrivatePublication {
     ready: AtomicBool,
     accepted: Mutex<Option<bool>>,
+    storage: Mutex<Option<Arc<crate::WorkingCopyStorage>>>,
     wake: Condvar,
 }
 
 impl PrivatePublication {
+    pub(crate) fn retain_storage(
+        &self,
+        storage: Arc<crate::WorkingCopyStorage>,
+    ) -> Result<(), QuarryError> {
+        let decision = self.accepted.lock().unwrap();
+        if decision.is_some() {
+            return Err(QuarryError::InvalidOption(
+                "retain working storage before accepting publication",
+            ));
+        }
+        let mut owner = self.storage.lock().unwrap();
+        if owner.is_some() {
+            return Err(QuarryError::InvalidOption(
+                "working storage is already retained",
+            ));
+        }
+        *owner = Some(storage);
+        Ok(())
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -2202,14 +2255,14 @@ impl ExportTarget {
         if !source_matches_stamp(source, source_path, &source_stamp)? {
             return Err(QuarryError::SourceChanged);
         }
-        Self::create(
-            destination,
-            Publication::GuardedCreateWorkingCopy {
-                source_path: source_path.to_path_buf(),
-                source: source.try_clone()?,
-                source_stamp,
-            },
-        )
+        let mut target = Self::new_combined(Vec::new(), destination)?;
+        target.publication = Publication::GuardedCreateWorkingCopy {
+            source_path: source_path.to_path_buf(),
+            source: source.try_clone()?,
+            source_stamp,
+        };
+        target.ensure_source_unchanged()?;
+        Ok(target)
     }
 
     fn replace_source(
@@ -2686,7 +2739,11 @@ impl ExportTarget {
         }
         file.sync_all()
             .map_err(|error| storage_error(parent, error))?;
-        let observed_output = if capture_stamp {
+        let observed_output = if capture_stamp
+            || matches!(
+                self.publication,
+                Publication::GuardedCreateWorkingCopy { .. }
+            ) {
             let before = SourceStamp::from_file(&file).ok();
             Some((file, before))
         } else {
@@ -2719,7 +2776,25 @@ impl ExportTarget {
                     self.remove_temporary()?;
                     return Ok((FilterExportOutcome::Cancelled, None, None));
                 }
-                publish_no_replace(&self.temporary, &self.destination)
+                let staging = self
+                    .pinned_staging
+                    .as_ref()
+                    .expect("private publication pins its destination");
+                let storage = self
+                    .private_publication
+                    .as_ref()
+                    .and_then(|publication| publication.storage.lock().unwrap().clone());
+                if let Some(storage) = storage {
+                    storage.publish(
+                        staging,
+                        &observed_output
+                            .as_ref()
+                            .expect("private output descriptor")
+                            .0,
+                    )
+                } else {
+                    staging.publish()
+                }
             }
             Publication::ReplaceSource { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {

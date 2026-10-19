@@ -150,3 +150,32 @@ When the physical generation differs from the saved source, analysis pins its pr
 
 
 Working overlays are applied before UTF-8 validation of effective field values. A current cell/header edit can repair invalid UTF-8 in the replaced saved value; every remaining current field, including excluded columns, must still validate. Structural CSV errors and malformed native encoding remain errors. Header probing uses the same effective values as analysis, with bounded labels and logical-source diagnostics. Source bytes remain unchanged.
+
+
+### Private generation ownership
+
+A working generation is owned by a pinned `WorkingCopyStorage`, shared by the
+document, its current writer, and any captured join input. The owner records
+only the names and original file identities successfully published by its jobs.
+Dropping a document or pruning history cannot release a generation retained by
+another owner.
+
+Private writers stage through captured directory handles and retain the owner
+before their existing acceptance handshake. Publication verifies that the
+captured destination belongs to that owner, never replaces an existing entry,
+and registers the original output descriptor's identity. A relocated directory
+can report its verified current location; a substituted directory is rejected.
+The UI installs the actual successful output path.
+
+Cleanup unlinks only registered matching files through the held directory and
+then removes that empty directory without recursion. Unregistered entries and
+replacement files are preserved, even if their bytes equal an earlier output.
+Cancellation never gives a caller authority to remove the requested destination.
+A retained report channel carries cleanup failures beyond a storage owner's
+lifetime; the application surfaces those errors while it is running. Pending
+private destinations and retained history directories are excluded from join
+output choices.
+
+This ownership foundation does not complete the unsaved-input desktop workflow.
+Source selection, input reservations, invalidation, and close/quit cleanup
+coordination still require the remaining #126/#127 integration and validation.

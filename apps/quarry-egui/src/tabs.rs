@@ -449,6 +449,7 @@ impl QuarryApp {
             }
         };
         document.working_directory = self.working_directory.clone();
+        document.working_cleanup = self.working_cleanup.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
             current.commit_edits();

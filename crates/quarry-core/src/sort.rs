@@ -565,6 +565,14 @@ pub struct SortJob {
 }
 
 impl SortJob {
+    /// Retain the private generation owner before accepting publication.
+    pub fn retain_working_storage(
+        &self,
+        storage: Arc<crate::WorkingCopyStorage>,
+    ) -> Result<(), QuarryError> {
+        self.publication.retain_storage(storage)
+    }
+
     /// Start a guarded private sort with scratch files beside the destination.
     #[allow(clippy::too_many_arguments)]
     fn start(

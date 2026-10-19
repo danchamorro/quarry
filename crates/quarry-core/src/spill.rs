@@ -36,7 +36,7 @@ struct WorkspaceState {
 }
 
 #[derive(Clone)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -46,7 +46,7 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn capture(file: &File) -> io::Result<Self> {
+    pub(crate) fn capture(file: &File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(changed_file());
@@ -167,10 +167,18 @@ impl SpillFile {
 }
 
 fn open_owned(directory: &Directory, id: u64, identity: &FileIdentity) -> io::Result<File> {
+    open_owned_named(directory, std::ffi::OsStr::new(&run_name(id)), identity)
+}
+
+fn open_owned_named(
+    directory: &Directory,
+    name: &std::ffi::OsStr,
+    identity: &FileIdentity,
+) -> io::Result<File> {
     #[cfg(unix)]
     let file = File::from(rustix::fs::openat(
         &directory.file,
-        run_name(id),
+        name,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::NONBLOCK
             | rustix::fs::OFlags::CLOEXEC
@@ -188,7 +196,7 @@ fn open_owned(directory: &Directory, id: u64, identity: &FileIdentity) -> io::Re
                 windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
             );
         }
-        options.open(directory.current_path()?.join(run_name(id)))?
+        options.open(directory.current_path()?.join(name))?
     };
     if !identity.matches(&file)? {
         return Err(changed_file());
@@ -196,14 +204,21 @@ fn open_owned(directory: &Directory, id: u64, identity: &FileIdentity) -> io::Re
     Ok(file)
 }
 
-#[allow(clippy::unnecessary_cast)]
 fn remove_owned(directory: &Directory, id: u64, identity: &FileIdentity) -> io::Result<()> {
+    remove_owned_named(directory, std::ffi::OsStr::new(&run_name(id)), identity)
+}
+
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn remove_owned_named(
+    directory: &Directory,
+    name: &std::ffi::OsStr,
+    identity: &FileIdentity,
+) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let name = run_name(id);
         let stat = match rustix::fs::statat(
             &directory.file,
-            &name,
+            name,
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         ) {
             Ok(stat) => stat,
@@ -220,12 +235,12 @@ fn remove_owned(directory: &Directory, id: u64, identity: &FileIdentity) -> io::
     }
     #[cfg(not(unix))]
     {
-        match open_owned(directory, id, identity) {
+        match open_owned_named(directory, name, identity) {
             Ok(file) => drop(file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
         }
-        fs::remove_file(directory.current_path()?.join(run_name(id)))
+        fs::remove_file(directory.current_path()?.join(name))
     }
 }
 
@@ -378,6 +393,14 @@ impl SpillWorkspace {
             format!("could not reserve a temporary {namespace} directory"),
         )
         .into())
+    }
+
+    pub(crate) fn with_directory<T>(
+        &self,
+        operation: impl FnOnce(&Directory) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let state = self.root.lock()?;
+        operation(state.directory.as_ref().ok_or_else(changed_file)?)
     }
 
     /// Creates an owner-only spill file relative to the captured directory.

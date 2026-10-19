@@ -837,15 +837,19 @@ impl QuarryApp {
                 tabs::paths_alias(path, &doc.logical_path)
                     || tabs::paths_alias(path, doc.session.path())
                     || doc.working_copy.as_ref().is_some_and(|state| {
-                        std::iter::once(state.directory.path())
-                            .chain(
-                                state
-                                    .previous_directories
-                                    .iter()
-                                    .map(|directory| directory.path()),
-                            )
-                            .any(|directory| output_is_inside_working_directory(path, directory))
+                        state.owns(path)
+                            || std::iter::once(&state.directory)
+                                .chain(state.previous_directories.iter())
+                                .any(|directory| {
+                                    output_is_inside_working_directory(path, directory.path())
+                                        || directory.current_path().is_ok_and(|current| {
+                                            output_is_inside_working_directory(path, &current)
+                                        })
+                                })
                     })
+                    || doc
+                        .reserved_working_destination()
+                        .is_some_and(|destination| tabs::paths_alias(path, destination))
             }) || tab
                 .write_destination
                 .as_ref()

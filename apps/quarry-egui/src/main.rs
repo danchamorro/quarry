@@ -43,7 +43,6 @@ use quarry_core::{
     SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SortSpec, SplitAnalysisJob,
     SplitAnalysisOutcome, StructuralIndex,
 };
-use tempfile::TempDir;
 
 mod about;
 mod combine_files;
@@ -334,6 +333,7 @@ fn main() -> eframe::Result<()> {
 }
 
 struct QuarryApp {
+    working_cleanup: quarry_core::WorkingCopyCleanup,
     whitespace_preferences: whitespace::Preferences,
     about: about::About,
     combine_files: Option<combine_files::CombineDialog>,
@@ -671,6 +671,7 @@ impl QuarryApp {
             about: about::About::new(),
             combine_files: None,
             join_files: None,
+            working_cleanup: quarry_core::WorkingCopyCleanup::default(),
             working_directory: std::env::temp_dir(),
             active: DocumentTab::new(1),
             tabs: Vec::new(),
@@ -745,6 +746,7 @@ impl QuarryApp {
         let mut document =
             Document::prepare_with_encoding(&path, options, encoding).map_err(AppMessage::error)?;
         document.working_directory = self.working_directory.clone();
+        document.working_cleanup = self.working_cleanup.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
             current.shutdown();
@@ -1575,6 +1577,7 @@ impl QuarryApp {
         replacement.original_session = current.original_session.take();
         replacement.working_copy = current.working_copy.take();
         replacement.working_directory = self.working_directory.clone();
+        replacement.working_cleanup = self.working_cleanup.clone();
         replacement.selected_columns = ready.selected_columns;
         let first_selected = replacement.selected_columns.iter().next().copied();
         replacement.column_selection_anchor = first_selected;
@@ -1794,6 +1797,7 @@ impl QuarryApp {
         replacement.original_session = current.original_session.take();
         replacement.working_copy = Some(state);
         replacement.working_directory = self.working_directory.clone();
+        replacement.working_cleanup = self.working_cleanup.clone();
         current.shutdown();
         self.active.document = Some(replacement);
         self.active.structural_dialog = None;
@@ -2115,6 +2119,10 @@ impl eframe::App for QuarryApp {
 
         self.reset_tab_focus(ctx);
         self.poll_document_tabs(ctx);
+        let cleanup_errors = self.working_cleanup.take_errors();
+        if !cleanup_errors.is_empty() {
+            self.active.notice = Some(AppMessage::warning(cleanup_errors.join("\n")));
+        }
         self.poll_inspections(ctx);
 
         if self.active.close_confirmation_open {
@@ -5560,10 +5568,11 @@ impl RowSelection {
 }
 
 struct WorkingCopyState {
+    cleanup: quarry_core::WorkingCopyCleanup,
     // Captured working inputs must own their private generations independently
     // of a tab's lifetime and pruning of obsolete storage roots.
-    directory: Arc<TempDir>,
-    previous_directories: Vec<Arc<TempDir>>,
+    directory: Arc<quarry_core::WorkingCopyStorage>,
+    previous_directories: Vec<Arc<quarry_core::WorkingCopyStorage>>,
     next_generation: u64,
     undo: Option<WorkingCopySnapshot>,
     redo: Option<WorkingCopySnapshot>,
@@ -5575,11 +5584,18 @@ impl WorkingCopyState {
         Self::new_in(&std::env::temp_dir())
     }
 
+    #[cfg(test)]
     fn new_in(parent: &Path) -> Result<Self, String> {
+        Self::new_in_with_cleanup(parent, quarry_core::WorkingCopyCleanup::default())
+    }
+
+    fn new_in_with_cleanup(
+        parent: &Path,
+        cleanup: quarry_core::WorkingCopyCleanup,
+    ) -> Result<Self, String> {
         Ok(Self {
-            directory: tempfile::Builder::new()
-                .prefix("quarry-working-")
-                .tempdir_in(parent)
+            cleanup: cleanup.clone(),
+            directory: quarry_core::WorkingCopyStorage::new_in(parent, cleanup)
                 .map(Arc::new)
                 .map_err(|error| format!("Cannot create working files in {}: {error}. Choose another folder in File > Temporary storage.", parent.display()))?,
             previous_directories: Vec::new(),
@@ -5589,13 +5605,17 @@ impl WorkingCopyState {
         })
     }
 
-    fn next_path(&mut self) -> PathBuf {
+    fn next_path(&mut self) -> Result<PathBuf, String> {
         let path = self
             .directory
-            .path()
+            .current_path()
+            .map_err(|error| format!("Cannot locate private working files: {error}"))?
             .join(format!("generation-{}.csv", self.next_generation));
-        self.next_generation = self.next_generation.saturating_add(1);
-        path
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| "The working generation limit has been reached.".to_owned())?;
+        Ok(path)
     }
 }
 
@@ -5938,6 +5958,7 @@ struct Document {
     pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
     pending_diagnostic_message: Option<String>,
     working_directory: PathBuf,
+    working_cleanup: quarry_core::WorkingCopyCleanup,
     pending_materialization: Option<(ColumnTransformation, BTreeSet<usize>, u64)>,
     session: Arc<Session>,
     logical_path: PathBuf,
@@ -6106,6 +6127,7 @@ impl Document {
             pending_diagnostic: None,
             pending_diagnostic_message: None,
             working_directory: std::env::temp_dir(),
+            working_cleanup: quarry_core::WorkingCopyCleanup::default(),
             pending_materialization: None,
             original_session: None,
             working_copy: None,
@@ -6318,6 +6340,14 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
+        job.retain_working_storage(Arc::clone(
+            &self
+                .working_copy
+                .as_ref()
+                .expect("working storage prepared")
+                .directory,
+        ))
+        .map_err(AppMessage::core_error)?;
         self.structural_job = Some(StructuralJob::InsertingRows {
             job,
             destination,
@@ -6506,6 +6536,14 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
+        job.retain_working_storage(Arc::clone(
+            &self
+                .working_copy
+                .as_ref()
+                .expect("working storage prepared")
+                .directory,
+        ))
+        .map_err(AppMessage::core_error)?;
         self.structural_job = Some(StructuralJob::DeletingRows {
             job,
             destination,
@@ -6614,6 +6652,14 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
+        job.retain_working_storage(Arc::clone(
+            &self
+                .working_copy
+                .as_ref()
+                .expect("working storage prepared")
+                .directory,
+        ))
+        .map_err(AppMessage::core_error)?;
         self.structural_job = Some(StructuralJob::Sorting {
             job,
             destination,
@@ -6671,6 +6717,14 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
+        job.retain_working_storage(Arc::clone(
+            &self
+                .working_copy
+                .as_ref()
+                .expect("working storage prepared")
+                .directory,
+        ))
+        .map_err(AppMessage::core_error)?;
         self.structural_job = Some(StructuralJob::FindingDuplicates {
             job,
             destination,
@@ -6756,8 +6810,13 @@ impl Document {
             self.original_session = Some(original);
         }
         if self.working_copy.is_none() {
-            self.working_copy =
-                Some(WorkingCopyState::new_in(&self.working_directory).map_err(AppMessage::error)?);
+            self.working_copy = Some(
+                WorkingCopyState::new_in_with_cleanup(
+                    &self.working_directory,
+                    self.working_cleanup.clone(),
+                )
+                .map_err(AppMessage::error)?,
+            );
         }
         let undo = WorkingCopySnapshot {
             path: self.session.path().to_path_buf(),
@@ -6774,7 +6833,7 @@ impl Document {
         state
             .use_directory(&self.working_directory)
             .map_err(AppMessage::error)?;
-        let destination = state.next_path();
+        let destination = state.next_path().map_err(AppMessage::error)?;
         let renames = self
             .header_renames
             .iter()
@@ -6819,6 +6878,14 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
+        job.retain_working_storage(Arc::clone(
+            &self
+                .working_copy
+                .as_ref()
+                .expect("working storage prepared")
+                .directory,
+        ))
+        .map_err(AppMessage::core_error)?;
         self.structural_job = Some(StructuralJob::Materializing {
             job,
             destination,
@@ -6870,6 +6937,14 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
+        job.retain_working_storage(Arc::clone(
+            &self
+                .working_copy
+                .as_ref()
+                .expect("working storage prepared")
+                .directory,
+        ))
+        .map_err(AppMessage::core_error)?;
         self.structural_job = Some(StructuralJob::Cleaning {
             job,
             destination,
@@ -6933,6 +7008,14 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
+        job.retain_working_storage(Arc::clone(
+            &self
+                .working_copy
+                .as_ref()
+                .expect("working storage prepared")
+                .directory,
+        ))
+        .map_err(AppMessage::core_error)?;
         self.structural_job = Some(StructuralJob::Replacing {
             job,
             destination,
@@ -6953,7 +7036,9 @@ impl Document {
         let current_path = self.session.path().to_path_buf();
         for obsolete in [state.undo.take(), state.redo.take()].into_iter().flatten() {
             if obsolete.path != current_path && state.owns(&obsolete.path) {
-                let _ = std::fs::remove_file(obsolete.path);
+                if let Err(error) = state.remove(&obsolete.path) {
+                    self.working_cleanup.report(error);
+                }
             }
         }
         debug_assert_eq!(undo.path, current_path);
@@ -7011,7 +7096,7 @@ impl Document {
                         });
                     }
                     Ok(_) => {
-                        let _ = std::fs::remove_file(destination);
+                        self.remove_working_file(&destination);
                         self.cleanup_empty_working_copy();
                         self.structural_status = Some(
                             if cancel_requested {
@@ -7023,11 +7108,12 @@ impl Document {
                         );
                     }
                     Err(error) => {
-                        let _ = std::fs::remove_file(destination);
+                        self.remove_working_file(&destination);
                         self.cleanup_empty_working_copy();
                         self.structural_status =
                             Some("Duplicate search failed. The document was not changed.".into());
                         if matches!(error, QuarryError::SourceChanged) {
+                            self.remove_working_file(&destination);
                             self.invalidate_changed_source();
                             return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                         }
@@ -7113,7 +7199,7 @@ impl Document {
                     ),
                 })),
                 Ok(outcome @ (CleanupOutcome::Unchanged | CleanupOutcome::Cancelled)) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status = Some(
                         if matches!(outcome, CleanupOutcome::Unchanged) {
@@ -7126,7 +7212,7 @@ impl Document {
                     Ok(None)
                 }
                 Err(error) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     if matches!(error, QuarryError::SourceChanged) {
                         self.invalidate_changed_source();
@@ -7141,30 +7227,27 @@ impl Document {
                 selected_columns,
                 undo,
             } => match job.wait() {
-                Ok(SaveAsOutcome::Complete(summary)) => {
-                    debug_assert_eq!(summary.destination, destination);
-                    Ok(Some(MaterializedWorkingCopy {
-                        path: summary.destination,
-                        output_index: None,
-                        undo,
-                        selected_columns,
-                        notice: "Column edit applied. Save to keep it, or discard changes.".into(),
-                    }))
-                }
+                Ok(SaveAsOutcome::Complete(summary)) => Ok(Some(MaterializedWorkingCopy {
+                    path: summary.destination,
+                    output_index: None,
+                    undo,
+                    selected_columns,
+                    notice: "Column edit applied. Save to keep it, or discard changes.".into(),
+                })),
                 Ok(SaveAsOutcome::Cancelled) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Column edit cancelled. The document was not changed.".into());
                     Ok(None)
                 }
                 Err(QuarryError::SourceChanged) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.invalidate_changed_source();
                     Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Column edit failed. The document was not changed.".into());
@@ -7177,33 +7260,30 @@ impl Document {
                 undo,
                 count,
             } => match job.wait() {
-                Ok(SaveAsOutcome::Complete(summary)) => {
-                    debug_assert_eq!(summary.destination, destination);
-                    Ok(Some(MaterializedWorkingCopy {
-                        path: summary.destination,
-                        output_index: None,
-                        undo,
-                        selected_columns: BTreeSet::new(),
-                        notice: format!(
-                            "Inserted {count} row{}. Save to keep it, or discard changes.",
-                            if count == 1 { "" } else { "s" }
-                        ),
-                    }))
-                }
+                Ok(SaveAsOutcome::Complete(summary)) => Ok(Some(MaterializedWorkingCopy {
+                    path: summary.destination,
+                    output_index: None,
+                    undo,
+                    selected_columns: BTreeSet::new(),
+                    notice: format!(
+                        "Inserted {count} row{}. Save to keep it, or discard changes.",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                })),
                 Ok(SaveAsOutcome::Cancelled) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Row insertion cancelled. The document was not changed.".into());
                     Ok(None)
                 }
                 Err(QuarryError::SourceChanged) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.invalidate_changed_source();
                     Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Row insertion failed. The document was not changed.".into());
@@ -7216,33 +7296,30 @@ impl Document {
                 undo,
                 count,
             } => match job.wait() {
-                Ok(SaveAsOutcome::Complete(summary)) => {
-                    debug_assert_eq!(summary.destination, destination);
-                    Ok(Some(MaterializedWorkingCopy {
-                        path: summary.destination,
-                        output_index: None,
-                        undo,
-                        selected_columns: BTreeSet::new(),
-                        notice: format!(
-                            "Deleted {count} row{}. Save to keep it, or discard changes.",
-                            if count == 1 { "" } else { "s" }
-                        ),
-                    }))
-                }
+                Ok(SaveAsOutcome::Complete(summary)) => Ok(Some(MaterializedWorkingCopy {
+                    path: summary.destination,
+                    output_index: None,
+                    undo,
+                    selected_columns: BTreeSet::new(),
+                    notice: format!(
+                        "Deleted {count} row{}. Save to keep it, or discard changes.",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                })),
                 Ok(SaveAsOutcome::Cancelled) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Row deletion cancelled. The document was not changed.".into());
                     Ok(None)
                 }
                 Err(QuarryError::SourceChanged) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.invalidate_changed_source();
                     Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Row deletion failed. The document was not changed.".into());
@@ -7256,7 +7333,6 @@ impl Document {
                 undo,
             } => match job.wait() {
                 Ok(ReplaceAllOutcome::Complete(summary)) => {
-                    debug_assert_eq!(summary.destination, destination);
                     let count = summary.replacements;
                     Ok(Some(MaterializedWorkingCopy {
                         path: summary.destination,
@@ -7270,26 +7346,26 @@ impl Document {
                     }))
                 }
                 Ok(ReplaceAllOutcome::NoMatch) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("No matches found. The document was not changed.".into());
                     Ok(None)
                 }
                 Ok(ReplaceAllOutcome::Cancelled) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Replace All cancelled. The document was not changed.".into());
                     Ok(None)
                 }
                 Err(QuarryError::SourceChanged) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.invalidate_changed_source();
                     Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
-                    let _ = std::fs::remove_file(destination);
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Replace All failed. The document was not changed.".into());
@@ -7304,7 +7380,6 @@ impl Document {
                 plan,
             } => match job.wait() {
                 Ok(SortOutcome::Complete(summary)) => {
-                    debug_assert_eq!(summary.destination, destination);
                     let operation = match plan.keys[0].mode {
                         SortMode::Shuffle { .. } => "Shuffled rows.".to_owned(),
                         SortMode::Reverse => "Reversed row order.".to_owned(),
@@ -7330,16 +7405,19 @@ impl Document {
                     }))
                 }
                 Ok(SortOutcome::Cancelled) => {
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Sort cancelled. The document was not changed.".into());
                     Ok(None)
                 }
                 Err(QuarryError::SourceChanged) => {
+                    self.remove_working_file(&destination);
                     self.invalidate_changed_source();
                     Err(AppMessage::warning(SOURCE_CHANGED_NOTICE))
                 }
                 Err(error) => {
+                    self.remove_working_file(&destination);
                     self.cleanup_empty_working_copy();
                     self.structural_status =
                         Some("Sort failed. The document was not changed.".into());
@@ -7357,7 +7435,7 @@ impl Document {
             if let Some(StructuralJob::DuplicatePreview { summary, .. }) =
                 self.structural_job.take()
             {
-                let _ = std::fs::remove_file(summary.destination);
+                self.remove_working_file(&summary.destination);
             }
             self.cleanup_empty_working_copy();
             self.structural_cancel_requested = false;
@@ -7386,6 +7464,28 @@ impl Document {
         self.structural_status = Some("Cancelling change…".into());
     }
 
+    fn reserved_working_destination(&self) -> Option<&Path> {
+        match self.structural_job.as_ref()? {
+            StructuralJob::FindingDuplicates { destination, .. }
+            | StructuralJob::Sorting { destination, .. }
+            | StructuralJob::Materializing { destination, .. }
+            | StructuralJob::Replacing { destination, .. }
+            | StructuralJob::Cleaning { destination, .. }
+            | StructuralJob::InsertingRows { destination, .. }
+            | StructuralJob::DeletingRows { destination, .. } => Some(destination),
+            StructuralJob::DuplicatePreview { summary, .. } => Some(&summary.destination),
+            StructuralJob::AnalyzingSplit { .. } => None,
+        }
+    }
+
+    fn remove_working_file(&self, path: &Path) {
+        if let Some(state) = &self.working_copy
+            && let Err(error) = state.remove(path)
+        {
+            self.working_cleanup.report(error);
+        }
+    }
+
     fn cleanup_empty_working_copy(&mut self) {
         let empty = self.working_copy.as_ref().is_some_and(|state| {
             state.undo.is_none() && state.redo.is_none() && self.session.path() == self.logical_path
@@ -7404,7 +7504,9 @@ impl Document {
             return;
         };
         if redo.path != self.session.path() && state.owns(&redo.path) {
-            let _ = std::fs::remove_file(redo.path);
+            if let Err(error) = state.remove(&redo.path) {
+                self.working_cleanup.report(error);
+            }
         }
         state.prune_directories(self.session.path());
     }
@@ -8846,7 +8948,7 @@ impl Document {
             match job {
                 StructuralJob::FindingDuplicates { job, .. } => job.cancel(),
                 StructuralJob::DuplicatePreview { summary, .. } => {
-                    let _ = std::fs::remove_file(summary.destination);
+                    self.remove_working_file(&summary.destination);
                 }
                 StructuralJob::AnalyzingSplit { job, .. } => job.cancel(),
                 StructuralJob::Materializing { job, .. } => job.cancel(),
@@ -18186,6 +18288,53 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_search_without_matches_releases_its_owned_candidate_with_existing_history() {
+        use quarry_core::{CleanupOperation, ColumnCleanup};
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("unique.csv");
+        let original = b"id,value\na, first \nb, second \n";
+        fs::write(&source, original).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        finish_index(app.active.document.as_mut().unwrap());
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_cleanup(ColumnCleanup {
+                columns: vec![1],
+                operation: CleanupOperation::Trim,
+            })
+            .unwrap();
+        finish_structural_edit(&mut app);
+        let document = app.active.document.as_ref().unwrap();
+        let current = document.session.path().to_owned();
+        let root = document
+            .working_copy
+            .as_ref()
+            .unwrap()
+            .directory
+            .path()
+            .to_owned();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_find_duplicates(vec![0], CaseSensitivity::Sensitive)
+            .unwrap();
+        finish_duplicate_search(&mut app);
+        let document = app.active.document.as_ref().unwrap();
+        assert!(document.structural_job.is_none());
+        assert_eq!(document.session.path(), current);
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "a zero-duplicate candidate must not accumulate beside current/history files"
+        );
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
     fn duplicates_preview_source_conflict_and_reopen_failure_do_not_consume_history() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("duplicates.csv");
@@ -18234,7 +18383,7 @@ mod tests {
             history_len
         );
         assert_eq!(app.active.document.as_ref().unwrap().session.path(), source);
-        fs::write(&candidate, candidate_bytes).unwrap();
+        fs::write(&candidate, &candidate_bytes).unwrap();
         fs::write(&source, b"key,value\nexternal,changed\n").unwrap();
         assert_eq!(
             app.confirm_duplicate_removal().unwrap_err(),
@@ -18243,7 +18392,10 @@ mod tests {
         let document = app.active.document.as_ref().unwrap();
         assert_eq!(document.edit_history.undo.len(), history_len);
         assert_eq!(document.column_name(1), "memo");
-        assert!(!candidate.exists());
+        // Recreating the same bytes produces a different file identity.
+        // Cleanup has no authority to delete that replacement.
+        assert_eq!(fs::read(&candidate).unwrap(), candidate_bytes);
+        assert!(!document.working_cleanup.take_errors().is_empty());
         assert!(document.source_changed);
         assert_eq!(fs::read(source).unwrap(), b"key,value\nexternal,changed\n");
     }

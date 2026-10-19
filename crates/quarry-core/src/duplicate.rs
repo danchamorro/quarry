@@ -114,6 +114,14 @@ pub struct DuplicateJob {
 }
 
 impl DuplicateJob {
+    /// Retain the private generation owner before accepting publication.
+    pub fn retain_working_storage(
+        &self,
+        storage: Arc<crate::WorkingCopyStorage>,
+    ) -> Result<(), QuarryError> {
+        self.publication.retain_storage(storage)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn start(
         session: &Session,
