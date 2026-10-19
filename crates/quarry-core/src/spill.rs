@@ -307,9 +307,8 @@ impl SpillWorkspace {
                     {
                         use std::os::unix::fs::MetadataExt;
                         let metadata = directory.file.metadata()?;
-                        // SAFETY: geteuid has no arguments or memory preconditions.
                         if metadata.mode() & 0o077 != 0
-                            || metadata.uid() != unsafe { libc::geteuid() }
+                            || metadata.uid() != rustix::process::geteuid().as_raw()
                         {
                             return Err(changed_file().into());
                         }
