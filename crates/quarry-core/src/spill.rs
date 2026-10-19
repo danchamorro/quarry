@@ -215,6 +215,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// Tiny bounds exercise oversized declarations without allocating large payloads.
     fn limits() -> FrameLimits {
         FrameLimits {
             max_key_bytes: 3,
