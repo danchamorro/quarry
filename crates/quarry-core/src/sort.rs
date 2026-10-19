@@ -1704,10 +1704,12 @@ fn reduce_runs(
     Ok(true)
 }
 
+/// Serialize a complete in-memory sort entry in the shared spill format.
 fn write_entry(writer: &mut BufWriter<File>, entry: &RunEntry) -> Result<u64, QuarryError> {
     write_entry_parts(writer, &entry.key, &entry.record, entry.ordinal)
 }
 
+/// Serialize a merge entry without allocating another combined payload.
 fn write_entry_parts(
     writer: &mut BufWriter<File>,
     key: &[u8],
@@ -1717,6 +1719,7 @@ fn write_entry_parts(
     Ok(spill::write_frame(writer, key, record, ordinal)?)
 }
 
+/// Retain sort diagnostics while sharing operation-independent frame validation.
 fn frame_error(error: FrameReadError) -> QuarryError {
     match error {
         FrameReadError::Io(error) => error.into(),
@@ -1744,6 +1747,7 @@ fn read_head(
     .map_err(frame_error)
 }
 
+/// Read one bounded payload after its head, without retaining other run records.
 fn read_record(
     reader: &mut BufReader<File>,
     length: usize,

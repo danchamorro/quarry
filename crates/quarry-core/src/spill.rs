@@ -85,6 +85,7 @@ impl SpillWorkspace {
         Ok((path, BufWriter::new(file)))
     }
 
+    /// Remove owned scratch data explicitly so cleanup failures reach the caller.
     pub(crate) fn cleanup(mut self) -> Result<(), QuarryError> {
         match fs::remove_dir_all(&self.path) {
             Ok(()) => {
@@ -101,6 +102,7 @@ impl SpillWorkspace {
 }
 
 impl Drop for SpillWorkspace {
+    /// Best-effort fallback for abandoned operations; use cleanup to observe errors.
     fn drop(&mut self) {
         if self.active {
             let _ = fs::remove_dir_all(&self.path);
@@ -131,6 +133,7 @@ pub(crate) enum FrameReadError {
 }
 
 impl From<io::Error> for FrameReadError {
+    /// Preserve the underlying I/O failure separately from invalid frame lengths.
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
