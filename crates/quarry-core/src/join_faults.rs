@@ -22,6 +22,7 @@ pub(crate) enum Event {
     OutputWrite,
     OutputFlush,
     OutputSync,
+    DestinationPinned,
     BeforeSourceGuard,
     BeforePublication,
     AfterPublication,
@@ -860,5 +861,78 @@ fn cancellation_and_source_conflict_remain_visible_when_staging_cleanup_fails() 
         assert_eq!(std::fs::read_dir(staging).unwrap().count(), 1);
         assert_eq!(fixture.workspaces(), vec![staging.to_owned()]);
         assert_eq!(std::fs::read(&fixture.paths[1]).unwrap(), ADDITIONAL);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn creation_capacity_follows_pinned_folders_after_rename_and_replacement() {
+    for target in ["temporary", "output"] {
+        for replacement in ["missing", "directory", "file"] {
+            let fixture = Fixture::new();
+            let output = fixture.directory.path().join("output");
+            std::fs::create_dir(&output).unwrap();
+            let plan = fixture.plan(JoinMode::Full);
+            let workspace = fixture.workspaces().pop().unwrap();
+            let original = if target == "temporary" {
+                &workspace
+            } else {
+                &output
+            };
+            let moved = fixture.directory.path().join("moved");
+            let probe = Probe::pause(Event::DestinationPinned);
+            let job = plan
+                .start_write_acknowledged(output.join("joined.csv"), true)
+                .unwrap();
+            let resume = probe.wait();
+            std::fs::rename(original, &moved).unwrap();
+            match replacement {
+                "directory" => {
+                    std::fs::create_dir(original).unwrap();
+                    std::fs::write(original.join("foreign.csv"), b"preserve replacement\n")
+                        .unwrap();
+                }
+                "file" => std::fs::write(original, b"preserve replacement\n").unwrap(),
+                _ => {}
+            }
+            drop(resume);
+            let summary = job
+                .wait()
+                .unwrap_or_else(|error| panic!("{target} {replacement}: {error}"))
+                .unwrap();
+            let result = if target == "output" { &moved } else { &output }.join("joined.csv");
+            assert_eq!(
+                summary.destination.canonicalize().unwrap(),
+                result.canonicalize().unwrap()
+            );
+            assert_eq!(summary.data_rows, 7);
+            assert_eq!(summary.bytes_written, FULL_RESULT.len() as u64);
+            assert_eq!(std::fs::read(&result).unwrap(), FULL_RESULT.as_bytes());
+            assert_eq!(
+                std::fs::read_dir(result.parent().unwrap()).unwrap().count(),
+                1
+            );
+            assert!(summary.cleanup_warning.is_none());
+            assert!(
+                !(if target == "temporary" {
+                    &moved
+                } else {
+                    &workspace
+                })
+                .exists()
+            );
+            match replacement {
+                "directory" => {
+                    assert_eq!(
+                        std::fs::read(original.join("foreign.csv")).unwrap(),
+                        b"preserve replacement\n"
+                    );
+                    assert_eq!(std::fs::read_dir(original).unwrap().count(), 1);
+                }
+                "file" => assert_eq!(std::fs::read(original).unwrap(), b"preserve replacement\n"),
+                _ => assert!(!original.exists()),
+            }
+            fixture.assert_inputs();
+        }
     }
 }

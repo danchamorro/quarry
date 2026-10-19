@@ -162,6 +162,40 @@ impl Directory {
         }
     }
 
+    /// Capacity follows the captured directory even if its old name is replaced.
+    /// Writability is checked by the real staging/run creation immediately afterward.
+    pub(crate) fn storage_space(&self) -> Result<crate::StorageSpace, QuarryError> {
+        #[cfg(unix)]
+        {
+            let directory = self.current_path().unwrap_or_else(|_| self.path.clone());
+            let space = rustix::fs::fstatvfs(&self.file)
+                .map_err(|error| crate::storage::storage_error(&directory, error.into()))?;
+            Ok(crate::StorageSpace {
+                directory,
+                required_bytes: 0,
+                available_bytes: space.f_bavail.saturating_mul(space.f_frsize),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows pins the resolved path and every ancestor against rename.
+            crate::inspect_storage(&self.path)
+        }
+    }
+
+    pub(crate) fn same_volume(&self, other: &Self) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            Ok(identity(&self.file)?.0 == identity(&other.file)?.0)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            // Unknown volume identity must not undercount simultaneous allocation.
+            Ok(true)
+        }
+    }
+
     pub(crate) fn same_directory(&self, other: &Self) -> io::Result<bool> {
         #[cfg(unix)]
         {
@@ -215,11 +249,15 @@ impl PreparedDestination {
         })
     }
 
+    pub(crate) fn storage_directory(&self) -> &Directory {
+        &self.parent
+    }
+
     pub(crate) fn physical_path(&self) -> PathBuf {
         self.parent.path.join(&self.name)
     }
 
-    fn reported_path(&self) -> io::Result<PathBuf> {
+    pub(crate) fn reported_path(&self) -> io::Result<PathBuf> {
         if self
             .parent
             .still_named_by(crate::storage::output_parent(&self.requested))

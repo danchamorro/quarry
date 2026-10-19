@@ -2751,34 +2751,24 @@ pub fn analyze_join_with_working(
 
 /// Account for simultaneous staging and ordering files on their actual volumes.
 fn check_creation_space(
-    temporary: &Path,
-    destination: &Path,
+    temporary: &crate::destination::Directory,
+    destination: &crate::destination::Directory,
     spill_bytes: u64,
     output_bytes: u64,
 ) -> JResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let same_volume =
-            fs::metadata(temporary)?.dev() == fs::metadata(output_parent(destination))?.dev();
-        if same_volume {
-            check_storage(temporary, add(spill_bytes, output_bytes)?)?;
-        } else {
-            check_storage(temporary, spill_bytes)?;
-            check_storage(output_parent(destination), output_bytes)?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // Unknown volume identity requires checking both locations. Reuse the
-        // shared conservative fallback rather than inspecting only scratch space.
-        crate::storage::check_operation_storage(
-            temporary,
-            destination,
-            add(spill_bytes, output_bytes)?,
-            output_bytes,
-        )?;
-    }
+    let temporary_space = temporary.storage_space()?;
+    let output_space = destination.storage_space()?;
+    let same_volume = temporary
+        .same_volume(destination)
+        .map_err(|error| crate::storage::storage_error(&temporary_space.directory, error))?;
+    let (temporary_required, output_required) = if same_volume {
+        let total = add(spill_bytes, output_bytes)?;
+        (total, total)
+    } else {
+        (spill_bytes, output_bytes)
+    };
+    temporary_space.require(temporary_required)?;
+    output_space.require(output_required)?;
     Ok(())
 }
 
@@ -2906,6 +2896,8 @@ impl JoinPlan {
                 source.ensure_output_outside(&prepared_destination)?;
             }
         }
+        #[cfg(test)]
+        crate::join_faults::observe(crate::join_faults::Event::DestinationPinned);
         let retained = add(self.inputs[0].frame_bytes, self.inputs[1].frame_bytes)?;
         state.add_disk(retained)?;
         for (role, input) in [JoinSource::Main, JoinSource::Additional]
@@ -2919,12 +2911,15 @@ impl JoinPlan {
             self.analysis.output_bytes - header.len() as u64,
             mul(self.analysis.output_rows, 40)?,
         )?;
-        check_creation_space(
-            &workspace.path,
-            &prepared_destination.physical_path(),
-            mul(frame_bytes, 2)?,
-            self.analysis.output_bytes,
-        )?;
+        let spill_bytes = mul(frame_bytes, 2)?;
+        workspace.with_directory(|temporary| {
+            Ok(check_creation_space(
+                temporary,
+                prepared_destination.storage_directory(),
+                spill_bytes,
+                self.analysis.output_bytes,
+            ))
+        })??;
         let sources = self
             .inputs
             .iter()
@@ -3091,6 +3086,33 @@ impl JoinPlan {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_capacity_combines_same_volume_allowances_after_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_temporary = dir.path().join("temporary");
+        let old_output = dir.path().join("output");
+        fs::create_dir(&old_temporary).unwrap();
+        fs::create_dir(&old_output).unwrap();
+        let temporary = crate::destination::Directory::open(&old_temporary).unwrap();
+        let output = crate::destination::Directory::open(&old_output).unwrap();
+        let moved_temporary = dir.path().join("moved-temporary");
+        let moved_output = dir.path().join("moved-output");
+        fs::rename(&old_temporary, &moved_temporary).unwrap();
+        fs::rename(&old_output, &moved_output).unwrap();
+        let failure =
+            check_creation_space(&temporary, &output, u64::MAX / 2, u64::MAX / 2).unwrap_err();
+        assert!(
+            matches!(failure, Failure::Error(QuarryError::InsufficientStorage {
+            directory, required_bytes, available_bytes,
+        }) if directory == moved_temporary.canonicalize().unwrap() && required_bytes == u64::MAX - 1
+            && available_bytes < required_bytes)
+        );
+        assert!(fs::read_dir(moved_temporary).unwrap().next().is_none());
+        assert!(fs::read_dir(moved_output).unwrap().next().is_none());
+        assert!(!old_temporary.exists() && !old_output.exists());
+    }
 
     #[cfg(unix)]
     #[test]

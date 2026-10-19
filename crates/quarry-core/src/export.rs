@@ -2195,7 +2195,9 @@ impl ExportTarget {
         sources: Vec<(PathBuf, SourceStamp)>,
         destination: crate::destination::PreparedDestination,
     ) -> Result<Self, QuarryError> {
-        let physical = destination.physical_path();
+        let physical = destination
+            .reported_path()
+            .map_err(|error| storage_error(output_parent(&destination.physical_path()), error))?;
         for (path, _) in &sources {
             validate_destination(path, &physical)?;
         }
