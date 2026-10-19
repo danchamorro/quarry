@@ -1,6 +1,7 @@
-//! Bounded, source-preserving joins. The initial desktop slice supports saved,
-//! headered UTF-8 inputs, one unique key per side, and a left join.
+//! Bounded, source-preserving joins of saved, headered UTF-8 inputs.
+//! One key per side supports all matching pairs and a source-ordered left join.
 use crate::source_stamp::open_regular_file;
+
 use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
@@ -34,6 +35,8 @@ pub struct JoinInput {
     pub key_column: usize,
     /// Bind a UI selection to the file version whose header was shown.
     pub expected_version: Option<JoinSourceVersion>,
+    /// Reject repeated nonempty keys when explicitly requested.
+    pub require_unique: bool,
 }
 
 /// Opaque identity of the file whose column labels were presented to the user.
@@ -163,6 +166,8 @@ pub fn read_join_header(path: PathBuf) -> Result<JoinJob<JoinHeader>, QuarryErro
 pub struct JoinConfig {
     pub memory_bytes: usize,
     pub run_memory_bytes: usize,
+    /// Target capacity of a Main-side row block; a single larger record is allowed.
+    pub group_memory_bytes: usize,
     pub max_record_bytes: usize,
     pub max_columns: usize,
     pub max_merge_fan_in: usize,
@@ -175,6 +180,7 @@ impl Default for JoinConfig {
         Self {
             memory_bytes: 512 * 1024 * 1024,
             run_memory_bytes: 16 * 1024 * 1024,
+            group_memory_bytes: 8 * 1024 * 1024,
             max_record_bytes: RECORD_LIMIT,
             max_columns: COLUMN_LIMIT,
             max_merge_fan_in: 32,
@@ -201,12 +207,24 @@ pub struct JoinAnalysis {
     pub input_rows: [u64; 2],
     pub matching_rows: [u64; 2],
     pub matching_pairs: u64,
+    pub duplicate_groups: [u64; 2],
+    pub many_to_many_groups: u64,
+    pub many_to_many_pairs: u64,
+    pub duplicate_samples: Vec<JoinDuplicateExample>,
     pub unmatched_rows: [u64; 2],
     pub empty_key_rows: [u64; 2],
     pub output_rows: u64,
     pub output_bytes: u64,
     pub additional_temporary_bytes: u64,
     pub preview: Vec<Vec<String>>,
+}
+
+/// Bounded examples identify duplicate groups without retaining their records.
+#[derive(Debug)]
+pub struct JoinDuplicateExample {
+    pub key: String,
+    pub main_rows: u64,
+    pub additional_rows: u64,
 }
 
 /// Immutable analysis owns its private sorted inputs until creation or release.
@@ -223,6 +241,8 @@ pub struct JoinSummary {
     pub data_rows: u64,
     pub bytes_written: u64,
     pub peak_temporary_bytes: u64,
+    /// Peak Main-side block capacity, excluding the separately streamed Additional row.
+    pub peak_group_buffer_bytes: usize,
     pub cleanup_warning: Option<String>,
 }
 
@@ -263,6 +283,7 @@ struct Progress {
     bytes: AtomicU64,
     temporary: AtomicU64,
     peak: AtomicU64,
+    group_peak: AtomicUsize,
     cancel: AtomicBool,
     done: AtomicBool,
 }
@@ -275,6 +296,7 @@ impl Progress {
             bytes: AtomicU64::new(0),
             temporary: AtomicU64::new(0),
             peak: AtomicU64::new(0),
+            group_peak: AtomicUsize::new(0),
             cancel: AtomicBool::new(false),
             done: AtomicBool::new(false),
         }
@@ -384,6 +406,7 @@ impl<T> Drop for JoinJob<T> {
     }
 }
 
+#[derive(Debug)]
 enum Failure {
     Cancelled,
     Error(QuarryError),
@@ -436,6 +459,7 @@ impl JoinConfig {
             || self.max_columns == 0
             || self.max_columns > COLUMN_LIMIT
             || self.run_memory_bytes == 0
+            || self.group_memory_bytes == 0
             || self.max_merge_fan_in < 2
             || self.max_merge_fan_in > 32
             || self.preview_rows > 100
@@ -456,6 +480,7 @@ impl JoinConfig {
             .max_record_bytes
             .saturating_mul(7)
             .saturating_add(self.run_memory_bytes)
+            .saturating_add(self.group_memory_bytes)
             .saturating_add(self.preview_bytes)
             .saturating_add(self.max_columns.saturating_mul(64))
             .saturating_add(
@@ -480,6 +505,7 @@ impl JoinConfig {
             .max_record_bytes
             .saturating_mul(3)
             .saturating_add(self.run_memory_bytes)
+            .saturating_add(self.group_memory_bytes)
             .saturating_add(self.preview_bytes)
             .saturating_add(self.max_columns.saturating_mul(64))
             .saturating_add(4 * 1024 * 1024);
@@ -492,7 +518,7 @@ impl JoinConfig {
     /// Keep every private frame within the input record and key limits.
     fn frame_limits(self) -> FrameLimits {
         FrameLimits {
-            max_key_bytes: self.max_record_bytes.saturating_add(9),
+            max_key_bytes: self.max_record_bytes.saturating_add(9).max(16),
             max_record_bytes: self.max_record_bytes,
         }
     }
@@ -503,6 +529,8 @@ struct PreparedInput {
     info: JoinInputInfo,
     stamp: SourceStamp,
     key_column: usize,
+    require_unique: bool,
+    output_delimiter: u8,
     sorted: SpillFile,
     frame_bytes: u64,
 }
@@ -899,6 +927,8 @@ struct Inspected {
     info: JoinInputInfo,
     stamp: SourceStamp,
     key_column: usize,
+    require_unique: bool,
+    output_delimiter: u8,
     frame_bytes: u64,
     max_key_bytes: usize,
 }
@@ -1020,6 +1050,8 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
         },
         stamp,
         key_column: input.key_column,
+        require_unique: input.require_unique,
+        output_delimiter: delimiter,
         frame_bytes,
         max_key_bytes,
     })
@@ -1095,6 +1127,8 @@ fn prepare(
         info: input.info,
         stamp: input.stamp,
         key_column: input.key_column,
+        require_unique: input.require_unique,
+        output_delimiter: input.output_delimiter,
         sorted: run.path,
         frame_bytes: run.bytes,
     })
@@ -1244,155 +1278,419 @@ fn output_record(
     encode(values, inputs[0].info.delimiter, config.max_record_bytes)
 }
 
-struct Stream<'a> {
+/// A duplicate group is a byte range in an immutable private sorted run.
+/// Reusing that backing file avoids copying or buffering the full group.
+#[derive(Clone, Copy)]
+struct GroupRange {
+    start: u64,
+    end: u64,
+    rows: u64,
+    value_bytes: u64,
+    max_value_bytes: usize,
+}
+
+struct Group {
+    key: Vec<u8>,
+    range: GroupRange,
+}
+
+impl Group {
+    fn into_range(self) -> GroupRange {
+        let Self { key, range } = self;
+        drop(key);
+        range
+    }
+}
+
+struct OwnedRow {
+    record: Vec<u8>,
+    ordinal: u64,
+}
+
+/// Compute exactly the escaping contribution of one value in its output position.
+fn encoded_value_bytes(value: &[u8], delimiter: u8, first: bool) -> JResult<usize> {
+    let quote = value
+        .iter()
+        .any(|b| [delimiter, b'"', b'\r', b'\n'].contains(b))
+        || (first && value.starts_with(b"\xef\xbb\xbf"));
+    value
+        .len()
+        .checked_add(if quote {
+            2 + value.iter().filter(|b| **b == b'"').count()
+        } else {
+            0
+        })
+        .ok_or_else(|| error("Joined value length overflow.").into())
+}
+
+/// Separate value bytes from the fixed per-row delimiter and LF contribution.
+fn row_value_bytes(
+    input: &PreparedInput,
+    side: usize,
+    row: &OwnedRow,
+    config: JoinConfig,
+) -> JResult<usize> {
+    let values = fields(
+        &row.record,
+        input.info.delimiter,
+        false,
+        &input.info.path,
+        row.ordinal + 1,
+        config,
+    )?;
+    if values.len() > input.info.columns.len() {
+        return Err(error("Prepared row exceeds the analyzed schema.").into());
+    }
+    let mut size = 0_usize;
+    for (column, value) in values.iter().enumerate() {
+        size = size
+            .checked_add(encoded_value_bytes(
+                value,
+                input.output_delimiter,
+                side == 0 && column == 0,
+            )?)
+            .ok_or_else(|| error("Joined row length overflow."))?;
+    }
+    Ok(size)
+}
+
+/// Verify the stored comparison key against the decoded record before using it.
+fn read_row(
+    reader: &mut impl Read,
+    input: &PreparedInput,
+    key: &[u8],
+    record_len: usize,
+    ordinal: u64,
+    config: JoinConfig,
+    state: &Progress,
+) -> JResult<OwnedRow> {
+    if ordinal >= input.info.data_rows {
+        return Err(error("Invalid private source ordinal.").into());
+    }
+    let record = read_record(reader, record_len, config, state)?;
+    let values = fields(
+        &record,
+        input.info.delimiter,
+        false,
+        &input.info.path,
+        ordinal + 1,
+        config,
+    )?;
+    let value = values
+        .get(input.key_column)
+        .filter(|value| !value.is_empty());
+    let matches = match value {
+        Some(value) => key.first() == Some(&1) && key.get(1..) == Some(value.as_ref()),
+        None => key.first() == Some(&0) && key.get(1..) == Some(ordinal.to_be_bytes().as_slice()),
+    };
+    if !matches {
+        return Err(error("Private join key differs from its record.").into());
+    }
+    drop(values);
+    Ok(OwnedRow { record, ordinal })
+}
+
+struct Groups<'a> {
     input: &'a PreparedInput,
+    side: usize,
     reader: BufReader<File>,
-    head: Option<FrameHead>,
+    config: JoinConfig,
+    state: &'a Progress,
+    rows: u64,
+}
+
+impl<'a> Groups<'a> {
+    fn new(
+        input: &'a PreparedInput,
+        side: usize,
+        config: JoinConfig,
+        state: &'a Progress,
+    ) -> JResult<Self> {
+        Ok(Self {
+            input,
+            side,
+            reader: BufReader::new(input.sorted.open()?),
+            config,
+            state,
+            rows: 0,
+        })
+    }
+
+    /// Scan each group once for counts and exact byte-size contributions.
+    fn next(&mut self) -> JResult<Option<Group>> {
+        self.state.check()?;
+        let start = self.reader.stream_position()?;
+        let Some(first) = read_head(&mut self.reader, self.config, self.state)? else {
+            if self.rows != self.input.info.data_rows {
+                return Err(error("Prepared join row count changed.").into());
+            }
+            return Ok(None);
+        };
+        if first.key.is_empty() {
+            return Err(error("Empty private join key.").into());
+        }
+        let FrameHead {
+            key,
+            record_len,
+            ordinal,
+        } = first;
+        let mut head = (record_len, ordinal);
+        let mut rows = 0;
+        let mut value_bytes = 0;
+        let mut max_value_bytes = 0;
+        let mut last_ordinal = None;
+        let end;
+        loop {
+            self.state.check()?;
+            if last_ordinal.is_some_and(|last| head.1 <= last) {
+                return Err(error("Private join ordinals are out of order.").into());
+            }
+            let row = read_row(
+                &mut self.reader,
+                self.input,
+                &key,
+                head.0,
+                head.1,
+                self.config,
+                self.state,
+            )?;
+            let size = row_value_bytes(self.input, self.side, &row, self.config)?;
+            value_bytes = add(value_bytes, size as u64)?;
+            max_value_bytes = max_value_bytes.max(size);
+            rows = add(rows, 1)?;
+            last_ordinal = Some(head.1);
+            drop(row);
+            if rows > 1 && key[0] == 1 && self.input.require_unique {
+                return Err(input_error(
+                    &self.input.info.path,
+                    Some(head.1 + 2),
+                    "Repeated key found, but Require unique key is enabled for this input.",
+                )
+                .into());
+            }
+            let next_position = self.reader.stream_position()?;
+            let Some(next) = read_head(&mut self.reader, self.config, self.state)? else {
+                end = next_position;
+                break;
+            };
+            if next.key != key {
+                if next.key < key {
+                    return Err(error("Private join groups are out of order.").into());
+                }
+                self.reader.seek(SeekFrom::Start(next_position))?;
+                end = next_position;
+                break;
+            }
+            head = (next.record_len, next.ordinal);
+        }
+        self.rows = add(self.rows, rows)?;
+        Ok(Some(Group {
+            key,
+            range: GroupRange {
+                start,
+                end,
+                rows,
+                value_bytes,
+                max_value_bytes,
+            },
+        }))
+    }
+}
+
+/// Merge only group metadata; the potentially enormous groups remain on disk.
+fn walk_groups(
+    inputs: &[PreparedInput; 2],
+    config: JoinConfig,
+    state: &Progress,
+    mut visit: impl FnMut(Option<Group>, Option<Group>) -> JResult<()>,
+) -> JResult<()> {
+    let mut left = Groups::new(&inputs[0], 0, config, state)?;
+    let mut right = Groups::new(&inputs[1], 1, config, state)?;
+    let mut a = left.next()?;
+    let mut b = right.next()?;
+    loop {
+        state.check()?;
+        let order = match (&a, &b) {
+            (None, None) => break,
+            (Some(_), None) => CmpOrdering::Less,
+            (None, Some(_)) => CmpOrdering::Greater,
+            (Some(a), Some(_)) if a.key[0] == 0 => CmpOrdering::Less,
+            (Some(_), Some(b)) if b.key[0] == 0 => CmpOrdering::Greater,
+            (Some(a), Some(b)) => a.key.cmp(&b.key),
+        };
+        match order {
+            CmpOrdering::Less => {
+                visit(a.take(), None)?;
+                a = left.next()?;
+            }
+            CmpOrdering::Greater => {
+                visit(None, b.take())?;
+                b = right.next()?;
+            }
+            CmpOrdering::Equal => {
+                visit(a.take(), b.take())?;
+                a = left.next()?;
+                b = right.next()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct RangeRows<'a> {
+    input: &'a PreparedInput,
+    range: GroupRange,
+    reader: BufReader<File>,
+    consumed: u64,
     config: JoinConfig,
     state: &'a Progress,
 }
-impl<'a> Stream<'a> {
-    fn new(input: &'a PreparedInput, config: JoinConfig, state: &'a Progress) -> JResult<Self> {
+
+impl<'a> RangeRows<'a> {
+    fn new(
+        input: &'a PreparedInput,
+        range: GroupRange,
+        config: JoinConfig,
+        state: &'a Progress,
+    ) -> JResult<Self> {
         let mut reader = BufReader::new(input.sorted.open()?);
-        let head = read_head(&mut reader, config, state)?;
+        reader.seek(SeekFrom::Start(range.start))?;
+
         Ok(Self {
             input,
+            range,
             reader,
-            head,
+            consumed: 0,
             config,
             state,
         })
     }
-    /// Verify the comparison key against its payload before releasing key memory.
-    fn record(&mut self) -> JResult<(Vec<u8>, u64)> {
-        let head = self.head.take().expect("stream head");
-        let record = read_record(&mut self.reader, head.record_len, self.config, self.state)?;
-        let parsed = fields(
-            &record,
-            self.input.info.delimiter,
-            false,
-            &self.input.info.path,
-            head.ordinal + 1,
-            self.config,
-        )?;
-        let value = parsed
-            .get(self.input.key_column)
-            .filter(|value| !value.is_empty());
-        let matches = match value {
-            Some(value) => {
-                head.key.first() == Some(&1) && head.key.get(1..) == Some(value.as_ref())
+
+    fn next(&mut self) -> JResult<Option<OwnedRow>> {
+        self.state.check()?;
+        let position = self.reader.stream_position()?;
+        if position == self.range.end {
+            if self.consumed != self.range.rows {
+                return Err(error("Private duplicate group changed.").into());
             }
-            None => {
-                head.key.first() == Some(&0)
-                    && head.key.get(1..) == Some(head.ordinal.to_be_bytes().as_slice())
-            }
-        };
-        if !matches {
-            return Err(error("Private join key differs from its record.").into());
+            return Ok(None);
         }
-        drop(parsed);
-        Ok((record, head.ordinal))
+        if position > self.range.end || self.consumed >= self.range.rows {
+            return Err(error("Invalid private duplicate-group range.").into());
+        }
+        let head = read_head(&mut self.reader, self.config, self.state)?
+            .ok_or_else(|| error("Truncated duplicate group."))?;
+        let row = read_row(
+            &mut self.reader,
+            self.input,
+            &head.key,
+            head.record_len,
+            head.ordinal,
+            self.config,
+            self.state,
+        )?;
+        self.consumed += 1;
+        if self.reader.stream_position()? > self.range.end {
+            return Err(error("Private duplicate group overran its range.").into());
+        }
+        Ok(Some(row))
     }
-    /// Load the next head only after the previous callback releases its payload.
-    fn advance(&mut self) -> JResult<()> {
-        self.head = read_head(&mut self.reader, self.config, self.state)?;
-        Ok(())
+
+    /// Peek only the next frame length, rewinding before holding any row block.
+    fn next_size(&mut self) -> JResult<Option<usize>> {
+        let position = self.reader.stream_position()?;
+        if position == self.range.end {
+            if self.consumed != self.range.rows {
+                return Err(error("Private duplicate group changed.").into());
+            }
+            return Ok(None);
+        }
+        let head = read_head(&mut self.reader, self.config, self.state)?
+            .ok_or_else(|| error("Truncated duplicate group."))?;
+        let bytes = head
+            .record_len
+            .saturating_add(std::mem::size_of::<OwnedRow>());
+        drop(head);
+        self.reader.seek(SeekFrom::Start(position))?;
+        Ok(Some(bytes))
+    }
+
+    /// A single oversized record is allowed, within the validated record budget.
+    fn block(&mut self) -> JResult<Vec<OwnedRow>> {
+        let mut rows = Vec::new();
+        let mut bytes = 0_usize;
+        while let Some(size) = self.next_size()? {
+            if !rows.is_empty() && bytes.saturating_add(size) > self.config.group_memory_bytes {
+                break;
+            }
+            let row = self
+                .next()?
+                .ok_or_else(|| error("Duplicate group ended unexpectedly."))?;
+            rows.try_reserve_exact(1)
+                .map_err(|_| error("Cannot allocate the bounded duplicate block."))?;
+            bytes = bytes
+                .saturating_add(row.record.capacity())
+                .saturating_add(std::mem::size_of::<OwnedRow>());
+            rows.push(row);
+        }
+        self.state.group_peak.fetch_max(bytes, Ordering::AcqRel);
+        Ok(rows)
     }
 }
 
-/// Visit equality matches and both kinds of unmatched rows. Callback payloads
-/// are released before fetching more heads, keeping the live set bounded.
-fn walk(
+/// Enumerate all pairs by bounded Main blocks and streamed Additional rows.
+/// The final ordinal pass establishes public order independently of block order.
+fn enumerate_pairs(
     inputs: &[PreparedInput; 2],
+    left: GroupRange,
+    right: Option<GroupRange>,
     config: JoinConfig,
     state: &Progress,
-    mut visit: impl FnMut(Option<(&[u8], u64)>, Option<(&[u8], u64)>) -> JResult<()>,
+    limit: Option<usize>,
+    mut emit: impl FnMut(&OwnedRow, Option<&OwnedRow>) -> JResult<()>,
 ) -> JResult<()> {
-    let mut a = Stream::new(&inputs[0], config, state)?;
-    let mut b = Stream::new(&inputs[1], config, state)?;
-    loop {
-        state.check()?;
-        let order = match (&a.head, &b.head) {
-            (None, None) => break,
-            (Some(_), None) => CmpOrdering::Less,
-            (None, Some(_)) => CmpOrdering::Greater,
-            (Some(left), Some(_)) if left.key.first() == Some(&0) => CmpOrdering::Less,
-            (Some(_), Some(right)) if right.key.first() == Some(&0) => CmpOrdering::Greater,
-            (Some(left), Some(right)) => left.key.cmp(&right.key),
-        };
-        match order {
-            CmpOrdering::Less => {
-                let (record, ordinal) = a.record()?;
-                visit(Some((&record, ordinal)), None)?;
-                drop(record);
-                a.advance()?;
+    let mut config = config;
+    if limit.is_some() {
+        config.group_memory_bytes = 1;
+    }
+    let mut a = RangeRows::new(&inputs[0], left, config, state)?;
+    let mut emitted = 0_usize;
+    if let Some(right) = right {
+        loop {
+            let block = a.block()?;
+            if block.is_empty() {
+                break;
             }
-            CmpOrdering::Greater => {
-                let (record, ordinal) = b.record()?;
-                visit(None, Some((&record, ordinal)))?;
-                drop(record);
-                b.advance()?;
+            let mut b = RangeRows::new(&inputs[1], right, config, state)?;
+            while let Some(row) = b.next()? {
+                for main in &block {
+                    state.check()?;
+                    emit(main, Some(&row))?;
+                    emitted = emitted.saturating_add(1);
+                    if limit.is_some_and(|limit| emitted >= limit) {
+                        return Ok(());
+                    }
+                }
             }
-            CmpOrdering::Equal => {
-                let (left, left_ordinal) = a.record()?;
-                let (right, right_ordinal) = b.record()?;
-                visit(Some((&left, left_ordinal)), Some((&right, right_ordinal)))?;
-                drop(left);
-                drop(right);
-                a.advance()?;
-                b.advance()?;
+        }
+    } else {
+        while let Some(row) = a.next()? {
+            state.check()?;
+            emit(&row, None)?;
+            emitted = emitted.saturating_add(1);
+            if limit.is_some_and(|limit| emitted >= limit) {
+                return Ok(());
             }
         }
     }
     Ok(())
 }
 
-/// Reject duplicate keys and malformed ordering before retaining a plan.
-fn validate_keys(input: &PreparedInput, config: JoinConfig, state: &Progress) -> JResult<()> {
-    let mut reader = BufReader::new(input.sorted.open()?);
-    let mut previous: Option<FrameHead> = None;
-    let mut count = 0;
-    while let Some(head) = read_head(&mut reader, config, state)? {
-        if head.key.is_empty() {
-            return Err(error("Empty private join key.").into());
-        }
-        if let Some(previous) = &previous {
-            if previous.key > head.key
-                || (previous.key == head.key && previous.ordinal >= head.ordinal)
-            {
-                return Err(error("Private join records are out of order.").into());
-            }
-            if head.key[0] == 1 && previous.key == head.key {
-                return Err(input_error(
-                    &input.info.path,
-                    Some(head.ordinal + 2),
-                    "Repeated key found. This first join version requires unique nonempty keys.",
-                )
-                .into());
-            }
-        }
-        let mut body = CancelRead {
-            reader: &mut reader,
-            state,
-        }
-        .take(head.record_len as u64);
-        if io::copy(&mut body, &mut io::sink()).map_err(|e| {
-            if state.cancel.load(Ordering::Acquire) {
-                Failure::Cancelled
-            } else {
-                e.into()
-            }
-        })? != head.record_len as u64
-        {
-            return Err(error("Truncated private join record.").into());
-        }
-        previous = Some(head);
-        count = add(count, 1)?;
-    }
-    if count != input.info.data_rows {
-        return Err(error("Prepared join row count changed.").into());
-    }
-    Ok(())
+fn pair_key(main: u64, additional: Option<u64>) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16);
+    key.extend_from_slice(&main.to_be_bytes());
+    key.extend_from_slice(&additional.unwrap_or(u64::MAX).to_be_bytes());
+    key
 }
 
 /// Bound displayed columns and text independently of full result values.
@@ -1425,70 +1723,157 @@ fn preview_row(
     Ok(output)
 }
 
-/// Count the full join while retaining only a bounded preview in source order.
+/// Compute group expansion before allocating or generating any result rows.
+fn matched_group_output(
+    a: GroupRange,
+    b: GroupRange,
+    columns: u64,
+    limit: usize,
+) -> JResult<(u64, u64)> {
+    let count = mul(a.rows, b.rows)?;
+    let bytes = add(
+        add(mul(a.value_bytes, b.rows)?, mul(b.value_bytes, a.rows)?)?,
+        mul(count, columns)?,
+    )?;
+    let max = a
+        .max_value_bytes
+        .checked_add(b.max_value_bytes)
+        .and_then(|n| n.checked_add(columns as usize))
+        .ok_or_else(|| error("Joined record length overflow."))?;
+    if max > limit {
+        return Err(error("A joined record exceeds the configured size limit.").into());
+    }
+    Ok((count, bytes))
+}
+
+/// Analyze group cardinality and byte bounds without materializing the Cartesian result.
 fn analyze_prepared(
     inputs: &[PreparedInput; 2],
     config: JoinConfig,
     state: &Progress,
 ) -> JResult<JoinAnalysis> {
     state.phase(JoinPhase::Analyzing);
-    for input in inputs {
-        validate_keys(input, config, state)?;
-    }
     let header_bytes = output_header(inputs, config, state)?.len() as u64;
-    let mut matching = 0;
+    let columns = (inputs[0].info.columns.len() + inputs[1].info.columns.len()) as u64;
+    let mut matching = [0, 0];
+    let mut pairs = 0;
     let mut unmatched = [0, 0];
+    let mut duplicate_groups = [0, 0];
+    let mut many_to_many_groups = 0;
+    let mut many_to_many_pairs = 0;
+    let mut duplicate_samples = Vec::new();
     let mut output_rows = 0;
     let mut output_bytes = header_bytes;
     let mut preview = std::collections::BTreeMap::new();
-    walk(inputs, config, state, |left, right| {
-        match (left.is_some(), right.is_some()) {
-            (true, true) => matching = add(matching, 1)?,
-            (true, false) => unmatched[0] = add(unmatched[0], 1)?,
-            (false, true) => unmatched[1] = add(unmatched[1], 1)?,
-            _ => unreachable!(),
-        }
-        if let Some((left, ordinal)) = left {
-            let row = output_record(inputs, left, right.map(|(record, _)| record), config)?;
-            output_rows = add(output_rows, 1)?;
-            output_bytes = add(output_bytes, row.len() as u64)?;
-            if config.preview_rows > 0
-                && (preview.len() < config.preview_rows
-                    || preview
-                        .last_key_value()
-                        .is_some_and(|(&last, _)| ordinal < last))
-            {
-                preview.insert(
-                    ordinal,
-                    preview_row(
-                        &row,
-                        inputs[0].info.delimiter,
-                        config.preview_bytes / config.preview_rows,
-                        config,
-                    )?,
-                );
-                if preview.len() > config.preview_rows {
-                    preview.pop_last();
-                }
+    walk_groups(inputs, config, state, |left, right| {
+        for (side, group) in [left.as_ref(), right.as_ref()].into_iter().enumerate() {
+            if group.is_some_and(|group| group.key[0] == 1 && group.range.rows > 1) {
+                duplicate_groups[side] = add(duplicate_groups[side], 1)?;
             }
         }
-        state.records.fetch_add(1, Ordering::Release);
+        if duplicate_samples.len() < 8
+            && (left.as_ref().is_some_and(|g| g.range.rows > 1)
+                || right.as_ref().is_some_and(|g| g.range.rows > 1))
+        {
+            let key = &left.as_ref().or(right.as_ref()).unwrap().key;
+            let text =
+                std::str::from_utf8(&key[1..]).map_err(|_| error("Invalid private key text."))?;
+            let mut end = text.len().min(128);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            duplicate_samples.push(JoinDuplicateExample {
+                key: text[..end].to_string(),
+                main_rows: left.as_ref().map_or(0, |g| g.range.rows),
+                additional_rows: right.as_ref().map_or(0, |g| g.range.rows),
+            });
+        }
+        let left = left.map(Group::into_range);
+        let right = right.map(Group::into_range);
+        match (left, right) {
+            (Some(a), Some(b)) => {
+                let (count, bytes) = matched_group_output(a, b, columns, config.max_record_bytes)?;
+                matching[0] = add(matching[0], a.rows)?;
+                matching[1] = add(matching[1], b.rows)?;
+                pairs = add(pairs, count)?;
+                if a.rows > 1 && b.rows > 1 {
+                    many_to_many_groups = add(many_to_many_groups, 1)?;
+                    many_to_many_pairs = add(many_to_many_pairs, count)?;
+                }
+                output_rows = add(output_rows, count)?;
+                output_bytes = add(output_bytes, bytes)?;
+            }
+            (Some(a), None) => {
+                unmatched[0] = add(unmatched[0], a.rows)?;
+                output_rows = add(output_rows, a.rows)?;
+                output_bytes = add(output_bytes, add(a.value_bytes, mul(a.rows, columns)?)?)?;
+                if a.max_value_bytes.saturating_add(columns as usize) > config.max_record_bytes {
+                    return Err(error("A joined record exceeds the configured size limit.").into());
+                }
+            }
+            (None, Some(b)) => unmatched[1] = add(unmatched[1], b.rows)?,
+            _ => unreachable!(),
+        }
+        if let Some(a) = left {
+            if config.preview_rows > 0 {
+                enumerate_pairs(
+                    inputs,
+                    a,
+                    right,
+                    config,
+                    state,
+                    Some(config.preview_rows),
+                    |a, b| {
+                        let row = output_record(
+                            inputs,
+                            &a.record,
+                            b.map(|b| b.record.as_slice()),
+                            config,
+                        )?;
+                        let key = (a.ordinal, b.map_or(u64::MAX, |b| b.ordinal));
+                        if preview.len() < config.preview_rows
+                            || preview
+                                .last_key_value()
+                                .is_some_and(|(&last, _)| key < last)
+                        {
+                            preview.insert(
+                                key,
+                                preview_row(
+                                    &row,
+                                    inputs[0].info.delimiter,
+                                    config.preview_bytes / config.preview_rows,
+                                    config,
+                                )?,
+                            );
+                            if preview.len() > config.preview_rows {
+                                preview.pop_last();
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        state
+            .records
+            .store(add(matching[0], unmatched[0])?, Ordering::Release);
         Ok(())
     })?;
-    if output_rows != inputs[0].info.data_rows {
-        return Err(error("Analyzed join row count differs from Main.").into());
-    }
-    let frames = add(output_bytes - header_bytes, mul(output_rows, 32)?)?;
+    let frames = add(output_bytes - header_bytes, mul(output_rows, 40)?)?;
     let temporary = add(mul(frames, 2)?, output_bytes)?;
     for input in inputs {
         check_source(input)?;
     }
     Ok(JoinAnalysis {
         input_rows: [inputs[0].info.data_rows, inputs[1].info.data_rows],
-        matching_rows: [matching, matching],
-        matching_pairs: matching,
+        matching_rows: matching,
+        matching_pairs: pairs,
         unmatched_rows: unmatched,
         empty_key_rows: [inputs[0].info.empty_key_rows, inputs[1].info.empty_key_rows],
+        duplicate_groups,
+        many_to_many_groups,
+        many_to_many_pairs,
+        duplicate_samples,
         output_rows,
         output_bytes,
         additional_temporary_bytes: temporary,
@@ -1523,7 +1908,8 @@ pub fn analyze_join(
     JoinJob::spawn(move |state| {
         let [left, right] = inputs;
         let left = inspect(left, config, state)?;
-        let right = inspect(right, config, state)?;
+        let mut right = inspect(right, config, state)?;
+        right.output_delimiter = left.info.delimiter;
         if same_input(&left, &right)? {
             return Err(
                 error("Choose two different input files. Self joins are not supported.").into(),
@@ -1609,11 +1995,23 @@ impl JoinPlan {
         self.workspace.take().expect("join workspace").cleanup()
     }
 
-    /// Consume the immutable analyzed plan and atomically create a new file.
-    pub fn start_write(
+    /// Create a result when no many-to-many acknowledgement is required.
+    pub fn start_write(self, destination: PathBuf) -> Result<JoinJob<JoinSummary>, QuarryError> {
+        self.start_write_acknowledged(destination, false)
+    }
+
+    /// Acknowledgement is tied to this immutable, fully analyzed plan.
+    pub fn start_write_acknowledged(
         mut self,
         destination: PathBuf,
+        acknowledge_expansion: bool,
     ) -> Result<JoinJob<JoinSummary>, QuarryError> {
+        if self.analysis.many_to_many_groups > 0 && !acknowledge_expansion {
+            self.release()?;
+            return Err(error(
+                "Acknowledge the exact many-to-many row expansion before creating this result.",
+            ));
+        }
         let workspace = self.workspace.take().expect("join workspace");
         JoinJob::spawn(move |state| {
             let result = self.write_inner(&workspace, &destination, state);
@@ -1652,7 +2050,7 @@ impl JoinPlan {
         let header = output_header(&self.inputs, self.config, state)?;
         let frame_bytes = add(
             self.analysis.output_bytes - header.len() as u64,
-            mul(self.analysis.output_rows, 32)?,
+            mul(self.analysis.output_rows, 40)?,
         )?;
         check_creation_space(
             &workspace.path,
@@ -1671,25 +2069,38 @@ impl JoinPlan {
             output.write_all(&header)?;
             state.add_disk(header.len() as u64)?;
             drop(header);
-            let mut runs = Runs::new(workspace, self.config, state, 8);
+            let mut runs = Runs::new(workspace, self.config, state, 16);
             let mut count = 0;
             let mut bytes = 0;
-            walk(&self.inputs, self.config, state, |left, right| {
-                if let Some((left, ordinal)) = left {
-                    let row = output_record(
+            walk_groups(&self.inputs, self.config, state, |left, right| {
+                if let Some(left) = left {
+                    let a = left.into_range();
+                    let b = right.map(Group::into_range);
+                    enumerate_pairs(
                         &self.inputs,
-                        left,
-                        right.map(|(record, _)| record),
+                        a,
+                        b,
                         self.config,
+                        state,
+                        None,
+                        |left, right| {
+                            let row = output_record(
+                                &self.inputs,
+                                &left.record,
+                                right.map(|r| r.record.as_slice()),
+                                self.config,
+                            )?;
+                            count = add(count, 1)?;
+                            bytes = add(bytes, row.len() as u64)?;
+                            runs.push(Entry {
+                                key: pair_key(left.ordinal, right.map(|r| r.ordinal)),
+                                record: row,
+                                ordinal: left.ordinal,
+                            })?;
+                            state.records.store(count, Ordering::Release);
+                            Ok(())
+                        },
                     )?;
-                    count = add(count, 1)?;
-                    bytes = add(bytes, row.len() as u64)?;
-                    runs.push(Entry {
-                        key: ordinal.to_be_bytes().to_vec(),
-                        record: row,
-                        ordinal,
-                    })?;
-                    state.records.store(count, Ordering::Release);
                 }
                 Ok(())
             })?;
@@ -1704,10 +2115,18 @@ impl JoinPlan {
             }
             let mut reader = BufReader::new(ordered.path.open()?);
             let mut ordinal = 0;
+            let mut previous_order: Option<Vec<u8>> = None;
             while let Some(head) = read_head(&mut reader, self.config, state)? {
-                if head.ordinal != ordinal || head.key != ordinal.to_be_bytes() {
-                    return Err(error("Joined rows are not in source order.").into());
+                if head.key.len() != 16
+                    || head.ordinal >= self.inputs[0].info.data_rows
+                    || head.key[..8] != head.ordinal.to_be_bytes()
+                    || previous_order
+                        .as_ref()
+                        .is_some_and(|previous| previous >= &head.key)
+                {
+                    return Err(error("Joined row pairs are not in source order.").into());
                 }
+                previous_order = Some(head.key);
                 let record = read_record(&mut reader, head.record_len, self.config, state)?;
                 let parsed = fields(
                     &record,
@@ -1761,6 +2180,7 @@ impl JoinPlan {
                 data_rows: self.analysis.output_rows,
                 bytes_written: self.analysis.output_bytes,
                 peak_temporary_bytes: state.peak.load(Ordering::Acquire),
+                peak_group_buffer_bytes: state.group_peak.load(Ordering::Acquire),
                 cleanup_warning,
             }),
         }
@@ -1936,6 +2356,7 @@ mod tests {
         JoinConfig {
             memory_bytes: 512 * 1024,
             run_memory_bytes: 128,
+            group_memory_bytes: 64,
             max_record_bytes: 1024,
             max_columns: 16,
             max_merge_fan_in: 2,
@@ -1954,6 +2375,7 @@ mod tests {
             encoding: Some(Encoding::Utf8),
             key_column: 0,
             expected_version: None,
+            require_unique: true,
         })
     }
     /// Exercise analysis through the public worker boundary with synthetic files.
@@ -2599,5 +3021,234 @@ mod tests {
             assert_eq!(fs::read_dir(other).unwrap().count(), 1);
             assert_eq!(fs::read(source).unwrap(), b"id\none\n");
         }
+    }
+
+    fn duplicate_plan(dir: &Path, a: &[u8], b: &[u8], cfg: JoinConfig) -> JoinPlan {
+        let mut sources = inputs(dir, a, b);
+        for input in &mut sources {
+            input.require_unique = false;
+        }
+        analyze_join(sources, dir.to_path_buf(), cfg)
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn all_duplicate_pairs_match_a_handwritten_oracle_and_require_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = b"id,left\nx,L1\nz,alone\nx,\"L,2\"\ny,Y1\ny,Y2\n";
+        let b = b"id,right\ny,\"R\"\"Y\"\nx,R1\nx,R2\nnone,N\n";
+        let p = duplicate_plan(dir.path(), a, b, config());
+        assert_eq!(p.analysis.matching_rows, [4, 3]);
+        assert_eq!(p.analysis.matching_pairs, 6);
+        assert_eq!(p.analysis.duplicate_groups, [2, 1]);
+        assert_eq!(p.analysis.many_to_many_groups, 1);
+        assert_eq!(p.analysis.many_to_many_pairs, 4);
+        assert_eq!(p.analysis.output_rows, 7);
+        assert_eq!(p.analysis.unmatched_rows, [1, 1]);
+        assert_eq!(p.analysis.preview[0], ["x", "L1", "x", "R1"]);
+        assert_eq!(p.analysis.preview[1], ["x", "L1", "x", "R2"]);
+        assert_eq!(p.analysis.preview[2], ["z", "alone", "", ""]);
+        let output = dir.path().join("denied.csv");
+        assert!(p.start_write(output.clone()).is_err());
+        assert!(!output.exists());
+        assert!(workspaces(dir.path()).is_empty());
+        let p = duplicate_plan(dir.path(), a, b, config());
+        let expected=b"id (Main),left,id (Additional),right\nx,L1,x,R1\nx,L1,x,R2\nz,alone,,\nx,\"L,2\",x,R1\nx,\"L,2\",x,R2\ny,Y1,y,\"R\"\"Y\"\ny,Y2,y,\"R\"\"Y\"\n";
+        assert_eq!(p.analysis.output_bytes, expected.len() as u64);
+        let allowance = p.analysis.additional_temporary_bytes
+            + p.inputs.iter().map(|i| i.frame_bytes).sum::<u64>();
+        let summary = p
+            .start_write_acknowledged(output.clone(), true)
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.data_rows, 7);
+        assert_eq!(fs::read(output).unwrap(), expected);
+        assert!(summary.peak_temporary_bytes <= allowance);
+        assert!(summary.peak_group_buffer_bytes <= config().group_memory_bytes);
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn large_cartesian_analysis_counts_without_generating_the_full_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = format!("id,value\n{}", "x,Main\n".repeat(5000));
+        let b = format!("id,value\n{}", "x,Right\n".repeat(5000));
+        let cfg = JoinConfig {
+            memory_bytes: 4 * 1024 * 1024,
+            run_memory_bytes: 32 * 1024,
+            max_merge_fan_in: 4,
+            ..config()
+        };
+        let p = duplicate_plan(dir.path(), a.as_bytes(), b.as_bytes(), cfg);
+        assert_eq!(p.analysis.matching_rows, [5000, 5000]);
+        assert_eq!(p.analysis.matching_pairs, 25_000_000);
+        assert_eq!(p.analysis.output_rows, 25_000_000);
+        assert_eq!(p.analysis.preview.len(), 3);
+        assert_eq!(p.analysis.many_to_many_groups, 1);
+        assert_eq!(
+            p.analysis.output_bytes,
+            output_header(&p.inputs, cfg, &Progress::new())
+                .unwrap()
+                .len() as u64
+                + 25_000_000 * 15
+        );
+        let physical: u64 = fs::read_dir(p.workspace.as_ref().unwrap().path.clone())
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(
+            physical < 2_000_000,
+            "analysis should retain inputs, not the 375 MB Cartesian result"
+        );
+        p.release().unwrap();
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_group_exceeding_the_block_budget_streams_exactly_and_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = format!(
+            "id,value\n{}",
+            (0..240)
+                .map(|i| format!("x,{i:03}{}\n", "a".repeat(400)))
+                .collect::<String>()
+        );
+        let b = format!(
+            "id,value\n{}",
+            (0..80).map(|i| format!("x,R{i:03}\n")).collect::<String>()
+        );
+        let cfg = JoinConfig {
+            run_memory_bytes: 8 * 1024,
+            group_memory_bytes: 512,
+            ..config()
+        };
+        let p = duplicate_plan(dir.path(), a.as_bytes(), b.as_bytes(), cfg);
+        assert_eq!(p.analysis.output_rows, 19200);
+        let output = dir.path().join("expanded.csv");
+        let summary = p
+            .start_write_acknowledged(output.clone(), true)
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.data_rows, 19200);
+        assert!(summary.peak_group_buffer_bytes <= cfg.group_memory_bytes);
+        // Verify every cross-product row independently, including block boundaries.
+        {
+            use std::io::BufRead;
+            let mut reader = BufReader::new(File::open(&output).unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(
+                line,
+                "id (Main),value (Main),id (Additional),value (Additional)\n"
+            );
+            for main in 0..240 {
+                for additional in 0..80 {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    assert_eq!(
+                        line,
+                        format!("x,{main:03}{},x,R{additional:03}\n", "a".repeat(400))
+                    );
+                }
+            }
+            line.clear();
+            assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+        }
+        let session = crate::Session::open(
+            &output,
+            crate::OpenOptions {
+                rows: 3,
+                header_mode: crate::HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(session.first_rows[1].fields[3], b"R000");
+        assert_eq!(session.first_rows[2].fields[3], b"R001");
+        assert!(workspaces(dir.path()).is_empty());
+        let p = duplicate_plan(dir.path(), a.as_bytes(), b.as_bytes(), cfg);
+        let output = dir.path().join("cancelled-expansion.csv");
+        let job = p.start_write_acknowledged(output.clone(), true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while job.progress().records == 0 {
+            assert!(!job.progress().done);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        job.cancel();
+        assert!(job.wait().unwrap().is_none());
+        assert!(!output.exists());
+        assert!(workspaces(dir.path()).is_empty());
+        assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), a.as_bytes());
+    }
+
+    #[test]
+    fn optional_uniqueness_checks_each_side_and_one_to_many_needs_no_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        for side in 0..2 {
+            let mut sources = inputs(dir.path(), b"id\nx\nx\n", b"id\nx\nx\n");
+            for source in &mut sources {
+                source.require_unique = false;
+            }
+            sources[side].require_unique = true;
+            let job = analyze_join(sources, dir.path().to_path_buf(), config()).unwrap();
+            assert!(job.wait().is_err());
+            assert!(workspaces(dir.path()).is_empty());
+        }
+        let p = duplicate_plan(
+            dir.path(),
+            b"id\nx\n",
+            b"id,value\nx,one\nx,two\n",
+            config(),
+        );
+        assert_eq!(p.analysis.output_rows, 2);
+        assert_eq!(p.analysis.many_to_many_groups, 0);
+        let output = dir.path().join("one-to-many.csv");
+        p.start_write(output.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(output).unwrap(),
+            b"id (Main),id (Additional),value\nx,x,one\nx,x,two\n"
+        );
+    }
+
+    #[test]
+    fn expanded_group_count_and_bytes_overflow_are_rejected_before_generation() {
+        let group = GroupRange {
+            start: 0,
+            end: 0,
+            rows: 1u64 << 32,
+            value_bytes: 1,
+            max_value_bytes: 1,
+        };
+        assert!(matched_group_output(group, group, 4, 1024).is_err());
+        let left = GroupRange {
+            rows: 1,
+            value_bytes: u64::MAX,
+            ..group
+        };
+        let right = GroupRange {
+            rows: 2,
+            value_bytes: 2,
+            ..group
+        };
+        assert!(matched_group_output(left, right, 4, 1024).is_err());
+        let large = GroupRange {
+            rows: 1,
+            value_bytes: 1,
+            max_value_bytes: 1024,
+            ..group
+        };
+        assert!(matched_group_output(large, large, 4, 1024).is_err());
     }
 }

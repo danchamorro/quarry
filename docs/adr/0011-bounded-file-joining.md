@@ -12,6 +12,8 @@ Joining two files can multiply records: a shared key with m rows on one side and
 
 Use external sort/merge on unambiguous framed comparison keys and original source ordinals. Prepare each source independently, sort its runs, analyze matching groups, and stream their matching pairs. Spool oversized duplicate groups to private disk and enumerate them in bounded blocks. Restore the approved output order through an external ordinal sort; key order must not escape into the result. No new database or sorting dependency is required for this direction.
 
+Duplicate groups use byte ranges in the owned, immutable prepared runs as their disk-backed storage. The matcher counts and measures each group in one scan, then releases its key before enumerating rows. Creation holds a bounded Main block and streams the Additional range for that block; no file-sized or group-sized in-memory map is built. This avoids an extra copy of data already spooled privately. Ordering frames contain both Main and Additional ordinals so block iteration cannot change public row order.
+
 The first extraction shares only private workspace ownership, the existing run frame, and bounded streaming frame I/O. Keep sort/duplicate comparison, numeric/date keys, fan-in calculations, progress, preservation checks and public APIs with their current operation. Preserve existing sort directory/file naming and the frame bytes. A generic reader must reject declared key or record lengths before allocating; callers supply their operation-specific limits and retain useful error context. Every frame body is consumed or skipped before another head is read.
 
 ### Memory

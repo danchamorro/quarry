@@ -10,6 +10,8 @@ pub(super) struct JoinDialog {
     paths: [Option<PathBuf>; 2],
     headers: [Option<HeaderInfo>; 2],
     keys: [usize; 2],
+    require_unique: [bool; 2],
+    acknowledge_expansion: bool,
     temporary: PathBuf,
     header_job: Option<(usize, JoinJob<HeaderInfo>)>,
     checking: Option<JoinJob<JoinPlan>>,
@@ -42,6 +44,8 @@ impl JoinDialog {
             paths: [None, None],
             headers: [None, None],
             keys: [0, 0],
+            require_unique: [false, false],
+            acknowledge_expansion: false,
             temporary,
             header_job: None,
             checking: None,
@@ -88,6 +92,7 @@ impl JoinDialog {
 
     /// Release a retained plan off-thread before allowing another analysis.
     fn reset(&mut self) {
+        self.acknowledge_expansion = false;
         if let Some(plan) = self.plan.take() {
             self.cleanup = Some(thread::spawn(move || {
                 plan.release().map_err(|e| e.to_string())
@@ -226,6 +231,7 @@ impl JoinDialog {
 
     /// Capture explicit saved-file settings for the full analysis worker.
     fn start_analysis(&mut self) {
+        self.acknowledge_expansion = false;
         let inputs = std::array::from_fn(|side| JoinInput {
             path: self.paths[side].as_ref().unwrap().clone(),
             delimiter: Some(self.headers[side].as_ref().unwrap().delimiter),
@@ -233,6 +239,7 @@ impl JoinDialog {
             encoding: Some(Encoding::Utf8),
             key_column: self.keys[side],
             expected_version: Some(self.headers[side].as_ref().unwrap().source_version.clone()),
+            require_unique: self.require_unique[side],
         });
         self.message = None;
         self.result = None;
@@ -254,7 +261,7 @@ impl JoinDialog {
         };
         self.message = None;
         self.cancel_requested = false;
-        match plan.start_write(destination) {
+        match plan.start_write_acknowledged(destination, self.acknowledge_expansion) {
             Ok(job) => self.writing = Some(job),
             Err(error) => self.message = Some(error.to_string()),
         }
@@ -274,7 +281,7 @@ impl JoinDialog {
             .open(&mut open).default_width(680.0).min_width(480.0)
             .show(ctx,|ui|{
                 ui.label("Match key columns and create a separate joined file.");
-                ui.small("First version: two saved UTF-8 files with headers, unique keys, and all Main rows. Empty keys never match.");
+                ui.small("Saved UTF-8 files with headers. Keep all Main rows and every matching pair. Empty keys never match.");
                 ui.small("Keys match exactly, including case and whitespace.");
                 egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-210.0).max(180.0)).show(ui,|ui|{
                     ui.columns(2,|columns|{
@@ -283,6 +290,7 @@ impl JoinDialog {
                             column.add(egui::Label::new(self.paths[side].as_ref().and_then(|p|p.file_name()).map_or_else(||"No file selected".into(),|n|n.to_string_lossy().into_owned())).truncate());
                             if column.add_enabled(editable && can_start,egui::Button::new(if side==0{"Choose Main…"}else{"Choose Additional…"})).clicked(){action=DialogAction::Select(side);}
                             column.add_enabled_ui(editable,|ui|{
+                                ui.checkbox(&mut self.require_unique[side], if side == 0 { "Require unique Main key" } else { "Require unique Additional key" });
                                 if let Some(header)=&self.headers[side]{
                                     ui.small(format!("{} columns · UTF-8 · header row",header.columns.len()));
                                     let selected=self.keys[side];
@@ -305,6 +313,14 @@ impl JoinDialog {
                         ui.label(format!("Matching pairs: {} · Result: {} rows",a.matching_pairs,a.output_rows));
                         ui.label(format!("Unmatched: {} Main, {} Additional",a.unmatched_rows[0],a.unmatched_rows[1]));
                         ui.label(format!("Empty keys: {} Main, {} Additional",a.empty_key_rows[0],a.empty_key_rows[1]));
+                        ui.label(format!("Duplicate-key groups: {} Main, {} Additional",a.duplicate_groups[0],a.duplicate_groups[1]));
+                        if a.many_to_many_groups > 0 {
+                            ui.label(RichText::new(format!("{} many-to-many groups produce {} matching pairs.",a.many_to_many_groups,a.many_to_many_pairs)).strong());
+                            ui.checkbox(&mut self.acknowledge_expansion,format!("I understand this will create {} rows.",a.output_rows));
+                        }
+                        for sample in &a.duplicate_samples {
+                            ui.small(format!("Key {}: {} Main × {} Additional",sample.key,sample.main_rows,sample.additional_rows));
+                        }
                         ui.small(format!("Output: {} · Conservative additional storage: {}",format_bytes(a.output_bytes),format_bytes(a.additional_temporary_bytes)));
                         ui.small("Sample in output order; at most 20 rows and columns. Long values are clipped.");
                         egui::ScrollArea::both().max_height(150.0).show(ui,|ui|{
@@ -333,7 +349,7 @@ impl JoinDialog {
                     }else if self.plan.is_some(){
                         if ui.button("Reset Analysis").clicked(){self.reset();}
                         if ui.button("Choose Output…").clicked(){action=DialogAction::ChooseOutput;}
-                        if ui.add_enabled(can_start && self.destination.is_some(),egui::Button::new("Create Joined File")).clicked(){action=DialogAction::Create;}
+                        if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion),egui::Button::new("Create Joined File")).clicked(){action=DialogAction::Create;}
                     }else if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some),egui::Button::new("Analyze & Preview")).clicked(){
                         action=DialogAction::Analyze;
                     }
@@ -889,6 +905,74 @@ mod tests {
             "a cleanup failure must remain visible instead of closing the dialog"
         );
         assert!(!dialog.quit_after_close);
+    }
+
+    #[test]
+    fn many_to_many_creation_requires_acknowledgement_for_each_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        let (a, b) = prepare(&mut app, dir.path());
+        fs::write(&a, b"id,name\nx,A\nx,B\n").unwrap();
+        fs::write(&b, b"id,city\nx,One\nx,Two\n").unwrap();
+        app.join_files.as_mut().unwrap().read_header(0,a); finish(&mut app);
+        app.join_files.as_mut().unwrap().read_header(1,b); finish(&mut app);
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert_eq!(
+            app.join_files
+                .as_ref()
+                .unwrap()
+                .plan
+                .as_ref()
+                .unwrap()
+                .analysis()
+                .output_rows,
+            4
+        );
+        let output = dir.path().join("expanded.csv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        assert!(app.join_files.as_ref().unwrap().writing.is_none());
+        assert!(!output.exists());
+        click(&mut app, &ctx, "I understand this will create 4 rows.");
+        assert!(app.join_files.as_ref().unwrap().acknowledge_expansion);
+        click(&mut app, &ctx, "Reset Analysis");
+        finish(&mut app);
+        assert!(!app.join_files.as_ref().unwrap().acknowledge_expansion);
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "I understand this will create 4 rows.");
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(
+            fs::read(output).unwrap(),
+            b"id (Main),name,id (Additional),city\nx,A,x,One\nx,A,x,Two\nx,B,x,One\nx,B,x,Two\n"
+        );
+    }
+
+    #[test]
+    fn a_selected_uniqueness_requirement_blocks_repeated_input_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        let (a, _) = prepare(&mut app, dir.path());
+        fs::write(&a, b"id,name\nx,A\nx,B\n").unwrap();
+        app.join_files.as_mut().unwrap().read_header(0,a); finish(&mut app);
+        click(&mut app, &ctx, "Require unique Main key");
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert!(app.join_files.as_ref().unwrap().plan.is_none());
+        assert!(
+            app.join_files
+                .as_ref()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Require unique key")
+        );
     }
     #[test]
     fn existing_output_keeps_analysis_and_existing_bytes() {
