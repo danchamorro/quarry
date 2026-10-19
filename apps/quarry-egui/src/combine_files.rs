@@ -21,6 +21,7 @@ pub(super) struct CombineDialog {
     problem_path: Option<PathBuf>,
     cancel_requested: bool,
     protected_paths: Vec<PathBuf>,
+    start_allowed: bool,
 }
 
 impl Default for CombineDialog {
@@ -41,6 +42,7 @@ impl Default for CombineDialog {
             problem_path: None,
             cancel_requested: false,
             protected_paths: Vec::new(),
+            start_allowed: true,
         }
     }
 }
@@ -60,6 +62,10 @@ impl CombineDialog {
                 |message| format!("{warning}\n{message}"),
             ));
         }
+    }
+
+    pub(super) fn reserved_output(&self) -> Option<&Path> {
+        self.destination.as_deref()
     }
 
     pub(super) fn busy(&self) -> bool {
@@ -83,6 +89,10 @@ impl CombineDialog {
     }
 
     fn start_check(&mut self) {
+        if !self.start_allowed {
+            self.message = Some("Two file operations are already running.".into());
+            return;
+        }
         self.invalidate();
         self.cancel_requested = false;
         match check_combine_files_with_encoding(
@@ -210,10 +220,24 @@ impl CombineDialog {
     }
 
     fn start_write(&mut self) {
+        if !self.start_allowed {
+            self.message = Some("Two file operations are already running.".into());
+            return;
+        }
         let (Some(plan), Some(destination), Some(_)) = (&self.plan, &self.destination, &self.space)
         else {
             return;
         };
+        if self
+            .protected_paths
+            .iter()
+            .any(|path| tabs::paths_alias(path, destination))
+        {
+            self.message = Some(
+                "The output is now reserved by another operation. Choose a different path.".into(),
+            );
+            return;
+        }
         match plan.clone().start_write(destination.clone()) {
             Ok(job) => {
                 self.writing = Some(job);
@@ -425,9 +449,26 @@ impl QuarryApp {
         if self.active.inspection.open {
             return;
         }
+        let start_allowed = self.write_slot_available();
+        let mut protected_paths: Vec<PathBuf> = self
+            .document_tabs()
+            .flat_map(|tab| {
+                tab.document
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|doc| [doc.logical_path.clone(), doc.session.path().to_path_buf()])
+                    .chain(tab.write_destination.clone())
+            })
+            .collect();
+        if let Some(join) = &self.join_files {
+            protected_paths.extend(join.reserved_inputs().map(Path::to_path_buf));
+            protected_paths.extend(join.reserved_output().map(Path::to_path_buf));
+        }
         let Some(dialog) = self.combine_files.as_mut() else {
             return;
         };
+        dialog.start_allowed = start_allowed;
+        dialog.protected_paths = protected_paths;
         match dialog.show(ctx) {
             DialogAction::None => {}
             DialogAction::Inspect => self.inspect_combine_problem(),

@@ -377,6 +377,11 @@ impl QuarryApp {
         options: OpenOptions,
         encoding: Option<Encoding>,
     ) -> Result<(), AppMessage> {
+        if self.join_reserves_path(&path) {
+            return Err(AppMessage::warning(
+                "This path is reserved by Join Files. Close or reset the join before opening it.",
+            ));
+        }
         if self.quit_pending
             || self.active.close_confirmation_open
             || self.active.close_after_save
@@ -468,17 +473,18 @@ impl QuarryApp {
 
     /// Rejects another tab's source/working file and every reserved writer output.
     pub(super) fn destination_available(&self, destination: &Path) -> bool {
-        !self.document_tabs().any(|tab| {
-            (tab.id != self.active.id
-                && tab.document.as_ref().is_some_and(|document| {
-                    paths_alias(destination, &document.logical_path)
-                        || paths_alias(destination, document.session.path())
-                }))
-                || tab
-                    .write_destination
-                    .as_ref()
-                    .is_some_and(|path| paths_alias(destination, path))
-        })
+        !self.join_reserves_path(destination)
+            && !self.document_tabs().any(|tab| {
+                (tab.id != self.active.id
+                    && tab.document.as_ref().is_some_and(|document| {
+                        paths_alias(destination, &document.logical_path)
+                            || paths_alias(destination, document.session.path())
+                    }))
+                    || tab
+                        .write_destination
+                        .as_ref()
+                        .is_some_and(|path| paths_alias(destination, path))
+            })
     }
 
     /// Applies the shared two-operation limit to document tabs and Combine Files.
@@ -488,6 +494,11 @@ impl QuarryApp {
                 self.combine_files
                     .as_ref()
                     .is_some_and(combine_files::CombineDialog::busy),
+            )
+            + usize::from(
+                self.join_files
+                    .as_ref()
+                    .is_some_and(join_files::JoinDialog::running_operation),
             )
             < MAX_WRITE_JOBS
     }
@@ -547,6 +558,10 @@ impl QuarryApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         if let Some(dialog) = self.combine_files.as_mut() {
             dialog.preserve_for_quit();
+            return;
+        }
+        if let Some(dialog) = self.join_files.as_mut() {
+            dialog.request_close(true);
             return;
         }
         if self.quit_pending {

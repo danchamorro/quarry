@@ -87,7 +87,7 @@ pub struct JoinAnalysis {
 /// Immutable analysis owns its private sorted inputs until creation or release.
 pub struct JoinPlan {
     inputs: [PreparedInput; 2],
-    pub analysis: JoinAnalysis,
+    analysis: JoinAnalysis,
     workspace: Option<SpillWorkspace>,
     config: JoinConfig,
 }
@@ -293,7 +293,8 @@ fn mul(left: u64, right: u64) -> JResult<u64> {
 
 impl JoinConfig {
     fn validate(self, temporary: &Path) -> Result<(), QuarryError> {
-        if self.max_record_bytes == 0
+        if self.memory_bytes > 512 * 1024 * 1024
+            || self.max_record_bytes == 0
             || self.max_record_bytes > RECORD_LIMIT
             || self.max_columns == 0
             || self.max_columns > COLUMN_LIMIT
@@ -979,7 +980,11 @@ fn encode<'a>(
     Ok(output)
 }
 
-fn output_header(inputs: &[PreparedInput; 2], config: JoinConfig) -> JResult<Vec<u8>> {
+fn output_header(
+    inputs: &[PreparedInput; 2],
+    config: JoinConfig,
+    state: &Progress,
+) -> JResult<Vec<u8>> {
     use std::collections::{HashMap, HashSet};
     let mut counts = HashMap::new();
     for input in inputs {
@@ -988,10 +993,13 @@ fn output_header(inputs: &[PreparedInput; 2], config: JoinConfig) -> JResult<Vec
         }
     }
     let mut used = HashSet::new();
+    let mut suffixes: HashMap<String, usize> = HashMap::new();
     let mut names = Vec::new();
+    let mut name_bytes = 0_usize;
     for (side, input) in inputs.iter().enumerate() {
         let role = if side == 0 { "Main" } else { "Additional" };
         for (column, name) in input.info.columns.iter().enumerate() {
+            state.check()?;
             let base = if name.is_empty() {
                 format!("{role} column {}", column + 1)
             } else if counts[name.as_str()] > 1 {
@@ -1000,11 +1008,24 @@ fn output_header(inputs: &[PreparedInput; 2], config: JoinConfig) -> JResult<Vec
                 name.clone()
             };
             let mut candidate = base.clone();
-            let mut suffix = 2;
-            while !used.insert(candidate.clone()) {
-                candidate = format!("{base} {suffix}");
-                suffix += 1;
+            if used.contains(&candidate) {
+                let next = suffixes.entry(base.clone()).or_insert(2);
+                loop {
+                    state.check()?;
+                    candidate = format!("{base} {next}");
+                    *next += 1;
+                    if !used.contains(&candidate) {
+                        break;
+                    }
+                }
             }
+            // Bound intermediate names before serialization as well as the
+            // final escaped header. Repeated names never restart suffix scans.
+            name_bytes = name_bytes.saturating_add(candidate.len()).saturating_add(1);
+            if name_bytes > config.max_record_bytes {
+                return Err(error("The joined header exceeds the configured size limit.").into());
+            }
+            used.insert(candidate.clone());
             names.push(candidate);
         }
     }
@@ -1240,7 +1261,7 @@ fn analyze_prepared(
     for input in inputs {
         validate_keys(input, config, state)?;
     }
-    let header_bytes = output_header(inputs, config)?.len() as u64;
+    let header_bytes = output_header(inputs, config, state)?.len() as u64;
     let mut matching = 0;
     let mut unmatched = [0, 0];
     let mut output_rows = 0;
@@ -1388,6 +1409,11 @@ fn check_creation_space(
 }
 
 impl JoinPlan {
+    /// Read exact analysis without permitting a caller to alter the retained plan.
+    pub fn analysis(&self) -> &JoinAnalysis {
+        &self.analysis
+    }
+
     pub fn inputs(&self) -> [&JoinInputInfo; 2] {
         [&self.inputs[0].info, &self.inputs[1].info]
     }
@@ -1430,7 +1456,7 @@ impl JoinPlan {
         for input in &self.inputs {
             check_source(input)?;
         }
-        let header = output_header(&self.inputs, self.config)?;
+        let header = output_header(&self.inputs, self.config, state)?;
         let frame_bytes = add(
             self.analysis.output_bytes - header.len() as u64,
             mul(self.analysis.output_rows, 32)?,
@@ -1515,6 +1541,9 @@ impl JoinPlan {
                     error("Joined output count or size changed before publication.").into(),
                 );
             }
+            for input in &self.inputs {
+                check_source(input)?;
+            }
             Ok(())
         })();
         if let Err(failure) = prepared {
@@ -1527,9 +1556,6 @@ impl JoinPlan {
             });
         }
         state.phase(JoinPhase::Publishing);
-        for input in &self.inputs {
-            check_source(input)?;
-        }
         match output.publish(
             self.analysis.output_rows,
             self.analysis.output_bytes,
@@ -1654,7 +1680,7 @@ mod tests {
             let (key, label) = l.trim_end().split_once(',').unwrap();
             let found = right.iter().find(|r| r.split_once(',').unwrap().0 == key);
             if let Some(r) = found {
-                expected.push_str(&format!("{key},{label},{}", r));
+                expected.push_str(&format!("{key},{label},{r}"));
                 matches += 1;
             } else {
                 expected.push_str(&format!("{key},{label},,\n"));
@@ -1951,5 +1977,40 @@ mod tests {
         assert!(!output.exists());
         assert!(workspaces(dir.path()).is_empty());
         assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), a.as_bytes());
+    }
+    #[test]
+    fn many_identical_headers_have_unique_bounded_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = format!("{}\n", vec!["same"; 2048].join(","));
+        let args = inputs(dir.path(), header.as_bytes(), b"extra\n");
+        let cfg = JoinConfig {
+            memory_bytes: 2 * 1024 * 1024,
+            max_record_bytes: 64 * 1024,
+            max_columns: 4096,
+            ..config()
+        };
+        let plan = analyze_join(args, dir.path().to_path_buf(), cfg)
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        let output = dir.path().join("wide.csv");
+        plan.start_write(output.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        let source = fs::read(output).unwrap();
+        let header = quarry_delimited::parse_record(&source, b',').unwrap();
+        assert_eq!(header.len(), 2049);
+        assert_eq!(header[2047].as_ref(), b"same (Main) 2048");
+        assert_eq!(
+            header
+                .iter()
+                .map(|field| field.as_ref())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2049
+        );
     }
 }

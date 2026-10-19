@@ -47,6 +47,7 @@ use tempfile::TempDir;
 
 mod about;
 mod combine_files;
+mod join_files;
 mod storage;
 mod tabs;
 mod whitespace;
@@ -336,6 +337,7 @@ struct QuarryApp {
     whitespace_preferences: whitespace::Preferences,
     about: about::About,
     combine_files: Option<combine_files::CombineDialog>,
+    join_files: Option<join_files::JoinDialog>,
     working_directory: PathBuf,
     active: DocumentTab,
     tabs: Vec<DocumentTab>,
@@ -668,6 +670,7 @@ impl QuarryApp {
             whitespace_preferences: whitespace::Preferences::default(),
             about: about::About::new(),
             combine_files: None,
+            join_files: None,
             working_directory: std::env::temp_dir(),
             active: DocumentTab::new(1),
             tabs: Vec::new(),
@@ -1103,6 +1106,10 @@ impl QuarryApp {
             self.request_tab_close(ctx);
             return;
         }
+        if action == Action::JoinFiles {
+            self.open_join_files();
+            return;
+        }
         if action == Action::CombineFiles {
             self.open_combine_files();
             return;
@@ -1263,6 +1270,7 @@ impl QuarryApp {
             | Action::About
             | Action::ShowAllWhitespace(_)
             | Action::CombineFiles
+            | Action::JoinFiles
             | Action::ReopenWithFormat(_, _, _)
             | Action::ReloadFromDisk
             | Action::Save
@@ -2715,6 +2723,7 @@ impl eframe::App for QuarryApp {
         if self.combine_files.is_some() {
             self.show_combine_files(ctx);
         }
+        self.show_join_files(ctx);
         self.show_inspection(ctx);
     }
 }
@@ -2791,6 +2800,7 @@ enum Action {
     CloseTab,
     About,
     CombineFiles,
+    JoinFiles,
     Choose,
     ChooseWithEncoding(Encoding),
     TemporaryStorage,
@@ -3503,6 +3513,9 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
         {
             action = Some(Action::CombineFiles);
         }
+        if ui.button("Join Files…").clicked() {
+            action = Some(Action::JoinFiles);
+        }
         if ui
             .add_enabled(document_open, egui::Button::new("Close Tab"))
             .on_hover_text("Close this document (⌘W)")
@@ -3657,6 +3670,9 @@ fn show_empty_state(ui: &mut egui::Ui, local_file_hovered: bool) -> Option<Actio
             }
             if ui.button("Combine Files…").clicked() {
                 action = Some(Action::CombineFiles);
+            }
+            if ui.button("Join Files…").clicked() {
+                action = Some(Action::JoinFiles);
             }
         },
     );
