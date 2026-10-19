@@ -2145,7 +2145,7 @@ impl<'a> Groups<'a> {
             if rows > 1 && key[0] == 1 && self.input.require_unique {
                 return Err(input_error(
                     &self.input.info.path,
-                    Some(head.1 + 2),
+                    Some(add(head.1, 1 + u64::from(self.input.info.has_header))?),
                     "Repeated key found, but Require unique key is enabled for this input.",
                 )
                 .into());
@@ -3086,6 +3086,55 @@ impl JoinPlan {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn duplicate_uniqueness_diagnostic_uses_each_inputs_header_record_offset() {
+        for duplicate_side in 0..2 {
+            for header_flags in [[false, false], [false, true], [true, false], [true, true]] {
+                let dir = tempfile::tempdir().unwrap();
+                let contents: [Vec<u8>; 2] = std::array::from_fn(|side| {
+                    let mut bytes = if header_flags[side] {
+                        b"key,value\n".to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    bytes.extend_from_slice(if side == duplicate_side {
+                        b"k,\"one\nline\"\nk,two\n"
+                    } else {
+                        b"k,other\n"
+                    });
+                    bytes
+                });
+                let mut sources = inputs(dir.path(), &contents[0], &contents[1]);
+                for side in 0..2 {
+                    sources[side].has_header = header_flags[side];
+                    sources[side].require_unique = side == duplicate_side;
+                }
+                let selected = sources[duplicate_side].path.clone();
+                let failure = analyze_join(sources, dir.path().to_owned(), config())
+                    .unwrap()
+                    .wait()
+                    .err()
+                    .expect("duplicate key must fail uniqueness");
+                let expected_record = 2 + u64::from(header_flags[duplicate_side]);
+                assert_eq!(
+                    crate::Diagnostic::from_error(&failure).record,
+                    Some(expected_record),
+                    "side {duplicate_side}, headers {header_flags:?}: {failure}"
+                );
+                assert!(
+                    matches!(failure, QuarryError::JoinFile { path: Some(path), record: Some(record), .. }
+                    if path == selected && record == expected_record)
+                );
+                assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), contents[0]);
+                assert_eq!(
+                    fs::read(dir.path().join("additional.csv")).unwrap(),
+                    contents[1]
+                );
+                assert!(workspaces(dir.path()).is_empty());
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]

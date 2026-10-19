@@ -60,6 +60,25 @@ other existing suites. Formatting, all-target/all-feature Clippy with warnings
 denied, diff checks, Python syntax and CI YAML parsing pass. The submitted final
 head still needs its own platform CI and actual completed review before merge.
 
+## Later uniqueness diagnostic correction
+
+A subsequent review found that Require unique key reported the next logical
+record when its selected input had no header. The public-job regression first
+returned record 3 for the duplicate in record 2. The corrected checked offset
+uses that input's own header flag. Eight cases cover both Main/Additional roles,
+all four independent header combinations, and quoted multiline values. They
+assert the diagnostic record and input path, unchanged sources, and complete
+owned-analysis cleanup.
+
+The cumulative workspace now passes 680 tests: 365 core, 268 egui and 47 other
+tests. Formatting and strict Clippy pass. Windows CI explicitly runs this
+portable diagnostic regression. This correction changes only an error record
+number; it does not change successful join values, comparison, ordering or the
+algorithm. The release measurements below retain their actual 2d16932 source
+and executable hashes; the later diagnostic correction is not included in
+that measured executable. The resulting submitted head requires fresh CI and
+review before merging.
+
 ## Full release rerun
 
 [Machine-readable results](2026-10-19-join-review-acceptance.json) retain source,

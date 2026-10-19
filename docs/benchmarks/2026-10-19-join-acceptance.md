@@ -6,7 +6,7 @@ The implementation is in [PR #137](https://github.com/danchamorro/quarry/pull/13
 It does not claim that review, merge or the installed VM update has completed.
 
 [Final review fixes and rebuilt-engine measurements](2026-10-19-join-review-followup.md)
-record the later 679-test suite, provenance checks and complete release rerun.
+record the later regression checks, provenance checks and complete release rerun.
 
 All development and application work ran in VMPal macOS VM 1, macOS 27.0.1
 (26A434), Apple M3 Max (Virtual), eight virtual CPUs and 16 GiB RAM, using
