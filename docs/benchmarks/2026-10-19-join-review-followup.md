@@ -79,6 +79,57 @@ and executable hashes; the later diagnostic correction is not included in
 that measured executable. The resulting submitted head requires fresh CI and
 review before merging.
 
+## Later Discard Changes feedback correction
+
+The next completed full CodeRabbit review covered clean head 600c770. Its
+Discard Changes finding was reproduced with the real analyzed-current-document
+lease: header/cell edits and Undo history survived, but the action cleared the
+notice instead of explaining the reservation. The regression failed on that
+missing warning before the fix, then passed after an early action guard was
+added. The menu now disables Discard Changes for a reserved document and
+explains the reservation on hover. After the join closes, the same test verifies
+that ordinary discard clears edits/history and leaves the original file intact.
+
+The cumulative workspace passes 681 tests: 365 core, 269 egui and 47 other
+tests. Formatting, strict Clippy and diff checks pass. This feedback correction
+does not change the successful join engine or the measured binary below.
+
+The review also suggested falling back to legacy Windows file IDs when
+FileIdInfo is unavailable. That availability change was declined: Microsoft's
+[BY_HANDLE_FILE_INFORMATION documentation](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information)
+states that its 64-bit IDs are not guaranteed unique on ReFS. This shared stamp
+also establishes private-file ownership for cleanup, so an unconditional
+fallback would weaken that contract. Unsupported FileIdInfo backends continue
+to return an error; no SMB compatibility claim or native Windows port is made.
+Supporting those backends requires capability validation and direct backend
+tests rather than treating a shorter ID as equivalent.
+
+## Latest native candidate observations
+
+Clean macOS VM candidate build 209 at 600c770 joined Main's current unsaved
+Trim result with the saved Additional file using two keys. The preview reported
+five/six input rows, seven matching pairs, nine Left result rows, two unmatched
+rows per input and one many-to-many group producing six pairs. Create was
+blocked before acknowledgement. The saved nine-row, six-column result matched
+the independent 315-byte oracle exactly (SHA-256
+cb68a5b7c14d4593d4f4b2a52fe9f0942d2cb28a6527b63976188b857a4b8cf6).
+Both source hashes stayed unchanged; output was mode 0600 with no ACL entries
+or unpublished staging. Opening, editing and Undo worked in an ordinary result
+tab. A repeated complete join produced the same exact result.
+
+One compact-window quit check showed an unreadable raster artifact during
+unsaved-work review. Resizing restored the correct warning and the unsaved
+Trim; Keep Editing preserved the session, and a subsequent explicit discard
+closed only synthetic work. Disk sources and saved results remained unchanged.
+Two matching installed-baseline build 157 checks and three further candidate
+checks (without Join, after visiting Join, and after a repeated full join)
+showed the normal warning. This does not establish the artifact's cause or a
+rendering fix. Independent guest screencapture was unavailable; the failure
+was retained rather than bypassing capture permissions. This display
+observation remains a validation limitation, separate from the exact data and
+ownership checks. The installed application was still baseline 157 during
+these comparisons.
+
 ## Full release rerun
 
 [Machine-readable results](2026-10-19-join-review-acceptance.json) retain source,

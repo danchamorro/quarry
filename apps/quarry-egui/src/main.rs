@@ -1216,6 +1216,15 @@ impl QuarryApp {
             }
             Action::ChooseFilteredExport => return self.choose_filtered_export(),
             Action::DiscardChanges => {
+                if self
+                    .active
+                    .document
+                    .as_ref()
+                    .is_some_and(Document::join_reserved)
+                {
+                    self.active.notice = Some(AppMessage::warning(join_files::INPUT_RESERVED));
+                    return;
+                }
                 if self.active.document.as_ref().is_some_and(|document| {
                     document.structural_job.is_some()
                         || document.save_job.is_some()
@@ -3496,7 +3505,8 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
     });
     let save_ready = document.is_some_and(Document::is_save_ready);
     let save_as_ready = document.is_some_and(Document::is_save_as_ready);
-    let discard_ready = dirty && !file_operation_active;
+    let join_reserved = document.is_some_and(Document::join_reserved);
+    let discard_ready = dirty && !file_operation_active && !join_reserved;
     let (filename, full_path) = document.map_or_else(
         || ("File".to_owned(), None),
         |document| {
@@ -3609,6 +3619,8 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
                 "Open a file first."
             } else if !dirty {
                 "There are no changes to discard."
+            } else if join_reserved {
+                join_files::INPUT_RESERVED
             } else {
                 "Wait for the active file operation to finish."
             });

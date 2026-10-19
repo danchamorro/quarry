@@ -3525,4 +3525,68 @@ value
             "manual scrolling must not snap back to unchanged keyboard focus: {before:?} -> {after:?}"
         );
     }
+
+    #[test]
+    fn discard_changes_explains_join_reservation_and_works_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"id,value\nx,saved\n";
+        let a = fixture(dir.path(), "discard-main.csv", original);
+        let b = fixture(dir.path(), "discard-other.csv", b"id,city\nx,Paris\n");
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_document_tab_with_encoding(
+            a.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Utf8),
+        )
+        .unwrap();
+        finish_document(&mut app);
+        let id = app.active.id;
+        {
+            let doc = app.active.document.as_mut().unwrap();
+            doc.rename_header(1, "Current value".into()).unwrap();
+            doc.begin_cell_edit(1, 1, b"saved".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "kept".into();
+        }
+        app.open_join_files();
+        app.select_join_document(0, id).unwrap();
+        finish(&mut app);
+        app.select_join_input_path(1, b).unwrap();
+        finish(&mut app);
+        let ctx = context();
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let history = app.active.document.as_ref().unwrap().edit_history.clone();
+        assert!(app.active.document.as_ref().unwrap().join_reserved());
+        app.active.notice = None;
+        app.apply(&ctx, Action::DiscardChanges);
+        assert!(
+            app.active
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains(INPUT_RESERVED)),
+            "blocked Discard Changes must explain the Join Files reservation"
+        );
+        let doc = app.active.document.as_ref().unwrap();
+        assert_eq!(doc.edit_history, history);
+        assert_eq!(doc.column_name(1), "Current value");
+        assert_eq!(doc.cell_edits[&(1, 1)].as_slice(), b"kept");
+        assert!(doc.is_dirty());
+        assert_eq!(fs::read(&a).unwrap(), original);
+        app.join_files.as_mut().unwrap().request_close(false);
+        finish(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.join_files.is_none());
+        assert!(!app.active.document.as_ref().unwrap().join_reserved());
+        app.apply(&ctx, Action::DiscardChanges);
+        let doc = app.active.document.as_ref().unwrap();
+        assert!(!doc.is_dirty());
+        assert_eq!(doc.column_name(1), "value");
+        assert!(doc.cell_edits.is_empty());
+        assert!(!doc.can_undo());
+        assert!(app.active.notice.is_none());
+        assert_eq!(fs::read(a).unwrap(), original);
+    }
 }
