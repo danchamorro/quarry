@@ -4,7 +4,7 @@ Date: 2026-10-18. [#124](https://github.com/danchamorro/quarry/issues/124), part
 
 ## Automated checks
 
-All 591 workspace tests passed in the VMPal macOS VM (macOS 27.0.1, build 26A434), together with formatting, all-target/all-feature Clippy and the release build.
+All 592 workspace tests passed in the VMPal macOS VM (macOS 27.0.1, build 26A434), together with formatting, all-target/all-feature Clippy and the release build.
 
 The new core matrix compares an independent nested-loop result with 32 output combinations: all four modes, header enabled/disabled, and four projections. It verifies exact fields, order, serialized bytes, reopen behavior, output from only one side, omitted keys, padding, embedded quotes/newlines and a BOM-looking value placed first.
 
@@ -43,6 +43,10 @@ SHA-256:
 Both source files retained their exact bytes. The synthetic session then closed normally.
 
 The first native pass exposed a nested scroll-list sizing problem: the fourth column was clipped while the heading editor appeared below it. Reserving the list height and deriving row height from its controls fixed the native reproduction; the repeat showed all four choices together. A component-only check did not reproduce this nested layout and was not retained or claimed as a regression test.
+
+## Existing-output review follow-up
+
+A subsequent review exposed that choosing an existing destination consumed the retained analysis. The added UI regression first failed because the plan disappeared; it now verifies that existing files and dangling links are rejected before starting a writer and that a fresh destination can be written using the same preview. This fix is inherited from #120 and was rechecked through the stacked branches. The native happy-path binary recorded above predates this preflight-only follow-up.
 
 ## Remaining parent work
 
