@@ -31,12 +31,19 @@ pub struct JoinInput {
     pub has_header: bool,
     pub encoding: Option<Encoding>,
     pub key_column: usize,
+    /// Bind a UI selection to the file version whose header was shown.
+    pub expected_version: Option<JoinSourceVersion>,
 }
+
+/// Opaque identity of the file whose column labels were presented to the user.
+#[derive(Clone, Debug)]
+pub struct JoinSourceVersion(SourceStamp);
 
 /// Bounded labels for selecting a saved input's key column.
 pub struct JoinHeader {
     pub delimiter: u8,
     pub columns: Vec<String>,
+    pub source_version: JoinSourceVersion,
 }
 
 /// Check cancellation between bounded filesystem reads and seeks.
@@ -131,7 +138,11 @@ fn header_info(path: &Path, state: &Progress) -> JResult<JoinHeader> {
                 text[..end].to_string()
             })
             .collect();
-        Ok(JoinHeader { delimiter, columns })
+        Ok(JoinHeader {
+            delimiter,
+            columns,
+            source_version: JoinSourceVersion(stamp.clone()),
+        })
     })();
     state.check()?;
     let header = result?;
@@ -917,6 +928,15 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
         return Err(input_error(&path, None, "Select a regular file.").into());
     }
     let stamp = SourceStamp::from_file(&file)?;
+    if input
+        .expected_version
+        .as_ref()
+        .is_some_and(|expected| !expected.0.matches(&stamp))
+    {
+        return Err(input_error(&path, None,
+            "The selected file changed after its columns were loaded. Choose that file again before analyzing.").into());
+    }
+
     let encoding =
         Encoding::detect(&mut file, input.encoding).map_err(|e| input_error(&path, None, e))?;
     if encoding != Encoding::Utf8 {
@@ -1542,17 +1562,27 @@ fn check_creation_space(
     output_bytes: u64,
 ) -> JResult<()> {
     #[cfg(unix)]
-    let same_volume = {
+    {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(temporary)?.dev() == fs::metadata(output_parent(destination))?.dev()
-    };
+        let same_volume =
+            fs::metadata(temporary)?.dev() == fs::metadata(output_parent(destination))?.dev();
+        if same_volume {
+            check_storage(temporary, add(spill_bytes, output_bytes)?)?;
+        } else {
+            check_storage(temporary, spill_bytes)?;
+            check_storage(output_parent(destination), output_bytes)?;
+        }
+    }
     #[cfg(not(unix))]
-    let same_volume = true;
-    if same_volume {
-        check_storage(temporary, add(spill_bytes, output_bytes)?)?;
-    } else {
-        check_storage(temporary, spill_bytes)?;
-        check_storage(output_parent(destination), output_bytes)?;
+    {
+        // Unknown volume identity requires checking both locations. Reuse the
+        // shared conservative fallback rather than inspecting only scratch space.
+        crate::storage::check_operation_storage(
+            temporary,
+            destination,
+            add(spill_bytes, output_bytes)?,
+            output_bytes,
+        )?;
     }
     Ok(())
 }
@@ -1760,6 +1790,7 @@ mod tests {
             has_header: true,
             encoding: Some(Encoding::Utf8),
             key_column: 0,
+            expected_version: None,
         })
     }
     /// Exercise analysis through the public worker boundary with synthetic files.

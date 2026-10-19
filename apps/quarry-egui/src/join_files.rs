@@ -123,6 +123,13 @@ impl JoinDialog {
         self.cancel_requested = true;
     }
 
+    /// Preserve worker failures and cleanup warnings for explicit user review.
+    fn worker_failed(&mut self, message: String) {
+        self.closing = false;
+        self.quit_after_close = false;
+        self.message = Some(message);
+    }
+
     /// Adopt completed workers and retain published results even after cancellation.
     fn poll(&mut self) {
         if self
@@ -141,7 +148,7 @@ impl JoinDialog {
                         self.keys[side] = 0;
                     }
                     Ok(None) => self.message = Some("Header reading cancelled.".into()),
-                    Err(error) => self.message = Some(error.to_string()),
+                    Err(error) => self.worker_failed(error.to_string()),
                 }
             }
             self.cancel_requested = false;
@@ -165,21 +172,24 @@ impl JoinDialog {
                 Ok(None) => {
                     self.message = Some("Analysis cancelled. No output was created.".into())
                 }
-                Err(error) => self.message = Some(error.to_string()),
+                Err(error) => self.worker_failed(error.to_string()),
             }
             self.cancel_requested = false;
         }
         if self.writing.as_ref().is_some_and(|job| job.progress().done) {
             match self.writing.take().unwrap().wait() {
                 Ok(Some(result)) => {
-                    self.message = result
-                        .cleanup_warning
-                        .as_ref()
-                        .map(|e| format!("The joined file is saved. Cleanup needs attention: {e}"));
+                    if let Some(warning) = &result.cleanup_warning {
+                        self.worker_failed(format!(
+                            "The joined file is saved. Cleanup needs attention: {warning}"
+                        ));
+                    } else {
+                        self.message = None;
+                    }
                     self.result = Some(result);
                 }
                 Ok(None) => self.message = Some("Join cancelled. No output was created.".into()),
-                Err(error) => self.message = Some(error.to_string()),
+                Err(error) => self.worker_failed(error.to_string()),
             }
             self.cancel_requested = false;
         }
@@ -222,6 +232,7 @@ impl JoinDialog {
             has_header: true,
             encoding: Some(Encoding::Utf8),
             key_column: self.keys[side],
+            expected_version: Some(self.headers[side].as_ref().unwrap().source_version.clone()),
         });
         self.message = None;
         self.result = None;
@@ -777,5 +788,77 @@ mod tests {
         );
         assert!(dialog.message.as_ref().unwrap().contains("cancelled"));
         assert!(!dialog.running_operation());
+    }
+    #[test]
+    fn review_regression_changed_probe_source_requires_reselection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        let (a, _) = prepare(&mut app, dir.path());
+        let replacement = fixture(
+            dir.path(),
+            "replacement.csv",
+            b"name,id\nBob,b\nAlice,a\nLast,z\n",
+        );
+        fs::rename(replacement, &a).unwrap();
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(
+            dialog.plan.is_none(),
+            "a stale selected column must not silently join the reordered file"
+        );
+        assert!(dialog.message.as_ref().unwrap().contains("changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_regression_worker_cleanup_failure_cancels_closing() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let workspace = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".quarry-join-")
+            })
+            .unwrap();
+        let _restore = Restore(workspace.clone());
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o500)).unwrap();
+        let dialog = app.join_files.as_mut().unwrap();
+        dialog.destination = Some(dir.path().join("result.csv"));
+        dialog.start_write();
+        while !dialog.writing.as_ref().unwrap().progress().done {
+            thread::yield_now();
+        }
+        dialog.request_close(true);
+        dialog.poll();
+        assert!(
+            dialog
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Could not remove private join data")
+        );
+        assert!(
+            !dialog.closing,
+            "a cleanup failure must remain visible instead of closing the dialog"
+        );
+        assert!(!dialog.quit_after_close);
     }
 }

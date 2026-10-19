@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         has_header: true,
         encoding: Some(Encoding::Utf8),
         key_column: 0,
+        expected_version: None,
     });
     let start = Instant::now();
     let plan = finish(analyze_join(
