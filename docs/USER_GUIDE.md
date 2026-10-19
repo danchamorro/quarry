@@ -273,8 +273,8 @@ then Main row order for multiple matches.
 
 Joining uses all current rows, including hidden columns independently of their
 display order. Clear filters and wait for selected inputs to become idle first.
-Commit a valid editor draft before analysis; an invalid or oversized draft must
-be corrected. While analysis, a retained preview or creation owns selected
+Quarry commits a valid editor draft before analysis; an invalid or oversized
+draft must be corrected. While analysis, a retained preview or creation owns selected
 documents, Quarry reserves them against editing, saving, reloading and closing.
 Other documents remain usable. Resetting or closing the preview releases those
 reservations after cleanup.

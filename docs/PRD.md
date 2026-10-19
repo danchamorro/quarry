@@ -338,6 +338,32 @@ the existing document guard. It does not append to the active document or add
 cross-file history. See [the user guide](USER_GUIDE.md#combine-files) and
 [ADR 0006](adr/0006-combine-files.md).
 
+## Joining files by matching keys
+
+**Join Files** matches two different saved files or current open documents and
+creates a separate UTF-8 result. One to sixteen paired columns compare complete
+values, case-sensitively by default, with an explicit ASCII-only insensitive
+option. Empty or missing components never match. Source values are preserved.
+
+Users retain all Main rows, matching pairs only, all Additional rows or all rows
+from both inputs. Every matching pair is retained; duplicate groups can multiply
+rows and require explicit review. Output columns can be included, ordered and
+renamed independently of the keys. Full analysis supplies exact counts, bounded
+samples and storage allowances before guarded creation.
+
+Current documents retain source/format/edit provenance and private-generation
+ownership. Inputs stay reserved through analysis, a retained preview and creation;
+unrelated documents remain usable. Joining uses bounded external processing,
+the two-operation policy, private temporary storage and atomic no-clobber
+publication. Close/quit waits for active cleanup and retains unsaved-work review.
+The saved result opens in an ordinary editable tab without changing input history.
+
+The accepted specification and dependencies live on
+[#71](https://github.com/danchamorro/quarry/issues/71).
+See [the user guide](USER_GUIDE.md#join-files),
+[ADR 0011](adr/0011-bounded-file-joining.md), and
+[the integrated acceptance report](benchmarks/2026-10-19-join-acceptance.md).
+
 ## Progressive opening
 1. Open the file and sample a bounded region.
 2. Detect likely encoding/delimiter/quote settings.

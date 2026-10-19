@@ -1,0 +1,266 @@
+{
+  "schema": 1,
+  "environment": {
+    "computer": "VMPal macOS VM 1",
+    "macos": "27.0.1 (26A434)",
+    "cpu": "Apple M3 Max (Virtual)",
+    "vcpus": 8,
+    "architecture": "aarch64-apple-darwin",
+    "ram_bytes": 17179869184,
+    "rustc": "1.88.0 (6b00bc388 2025-06-23)"
+  },
+  "engine_revision": "ac6c4f55dba1d0b96348646381b651ea2785591e",
+  "focus_revision": "614ac9e253741bc0bace8456d0009b6d21756ae5",
+  "cases": [
+    {
+      "case": "wide",
+      "label": "complete",
+      "source_revision": "ac6c4f55dba1d0b96348646381b651ea2785591e",
+      "started_at_utc": "2026-10-19T10:01:27.175429+00:00",
+      "rows": [
+        32,
+        32
+      ],
+      "columns_per_side": 32768,
+      "key_pairs": 16,
+      "input_bytes": [
+        23978666,
+        30465962
+      ],
+      "input_allocated_bytes": [
+        23982080,
+        30466048
+      ],
+      "input_sha256": [
+        "5efba4a95f50e55ab9394aaf1aabdd410b11843cb901349f632eced85d03200f",
+        "1f0c44aa9fdd4b4fb92becf7a933ab2c053a14f6dfbf779120a9fd6ee70d976c"
+      ],
+      "expected_output_rows": 32,
+      "expected_output_bytes": 32921700,
+      "expected_output_sha256": "d2fae7107f624c4121b70af9e7145e6f8d6e4eba7b2a123584ddf1cc92faed3b",
+      "max_rss_macos_time_bytes": 49807360,
+      "peak_fixture_allocated_bytes_sampled": 107646976,
+      "elapsed_seconds_including_polling": 1.0620125420000002,
+      "metrics": {
+        "observed_peak_temporary_bytes": 117740532,
+        "analysis_seconds": 0.353062209,
+        "input_rows_main": 32,
+        "input_rows_additional": 32,
+        "matching_pairs": 8,
+        "projected_output_rows": 32,
+        "projected_output_bytes": 32921700,
+        "additional_temporary_bytes": 96190852,
+        "total_seconds": 0.61795175,
+        "result": "complete",
+        "actual_rows": 32,
+        "actual_bytes": 32921700,
+        "peak_temporary_bytes": 117741812,
+        "peak_group_buffer_bytes": 742570
+      },
+      "binary_sha256": "e9ea3649a760d32c0902b746ab09c42a1fbff4204bf9e4a90b08813f258aded1",
+      "probe_source_sha256": "876f0c566d607a07f7b1b52b23411e7f29d52aa515b5b35996052e9f79cfd14c",
+      "harness_sha256": "4eb19a05ce336b95081e12b49052824872cefa2f04b2e8c0f6ae97f4e5370c6e",
+      "all_checks_passed": true
+    },
+    {
+      "case": "skew",
+      "label": "complete",
+      "source_revision": "ac6c4f55dba1d0b96348646381b651ea2785591e",
+      "started_at_utc": "2026-10-19T10:01:29.663105+00:00",
+      "rows": [
+        1024,
+        1536
+      ],
+      "columns_per_side": 2,
+      "key_pairs": 1,
+      "input_bytes": [
+        265228,
+        397836
+      ],
+      "input_allocated_bytes": [
+        266240,
+        401408
+      ],
+      "input_sha256": [
+        "01462096a3872c48eca310d6cc95727d47eae6f2d04c5fc7badc749d5f612387",
+        "de436210ab1eaa15c59c55a7bc47c6eace601b79dbca3816b9e7f8cadb3bb4a3"
+      ],
+      "expected_output_rows": 1572864,
+      "expected_output_bytes": 814743616,
+      "expected_output_sha256": "22e5f258d09fb8955d1901367e29216b16131b7be3c077f340395976ba669743",
+      "max_rss_macos_time_bytes": 5144576,
+      "peak_fixture_allocated_bytes_sampled": 1684406272,
+      "elapsed_seconds_including_polling": 6.582902292,
+      "metrics": {
+        "observed_peak_temporary_bytes": 1754453748,
+        "analysis_seconds": 0.094131333,
+        "input_rows_main": 1024,
+        "input_rows_additional": 1536,
+        "matching_pairs": 1572864,
+        "projected_output_rows": 1572864,
+        "projected_output_bytes": 814743616,
+        "additional_temporary_bytes": 2570059840,
+        "total_seconds": 6.141567417,
+        "result": "complete",
+        "actual_rows": 1572864,
+        "actual_bytes": 814743616,
+        "peak_temporary_bytes": 1756066368,
+        "peak_group_buffer_bytes": 130950
+      },
+      "binary_sha256": "e9ea3649a760d32c0902b746ab09c42a1fbff4204bf9e4a90b08813f258aded1",
+      "probe_source_sha256": "876f0c566d607a07f7b1b52b23411e7f29d52aa515b5b35996052e9f79cfd14c",
+      "harness_sha256": "4eb19a05ce336b95081e12b49052824872cefa2f04b2e8c0f6ae97f4e5370c6e",
+      "all_checks_passed": true
+    },
+    {
+      "case": "large",
+      "label": "complete",
+      "source_revision": "ac6c4f55dba1d0b96348646381b651ea2785591e",
+      "started_at_utc": "2026-10-19T10:01:50.849544+00:00",
+      "rows": [
+        73728,
+        73728
+      ],
+      "columns_per_side": 2,
+      "key_pairs": 1,
+      "input_bytes": [
+        9664782496,
+        9665224420
+      ],
+      "input_allocated_bytes": [
+        9668784128,
+        9669210112
+      ],
+      "input_sha256": [
+        "ff42e44cfd117844797e6e097c1a086b68cfa5c75dc2bc1b29e0ae4510eaf026",
+        "5f2517dbd87f9da221c94af07366ff15f369bb7df9961c97fe381727eba606eb"
+      ],
+      "expected_output_rows": 73728,
+      "expected_output_bytes": 9674630442,
+      "expected_output_sha256": "4876826f2084fd4450291177777ef0ab60192558162e51fe6227241ef96b63b7",
+      "max_rss_macos_time_bytes": 24068096,
+      "peak_fixture_allocated_bytes_sampled": 57925263360,
+      "elapsed_seconds_including_polling": 167.539946625,
+      "metrics": {
+        "observed_peak_temporary_bytes": 38689442028,
+        "analysis_seconds": 86.105739333,
+        "input_rows_main": 73728,
+        "input_rows_additional": 73728,
+        "matching_pairs": 74,
+        "projected_output_rows": 73728,
+        "projected_output_bytes": 9674630442,
+        "additional_temporary_bytes": 29029789438,
+        "total_seconds": 167.251143333,
+        "result": "complete",
+        "actual_rows": 73728,
+        "actual_bytes": 9674630442,
+        "peak_temporary_bytes": 38692391148,
+        "peak_group_buffer_bytes": 131121
+      },
+      "binary_sha256": "e9ea3649a760d32c0902b746ab09c42a1fbff4204bf9e4a90b08813f258aded1",
+      "probe_source_sha256": "876f0c566d607a07f7b1b52b23411e7f29d52aa515b5b35996052e9f79cfd14c",
+      "harness_sha256": "4eb19a05ce336b95081e12b49052824872cefa2f04b2e8c0f6ae97f4e5370c6e",
+      "all_checks_passed": true
+    },
+    {
+      "case": "large",
+      "label": "cancel",
+      "source_revision": "ac6c4f55dba1d0b96348646381b651ea2785591e",
+      "started_at_utc": "2026-10-19T10:04:56.472449+00:00",
+      "rows": [
+        73728,
+        73728
+      ],
+      "columns_per_side": 2,
+      "key_pairs": 1,
+      "input_bytes": [
+        9664782496,
+        9665224420
+      ],
+      "input_allocated_bytes": [
+        9668784128,
+        9669210112
+      ],
+      "input_sha256": [
+        "ff42e44cfd117844797e6e097c1a086b68cfa5c75dc2bc1b29e0ae4510eaf026",
+        "5f2517dbd87f9da221c94af07366ff15f369bb7df9961c97fe381727eba606eb"
+      ],
+      "expected_output_rows": 73728,
+      "expected_output_bytes": 9674630442,
+      "expected_output_sha256": "4876826f2084fd4450291177777ef0ab60192558162e51fe6227241ef96b63b7",
+      "max_rss_macos_time_bytes": 23969792,
+      "peak_fixture_allocated_bytes_sampled": 57833238528,
+      "elapsed_seconds_including_polling": 91.343144917,
+      "metrics": {
+        "observed_peak_temporary_bytes": 28931930841,
+        "analysis_seconds": 90.468281167,
+        "input_rows_main": 73728,
+        "input_rows_additional": 73728,
+        "matching_pairs": 74,
+        "projected_output_rows": 73728,
+        "projected_output_bytes": 9674630442,
+        "additional_temporary_bytes": 29029789438,
+        "cancel_latency_seconds": 0.151776792,
+        "total_seconds": 91.182748709,
+        "result": "cancelled"
+      },
+      "binary_sha256": "e9ea3649a760d32c0902b746ab09c42a1fbff4204bf9e4a90b08813f258aded1",
+      "probe_source_sha256": "876f0c566d607a07f7b1b52b23411e7f29d52aa515b5b35996052e9f79cfd14c",
+      "harness_sha256": "4eb19a05ce336b95081e12b49052824872cefa2f04b2e8c0f6ae97f4e5370c6e",
+      "all_checks_passed": true
+    }
+  ],
+  "native": {
+    "full_candidate": {
+      "CFBundleShortVersionString": "0.1.0",
+      "CFBundleVersion": "203",
+      "QuarryGitRevision": "ac6c4f55dba1d0b96348646381b651ea2785591e",
+      "QuarrySourceStatus": "clean",
+      "binary_sha256": "dc998751cdb5194d8f5ac246725a8b10e6103634f67b6d6ed66922824a0df891"
+    },
+    "focus_candidate": {
+      "CFBundleShortVersionString": "0.1.0",
+      "CFBundleVersion": "204",
+      "QuarryGitRevision": "614ac9e253741bc0bace8456d0009b6d21756ae5",
+      "QuarrySourceStatus": "clean",
+      "binary_sha256": "56c527f97282a3ac0d75fc889c18fb0ff59d7dfbc8f3c4aca977e1ee00b6a658"
+    },
+    "full_result": {
+      "rows": 11,
+      "bytes": 366,
+      "sha256": "c3e92093714079354aa7f232634a41e5bb0a046114f789d099b95fd2760128b9",
+      "matching_rows": [
+        3,
+        4
+      ],
+      "matching_pairs": 7,
+      "unmatched_rows": [
+        2,
+        2
+      ],
+      "empty_key_rows": [
+        1,
+        1
+      ]
+    },
+    "left_result": {
+      "rows": 9,
+      "bytes": 315,
+      "sha256": "cb68a5b7c14d4593d4f4b2a52fe9f0942d2cb28a6527b63976188b857a4b8cf6",
+      "output": "focus-joined.csv"
+    },
+    "input_sha256": [
+      "4bf74ebc80d3db5284daa414a10162efbb9aecd824d25a1e4e8d0a69616dbe28",
+      "1cec30a057f54479a8f115c0af1bee816725fd8ea8a6dcd76eed23e636911480"
+    ],
+    "all_outputs_match_independent_oracles": true,
+    "sources_unchanged": true,
+    "outputs_mode": "0600",
+    "no_output_staging": true,
+    "ordinary_tab_reveals_control_and_space_activates": true,
+    "result_edit_undo_and_control_tab_verified": true,
+    "keep_editing_retains_unsaved_main_then_explicit_synthetic_discard": true,
+    "all_synthetic_sessions_closed": true,
+    "resize_observation": "One transient raster artifact at frame1691 cleared after restoring size. Controlled same-candidate and installed-main two-tab resize/quit repeats rendered normally. Cause unproven; not claimed as a reproducible fixed product defect."
+  }
+}
