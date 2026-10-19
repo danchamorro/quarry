@@ -11,6 +11,8 @@ pub(crate) struct SourceStamp {
     len: u64,
     modified: Option<SystemTime>,
     readonly: bool,
+    #[cfg(windows)]
+    windows: Option<WindowsVersion>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -37,11 +39,26 @@ impl SourceStamp {
     pub(crate) fn from_file(file: &File) -> io::Result<Self> {
         #[cfg(target_os = "macos")]
         let before = data_generation(file);
+        #[cfg(windows)]
+        let before = windows_version(file)?;
         let stamp = Self::from_metadata(&file.metadata()?);
         #[cfg(target_os = "macos")]
         let stamp = Self {
             data_generation: before.filter(|_| before == data_generation(file)),
             ..stamp
+        };
+        #[cfg(windows)]
+        let stamp = {
+            let after = windows_version(file)?;
+            if before != after {
+                return Err(io::Error::other(
+                    "The file changed while its identity was being captured.",
+                ));
+            }
+            Self {
+                windows: Some(after),
+                ..stamp
+            }
         };
         Ok(stamp)
     }
@@ -51,6 +68,8 @@ impl SourceStamp {
             len: metadata.len(),
             modified: metadata.modified().ok(),
             readonly: metadata.permissions().readonly(),
+            #[cfg(windows)]
+            windows: None,
             #[cfg(unix)]
             device: metadata.dev(),
             #[cfg(unix)]
@@ -72,6 +91,12 @@ impl SourceStamp {
 
     pub(crate) fn matches(&self, observed: &Self) -> bool {
         if !self.same_file_metadata(observed) {
+            return false;
+        }
+        #[cfg(windows)]
+        if self.windows.map(|version| version.changed)
+            != observed.windows.map(|version| version.changed)
+        {
             return false;
         }
         #[cfg(unix)]
@@ -113,13 +138,27 @@ impl SourceStamp {
     /// Check the path's identity and ordinary metadata alongside matching a file
     /// descriptor. This alone does not establish that ctime changes are harmless.
     pub(crate) fn matches_metadata(&self, metadata: &Metadata) -> bool {
-        self.same_file_metadata(&Self::from_metadata(metadata))
+        let observed = Self::from_metadata(metadata);
+        // Metadata alone has no stable Windows file ID. Callers must also
+        // compare an opened path handle; source_matches_stamp does that.
+        #[cfg(windows)]
+        let observed = Self {
+            windows: self.windows,
+            ..observed
+        };
+        self.same_file_metadata(&observed)
     }
 
     fn same_file_metadata(&self, other: &Self) -> bool {
         if self.len != other.len
             || self.modified != other.modified
             || self.readonly != other.readonly
+        {
+            return false;
+        }
+        #[cfg(windows)]
+        if self.windows.map(|version| version.identity)
+            != other.windows.map(|version| version.identity)
         {
             return false;
         }
@@ -133,6 +172,51 @@ impl SourceStamp {
             return false;
         }
         true
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowsVersion {
+    identity: (u64, [u8; 16]),
+    changed: i64,
+}
+
+#[cfg(windows)]
+fn windows_version(file: &File) -> io::Result<WindowsVersion> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FILE_ID_INFO, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    let mut id = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+    let mut basic = std::mem::MaybeUninit::<FILE_BASIC_INFO>::uninit();
+    // SAFETY: the file handle is live. Each buffer matches the requested
+    // information class and has the exact initialized-on-success C layout.
+    unsafe {
+        if GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            id.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            basic.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let id = id.assume_init();
+        let basic = basic.assume_init();
+        Ok(WindowsVersion {
+            identity: (id.VolumeSerialNumber, id.FileId.Identifier),
+            changed: basic.ChangeTime,
+        })
     }
 }
 
@@ -307,5 +391,53 @@ mod tests {
         assert_eq!(stamp.len, rewritten.len);
         assert_eq!(stamp.modified, rewritten.modified);
         assert!(!stamp.matches(&rewritten));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_rejects_same_size_same_time_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.csv");
+        std::fs::write(&path, b"id,name\n1,A\n").unwrap();
+        let original = File::open(&path).unwrap();
+        let stamp = SourceStamp::from_file(&original).unwrap();
+        std::fs::rename(&path, dir.path().join("old.csv")).unwrap();
+        std::fs::write(&path, b"name,id\nA,1\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp.modified.unwrap()))
+            .unwrap();
+        let replacement = File::open(&path).unwrap();
+        assert!(
+            stamp.matches_metadata(&replacement.metadata().unwrap()),
+            "ordinary length/mtime/readonly metadata does not identify the selected input"
+        );
+        let observed = SourceStamp::from_file(&replacement).unwrap();
+        assert!(!stamp.matches(&observed));
+        assert!(!crate::export::source_matches_stamp(&original, &path, &stamp).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_change_time_rejects_restored_mtime_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.csv");
+        std::fs::write(&path, b"id,name\n1,A\n").unwrap();
+        let original = File::open(&path).unwrap();
+        let stamp = SourceStamp::from_file(&original).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"name,id\nA,1\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp.modified.unwrap()))
+            .unwrap();
+        let observed = SourceStamp::from_file(&File::open(&path).unwrap()).unwrap();
+        assert_eq!(stamp.len, observed.len);
+        assert_eq!(stamp.modified, observed.modified);
+        assert!(!stamp.matches(&observed));
+        assert!(!crate::export::source_matches_stamp(&original, &path, &stamp).unwrap());
     }
 }

@@ -73,7 +73,8 @@ impl Directory {
             use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
             use windows_sys::Win32::Storage::FileSystem::{
                 FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ, FILE_SHARE_WRITE,
             };
             let resolved = path.canonicalize()?;
             let mut prefix = PathBuf::new();
@@ -84,7 +85,9 @@ impl Directory {
                     continue;
                 }
                 let file = fs::OpenOptions::new()
-                    .access_mode(0)
+                    // Metadata-only zero-access handles do not enforce delete
+                    // sharing on the leaf. Directory read access is required.
+                    .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
                     .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                     .open(&prefix)?;
@@ -114,6 +117,30 @@ impl Directory {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Pinned output publication is unavailable on this platform.",
+            ))
+        }
+    }
+
+    fn current_path(&self) -> io::Result<PathBuf> {
+        #[cfg(target_os = "macos")]
+        let path = {
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(OsString::from_vec(
+                rustix::fs::getpath(&self.file)?.into_bytes(),
+            ))
+        };
+        #[cfg(target_os = "linux")]
+        let path = {
+            use std::os::fd::AsRawFd;
+            fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))?
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let path = self.path.clone();
+        if self.still_named_by(&path) {
+            Ok(path)
+        } else {
+            Err(io::Error::other(
+                "The captured output directory can no longer be located by name.",
             ))
         }
     }
@@ -164,14 +191,14 @@ impl PreparedDestination {
         self.parent.path.join(&self.name)
     }
 
-    fn reported_path(&self) -> PathBuf {
+    fn reported_path(&self) -> io::Result<PathBuf> {
         if self
             .parent
             .still_named_by(crate::storage::output_parent(&self.requested))
         {
-            self.requested.clone()
+            Ok(self.requested.clone())
         } else {
-            self.physical_path()
+            Ok(self.parent.current_path()?.join(&self.name))
         }
     }
 
@@ -239,12 +266,21 @@ impl PreparedDestination {
         }
         #[cfg(not(unix))]
         {
-            let directory = crate::export::private_staging_directory(&self.parent.path)?;
-            let temporary = directory.path().join("data.tmp");
-            let file = fs::OpenOptions::new()
+            // Cleanup must never recurse into an unrelated entry, including
+            // after our own Drop has reported a nonempty-directory error.
+            let directory = crate::export::private_staging_directory(&self.parent.path)?.keep();
+            let temporary = directory.join("data.tmp");
+            let file = match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&temporary)?;
+                .open(&temporary)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = fs::remove_dir(&directory);
+                    return Err(error);
+                }
+            };
             Ok((
                 StagedDestination {
                     temporary,
@@ -359,7 +395,7 @@ pub(crate) struct StagedDestination {
     #[cfg(unix)]
     unix: UnixStage,
     #[cfg(not(unix))]
-    directory: tempfile::TempDir,
+    directory: PathBuf,
     // Kept after the staging owner so Windows locks outlive directory cleanup.
     destination: PreparedDestination,
 }
@@ -367,21 +403,26 @@ impl StagedDestination {
     pub(crate) fn temporary(&self) -> &Path {
         &self.temporary
     }
-    pub(crate) fn reported_path(&self) -> PathBuf {
+    pub(crate) fn reported_path(&self) -> io::Result<PathBuf> {
         self.destination.reported_path()
     }
 
     pub(crate) fn publish(&self) -> io::Result<()> {
+        // Fail before publication on platforms that cannot locate a moved parent.
+        self.destination.reported_path()?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            rustix::fs::renameat_with(
+            let renamed = rustix::fs::renameat_with(
                 &self.unix.directory,
                 "data.tmp",
                 &self.destination.parent.file,
                 &self.destination.name,
                 rustix::fs::RenameFlags::NOREPLACE,
-            )
-            .map_err(Into::into)
+            );
+            #[cfg(target_os = "linux")]
+            return self.finish_linux_rename(renamed);
+            #[cfg(not(target_os = "linux"))]
+            renamed.map_err(Into::into)
         }
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
         {
@@ -400,6 +441,21 @@ impl StagedDestination {
         }
     }
 
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    fn finish_linux_rename(&self, renamed: rustix::io::Result<()>) -> io::Result<()> {
+        if matches!(renamed, Err(rustix::io::Errno::INVAL)) {
+            return rustix::fs::linkat(
+                &self.unix.directory,
+                "data.tmp",
+                &self.destination.parent.file,
+                &self.destination.name,
+                rustix::fs::AtFlags::empty(),
+            )
+            .map_err(Into::into);
+        }
+        renamed.map_err(Into::into)
+    }
+
     pub(crate) fn cleanup(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -412,7 +468,7 @@ impl StagedDestination {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            match fs::remove_dir(self.directory.path()) {
+            match fs::remove_dir(&self.directory) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
@@ -468,5 +524,63 @@ mod windows_tests {
         );
         staged.cleanup().unwrap();
         assert_eq!(fs::read(path).unwrap(), b"existing");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn unsupported_linux_rename_uses_pinned_no_clobber_links() {
+        for existing in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("result.csv");
+            let (stage, mut file) = PreparedDestination::new(destination.clone())
+                .unwrap()
+                .stage()
+                .unwrap();
+            file.write_all(b"new output").unwrap();
+            drop(file);
+            if existing {
+                fs::write(&destination, b"existing").unwrap();
+            }
+            let result = stage.finish_linux_rename(Err(rustix::io::Errno::INVAL));
+            if existing {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+            } else {
+                result.unwrap();
+            }
+            stage.cleanup().unwrap();
+            assert_eq!(
+                fs::read(&destination).unwrap(),
+                if existing {
+                    b"existing".as_slice()
+                } else {
+                    b"new output".as_slice()
+                }
+            );
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("denied.csv");
+        let (stage, file) = PreparedDestination::new(destination.clone())
+            .unwrap()
+            .stage()
+            .unwrap();
+        drop(file);
+        assert_eq!(
+            stage
+                .finish_linux_rename(Err(rustix::io::Errno::ACCESS))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        stage.cleanup().unwrap();
+        assert!(
+            !destination.exists(),
+            "unrelated rename errors must not trigger a fallback"
+        );
     }
 }

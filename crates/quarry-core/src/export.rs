@@ -2151,7 +2151,9 @@ impl ExportTarget {
             record_limit: DEFAULT_MAX_RECORD_BYTES,
             suppress_next_source_bom: false,
             _private_directory: None,
-            destination: staging.reported_path(),
+            destination: staging
+                .reported_path()
+                .map_err(|error| storage_error(output_parent(&physical), error))?,
             pinned_staging: Some(staging),
             private_publication: None,
             temporary,
@@ -2760,7 +2762,14 @@ impl ExportTarget {
             });
         }
         if let Some(staging) = &self.pinned_staging {
-            self.destination = staging.reported_path();
+            self.destination = staging.reported_path().map_err(|error| {
+                storage_error(
+                    output_parent(&self.destination),
+                    io::Error::other(format!(
+                        "The output was saved, but its directory cannot be located: {error}"
+                    )),
+                )
+            })?;
         }
         let cleanup_warning = self
             .remove_temporary()
@@ -2832,8 +2841,22 @@ pub(crate) fn source_matches_stamp(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    Ok(expected.matches_metadata(&path_metadata)
-        && expected.matches(&SourceStamp::from_file(source)?))
+    if !expected.matches_metadata(&path_metadata)
+        || !expected.matches(&SourceStamp::from_file(source)?)
+    {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        let named = match File::open(source_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        return Ok(expected.matches(&SourceStamp::from_file(&named)?));
+    }
+    #[cfg(not(windows))]
+    Ok(true)
 }
 
 fn validate_destination(source: &Path, destination: &Path) -> Result<(), QuarryError> {
@@ -9558,7 +9581,6 @@ mod tests {
             assert!(temporary_exports(&destination).is_empty());
         }
     }
-    #[cfg(unix)]
     #[test]
     fn pinned_publication_reports_cleanup_failure_without_removing_unrelated_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -9647,6 +9669,51 @@ mod tests {
                     .unwrap()
                     .contains("group:everyone")
             );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn review_regression_renamed_parent_returns_saved_file() {
+        for ancestor in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.csv");
+            fs::write(&source, b"id\none\n").unwrap();
+            let parent = dir.path().join("chosen");
+            let selected = if ancestor {
+                parent.join("inside")
+            } else {
+                parent.clone()
+            };
+            fs::create_dir_all(&selected).unwrap();
+            let stamp = crate::SourceStamp::from_file(&File::open(&source).unwrap()).unwrap();
+            let mut target = ExportTarget::new_combined(
+                vec![(source.clone(), stamp)],
+                selected.join("joined.csv"),
+            )
+            .unwrap();
+            target.write_all(b"id\none\n").unwrap();
+            let moved = dir.path().join("moved");
+            fs::rename(&parent, &moved).unwrap();
+            fs::create_dir_all(&selected).unwrap();
+            fs::write(selected.join("joined.csv"), b"unrelated").unwrap();
+            let outcome = target.publish(1, 7, &AtomicBool::new(false)).unwrap();
+            let FilterExportOutcome::Complete(summary) = outcome else {
+                panic!("expected completion")
+            };
+            let actual_parent = if ancestor {
+                moved.join("inside")
+            } else {
+                moved
+            };
+            assert_eq!(
+                summary.destination.canonicalize().unwrap(),
+                actual_parent.join("joined.csv").canonicalize().unwrap(),
+                "the result must identify the moved directory, not an unrelated replacement"
+            );
+            assert_eq!(fs::read(&summary.destination).unwrap(), b"id\none\n");
+            assert_eq!(fs::read(selected.join("joined.csv")).unwrap(), b"unrelated");
+            assert_eq!(fs::read_dir(actual_parent).unwrap().count(), 1);
+            assert_eq!(fs::read(source).unwrap(), b"id\none\n");
         }
     }
 }
