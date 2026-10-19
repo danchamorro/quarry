@@ -21,6 +21,8 @@ pub(super) struct CombineDialog {
     problem_path: Option<PathBuf>,
     cancel_requested: bool,
     protected_paths: Vec<PathBuf>,
+    cleanup_reservations: Vec<tabs::CleanupReservation>,
+    start_allowed: bool,
 }
 
 impl Default for CombineDialog {
@@ -41,6 +43,8 @@ impl Default for CombineDialog {
             problem_path: None,
             cancel_requested: false,
             protected_paths: Vec::new(),
+            cleanup_reservations: Vec::new(),
+            start_allowed: true,
         }
     }
 }
@@ -60,6 +64,10 @@ impl CombineDialog {
                 |message| format!("{warning}\n{message}"),
             ));
         }
+    }
+
+    pub(super) fn reserved_output(&self) -> Option<&Path> {
+        self.destination.as_deref()
     }
 
     pub(super) fn busy(&self) -> bool {
@@ -83,6 +91,10 @@ impl CombineDialog {
     }
 
     fn start_check(&mut self) {
+        if !self.start_allowed {
+            self.message = Some("Two file operations are already running.".into());
+            return;
+        }
         self.invalidate();
         self.cancel_requested = false;
         match check_combine_files_with_encoding(
@@ -174,12 +186,18 @@ impl CombineDialog {
         }
     }
 
-    fn prepare_destination(&mut self, destination: PathBuf) {
-        if self
-            .protected_paths
+    fn output_is_protected(&self, path: &Path) -> bool {
+        self.protected_paths
             .iter()
-            .any(|path| tabs::paths_alias(path, &destination))
-        {
+            .any(|protected| tabs::paths_alias(protected, path))
+            || self
+                .cleanup_reservations
+                .iter()
+                .any(|reservation| reservation.contains(path))
+    }
+
+    fn prepare_destination(&mut self, destination: PathBuf) {
+        if self.output_is_protected(&destination) {
             self.space = None;
             self.destination = None;
             self.message = Some(
@@ -210,10 +228,20 @@ impl CombineDialog {
     }
 
     fn start_write(&mut self) {
+        if !self.start_allowed {
+            self.message = Some("Two file operations are already running.".into());
+            return;
+        }
         let (Some(plan), Some(destination), Some(_)) = (&self.plan, &self.destination, &self.space)
         else {
             return;
         };
+        if self.output_is_protected(destination) {
+            self.message = Some(
+                "The output is now reserved by another operation. Choose a different path.".into(),
+            );
+            return;
+        }
         match plan.clone().start_write(destination.clone()) {
             Ok(job) => {
                 self.writing = Some(job);
@@ -425,9 +453,32 @@ impl QuarryApp {
         if self.active.inspection.open {
             return;
         }
+        let start_allowed = self.write_slot_available();
+        let cleanup_reservations = self
+            .document_cleanup
+            .as_ref()
+            .map(tabs::DocumentCleanup::path_reservations)
+            .unwrap_or_default();
+        let mut protected_paths: Vec<PathBuf> = self
+            .document_tabs()
+            .flat_map(|tab| {
+                tab.document
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|doc| [doc.logical_path.clone(), doc.session.path().to_path_buf()])
+                    .chain(tab.write_destination.clone())
+            })
+            .collect();
+        if let Some(join) = &self.join_files {
+            protected_paths.extend(join.reserved_inputs().map(Path::to_path_buf));
+            protected_paths.extend(join.reserved_output().map(Path::to_path_buf));
+        }
         let Some(dialog) = self.combine_files.as_mut() else {
             return;
         };
+        dialog.start_allowed = start_allowed;
+        dialog.protected_paths = protected_paths;
+        dialog.cleanup_reservations = cleanup_reservations;
         match dialog.show(ctx) {
             DialogAction::None => {}
             DialogAction::Inspect => self.inspect_combine_problem(),
@@ -504,6 +555,81 @@ mod tests {
                 dialog.show(ctx);
             },
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_working_roots_block_combine_selection_and_start_after_moves() {
+        for stage in ["select-moved", "select-alias", "start-original"] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a.csv");
+            let b = dir.path().join("b.csv");
+            fs::write(&a, b"id,value\n1,a\n").unwrap();
+            fs::write(&b, b"id,value\n2,b\n").unwrap();
+            let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
+            let state =
+                WorkingCopyState::new_in_with_cleanup(dir.path(), app.working_cleanup.clone())
+                    .unwrap();
+            let root = state.directory.path().to_owned();
+            app.active.document.as_mut().unwrap().working_copy = Some(state);
+            app.open_new_path(b.clone()).unwrap();
+            app.open_combine_files();
+            let dialog = app.combine_files.as_mut().unwrap();
+            dialog.add_paths(vec![a.clone(), b.clone()]);
+            dialog.start_check();
+            finish(dialog);
+            let old_destination = root.join("joined.csv");
+            if stage == "start-original" {
+                dialog.prepare_destination(old_destination.clone());
+                finish(dialog);
+                assert!(dialog.space.is_some());
+            }
+            let closing = app.tabs.remove(0);
+            let (release, wait) = std::sync::mpsc::channel();
+            let ctx = egui::Context::default();
+            app.retire_document_tabs_with(&ctx, vec![closing], false, move |work| {
+                std::thread::Builder::new().spawn(move || {
+                    let _ = wait.recv();
+                    work();
+                })
+            });
+            let moved = dir.path().join("moved");
+            fs::rename(&root, &moved).unwrap();
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("foreign.csv"), b"preserve\n").unwrap();
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&moved, &alias).unwrap();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.show_combine_files(ctx));
+            let dialog = app.combine_files.as_mut().unwrap();
+            if stage == "start-original" {
+                dialog.start_write();
+                assert!(
+                    dialog.writing.is_none(),
+                    "a retired reservation must block starting Combine"
+                );
+            } else {
+                let parent = if stage == "select-alias" {
+                    &alias
+                } else {
+                    &moved
+                };
+                dialog.prepare_destination(parent.join("joined.csv"));
+                assert!(
+                    dialog.destination.is_none(),
+                    "a retired reservation must block choosing Combine output"
+                );
+                assert!(dialog.storage_check.is_none());
+            }
+            assert!(!old_destination.exists());
+            assert!(!moved.join("joined.csv").exists());
+            assert!(fs::read_dir(&moved).unwrap().next().is_none());
+            release.send(()).unwrap();
+            crate::tests::finish_document_cleanup(&mut app, &ctx);
+            assert!(!moved.exists());
+            assert_eq!(fs::read(root.join("foreign.csv")).unwrap(), b"preserve\n");
+            assert_eq!(fs::read(&a).unwrap(), b"id,value\n1,a\n");
+            assert_eq!(fs::read(&b).unwrap(), b"id,value\n2,b\n");
+        }
     }
 
     #[test]

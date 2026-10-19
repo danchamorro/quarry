@@ -2,11 +2,16 @@ mod case;
 mod cleanup;
 mod combine;
 mod date_time_sort;
+mod destination;
 mod encoding;
 mod export;
 mod filter;
 mod index;
 mod inspection;
+mod join;
+#[cfg(test)]
+mod join_faults;
+
 mod search;
 mod sort;
 mod source_stamp;
@@ -52,6 +57,19 @@ pub use inspection::{
     Diagnostic, DiagnosticKind, InspectionEdits, InspectionJob, InspectionOptions,
     InspectionProgress, InspectionReport, InspectionStatus, RecoveryJob, RecoverySummary,
     SourcePreview,
+};
+pub use join::{
+    JoinAnalysis, JoinCase, JoinConfig, JoinDuplicateExample, JoinFormat, JoinHeader, JoinInput,
+    JoinInputInfo, JoinJob, JoinMode, JoinPhase, JoinPlan, JoinProgress, JoinSourceVersion,
+    JoinSummary, JoinUnmatchedExample, analyze_join,
+};
+pub use join::{
+    JoinCellEdits, JoinHeaderEdits, JoinInputOwner, JoinWorkingSource, analyze_join_with_working,
+    read_join_working_header,
+};
+pub use join::{
+    JoinOutputColumn, JoinOutputOptions, JoinSource, analyze_join_with_output, read_join_header,
+    read_join_header_with_format,
 };
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
@@ -126,6 +144,11 @@ pub(crate) fn record_encoding_error(record: u64, error: QuarryError) -> QuarryEr
 
 #[derive(Debug)]
 pub enum QuarryError {
+    JoinFile {
+        path: Option<PathBuf>,
+        record: Option<u64>,
+        reason: String,
+    },
     CombineFile {
         path: PathBuf,
         record: Option<u64>,
@@ -209,6 +232,21 @@ impl fmt::Display for QuarryError {
                 cause => write!(f, "Record {record}: {cause}"),
             },
 
+            Self::JoinFile {
+                path,
+                record,
+                reason,
+            } => {
+                if let Some(path) = path {
+                    write!(f, "{}", path.display())?;
+                } else {
+                    f.write_str("Cannot join files")?;
+                }
+                if let Some(record) = record {
+                    write!(f, ", record {record}")?;
+                }
+                write!(f, ": {reason}")
+            }
             Self::CombineFile {
                 path,
                 record,
@@ -526,7 +564,7 @@ impl Session {
 }
 
 fn read_initial_records(
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     file_size: u64,
     delimiter: u8,
     wanted: usize,
@@ -597,7 +635,7 @@ fn materialize_rows(
 }
 
 fn detect_file_delimiter(
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     file_size: u64,
     sample_bytes: usize,
     limit: usize,
@@ -1107,3 +1145,6 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 }
+
+mod working_storage;
+pub use working_storage::{WorkingCopyCleanup, WorkingCopyStorage};

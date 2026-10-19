@@ -1,7 +1,9 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::collections::{BTreeMap, BinaryHeap};
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +20,8 @@ use crate::date_time_sort::date_time_key;
 use crate::estimate_edited_output_bytes;
 use crate::export::{ExportTarget, PrivatePublication, source_matches_stamp};
 use crate::spill::{
-    self, FrameHead as RunHead, FrameLimits, FrameReadError, SpillWorkspace as RunWorkspace,
+    self, FrameHead as RunHead, FrameLimits, FrameReadError, SpillFile,
+    SpillWorkspace as RunWorkspace,
 };
 use crate::storage::{check_operation_storage, output_parent, storage_error};
 use crate::{
@@ -562,6 +565,14 @@ pub struct SortJob {
 }
 
 impl SortJob {
+    /// Retain the private generation owner before accepting publication.
+    pub fn retain_working_storage(
+        &self,
+        storage: Arc<crate::WorkingCopyStorage>,
+    ) -> Result<(), QuarryError> {
+        self.publication.retain_storage(storage)
+    }
+
     /// Start a guarded private sort with scratch files beside the destination.
     #[allow(clippy::too_many_arguments)]
     fn start(
@@ -1019,7 +1030,7 @@ fn invalid_sort_output(message: &'static str) -> QuarryError {
 struct ScanSummary {
     header: Option<Vec<u8>>,
     preferred_ending: Vec<u8>,
-    runs: Vec<PathBuf>,
+    runs: Vec<SpillFile>,
     rows: u64,
     max_key_bytes: usize,
     records: RecordMultisetFingerprint,
@@ -1085,7 +1096,7 @@ struct InitialRunBuilder<'a> {
     ending_seen: bool,
     entries: Vec<RunEntry>,
     entry_bytes: usize,
-    runs: Vec<PathBuf>,
+    runs: Vec<SpillFile>,
     rows: u64,
     max_key_bytes: usize,
     records: RecordMultisetFingerprint,
@@ -1671,7 +1682,7 @@ fn run_sort_inner(
 }
 
 fn reduce_runs(
-    runs: &mut Vec<PathBuf>,
+    runs: &mut Vec<SpillFile>,
     direction: SortDirection,
     max_key_bytes: usize,
     config: SortConfig,
@@ -1690,8 +1701,8 @@ fn reduce_runs(
                 return Ok(false);
             }
             for old in group {
-                let bytes = fs::metadata(old)?.len();
-                fs::remove_file(old)?;
+                let bytes = old.metadata()?.len();
+                old.remove()?;
                 shared.remove_temporary_bytes(bytes);
             }
             next.push(path);
@@ -1756,10 +1767,10 @@ fn read_record(
     spill::read_record(reader, length, max_record_bytes).map_err(frame_error)
 }
 
-fn open_run_readers(paths: &[PathBuf]) -> Result<Vec<BufReader<File>>, QuarryError> {
+fn open_run_readers(paths: &[SpillFile]) -> Result<Vec<BufReader<File>>, QuarryError> {
     paths
         .iter()
-        .map(|path| File::open(path).map(BufReader::new).map_err(Into::into))
+        .map(|path| path.open().map(BufReader::new).map_err(Into::into))
         .collect()
 }
 
@@ -1789,7 +1800,7 @@ fn seed_heap(
 }
 
 fn merge_runs_to_run(
-    paths: &[PathBuf],
+    paths: &[SpillFile],
     mut writer: BufWriter<File>,
     direction: SortDirection,
     max_record_bytes: usize,
@@ -1836,7 +1847,7 @@ struct PendingOutputEntry {
 
 #[allow(clippy::too_many_arguments)]
 fn merge_runs_to_output(
-    paths: &[PathBuf],
+    paths: &[SpillFile],
     output: &mut ExportTarget,
     direction: SortDirection,
     preferred_ending: &[u8],
@@ -4005,7 +4016,7 @@ mod tests {
         let (run_path, mut run) = workspace.create_run().unwrap();
         run.write_all(b"synthetic CSV values").unwrap();
         run.flush().unwrap();
-        for path in [&workspace.path, &run_path] {
+        for path in [workspace.path.as_path(), run_path.as_ref()] {
             let out = Command::new("/bin/ls")
                 .arg("-lde")
                 .arg(path)

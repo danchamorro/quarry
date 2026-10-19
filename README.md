@@ -65,6 +65,7 @@ acceptance or discovery criteria. Propose a feature through
 | Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
 | Document tabs | Up to eight independent files; retain edits, selection, view, filters and background progress; safe per-tab close and session quit; two concurrent file operations |
 | Combine files | Combine two or more matching saved files in a chosen order; validate every record; keep one header and all data rows; save to a new file with progress and cancellation |
+| [Join files](docs/USER_GUIDE.md#join-files) | Match one to sixteen key pairs across two saved or current documents; choose retained rows and output columns; review duplicates and exact counts; create a separate UTF-8 file |
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
 | Find and replace | Literal Find Next and Find Previous, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
 | Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, Does not equal, exact numeric comparisons, and inclusive Between; same-column alternatives with AND across columns; text is case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
@@ -220,6 +221,7 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - [1 GB duplicate matching and removal validation](docs/benchmarks/2026-09-05-find-remove-duplicates.md)
 - [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)
 - [Matching-file combination and 20 GB write cancellation in VMPal](docs/benchmarks/2026-10-10-combine-files.md)
+- [Complete file joining, 18 GiB inputs, skewed keys and native workflows](docs/benchmarks/2026-10-19-join-acceptance.md)
 - [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
 
 </details>

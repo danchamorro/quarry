@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-Accepted implementation direction for [#71](https://github.com/danchamorro/quarry/issues/71), beginning with [#119](https://github.com/danchamorro/quarry/issues/119). This records the algorithm and resource obligations before extracting shared code. The join itself and its large-file acceptance remain unimplemented; existing sort measurements are not join measurements.
+Accepted implementation direction for [#71](https://github.com/danchamorro/quarry/issues/71), beginning with [#119](https://github.com/danchamorro/quarry/issues/119). This records the algorithm and resource obligations before extracting shared code. The integrated join is under review in PR #137. Its dedicated acceptance evidence remains separate from existing sort measurements.
 
 ## Context
 
@@ -11,6 +11,8 @@ Joining two files can multiply records: a shared key with m rows on one side and
 ## Decision
 
 Use external sort/merge on unambiguous framed comparison keys and original source ordinals. Prepare each source independently, sort its runs, analyze matching groups, and stream their matching pairs. Spool oversized duplicate groups to private disk and enumerate them in bounded blocks. Restore the approved output order through an external ordinal sort; key order must not escape into the result. No new database or sorting dependency is required for this direction.
+
+Duplicate groups use byte ranges in the owned, immutable prepared runs as their disk-backed storage. The matcher counts and measures each group in one scan, then releases its key before enumerating rows. Creation holds a bounded Main block and streams the Additional range for that block; no file-sized or group-sized in-memory map is built. This avoids an extra copy of data already spooled privately. Ordering frames contain both Main and Additional ordinals so block iteration cannot change public row order.
 
 The first extraction shares only private workspace ownership, the existing run frame, and bounded streaming frame I/O. Keep sort/duplicate comparison, numeric/date keys, fan-in calculations, progress, preservation checks and public APIs with their current operation. Preserve existing sort directory/file naming and the frame bytes. A generic reader must reject declared key or record lengths before allocating; callers supply their operation-specific limits and retain useful error context. Every frame body is consumed or skipped before another head is read.
 
@@ -34,6 +36,10 @@ Keep logical-source, working-generation, format and overlay provenance with the 
 
 Every workspace and spill file must be owner-only and clear inherited macOS ACLs before writing values. Reuse the same protection as #118. The final output is independently staged on its destination filesystem and published with create-new semantics only after source, output-count/schema, and cancellation checks. Report cleanup errors without deleting unrelated files. After atomic publication, cancellation retains the completed result.
 
+For join and append-combine create-new outputs, capture the destination directory before checking its workspace membership. On Unix, retain a directory descriptor and use descriptor-relative private staging, no-replace publication and owned-file cleanup. A later symbolic-link retarget must neither redirect publication into a workspace nor strand its staging in the original folder. The membership check walks the captured directory's ancestry by identity. On Windows, retain non-delete-sharing handles for each resolved ancestor and reject changed/reparse-point components; no new Windows application work is implied.
+
+A successful write resolves the captured directory's current name from its retained handle when the requested alias no longer names it (F_GETPATH on macOS and /proc/self/fd on Linux). It verifies that the resolved path still names that directory; an unsupported or unlocatable moved directory fails instead of reporting a stale path. Linux filesystems rejecting no-replace rename flags with EINVAL use descriptor-relative no-clobber hard links. Report post-publication staging cleanup failures alongside completion and retain the output. Cleanup removes only the owned data file and its empty staging directory; unrelated entries prevent directory removal and remain untouched. The same-filesystem private fallback for a macOS file-only drop folder remains supported. Existing Save As, source replacement and structural-edit publication constructors retain their established behavior.
+
 Comparison normalization never changes emitted values. Validate UTF-8 explicitly because the existing decoder's UTF-8 branch intentionally returns raw bytes. Keep full-width source identities and output projection separate from the grid's visible columns. Sort's one-input record-multiset verifier is not a join verifier; verify pair cardinality, required unmatched records, projection, and the specified ordinal order instead.
 
 ## Alternatives
@@ -45,3 +51,222 @@ A file-sized in-memory hash table violates the source-size-independent memory co
 The extraction must leave existing sort and duplicate outputs, error categories, private naming, cancellation and cleanup unchanged. Run their existing regression coverage, forced small-budget/multipass tests, malformed frames and inherited-ACL checks. Frame-level tests cover exact byte compatibility, empty/truncated frames, oversize lengths before allocation, and bounded body handling.
 
 Subsequent tickets prove joining separately with a small independent oracle and complete native workflows. Large-file acceptance must include data larger than RAM, a duplicate group larger than the join's in-memory block, long/composite keys, mostly unmatched data, and failure/cancellation in each phase. Record release-build RSS, peak temporary disk, elapsed time, cancellation latency and exact results; do not infer join performance from existing sort evidence.
+
+### Cross-platform source and cleanup guards
+
+Windows source versions capture the volume ID, 128-bit file ID and change time from the file handle, sampled around generic metadata capture. Path revalidation opens the named file as well as checking the retained handle. Same-size replacements and in-place rewrites with restored modification times must invalidate the selected schema. This extends the shared source-stamp contract used by join, combine and existing operations; Unix source-stamp behavior remains unchanged. Targeted Windows core CI exercises these guards, directory rename locking and nonrecursive output cleanup. It does not introduce a Windows application port.
+
+Non-Unix pinned staging retains an owned directory path after disabling TempDir's recursive destructor. Only data.tmp and the empty owned directory may be removed, including on file-creation failure. Windows directory handles request directory read/attribute access with delete sharing denied; zero-access metadata handles do not establish the required rename exclusion.
+
+
+### Retained spill directory identities
+
+A retained preview owns a pinned spill directory, not authority to recursively remove its original name. Unix creates, opens and removes run files relative to that descriptor with no-follow/nonblocking safeguards; Windows retains the directory/ancestor delete-sharing locks. Every run reference carries the captured root and registered file identity. Cleanup removes only registered regular files and then the empty captured directory, including when its original name has been replaced. Foreign entries cause an explicit cleanup failure and remain untouched. There is no recursive fallback on release, cancellation, creation or Drop. Ordinary resolution first accepts the captured canonical path only while its leaf remains the same directory; a replaced leaf or moved directory requires a verified platform location. Unmoved Linux directories do not require procfs.
+
+Private permission enforcement is required for all spill callers, including sort and duplicate removal. If a temporary volume cannot enforce owner-only access, fail before writing data and direct the user to another temporary folder. Every failed reservation attempts nonrecursive cleanup through its captured directory; preserve unrelated entries and report cleanup failure. Do not restore the older permissive behavior on such volumes.
+
+The registry contains only live run identities: obsolete-run unlinking removes its entry. Join's existing bounded run-level count also bounds this metadata, and the aggregate reservation includes both displayed paths and identity/registry overhead. Destination membership uses the captured spill directory identity as well, so renaming it cannot allow output into owned scratch. Sorting and duplicate removal retain their frame format, naming, comparisons and result behavior while adopting the same storage ownership.
+
+## Row-retention modes
+
+The analysis configuration captures Left, Inner, Right or Full mode before a plan is retained. Counts of source matches and unmatched rows always describe both complete inputs; the projected output includes only rows retained by the chosen mode.
+
+Matching pairs use Main then Additional ordinals for Left, Inner and Full, and Additional then Main ordinals for Right. Full appends Additional-only rows after all Main-driven rows. The private ordinal key uses the absent-side sentinel only where the mode permits it; publication validates both ordinal bounds and the retained-side rule. Preview uses the same ordering key as creation. Pair enumeration streams bounded blocks from the side driving that mode, so the preview's first pairs have the public order even when groups exceed the memory budget.
+
+An absent source side serializes to empty fields without changing the order or width of either source's columns. Source comparison, full-input validation, uniqueness, duplicate acknowledgement, reservations and publication safeguards are unchanged.
+
+## Composite comparison keys
+
+One to sixteen ordered column pairs define a comparison tuple; both inputs must supply the same number of key columns. A nonempty tuple is framed as a matchable tag followed by a 64-bit length and UTF-8 bytes for each component. A tuple with any empty or missing component is represented by an unmatched tag plus its source ordinal. Boundaries and embedded NUL bytes cannot alias another tuple.
+
+Case-sensitive comparison remains the default. ASCII-insensitive comparison lowercases only ASCII bytes in the private key; source records and result values remain unchanged. Private-key validation compares framed components against decoded source fields without allocating another full key. Duplicate samples escape controls and show bounded tuple components.
+
+The complete framed key is capped at the existing record limit plus sixteen length prefixes and its tag. This is checked before allocation, including when a caller repeats the same source column in several key pairs. Resource accounting reserves the framing overhead and merge fan-in uses the observed complete key size.
+
+## Result projection and headings
+
+An output layout is an ordered list of source identities (Main or Additional,
+original column index), independent of matching keys, names and grid order.
+Default layouts include both sources in source order, including keys. The layout
+is immutable with its analysis; selecting another source discards its UI draft,
+and changing a retained layout requires releasing the analysis first.
+
+Analysis computes exact serialized contributions only for selected fields while
+still decoding and validating every input field. It accounts for first-field BOM
+quoting at the selected output position, absent-side padding, separators and
+optional header bytes. Creation applies the identical layout and validates the
+actual selected width and byte total before publication.
+
+Automatic headings retain unambiguous original names. Conflicts use the source
+role and numeric suffixes; unnamed columns use the source role and original
+column number. Explicit names are preserved and duplicate explicit names are
+reported to the user. Requested names, collision bookkeeping and retained
+headings share a bounded additional memory allowance. Preview and creation share
+the resolved heading array rather than duplicating its payload.
+
+The header switch is captured by the plan and completion result. Opening the
+result passes the same header mode explicitly, so a header-free first record
+remains data. The saved file always remains independent of source headers and
+source edit history.
+
+## Source formats and complete-width discovery
+
+Each saved input carries independent delimiter, encoding and header choices.
+Auto detects Unicode BOMs or uses UTF-8; it does not guess legacy encodings.
+Picker metadata remains bounded and version-bound. Full analysis validates every
+decoded field, including fields omitted from the output.
+
+The join scanner frames native source records and decodes each record into UTF-8
+before comparison, size accounting and private framing. UTF-16 uses the existing
+structural inspection scanner and aligned reads; validity is checked per complete
+record so an invalid surrogate in a later row does not acquire an earlier row's
+number. Native BOM removal happens once, before decoding. Quoted BOM-looking
+values, embedded CR/LF and quote contents remain data. No shared codec or scanner
+behavior is changed.
+
+Private frame sizes are measured from actual decoded records and comparison keys,
+rather than native file sizes or sampled expansion. Native and decoded records
+remain bounded. The resource reserve includes bounded discovered-column labels
+and their bookkeeping in addition to retained headers and result headings.
+
+The full scan grows source schemas by original column index. A layout captures
+the widths previously shown to its caller, appends newly discovered columns
+selected by default, and requires explicit review before creation. Resetting an
+analysis preserves these discovered identities so users can exclude, reorder or
+rename them before analyzing again. The immutable plan carries the review
+requirement through the core creation boundary, not only a disabled UI button.
+
+Analysis workers expose bounded discovered-schema metadata even if the requested
+result exceeds its column limit. The dialog can therefore reveal all fields and
+allow a smaller selection after that error. Releasing the failed job releases
+its private data; schema metadata alone does not reserve a running-operation slot.
+
+
+### Frozen working-source contract
+
+Working-source capture shares an Arc<Session> and immutable Arc edit maps, retaining logical-source provenance and an opaque lifetime owner. It does no filesystem I/O or row/map copying on the UI thread. Analysis validates both saved-source and physical-generation versions, inherits the applied format, overlays one bounded record at a time, and retains those owners through preview and creation. It never treats saved bytes as the current values of a structurally changed document. Header probing is a separate bounded worker; source-version binding identifies the physical generation whose columns were shown.
+
+When the physical generation differs from the saved source, analysis pins its private parent directory. Creation excludes that directory as well as its own spill directory, preventing a result from being published inside data later removed by a generation owner. Directory pins drop before the final generation owner, including on Windows. Application lease counters and mutation/close guards are the remaining desktop integration in #126; exposing this core API alone does not complete that ticket.
+
+
+Working overlays are applied before UTF-8 validation of effective field values. A current cell/header edit can repair invalid UTF-8 in the replaced saved value; every remaining current field, including excluded columns, must still validate. Structural CSV errors and malformed native encoding remain errors. Header probing uses the same effective values as analysis, with bounded labels and logical-source diagnostics. Source bytes remain unchanged.
+
+
+### Private generation ownership
+
+A working generation is owned by a pinned `WorkingCopyStorage`, shared by the
+document, its current writer, and any captured join input. The owner records
+only the names and original file identities successfully published by its jobs.
+Dropping a document or pruning history cannot release a generation retained by
+another owner.
+
+Private writers stage through captured directory handles and retain the owner
+before their existing acceptance handshake. Publication verifies that the
+captured destination belongs to that owner, never replaces an existing entry,
+and registers the original output descriptor's identity. A relocated directory
+can report its verified current location; a substituted directory is rejected.
+The UI installs the actual successful output path.
+
+Cleanup unlinks only registered matching files through the held directory and
+then removes that empty directory without recursion. Unregistered entries and
+replacement files are preserved, even if their bytes equal an earlier output.
+Cancellation never gives a caller authority to remove the requested destination.
+A retained report channel carries cleanup failures beyond a storage owner's
+lifetime; the application surfaces those errors while it is running. Pending
+private destinations and retained history directories are excluded from join
+output choices.
+
+This ownership foundation does not complete the unsaved-input desktop workflow.
+Source selection, input reservations, invalidation, and close/quit cleanup
+coordination still require the remaining #126/#127 integration and validation.
+
+
+### Open-document selection and leases
+
+The egui picker resolves an open document or an alias to its current applied
+format, structural generation, header edits, and cell edits. It commits valid
+drafts before capture, rejects busy or filtered inputs, and retains one owned
+generation by its internally unique name. Capture shares immutable maps and a
+session reference; it does not copy rows or edit maps.
+
+Header workers hold an input lease only while reading. Idle picker state keeps
+weak metadata signatures, allowing later edits without retaining old payloads.
+Analysis captures fresh data edits. A changed session, format, header map, or
+header-row cell overlay requires refreshing the shown columns before analysis;
+data-only edits retain the chosen layout and use current key/value contents.
+
+An atomic per-document lease count guards edits, saves, history, replacement,
+and close through analysis, retained preview, and creation. Unrelated tabs
+remain usable. Releasing a plan runs its cleanup off-thread and releases its
+leases; successful or failed workers release theirs on completion. Current
+generation aliases use the document's current values. Private history files
+must be selected through their current document rather than as independent
+saved inputs.
+
+Application close/quit finalization still needs the dedicated background
+cleanup coordination and failure matrix in #127. These picker/lease checks do
+not replace that acceptance gate or the final native/large-file checks in #128.
+
+
+### Approved document close and quit cleanup
+
+An approved tab close transfers that complete tab to one background retirement
+worker. Normal quit retains every tab and its Undo state until all unsaved-work
+reviews are approved; only then does it transfer the approved session. The UI
+shows cleanup progress and does not authorize native termination until the worker
+finishes. Cleanup errors cancel automatic termination and remain visible.
+Thread-start failure restores the tabs, including unrelated unsaved values.
+
+Retirement reservations hold bounded path/identity metadata rather than storage
+owners, so inspecting reservations cannot cause final file cleanup on the UI
+thread. Saved sources, current/history generations and working directories remain
+protected from opening or join/output reuse until retirement completes; Unix
+identity checks retain protection after directory moves and for hard links.
+Other tabs can still be edited. A second close waits for the existing retirement
+worker. Reports retain at most sixteen warnings.
+
+The complete fault/scale matrix remains a release gate. In particular, native
+Windows final-owner/drop ordering and filtered readers detached before closing
+still require explicit coverage; the macOS close checks do not establish that
+platform contract.
+
+
+### Publication failures and test isolation
+
+Creation checks cancellation again after final source/identity I/O, immediately
+before atomic publication. Once publication succeeds, cancellation cannot
+discard the result.
+
+The shared writer separates its primary publication outcome from explicit
+staging cleanup. Join keeps both causes when writing, flush/sync, cancellation
+or source validation fails together with cleanup; successful publication carries
+cleanup warnings without turning the saved result into a failed operation.
+Private spill errors retain their folder and I/O kind and add the active join
+phase and recovery guidance.
+
+The failure matrix uses scoped, thread-local instrumentation copied only into
+the initiating join worker. All instrumentation is compiled only for tests;
+it introduces no production setting, environment variable, global cross-test
+fault switch, or alternative publication path. Actual files, serialization,
+guards, cleanup and atomic rename still run.
+
+
+### Retained analysis examples
+
+The result preview retains at most twenty displayed columns per row with bounded
+UTF-8 text. Separate group examples retain at most eight duplicate keys and
+eight unmatched keys per input. An unmatched example identifies the first
+one-based data row in its group, including groups omitted by the selected mode.
+Examples show clipped, escaped comparison keys; an empty or missing component
+is labelled explicitly. Counts still describe the complete inputs.
+
+Group examples reuse the first source ordinal already validated by the group
+scan; they do not load another record or enumerate extra matching pairs.
+A fixed 16 KiB reservation covers their string capacities, vectors and metadata
+in both the aggregate budget and merge fan-in calculation. These examples do not
+change private frames, serialized output, comparison rules or publication.
+
+The desktop renders exact matching-row counts for each side as well as pairs.
+Source guards preserve the logical input path and Main/Additional role with
+the active phase when reporting a conflict. The display and early-conflict
+regressions failed before these additions and pass afterward.

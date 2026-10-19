@@ -38,6 +38,85 @@ pub(super) struct DocumentTab {
     pub(super) write_destination: Option<PathBuf>,
 }
 
+/// A single background retirement owns approved tabs until all readers and
+/// private generation owners have finished dropping. No unapproved tab is moved.
+pub(super) struct DocumentCleanup {
+    handle: Option<std::thread::JoinHandle<()>>,
+    quitting: bool,
+    warnings: Vec<String>,
+    reservations: Vec<CleanupReservation>,
+}
+
+/// Metadata, not storage ownership: querying a reservation can never become the
+/// final owner that removes a generation on the UI thread.
+#[derive(Clone)]
+pub(super) struct CleanupReservation {
+    path: PathBuf,
+    #[cfg(unix)]
+    metadata: Option<std::fs::Metadata>,
+    directory: bool,
+}
+
+impl CleanupReservation {
+    fn new(path: PathBuf, directory: bool) -> Self {
+        Self {
+            #[cfg(unix)]
+            metadata: std::fs::metadata(&path).ok(),
+            path,
+            directory,
+        }
+    }
+
+    fn aliases(&self, path: &Path) -> bool {
+        if paths_alias(path, &self.path) {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let (Some(expected), Ok(actual)) = (&self.metadata, std::fs::metadata(path)) {
+                return expected.dev() == actual.dev() && expected.ino() == actual.ino();
+            }
+        }
+        false
+    }
+
+    pub(super) fn contains(&self, path: &Path) -> bool {
+        if self.directory {
+            path.starts_with(&self.path) || path.ancestors().any(|parent| self.aliases(parent))
+        } else {
+            self.aliases(path)
+        }
+    }
+}
+
+impl DocumentCleanup {
+    pub(super) fn path_reservations(&self) -> Vec<CleanupReservation> {
+        self.reservations.clone()
+    }
+
+    fn record_warnings(&mut self, errors: impl IntoIterator<Item = String>) {
+        for error in errors {
+            if self.warnings.len() < 16 {
+                self.warnings.push(error);
+            } else {
+                self.warnings[15] =
+                    "Additional private working-file cleanup failures occurred.".into();
+            }
+        }
+    }
+}
+
+impl Drop for DocumentCleanup {
+    fn drop(&mut self) {
+        // Normal close/quit polls first. Unexpected application destruction must
+        // not detach a private-file cleanup worker.
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl DocumentTab {
     /// Creates an empty tab with an identity that remains stable across switches.
     pub(super) fn new(id: u64) -> Self {
@@ -377,6 +456,16 @@ impl QuarryApp {
         options: OpenOptions,
         encoding: Option<Encoding>,
     ) -> Result<(), AppMessage> {
+        if self.cleanup_reserves_path(&path) {
+            return Err(AppMessage::warning(
+                "This file is finishing document cleanup. Wait for cleanup to finish before opening it.",
+            ));
+        }
+        if self.join_reserves_path(&path) {
+            return Err(AppMessage::warning(
+                "This path is reserved by Join Files. Close or reset the join before opening it.",
+            ));
+        }
         if self.quit_pending
             || self.active.close_confirmation_open
             || self.active.close_after_save
@@ -444,6 +533,7 @@ impl QuarryApp {
             }
         };
         document.working_directory = self.working_directory.clone();
+        document.working_cleanup = self.working_cleanup.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
             current.commit_edits();
@@ -468,33 +558,45 @@ impl QuarryApp {
 
     /// Rejects another tab's source/working file and every reserved writer output.
     pub(super) fn destination_available(&self, destination: &Path) -> bool {
-        !self.document_tabs().any(|tab| {
-            (tab.id != self.active.id
-                && tab.document.as_ref().is_some_and(|document| {
-                    paths_alias(destination, &document.logical_path)
-                        || paths_alias(destination, document.session.path())
-                }))
-                || tab
-                    .write_destination
-                    .as_ref()
-                    .is_some_and(|path| paths_alias(destination, path))
-        })
+        !self.join_reserves_path(destination)
+            && !self.cleanup_reserves_path(destination)
+            && !self.document_tabs().any(|tab| {
+                (tab.id != self.active.id
+                    && tab.document.as_ref().is_some_and(|document| {
+                        paths_alias(destination, &document.logical_path)
+                            || paths_alias(destination, document.session.path())
+                    }))
+                    || tab
+                        .write_destination
+                        .as_ref()
+                        .is_some_and(|path| paths_alias(destination, path))
+            })
     }
 
     /// Applies the shared two-operation limit to document tabs and Combine Files.
     pub(super) fn write_slot_available(&self) -> bool {
-        self.document_tabs().filter(|tab| tab.writing()).count()
-            + usize::from(
-                self.combine_files
-                    .as_ref()
-                    .is_some_and(combine_files::CombineDialog::busy),
-            )
-            < MAX_WRITE_JOBS
+        !self.quitting_cleanup()
+            && self.document_tabs().filter(|tab| tab.writing()).count()
+                + usize::from(
+                    self.combine_files
+                        .as_ref()
+                        .is_some_and(combine_files::CombineDialog::busy),
+                )
+                + usize::from(
+                    self.join_files
+                        .as_ref()
+                        .is_some_and(join_files::JoinDialog::running_operation),
+                )
+                < MAX_WRITE_JOBS
     }
 
     /// Polls jobs against their owning tab, surfaces failed reloads, and advances closes.
     /// Background completions retain the visible document and its focus/history.
     pub(super) fn poll_document_tabs(&mut self, ctx: &egui::Context) {
+        self.poll_document_cleanup(ctx);
+        if self.quit_authorized {
+            return;
+        }
         self.poll_active_document(ctx, true);
         let mut failed_reloads = Vec::new();
         if self.active.document.is_none()
@@ -549,6 +651,10 @@ impl QuarryApp {
             dialog.preserve_for_quit();
             return;
         }
+        if let Some(dialog) = self.join_files.as_mut() {
+            dialog.request_close(true);
+            return;
+        }
         if self.quit_pending {
             return;
         }
@@ -566,6 +672,21 @@ impl QuarryApp {
 
     /// Commits drafts, waits for file operations, then prompts for unsaved changes.
     fn review_document_close(&mut self, ctx: &egui::Context) {
+        if self.document_cleanup.is_some() {
+            if !self.quitting_cleanup() {
+                self.active.close_after_jobs = true;
+            }
+            return;
+        }
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            self.active.notice = Some(AppMessage::warning(join_files::INPUT_RESERVED));
+            return;
+        }
         if let Some(document) = self.active.document.as_mut() {
             document.commit_edits();
             if document.save_job.is_some() {
@@ -592,6 +713,21 @@ impl QuarryApp {
     /// Removes an approved tab, or records a quit approval while retaining every tab.
     /// Quit releases documents only after the entire session has been approved.
     fn finish_document_close(&mut self, ctx: &egui::Context) {
+        if self.document_cleanup.is_some() {
+            if !self.quitting_cleanup() {
+                self.active.close_after_jobs = true;
+            }
+            return;
+        }
+        if self
+            .active
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            self.active.notice = Some(AppMessage::warning(join_files::INPUT_RESERVED));
+            return;
+        }
         self.active.close_confirmation_open = false;
         self.active.close_after_save = false;
         self.active.close_after_jobs = false;
@@ -607,11 +743,14 @@ impl QuarryApp {
                 self.switch_tab(ctx, id);
                 self.review_document_close(ctx);
             } else {
-                self.quit_authorized = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                let empty = DocumentTab::new(self.next_tab_id);
+                self.next_tab_id += 1;
+                let mut closing = vec![std::mem::replace(&mut self.active, empty)];
+                closing.append(&mut self.tabs);
+                self.retire_document_tabs(ctx, closing, true);
             }
         } else {
-            self.active = if self.tabs.is_empty() {
+            let next = if self.tabs.is_empty() {
                 let tab = DocumentTab::new(self.next_tab_id);
                 self.next_tab_id += 1;
                 tab
@@ -625,6 +764,8 @@ impl QuarryApp {
                         .0,
                 )
             };
+            let closing = std::mem::replace(&mut self.active, next);
+            self.retire_document_tabs(ctx, vec![closing], false);
             self.pending_tab_focus = true;
             self.reveal_tab = true;
             self.reset_tab_focus(ctx);
@@ -636,8 +777,186 @@ impl QuarryApp {
         }
     }
 
+    /// Transfer only approved tabs to one worker. A failed spawn retains them.
+    fn retire_document_tabs(
+        &mut self,
+        ctx: &egui::Context,
+        tabs: Vec<DocumentTab>,
+        quitting: bool,
+    ) {
+        self.retire_document_tabs_with(ctx, tabs, quitting, |work| {
+            std::thread::Builder::new()
+                .name("quarry-document-cleanup".into())
+                .spawn(work)
+        });
+    }
+
+    pub(super) fn retire_document_tabs_with(
+        &mut self,
+        ctx: &egui::Context,
+        tabs: Vec<DocumentTab>,
+        quitting: bool,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) {
+        debug_assert!(self.document_cleanup.is_none());
+        let mut reservations = Vec::new();
+        for tab in &tabs {
+            if let Some(document) = &tab.document {
+                reservations.push(CleanupReservation::new(
+                    document.logical_path.clone(),
+                    false,
+                ));
+                reservations.push(CleanupReservation::new(
+                    document.session.path().to_owned(),
+                    false,
+                ));
+                if let Some(state) = &document.working_copy {
+                    for storage in
+                        std::iter::once(&state.directory).chain(state.previous_directories.iter())
+                    {
+                        reservations.push(CleanupReservation::new(storage.path().to_owned(), true));
+                        if let Ok(current) = storage.current_path() {
+                            reservations.push(CleanupReservation::new(current, true));
+                        }
+                    }
+                    for snapshot in state.undo.iter().chain(state.redo.iter()) {
+                        reservations.push(CleanupReservation::new(snapshot.path.clone(), false));
+                    }
+                }
+            }
+            if let Some(path) = &tab.write_destination {
+                reservations.push(CleanupReservation::new(path.clone(), false));
+            }
+        }
+        let retained = Arc::new(std::sync::Mutex::new(Some(tabs)));
+        let worker_tabs = Arc::clone(&retained);
+        match spawn(Box::new(move || {
+            let mut tabs = worker_tabs.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(tabs) = &mut tabs {
+                for tab in tabs {
+                    if let Some(document) = &mut tab.document {
+                        // Joining this reader is safe here and must precede the
+                        // private generation owner's final drop.
+                        drop(document.filter_read.take());
+                    }
+                }
+            }
+            drop(tabs);
+        })) {
+            Ok(handle) => {
+                self.document_cleanup = Some(DocumentCleanup {
+                    handle: Some(handle),
+                    quitting,
+                    warnings: Vec::new(),
+                    reservations,
+                });
+                ctx.request_repaint();
+            }
+            Err(error) => {
+                let mut tabs = retained
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .unwrap();
+                // Original active tab is first; do not discard its unsaved values.
+                let previous = std::mem::replace(&mut self.active, tabs.remove(0));
+                if previous.document.is_some() {
+                    self.tabs.push(previous);
+                }
+                self.tabs.extend(tabs);
+                self.quit_pending = false;
+                self.quit_approved.clear();
+                self.active.notice = Some(AppMessage::error(format!(
+                    "Could not start document cleanup: {error}. Your documents remain open; try closing again."
+                )));
+            }
+        }
+    }
+
+    pub(super) fn cleanup_reserves_path(&self, path: &Path) -> bool {
+        self.document_cleanup.as_ref().is_some_and(|cleanup| {
+            cleanup
+                .reservations
+                .iter()
+                .any(|reservation| reservation.contains(path))
+        })
+    }
+
+    pub(super) fn quitting_cleanup(&self) -> bool {
+        self.document_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.quitting)
+    }
+
+    /// Read cleanup reports before deciding whether an approved quit may finish.
+    fn poll_document_cleanup(&mut self, ctx: &egui::Context) {
+        let errors = self.working_cleanup.take_errors();
+        let Some(cleanup) = self.document_cleanup.as_mut() else {
+            if !errors.is_empty() {
+                self.active.notice = Some(AppMessage::warning(errors.join("\n")));
+            }
+            return;
+        };
+        cleanup.record_warnings(errors);
+        if !cleanup.handle.as_ref().unwrap().is_finished() {
+            ctx.request_repaint_after(POLL_INTERVAL);
+            return;
+        }
+        let mut cleanup = self.document_cleanup.take().unwrap();
+        if cleanup.handle.take().unwrap().join().is_err() {
+            cleanup.record_warnings([
+                "Document cleanup failed unexpectedly. Some private files may remain.".into(),
+            ]);
+        }
+        // The thread's completion happens after every tab, reader and owner drops.
+        cleanup.record_warnings(self.working_cleanup.take_errors());
+        if cleanup.warnings.is_empty() {
+            if cleanup.quitting {
+                self.quit_pending = false;
+                self.quit_approved.clear();
+                self.quit_authorized = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else {
+            self.quit_pending = false;
+            self.quit_approved.clear();
+            self.active.close_after_jobs = false;
+            self.active.close_after_save = false;
+            self.active.close_ready = false;
+            self.active.notice = Some(AppMessage::warning(cleanup.warnings.join("\n")));
+        }
+    }
+
+    pub(super) fn show_document_cleanup(&self, ctx: &egui::Context) {
+        let Some(cleanup) = &self.document_cleanup else {
+            return;
+        };
+        let contents = |ui: &mut egui::Ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Finishing private-file cleanup…");
+            });
+            if cleanup.quitting {
+                ui.label("Quarry will close when cleanup finishes. Any failures will be shown.");
+            }
+        };
+        if cleanup.quitting {
+            egui::Modal::new(egui::Id::new("quitting_document_cleanup")).show(ctx, contents);
+        } else {
+            egui::Window::new("Closing document")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -30.0])
+                .show(ctx, contents);
+        }
+        ctx.request_repaint_after(POLL_INTERVAL);
+    }
+
     /// Cancels close/quit intentions and clears approvals without discarding documents.
     pub(super) fn keep_editing(&mut self) {
+        if self.quitting_cleanup() {
+            return;
+        }
         self.active.close_confirmation_open = false;
         self.active.close_after_save = false;
         self.active.close_after_jobs = false;
@@ -1070,6 +1389,195 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_spawn_failure_restores_both_dirty_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = fixture(directory.path(), "a.csv");
+        let b = fixture(directory.path(), "b.csv");
+        let mut app = QuarryApp::new(Some(a.clone()), Instant::now());
+        edited(&mut app, "a-edited");
+        let a_id = app.active.id;
+        app.open_new_path(b.clone()).unwrap();
+        edited(&mut app, "b-edited");
+        let b_id = app.active.id;
+        let closing = std::mem::replace(&mut app.active, app.tabs.remove(0));
+        let ctx = egui::Context::default();
+        app.retire_document_tabs_with(&ctx, vec![closing], false, |_| {
+            Err(std::io::Error::other("injected thread creation failure"))
+        });
+        assert!(app.document_cleanup.is_none());
+        assert_eq!(app.active.id, b_id);
+        assert_eq!(app.document_tabs().count(), 2);
+        for (id, name) in [(a_id, "a-edited"), (b_id, "b-edited")] {
+            let document = app
+                .document_tabs()
+                .find(|tab| tab.id == id)
+                .unwrap()
+                .document
+                .as_ref()
+                .unwrap();
+            assert_eq!(document.column_name(0), name);
+            assert!(document.can_undo());
+        }
+        assert!(
+            app.active
+                .notice
+                .as_ref()
+                .unwrap()
+                .contains("documents remain open")
+        );
+        assert!(fs::read_to_string(a).unwrap().starts_with("name,value"));
+        assert!(fs::read_to_string(b).unwrap().starts_with("name,value"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retiring_sources_stay_reserved_through_moved_roots_while_other_tabs_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = fixture(directory.path(), "source.csv");
+        let other = fixture(directory.path(), "other.csv");
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        let state =
+            WorkingCopyState::new_in_with_cleanup(directory.path(), app.working_cleanup.clone())
+                .unwrap();
+        let root = state.directory.path().to_owned();
+        app.active.document.as_mut().unwrap().working_copy = Some(state);
+        app.open_new_path(other).unwrap();
+        let closing = app.tabs.remove(0);
+        let (release, wait) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        app.retire_document_tabs_with(&ctx, vec![closing], false, move |work| {
+            std::thread::Builder::new().spawn(move || {
+                let _ = wait.recv();
+                work();
+            })
+        });
+        let moved = directory.path().join("moved");
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("foreign.csv"), b"preserve").unwrap();
+        let alias = directory.path().join("source-alias.csv");
+        fs::hard_link(&source, &alias).unwrap();
+        assert!(app.cleanup_reserves_path(&alias));
+        assert!(app.cleanup_reserves_path(&moved.join("new/nested.csv")));
+        assert!(!app.destination_available(&moved.join("next.csv")));
+        assert!(!app.join_destination_is_available(&moved.join("next.csv")));
+        assert!(app.open_new_path(alias.clone()).is_err());
+        app.open_join_files();
+        assert!(app.select_join_input_path(0, alias).is_err());
+        app.join_files = None;
+        edited(&mut app, "still-editable");
+        assert!(app.active.document.as_ref().unwrap().can_undo());
+        assert!(moved.exists(), "the held cleanup must own its private root");
+        release.send(()).unwrap();
+        crate::tests::finish_document_cleanup(&mut app, &ctx);
+        assert!(!moved.exists());
+        assert_eq!(fs::read(root.join("foreign.csv")).unwrap(), b"preserve");
+        assert_eq!(
+            app.active.document.as_ref().unwrap().column_name(0),
+            "still-editable"
+        );
+        assert!(!app.quit_authorized);
+    }
+
+    #[test]
+    fn approved_quit_waits_visibly_for_cleanup_before_closing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = fixture(directory.path(), "source.csv");
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        let state =
+            WorkingCopyState::new_in_with_cleanup(directory.path(), app.working_cleanup.clone())
+                .unwrap();
+        let root = state.directory.path().to_owned();
+        app.active.document.as_mut().unwrap().working_copy = Some(state);
+        let closing = std::mem::replace(&mut app.active, DocumentTab::new(99));
+        let (release, wait) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.quit_pending = true;
+        app.retire_document_tabs_with(&ctx, vec![closing], true, move |work| {
+            std::thread::Builder::new().spawn(move || {
+                let _ = wait.recv();
+                work();
+            })
+        });
+        app.discard_and_close(&ctx); // A stale action must not enqueue another close.
+        app.keep_editing(); // Every document has already been approved and transferred.
+        let output = ctx.run(input(vec![]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+        });
+        let tree = output.platform_output.accesskit_update.unwrap();
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.value()
+                .or_else(|| node.label())
+                .is_some_and(|text| text.contains("Finishing private-file cleanup"))
+        }));
+        assert!(!app.quit_authorized);
+        assert!(app.quit_pending);
+        assert!(!app.write_slot_available());
+        assert!(root.exists());
+        release.send(()).unwrap();
+        let output = crate::tests::finish_document_cleanup(&mut app, &ctx);
+        assert!(app.quit_authorized);
+        assert!(!root.exists());
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Close))
+        );
+        assert!(app.document_cleanup.is_none());
+    }
+
+    #[test]
+    fn quit_waits_for_private_cleanup_and_surfaces_preserved_foreign_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = fixture(directory.path(), "source.csv");
+        let original = fs::read(&source).unwrap();
+        let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
+        let state =
+            WorkingCopyState::new_in_with_cleanup(directory.path(), app.working_cleanup.clone())
+                .unwrap();
+        let root = state.directory.path().to_owned();
+        fs::write(root.join("foreign.csv"), b"preserve").unwrap();
+        app.active.document.as_mut().unwrap().working_copy = Some(state);
+        let ctx = egui::Context::default();
+        let output = ctx.run(input(vec![]), |ctx| {
+            app.quit_pending = true;
+            app.discard_and_close(ctx);
+        });
+        assert!(
+            !app.quit_authorized,
+            "quit must wait for final document cleanup"
+        );
+        assert!(
+            !output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Close))
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.quit_pending {
+            assert!(Instant::now() < deadline, "cleanup did not finish");
+            let _ = ctx.run(input(vec![]), |ctx| {
+                eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+            });
+            std::thread::yield_now();
+        }
+        assert!(
+            !app.quit_authorized,
+            "cleanup warnings must cancel automatic quit"
+        );
+        assert!(
+            app.active
+                .notice
+                .as_ref()
+                .is_some_and(|message| message.contains("Could not remove private working files"))
+        );
+        assert_eq!(fs::read(root.join("foreign.csv")).unwrap(), b"preserve");
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
     fn cancelling_quit_retains_even_previously_discarded_tabs_and_their_undo() {
         let directory = tempfile::tempdir().unwrap();
         let a = fixture(directory.path(), "a.csv");
@@ -1106,11 +1614,18 @@ mod tests {
         assert!(fs::read_to_string(a).unwrap().starts_with("name,value"));
         assert!(fs::read_to_string(b).unwrap().starts_with("name,value"));
         app.quit_pending = true;
-        let output = ctx.run(input(vec![]), |ctx| {
+        let initial_output = ctx.run(input(vec![]), |ctx| {
             app.review_document_close(ctx);
             app.discard_and_close(ctx);
             app.discard_and_close(ctx);
         });
+        assert!(
+            !initial_output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Close))
+        );
+        let output = crate::tests::finish_document_cleanup(&mut app, &ctx);
         assert!(app.quit_authorized);
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
@@ -1244,6 +1759,7 @@ mod tests {
         }
         app.switch_tab(&ctx, a_id);
         app.discard_and_close(&ctx);
+        crate::tests::finish_document_cleanup(&mut app, &ctx);
         assert!(!working.exists());
         assert!(app.tabs.is_empty());
         assert_eq!(app.active.id, b_id);
@@ -1326,6 +1842,7 @@ mod tests {
         assert!(working.exists());
         assert_eq!(fs::read(&document.logical_path).unwrap(), before);
         app.discard_and_close(&ctx);
+        crate::tests::finish_document_cleanup(&mut app, &ctx);
         assert!(!working.exists());
         assert_eq!(app.active.id, a_id);
         assert_eq!(

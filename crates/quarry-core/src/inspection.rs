@@ -69,7 +69,9 @@ impl Diagnostic {
                 d.data_row = Some(*data_row);
                 d.column = Some(*column);
             }
-            QuarryError::CombineFile { record, .. } => d.record = *record,
+            QuarryError::CombineFile { record, .. } | QuarryError::JoinFile { record, .. } => {
+                d.record = *record;
+            }
             QuarryError::RecordEncoding { record, cause } => {
                 d.kind = DiagnosticKind::Encoding;
                 d.record = Some(*record);
@@ -1434,6 +1436,28 @@ fn recover(
 mod tests {
     use super::*;
     use crate::OpenOptions;
+
+    #[test]
+    fn join_diagnostics_preserve_record_without_inventing_other_locations() {
+        let error = QuarryError::JoinFile {
+            path: Some(PathBuf::from("additional.csv")),
+            record: Some(42),
+            reason: "Invalid UTF-8 text".into(),
+        };
+        let diagnostic = Diagnostic::from_error(&error);
+        assert_eq!(diagnostic.record, Some(42));
+        assert_eq!(diagnostic.data_row, None);
+        assert_eq!(diagnostic.column, None);
+        assert_eq!(diagnostic.byte_offset, None);
+        assert!(diagnostic.details().contains("Record: 42"));
+        assert!(diagnostic.message.contains("additional.csv"));
+        let no_record = QuarryError::JoinFile {
+            path: None,
+            record: None,
+            reason: "Cancelled".into(),
+        };
+        assert_eq!(Diagnostic::from_error(&no_record).record, None);
+    }
     /// Creates an explicit comma-and-header test configuration.
     fn options() -> InspectionOptions {
         InspectionOptions {

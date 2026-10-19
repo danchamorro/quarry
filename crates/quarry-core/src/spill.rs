@@ -3,27 +3,318 @@
 //! This module owns storage and framing only. Comparators, resource budgets,
 //! cancellation, progress and verification remain with each operation.
 
-use std::fs::{self, File, OpenOptions};
+use std::collections::BTreeMap;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::QuarryError;
+use crate::destination::{Directory, PreparedDestination};
 use crate::storage::storage_error;
 
 static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct SpillWorkspace {
     pub(crate) path: PathBuf,
+    root: Arc<WorkspaceRoot>,
     next_run: AtomicU64,
     active: bool,
+}
+
+struct WorkspaceRoot {
+    state: Mutex<WorkspaceState>,
+}
+
+struct WorkspaceState {
+    directory: Option<Directory>,
+    // Only live owned files are retained. Unlinking a run removes its entry.
+    files: BTreeMap<u64, FileIdentity>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    stamp: crate::SourceStamp,
+}
+
+impl FileIdentity {
+    pub(crate) fn capture(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(changed_file());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                stamp: crate::SourceStamp::from_file(file)?,
+            })
+        }
+    }
+
+    fn matches(&self, file: &File) -> io::Result<bool> {
+        let observed = Self::capture(file)?;
+        #[cfg(unix)]
+        {
+            Ok((self.device, self.inode) == (observed.device, observed.inode))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(self.stamp.same_identity(&observed.stamp))
+        }
+    }
+}
+
+/// A spill reference carries its directory identity, not authority to reopen a
+/// mutable pathname. The displayed path is only for diagnostics and tests.
+#[derive(Clone)]
+pub(crate) struct SpillFile {
+    path: PathBuf,
+    id: u64,
+    root: Arc<WorkspaceRoot>,
+}
+
+impl std::fmt::Debug for SpillFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.path.fmt(formatter)
+    }
+}
+
+impl AsRef<Path> for SpillFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for SpillFile {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn changed_file() -> io::Error {
+    io::Error::other("A private spill file changed or its workspace was released.")
+}
+
+fn run_name(id: u64) -> String {
+    format!("run-{id}.bin")
+}
+
+impl WorkspaceRoot {
+    fn lock(&self) -> io::Result<MutexGuard<'_, WorkspaceState>> {
+        self.state
+            .lock()
+            .map_err(|_| io::Error::other("Private spill ownership was interrupted."))
+    }
+
+    /// Delete only registered regular files through the held directory. Never
+    /// recurse into a directory found at the original (replaceable) pathname.
+    fn cleanup(&self) -> io::Result<()> {
+        let mut state = self.lock()?;
+        let Some(directory) = state.directory.take() else {
+            return Ok(());
+        };
+        let files = std::mem::take(&mut state.files);
+        let mut failure = None;
+        for (id, identity) in files {
+            if let Err(error) = remove_owned(&directory, id, &identity) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = remove_empty_directory(directory) {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+impl SpillFile {
+    pub(crate) fn open(&self) -> io::Result<File> {
+        let state = self.root.lock()?;
+        let directory = state.directory.as_ref().ok_or_else(changed_file)?;
+        let identity = state.files.get(&self.id).ok_or_else(changed_file)?;
+        open_owned(directory, self.id, identity)
+    }
+
+    pub(crate) fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.open()?.metadata()
+    }
+
+    pub(crate) fn remove(&self) -> io::Result<()> {
+        let mut state = self.root.lock()?;
+        let directory = state.directory.as_ref().ok_or_else(changed_file)?;
+        let identity = state.files.get(&self.id).ok_or_else(changed_file)?;
+        remove_owned(directory, self.id, identity)?;
+        state.files.remove(&self.id);
+        Ok(())
+    }
+}
+
+fn open_owned(directory: &Directory, id: u64, identity: &FileIdentity) -> io::Result<File> {
+    open_owned_named(directory, std::ffi::OsStr::new(&run_name(id)), identity)
+}
+
+fn open_owned_named(
+    directory: &Directory,
+    name: &std::ffi::OsStr,
+    identity: &FileIdentity,
+) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = File::from(rustix::fs::openat(
+        &directory.file,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )?);
+    #[cfg(not(unix))]
+    let file = {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
+        options.open(directory.current_path()?.join(name))?
+    };
+    if !identity.matches(&file)? {
+        return Err(changed_file());
+    }
+    Ok(file)
+}
+
+fn remove_owned(directory: &Directory, id: u64, identity: &FileIdentity) -> io::Result<()> {
+    remove_owned_named(directory, std::ffi::OsStr::new(&run_name(id)), identity)
+}
+
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn remove_owned_named(
+    directory: &Directory,
+    name: &std::ffi::OsStr,
+    identity: &FileIdentity,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let stat = match rustix::fs::statat(
+            &directory.file,
+            name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+            || (stat.st_dev as u64, stat.st_ino as u64) != (identity.device, identity.inode)
+        {
+            return Err(changed_file());
+        }
+        rustix::fs::unlinkat(&directory.file, name, rustix::fs::AtFlags::empty())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        match open_owned_named(directory, name, identity) {
+            Ok(file) => drop(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        fs::remove_file(directory.current_path()?.join(name))
+    }
+}
+
+/// rmdir is deliberately nonrecursive even after an identity check. A later
+/// name substitution can never turn this into deletion of another tree's data.
+fn remove_empty_directory(directory: Directory) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = match directory.file.metadata() {
+            Ok(metadata) => metadata,
+            // macOS O_EVTONLY handles report ENOENT after rmdir.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.nlink() == 0 {
+            return Ok(());
+        }
+        let current = match directory.current_path() {
+            Ok(path) => path,
+            // Darwin cannot recover a pathname for a directory already unlinked.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let parent = Directory::open(current.parent().ok_or_else(changed_file)?)?;
+        let name = current.file_name().ok_or_else(changed_file)?;
+        let observed = File::from(rustix::fs::openat(
+            &parent.file,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )?);
+        let observed = observed.metadata()?;
+        if (metadata.dev(), metadata.ino()) != (observed.dev(), observed.ino()) {
+            return Err(changed_file());
+        }
+        rustix::fs::unlinkat(&parent.file, name, rustix::fs::AtFlags::REMOVEDIR)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let path = directory.current_path()?;
+        // Keep ancestors pinned while releasing the leaf's Windows delete lock.
+        let _parent = Directory::open(path.parent().ok_or_else(changed_file)?)?;
+        drop(directory);
+        fs::remove_dir(path)
+    }
+}
+
+fn preparation_error(parent: &Path, error: io::Error, cleanup: io::Result<()>) -> QuarryError {
+    let error = match cleanup {
+        Err(cleanup) if cleanup.kind() != io::ErrorKind::NotFound => io::Error::new(
+            error.kind(),
+            format!("{error} Could not remove temporary folder: {cleanup}"),
+        ),
+        _ => error,
+    };
+    storage_error(parent, error)
 }
 
 impl SpillWorkspace {
     /// Reserve owner-only storage before writing any source values.
     pub(crate) fn create_in(parent: &Path, namespace: &str) -> Result<Self, QuarryError> {
+        Self::create_in_with(parent, namespace, |_| Ok(()))
+    }
+
+    fn create_in_with(
+        parent: &Path,
+        namespace: &str,
+        after_pin: impl FnOnce(&Directory) -> io::Result<()>,
+    ) -> Result<Self, QuarryError> {
         if namespace.is_empty()
             || !namespace
                 .bytes()
@@ -41,15 +332,54 @@ impl SpillWorkspace {
             builder.mode(0o700);
             match builder.create(&path) {
                 Ok(()) => {
-                    #[cfg(target_os = "macos")]
-                    if let Err(error) = File::open(&path)
-                        .and_then(|directory| crate::storage::set_macos_acl(&directory, None))
-                    {
-                        let _ = fs::remove_dir(&path);
-                        return Err(storage_error(parent, error));
+                    let directory = match Directory::open(&path) {
+                        Ok(directory) => directory,
+                        Err(error) => {
+                            // No data has been written. Never recurse through this name.
+                            return Err(preparation_error(parent, error, fs::remove_dir(&path)));
+                        }
+                    };
+                    let prepared = (|| -> io::Result<()> {
+                        after_pin(&directory)?;
+                        if !fs::symlink_metadata(&path)?.is_dir()
+                            || !directory.still_named_by(&path)
+                        {
+                            return Err(io::Error::other(
+                                "The temporary folder changed while it was being reserved. Try again or choose another folder.",
+                            ));
+                        }
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            let metadata = directory.file.metadata()?;
+                            if metadata.mode() & 0o077 != 0
+                                || metadata.uid() != rustix::process::geteuid().as_raw()
+                            {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "This folder cannot hold private temporary files. Choose another temporary folder on a disk that supports owner-only permissions.",
+                                ));
+                            }
+                        }
+                        #[cfg(target_os = "macos")]
+                        crate::storage::set_macos_acl(&directory.file, None)?;
+                        Ok(())
+                    })();
+                    if let Err(error) = prepared {
+                        return Err(preparation_error(
+                            parent,
+                            error,
+                            remove_empty_directory(directory),
+                        ));
                     }
                     return Ok(Self {
                         path,
+                        root: Arc::new(WorkspaceRoot {
+                            state: Mutex::new(WorkspaceState {
+                                directory: Some(directory),
+                                files: BTreeMap::new(),
+                            }),
+                        }),
                         next_run: AtomicU64::new(0),
                         active: true,
                     });
@@ -65,47 +395,77 @@ impl SpillWorkspace {
         .into())
     }
 
-    /// Creates an owner-only spill file without inherited macOS access grants.
-    pub(crate) fn create_run(&self) -> Result<(PathBuf, BufWriter<File>), QuarryError> {
+    pub(crate) fn with_directory<T>(
+        &self,
+        operation: impl FnOnce(&Directory) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let state = self.root.lock()?;
+        operation(state.directory.as_ref().ok_or_else(changed_file)?)
+    }
+
+    /// Creates an owner-only spill file relative to the captured directory.
+    pub(crate) fn create_run(&self) -> Result<(SpillFile, BufWriter<File>), QuarryError> {
         let id = self.next_run.fetch_add(1, Ordering::Relaxed);
-        let path = self.path.join(format!("run-{id}.bin"));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        let mut state = self.root.lock()?;
+        let directory = state.directory.as_ref().ok_or_else(changed_file)?;
         #[cfg(unix)]
-        options.mode(0o600);
-        let file = options
-            .open(&path)
+        let file = File::from(
+            rustix::fs::openat(
+                &directory.file,
+                run_name(id),
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(|error| storage_error(&self.path, error.into()))?,
+        );
+        #[cfg(not(unix))]
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.current_path()?.join(run_name(id)))
             .map_err(|error| storage_error(&self.path, error))?;
+        let identity = FileIdentity::capture(&file)?;
         #[cfg(target_os = "macos")]
         if let Err(error) = crate::storage::set_macos_acl(&file, None) {
             drop(file);
-            let _ = fs::remove_file(&path);
+            let _ = remove_owned(directory, id, &identity);
             return Err(storage_error(&self.path, error));
         }
-        Ok((path, BufWriter::new(file)))
+        state.files.insert(id, identity);
+        Ok((
+            SpillFile {
+                path: self.path.join(run_name(id)),
+                id,
+                root: Arc::clone(&self.root),
+            },
+            BufWriter::new(file),
+        ))
+    }
+
+    pub(crate) fn ensure_output_outside(
+        &self,
+        destination: &PreparedDestination,
+    ) -> Result<(), QuarryError> {
+        let state = self.root.lock()?;
+        destination.ensure_outside_directory(state.directory.as_ref().ok_or_else(changed_file)?)
     }
 
     /// Remove owned scratch data explicitly so cleanup failures reach the caller.
     pub(crate) fn cleanup(mut self) -> Result<(), QuarryError> {
-        match fs::remove_dir_all(&self.path) {
-            Ok(()) => {
-                self.active = false;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.active = false;
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
-        }
+        self.active = false;
+        self.root.cleanup().map_err(Into::into)
     }
 }
 
 impl Drop for SpillWorkspace {
-    /// Best-effort fallback for abandoned operations; use cleanup to observe errors.
+    /// Best-effort fallback uses the same nonrecursive, identity-bound cleanup.
     fn drop(&mut self) {
         if self.active {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = self.root.cleanup();
         }
     }
 }
@@ -342,6 +702,154 @@ mod tests {
         assert_eq!(fs::read(unrelated).unwrap(), b"untouched");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn renamed_workspaces_keep_reads_writes_and_unlinks_on_the_captured_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = SpillWorkspace::create_in(parent.path(), "join").unwrap();
+        let original = workspace.path.clone();
+        let moved = parent.path().join("moved");
+        let (old_run, mut writer) = workspace.create_run().unwrap();
+        writer.write_all(b"owned").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("run-0.bin"), b"unrelated").unwrap();
+        let mut bytes = Vec::new();
+        old_run.open().unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"owned");
+        let (new_run, mut writer) = workspace.create_run().unwrap();
+        writer.write_all(b"new owned data").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(
+            fs::read(moved.join("run-1.bin")).unwrap(),
+            b"new owned data"
+        );
+        assert!(!original.join("run-1.bin").exists());
+        old_run.remove().unwrap();
+        assert!(!moved.join("run-0.bin").exists());
+        let selected = PreparedDestination::new(moved.join("result.csv")).unwrap();
+        assert!(workspace.ensure_output_outside(&selected).is_err());
+        drop(selected);
+        workspace.cleanup().unwrap();
+        assert!(!moved.exists());
+        assert_eq!(fs::read(original.join("run-0.bin")).unwrap(), b"unrelated");
+        assert!(
+            new_run.open().is_err(),
+            "released references cannot reopen a substitute"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retained_workspace_pins_its_name_and_ancestors_until_cleanup() {
+        let parent = tempfile::tempdir().unwrap();
+        let container = parent.path().join("container");
+        fs::create_dir(&container).unwrap();
+        let workspace = SpillWorkspace::create_in(&container, "join").unwrap();
+        let (run, writer) = workspace.create_run().unwrap();
+        drop(writer);
+        assert!(fs::rename(&workspace.path, container.join("moved")).is_err());
+        assert!(fs::rename(&container, parent.path().join("moved-container")).is_err());
+        workspace.cleanup().unwrap();
+        assert!(run.open().is_err());
+        let moved = parent.path().join("moved-container");
+        fs::rename(&container, &moved).unwrap();
+        fs::rename(&moved, &container).unwrap();
+        assert_eq!(fs::read_dir(&container).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cleanup_and_drop_preserve_unregistered_nested_data_and_report_failure() {
+        for explicit in [true, false] {
+            let parent = tempfile::tempdir().unwrap();
+            let workspace = SpillWorkspace::create_in(parent.path(), "join").unwrap();
+            let path = workspace.path.clone();
+            let (run, writer) = workspace.create_run().unwrap();
+            drop(writer);
+            fs::create_dir(path.join("unrelated")).unwrap();
+            fs::write(path.join("unrelated/keep.csv"), b"untouched").unwrap();
+            if explicit {
+                assert!(
+                    workspace.cleanup().is_err(),
+                    "nonempty workspace must report failed cleanup"
+                );
+            } else {
+                drop(workspace);
+            }
+            assert_eq!(
+                fs::read(path.join("unrelated/keep.csv")).unwrap(),
+                b"untouched"
+            );
+            assert!(!run.exists(), "the registered spill is removed");
+        }
+    }
+
+    #[test]
+    fn substituted_run_files_are_not_read_or_deleted() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = SpillWorkspace::create_in(parent.path(), "join").unwrap();
+        let (run, writer) = workspace.create_run().unwrap();
+        drop(writer);
+        // Retain the original inode, so replacement cannot reuse its identity.
+        fs::rename(run.as_ref(), parent.path().join("original-owned")).unwrap();
+        fs::write(run.as_ref(), b"unrelated").unwrap();
+        assert!(run.open().is_err());
+        assert!(run.remove().is_err());
+        assert!(workspace.cleanup().is_err());
+        assert_eq!(fs::read(run.as_ref()).unwrap(), b"unrelated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_symlinks_and_directories_are_never_followed_or_recursed() {
+        use std::os::unix::fs::symlink;
+        for directory in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let workspace = SpillWorkspace::create_in(parent.path(), "join").unwrap();
+            let (run, writer) = workspace.create_run().unwrap();
+            drop(writer);
+            let outside = parent.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("keep.csv"), b"untouched").unwrap();
+            fs::remove_file(run.as_ref()).unwrap();
+            if directory {
+                fs::create_dir(run.as_ref()).unwrap();
+                fs::write(run.join("keep.csv"), b"nested").unwrap();
+            } else {
+                symlink(&outside, run.as_ref()).unwrap();
+            }
+            assert!(run.open().is_err());
+            assert!(run.remove().is_err());
+            assert!(workspace.cleanup().is_err());
+            assert_eq!(fs::read(outside.join("keep.csv")).unwrap(), b"untouched");
+            assert_eq!(
+                fs::read(run.join("keep.csv")).unwrap(),
+                if directory {
+                    b"nested".as_slice()
+                } else {
+                    b"untouched".as_slice()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unlinking_runs_does_not_retain_metadata_for_previous_passes() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = SpillWorkspace::create_in(parent.path(), "join").unwrap();
+        for _ in 0..256 {
+            let (run, writer) = workspace.create_run().unwrap();
+            drop(writer);
+            assert_eq!(workspace.root.lock().unwrap().files.len(), 1);
+            run.remove().unwrap();
+            assert!(workspace.root.lock().unwrap().files.is_empty());
+        }
+        workspace.cleanup().unwrap();
+    }
+
     #[test]
     fn missing_workspaces_clean_up_and_invalid_names_create_nothing() {
         let parent = tempfile::tempdir().unwrap();
@@ -350,7 +858,13 @@ mod tests {
         }
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
         let workspace = SpillWorkspace::create_in(parent.path(), "join").unwrap();
+        #[cfg(unix)]
         fs::remove_dir(&workspace.path).unwrap();
+        #[cfg(windows)]
+        assert!(
+            fs::remove_dir(&workspace.path).is_err(),
+            "the retained directory is pinned"
+        );
         workspace.cleanup().unwrap();
     }
 
@@ -371,5 +885,102 @@ mod tests {
         );
         drop(writer);
         workspace.cleanup().unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_mode_failure_reclaims_the_reservation_and_explains_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o755, 0o777] {
+            let parent = tempfile::tempdir().unwrap();
+            let error = SpillWorkspace::create_in_with(parent.path(), "join", |directory| {
+                // Linux's O_PATH pin supports identity/openat, not fchmod.
+                let metadata_handle = File::from(rustix::fs::openat(
+                    &directory.file,
+                    ".",
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )?);
+                metadata_handle.set_permissions(fs::Permissions::from_mode(mode))
+            })
+            .err()
+            .expect("non-private modes must be rejected before data is written");
+            assert_eq!(
+                fs::read_dir(parent.path()).unwrap().count(),
+                0,
+                "failed reservations must not leak empty folders"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("private") && message.contains("Choose another"),
+                "{message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renamed_reservation_is_cleaned_without_touching_its_replacement() {
+        let parent = tempfile::tempdir().unwrap();
+        let moved = parent.path().join("moved");
+        let replacement = Mutex::new(None);
+        let error = SpillWorkspace::create_in_with(parent.path(), "join", |directory| {
+            let original = directory.current_path()?;
+            fs::rename(&original, &moved)?;
+            fs::create_dir_all(original.join("unrelated"))?;
+            fs::write(original.join("unrelated/keep.csv"), b"untouched")?;
+            *replacement.lock().unwrap() = Some(original);
+            Ok(())
+        })
+        .err()
+        .expect("a replaced reservation must be rejected");
+        assert!(!moved.exists(), "clean the captured empty reservation");
+        assert_eq!(
+            fs::read(
+                replacement
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .join("unrelated/keep.csv")
+            )
+            .unwrap(),
+            b"untouched",
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparation_failure_reports_cleanup_failure_and_preserves_foreign_data() {
+        let parent = tempfile::tempdir().unwrap();
+        let error = SpillWorkspace::create_in_with(parent.path(), "join", |directory| {
+            let path = directory.current_path()?;
+            fs::create_dir(path.join("unrelated"))?;
+            fs::write(path.join("unrelated/keep.csv"), b"untouched")?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected preparation failure",
+            ))
+        })
+        .err()
+        .expect("failed preparation must return an error");
+        let root = fs::read_dir(parent.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::read(root.join("unrelated/keep.csv")).unwrap(),
+            b"untouched"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Could not remove temporary folder"),
+            "{error}"
+        );
     }
 }

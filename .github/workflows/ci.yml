@@ -31,3 +31,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
       - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
+
+  windows-core:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo test -p quarry-core --locked windows_
+      - run: cargo test -p quarry-core --locked pinned_publication_reports_cleanup_failure
+      - run: cargo test -p quarry-core --locked publication_wrappers_keep_primary_errors_and_staging_cleanup_context
+      - run: cargo test -p quarry-core --locked duplicate_uniqueness_diagnostic_uses_each_inputs_header_record_offset
+      - run: cargo test -p quarry-core --locked spill::tests
+      - run: cargo test -p quarry-core --locked join::working::tests
+      - run: cargo test -p quarry-core --locked working_storage::tests
+      - run: "cargo test -p quarry-core --locked join_faults::"
+      - run: cargo build -p quarry-core -p quarry-delimited --release --locked

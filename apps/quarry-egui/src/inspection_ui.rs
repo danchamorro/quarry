@@ -16,8 +16,8 @@ impl Snapshot {
     fn capture(doc: &Document) -> Self {
         Self {
             session: doc.session.clone(),
-            headers: doc.header_renames.clone(),
-            cells: doc.cell_edits.clone(),
+            headers: doc.header_renames.as_ref().clone(),
+            cells: doc.cell_edits.as_ref().clone(),
         }
     }
     /// Checks source identity and effective drafts without treating editor focus as an edit.
@@ -927,11 +927,7 @@ mod tests {
     /// Verifies that inspection uses unsaved values without owning copies each frame.
     fn inspection_uses_unsaved_values_without_owning_copies_each_frame() {
         let (_dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
-        app.active
-            .document
-            .as_mut()
-            .unwrap()
-            .cell_edits
+        Arc::make_mut(&mut app.active.document.as_mut().unwrap().cell_edits)
             .insert((1, 1), Arc::new(vec![0xff]));
         app.start_current_inspection();
         wait_report(&mut app);
@@ -957,11 +953,7 @@ mod tests {
         let (_dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
         app.start_current_inspection();
         wait_report(&mut app);
-        app.active
-            .document
-            .as_mut()
-            .unwrap()
-            .cell_edits
+        Arc::make_mut(&mut app.active.document.as_mut().unwrap().cell_edits)
             .insert((1, 1), Arc::new(b"3".to_vec()));
         app.active.inspection.last_poll = Instant::now() - POLL_INTERVAL;
         app.poll_inspections(&egui::Context::default());
@@ -973,11 +965,7 @@ mod tests {
     /// Verifies that failed open retains current dirty document and shows bounded prefix.
     fn failed_open_retains_current_dirty_document_and_shows_bounded_prefix() {
         let (dir, mut app) = app(b"name,id\nAlice,1\nBob,2\n");
-        app.active
-            .document
-            .as_mut()
-            .unwrap()
-            .cell_edits
+        Arc::make_mut(&mut app.active.document.as_mut().unwrap().cell_edits)
             .insert((1, 1), Arc::new(b"3".to_vec()));
         let old = app.active.id;
         let bad = dir.path().join("bad.csv");
@@ -1431,6 +1419,7 @@ mod tests {
                 .contains("Recovery copy created")
         );
         app.poll_document_tabs(&ctx);
+        crate::tests::finish_document_cleanup(&mut app, &ctx);
         assert!(app.quit_authorized);
     }
 }
