@@ -57,8 +57,9 @@ pub use inspection::{
 };
 pub use join::read_join_header;
 pub use join::{
-    JoinAnalysis, JoinConfig, JoinDuplicateExample, JoinHeader, JoinInput, JoinInputInfo, JoinJob,
-    JoinMode, JoinPhase, JoinPlan, JoinProgress, JoinSourceVersion, JoinSummary, analyze_join,
+    JoinAnalysis, JoinCase, JoinConfig, JoinDuplicateExample, JoinHeader, JoinInput, JoinInputInfo,
+    JoinJob, JoinMode, JoinPhase, JoinPlan, JoinProgress, JoinSourceVersion, JoinSummary,
+    analyze_join,
 };
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};

@@ -74,3 +74,11 @@ The analysis configuration captures Left, Inner, Right or Full mode before a pla
 Matching pairs use Main then Additional ordinals for Left, Inner and Full, and Additional then Main ordinals for Right. Full appends Additional-only rows after all Main-driven rows. The private ordinal key uses the absent-side sentinel only where the mode permits it; publication validates both ordinal bounds and the retained-side rule. Preview uses the same ordering key as creation. Pair enumeration streams bounded blocks from the side driving that mode, so the preview's first pairs have the public order even when groups exceed the memory budget.
 
 An absent source side serializes to empty fields without changing the order or width of either source's columns. Source comparison, full-input validation, uniqueness, duplicate acknowledgement, reservations and publication safeguards are unchanged.
+
+## Composite comparison keys
+
+One to sixteen ordered column pairs define a comparison tuple; both inputs must supply the same number of key columns. A nonempty tuple is framed as a matchable tag followed by a 64-bit length and UTF-8 bytes for each component. A tuple with any empty or missing component is represented by an unmatched tag plus its source ordinal. Boundaries and embedded NUL bytes cannot alias another tuple.
+
+Case-sensitive comparison remains the default. ASCII-insensitive comparison lowercases only ASCII bytes in the private key; source records and result values remain unchanged. Private-key validation compares framed components against decoded source fields without allocating another full key. Duplicate samples escape controls and show bounded tuple components.
+
+The complete framed key is capped at the existing record limit plus sixteen length prefixes and its tag. This is checked before allocation, including when a caller repeats the same source column in several key pairs. Resource accounting reserves the framing overhead and merge fan-in uses the observed complete key size.

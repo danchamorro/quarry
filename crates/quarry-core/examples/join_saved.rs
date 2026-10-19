@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         delimiter: Some(b','),
         has_header: true,
         encoding: Some(Encoding::Utf8),
-        key_column: 0,
+        key_columns: vec![0],
         expected_version: None,
         require_unique: false,
     });

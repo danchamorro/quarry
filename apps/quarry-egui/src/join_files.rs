@@ -1,7 +1,8 @@
 use super::*;
 use quarry_core::JoinHeader as HeaderInfo;
 use quarry_core::{
-    JoinConfig, JoinInput, JoinJob, JoinMode, JoinPlan, JoinSummary, analyze_join, read_join_header,
+    JoinCase, JoinConfig, JoinInput, JoinJob, JoinMode, JoinPlan, JoinSummary, analyze_join,
+    read_join_header,
 };
 use std::thread::{self, JoinHandle};
 
@@ -9,7 +10,8 @@ use std::thread::{self, JoinHandle};
 pub(super) struct JoinDialog {
     paths: [Option<PathBuf>; 2],
     headers: [Option<HeaderInfo>; 2],
-    keys: [usize; 2],
+    keys: Vec<[usize; 2]>,
+    ignore_ascii_case: bool,
     require_unique: [bool; 2],
     acknowledge_expansion: bool,
     mode: JoinMode,
@@ -44,7 +46,8 @@ impl JoinDialog {
         Self {
             paths: [None, None],
             headers: [None, None],
-            keys: [0, 0],
+            keys: vec![[0, 0]],
+            ignore_ascii_case: false,
             require_unique: [false, false],
             acknowledge_expansion: false,
             mode: JoinMode::Left,
@@ -152,7 +155,9 @@ impl JoinDialog {
                 match result {
                     Ok(Some(header)) => {
                         self.headers[side] = Some(header);
-                        self.keys[side] = 0;
+                        for pair in &mut self.keys {
+                            pair[side] = 0;
+                        }
                     }
                     Ok(None) => self.message = Some("Header reading cancelled.".into()),
                     Err(error) => self.worker_failed(error.to_string()),
@@ -239,7 +244,7 @@ impl JoinDialog {
             delimiter: Some(self.headers[side].as_ref().unwrap().delimiter),
             has_header: true,
             encoding: Some(Encoding::Utf8),
-            key_column: self.keys[side],
+            key_columns: self.keys.iter().map(|pair| pair[side]).collect(),
             expected_version: Some(self.headers[side].as_ref().unwrap().source_version.clone()),
             require_unique: self.require_unique[side],
         });
@@ -251,6 +256,11 @@ impl JoinDialog {
             self.temporary.clone(),
             JoinConfig {
                 mode: self.mode,
+                case: if self.ignore_ascii_case {
+                    JoinCase::AsciiInsensitive
+                } else {
+                    JoinCase::Sensitive
+                },
                 ..JoinConfig::default()
             },
         ) {
@@ -276,6 +286,111 @@ impl JoinDialog {
         }
     }
 
+    /// Pair identity and ordering are shared by both sources.
+    fn show_key_pairs(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.strong("Key column pairs");
+        ui.small("All pairs must match. Empty or missing components never match.");
+        ui.checkbox(
+            &mut self.ignore_ascii_case,
+            "Ignore ASCII letter case (A–Z only)",
+        );
+        let count = self.keys.len();
+        let mut edit = None;
+        for (index, pair) in self.keys.iter_mut().enumerate() {
+            ui.push_id(("join-key-pair", index), |ui| {
+                ui.label(format!("Pair {}", index + 1));
+                ui.columns(2, |columns| {
+                    for (side, column) in columns.iter_mut().enumerate() {
+                        let role = if side == 0 { "Main" } else { "Additional" };
+                        if let Some(header) = &self.headers[side] {
+                            let label = header
+                                .columns
+                                .get(pair[side])
+                                .map(|name| format!("{role} {}: {name}", pair[side] + 1))
+                                .unwrap_or_else(|| format!("{role}: choose a column"));
+                            egui::ComboBox::from_id_salt(("column", side))
+                                .selected_text(format!("Pair {} · {label}", index + 1))
+                                .width(245.0)
+                                .show_ui(column, |ui| {
+                                    egui::ScrollArea::vertical().max_height(220.0).show_rows(
+                                        ui,
+                                        22.0,
+                                        header.columns.len(),
+                                        |ui, range| {
+                                            for i in range {
+                                                ui.selectable_value(
+                                                    &mut pair[side],
+                                                    i,
+                                                    format!(
+                                                        "{role} {}: {}",
+                                                        i + 1,
+                                                        header.columns[i]
+                                                    ),
+                                                );
+                                            }
+                                        },
+                                    );
+                                });
+                        } else {
+                            column.label(format!("{role}: choose a file first"));
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            index > 0,
+                            egui::Button::new(format!("Move pair {} up", index + 1)),
+                        )
+                        .clicked()
+                    {
+                        edit = Some((index, 0));
+                    }
+                    if ui
+                        .add_enabled(
+                            index + 1 < count,
+                            egui::Button::new(format!("Move pair {} down", index + 1)),
+                        )
+                        .clicked()
+                    {
+                        edit = Some((index, 1));
+                    }
+                    if ui
+                        .add_enabled(
+                            count > 1,
+                            egui::Button::new(format!("Remove pair {}", index + 1)),
+                        )
+                        .clicked()
+                    {
+                        edit = Some((index, 2));
+                    }
+                });
+            });
+        }
+        if let Some((index, action)) = edit {
+            match action {
+                0 => self.keys.swap(index, index - 1),
+                1 => self.keys.swap(index, index + 1),
+                _ => {
+                    self.keys.remove(index);
+                }
+            }
+        }
+        if ui
+            .add_enabled(
+                self.keys.len() < 16 && self.headers.iter().all(Option::is_some),
+                egui::Button::new("Add key pair"),
+            )
+            .clicked()
+        {
+            let next = self.keys.len();
+            self.keys.push(std::array::from_fn(|side| {
+                next.min(self.headers[side].as_ref().unwrap().columns.len() - 1)
+            }));
+        }
+    }
+
     /// Render the modeless workflow while leaving unrelated documents usable.
     fn show(&mut self, ctx: &egui::Context, can_start: bool) -> DialogAction {
         self.poll();
@@ -291,7 +406,7 @@ impl JoinDialog {
             .show(ctx,|ui|{
                 ui.label("Match key columns and create a separate joined file.");
                 ui.small("Saved UTF-8 files with headers. Retain every matching pair. Empty keys never match.");
-                ui.small("Keys match exactly, including case and whitespace.");
+                ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant.");
                 egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-210.0).max(180.0)).show(ui,|ui|{
                     ui.add_enabled_ui(editable, |ui| {
                         ui.horizontal(|ui| {
@@ -312,19 +427,11 @@ impl JoinDialog {
                                 ui.checkbox(&mut self.require_unique[side], if side == 0 { "Require unique Main key" } else { "Require unique Additional key" });
                                 if let Some(header)=&self.headers[side]{
                                     ui.small(format!("{} columns · UTF-8 · header row",header.columns.len()));
-                                    let selected=self.keys[side];
-                                    let label=header.columns.get(selected).map(|n|format!("{}: {}",selected+1,n)).unwrap_or_default();
-                                    egui::ComboBox::from_id_salt(("join-key",side)).selected_text(label).width(245.0).show_ui(ui,|ui|{
-                                        egui::ScrollArea::vertical().max_height(220.0).show_rows(ui,22.0,header.columns.len(),|ui,range|{
-                                            for index in range {
-                                                ui.selectable_value(&mut self.keys[side],index,format!("{}: {}",index+1,header.columns[index]));
-                                            }
-                                        });
-                                    });
                                 }else{ui.label("Key column: choose a file first");}
                             });
                         }
                     });
+                    ui.add_enabled_ui(editable, |ui| self.show_key_pairs(ui));
                     if let Some(plan)=&self.plan{
                         let a=plan.analysis();
                         ui.separator();
@@ -1035,6 +1142,98 @@ mod tests {
             wanted.extend_from_slice(expected);
             assert_eq!(fs::read(output).unwrap(), wanted, "{mode:?}");
         }
+    }
+    #[test]
+    fn composite_pair_controls_and_ascii_case_reach_the_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(
+            dir.path(),
+            "main.csv",
+            b"region,account,label\nEU,001,A\neu,001,B\nEU,002,C\n",
+        );
+        let b = fixture(
+            dir.path(),
+            "additional.csv",
+            b"acct,area,city\n001,eu,Paris\n002,EU,Rome\n",
+        );
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        app.open_join_files();
+        app.join_files.as_mut().unwrap().temporary = dir.path().to_path_buf();
+        app.join_files.as_mut().unwrap().read_header(0, a.clone());
+        finish(&mut app);
+        app.join_files.as_mut().unwrap().read_header(1, b.clone());
+        finish(&mut app);
+        click(&mut app, &ctx, "Pair 1 · Additional 1: acct");
+        click(&mut app, &ctx, "Additional 2: area");
+        click(&mut app, &ctx, "Add key pair");
+        click(&mut app, &ctx, "Pair 2 · Additional 2: area");
+        click(&mut app, &ctx, "Additional 1: acct");
+        click(&mut app, &ctx, "Move pair 2 up");
+        assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[1, 0], [0, 1]]);
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert_eq!(
+            app.join_files
+                .as_ref()
+                .unwrap()
+                .plan
+                .as_ref()
+                .unwrap()
+                .analysis()
+                .matching_pairs,
+            2
+        );
+        click(&mut app, &ctx, "Reset Analysis");
+        finish(&mut app);
+        click(&mut app, &ctx, "Ignore ASCII letter case (A–Z only)");
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert_eq!(
+            app.join_files
+                .as_ref()
+                .unwrap()
+                .plan
+                .as_ref()
+                .unwrap()
+                .analysis()
+                .matching_pairs,
+            3
+        );
+        let output = dir.path().join("composite.csv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(fs::read(output).unwrap(),
+            b"region,account,label,acct,area,city\nEU,001,A,001,eu,Paris\neu,001,B,001,eu,Paris\nEU,002,C,002,EU,Rome\n");
+        assert_eq!(
+            fs::read(a).unwrap(),
+            b"region,account,label\nEU,001,A\neu,001,B\nEU,002,C\n"
+        );
+        assert_eq!(
+            fs::read(b).unwrap(),
+            b"acct,area,city\n001,eu,Paris\n002,EU,Rome\n"
+        );
+    }
+
+    #[test]
+    fn pair_removal_preserves_one_pair_and_source_change_resets_its_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        click(&mut app, &ctx, "Add key pair");
+        assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[0, 0], [1, 1]]);
+        click(&mut app, &ctx, "Move pair 1 down");
+        assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[1, 1], [0, 0]]);
+        click(&mut app, &ctx, "Remove pair 2");
+        assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[1, 1]]);
+        click(&mut app, &ctx, "Remove pair 1");
+        assert_eq!(app.join_files.as_ref().unwrap().keys.len(), 1);
+        let replacement = fixture(dir.path(), "replacement.csv", b"only\nvalue\n");
+        app.join_files.as_mut().unwrap().read_header(0, replacement);
+        finish(&mut app);
+        assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[0, 1]]);
     }
     #[test]
     fn existing_output_keeps_analysis_and_existing_bytes() {

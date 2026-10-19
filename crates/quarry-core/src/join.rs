@@ -24,6 +24,8 @@ const RECORD_LIMIT: usize = 64 * 1024 * 1024;
 const COLUMN_LIMIT: usize = 65_536;
 const READ_CHUNK: usize = 64 * 1024;
 const MAX_RUN_LEVELS: usize = 64;
+const MAX_KEY_PAIRS: usize = 16;
+const KEY_FRAME_OVERHEAD: usize = 1 + 8 * MAX_KEY_PAIRS;
 
 /// Explicit interpretation of one saved input. Column positions are zero based.
 #[derive(Clone, Debug)]
@@ -32,7 +34,7 @@ pub struct JoinInput {
     pub delimiter: Option<u8>,
     pub has_header: bool,
     pub encoding: Option<Encoding>,
-    pub key_column: usize,
+    pub key_columns: Vec<usize>,
     /// Bind a UI selection to the file version whose header was shown.
     pub expected_version: Option<JoinSourceVersion>,
     /// Reject repeated nonempty keys when explicitly requested.
@@ -161,6 +163,23 @@ pub fn read_join_header(path: PathBuf) -> Result<JoinJob<JoinHeader>, QuarryErro
     JoinJob::spawn(move |state| header_info(&path, state))
 }
 
+/// Case comparison affects keys only; stored and emitted field values are unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JoinCase {
+    #[default]
+    Sensitive,
+    AsciiInsensitive,
+}
+
+impl JoinCase {
+    fn byte(self, value: u8) -> u8 {
+        match self {
+            Self::Sensitive => value,
+            Self::AsciiInsensitive => value.to_ascii_lowercase(),
+        }
+    }
+}
+
 /// Which source rows are retained, with stable order defined by the driving side.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JoinMode {
@@ -195,6 +214,7 @@ impl JoinMode {
 #[derive(Clone, Copy, Debug)]
 pub struct JoinConfig {
     pub mode: JoinMode,
+    pub case: JoinCase,
     pub memory_bytes: usize,
     pub run_memory_bytes: usize,
     /// Target capacity of the driving-side row block; a single larger record is allowed.
@@ -210,6 +230,7 @@ impl Default for JoinConfig {
     fn default() -> Self {
         Self {
             mode: JoinMode::Left,
+            case: JoinCase::Sensitive,
             memory_bytes: 512 * 1024 * 1024,
             run_memory_bytes: 16 * 1024 * 1024,
             group_memory_bytes: 8 * 1024 * 1024,
@@ -511,6 +532,7 @@ impl JoinConfig {
         let reserved = self
             .max_record_bytes
             .saturating_mul(7)
+            .saturating_add(KEY_FRAME_OVERHEAD * 7)
             .saturating_add(self.run_memory_bytes)
             .saturating_add(self.group_memory_bytes)
             .saturating_add(self.preview_bytes)
@@ -550,7 +572,10 @@ impl JoinConfig {
     /// Keep every private frame within the input record and key limits.
     fn frame_limits(self) -> FrameLimits {
         FrameLimits {
-            max_key_bytes: self.max_record_bytes.saturating_add(9).max(16),
+            max_key_bytes: self
+                .max_record_bytes
+                .saturating_add(KEY_FRAME_OVERHEAD)
+                .max(16),
             max_record_bytes: self.max_record_bytes,
         }
     }
@@ -560,7 +585,7 @@ impl JoinConfig {
 struct PreparedInput {
     info: JoinInputInfo,
     stamp: SourceStamp,
-    key_column: usize,
+    key_columns: Vec<usize>,
     require_unique: bool,
     output_delimiter: u8,
     sorted: SpillFile,
@@ -938,27 +963,159 @@ fn fields<'a>(
         .map_err(|e| input_error(path, Some(row + 1), e).into())
 }
 
-/// Distinguish matchable values from ordinal-tagged empty or missing keys.
-fn key(fields: &[Cow<'_, [u8]>], column: usize, ordinal: u64) -> Vec<u8> {
-    match fields.get(column).filter(|field| !field.is_empty()) {
-        Some(value) => {
-            let mut result = Vec::with_capacity(value.len() + 1);
-            result.push(1);
-            result.extend_from_slice(value);
-            result
-        }
-        None => {
-            let mut result = vec![0];
-            result.extend_from_slice(&ordinal.to_be_bytes());
-            result
-        }
+/// Length-prefix every nonempty component so tuple boundaries cannot collide.
+fn key(
+    fields: &[Cow<'_, [u8]>],
+    columns: &[usize],
+    ordinal: u64,
+    config: JoinConfig,
+) -> JResult<Vec<u8>> {
+    if columns
+        .iter()
+        .any(|&column| fields.get(column).is_none_or(|field| field.is_empty()))
+    {
+        let mut result = vec![0];
+        result.extend_from_slice(&ordinal.to_be_bytes());
+        return Ok(result);
     }
+    let size = columns.iter().try_fold(1_usize, |size, &column| {
+        size.checked_add(8)
+            .and_then(|n| n.checked_add(fields[column].len()))
+            .ok_or_else(|| error("Composite key length overflow."))
+    })?;
+    if size > config.frame_limits().max_key_bytes {
+        return Err(error("A composite key exceeds the comparison-key size limit.").into());
+    }
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(size)
+        .map_err(|_| error("Cannot allocate a bounded comparison key."))?;
+    result.push(1);
+    for &column in columns {
+        let value = &fields[column];
+        result.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        result.extend(value.iter().map(|&byte| config.case.byte(byte)));
+    }
+    Ok(result)
+}
+
+/// Check stored framing without allocating another record-sized comparison key.
+fn key_matches(
+    stored: &[u8],
+    fields: &[Cow<'_, [u8]>],
+    columns: &[usize],
+    ordinal: u64,
+    case: JoinCase,
+) -> bool {
+    if columns
+        .iter()
+        .any(|&column| fields.get(column).is_none_or(|field| field.is_empty()))
+    {
+        return stored.first() == Some(&0)
+            && stored.get(1..) == Some(ordinal.to_be_bytes().as_slice());
+    }
+    if stored.first() != Some(&1) {
+        return false;
+    }
+    let mut rest = &stored[1..];
+    for &column in columns {
+        let value = &fields[column];
+        let Some(length) = rest.get(..8) else {
+            return false;
+        };
+        if u64::from_be_bytes(length.try_into().unwrap()) != value.len() as u64 {
+            return false;
+        }
+        rest = &rest[8..];
+        let Some(component) = rest.get(..value.len()) else {
+            return false;
+        };
+        if !component
+            .iter()
+            .copied()
+            .eq(value.iter().map(|&byte| case.byte(byte)))
+        {
+            return false;
+        }
+        rest = &rest[value.len()..];
+    }
+    rest.is_empty()
+}
+
+/// Format bounded, unambiguous samples, escaping invisible and delimiter characters.
+fn key_label(key: &[u8]) -> JResult<String> {
+    if key.first() != Some(&1) {
+        return Err(error("Invalid private comparison key.").into());
+    }
+    let mut rest = &key[1..];
+    let mut label = String::new();
+    let mut components = 0;
+    let mut clipped = false;
+    let append = |label: &mut String, text: &str, clipped: &mut bool| {
+        if label.len() + text.len() <= 128 {
+            label.push_str(text);
+        } else {
+            *clipped = true;
+        }
+    };
+    append(&mut label, "(", &mut clipped);
+    while !rest.is_empty() {
+        components += 1;
+        if components > MAX_KEY_PAIRS {
+            return Err(error("Invalid private key component count.").into());
+        }
+        let length = rest
+            .get(..8)
+            .ok_or_else(|| error("Truncated private comparison key."))?;
+        let size = usize::try_from(u64::from_be_bytes(length.try_into().unwrap()))
+            .map_err(|_| error("Invalid private key component length."))?;
+        rest = &rest[8..];
+        let value = rest
+            .get(..size)
+            .ok_or_else(|| error("Truncated private key component."))?;
+        if value.is_empty() {
+            return Err(error("Empty private key component.").into());
+        }
+        let text = std::str::from_utf8(value).map_err(|_| error("Invalid private key text."))?;
+        if components > 1 {
+            append(&mut label, ", ", &mut clipped);
+        }
+        append(&mut label, "\"", &mut clipped);
+        for ch in text.chars() {
+            if clipped {
+                break;
+            }
+            match ch {
+                '\0' => append(&mut label, "\\0", &mut clipped),
+                '\n' => append(&mut label, "\\n", &mut clipped),
+                '\r' => append(&mut label, "\\r", &mut clipped),
+                '\t' => append(&mut label, "\\t", &mut clipped),
+                '"' => append(&mut label, "\\\"", &mut clipped),
+                '\\' => append(&mut label, "\\\\", &mut clipped),
+                _ if ch.is_control() => append(&mut label, "?", &mut clipped),
+                _ => {
+                    let mut encoded = [0; 4];
+                    append(&mut label, ch.encode_utf8(&mut encoded), &mut clipped);
+                }
+            }
+        }
+        append(&mut label, "\"", &mut clipped);
+        rest = &rest[size..];
+    }
+    if components == 0 {
+        return Err(error("Missing private key components.").into());
+    }
+    if clipped {
+        label.push('…');
+    }
+    label.push(')');
+    Ok(label)
 }
 
 struct Inspected {
     info: JoinInputInfo,
     stamp: SourceStamp,
-    key_column: usize,
+    key_columns: Vec<usize>,
     require_unique: bool,
     output_delimiter: u8,
     frame_bytes: u64,
@@ -1042,7 +1199,11 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
                 .iter()
                 .map(|field| String::from_utf8(field.to_vec()).expect("validated UTF-8"))
                 .collect();
-            if input.key_column >= names.len() {
+            if input
+                .key_columns
+                .iter()
+                .any(|&column| column >= names.len())
+            {
                 return Err(input_error(
                     &path,
                     Some(1),
@@ -1055,7 +1216,15 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
             if parsed.len() > columns.as_ref().map_or(0, Vec::len) {
                 return Err(input_error(&path, Some(row+1), "A row contains more columns than its header. This join version requires named columns.").into());
             }
-            let key = key(&parsed, input.key_column, data_rows);
+            let key =
+                key(&parsed, &input.key_columns, data_rows, config).map_err(
+                    |failure| match failure {
+                        Failure::Error(error) => {
+                            Failure::Error(input_error(&path, Some(row + 1), error))
+                        }
+                        cancelled => cancelled,
+                    },
+                )?;
             if key[0] == 0 {
                 empty_key_rows = add(empty_key_rows, 1)?;
             }
@@ -1081,7 +1250,7 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
             bytes: stamp.file_size(),
         },
         stamp,
-        key_column: input.key_column,
+        key_columns: input.key_columns,
         require_unique: input.require_unique,
         output_delimiter: delimiter,
         frame_bytes,
@@ -1137,7 +1306,7 @@ fn prepare(
                 row,
                 config,
             )?;
-            let comparison = key(&parsed, input.key_column, rows);
+            let comparison = key(&parsed, &input.key_columns, rows, config)?;
             drop(parsed);
             runs.push(Entry {
                 key: comparison,
@@ -1158,7 +1327,7 @@ fn prepare(
     Ok(PreparedInput {
         info: input.info,
         stamp: input.stamp,
-        key_column: input.key_column,
+        key_columns: input.key_columns,
         require_unique: input.require_unique,
         output_delimiter: input.output_delimiter,
         sorted: run.path,
@@ -1413,13 +1582,7 @@ fn read_row(
         ordinal + 1,
         config,
     )?;
-    let value = values
-        .get(input.key_column)
-        .filter(|value| !value.is_empty());
-    let matches = match value {
-        Some(value) => key.first() == Some(&1) && key.get(1..) == Some(value.as_ref()),
-        None => key.first() == Some(&0) && key.get(1..) == Some(ordinal.to_be_bytes().as_slice()),
-    };
+    let matches = key_matches(key, &values, &input.key_columns, ordinal, config.case);
     if !matches {
         return Err(error("Private join key differs from its record.").into());
     }
@@ -1853,14 +2016,8 @@ fn analyze_prepared(
                 || right.as_ref().is_some_and(|g| g.range.rows > 1))
         {
             let key = &left.as_ref().or(right.as_ref()).unwrap().key;
-            let text =
-                std::str::from_utf8(&key[1..]).map_err(|_| error("Invalid private key text."))?;
-            let mut end = text.len().min(128);
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
             duplicate_samples.push(JoinDuplicateExample {
-                key: text[..end].to_string(),
+                key: key_label(key)?,
                 main_rows: left.as_ref().map_or(0, |g| g.range.rows),
                 additional_rows: right.as_ref().map_or(0, |g| g.range.rows),
             });
@@ -1992,6 +2149,10 @@ pub fn analyze_join(
     config: JoinConfig,
 ) -> Result<JoinJob<JoinPlan>, QuarryError> {
     config.validate(&temporary)?;
+    let pair_count = inputs[0].key_columns.len();
+    if !(1..=MAX_KEY_PAIRS).contains(&pair_count) || inputs[1].key_columns.len() != pair_count {
+        return Err(error("Select one to sixteen matching key-column pairs."));
+    }
     JoinJob::spawn(move |state| {
         let [left, right] = inputs;
         let left = inspect(left, config, state)?;
@@ -2445,6 +2606,7 @@ mod tests {
     fn config() -> JoinConfig {
         JoinConfig {
             mode: JoinMode::Left,
+            case: JoinCase::Sensitive,
             memory_bytes: 512 * 1024,
             run_memory_bytes: 128,
             group_memory_bytes: 64,
@@ -2464,7 +2626,7 @@ mod tests {
             delimiter: Some(b','),
             has_header: true,
             encoding: Some(Encoding::Utf8),
-            key_column: 0,
+            key_columns: vec![0],
             expected_version: None,
             require_unique: true,
         })
@@ -2730,7 +2892,8 @@ mod tests {
             b"value,id\nupper,A\nlower,a\nspace, a\nmissing\n",
             b"name,key\nmatch,a\n",
         );
-        args.iter_mut().for_each(|input| input.key_column = 1);
+        args.iter_mut()
+            .for_each(|input| input.key_columns = vec![1]);
         let p = analyze_join(args, dir.path().to_path_buf(), config())
             .unwrap()
             .wait()
@@ -3584,5 +3747,339 @@ mod tests {
                 assert!(!valid_pair_order(&pair_key(order), 42, mode, [2, 3]));
             }
         }
+    }
+    fn tuple_matches(a: &[String], b: &[String], ascii: bool) -> bool {
+        [(0, 1), (1, 0)].iter().all(|&(left, right)| {
+            let Some(a) = a.get(left).filter(|value| !value.is_empty()) else {
+                return false;
+            };
+            let Some(b) = b.get(right).filter(|value| !value.is_empty()) else {
+                return false;
+            };
+            if ascii {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        })
+    }
+
+    fn tuple_oracle(
+        mode: JoinMode,
+        a: &[Vec<String>],
+        b: &[Vec<String>],
+        ascii: bool,
+    ) -> Vec<Vec<String>> {
+        let pair = |a: Option<&Vec<String>>, b: Option<&Vec<String>>| {
+            (0..3)
+                .map(|i| a.and_then(|row| row.get(i)).cloned().unwrap_or_default())
+                .chain((0..3).map(|i| b.and_then(|row| row.get(i)).cloned().unwrap_or_default()))
+                .collect::<Vec<_>>()
+        };
+        let mut result = Vec::new();
+        if mode == JoinMode::Right {
+            for right in b {
+                let mut found = false;
+                for left in a {
+                    if tuple_matches(left, right, ascii) {
+                        found = true;
+                        result.push(pair(Some(left), Some(right)));
+                    }
+                }
+                if !found {
+                    result.push(pair(None, Some(right)));
+                }
+            }
+        } else {
+            let mut used = vec![false; b.len()];
+            for left in a {
+                let mut found = false;
+                for (i, right) in b.iter().enumerate() {
+                    if tuple_matches(left, right, ascii) {
+                        found = true;
+                        used[i] = true;
+                        result.push(pair(Some(left), Some(right)));
+                    }
+                }
+                if !found && mode != JoinMode::Inner {
+                    result.push(pair(Some(left), None));
+                }
+            }
+            if mode == JoinMode::Full {
+                for (i, right) in b.iter().enumerate() {
+                    if !used[i] {
+                        result.push(pair(None, Some(right)));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn composite_keys_and_ascii_case_match_an_independent_oracle_in_every_mode() {
+        let row = |a: &str, b: &str, c: &str| vec![a.to_owned(), b.to_owned(), c.to_owned()];
+        let a = vec![
+            row("ab", "c", "boundary one"),
+            row("a", "bc", "boundary two"),
+            row("x\0y", "z", "nul one"),
+            row("x", "y\0z", "nul two"),
+            row("Ab", "C", "ASCII"),
+            row("é", "1", "lower"),
+            row("É", "1", "upper"),
+            row("é", "01", "leading zero"),
+            row("e\u{301}", "1", "decomposed"),
+            row(" ", "1", "space"),
+            row("", "q", "empty first"),
+            row("x", "", "empty second"),
+            vec!["missing".into()],
+            row("dup", "D", "first"),
+            row("dup", "D", "second"),
+        ];
+        let b = vec![
+            row("c", "ab", "boundary one"),
+            row("bc", "a", "boundary two"),
+            row("z", "x\0y", "nul one"),
+            row("y\0z", "x", "nul two"),
+            row("c", "aB", "ASCII"),
+            row("1", "é", "lower"),
+            row("1", "É", "upper"),
+            row("01", "é", "leading zero"),
+            row("1", "e\u{301}", "decomposed"),
+            row("1", " ", "space"),
+            row("q", "", "empty first"),
+            row("", "x", "empty second"),
+            vec!["missing".into()],
+            row("D", "dup", "first"),
+            row("d", "DUP", "second"),
+            row("1", "other", "unmatched"),
+        ];
+        for ascii in [false, true] {
+            for mode in [
+                JoinMode::Left,
+                JoinMode::Inner,
+                JoinMode::Right,
+                JoinMode::Full,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut left = vec![row("region", "account", "left")];
+                left.extend(a.clone());
+                let mut right = vec![row("account2", "region2", "right")];
+                right.extend(b.clone());
+                let left = oracle_csv(&left);
+                let right = oracle_csv(&right);
+                let mut sources = inputs(dir.path(), &left, &right);
+                sources[0].key_columns = vec![0, 1];
+                sources[1].key_columns = vec![1, 0];
+                for source in &mut sources {
+                    source.require_unique = false;
+                }
+                let cfg = JoinConfig {
+                    mode,
+                    case: if ascii {
+                        JoinCase::AsciiInsensitive
+                    } else {
+                        JoinCase::Sensitive
+                    },
+                    ..config()
+                };
+                let p = analyze_join(sources, dir.path().to_path_buf(), cfg)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                let wanted = tuple_oracle(mode, &a, &b, ascii);
+                let pairs = a
+                    .iter()
+                    .flat_map(|a| b.iter().map(move |b| tuple_matches(a, b, ascii)))
+                    .filter(|same| *same)
+                    .count();
+                assert_eq!(p.analysis.matching_pairs, pairs as u64);
+                assert_eq!(p.analysis.empty_key_rows, [3, 3]);
+                assert_eq!(p.analysis.output_rows, wanted.len() as u64);
+                assert_eq!(
+                    p.analysis.preview,
+                    wanted
+                        .iter()
+                        .take(cfg.preview_rows)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                );
+                let mut rows = vec![vec![
+                    "region".into(),
+                    "account".into(),
+                    "left".into(),
+                    "account2".into(),
+                    "region2".into(),
+                    "right".into(),
+                ]];
+                rows.extend(wanted.clone());
+                let expected = oracle_csv(&rows);
+                assert_eq!(p.analysis.output_bytes, expected.len() as u64);
+                let output = dir.path().join("tuple.csv");
+                p.start_write_acknowledged(output.clone(), true)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fs::read(&output).unwrap(),
+                    expected,
+                    "{mode:?} ASCII={ascii}"
+                );
+                let reopened = crate::Session::open(
+                    &output,
+                    crate::OpenOptions {
+                        rows: 100,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(reopened.first_rows.len(), wanted.len() + 1);
+                assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), left);
+                assert_eq!(fs::read(dir.path().join("additional.csv")).unwrap(), right);
+                assert!(workspaces(dir.path()).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn tuple_framing_has_no_boundary_or_nul_collisions_and_is_bounded() {
+        let fields = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|s| Cow::Owned(s.as_bytes().to_vec()))
+                .collect::<Vec<_>>()
+        };
+        let cfg = config();
+        let a = key(&fields(&["ab", "c"]), &[0, 1], 0, cfg).unwrap();
+        let b = key(&fields(&["a", "bc"]), &[0, 1], 0, cfg).unwrap();
+        let c = key(&fields(&["a\0b", "c"]), &[0, 1], 0, cfg).unwrap();
+        let d = key(&fields(&["a", "b\0c"]), &[0, 1], 0, cfg).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(c, d);
+        assert_eq!(key_label(&c).unwrap(), "(\"a\\0b\", \"c\")");
+        assert!(!key_matches(
+            &a,
+            &fields(&["a", "bc"]),
+            &[0, 1],
+            0,
+            JoinCase::Sensitive
+        ));
+        let mut trailing = a.clone();
+        trailing.push(0);
+        assert!(!key_matches(
+            &trailing,
+            &fields(&["ab", "c"]),
+            &[0, 1],
+            0,
+            JoinCase::Sensitive
+        ));
+        let long = key(&fields(&[&"é".repeat(300)]), &[0], 0, cfg).unwrap();
+        assert!(key_label(&long).unwrap().len() <= 133);
+        let cfg = JoinConfig {
+            max_record_bytes: 32,
+            ..cfg
+        };
+        assert!(key(&fields(&[&"x".repeat(20)]), &[0; 16], 0, cfg).is_err());
+    }
+
+    #[test]
+    fn pair_count_column_bounds_and_sixteen_component_matching_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        for (a, b) in [
+            (vec![], vec![]),
+            (vec![0; 17], vec![0; 17]),
+            (vec![0], vec![0, 0]),
+        ] {
+            let mut sources = inputs(dir.path(), b"id\nx\n", b"id\nx\n");
+            sources[0].key_columns = a;
+            sources[1].key_columns = b;
+            assert!(analyze_join(sources, dir.path().to_path_buf(), config()).is_err());
+            assert!(workspaces(dir.path()).is_empty());
+        }
+        let mut sources = inputs(dir.path(), b"id\nx\n", b"id\nx\n");
+        sources[0].key_columns = vec![1];
+        assert!(
+            analyze_join(sources, dir.path().to_path_buf(), config())
+                .unwrap()
+                .wait()
+                .is_err()
+        );
+        let mut left = vec![(0..16).map(|i| format!("left{i}")).collect::<Vec<_>>()];
+        left.push((0..16).map(|i| format!("value{i}")).collect());
+        let mut right = vec![(0..16).map(|i| format!("right{i}")).collect::<Vec<_>>()];
+        right.push(left[1].iter().rev().cloned().collect());
+        let mut unmatched = right[1].clone();
+        unmatched[0] = "different".into();
+        right.push(unmatched);
+        let mut sources = inputs(dir.path(), &oracle_csv(&left), &oracle_csv(&right));
+        sources[0].key_columns = (0..16).collect();
+        sources[1].key_columns = (0..16).rev().collect();
+        let cfg = JoinConfig {
+            max_columns: 32,
+            ..config()
+        };
+        let p = analyze_join(sources, dir.path().to_path_buf(), cfg)
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.analysis.matching_pairs, 1);
+        assert_eq!(p.analysis.unmatched_rows, [0, 1]);
+        let expected = oracle_csv(&[
+            left[0].iter().chain(&right[0]).cloned().collect(),
+            left[1].iter().chain(&right[1]).cloned().collect(),
+        ]);
+        assert_eq!(p.analysis.output_bytes, expected.len() as u64);
+        let output = dir.path().join("sixteen-pairs.csv");
+        p.start_write(output.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(output).unwrap(), expected);
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn ascii_uniqueness_and_duplicate_analysis_use_the_same_tuple_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        for case in [JoinCase::Sensitive, JoinCase::AsciiInsensitive] {
+            let sources = inputs(dir.path(), b"id,part\nA,x\na,x\n", b"id,part\na,x\n");
+            let cfg = JoinConfig { case, ..config() };
+            let result = analyze_join(sources, dir.path().to_path_buf(), cfg)
+                .unwrap()
+                .wait();
+            if case == JoinCase::Sensitive {
+                result.unwrap().unwrap().release().unwrap();
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let mut sources = inputs(dir.path(), b"id,part\nA,x\na,x\n", b"id,part\na,x\nA,X\n");
+        for input in &mut sources {
+            input.key_columns = vec![0, 1];
+            input.require_unique = false;
+        }
+        let p = analyze_join(
+            sources,
+            dir.path().to_path_buf(),
+            JoinConfig {
+                case: JoinCase::AsciiInsensitive,
+                ..config()
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.analysis.duplicate_groups, [1, 1]);
+        assert_eq!(p.analysis.many_to_many_groups, 1);
+        assert_eq!(p.analysis.matching_pairs, 4);
+        let output = dir.path().join("unacknowledged.csv");
+        assert!(p.start_write(output.clone()).is_err());
+        assert!(!output.exists());
+        assert!(workspaces(dir.path()).is_empty());
     }
 }
