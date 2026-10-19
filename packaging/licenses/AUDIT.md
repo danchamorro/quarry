@@ -203,3 +203,14 @@ Recheck the final binary and keep candidate, supported-platform, signing, and
 owner-acceptance gates separate in the [beta checklist](../../docs/BETA_RELEASE_CHECKLIST.md).
 This recorded review covers the specified inventory only. A changed dependency,
 toolchain, native resource, or target requires checking the affected provenance.
+
+## 2026-10-19 private-storage follow-up
+
+The Unix owner check enables the existing Rustix `process` feature. Regeneration
+with the checksum-verified cargo-about 0.9.2 ARM64 tool produced byte-identical
+notice HTML (SHA-256
+`6a816f8e7da6ec6ff2fed36f8a666c1d6eeab062ed927aaf3915a8da5615a3e3`).
+The lockfile, selected notice terms, supplemental text/font hashes, and Rust
+runtime resources are unchanged. The affected inputs are the core manifest and
+this audit record. The regenerated manifest hash records this bounded source
+and inventory review; it is not a change of license terms or release approval.

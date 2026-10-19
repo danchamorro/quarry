@@ -870,9 +870,16 @@ mod tests {
         for mode in [0o755, 0o777] {
             let parent = tempfile::tempdir().unwrap();
             let error = SpillWorkspace::create_in_with(parent.path(), "join", |directory| {
-                directory
-                    .file
-                    .set_permissions(fs::Permissions::from_mode(mode))
+                // Linux's O_PATH pin supports identity/openat, not fchmod.
+                let metadata_handle = File::from(rustix::fs::openat(
+                    &directory.file,
+                    ".",
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )?);
+                metadata_handle.set_permissions(fs::Permissions::from_mode(mode))
             })
             .err()
             .expect("non-private modes must be rejected before data is written");
