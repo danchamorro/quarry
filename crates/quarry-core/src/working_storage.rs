@@ -145,16 +145,29 @@ impl WorkingCopyStorage {
         let Some(workspace) = self.workspace.take() else {
             return;
         };
+        let root = workspace
+            .with_directory(|directory| {
+                if directory.still_named_by(&workspace.path) {
+                    Ok(workspace.path.clone())
+                } else {
+                    directory.current_path()
+                }
+            })
+            .unwrap_or_else(|_| workspace.path.clone());
         let files = std::mem::take(self.files.get_mut().unwrap_or_else(|e| e.into_inner()));
         for (name, identity) in files {
             if let Err(error) = workspace
                 .with_directory(|directory| remove_owned_named(directory, &name, &identity))
             {
-                self.cleanup.report(error);
+                self.cleanup
+                    .report(format_args!("{}: {error}", root.join(&name).display()));
             }
         }
         if let Err(error) = workspace.cleanup() {
-            self.cleanup.report(error);
+            self.cleanup.report(format_args!(
+                "{}: {error}. Review the remaining files before removing anything.",
+                root.display()
+            ));
         }
     }
 }
@@ -272,8 +285,88 @@ mod tests {
             !errors.is_empty(),
             "cleanup failure must survive the last owner"
         );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains(root.to_str().unwrap())),
+            "cleanup recovery must identify the folder that remains"
+        );
         assert!(cleanup.take_errors().is_empty());
     }
+    #[test]
+    fn last_private_job_owner_cleans_after_completion_cancellation_and_drop() {
+        use crate::{
+            CleanupOperation, CleanupOutcome, ColumnCleanup, HeaderMode, OpenOptions, Session,
+        };
+        use std::time::{Duration, Instant};
+
+        for action in ["complete", "cancel", "drop"] {
+            let parent = tempfile::tempdir().unwrap();
+            let source = parent.path().join("source.csv");
+            let original = b"id,value\nx, spaced \n";
+            std::fs::write(&source, original).unwrap();
+            let options = OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            };
+            let source_session = Session::open(&source, options).unwrap();
+            let cleanup = WorkingCopyCleanup::default();
+            let storage =
+                Arc::new(WorkingCopyStorage::new_in(parent.path(), cleanup.clone()).unwrap());
+            let root = storage.path().to_owned();
+            let first = source_session
+                .start_create_cleaned_working_copy(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    ColumnCleanup {
+                        columns: vec![1],
+                        operation: CleanupOperation::Trim,
+                    },
+                    root.join("generation-1.csv"),
+                )
+                .unwrap();
+            first.retain_working_storage(Arc::clone(&storage)).unwrap();
+            assert!(matches!(first.wait().unwrap(), CleanupOutcome::Complete(_)));
+            let current = Session::open(root.join("generation-1.csv"), options).unwrap();
+            let last = current
+                .start_create_cleaned_working_copy(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    ColumnCleanup {
+                        columns: vec![1],
+                        operation: CleanupOperation::Uppercase,
+                    },
+                    root.join("generation-2.csv"),
+                )
+                .unwrap();
+            last.retain_working_storage(Arc::clone(&storage)).unwrap();
+            let owner = Arc::downgrade(&storage);
+            drop(current);
+            drop(storage);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !last.progress().done {
+                assert!(Instant::now() < deadline, "private job stalled: {action}");
+                std::thread::yield_now();
+            }
+            assert!(owner.upgrade().is_some());
+            match action {
+                "complete" => assert!(matches!(last.wait().unwrap(), CleanupOutcome::Complete(_))),
+                "cancel" => {
+                    last.cancel();
+                    assert_eq!(last.wait().unwrap(), CleanupOutcome::Cancelled);
+                }
+                _ => drop(last),
+            }
+            assert!(owner.upgrade().is_none(), "job leaked its owner: {action}");
+            assert!(!root.exists(), "private generation root survived {action}");
+            assert!(
+                cleanup.take_errors().is_empty(),
+                "cleanup failed after {action}"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_real_private_job_retains_ownership_and_reports_a_moved_publication() {

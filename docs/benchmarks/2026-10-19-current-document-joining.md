@@ -77,3 +77,33 @@ the real retirement worker and retain their exact data/removal assertions.
 These checks extend the initial 651-test evidence; final combined counts and CI
 are recorded after integration. They do not replace native testing of the new
 cleanup UI or the remaining full failure and scale matrix.
+
+
+## Native final-close failure check
+
+The rebased candidate at `0e9fde29b2c1412e267cbe6af1774815a60359f3`, app build
+197, passed 655 workspace tests, formatting, Clippy and the 17 packaging
+self-tests, and was packaged successfully in the same VM. It was launched from
+the package directory without changing the installed application.
+
+Using native controls, trimmed a synthetic column to create a private working
+generation. Added a synthetic foreign sentinel to that owned directory, requested
+quit and approved discarding only the synthetic edits. Quarry removed its own
+generation, preserved the foreign file and original CSV bytes, displayed the
+cleanup failure, and remained open. A subsequent explicit quit closed the app.
+The original CSV SHA-256 remained
+`48927172e4a793a515326102e4ebd6e60828395bb7f51fcc2849062897ea9aac`.
+
+This exposed an actionable-diagnostic gap: the warning did not identify the
+remaining folder. A new folder-path assertion failed before the diagnostic fix
+and passed afterward. Cleanup reports now include the actual captured folder
+(or its original diagnostic path if it cannot be located) and tell the user to
+review remaining files before deleting anything. The longer native warning's
+layout remains part of the final UI matrix.
+
+A further portable public-job test uses a private generation as the next job's
+source, releases the document's owner, then exercises completion, cancellation
+and dropping the last job. All three paths remove the owned root, retain original
+source bytes, release ownership and report no cleanup errors in macOS. The
+existing Windows `working_storage::tests` CI step also runs this case; native
+Windows results are required before clearing that platform lifecycle check.
