@@ -992,6 +992,21 @@ impl JoinDialog {
         }
     }
 
+    /// Reveal keyboard focus in this form without following focus in another
+    /// document, the footer, or a popup, and without undoing manual scrolling.
+    fn reveal_keyboard_focus(ui: &mut egui::Ui) {
+        if let Some(id) = ui.ctx().memory(|memory| memory.focused())
+            && let Some(response) = ui.ctx().read_response(id)
+            && response.gained_focus()
+            && response.layer_id == ui.layer_id()
+            && ui.min_rect().contains_rect(response.rect)
+            && response.rect != response.interact_rect
+        {
+            response.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
+            ui.ctx().request_repaint();
+        }
+    }
+
     /// Render the modeless workflow while leaving unrelated documents usable.
     fn show(
         &mut self,
@@ -1070,6 +1085,7 @@ impl JoinDialog {
                     if let Some(progress)=self.checking.as_ref().map(JoinJob::progress).or_else(||self.writing.as_ref().map(JoinJob::progress)){
                         ui.horizontal(|ui|{ui.spinner();ui.label(format!("{} · {} rows processed",progress.phase.label(),progress.records));});
                     }else if busy {ui.horizontal(|ui|{ui.spinner();ui.label(if self.cleanup.is_some(){"Releasing private join data…"}else{"Reading header…"});});}
+                    Self::reveal_keyboard_focus(ui);
                 });
                 ui.separator();
                 ui.horizontal_wrapped(|ui|{
@@ -3372,6 +3388,141 @@ value
         assert_eq!(
             fs::read(b).unwrap(),
             b"id,city\nmatch,Additional\nright-only,Other unmatched\n,Missing\n"
+        );
+    }
+
+    #[test]
+    fn ordinary_tab_navigation_reaches_join_controls_in_the_full_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = fixture(dir.path(), "keyboard-open.csv", b"id,value\nx,current\n");
+        let mut app = QuarryApp::new(Some(opened), Instant::now());
+        finish_document(&mut app);
+        prepare(&mut app, dir.path());
+        let ctx = context();
+        let mut native_frame = eframe::Frame::_new_kittest();
+        let mut draw = |app: &mut QuarryApp, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 750.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| eframe::App::update(app, ctx, &mut native_frame),
+            )
+        };
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let visible = |output: &egui::FullOutput| {
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text)
+                if text.galley.text() == "Ignore ASCII letter case (A–Z only)"
+                && shape.clip_rect.contains_rect(shape.shape.visual_bounding_rect()))
+            })
+        };
+        let mut target = None;
+        let mut focused_labels = Vec::new();
+        let mut labels = std::collections::HashMap::new();
+        let mut reached = false;
+        for step in 0..130 {
+            let output = draw(
+                &mut app,
+                if step < 2 {
+                    vec![]
+                } else {
+                    vec![key(egui::Key::Tab, true), key(egui::Key::Tab, false)]
+                },
+            );
+            let tree = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("accessibility tree");
+            for (id, node) in &tree.nodes {
+                if let Some(label) = node.label() {
+                    labels.insert(id.0, label.to_owned());
+                    if label == "Ignore ASCII letter case (A–Z only)" {
+                        target = Some(id.0);
+                    }
+                }
+            }
+            if let Some(id) = ctx.memory(|memory| memory.focused()).map(|id| id.value()) {
+                focused_labels.push(
+                    labels
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("id {id}")),
+                );
+                if Some(id) == target {
+                    let mut shown = visible(&output);
+                    for _ in 0..4 {
+                        if shown {
+                            break;
+                        }
+                        shown = visible(&draw(&mut app, vec![]));
+                    }
+                    assert!(
+                        shown,
+                        "the focused join control must be visible after scrolling; response: {:?}",
+                        ctx.memory(|memory| memory.focused())
+                            .and_then(|id| ctx.read_response(id))
+                            .map(|response| (
+                                response.rect,
+                                response.interact_rect,
+                                response.layer_id
+                            ))
+                    );
+                    reached = true;
+                    break;
+                }
+            }
+        }
+        assert!(target.is_some(), "join checkbox was not rendered");
+        assert!(
+            reached,
+            "Tab never reached the join control: {focused_labels:?}"
+        );
+        assert!(!app.join_files.as_ref().unwrap().ignore_ascii_case);
+        draw(
+            &mut app,
+            vec![key(egui::Key::Space, true), key(egui::Key::Space, false)],
+        );
+        assert!(
+            app.join_files.as_ref().unwrap().ignore_ascii_case,
+            "Space must activate the focused join checkbox"
+        );
+        eprintln!(
+            "Ordinary Tab transitions to visible join checkbox: {}",
+            focused_labels.len()
+        );
+        let focused = ctx.memory(|memory| memory.focused()).unwrap();
+        let before = ctx.read_response(focused).unwrap().rect;
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(before.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -600.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..24 {
+            draw(&mut app, vec![]);
+        }
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(focused));
+        let after = ctx.read_response(focused).unwrap().rect;
+        assert!(
+            after.top() < before.top() - 10.0,
+            "manual scrolling must not snap back to unchanged keyboard focus: {before:?} -> {after:?}"
         );
     }
 }
