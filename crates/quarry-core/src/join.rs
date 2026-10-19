@@ -249,9 +249,59 @@ pub struct JoinInputInfo {
     pub path: PathBuf,
     pub delimiter: u8,
     pub columns: Vec<String>,
+    pub has_header: bool,
     pub data_rows: u64,
     pub empty_key_rows: u64,
     pub bytes: u64,
+}
+
+/// Source identity for an output column, independent of its output position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JoinSource {
+    Main,
+    Additional,
+}
+impl JoinSource {
+    pub fn index(self) -> usize {
+        match self {
+            Self::Main => 0,
+            Self::Additional => 1,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Main => "Main",
+            Self::Additional => "Additional",
+        }
+    }
+}
+
+/// One selected source column. None keeps an automatically disambiguated heading.
+#[derive(Clone, Debug)]
+pub struct JoinOutputColumn {
+    pub source: JoinSource,
+    pub column: usize,
+    pub name: Option<String>,
+}
+
+/// Output choices are owned by the immutable analysis, separate from resource policy.
+#[derive(Clone, Debug, Default)]
+pub struct JoinOutputOptions {
+    pub columns: Option<Vec<JoinOutputColumn>>,
+    pub include_header: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct ColumnRef {
+    source: JoinSource,
+    column: usize,
+}
+
+struct OutputLayout {
+    columns: Vec<ColumnRef>,
+    headers: Arc<[String]>,
+    include_header: bool,
+    duplicate_headers: bool,
 }
 
 /// Counts describe the entire input; only preview values are sampled and clipped.
@@ -270,6 +320,9 @@ pub struct JoinAnalysis {
     pub output_bytes: u64,
     pub additional_temporary_bytes: u64,
     pub preview: Vec<Vec<String>>,
+    pub output_headers: Arc<[String]>,
+    pub include_header: bool,
+    pub duplicate_headers: bool,
 }
 
 /// Bounded examples identify duplicate groups without retaining their records.
@@ -284,6 +337,7 @@ pub struct JoinDuplicateExample {
 pub struct JoinPlan {
     inputs: [PreparedInput; 2],
     analysis: JoinAnalysis,
+    output: OutputLayout,
     workspace: Option<SpillWorkspace>,
     config: JoinConfig,
 }
@@ -293,6 +347,7 @@ pub struct JoinSummary {
     pub destination: PathBuf,
     pub data_rows: u64,
     pub bytes_written: u64,
+    pub include_header: bool,
     pub peak_temporary_bytes: u64,
     /// Peak Main-side block capacity, excluding the separately streamed Additional row.
     pub peak_group_buffer_bytes: usize,
@@ -523,32 +578,35 @@ impl JoinConfig {
         // Worst concurrent payloads: two headers, two records, two parsed
         // quoted-field copies, and one output. Run buffers, previews, column
         // metadata, bounded run paths and reader buffers are accounted separately.
-        // Include directory ownership, live file identities and tree-node overhead.
-        let path_bytes = temporary
-            .as_os_str()
-            .len()
-            .saturating_mul(2)
-            .saturating_add(512);
-        let reserved = self
-            .max_record_bytes
-            .saturating_mul(7)
-            .saturating_add(KEY_FRAME_OVERHEAD * 7)
-            .saturating_add(self.run_memory_bytes)
-            .saturating_add(self.group_memory_bytes)
-            .saturating_add(self.preview_bytes)
-            .saturating_add(self.max_columns.saturating_mul(64))
-            .saturating_add(
-                MAX_RUN_LEVELS
-                    .saturating_mul(self.max_merge_fan_in)
-                    .saturating_mul(path_bytes),
-            )
-            .saturating_add(READ_CHUNK.saturating_mul(self.max_merge_fan_in + 1));
+        let reserved = self.reserved_bytes(temporary);
         if reserved > self.memory_bytes {
             return Err(error(
                 "The join memory budget cannot fit its record, preview and merge limits.",
             ));
         }
         Ok(())
+    }
+
+    fn reserved_bytes(self, temporary: &Path) -> usize {
+        // Include directory ownership, live file identities and tree-node overhead.
+        let path_bytes = temporary
+            .as_os_str()
+            .len()
+            .saturating_mul(2)
+            .saturating_add(512);
+        self.max_record_bytes
+            .saturating_mul(7)
+            .saturating_add(KEY_FRAME_OVERHEAD * 7)
+            .saturating_add(self.run_memory_bytes)
+            .saturating_add(self.group_memory_bytes)
+            .saturating_add(self.preview_bytes)
+            .saturating_add(self.max_columns.saturating_mul(384))
+            .saturating_add(
+                MAX_RUN_LEVELS
+                    .saturating_mul(self.max_merge_fan_in)
+                    .saturating_mul(path_bytes),
+            )
+            .saturating_add(READ_CHUNK.saturating_mul(self.max_merge_fan_in + 1))
     }
 
     /// Derive a bounded merge width from observed keys and reserved live memory.
@@ -588,6 +646,7 @@ struct PreparedInput {
     key_columns: Vec<usize>,
     require_unique: bool,
     output_delimiter: u8,
+    projection: Vec<(usize, bool)>,
     sorted: SpillFile,
     frame_bytes: u64,
 }
@@ -1245,6 +1304,7 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
             path,
             delimiter,
             columns,
+            has_header: input.has_header,
             data_rows,
             empty_key_rows,
             bytes: stamp.file_size(),
@@ -1330,6 +1390,7 @@ fn prepare(
         key_columns: input.key_columns,
         require_unique: input.require_unique,
         output_delimiter: input.output_delimiter,
+        projection: Vec::new(),
         sorted: run.path,
         frame_bytes: run.bytes,
     })
@@ -1382,59 +1443,149 @@ fn encode<'a>(
     Ok(output)
 }
 
-/// Assign deterministic unique names without quadratic suffix searches.
-fn output_header(
-    inputs: &[PreparedInput; 2],
-    config: JoinConfig,
-    state: &Progress,
-) -> JResult<Vec<u8>> {
-    use std::collections::{HashMap, HashSet};
-    let mut counts = HashMap::new();
-    for input in inputs {
-        for name in &input.info.columns {
-            *counts.entry(name.as_str()).or_insert(0_usize) += 1;
+impl OutputLayout {
+    fn resolve(
+        inputs: [&JoinInputInfo; 2],
+        options: JoinOutputOptions,
+        config: JoinConfig,
+        temporary: &Path,
+        state: &Progress,
+    ) -> JResult<Self> {
+        use std::collections::{HashMap, HashSet};
+        let requested = if let Some(columns) = options.columns {
+            columns
+        } else {
+            let count = inputs[0]
+                .columns
+                .len()
+                .checked_add(inputs[1].columns.len())
+                .ok_or_else(|| error("Too many result columns."))?;
+            if count > config.max_columns {
+                return Err(error("The result has too many columns. Select fewer columns.").into());
+            }
+            [JoinSource::Main, JoinSource::Additional]
+                .into_iter()
+                .flat_map(|source| {
+                    (0..inputs[source.index()].columns.len()).map(move |column| JoinOutputColumn {
+                        source,
+                        column,
+                        name: None,
+                    })
+                })
+                .collect()
+        };
+        if requested.is_empty() || requested.len() > config.max_columns {
+            return Err(error(
+                "Select between one and the supported maximum number of output columns.",
+            )
+            .into());
         }
-    }
-    let mut used = HashSet::new();
-    let mut suffixes: HashMap<String, usize> = HashMap::new();
-    let mut names = Vec::new();
-    let mut name_bytes = 0_usize;
-    for (side, input) in inputs.iter().enumerate() {
-        let role = if side == 0 { "Main" } else { "Additional" };
-        for (column, name) in input.info.columns.iter().enumerate() {
+        let include_header = options
+            .include_header
+            .unwrap_or(inputs.iter().any(|input| input.has_header));
+        let mut counts = HashMap::new();
+        for column in &requested {
+            let original = inputs[column.source.index()]
+                .columns
+                .get(column.column)
+                .ok_or_else(|| {
+                    error(format!(
+                        "{} output column {} is outside the source schema.",
+                        column.source.label(),
+                        column.column + 1
+                    ))
+                })?;
+            *counts
+                .entry(column.name.as_deref().unwrap_or(original))
+                .or_insert(0_usize) += 1;
+        }
+        // Reserve transient requested names, generated names and collision maps,
+        // as well as the headings retained by the immutable plan. Column metadata
+        // has its own worst-case reserve in JoinConfig.
+        let name_budget = config
+            .memory_bytes
+            .saturating_sub(config.reserved_bytes(temporary))
+            .saturating_div(4)
+            .min(config.max_record_bytes);
+        let requested_name_bytes = requested
+            .iter()
+            .filter_map(|column| column.name.as_ref())
+            .fold(0_usize, |total, name| {
+                total.saturating_add(name.len()).saturating_add(1)
+            });
+        if requested_name_bytes > name_budget {
+            return Err(error(
+                "The requested headings exceed the join memory or record-size limit.",
+            )
+            .into());
+        }
+        let mut name_bytes = 0_usize;
+        let mut used: HashSet<String> = requested.iter().filter_map(|c| c.name.clone()).collect();
+        let mut suffixes: HashMap<String, usize> = HashMap::new();
+        let mut headers = Vec::with_capacity(requested.len());
+        let mut columns = Vec::with_capacity(requested.len());
+        for column in &requested {
             state.check()?;
-            let base = if name.is_empty() {
-                format!("{role} column {}", column + 1)
-            } else if counts[name.as_str()] > 1 {
-                format!("{name} ({role})")
-            } else {
+            let role = column.source.label();
+            let original = &inputs[column.source.index()].columns[column.column];
+            let name = if let Some(name) = &column.name {
                 name.clone()
-            };
-            let mut candidate = base.clone();
-            if used.contains(&candidate) {
-                let next = suffixes.entry(base.clone()).or_insert(2);
-                loop {
-                    state.check()?;
-                    candidate = format!("{base} {next}");
-                    *next += 1;
-                    if !used.contains(&candidate) {
-                        break;
+            } else {
+                let base = if original.is_empty() {
+                    format!("{role} column {}", column.column + 1)
+                } else if counts[original.as_str()] > 1 {
+                    format!("{original} ({role})")
+                } else {
+                    original.clone()
+                };
+                let mut candidate = base.clone();
+                if used.contains(&candidate) {
+                    let next = suffixes.entry(base.clone()).or_insert(2);
+                    loop {
+                        state.check()?;
+                        candidate = format!("{base} {next}");
+                        *next += 1;
+                        if !used.contains(&candidate) {
+                            break;
+                        }
                     }
                 }
+                used.insert(candidate.clone());
+                candidate
+            };
+            name_bytes = name_bytes.saturating_add(name.len()).saturating_add(1);
+            if name_bytes > name_budget {
+                return Err(error("The result column names exceed the join memory or record-size limit. Select fewer columns or use shorter headings.").into());
             }
-            // Bound intermediate names before serialization as well as the
-            // final escaped header. Repeated names never restart suffix scans.
-            name_bytes = name_bytes.saturating_add(candidate.len()).saturating_add(1);
-            if name_bytes > config.max_record_bytes {
-                return Err(error("The joined header exceeds the configured size limit.").into());
-            }
-            used.insert(candidate.clone());
-            names.push(candidate);
+            headers.push(name);
+            columns.push(ColumnRef {
+                source: column.source,
+                column: column.column,
+            });
         }
+        let mut unique = HashSet::new();
+        let duplicate_headers = headers.iter().any(|name| !unique.insert(name.as_str()));
+        let layout = Self {
+            columns,
+            headers: headers.into(),
+            include_header,
+            duplicate_headers,
+        };
+        if include_header {
+            output_header(&layout, inputs[0].delimiter, config)?;
+        }
+        Ok(layout)
+    }
+}
+
+/// Serialize the chosen headings only when the result includes a header row.
+fn output_header(layout: &OutputLayout, delimiter: u8, config: JoinConfig) -> JResult<Vec<u8>> {
+    if !layout.include_header {
+        return Ok(Vec::new());
     }
     encode(
-        names.iter().map(|name| name.as_bytes()),
-        inputs[0].info.delimiter,
+        layout.headers.iter().map(|name| name.as_bytes()),
+        delimiter,
         config.max_record_bytes,
     )
 }
@@ -1444,6 +1595,7 @@ fn output_record(
     inputs: &[PreparedInput; 2],
     left: Option<&[u8]>,
     right: Option<&[u8]>,
+    output: &OutputLayout,
     config: JoinConfig,
 ) -> JResult<Vec<u8>> {
     let a = left
@@ -1475,12 +1627,15 @@ fn output_record(
     if a.len() > inputs[0].info.columns.len() || b.len() > inputs[1].info.columns.len() {
         return Err(error("Prepared join row exceeds the analyzed schema.").into());
     }
-    let values = (0..inputs[0].info.columns.len())
-        .map(|i| a.get(i).map_or(b"".as_slice(), |v| v.as_ref()))
-        .chain(
-            (0..inputs[1].info.columns.len())
-                .map(|i| b.get(i).map_or(b"".as_slice(), |v| v.as_ref())),
-        );
+    let values = output.columns.iter().map(|column| {
+        let row = if column.source == JoinSource::Main {
+            &a
+        } else {
+            &b
+        };
+        row.get(column.column)
+            .map_or(b"".as_slice(), |value| value.as_ref())
+    });
     encode(values, inputs[0].info.delimiter, config.max_record_bytes)
 }
 
@@ -1532,7 +1687,7 @@ fn encoded_value_bytes(value: &[u8], delimiter: u8, first: bool) -> JResult<usiz
 /// Separate value bytes from the fixed per-row delimiter and LF contribution.
 fn row_value_bytes(
     input: &PreparedInput,
-    side: usize,
+    _side: usize,
     row: &OwnedRow,
     config: JoinConfig,
 ) -> JResult<usize> {
@@ -1548,13 +1703,12 @@ fn row_value_bytes(
         return Err(error("Prepared row exceeds the analyzed schema.").into());
     }
     let mut size = 0_usize;
-    for (column, value) in values.iter().enumerate() {
+    for &(column, first) in &input.projection {
+        let value = values
+            .get(column)
+            .map_or(b"".as_slice(), |value| value.as_ref());
         size = size
-            .checked_add(encoded_value_bytes(
-                value,
-                input.output_delimiter,
-                side == 0 && column == 0,
-            )?)
+            .checked_add(encoded_value_bytes(value, input.output_delimiter, first)?)
             .ok_or_else(|| error("Joined row length overflow."))?;
     }
     Ok(size)
@@ -1989,12 +2143,13 @@ fn matched_group_output(
 /// Analyze group cardinality and byte bounds without materializing the Cartesian result.
 fn analyze_prepared(
     inputs: &[PreparedInput; 2],
+    output: &OutputLayout,
     config: JoinConfig,
     state: &Progress,
 ) -> JResult<JoinAnalysis> {
     state.phase(JoinPhase::Analyzing);
-    let header_bytes = output_header(inputs, config, state)?.len() as u64;
-    let columns = (inputs[0].info.columns.len() + inputs[1].info.columns.len()) as u64;
+    let header_bytes = output_header(output, inputs[0].info.delimiter, config)?.len() as u64;
+    let columns = output.columns.len() as u64;
     let mut matching = [0, 0];
     let mut pairs = 0;
     let mut unmatched = [0, 0];
@@ -2073,6 +2228,7 @@ fn analyze_prepared(
                         inputs,
                         a.map(|a| a.record.as_slice()),
                         b.map(|b| b.record.as_slice()),
+                        output,
                         config,
                     )?;
                     let key = pair_order(config.mode, a.map(|a| a.ordinal), b.map(|b| b.ordinal));
@@ -2122,6 +2278,9 @@ fn analyze_prepared(
         output_bytes,
         additional_temporary_bytes: temporary,
         preview: preview.into_values().collect(),
+        output_headers: Arc::clone(&output.headers),
+        include_header: output.include_header,
+        duplicate_headers: output.duplicate_headers,
     })
 }
 
@@ -2148,10 +2307,29 @@ pub fn analyze_join(
     temporary: PathBuf,
     config: JoinConfig,
 ) -> Result<JoinJob<JoinPlan>, QuarryError> {
+    analyze_join_with_output(inputs, temporary, config, JoinOutputOptions::default())
+}
+
+/// Analyze a selected output projection without changing either source.
+pub fn analyze_join_with_output(
+    inputs: [JoinInput; 2],
+    temporary: PathBuf,
+    config: JoinConfig,
+    output_options: JoinOutputOptions,
+) -> Result<JoinJob<JoinPlan>, QuarryError> {
     config.validate(&temporary)?;
     let pair_count = inputs[0].key_columns.len();
     if !(1..=MAX_KEY_PAIRS).contains(&pair_count) || inputs[1].key_columns.len() != pair_count {
         return Err(error("Select one to sixteen matching key-column pairs."));
+    }
+    if output_options
+        .columns
+        .as_ref()
+        .is_some_and(|columns| columns.is_empty() || columns.len() > config.max_columns)
+    {
+        return Err(error(
+            "Select at least one output column within the supported column limit.",
+        ));
     }
     JoinJob::spawn(move |state| {
         let [left, right] = inputs;
@@ -2163,15 +2341,13 @@ pub fn analyze_join(
                 error("Choose two different input files. Self joins are not supported.").into(),
             );
         }
-        if left
-            .info
-            .columns
-            .len()
-            .saturating_add(right.info.columns.len())
-            > config.max_columns
-        {
-            return Err(error("The result has too many columns.").into());
-        }
+        let output = OutputLayout::resolve(
+            [&left.info, &right.info],
+            output_options,
+            config,
+            &temporary,
+            state,
+        )?;
         let initial = mul(add(left.frame_bytes, right.frame_bytes)?, 2)?;
         check_storage(&temporary, initial)?;
         state.check()?;
@@ -2179,14 +2355,20 @@ pub fn analyze_join(
         let prepared = (|| {
             let left = prepare(left, &workspace, config, state)?;
             let right = prepare(right, &workspace, config, state)?;
-            let inputs = [left, right];
-            let analysis = analyze_prepared(&inputs, config, state)?;
+            let mut inputs = [left, right];
+            for (position, column) in output.columns.iter().enumerate() {
+                inputs[column.source.index()]
+                    .projection
+                    .push((column.column, position == 0));
+            }
+            let analysis = analyze_prepared(&inputs, &output, config, state)?;
             Ok((inputs, analysis))
         })();
         match prepared {
             Ok((inputs, analysis)) => Ok(JoinPlan {
                 inputs,
                 analysis,
+                output,
                 workspace: Some(workspace),
                 config,
             }),
@@ -2295,7 +2477,7 @@ impl JoinPlan {
         for input in &self.inputs {
             check_source(input)?;
         }
-        let header = output_header(&self.inputs, self.config, state)?;
+        let header = output_header(&self.output, self.inputs[0].info.delimiter, self.config)?;
         let frame_bytes = add(
             self.analysis.output_bytes - header.len() as u64,
             mul(self.analysis.output_rows, 40)?,
@@ -2333,6 +2515,7 @@ impl JoinPlan {
                             &self.inputs,
                             left.map(|r| r.record.as_slice()),
                             right.map(|r| r.record.as_slice()),
+                            &self.output,
                             self.config,
                         )?;
                         count = add(count, 1)?;
@@ -2387,9 +2570,7 @@ impl JoinPlan {
                     ordinal,
                     self.config,
                 )?;
-                if parsed.len()
-                    != self.inputs[0].info.columns.len() + self.inputs[1].info.columns.len()
-                {
+                if parsed.len() != self.output.columns.len() {
                     return Err(error("Joined row has the wrong number of columns.").into());
                 }
                 drop(parsed);
@@ -2430,6 +2611,7 @@ impl JoinPlan {
                 destination: summary.destination,
                 data_rows: self.analysis.output_rows,
                 bytes_written: self.analysis.output_bytes,
+                include_header: self.output.include_header,
                 peak_temporary_bytes: state.peak.load(Ordering::Acquire),
                 peak_group_buffer_bytes: state.group_peak.load(Ordering::Acquire),
                 cleanup_warning,
@@ -3033,7 +3215,7 @@ mod tests {
         let header = format!("{}\n", vec!["same"; 2048].join(","));
         let args = inputs(dir.path(), header.as_bytes(), b"extra\n");
         let cfg = JoinConfig {
-            memory_bytes: 2 * 1024 * 1024,
+            memory_bytes: 4 * 1024 * 1024,
             max_record_bytes: 64 * 1024,
             max_columns: 4096,
             ..config()
@@ -3346,7 +3528,7 @@ mod tests {
         assert_eq!(p.analysis.many_to_many_groups, 1);
         assert_eq!(
             p.analysis.output_bytes,
-            output_header(&p.inputs, cfg, &Progress::new())
+            output_header(&p.output, p.inputs[0].info.delimiter, cfg)
                 .unwrap()
                 .len() as u64
                 + 25_000_000 * 15
@@ -4080,6 +4262,355 @@ mod tests {
         let output = dir.path().join("unacknowledged.csv");
         assert!(p.start_write(output.clone()).is_err());
         assert!(!output.exists());
+        assert!(workspaces(dir.path()).is_empty());
+    }
+    fn output_column(index: usize, name: Option<&str>) -> JoinOutputColumn {
+        JoinOutputColumn {
+            source: if index < 2 {
+                JoinSource::Main
+            } else {
+                JoinSource::Additional
+            },
+            column: index % 2,
+            name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn projected_joins_match_independent_values_and_order_with_or_without_headers() {
+        let row = |a: &str, b: &str| vec![a.to_owned(), b.to_owned()];
+        let a = vec![
+            row("x", "Left,\" one"),
+            row("z", "alone\nline"),
+            row("", "empty"),
+            row("x", "L2"),
+        ];
+        let b = vec![
+            row("x", "\u{feff}marker"),
+            row("y", "extra"),
+            row("x", "R2"),
+            row("", "emptyR"),
+        ];
+        let mut left = vec![row("id", "value")];
+        left.extend(a.clone());
+        let mut right = vec![row("id", "value")];
+        right.extend(b.clone());
+        let source_left = oracle_csv(&left);
+        let source_right = oracle_csv(&right);
+        for mode in [
+            JoinMode::Left,
+            JoinMode::Inner,
+            JoinMode::Right,
+            JoinMode::Full,
+        ] {
+            for include_header in [false, true] {
+                for projection in [vec![3, 1, 2, 0], vec![3, 1], vec![3], vec![1]] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut sources = inputs(dir.path(), &source_left, &source_right);
+                    for source in &mut sources {
+                        source.require_unique = false;
+                    }
+                    let names = projection
+                        .iter()
+                        .map(|i| format!("selected {i}"))
+                        .collect::<Vec<_>>();
+                    let columns = projection
+                        .iter()
+                        .zip(&names)
+                        .map(|(&i, name)| output_column(i, Some(name)))
+                        .collect();
+                    let cfg = JoinConfig { mode, ..config() };
+                    let p = analyze_join_with_output(
+                        sources,
+                        dir.path().to_path_buf(),
+                        cfg,
+                        JoinOutputOptions {
+                            columns: Some(columns),
+                            include_header: Some(include_header),
+                        },
+                    )
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                    let wanted = oracle_rows(mode, &a, &b)
+                        .into_iter()
+                        .map(|row| {
+                            projection
+                                .iter()
+                                .map(|&i| row[i].clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        p.analysis.preview,
+                        wanted
+                            .iter()
+                            .take(cfg.preview_rows)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(p.analysis.output_headers.as_ref(), names);
+                    let mut rows = Vec::new();
+                    if include_header {
+                        rows.push(names);
+                    }
+                    rows.extend(wanted.clone());
+                    let expected = oracle_csv(&rows);
+                    assert_eq!(p.analysis.output_bytes, expected.len() as u64);
+                    let output = dir.path().join("projected.csv");
+                    let summary = p
+                        .start_write_acknowledged(output.clone(), true)
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(summary.include_header, include_header);
+                    assert_eq!(
+                        fs::read(&output).unwrap(),
+                        expected,
+                        "{mode:?}, header={include_header}, projection={projection:?}"
+                    );
+                    let reopened = crate::Session::open(
+                        &output,
+                        crate::OpenOptions {
+                            rows: 100,
+                            header_mode: if include_header {
+                                crate::HeaderMode::FirstRow
+                            } else {
+                                crate::HeaderMode::NoHeader
+                            },
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    let data = if include_header {
+                        &reopened.first_rows[1..]
+                    } else {
+                        &reopened.first_rows[..]
+                    };
+                    assert_eq!(data.len(), wanted.len());
+                    for (row, expected) in data.iter().zip(&wanted) {
+                        assert_eq!(
+                            row.fields,
+                            expected
+                                .iter()
+                                .map(|s| s.as_bytes().to_vec())
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), source_left);
+                    assert_eq!(
+                        fs::read(dir.path().join("additional.csv")).unwrap(),
+                        source_right
+                    );
+                    assert!(workspaces(dir.path()).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_names_are_disambiguated_but_explicit_duplicates_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = || {
+            inputs(
+                dir.path(),
+                b"id,,dup,dup\nx,a,b,c\n",
+                b"id,dup,solo\nx,d,e\n",
+            )
+        };
+        let p = analyze_join(make(), dir.path().to_path_buf(), config())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            p.analysis.output_headers.as_ref(),
+            [
+                "id (Main)",
+                "Main column 2",
+                "dup (Main)",
+                "dup (Main) 2",
+                "id (Additional)",
+                "dup (Additional)",
+                "solo"
+            ]
+        );
+        assert!(!p.analysis.duplicate_headers);
+        p.release().unwrap();
+        let columns = vec![
+            JoinOutputColumn {
+                source: JoinSource::Main,
+                column: 0,
+                name: Some("same".into()),
+            },
+            JoinOutputColumn {
+                source: JoinSource::Additional,
+                column: 0,
+                name: Some("same".into()),
+            },
+            JoinOutputColumn {
+                source: JoinSource::Main,
+                column: 2,
+                name: None,
+            },
+        ];
+        let p = analyze_join_with_output(
+            make(),
+            dir.path().to_path_buf(),
+            config(),
+            JoinOutputOptions {
+                columns: Some(columns),
+                include_header: Some(true),
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.analysis.output_headers.as_ref(), ["same", "same", "dup"]);
+        assert!(p.analysis.duplicate_headers);
+        let output = dir.path().join("duplicate-headings.csv");
+        p.start_write(output.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(output).unwrap(), b"same,same,dup\nx,x,b\n");
+    }
+
+    #[test]
+    fn projection_limits_apply_to_selected_columns_and_serialized_output() {
+        let dir = tempfile::tempdir().unwrap();
+        for columns in [vec![], vec![output_column(0, None); 3]] {
+            let sources = inputs(dir.path(), b"id,x\na,b\n", b"id,y\na,c\n");
+            let result = analyze_join_with_output(
+                sources,
+                dir.path().to_path_buf(),
+                JoinConfig {
+                    max_columns: 2,
+                    ..config()
+                },
+                JoinOutputOptions {
+                    columns: Some(columns),
+                    include_header: None,
+                },
+            );
+            assert!(result.is_err());
+            assert!(workspaces(dir.path()).is_empty());
+        }
+        let sources = inputs(dir.path(), b"id,x\na,b\n", b"id,y\na,c\n");
+        let p = analyze_join_with_output(
+            sources,
+            dir.path().to_path_buf(),
+            JoinConfig {
+                max_columns: 2,
+                ..config()
+            },
+            JoinOutputOptions {
+                columns: Some(vec![output_column(1, None), output_column(3, None)]),
+                include_header: None,
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.analysis.output_rows, 1);
+        p.release().unwrap();
+        let sources = inputs(dir.path(), b"id,x\na,b\n", b"id,y\na,c\n");
+        let result = analyze_join_with_output(
+            sources,
+            dir.path().to_path_buf(),
+            config(),
+            JoinOutputOptions {
+                columns: Some(vec![JoinOutputColumn {
+                    source: JoinSource::Main,
+                    column: 2,
+                    name: None,
+                }]),
+                include_header: None,
+            },
+        );
+        assert!(result.unwrap().wait().is_err());
+        let a = format!("id,x\na,{}\n", "v".repeat(40));
+        let b = format!("id,y\na,{}\n", "w".repeat(40));
+        let cfg = JoinConfig {
+            max_record_bytes: 64,
+            ..config()
+        };
+        assert!(
+            analyze_join(
+                inputs(dir.path(), a.as_bytes(), b.as_bytes()),
+                dir.path().to_path_buf(),
+                cfg
+            )
+            .unwrap()
+            .wait()
+            .is_err()
+        );
+        let p = analyze_join_with_output(
+            inputs(dir.path(), a.as_bytes(), b.as_bytes()),
+            dir.path().to_path_buf(),
+            cfg,
+            JoinOutputOptions {
+                columns: Some(vec![output_column(1, None)]),
+                include_header: None,
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        p.release().unwrap();
+        let columns = vec![output_column(1, Some(&"\"".repeat(65)))];
+        assert!(
+            analyze_join_with_output(
+                inputs(dir.path(), b"id,x\na,b\n", b"id,y\na,c\n"),
+                dir.path().to_path_buf(),
+                JoinConfig {
+                    max_record_bytes: 128,
+                    ..config()
+                },
+                JoinOutputOptions {
+                    columns: Some(columns),
+                    include_header: Some(true)
+                }
+            )
+            .unwrap()
+            .wait()
+            .is_err()
+        );
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn zero_row_headerless_output_is_a_valid_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = analyze_join_with_output(
+            inputs(dir.path(), b"id\n", b"id\n"),
+            dir.path().to_path_buf(),
+            config(),
+            JoinOutputOptions {
+                columns: None,
+                include_header: Some(false),
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.analysis.output_bytes, 0);
+        let output = dir.path().join("empty.csv");
+        let summary = p
+            .start_write(output.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert!(!summary.include_header);
+        assert_eq!(fs::read(output).unwrap(), b"");
         assert!(workspaces(dir.path()).is_empty());
     }
 }

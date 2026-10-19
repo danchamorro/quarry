@@ -1,10 +1,17 @@
 use super::*;
 use quarry_core::JoinHeader as HeaderInfo;
 use quarry_core::{
-    JoinCase, JoinConfig, JoinInput, JoinJob, JoinMode, JoinPlan, JoinSummary, analyze_join,
-    read_join_header,
+    JoinCase, JoinConfig, JoinInput, JoinJob, JoinMode, JoinOutputColumn, JoinOutputOptions,
+    JoinPlan, JoinSource, JoinSummary, analyze_join_with_output, read_join_header,
 };
 use std::thread::{self, JoinHandle};
+
+struct OutputColumnDraft {
+    source: JoinSource,
+    column: usize,
+    included: bool,
+    name: String,
+}
 
 /// Modeless join draft; source and destination reservations live with this state.
 pub(super) struct JoinDialog {
@@ -12,6 +19,9 @@ pub(super) struct JoinDialog {
     headers: [Option<HeaderInfo>; 2],
     keys: Vec<[usize; 2]>,
     ignore_ascii_case: bool,
+    output_columns: Vec<OutputColumnDraft>,
+    output_selected: Option<usize>,
+    output_has_header: bool,
     require_unique: [bool; 2],
     acknowledge_expansion: bool,
     mode: JoinMode,
@@ -48,6 +58,9 @@ impl JoinDialog {
             headers: [None, None],
             keys: vec![[0, 0]],
             ignore_ascii_case: false,
+            output_columns: Vec::new(),
+            output_selected: None,
+            output_has_header: true,
             require_unique: [false, false],
             acknowledge_expansion: false,
             mode: JoinMode::Left,
@@ -158,6 +171,7 @@ impl JoinDialog {
                         for pair in &mut self.keys {
                             pair[side] = 0;
                         }
+                        self.refresh_output_columns();
                     }
                     Ok(None) => self.message = Some("Header reading cancelled.".into()),
                     Err(error) => self.worker_failed(error.to_string()),
@@ -226,6 +240,7 @@ impl JoinDialog {
     fn read_header(&mut self, side: usize, path: PathBuf) {
         self.paths[side] = Some(path.clone());
         self.headers[side] = None;
+        self.refresh_output_columns();
         self.message = None;
         self.result = None;
         self.destination = None;
@@ -251,7 +266,25 @@ impl JoinDialog {
         self.message = None;
         self.result = None;
         self.cancel_requested = false;
-        match analyze_join(
+        let output = JoinOutputOptions {
+            columns: Some(
+                self.output_columns
+                    .iter()
+                    .filter(|column| column.included)
+                    .map(|column| JoinOutputColumn {
+                        source: column.source,
+                        column: column.column,
+                        name: if column.name.is_empty() {
+                            None
+                        } else {
+                            Some(column.name.clone())
+                        },
+                    })
+                    .collect(),
+            ),
+            include_header: Some(self.output_has_header),
+        };
+        match analyze_join_with_output(
             inputs,
             self.temporary.clone(),
             JoinConfig {
@@ -263,6 +296,7 @@ impl JoinDialog {
                 },
                 ..JoinConfig::default()
             },
+            output,
         ) {
             Ok(job) => self.checking = Some(job),
             Err(error) => self.message = Some(error.to_string()),
@@ -283,6 +317,151 @@ impl JoinDialog {
         match plan.start_write_acknowledged(destination, self.acknowledge_expansion) {
             Ok(job) => self.writing = Some(job),
             Err(error) => self.message = Some(error.to_string()),
+        }
+    }
+
+    /// Replacing either input invalidates the old projection identities.
+    fn refresh_output_columns(&mut self) {
+        self.output_columns = [JoinSource::Main, JoinSource::Additional]
+            .into_iter()
+            .flat_map(|source| {
+                (0..self.headers[source.index()]
+                    .as_ref()
+                    .map_or(0, |h| h.columns.len()))
+                    .map(move |column| OutputColumnDraft {
+                        source,
+                        column,
+                        included: true,
+                        name: String::new(),
+                    })
+            })
+            .collect();
+        self.output_selected = (!self.output_columns.is_empty()).then_some(0);
+        self.output_has_header = true;
+    }
+
+    fn show_output_columns(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.strong("Output columns");
+        ui.checkbox(
+            &mut self.output_has_header,
+            "Include a header row in the output",
+        );
+        ui.horizontal_wrapped(|ui| {
+            for source in [JoinSource::Main, JoinSource::Additional] {
+                for include in [true, false] {
+                    let label = format!(
+                        "Select {} {} columns",
+                        if include { "all" } else { "no" },
+                        source.label()
+                    );
+                    if ui.button(label).clicked() {
+                        for column in &mut self.output_columns {
+                            if column.source == source {
+                                column.included = include;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let count = self.output_columns.len();
+        let selected = self.output_selected;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    selected.is_some_and(|i| i > 0),
+                    egui::Button::new("Move output column up"),
+                )
+                .clicked()
+            {
+                let i = selected.unwrap();
+                self.output_columns.swap(i, i - 1);
+                self.output_selected = Some(i - 1);
+            }
+            if ui
+                .add_enabled(
+                    selected.is_some_and(|i| i + 1 < count),
+                    egui::Button::new("Move output column down"),
+                )
+                .clicked()
+            {
+                let i = selected.unwrap();
+                self.output_columns.swap(i, i + 1);
+                self.output_selected = Some(i + 1);
+            }
+        });
+        let headers = &self.headers;
+        let row_height = ui.spacing().interact_size.y.max(
+            ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
+        );
+        let list_height = ((row_height + ui.spacing().item_spacing.y) * count as f32).min(180.0);
+        egui::ScrollArea::vertical()
+            .id_salt("join-output-columns")
+            .max_height(180.0)
+            .min_scrolled_height(list_height)
+            .show_rows(ui, row_height, count, |ui, range| {
+                for i in range {
+                    let column = &mut self.output_columns[i];
+                    let role = column.source.label();
+                    let original =
+                        &headers[column.source.index()].as_ref().unwrap().columns[column.column];
+                    ui.horizontal(|ui| {
+                        let included = ui.checkbox(
+                            &mut column.included,
+                            format!("Include {role} {}", column.column + 1),
+                        );
+                        if included.has_focus() || included.clicked() {
+                            self.output_selected = Some(i);
+                        }
+                        if ui
+                            .selectable_label(
+                                self.output_selected == Some(i),
+                                format!(
+                                    "Output from {role} column {}: {original}",
+                                    column.column + 1
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.output_selected = Some(i);
+                        }
+                    });
+                }
+            });
+        if let Some(i) = self.output_selected.filter(|&i| i < count) {
+            let column = &mut self.output_columns[i];
+            ui.label(format!(
+                "New heading for {} column {} (optional)",
+                column.source.label(),
+                column.column + 1
+            ));
+            ui.add(
+                egui::TextEdit::singleline(&mut column.name)
+                    .id_salt("join-output-heading")
+                    .hint_text("Keep original heading")
+                    .desired_width(280.0),
+            );
+        }
+        let selected = self
+            .output_columns
+            .iter()
+            .filter(|column| column.included)
+            .count();
+        ui.small(format!("{selected} output columns selected"));
+        if selected == 0 && self.headers.iter().all(Option::is_some) {
+            ui.label(RichText::new("Select at least one output column.").color(ERROR_TEXT));
+        }
+        if self.output_has_header {
+            let mut seen = std::collections::HashSet::new();
+            if self
+                .output_columns
+                .iter()
+                .filter(|c| c.included && !c.name.is_empty())
+                .any(|c| !seen.insert(c.name.as_str()))
+            {
+                ui.label("Some renamed headings are identical. The output will keep those names.");
+            }
         }
     }
 
@@ -432,6 +611,7 @@ impl JoinDialog {
                         }
                     });
                     ui.add_enabled_ui(editable, |ui| self.show_key_pairs(ui));
+                    ui.add_enabled_ui(editable, |ui| self.show_output_columns(ui));
                     if let Some(plan)=&self.plan{
                         let a=plan.analysis();
                         ui.separator();
@@ -449,8 +629,11 @@ impl JoinDialog {
                         }
                         ui.small(format!("Output: {} · Conservative additional storage: {}",format_bytes(a.output_bytes),format_bytes(a.additional_temporary_bytes)));
                         ui.small("Sample in output order; at most 20 rows and columns. Long values are clipped.");
+                        if a.duplicate_headers && a.include_header { ui.label("The output contains duplicate headings."); }
                         egui::ScrollArea::both().max_height(150.0).show(ui,|ui|{
                             egui::Grid::new("join-preview").striped(true).show(ui,|ui|{
+                                for name in a.output_headers.iter().take(20) { ui.strong(name.chars().take(64).collect::<String>()); }
+                                ui.end_row();
                                 for row in &a.preview {for field in row{ui.label(field);}ui.end_row();}
                             });
                         });
@@ -476,7 +659,7 @@ impl JoinDialog {
                         if ui.button("Reset Analysis").clicked(){self.reset();}
                         if ui.button("Choose Output…").clicked(){action=DialogAction::ChooseOutput;}
                         if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion),egui::Button::new("Create Joined File")).clicked(){action=DialogAction::Create;}
-                    }else if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some),egui::Button::new("Analyze & Preview")).clicked(){
+                    }else if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some) && self.output_columns.iter().any(|column|column.included),egui::Button::new("Analyze & Preview")).clicked(){
                         action=DialogAction::Analyze;
                     }
                 });
@@ -646,7 +829,11 @@ impl QuarryApp {
                     path,
                     OpenOptions {
                         delimiter: Some(dialog.output_delimiter),
-                        header_mode: HeaderMode::FirstRow,
+                        header_mode: if dialog.result.as_ref().unwrap().include_header {
+                            HeaderMode::FirstRow
+                        } else {
+                            HeaderMode::NoHeader
+                        },
                         ..Default::default()
                     },
                     Some(Encoding::Utf8),
@@ -707,6 +894,66 @@ mod tests {
             )],
         );
     }
+    /// Focus a real control and activate it with the keyboard.
+    fn keyboard_activate(app: &mut QuarryApp, ctx: &egui::Context, label: &str) {
+        frame(app, ctx, vec![]);
+        let output = frame(app, ctx, vec![]);
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let (id, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(label) || node.value() == Some(label))
+            .unwrap_or_else(|| panic!("missing keyboard control {label}"));
+        frame(
+            app,
+            ctx,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: *id,
+                    data: None,
+                },
+            )],
+        );
+        for pressed in [true, false] {
+            frame(
+                app,
+                ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+    }
+
+    /// Enter a heading through the displayed text editor.
+    fn type_heading(app: &mut QuarryApp, ctx: &egui::Context, value: &str) {
+        frame(app, ctx, vec![]);
+        let output = frame(app, ctx, vec![]);
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let (id, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == egui::accesskit::Role::TextInput)
+            .expect("heading text editor");
+        frame(
+            app,
+            ctx,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: *id,
+                    data: None,
+                },
+            )],
+        );
+        frame(app, ctx, vec![egui::Event::Text(value.into())]);
+    }
+
     /// Poll real worker completion for deterministic integration assertions.
     fn finish(app: &mut QuarryApp) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1273,6 +1520,166 @@ mod tests {
                 .contains_rect(shape.shape.visual_bounding_rect())),
             "footer actions must fit inside their clipping rectangle"
         );
+    }
+    #[test]
+    fn output_controls_project_reorder_rename_and_open_headerless_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        let (a, b) = prepare(&mut app, dir.path());
+        assert_eq!(app.join_files.as_ref().unwrap().output_columns.len(), 4);
+        assert!(
+            app.join_files
+                .as_ref()
+                .unwrap()
+                .output_columns
+                .iter()
+                .all(|c| c.included)
+        );
+        keyboard_activate(&mut app, &ctx, "Include Main 1");
+        keyboard_activate(&mut app, &ctx, "Include Additional 1");
+        keyboard_activate(&mut app, &ctx, "Output from Additional column 2: city");
+        for _ in 0..3 {
+            keyboard_activate(&mut app, &ctx, "Move output column up");
+        }
+        type_heading(&mut app, &ctx, "Destination");
+        let draft = app.join_files.as_ref().unwrap();
+        assert_eq!(draft.output_columns[0].source, JoinSource::Additional);
+        assert_eq!(draft.output_columns[0].column, 1);
+        assert_eq!(draft.output_columns[0].name, "Destination");
+        keyboard_activate(&mut app, &ctx, "Include a header row in the output");
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let plan = app
+            .join_files
+            .as_ref()
+            .unwrap()
+            .plan
+            .as_ref()
+            .expect("projection plan");
+        assert_eq!(
+            plan.analysis().output_headers.as_ref(),
+            ["Destination", "name"]
+        );
+        assert!(!plan.analysis().include_header);
+        assert_eq!(plan.analysis().preview[0], ["LA", "Bob"]);
+        let output = dir.path().join("projected.csv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            b"LA,Bob
+Seattle,Alice
+,Last
+"
+        );
+        click(&mut app, &ctx, "Open Joined File");
+        assert!(app.join_files.is_none());
+        let doc = app.active.document.as_ref().unwrap();
+        assert_eq!(doc.logical_path, output);
+        assert_eq!(
+            doc.data_start, 0,
+            "first data row must not become the header"
+        );
+        assert_eq!(
+            doc.session.first_rows[0].fields,
+            [b"LA".to_vec(), b"Bob".to_vec()]
+        );
+        assert!(!doc.is_dirty());
+        assert_eq!(
+            fs::read(a).unwrap(),
+            b"id,name
+b,Bob
+a,Alice
+z,Last
+"
+        );
+        assert_eq!(
+            fs::read(b).unwrap(),
+            b"id,city
+a,Seattle
+b,LA
+"
+        );
+    }
+
+    #[test]
+    fn selection_buttons_empty_guard_duplicate_warning_and_source_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        click(&mut app, &ctx, "Select no Main columns");
+        click(&mut app, &ctx, "Select no Additional columns");
+        click(&mut app, &ctx, "Analyze & Preview");
+        assert!(!app.join_files.as_ref().unwrap().busy());
+        assert!(app.join_files.as_ref().unwrap().plan.is_none());
+        click(&mut app, &ctx, "Select all Main columns");
+        click(&mut app, &ctx, "Select all Additional columns");
+        click(&mut app, &ctx, "Output from Main column 2: name");
+        type_heading(&mut app, &ctx, "same");
+        click(&mut app, &ctx, "Output from Additional column 2: city");
+        type_heading(&mut app, &ctx, "same");
+        assert_eq!(
+            app.join_files.as_ref().unwrap().output_columns[1].name,
+            "same"
+        );
+        assert_eq!(
+            app.join_files.as_ref().unwrap().output_columns[3].name,
+            "same"
+        );
+        // Render the output panel fully, as after scrolling down in the dialog.
+        let warning_ctx = context();
+        let output = warning_ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.join_files.as_mut().unwrap().show_output_columns(ui);
+                });
+            },
+        );
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Text(t)
+            if t.galley.text().contains("Some renamed headings are identical")))
+        );
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        let plan = app.join_files.as_ref().unwrap().plan.as_ref().unwrap();
+        assert_eq!(
+            plan.analysis().output_headers.as_ref(),
+            ["id (Main)", "same", "id (Additional)", "same"]
+        );
+        assert!(plan.analysis().duplicate_headers);
+        click(&mut app, &ctx, "Reset Analysis");
+        finish(&mut app);
+        let replacement = fixture(
+            dir.path(),
+            "replacement.csv",
+            b"only
+value
+",
+        );
+        app.join_files.as_mut().unwrap().read_header(0, replacement);
+        finish(&mut app);
+        let draft = app.join_files.as_ref().unwrap();
+        assert_eq!(draft.output_columns.len(), 3);
+        assert!(
+            draft
+                .output_columns
+                .iter()
+                .all(|c| c.included && c.name.is_empty())
+        );
+        assert!(draft.output_has_header);
     }
     #[test]
     fn existing_output_keeps_analysis_and_existing_bytes() {

@@ -82,3 +82,29 @@ One to sixteen ordered column pairs define a comparison tuple; both inputs must 
 Case-sensitive comparison remains the default. ASCII-insensitive comparison lowercases only ASCII bytes in the private key; source records and result values remain unchanged. Private-key validation compares framed components against decoded source fields without allocating another full key. Duplicate samples escape controls and show bounded tuple components.
 
 The complete framed key is capped at the existing record limit plus sixteen length prefixes and its tag. This is checked before allocation, including when a caller repeats the same source column in several key pairs. Resource accounting reserves the framing overhead and merge fan-in uses the observed complete key size.
+
+## Result projection and headings
+
+An output layout is an ordered list of source identities (Main or Additional,
+original column index), independent of matching keys, names and grid order.
+Default layouts include both sources in source order, including keys. The layout
+is immutable with its analysis; selecting another source discards its UI draft,
+and changing a retained layout requires releasing the analysis first.
+
+Analysis computes exact serialized contributions only for selected fields while
+still decoding and validating every input field. It accounts for first-field BOM
+quoting at the selected output position, absent-side padding, separators and
+optional header bytes. Creation applies the identical layout and validates the
+actual selected width and byte total before publication.
+
+Automatic headings retain unambiguous original names. Conflicts use the source
+role and numeric suffixes; unnamed columns use the source role and original
+column number. Explicit names are preserved and duplicate explicit names are
+reported to the user. Requested names, collision bookkeeping and retained
+headings share a bounded additional memory allowance. Preview and creation share
+the resolved heading array rather than duplicating its payload.
+
+The header switch is captured by the plan and completion result. Opening the
+result passes the same header mode explicitly, so a header-free first record
+remains data. The saved file always remains independent of source headers and
+source edit history.

@@ -55,11 +55,13 @@ pub use inspection::{
     InspectionProgress, InspectionReport, InspectionStatus, RecoveryJob, RecoverySummary,
     SourcePreview,
 };
-pub use join::read_join_header;
 pub use join::{
     JoinAnalysis, JoinCase, JoinConfig, JoinDuplicateExample, JoinHeader, JoinInput, JoinInputInfo,
     JoinJob, JoinMode, JoinPhase, JoinPlan, JoinProgress, JoinSourceVersion, JoinSummary,
     analyze_join,
+};
+pub use join::{
+    JoinOutputColumn, JoinOutputOptions, JoinSource, analyze_join_with_output, read_join_header,
 };
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
