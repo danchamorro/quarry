@@ -512,6 +512,8 @@ impl Progress {
     fn phase(&self, phase: JoinPhase) {
         self.phase.store(phase as usize, Ordering::Release);
         self.records.store(0, Ordering::Release);
+        #[cfg(test)]
+        crate::join_faults::observe(crate::join_faults::Event::Phase(phase));
     }
 
     /// Track logical spill and staging bytes with checked arithmetic.
@@ -535,11 +537,15 @@ impl<T: Send + 'static> JoinJob<T> {
     fn spawn(
         work: impl FnOnce(&Progress) -> JResult<T> + Send + 'static,
     ) -> Result<Self, QuarryError> {
+        #[cfg(test)]
+        let instrumentation = crate::join_faults::capture();
         let state = Arc::new(Progress::new());
         let worker = Arc::clone(&state);
         let handle = thread::Builder::new()
             .name("quarry-join".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _instrumentation = crate::join_faults::install(instrumentation);
                 struct Done<'a>(&'a AtomicBool);
                 impl Drop for Done<'_> {
                     fn drop(&mut self) {
@@ -614,6 +620,15 @@ enum Failure {
     Error(QuarryError),
 }
 type JResult<T> = Result<T, Failure>;
+impl Failure {
+    fn description(&self) -> String {
+        match self {
+            Self::Cancelled => "Join cancelled".into(),
+            Self::Error(error) => error.to_string(),
+        }
+    }
+}
+
 impl From<QuarryError> for Failure {
     fn from(error: QuarryError) -> Self {
         Self::Error(error)
@@ -865,6 +880,47 @@ impl<'a> Runs<'a> {
         }
     }
 
+    fn spill_io_error(&self, error: io::Error) -> QuarryError {
+        let phase = if self.state.phase.load(Ordering::Acquire) == JoinPhase::Creating as usize {
+            JoinPhase::Creating
+        } else {
+            JoinPhase::Sorting
+        };
+        crate::storage::storage_error(
+            &self.workspace.path,
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{}: {error}. Free disk space or choose another temporary folder, then analyze again.",
+                    phase.label()
+                ),
+            ),
+        )
+    }
+
+    fn write_frame(
+        &self,
+        writer: &mut impl Write,
+        key: &[u8],
+        record: &[u8],
+        ordinal: u64,
+    ) -> JResult<u64> {
+        #[cfg(test)]
+        crate::join_faults::point(crate::join_faults::Event::SpillWrite)
+            .map_err(|error| self.spill_io_error(error))?;
+        spill::write_frame(writer, key, record, ordinal)
+            .map_err(|error| self.spill_io_error(error).into())
+    }
+
+    fn flush_writer(&self, writer: &mut impl Write) -> JResult<()> {
+        #[cfg(test)]
+        crate::join_faults::point(crate::join_faults::Event::SpillFlush)
+            .map_err(|error| self.spill_io_error(error))?;
+        writer
+            .flush()
+            .map_err(|error| self.spill_io_error(error).into())
+    }
+
     /// Flush accumulated rows before admitting another record beyond the run target.
     fn push(&mut self, entry: Entry) -> JResult<()> {
         self.state.check()?;
@@ -896,11 +952,11 @@ impl<'a> Runs<'a> {
         let mut bytes = 0;
         for entry in entries {
             self.state.check()?;
-            let count = spill::write_frame(&mut writer, &entry.key, &entry.record, entry.ordinal)?;
+            let count = self.write_frame(&mut writer, &entry.key, &entry.record, entry.ordinal)?;
             bytes = add(bytes, count)?;
             self.state.add_disk(count)?;
         }
-        writer.flush()?;
+        self.flush_writer(&mut writer)?;
         drop(writer);
         self.carry(Run { path, bytes }, 0)
     }
@@ -920,6 +976,8 @@ impl<'a> Runs<'a> {
                 return Ok(());
             }
             let group = std::mem::take(&mut self.levels[level]);
+            #[cfg(test)]
+            crate::join_faults::observe(crate::join_faults::Event::Merge);
             pending = self.merge(group)?;
             level += 1;
         }
@@ -948,7 +1006,7 @@ impl<'a> Runs<'a> {
                 self.state,
             )?;
             let count =
-                spill::write_frame(&mut writer, &entry.head.key, &record, entry.head.ordinal)?;
+                self.write_frame(&mut writer, &entry.head.key, &record, entry.head.ordinal)?;
             bytes = add(bytes, count)?;
             self.state.add_disk(count)?;
             let stream = entry.stream;
@@ -958,7 +1016,7 @@ impl<'a> Runs<'a> {
                 heap.push(HeapEntry { head, stream });
             }
         }
-        writer.flush()?;
+        self.flush_writer(&mut writer)?;
         drop(writer);
         drop(readers);
         for run in runs {
@@ -2250,6 +2308,8 @@ fn enumerate_pairs(
     let mut a = RangeRows::new(&inputs[primary], ranges[primary].unwrap(), config, state)?;
     let mut emitted = 0_usize;
     let mut visit = |first: &OwnedRow, second: Option<&OwnedRow>| -> JResult<bool> {
+        #[cfg(test)]
+        crate::join_faults::observe(crate::join_faults::Event::ExpandingPairs);
         state.check()?;
         if primary == 0 {
             emit(Some(first), second)?;
@@ -2526,10 +2586,7 @@ fn cleanup_failure(workspace: SpillWorkspace, failure: Failure) -> Failure {
     match workspace.cleanup() {
         Ok(()) => failure,
         Err(cleanup) => {
-            let cause = match failure {
-                Failure::Cancelled => "Join cancelled".to_string(),
-                Failure::Error(error) => error.to_string(),
-            };
+            let cause = failure.description();
             error(format!(
                 "{cause}. Could not remove private join data: {cleanup}"
             ))
@@ -2731,6 +2788,48 @@ impl JoinPlan {
         })
     }
 
+    /// Shared publication guards report CombineFile for multiple sources. Keep
+    /// a join failure tied to its logical input and explain the recovery action.
+    fn publication_error(&self, error: QuarryError, phase: JoinPhase) -> QuarryError {
+        match error {
+            QuarryError::CombineFile {
+                path,
+                record,
+                reason,
+            } => {
+                let source = self.inputs.iter().enumerate().find(|(_, input)| {
+                    input.info.path == path
+                        || input.physical_path == path
+                        || input.working.as_ref().is_some_and(|working| {
+                            working.guards().iter().any(|(guard, _)| guard == &path)
+                        })
+                });
+                match source {
+                    Some((side, input)) => input_error(
+                        &input.info.path,
+                        record,
+                        format!(
+                            "{} input changed after analysis. Review this input and analyze again.",
+                            if side == 0 { "Main" } else { "Additional" }
+                        ),
+                    ),
+                    None => input_error(&path, record, reason),
+                }
+            }
+            QuarryError::Storage { directory, error } => QuarryError::Storage {
+                directory,
+                error: io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{}: {error}. Check free space and folder permissions, then analyze again",
+                        phase.label()
+                    ),
+                ),
+            },
+            error => error,
+        }
+    }
+
     /// Validate count, shape and byte size before guarded atomic publication.
     fn write_inner(
         &self,
@@ -2775,10 +2874,13 @@ impl JoinPlan {
                 guards
             })
             .collect();
-        let mut output = ExportTarget::new_combined_at(sources, prepared_destination)?;
+        let mut output = ExportTarget::new_combined_at(sources, prepared_destination)
+            .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
         output.configure(Encoding::Utf8, Encoding::Utf8, self.config.max_record_bytes);
         let prepared = (|| {
-            output.write_all(&header)?;
+            output
+                .write_all(&header)
+                .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
             state.add_disk(header.len() as u64)?;
             drop(header);
             let mut runs = Runs::new(workspace, self.config, state, 16);
@@ -2818,6 +2920,8 @@ impl JoinPlan {
                 )?;
                 Ok(())
             })?;
+            #[cfg(test)]
+            crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
             let ordered = runs.finish()?;
             if count != self.analysis.output_rows
                 || add(bytes, output.bytes_written())? != self.analysis.output_bytes
@@ -2856,7 +2960,11 @@ impl JoinPlan {
                     return Err(error("Joined row has the wrong number of columns.").into());
                 }
                 drop(parsed);
-                output.write_all(&record)?;
+                #[cfg(test)]
+                crate::join_faults::observe(crate::join_faults::Event::WritingRow);
+                output
+                    .write_all(&record)
+                    .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
                 state.add_disk(record.len() as u64)?;
                 ordinal = add(ordinal, 1)?;
             }
@@ -2876,17 +2984,29 @@ impl JoinPlan {
             return Err(match output.discard() {
                 Ok(()) => failure,
                 Err(cleanup) => error(format!(
-                    "Join failed or was cancelled. Could not remove output staging: {cleanup}"
+                    "{}. Could not remove output staging: {cleanup}",
+                    failure.description()
                 ))
                 .into(),
             });
         }
         state.phase(JoinPhase::Publishing);
-        let (outcome, cleanup_warning) = output.publish_with_cleanup(
-            self.analysis.output_rows,
-            self.analysis.output_bytes,
-            &state.cancel,
-        )?;
+        let (outcome, cleanup_warning) = output
+            .publish_with_cleanup(
+                self.analysis.output_rows,
+                self.analysis.output_bytes,
+                &state.cancel,
+            )
+            .map_err(|failure| {
+                let cause = self.publication_error(failure.cause, JoinPhase::Publishing);
+                match failure.cleanup {
+                    Some(cleanup) => error(format!(
+                        "{}. Could not remove output staging: {cleanup}",
+                        cause.to_string().trim_end_matches('.')
+                    )),
+                    None => cause,
+                }
+            })?;
         match outcome {
             FilterExportOutcome::Cancelled => Err(Failure::Cancelled),
             FilterExportOutcome::Complete(summary) => Ok(JoinSummary {

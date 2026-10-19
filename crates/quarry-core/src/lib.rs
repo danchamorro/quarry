@@ -9,6 +9,8 @@ mod filter;
 mod index;
 mod inspection;
 mod join;
+#[cfg(test)]
+mod join_faults;
 
 mod search;
 mod sort;

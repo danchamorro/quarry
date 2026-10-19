@@ -229,3 +229,23 @@ The complete fault/scale matrix remains a release gate. In particular, native
 Windows final-owner/drop ordering and filtered readers detached before closing
 still require explicit coverage; the macOS close checks do not establish that
 platform contract.
+
+
+### Publication failures and test isolation
+
+Creation checks cancellation again after final source/identity I/O, immediately
+before atomic publication. Once publication succeeds, cancellation cannot
+discard the result.
+
+The shared writer separates its primary publication outcome from explicit
+staging cleanup. Join keeps both causes when writing, flush/sync, cancellation
+or source validation fails together with cleanup; successful publication carries
+cleanup warnings without turning the saved result into a failed operation.
+Private spill errors retain their folder and I/O kind and add the active join
+phase and recovery guidance.
+
+The failure matrix uses scoped, thread-local instrumentation copied only into
+the initiating join worker. All instrumentation is compiled only for tests;
+it introduces no production setting, environment variable, global cross-test
+fault switch, or alternative publication path. Actual files, serialization,
+guards, cleanup and atomic rename still run.

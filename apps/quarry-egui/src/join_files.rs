@@ -3116,4 +3116,98 @@ value
         assert_eq!(app.join_files.as_ref().unwrap().paths[0].as_ref(), Some(&a));
         assert!(app.join_files.as_ref().unwrap().document_inputs[0].is_some());
     }
+    #[test]
+    fn failed_current_source_creation_releases_both_leases_and_keeps_unsaved_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "current-main.csv", b"id,value\nx,saved-main\n");
+        let b = fixture(
+            dir.path(),
+            "current-additional.csv",
+            b"id,value\nx,saved-additional\n",
+        );
+        let mut app = QuarryApp::new(None, Instant::now());
+        let mut ids = Vec::new();
+        for (path, original, current) in [
+            (a.clone(), b"saved-main".as_slice(), "unsaved-main"),
+            (
+                b.clone(),
+                b"saved-additional".as_slice(),
+                "unsaved-additional",
+            ),
+        ] {
+            app.open_path_with_options(
+                path,
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            finish_document(&mut app);
+            ids.push(app.active.id);
+            let doc = app.active.document.as_mut().unwrap();
+            doc.begin_cell_edit(1, 1, original.to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = current.into();
+        }
+        app.open_join_files();
+        for (side, id) in ids.iter().copied().enumerate() {
+            app.select_join_document(side, id).unwrap();
+            finish(&mut app);
+        }
+        let ctx = context();
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert!(app.join_files.as_ref().unwrap().plan.is_some());
+        let histories: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let doc = app
+                    .document_tabs()
+                    .find(|tab| tab.id == *id)
+                    .unwrap()
+                    .document
+                    .as_ref()
+                    .unwrap();
+                assert!(doc.join_reserved());
+                (*id, doc.edit_history.clone())
+            })
+            .collect();
+        // Simulate an external change after the retained preview; Quarry must
+        // preserve it while reporting failure and releasing the captured inputs.
+        fs::write(&a, b"id,value\nx,external-main\n").unwrap();
+        let output = dir.path().join("joined.csv");
+        app.join_files.as_mut().unwrap().destination = Some(output.clone());
+        click(&mut app, &ctx, "Create Joined File");
+        finish(&mut app);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(dialog.plan.is_none() && dialog.writing.is_none() && dialog.result.is_none());
+        assert!(
+            dialog
+                .message
+                .as_ref()
+                .is_some_and(|message| message.contains("changed"))
+        );
+        assert!(app.write_slot_available());
+        assert!(!output.exists());
+        for (id, history) in histories {
+            let doc = app
+                .document_tabs()
+                .find(|tab| tab.id == id)
+                .unwrap()
+                .document
+                .as_ref()
+                .unwrap();
+            assert!(!doc.join_reserved());
+            assert_eq!(doc.edit_history, history);
+            assert!(doc.is_dirty());
+            let expected = if id == ids[0] {
+                b"unsaved-main".as_slice()
+            } else {
+                b"unsaved-additional".as_slice()
+            };
+            assert_eq!(doc.cell_edits[&(1, 1)].as_slice(), expected);
+        }
+        assert_eq!(fs::read(a).unwrap(), b"id,value\nx,external-main\n");
+        assert_eq!(fs::read(b).unwrap(), b"id,value\nx,saved-additional\n");
+    }
 }

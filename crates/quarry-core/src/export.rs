@@ -2130,6 +2130,13 @@ impl PrivatePublication {
     }
 }
 
+/// Preserve a primary publication failure alongside failed private cleanup.
+#[derive(Debug)]
+pub(crate) struct PublicationFailure {
+    pub(crate) cause: QuarryError,
+    pub(crate) cleanup: Option<Box<QuarryError>>,
+}
+
 pub(crate) struct ExportTarget {
     writer: Option<BufWriter<File>>,
     source_encoding: crate::Encoding,
@@ -2506,6 +2513,8 @@ impl ExportTarget {
             } else {
                 encoding.encode(bytes, limit)?
             };
+            #[cfg(test)]
+            crate::join_faults::point(crate::join_faults::Event::OutputWrite)?;
             writer.write_all(&encoded)?;
             *count = count.saturating_add(encoded.len() as u64);
             Ok(())
@@ -2682,14 +2691,61 @@ impl ExportTarget {
         rows_written: u64,
         bytes_written: u64,
         cancel_requested: &AtomicBool,
-    ) -> Result<(FilterExportOutcome, Option<String>), QuarryError> {
-        self.publish_inner(rows_written, bytes_written, cancel_requested, false)
+    ) -> Result<(FilterExportOutcome, Option<String>), PublicationFailure> {
+        self.publish_inner_report(rows_written, bytes_written, cancel_requested, false)
             .map(|(outcome, _, warning)| (outcome, warning))
     }
 
     /// Restores replacement permissions inside private staging, then publishes atomically.
     fn publish_inner(
+        self,
+        rows_written: u64,
+        bytes_written: u64,
+        cancel_requested: &AtomicBool,
+        capture_stamp: bool,
+    ) -> Result<(FilterExportOutcome, Option<SourceStamp>, Option<String>), QuarryError> {
+        self.publish_inner_report(rows_written, bytes_written, cancel_requested, capture_stamp)
+            .map_err(|failure| failure.cleanup.map_or(failure.cause, |cleanup| *cleanup))
+    }
+
+    fn publish_inner_report(
         mut self,
+        rows_written: u64,
+        bytes_written: u64,
+        cancel_requested: &AtomicBool,
+        capture_stamp: bool,
+    ) -> Result<(FilterExportOutcome, Option<SourceStamp>, Option<String>), PublicationFailure>
+    {
+        let result =
+            self.try_publish_inner(rows_written, bytes_written, cancel_requested, capture_stamp);
+        // Close any writer left by an early cancellation before removing staging.
+        drop(self.writer.take());
+        let cleanup = self.remove_temporary();
+        match (result, cleanup) {
+            (Ok((FilterExportOutcome::Cancelled, _, _)), Err(cleanup)) => Err(PublicationFailure {
+                cause: QuarryError::Io(io::Error::other("File operation cancelled")),
+                cleanup: Some(Box::new(cleanup)),
+            }),
+            (Ok((outcome, stamp, warning)), Err(cleanup)) => {
+                let cleanup = format!("Could not remove private output staging: {cleanup}");
+                Ok((
+                    outcome,
+                    stamp,
+                    Some(
+                        warning.map_or(cleanup.clone(), |warning| format!("{warning}; {cleanup}")),
+                    ),
+                ))
+            }
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(cause), cleanup) => Err(PublicationFailure {
+                cause,
+                cleanup: cleanup.err().map(Box::new),
+            }),
+        }
+    }
+
+    fn try_publish_inner(
+        &mut self,
         rows_written: u64,
         _bytes_written: u64,
         cancel_requested: &AtomicBool,
@@ -2698,11 +2754,13 @@ impl ExportTarget {
         let bytes_written = self.encoded_bytes_written;
         if cancel_requested.load(Ordering::Acquire) {
             drop(self.writer.take());
-            self.remove_temporary()?;
             return Ok((FilterExportOutcome::Cancelled, None, None));
         }
         let mut writer = self.writer.take().expect("export writer is present");
         let parent = output_parent(&self.destination);
+        #[cfg(test)]
+        crate::join_faults::point(crate::join_faults::Event::OutputFlush)
+            .map_err(|error| storage_error(parent, error))?;
         writer
             .flush()
             .map_err(|error| storage_error(parent, error))?;
@@ -2737,6 +2795,9 @@ impl ExportTarget {
             }
             _ => {}
         }
+        #[cfg(test)]
+        crate::join_faults::point(crate::join_faults::Event::OutputSync)
+            .map_err(|error| storage_error(parent, error))?;
         file.sync_all()
             .map_err(|error| storage_error(parent, error))?;
         let observed_output = if capture_stamp
@@ -2756,12 +2817,17 @@ impl ExportTarget {
             return Ok((FilterExportOutcome::Cancelled, None, None));
         }
         if cancel_requested.load(Ordering::Acquire) {
-            self.remove_temporary()?;
             return Ok((FilterExportOutcome::Cancelled, None, None));
         }
-        if let Err(error) = self.ensure_source_unchanged() {
-            self.remove_temporary()?;
-            return Err(error);
+        #[cfg(test)]
+        crate::join_faults::observe(crate::join_faults::Event::BeforeSourceGuard);
+        self.ensure_source_unchanged()?;
+        #[cfg(test)]
+        crate::join_faults::observe(crate::join_faults::Event::BeforePublication);
+        // Source/identity checks may perform slow filesystem I/O. Observe a
+        // cancellation that arrived during those checks before the atomic rename.
+        if cancel_requested.load(Ordering::Acquire) {
+            return Ok((FilterExportOutcome::Cancelled, None, None));
         }
         let publish_result = match &self.publication {
             Publication::CreateNew | Publication::GuardedCreateNew { .. } => {
@@ -2773,7 +2839,6 @@ impl ExportTarget {
             }
             Publication::GuardedCreateWorkingCopy { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {
-                    self.remove_temporary()?;
                     return Ok((FilterExportOutcome::Cancelled, None, None));
                 }
                 let staging = self
@@ -2798,7 +2863,6 @@ impl ExportTarget {
             }
             Publication::ReplaceSource { .. } => {
                 if cancel_requested.load(Ordering::Acquire) {
-                    self.remove_temporary()?;
                     return Ok((FilterExportOutcome::Cancelled, None, None));
                 }
                 fs::rename(&self.temporary, &self.destination)
@@ -2818,24 +2882,23 @@ impl ExportTarget {
                         destination_stamp,
                     )?;
                 if !destination_unchanged {
-                    self.remove_temporary()?;
                     return Err(QuarryError::SourceChanged);
                 }
                 if cancel_requested.load(Ordering::Acquire) {
-                    self.remove_temporary()?;
                     return Ok((FilterExportOutcome::Cancelled, None, None));
                 }
                 fs::rename(&self.temporary, &self.destination)
             }
         };
         if let Err(error) = publish_result {
-            self.remove_temporary()?;
             return Err(if error.kind() == io::ErrorKind::AlreadyExists {
                 QuarryError::ExportDestinationExists
             } else {
                 storage_error(output_parent(&self.destination), error)
             });
         }
+        #[cfg(test)]
+        crate::join_faults::observe(crate::join_faults::Event::AfterPublication);
         if let Some(staging) = &self.pinned_staging {
             self.destination = staging.reported_path().map_err(|error| {
                 storage_error(
@@ -2846,10 +2909,6 @@ impl ExportTarget {
                 )
             })?;
         }
-        let cleanup_warning = self
-            .remove_temporary()
-            .err()
-            .map(|error| format!("Could not remove private output staging: {error}"));
         // Keep the original output descriptor. A replacement at the destination
         // must never provide the provenance for an index built from our bytes.
         // Filesystems without metadata-only change verification safely re-index.
@@ -2876,7 +2935,7 @@ impl ExportTarget {
                 bytes_written,
             }),
             published_stamp,
-            cleanup_warning,
+            None,
         ))
     }
 
