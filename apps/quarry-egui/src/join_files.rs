@@ -1,11 +1,9 @@
 use super::*;
-use quarry_core::{JoinConfig, JoinInput, JoinJob, JoinPlan, JoinSummary, analyze_join};
+use quarry_core::JoinHeader as HeaderInfo;
+use quarry_core::{
+    JoinConfig, JoinInput, JoinJob, JoinPlan, JoinSummary, analyze_join, read_join_header,
+};
 use std::thread::{self, JoinHandle};
-
-struct HeaderInfo {
-    delimiter: u8,
-    columns: Vec<String>,
-}
 
 /// Modeless join draft; source and destination reservations live with this state.
 pub(super) struct JoinDialog {
@@ -13,7 +11,7 @@ pub(super) struct JoinDialog {
     headers: [Option<HeaderInfo>; 2],
     keys: [usize; 2],
     temporary: PathBuf,
-    header_job: Option<(usize, JoinHandle<Result<HeaderInfo, String>>)>,
+    header_job: Option<(usize, JoinJob<HeaderInfo>)>,
     checking: Option<JoinJob<JoinPlan>>,
     writing: Option<JoinJob<JoinSummary>>,
     cleanup: Option<JoinHandle<Result<(), String>>>,
@@ -113,6 +111,9 @@ impl JoinDialog {
 
     /// Request worker cancellation without dropping a running writer on the UI thread.
     fn cancel(&mut self) {
+        if let Some((_, job)) = &self.header_job {
+            job.cancel();
+        }
         if let Some(job) = &self.checking {
             job.cancel();
         }
@@ -127,17 +128,23 @@ impl JoinDialog {
         if self
             .header_job
             .as_ref()
-            .is_some_and(|(_, job)| job.is_finished())
+            .is_some_and(|(_, job)| job.progress().done)
         {
             let (side, job) = self.header_job.take().unwrap();
-            match job.join() {
-                Ok(Ok(header)) => {
-                    self.headers[side] = Some(header);
-                    self.keys[side] = 0;
+            let result = job.wait();
+            if self.cancel_requested {
+                self.message = Some("Header reading cancelled.".into());
+            } else {
+                match result {
+                    Ok(Some(header)) => {
+                        self.headers[side] = Some(header);
+                        self.keys[side] = 0;
+                    }
+                    Ok(None) => self.message = Some("Header reading cancelled.".into()),
+                    Err(error) => self.message = Some(error.to_string()),
                 }
-                Ok(Err(error)) => self.message = Some(error),
-                Err(_) => self.message = Some("Reading the file header failed.".into()),
             }
+            self.cancel_requested = false;
         }
         if self
             .checking
@@ -200,47 +207,11 @@ impl JoinDialog {
         self.message = None;
         self.result = None;
         self.destination = None;
-        self.header_job = Some((
-            side,
-            thread::spawn(move || {
-                let session = quarry_core::Session::open_with_encoding(
-                    &path,
-                    OpenOptions {
-                        rows: 1,
-                        header_mode: HeaderMode::FirstRow,
-                        ..Default::default()
-                    },
-                    Some(Encoding::Utf8),
-                )
-                .map_err(|e| e.to_string())?;
-                let row = session
-                    .first_rows
-                    .first()
-                    .ok_or("The file is empty and has no header.")?;
-                if row.fields.is_empty() {
-                    return Err("The file has no header columns.".into());
-                }
-                // Header labels have a separate 512 KiB aggregate text budget.
-                let each = (512 * 1024 / row.fields.len()).clamp(1, 256);
-                let columns = row
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        let text = std::str::from_utf8(field)
-                            .map_err(|_| "The header is not valid UTF-8.")?;
-                        let mut end = text.len().min(each);
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        Ok(text[..end].to_string())
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                Ok(HeaderInfo {
-                    delimiter: session.dialect.delimiter,
-                    columns,
-                })
-            }),
-        ));
+        self.cancel_requested = false;
+        match read_join_header(path) {
+            Ok(job) => self.header_job = Some((side, job)),
+            Err(error) => self.message = Some(error.to_string()),
+        }
     }
 
     /// Capture explicit saved-file settings for the full analysis worker.
@@ -788,5 +759,23 @@ mod tests {
                 "closing the dialog must not retry the cancelled quit"
             );
         }
+    }
+    #[test]
+    fn cancelling_a_header_read_discards_its_unadopted_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path(), "header.csv", b"id,name\nx,A\n");
+        let mut dialog = JoinDialog::new(dir.path().to_path_buf());
+        dialog.read_header(0, path);
+        while !dialog.header_job.as_ref().unwrap().1.progress().done {
+            thread::yield_now();
+        }
+        dialog.cancel();
+        dialog.poll();
+        assert!(
+            dialog.headers[0].is_none(),
+            "cancelled header must not populate the draft"
+        );
+        assert!(dialog.message.as_ref().unwrap().contains("cancelled"));
+        assert!(!dialog.running_operation());
     }
 }

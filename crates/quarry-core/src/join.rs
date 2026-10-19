@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -31,6 +31,119 @@ pub struct JoinInput {
     pub has_header: bool,
     pub encoding: Option<Encoding>,
     pub key_column: usize,
+}
+
+/// Bounded labels for selecting a saved input's key column.
+pub struct JoinHeader {
+    pub delimiter: u8,
+    pub columns: Vec<String>,
+}
+
+/// Check cancellation between bounded filesystem reads and seeks.
+struct HeaderReader<'a, R> {
+    inner: R,
+    state: &'a Progress,
+}
+
+impl<R: Read> Read for HeaderReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.state.cancel.load(Ordering::Acquire) {
+            return Err(io::Error::other("Header reading cancelled."));
+        }
+        let limit = buffer.len().min(READ_CHUNK);
+        let count = self.inner.read(&mut buffer[..limit])?;
+        self.state.bytes.fetch_add(count as u64, Ordering::Release);
+        Ok(count)
+    }
+}
+
+impl<R: Seek> Seek for HeaderReader<'_, R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        if self.state.cancel.load(Ordering::Acquire) {
+            return Err(io::Error::other("Header reading cancelled."));
+        }
+        self.inner.seek(position)
+    }
+}
+
+fn header_info(path: &Path, state: &Progress) -> JResult<JoinHeader> {
+    state.check()?;
+    state.phase(JoinPhase::Inspecting);
+    if !fs::metadata(path)?.is_file() {
+        return Err(input_error(path, None, "Select a regular file.").into());
+    }
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(input_error(path, None, "Select a regular file.").into());
+    }
+    let stamp = SourceStamp::from_file(&file)?;
+    Encoding::detect(&mut file, Some(Encoding::Utf8))?;
+    state.check()?;
+    let mut reader = HeaderReader {
+        inner: &mut file,
+        state,
+    };
+    let result = (|| -> Result<JoinHeader, QuarryError> {
+        let delimiter = crate::detect_file_delimiter(
+            &mut reader,
+            stamp.file_size(),
+            crate::DEFAULT_SAMPLE_BYTES,
+            crate::DEFAULT_BOOTSTRAP_LIMIT,
+            Encoding::Utf8,
+        )?;
+        reader.seek(SeekFrom::Start(0))?;
+        let (bytes, ends) = crate::read_initial_records(
+            &mut reader,
+            stamp.file_size(),
+            delimiter,
+            1,
+            crate::DEFAULT_BOOTSTRAP_LIMIT,
+            Encoding::Utf8,
+        )?;
+        let end = *ends
+            .first()
+            .ok_or_else(|| input_error(path, None, "The file is empty and has no header."))?
+            as usize;
+        let parsed = fields(
+            &bytes[..end],
+            delimiter,
+            true,
+            path,
+            0,
+            JoinConfig::default(),
+        )
+        .map_err(|failure| match failure {
+            Failure::Error(e) => e,
+            Failure::Cancelled => error("Header reading cancelled."),
+        })?;
+        if parsed.is_empty() {
+            return Err(input_error(path, None, "The file has no header columns."));
+        }
+        let each = (512 * 1024 / parsed.len()).clamp(1, 256);
+        let columns = parsed
+            .iter()
+            .map(|field| {
+                let text = std::str::from_utf8(field).expect("validated UTF-8");
+                let mut end = text.len().min(each);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text[..end].to_string()
+            })
+            .collect();
+        Ok(JoinHeader { delimiter, columns })
+    })();
+    state.check()?;
+    let header = result?;
+    if !source_matches_stamp(&file, path, &stamp)? {
+        return Err(QuarryError::SourceChanged.into());
+    }
+    Ok(header)
+}
+
+/// Read only bounded key-picker metadata with the same cancellable job lifecycle as analysis.
+pub fn read_join_header(path: PathBuf) -> Result<JoinJob<JoinHeader>, QuarryError> {
+    JoinJob::spawn(move |state| header_info(&path, state))
 }
 
 /// Resource limits are internal policy, shared by analysis and creation.
@@ -2113,5 +2226,50 @@ mod tests {
         );
         assert!(!destination.exists());
         assert!(workspaces(dir.path()).is_empty());
+    }
+    #[test]
+    fn header_reader_cancellation_stops_future_reads_and_seeks() {
+        let state = Progress::new();
+        let mut reader = HeaderReader {
+            inner: std::io::Cursor::new(vec![b'x'; READ_CHUNK * 2]),
+            state: &state,
+        };
+        let mut buffer = vec![0; READ_CHUNK * 2];
+        assert_eq!(reader.read(&mut buffer).unwrap(), READ_CHUNK);
+        let position = reader.inner.position();
+        state.cancel.store(true, Ordering::Release);
+        assert!(reader.read(&mut buffer).is_err());
+        assert!(reader.seek(SeekFrom::Start(0)).is_err());
+        assert_eq!(reader.inner.position(), position);
+        assert!(matches!(
+            header_info(Path::new("not-opened.csv"), &state),
+            Err(Failure::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn header_jobs_preserve_detection_and_bound_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headers.tsv");
+        fs::write(&path, format!("id\t{}\n1\tvalue\n", "é".repeat(200))).unwrap();
+        let header = read_join_header(path.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.delimiter, b'\t');
+        assert_eq!(header.columns[0], "id");
+        assert_eq!(header.columns[1].len(), 256);
+        assert!(header.columns.iter().map(String::len).sum::<usize>() <= 512 * 1024);
+        fs::write(&path, b"\xff,value\n").unwrap();
+        assert!(read_join_header(path.clone()).unwrap().wait().is_err());
+        fs::write(&path, b"").unwrap();
+        assert!(read_join_header(path).unwrap().wait().is_err());
+        assert!(
+            read_join_header(dir.path().to_path_buf())
+                .unwrap()
+                .wait()
+                .is_err()
+        );
     }
 }

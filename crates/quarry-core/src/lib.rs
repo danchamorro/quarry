@@ -54,9 +54,10 @@ pub use inspection::{
     InspectionProgress, InspectionReport, InspectionStatus, RecoveryJob, RecoverySummary,
     SourcePreview,
 };
+pub use join::read_join_header;
 pub use join::{
-    JoinAnalysis, JoinConfig, JoinInput, JoinInputInfo, JoinJob, JoinPhase, JoinPlan, JoinProgress,
-    JoinSummary, analyze_join,
+    JoinAnalysis, JoinConfig, JoinHeader, JoinInput, JoinInputInfo, JoinJob, JoinPhase, JoinPlan,
+    JoinProgress, JoinSummary, analyze_join,
 };
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
@@ -551,7 +552,7 @@ impl Session {
 }
 
 fn read_initial_records(
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     file_size: u64,
     delimiter: u8,
     wanted: usize,
@@ -622,7 +623,7 @@ fn materialize_rows(
 }
 
 fn detect_file_delimiter(
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     file_size: u64,
     sample_bytes: usize,
     limit: usize,
