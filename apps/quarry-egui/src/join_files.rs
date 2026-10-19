@@ -407,7 +407,7 @@ impl JoinDialog {
                 ui.label("Match key columns and create a separate joined file.");
                 ui.small("Saved UTF-8 files with headers. Retain every matching pair. Empty keys never match.");
                 ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant.");
-                egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-210.0).max(180.0)).show(ui,|ui|{
+                egui::ScrollArea::vertical().max_height((ui.available_height()-70.0).min(ctx.content_rect().height()-180.0).max(40.0)).show(ui,|ui|{
                     ui.add_enabled_ui(editable, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Rows to keep:");
@@ -1234,6 +1234,45 @@ mod tests {
         app.join_files.as_mut().unwrap().read_header(0, replacement);
         finish(&mut app);
         assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[0, 1]]);
+    }
+    #[test]
+    fn footer_actions_remain_visible_when_pair_list_scrolls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        app.join_files.as_mut().unwrap().keys = vec![[0, 0], [1, 1]];
+        app.join_files.as_mut().unwrap().start_analysis();
+        finish(&mut app);
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 450.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.show_join_files(ctx),
+            ));
+        }
+        let output = output.unwrap();
+        let labels = output
+            .shapes
+            .iter()
+            .filter(|clipped| {
+                matches!(&clipped.shape,
+            egui::Shape::Text(text) if text.galley.job.text=="Reset Analysis")
+            })
+            .collect::<Vec<_>>();
+        assert!(!labels.is_empty(), "the footer must be painted");
+        assert!(
+            labels.iter().all(|shape| shape
+                .clip_rect
+                .contains_rect(shape.shape.visual_bounding_rect())),
+            "footer actions must fit inside their clipping rectangle"
+        );
     }
     #[test]
     fn existing_output_keeps_analysis_and_existing_bytes() {
