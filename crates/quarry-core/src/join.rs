@@ -161,12 +161,43 @@ pub fn read_join_header(path: PathBuf) -> Result<JoinJob<JoinHeader>, QuarryErro
     JoinJob::spawn(move |state| header_info(&path, state))
 }
 
-/// Resource limits are internal policy, shared by analysis and creation.
+/// Which source rows are retained, with stable order defined by the driving side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JoinMode {
+    #[default]
+    Left,
+    Inner,
+    Right,
+    Full,
+}
+
+impl JoinMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Keep all Main rows",
+            Self::Inner => "Matching rows only",
+            Self::Right => "Keep all Additional rows",
+            Self::Full => "Keep all rows from both files",
+        }
+    }
+
+    fn retains(self, main: bool, additional: bool) -> bool {
+        match (main, additional) {
+            (true, true) => true,
+            (true, false) => matches!(self, Self::Left | Self::Full),
+            (false, true) => matches!(self, Self::Right | Self::Full),
+            (false, false) => false,
+        }
+    }
+}
+
+/// Join behavior and resource limits, shared by analysis and creation.
 #[derive(Clone, Copy, Debug)]
 pub struct JoinConfig {
+    pub mode: JoinMode,
     pub memory_bytes: usize,
     pub run_memory_bytes: usize,
-    /// Target capacity of a Main-side row block; a single larger record is allowed.
+    /// Target capacity of the driving-side row block; a single larger record is allowed.
     pub group_memory_bytes: usize,
     pub max_record_bytes: usize,
     pub max_columns: usize,
@@ -178,6 +209,7 @@ pub struct JoinConfig {
 impl Default for JoinConfig {
     fn default() -> Self {
         Self {
+            mode: JoinMode::Left,
             memory_bytes: 512 * 1024 * 1024,
             run_memory_bytes: 16 * 1024 * 1024,
             group_memory_bytes: 8 * 1024 * 1024,
@@ -1241,18 +1273,23 @@ fn output_header(
 /// Pad absent fields and serialize values without changing their contents.
 fn output_record(
     inputs: &[PreparedInput; 2],
-    left: &[u8],
+    left: Option<&[u8]>,
     right: Option<&[u8]>,
     config: JoinConfig,
 ) -> JResult<Vec<u8>> {
-    let a = fields(
-        left,
-        inputs[0].info.delimiter,
-        false,
-        &inputs[0].info.path,
-        0,
-        config,
-    )?;
+    let a = left
+        .map(|record| {
+            fields(
+                record,
+                inputs[0].info.delimiter,
+                false,
+                &inputs[0].info.path,
+                0,
+                config,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
     let b = right
         .map(|record| {
             fields(
@@ -1638,36 +1675,47 @@ impl<'a> RangeRows<'a> {
     }
 }
 
-/// Enumerate all pairs by bounded Main blocks and streamed Additional rows.
-/// The final ordinal pass establishes public order independently of block order.
+/// Stream retained pairs using bounded blocks of the side that drives public order.
 fn enumerate_pairs(
     inputs: &[PreparedInput; 2],
-    left: GroupRange,
+    left: Option<GroupRange>,
     right: Option<GroupRange>,
     config: JoinConfig,
     state: &Progress,
     limit: Option<usize>,
-    mut emit: impl FnMut(&OwnedRow, Option<&OwnedRow>) -> JResult<()>,
+    mut emit: impl FnMut(Option<&OwnedRow>, Option<&OwnedRow>) -> JResult<()>,
 ) -> JResult<()> {
+    if !config.mode.retains(left.is_some(), right.is_some()) {
+        return Ok(());
+    }
     let mut config = config;
     if limit.is_some() {
         config.group_memory_bytes = 1;
     }
-    let mut a = RangeRows::new(&inputs[0], left, config, state)?;
+    let primary = usize::from(left.is_none() || config.mode == JoinMode::Right);
+    let ranges = [left, right];
+    let mut a = RangeRows::new(&inputs[primary], ranges[primary].unwrap(), config, state)?;
     let mut emitted = 0_usize;
-    if let Some(right) = right {
+    let mut visit = |first: &OwnedRow, second: Option<&OwnedRow>| -> JResult<bool> {
+        state.check()?;
+        if primary == 0 {
+            emit(Some(first), second)?;
+        } else {
+            emit(second, Some(first))?;
+        }
+        emitted = emitted.saturating_add(1);
+        Ok(limit.is_some_and(|limit| emitted >= limit))
+    };
+    if let Some(other) = ranges[1 - primary] {
         loop {
             let block = a.block()?;
             if block.is_empty() {
                 break;
             }
-            let mut b = RangeRows::new(&inputs[1], right, config, state)?;
+            let mut b = RangeRows::new(&inputs[1 - primary], other, config, state)?;
             while let Some(row) = b.next()? {
-                for main in &block {
-                    state.check()?;
-                    emit(main, Some(&row))?;
-                    emitted = emitted.saturating_add(1);
-                    if limit.is_some_and(|limit| emitted >= limit) {
+                for first in &block {
+                    if visit(first, Some(&row))? {
                         return Ok(());
                     }
                 }
@@ -1675,10 +1723,7 @@ fn enumerate_pairs(
         }
     } else {
         while let Some(row) = a.next()? {
-            state.check()?;
-            emit(&row, None)?;
-            emitted = emitted.saturating_add(1);
-            if limit.is_some_and(|limit| emitted >= limit) {
+            if visit(&row, None)? {
                 return Ok(());
             }
         }
@@ -1686,11 +1731,43 @@ fn enumerate_pairs(
     Ok(())
 }
 
-fn pair_key(main: u64, additional: Option<u64>) -> Vec<u8> {
+fn pair_order(mode: JoinMode, main: Option<u64>, additional: Option<u64>) -> (u64, u64) {
+    let main = main.unwrap_or(u64::MAX);
+    let additional = additional.unwrap_or(u64::MAX);
+    if mode == JoinMode::Right {
+        (additional, main)
+    } else {
+        (main, additional)
+    }
+}
+
+fn pair_key(order: (u64, u64)) -> Vec<u8> {
     let mut key = Vec::with_capacity(16);
-    key.extend_from_slice(&main.to_be_bytes());
-    key.extend_from_slice(&additional.unwrap_or(u64::MAX).to_be_bytes());
+    key.extend_from_slice(&order.0.to_be_bytes());
+    key.extend_from_slice(&order.1.to_be_bytes());
     key
+}
+
+/// Validate ordinal bounds and retained-side rules before publication.
+fn valid_pair_order(key: &[u8], ordinal: u64, mode: JoinMode, rows: [u64; 2]) -> bool {
+    if key.len() != 16 {
+        return false;
+    }
+    let first = u64::from_be_bytes(key[..8].try_into().unwrap());
+    let second = u64::from_be_bytes(key[8..].try_into().unwrap());
+    if first != ordinal {
+        return false;
+    }
+    let (main, additional) = if mode == JoinMode::Right {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    let main_present = main != u64::MAX;
+    let additional_present = additional != u64::MAX;
+    mode.retains(main_present, additional_present)
+        && (!main_present || main < rows[0])
+        && (!additional_present || additional < rows[1])
 }
 
 /// Bound displayed columns and text independently of full result values.
@@ -1803,56 +1880,66 @@ fn analyze_prepared(
                 output_rows = add(output_rows, count)?;
                 output_bytes = add(output_bytes, bytes)?;
             }
-            (Some(a), None) => {
-                unmatched[0] = add(unmatched[0], a.rows)?;
-                output_rows = add(output_rows, a.rows)?;
-                output_bytes = add(output_bytes, add(a.value_bytes, mul(a.rows, columns)?)?)?;
-                if a.max_value_bytes.saturating_add(columns as usize) > config.max_record_bytes {
-                    return Err(error("A joined record exceeds the configured size limit.").into());
+            (a, b) => {
+                let (side, group) = if let Some(a) = a {
+                    (0, a)
+                } else {
+                    (1, b.unwrap())
+                };
+                unmatched[side] = add(unmatched[side], group.rows)?;
+                if config.mode.retains(a.is_some(), b.is_some()) {
+                    output_rows = add(output_rows, group.rows)?;
+                    output_bytes = add(
+                        output_bytes,
+                        add(group.value_bytes, mul(group.rows, columns)?)?,
+                    )?;
+                    if group.max_value_bytes.saturating_add(columns as usize)
+                        > config.max_record_bytes
+                    {
+                        return Err(
+                            error("A joined record exceeds the configured size limit.").into()
+                        );
+                    }
                 }
             }
-            (None, Some(b)) => unmatched[1] = add(unmatched[1], b.rows)?,
-            _ => unreachable!(),
         }
-        if let Some(a) = left {
-            if config.preview_rows > 0 {
-                enumerate_pairs(
-                    inputs,
-                    a,
-                    right,
-                    config,
-                    state,
-                    Some(config.preview_rows),
-                    |a, b| {
-                        let row = output_record(
-                            inputs,
-                            &a.record,
-                            b.map(|b| b.record.as_slice()),
-                            config,
-                        )?;
-                        let key = (a.ordinal, b.map_or(u64::MAX, |b| b.ordinal));
-                        if preview.len() < config.preview_rows
-                            || preview
-                                .last_key_value()
-                                .is_some_and(|(&last, _)| key < last)
-                        {
-                            preview.insert(
-                                key,
-                                preview_row(
-                                    &row,
-                                    inputs[0].info.delimiter,
-                                    config.preview_bytes / config.preview_rows,
-                                    config,
-                                )?,
-                            );
-                            if preview.len() > config.preview_rows {
-                                preview.pop_last();
-                            }
+        if config.preview_rows > 0 {
+            enumerate_pairs(
+                inputs,
+                left,
+                right,
+                config,
+                state,
+                Some(config.preview_rows),
+                |a, b| {
+                    let row = output_record(
+                        inputs,
+                        a.map(|a| a.record.as_slice()),
+                        b.map(|b| b.record.as_slice()),
+                        config,
+                    )?;
+                    let key = pair_order(config.mode, a.map(|a| a.ordinal), b.map(|b| b.ordinal));
+                    if preview.len() < config.preview_rows
+                        || preview
+                            .last_key_value()
+                            .is_some_and(|(&last, _)| key < last)
+                    {
+                        preview.insert(
+                            key,
+                            preview_row(
+                                &row,
+                                inputs[0].info.delimiter,
+                                config.preview_bytes / config.preview_rows,
+                                config,
+                            )?,
+                        );
+                        if preview.len() > config.preview_rows {
+                            preview.pop_last();
                         }
-                        Ok(())
-                    },
-                )?;
-            }
+                    }
+                    Ok(())
+                },
+            )?;
         }
         state
             .records
@@ -2073,35 +2160,36 @@ impl JoinPlan {
             let mut count = 0;
             let mut bytes = 0;
             walk_groups(&self.inputs, self.config, state, |left, right| {
-                if let Some(left) = left {
-                    let a = left.into_range();
-                    let b = right.map(Group::into_range);
-                    enumerate_pairs(
-                        &self.inputs,
-                        a,
-                        b,
-                        self.config,
-                        state,
-                        None,
-                        |left, right| {
-                            let row = output_record(
-                                &self.inputs,
-                                &left.record,
-                                right.map(|r| r.record.as_slice()),
-                                self.config,
-                            )?;
-                            count = add(count, 1)?;
-                            bytes = add(bytes, row.len() as u64)?;
-                            runs.push(Entry {
-                                key: pair_key(left.ordinal, right.map(|r| r.ordinal)),
-                                record: row,
-                                ordinal: left.ordinal,
-                            })?;
-                            state.records.store(count, Ordering::Release);
-                            Ok(())
-                        },
-                    )?;
-                }
+                enumerate_pairs(
+                    &self.inputs,
+                    left.map(Group::into_range),
+                    right.map(Group::into_range),
+                    self.config,
+                    state,
+                    None,
+                    |left, right| {
+                        let row = output_record(
+                            &self.inputs,
+                            left.map(|r| r.record.as_slice()),
+                            right.map(|r| r.record.as_slice()),
+                            self.config,
+                        )?;
+                        count = add(count, 1)?;
+                        bytes = add(bytes, row.len() as u64)?;
+                        let order = pair_order(
+                            self.config.mode,
+                            left.map(|r| r.ordinal),
+                            right.map(|r| r.ordinal),
+                        );
+                        runs.push(Entry {
+                            key: pair_key(order),
+                            record: row,
+                            ordinal: order.0,
+                        })?;
+                        state.records.store(count, Ordering::Release);
+                        Ok(())
+                    },
+                )?;
                 Ok(())
             })?;
             let ordered = runs.finish()?;
@@ -2117,12 +2205,14 @@ impl JoinPlan {
             let mut ordinal = 0;
             let mut previous_order: Option<Vec<u8>> = None;
             while let Some(head) = read_head(&mut reader, self.config, state)? {
-                if head.key.len() != 16
-                    || head.ordinal >= self.inputs[0].info.data_rows
-                    || head.key[..8] != head.ordinal.to_be_bytes()
-                    || previous_order
-                        .as_ref()
-                        .is_some_and(|previous| previous >= &head.key)
+                if !valid_pair_order(
+                    &head.key,
+                    head.ordinal,
+                    self.config.mode,
+                    [self.inputs[0].info.data_rows, self.inputs[1].info.data_rows],
+                ) || previous_order
+                    .as_ref()
+                    .is_some_and(|previous| previous >= &head.key)
                 {
                     return Err(error("Joined row pairs are not in source order.").into());
                 }
@@ -2354,6 +2444,7 @@ mod tests {
     /// Exercise multiple spill passes with small but valid resource budgets.
     fn config() -> JoinConfig {
         JoinConfig {
+            mode: JoinMode::Left,
             memory_bytes: 512 * 1024,
             run_memory_bytes: 128,
             group_memory_bytes: 64,
@@ -3250,5 +3341,248 @@ mod tests {
             ..group
         };
         assert!(matched_group_output(large, large, 4, 1024).is_err());
+    }
+    // Deliberately separate CSV serialization and nested-loop ordering oracle.
+    fn oracle_csv(rows: &[Vec<String>]) -> Vec<u8> {
+        let mut result = String::new();
+        for row in rows {
+            for (i, field) in row.iter().enumerate() {
+                if i > 0 {
+                    result.push(',');
+                }
+                if field.contains([',', '"', '\r', '\n'])
+                    || (i == 0 && field.starts_with('\u{feff}'))
+                {
+                    result.push('"');
+                    result.push_str(&field.replace('"', "\"\""));
+                    result.push('"');
+                } else {
+                    result.push_str(field);
+                }
+            }
+            result.push('\n');
+        }
+        result.into_bytes()
+    }
+
+    fn oracle_matches(a: &[String], b: &[String]) -> bool {
+        !a[0].is_empty() && a[0] == b[0]
+    }
+
+    fn oracle_rows(mode: JoinMode, a: &[Vec<String>], b: &[Vec<String>]) -> Vec<Vec<String>> {
+        let pair = |a: Option<&Vec<String>>, b: Option<&Vec<String>>| -> Vec<String> {
+            (0..2)
+                .map(|i| a.map_or_else(String::new, |row| row[i].clone()))
+                .chain((0..2).map(|i| b.map_or_else(String::new, |row| row[i].clone())))
+                .collect()
+        };
+        let mut rows = Vec::new();
+        if mode == JoinMode::Right {
+            for right in b {
+                let mut found = false;
+                for left in a {
+                    if oracle_matches(left, right) {
+                        found = true;
+                        rows.push(pair(Some(left), Some(right)));
+                    }
+                }
+                if !found {
+                    rows.push(pair(None, Some(right)));
+                }
+            }
+        } else {
+            let mut seen = vec![false; b.len()];
+            for left in a {
+                let mut found = false;
+                for (i, right) in b.iter().enumerate() {
+                    if oracle_matches(left, right) {
+                        found = true;
+                        seen[i] = true;
+                        rows.push(pair(Some(left), Some(right)));
+                    }
+                }
+                if !found && mode != JoinMode::Inner {
+                    rows.push(pair(Some(left), None));
+                }
+            }
+            if mode == JoinMode::Full {
+                for (i, right) in b.iter().enumerate() {
+                    if !seen[i] {
+                        rows.push(pair(None, Some(right)));
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn every_join_mode_matches_an_independent_oracle_through_spills_and_reopen() {
+        let rows = |data: &[(&str, &str)]| -> Vec<Vec<String>> {
+            data.iter()
+                .map(|(key, value)| vec![key.to_string(), value.to_string()])
+                .collect()
+        };
+        let cases = [
+            (
+                rows(&[
+                    ("x", "A0"),
+                    ("z", "solo"),
+                    ("x", "A1"),
+                    ("", "empty"),
+                    (" ", "space"),
+                    ("01", "zero"),
+                    ("a", "lower"),
+                    ("À", "unicode"),
+                    ("B", "quote,\"line\nnext"),
+                ]),
+                rows(&[
+                    ("x", "R0"),
+                    ("u", "extra"),
+                    ("x", "R1"),
+                    ("", "empty-other"),
+                    (" ", "space-right"),
+                    ("1", "one"),
+                    ("A", "upper"),
+                    ("A\u{300}", "decomposed"),
+                    ("B", "match"),
+                ]),
+            ),
+            (vec![], rows(&[("x", "one"), ("", "empty"), ("x", "two")])),
+            (rows(&[("x", "one"), ("", "empty"), ("x", "two")]), vec![]),
+            (vec![], vec![]),
+            (rows(&[("a", "left")]), rows(&[("b", "right")])),
+            (
+                rows(&[("x", "L1"), ("x", "L2")]),
+                rows(&[("x", "R1"), ("y", "R2"), ("y", "R3")]),
+            ),
+        ];
+        for (a, b) in cases {
+            for mode in [
+                JoinMode::Left,
+                JoinMode::Inner,
+                JoinMode::Right,
+                JoinMode::Full,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let header = vec!["key".to_string(), "value".to_string()];
+                let mut source_a = vec![header.clone()];
+                source_a.extend(a.clone());
+                let mut source_b = vec![header];
+                source_b.extend(b.clone());
+                let source_a = oracle_csv(&source_a);
+                let source_b = oracle_csv(&source_b);
+                let cfg = JoinConfig {
+                    mode,
+                    run_memory_bytes: 128,
+                    group_memory_bytes: 64,
+                    ..config()
+                };
+                let p = duplicate_plan(dir.path(), &source_a, &source_b, cfg);
+                let wanted = oracle_rows(mode, &a, &b);
+                let mut expected = vec![vec![
+                    "key (Main)".into(),
+                    "value (Main)".into(),
+                    "key (Additional)".into(),
+                    "value (Additional)".into(),
+                ]];
+                expected.extend(wanted.clone());
+                let expected = oracle_csv(&expected);
+                let pairs = a
+                    .iter()
+                    .flat_map(|left| b.iter().map(move |right| oracle_matches(left, right)))
+                    .filter(|v| *v)
+                    .count() as u64;
+                let main_matches = a
+                    .iter()
+                    .filter(|left| b.iter().any(|right| oracle_matches(left, right)))
+                    .count() as u64;
+                let additional_matches = b
+                    .iter()
+                    .filter(|right| a.iter().any(|left| oracle_matches(left, right)))
+                    .count() as u64;
+                assert_eq!(p.analysis.matching_pairs, pairs, "{mode:?}");
+                assert_eq!(p.analysis.matching_rows, [main_matches, additional_matches]);
+                assert_eq!(
+                    p.analysis.unmatched_rows,
+                    [
+                        a.len() as u64 - main_matches,
+                        b.len() as u64 - additional_matches
+                    ]
+                );
+                assert_eq!(p.analysis.output_rows, wanted.len() as u64, "{mode:?}");
+                assert_eq!(p.analysis.output_bytes, expected.len() as u64, "{mode:?}");
+                assert_eq!(
+                    p.analysis.preview,
+                    wanted
+                        .into_iter()
+                        .take(cfg.preview_rows)
+                        .collect::<Vec<_>>(),
+                    "{mode:?}"
+                );
+                let output = dir.path().join("joined.csv");
+                let summary = p
+                    .start_write_acknowledged(output.clone(), true)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    summary.data_rows + 1,
+                    crate::Session::open(
+                        &output,
+                        crate::OpenOptions {
+                            rows: 100,
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap()
+                    .first_rows
+                    .len() as u64
+                );
+                assert_eq!(fs::read(&output).unwrap(), expected, "{mode:?}");
+                assert_eq!(fs::read(dir.path().join("main.csv")).unwrap(), source_a);
+                assert_eq!(
+                    fs::read(dir.path().join("additional.csv")).unwrap(),
+                    source_b
+                );
+                assert!(workspaces(dir.path()).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn output_order_validation_rejects_wrong_sides_and_out_of_range_ordinals() {
+        for mode in [
+            JoinMode::Left,
+            JoinMode::Inner,
+            JoinMode::Right,
+            JoinMode::Full,
+        ] {
+            for (main, additional, valid) in [
+                (Some(1), Some(2), true),
+                (Some(2), Some(1), false),
+                (Some(0), Some(3), false),
+                (None, None, false),
+                (
+                    Some(0),
+                    None,
+                    matches!(mode, JoinMode::Left | JoinMode::Full),
+                ),
+                (
+                    None,
+                    Some(0),
+                    matches!(mode, JoinMode::Right | JoinMode::Full),
+                ),
+            ] {
+                let order = pair_order(mode, main, additional);
+                assert_eq!(
+                    valid_pair_order(&pair_key(order), order.0, mode, [2, 3]),
+                    valid,
+                    "{mode:?}"
+                );
+                assert!(!valid_pair_order(&pair_key(order), 42, mode, [2, 3]));
+            }
+        }
     }
 }

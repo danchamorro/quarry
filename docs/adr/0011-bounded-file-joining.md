@@ -52,7 +52,6 @@ The extraction must leave existing sort and duplicate outputs, error categories,
 
 Subsequent tickets prove joining separately with a small independent oracle and complete native workflows. Large-file acceptance must include data larger than RAM, a duplicate group larger than the join's in-memory block, long/composite keys, mostly unmatched data, and failure/cancellation in each phase. Record release-build RSS, peak temporary disk, elapsed time, cancellation latency and exact results; do not infer join performance from existing sort evidence.
 
-
 ### Cross-platform source and cleanup guards
 
 Windows source versions capture the volume ID, 128-bit file ID and change time from the file handle, sampled around generic metadata capture. Path revalidation opens the named file as well as checking the retained handle. Same-size replacements and in-place rewrites with restored modification times must invalidate the selected schema. This extends the shared source-stamp contract used by join, combine and existing operations; Unix source-stamp behavior remains unchanged. Targeted Windows core CI exercises these guards, directory rename locking and nonrecursive output cleanup. It does not introduce a Windows application port.
@@ -67,3 +66,11 @@ A retained preview owns a pinned spill directory, not authority to recursively r
 Private permission enforcement is required for all spill callers, including sort and duplicate removal. If a temporary volume cannot enforce owner-only access, fail before writing data and direct the user to another temporary folder. Every failed reservation attempts nonrecursive cleanup through its captured directory; preserve unrelated entries and report cleanup failure. Do not restore the older permissive behavior on such volumes.
 
 The registry contains only live run identities: obsolete-run unlinking removes its entry. Join's existing bounded run-level count also bounds this metadata, and the aggregate reservation includes both displayed paths and identity/registry overhead. Destination membership uses the captured spill directory identity as well, so renaming it cannot allow output into owned scratch. Sorting and duplicate removal retain their frame format, naming, comparisons and result behavior while adopting the same storage ownership.
+
+## Row-retention modes
+
+The analysis configuration captures Left, Inner, Right or Full mode before a plan is retained. Counts of source matches and unmatched rows always describe both complete inputs; the projected output includes only rows retained by the chosen mode.
+
+Matching pairs use Main then Additional ordinals for Left, Inner and Full, and Additional then Main ordinals for Right. Full appends Additional-only rows after all Main-driven rows. The private ordinal key uses the absent-side sentinel only where the mode permits it; publication validates both ordinal bounds and the retained-side rule. Preview uses the same ordering key as creation. Pair enumeration streams bounded blocks from the side driving that mode, so the preview's first pairs have the public order even when groups exceed the memory budget.
+
+An absent source side serializes to empty fields without changing the order or width of either source's columns. Source comparison, full-input validation, uniqueness, duplicate acknowledgement, reservations and publication safeguards are unchanged.

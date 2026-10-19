@@ -1,7 +1,7 @@
 use super::*;
 use quarry_core::JoinHeader as HeaderInfo;
 use quarry_core::{
-    JoinConfig, JoinInput, JoinJob, JoinPlan, JoinSummary, analyze_join, read_join_header,
+    JoinConfig, JoinInput, JoinJob, JoinMode, JoinPlan, JoinSummary, analyze_join, read_join_header,
 };
 use std::thread::{self, JoinHandle};
 
@@ -12,6 +12,7 @@ pub(super) struct JoinDialog {
     keys: [usize; 2],
     require_unique: [bool; 2],
     acknowledge_expansion: bool,
+    mode: JoinMode,
     temporary: PathBuf,
     header_job: Option<(usize, JoinJob<HeaderInfo>)>,
     checking: Option<JoinJob<JoinPlan>>,
@@ -46,6 +47,7 @@ impl JoinDialog {
             keys: [0, 0],
             require_unique: [false, false],
             acknowledge_expansion: false,
+            mode: JoinMode::Left,
             temporary,
             header_job: None,
             checking: None,
@@ -244,7 +246,14 @@ impl JoinDialog {
         self.message = None;
         self.result = None;
         self.cancel_requested = false;
-        match analyze_join(inputs, self.temporary.clone(), JoinConfig::default()) {
+        match analyze_join(
+            inputs,
+            self.temporary.clone(),
+            JoinConfig {
+                mode: self.mode,
+                ..JoinConfig::default()
+            },
+        ) {
             Ok(job) => self.checking = Some(job),
             Err(error) => self.message = Some(error.to_string()),
         }
@@ -281,9 +290,19 @@ impl JoinDialog {
             .open(&mut open).default_width(680.0).min_width(480.0)
             .show(ctx,|ui|{
                 ui.label("Match key columns and create a separate joined file.");
-                ui.small("Saved UTF-8 files with headers. Keep all Main rows and every matching pair. Empty keys never match.");
+                ui.small("Saved UTF-8 files with headers. Retain every matching pair. Empty keys never match.");
                 ui.small("Keys match exactly, including case and whitespace.");
                 egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-210.0).max(180.0)).show(ui,|ui|{
+                    ui.add_enabled_ui(editable, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Rows to keep:");
+                            egui::ComboBox::from_id_salt("join-mode").selected_text(self.mode.label()).show_ui(ui, |ui| {
+                                for mode in [JoinMode::Left, JoinMode::Inner, JoinMode::Right, JoinMode::Full] {
+                                    ui.selectable_value(&mut self.mode, mode, mode.label());
+                                }
+                            });
+                        });
+                    });
                     ui.columns(2,|columns|{
                         for (side,column) in columns.iter_mut().enumerate(){
                             column.strong(if side==0{"Main file"}else{"Additional file"});
@@ -567,7 +586,7 @@ mod tests {
         let (id, _) = tree
             .nodes
             .iter()
-            .find(|(_, node)| node.label() == Some(label))
+            .find(|(_, node)| node.label() == Some(label) || node.value() == Some(label))
             .unwrap_or_else(|| panic!("missing button {label}"));
         frame(
             app,
@@ -976,6 +995,46 @@ mod tests {
                 .unwrap()
                 .contains("Require unique key")
         );
+    }
+    #[test]
+    fn mode_picker_controls_preview_creation_and_output_order() {
+        for (mode, expected) in [
+            (
+                JoinMode::Left,
+                b"b,Bob,b,LA\na,Alice,a,Seattle\nz,Last,,\n".as_slice(),
+            ),
+            (
+                JoinMode::Inner,
+                b"b,Bob,b,LA\na,Alice,a,Seattle\n".as_slice(),
+            ),
+            (
+                JoinMode::Right,
+                b"a,Alice,a,Seattle\nb,Bob,b,LA\n".as_slice(),
+            ),
+            (
+                JoinMode::Full,
+                b"b,Bob,b,LA\na,Alice,a,Seattle\nz,Last,,\n".as_slice(),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = QuarryApp::new(None, Instant::now());
+            let ctx = context();
+            prepare(&mut app, dir.path());
+            if mode != JoinMode::Left {
+                click(&mut app, &ctx, JoinMode::Left.label());
+                click(&mut app, &ctx, mode.label());
+            }
+            assert_eq!(app.join_files.as_ref().unwrap().mode, mode);
+            click(&mut app, &ctx, "Analyze & Preview");
+            finish(&mut app);
+            let output = dir.path().join("mode.csv");
+            app.join_files.as_mut().unwrap().destination = Some(output.clone());
+            click(&mut app, &ctx, "Create Joined File");
+            finish(&mut app);
+            let mut wanted = b"id (Main),name,id (Additional),city\n".to_vec();
+            wanted.extend_from_slice(expected);
+            assert_eq!(fs::read(output).unwrap(), wanted, "{mode:?}");
+        }
     }
     #[test]
     fn existing_output_keeps_analysis_and_existing_bytes() {
