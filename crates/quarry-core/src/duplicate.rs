@@ -374,7 +374,7 @@ fn run_duplicates(
         ),
         output_bytes,
     )?;
-    let workspace = RunWorkspace::create_in(temporary_directory)?;
+    let workspace = RunWorkspace::create_in(temporary_directory, "sort")?;
     let built = (|| {
         let ScanOutcome::Complete(mut scan) = create_initial_runs(
             source,
@@ -556,7 +556,7 @@ fn retain_first_runs(
             reader.seek_relative(item.head.record_len as i64)?;
             state.duplicate_rows.fetch_add(1, Ordering::AcqRel);
         } else {
-            let record = read_record(reader, item.head.record_len)?;
+            let record = read_record(reader, item.head.record_len, config.max_record_bytes)?;
             let entry_size = record.len().saturating_add(32);
             if !entries.is_empty()
                 && entry_bytes.saturating_add(entry_size) > config.run_memory_bytes
