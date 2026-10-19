@@ -41,4 +41,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo test -p quarry-core --locked windows_
       - run: cargo test -p quarry-core --locked pinned_publication_reports_cleanup_failure
+      - run: cargo test -p quarry-core --locked spill::tests
       - run: cargo build -p quarry-core -p quarry-delimited --release --locked

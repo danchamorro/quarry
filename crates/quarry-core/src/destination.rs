@@ -11,10 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
-struct Directory {
+pub(crate) struct Directory {
     path: PathBuf,
     #[cfg(unix)]
-    file: File,
+    pub(crate) file: File,
     // Denying delete sharing pins every resolved component on Windows, where
     // std path operations otherwise allow a parent to be replaced underneath us.
     #[cfg(windows)]
@@ -47,7 +47,7 @@ fn identity(file: &File) -> io::Result<(u64, u64)> {
 }
 
 impl Directory {
-    fn open(path: &Path) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         {
             let file = File::from(rustix::fs::open(
@@ -121,7 +121,7 @@ impl Directory {
         }
     }
 
-    fn current_path(&self) -> io::Result<PathBuf> {
+    pub(crate) fn current_path(&self) -> io::Result<PathBuf> {
         #[cfg(target_os = "macos")]
         let path = {
             use std::os::unix::ffi::OsStringExt;
@@ -145,7 +145,7 @@ impl Directory {
         }
     }
 
-    fn still_named_by(&self, path: &Path) -> bool {
+    pub(crate) fn still_named_by(&self, path: &Path) -> bool {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -202,10 +202,10 @@ impl PreparedDestination {
         }
     }
 
-    pub(crate) fn ensure_outside(&self, excluded: &Path) -> Result<(), QuarryError> {
+    pub(crate) fn ensure_outside_directory(&self, excluded: &Directory) -> Result<(), QuarryError> {
         #[cfg(unix)]
         {
-            let excluded = identity(&File::open(excluded)?)?;
+            let excluded = identity(&excluded.file)?;
             let mut current = self.parent.file.try_clone()?;
             for _ in 0..1024 {
                 let here = identity(&current)?;
@@ -230,7 +230,7 @@ impl PreparedDestination {
         }
         #[cfg(not(unix))]
         {
-            if self.parent.path.starts_with(excluded.canonicalize()?) {
+            if self.parent.path.starts_with(&excluded.path) {
                 Err(workspace_error())
             } else {
                 Ok(())

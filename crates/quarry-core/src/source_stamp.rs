@@ -54,6 +54,21 @@ pub(crate) struct SourceStamp {
 }
 
 impl SourceStamp {
+    /// Spill ownership ignores size/time changes while its own writer appends.
+    #[cfg(not(unix))]
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        #[cfg(windows)]
+        {
+            self.windows.is_some()
+                && self.windows.map(|v| v.identity) == other.windows.map(|v| v.identity)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = other;
+            false
+        }
+    }
+
     pub(crate) fn file_size(&self) -> u64 {
         self.len
     }

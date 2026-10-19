@@ -493,10 +493,10 @@ fn run_duplicates(
     }
 }
 
-fn remove_runs(paths: &[PathBuf], shared: &SharedState) -> Result<(), QuarryError> {
+fn remove_runs(paths: &[SpillFile], shared: &SharedState) -> Result<(), QuarryError> {
     for path in paths {
-        let bytes = fs::metadata(path)?.len();
-        fs::remove_file(path)?;
+        let bytes = path.metadata()?.len();
+        path.remove()?;
         shared.remove_temporary_bytes(bytes);
     }
     Ok(())
@@ -504,7 +504,7 @@ fn remove_runs(paths: &[PathBuf], shared: &SharedState) -> Result<(), QuarryErro
 
 fn flush_survivors(
     entries: &mut Vec<RunEntry>,
-    runs: &mut Vec<PathBuf>,
+    runs: &mut Vec<SpillFile>,
     workspace: &RunWorkspace,
     shared: &SharedState,
 ) -> Result<bool, QuarryError> {
@@ -526,11 +526,11 @@ fn flush_survivors(
 }
 
 fn retain_first_runs(
-    paths: &[PathBuf],
+    paths: &[SpillFile],
     config: SortConfig,
     workspace: &RunWorkspace,
     state: &DuplicateState,
-) -> Result<Option<(Vec<PathBuf>, RecordMultisetFingerprint)>, QuarryError> {
+) -> Result<Option<(Vec<SpillFile>, RecordMultisetFingerprint)>, QuarryError> {
     let shared = &state.sort;
     let mut readers = open_run_readers(paths)?;
     let Some(mut heap) = seed_heap(

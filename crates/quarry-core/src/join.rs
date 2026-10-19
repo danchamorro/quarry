@@ -15,7 +15,7 @@ use quarry_delimited::parse_record_with_field_limit;
 
 use crate::encoding::RecordScanner;
 use crate::export::{ExportTarget, source_matches_stamp};
-use crate::spill::{self, FrameHead, FrameLimits, FrameReadError, SpillWorkspace};
+use crate::spill::{self, FrameHead, FrameLimits, FrameReadError, SpillFile, SpillWorkspace};
 use crate::storage::output_parent;
 use crate::{Encoding, FilterExportOutcome, QuarryError, SourceStamp, check_storage};
 
@@ -446,7 +446,12 @@ impl JoinConfig {
         // Worst concurrent payloads: two headers, two records, two parsed
         // quoted-field copies, and one output. Run buffers, previews, column
         // metadata, bounded run paths and reader buffers are accounted separately.
-        let path_bytes = temporary.as_os_str().len().saturating_add(128);
+        // Include directory ownership, live file identities and tree-node overhead.
+        let path_bytes = temporary
+            .as_os_str()
+            .len()
+            .saturating_mul(2)
+            .saturating_add(512);
         let reserved = self
             .max_record_bytes
             .saturating_mul(7)
@@ -498,7 +503,7 @@ struct PreparedInput {
     info: JoinInputInfo,
     stamp: SourceStamp,
     key_column: usize,
-    sorted: PathBuf,
+    sorted: SpillFile,
     frame_bytes: u64,
 }
 
@@ -508,7 +513,7 @@ struct Entry {
     ordinal: u64,
 }
 struct Run {
-    path: PathBuf,
+    path: SpillFile,
     bytes: u64,
 }
 
@@ -684,7 +689,7 @@ impl<'a> Runs<'a> {
         self.state.check()?;
         let mut readers: Vec<_> = runs
             .iter()
-            .map(|run| open_regular_file(&run.path).map(BufReader::new))
+            .map(|run| run.path.open().map(BufReader::new))
             .collect::<Result<_, _>>()?;
         let mut heap = BinaryHeap::new();
         for (stream, reader) in readers.iter_mut().enumerate() {
@@ -716,7 +721,7 @@ impl<'a> Runs<'a> {
         drop(writer);
         drop(readers);
         for run in runs {
-            fs::remove_file(run.path)?;
+            run.path.remove()?;
             self.state.temporary.fetch_sub(run.bytes, Ordering::AcqRel);
         }
         Ok(Run { path, bytes })
@@ -1248,7 +1253,7 @@ struct Stream<'a> {
 }
 impl<'a> Stream<'a> {
     fn new(input: &'a PreparedInput, config: JoinConfig, state: &'a Progress) -> JResult<Self> {
-        let mut reader = BufReader::new(open_regular_file(&input.sorted)?);
+        let mut reader = BufReader::new(input.sorted.open()?);
         let head = read_head(&mut reader, config, state)?;
         Ok(Self {
             input,
@@ -1344,7 +1349,7 @@ fn walk(
 
 /// Reject duplicate keys and malformed ordering before retaining a plan.
 fn validate_keys(input: &PreparedInput, config: JoinConfig, state: &Progress) -> JResult<()> {
-    let mut reader = BufReader::new(open_regular_file(&input.sorted)?);
+    let mut reader = BufReader::new(input.sorted.open()?);
     let mut previous: Option<FrameHead> = None;
     let mut count = 0;
     while let Some(head) = read_head(&mut reader, config, state)? {
@@ -1638,7 +1643,7 @@ impl JoinPlan {
         state.check()?;
         let prepared_destination =
             crate::destination::PreparedDestination::new(destination.to_path_buf())?;
-        prepared_destination.ensure_outside(&workspace.path)?;
+        workspace.ensure_output_outside(&prepared_destination)?;
         let retained = add(self.inputs[0].frame_bytes, self.inputs[1].frame_bytes)?;
         state.add_disk(retained)?;
         for input in &self.inputs {
@@ -1697,7 +1702,7 @@ impl JoinPlan {
                     error("Join output differs from the analyzed plan. Analyze again.").into(),
                 );
             }
-            let mut reader = BufReader::new(open_regular_file(&ordered.path)?);
+            let mut reader = BufReader::new(ordered.path.open()?);
             let mut ordinal = 0;
             while let Some(head) = read_head(&mut reader, self.config, state)? {
                 if head.ordinal != ordinal || head.key != ordinal.to_be_bytes() {
@@ -1766,6 +1771,62 @@ impl JoinPlan {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_workspace_replacement_never_deletes_a_substituted_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        for action in ["release", "drop", "create"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+            let source = inputs(
+                dir.path(),
+                b"id,value\nx,Main\n",
+                b"id,value\nx,Additional\n",
+            );
+            let plan = analyze_join(source, dir.path().to_path_buf(), config())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            let workspace = plan.workspace.as_ref().unwrap().path.clone();
+            let moved = dir.path().join("moved-private");
+            let victim = dir.path().join("victim");
+            fs::create_dir_all(victim.join("nested")).unwrap();
+            fs::write(victim.join("nested/keep.csv"), b"unrelated,data\nkeep,me\n").unwrap();
+            fs::rename(&workspace, &moved).unwrap();
+            fs::rename(&victim, &workspace).unwrap();
+            match action {
+                "release" => {
+                    plan.release().unwrap();
+                }
+                "drop" => drop(plan),
+                _ => {
+                    let output = dir.path().join("joined.csv");
+                    plan.start_write(output.clone())
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(fs::read(output).unwrap(),
+                        b"id (Main),value (Main),id (Additional),value (Additional)\nx,Main,x,Additional\n");
+                }
+            }
+            assert_eq!(
+                fs::read(workspace.join("nested/keep.csv")).unwrap(),
+                b"unrelated,data\nkeep,me\n",
+                "cleanup must leave the substituted tree untouched"
+            );
+            assert!(
+                !moved.exists(),
+                "the captured workspace itself should be cleaned"
+            );
+            assert_eq!(
+                fs::read(dir.path().join("main.csv")).unwrap(),
+                b"id,value\nx,Main\n"
+            );
+        }
+    }
 
     #[cfg(unix)]
     fn replace_with_fifo(path: &Path) {
@@ -2257,6 +2318,9 @@ mod tests {
                 .collect::<String>()
         );
         let mut cfg = config();
+        // Four streams also reserve the bounded ownership registry and paths.
+        // Keep the tiny run buffer, so cancellation still crosses spill passes.
+        cfg.memory_bytes = 1024 * 1024;
         cfg.run_memory_bytes = 32 * 1024;
         cfg.max_merge_fan_in = 4;
         let args = inputs(dir.path(), a.as_bytes(), b"id,value\nnone,other\n");
@@ -2420,7 +2484,7 @@ mod tests {
         let workspace = SpillWorkspace::create_in(dir.path(), "join").unwrap();
         let prepared =
             crate::destination::PreparedDestination::new(alias.join("joined.csv")).unwrap();
-        prepared.ensure_outside(&workspace.path).unwrap();
+        workspace.ensure_output_outside(&prepared).unwrap();
         // Deterministically schedule the symlink change after validation.
         fs::remove_file(&alias).unwrap();
         symlink(&workspace.path, &alias).unwrap();
@@ -2490,7 +2554,7 @@ mod tests {
         fs::remove_file(&alias).unwrap();
         symlink(&outside, &alias).unwrap();
         assert!(
-            prepared.ensure_outside(&workspace.path).is_err(),
+            workspace.ensure_output_outside(&prepared).is_err(),
             "moving the alias cannot change the selected directory's workspace membership"
         );
         workspace.cleanup().unwrap();
