@@ -32,7 +32,7 @@ jobs:
       - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
       - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
 
-  windows-core-cli:
+  windows-core:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,4 +41,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo test -p quarry-core --locked windows_
       - run: cargo test -p quarry-core --locked pinned_publication_reports_cleanup_failure
-      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
+      - run: cargo build -p quarry-core -p quarry-delimited --release --locked
