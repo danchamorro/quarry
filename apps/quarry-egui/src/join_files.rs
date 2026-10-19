@@ -915,8 +915,10 @@ mod tests {
         let (a, b) = prepare(&mut app, dir.path());
         fs::write(&a, b"id,name\nx,A\nx,B\n").unwrap();
         fs::write(&b, b"id,city\nx,One\nx,Two\n").unwrap();
-        app.join_files.as_mut().unwrap().read_header(0,a); finish(&mut app);
-        app.join_files.as_mut().unwrap().read_header(1,b); finish(&mut app);
+        app.join_files.as_mut().unwrap().read_header(0, a);
+        finish(&mut app);
+        app.join_files.as_mut().unwrap().read_header(1, b);
+        finish(&mut app);
         click(&mut app, &ctx, "Analyze & Preview");
         finish(&mut app);
         assert_eq!(
@@ -959,7 +961,8 @@ mod tests {
         let ctx = context();
         let (a, _) = prepare(&mut app, dir.path());
         fs::write(&a, b"id,name\nx,A\nx,B\n").unwrap();
-        app.join_files.as_mut().unwrap().read_header(0,a); finish(&mut app);
+        app.join_files.as_mut().unwrap().read_header(0, a);
+        finish(&mut app);
         click(&mut app, &ctx, "Require unique Main key");
         click(&mut app, &ctx, "Analyze & Preview");
         finish(&mut app);
