@@ -2137,6 +2137,25 @@ pub(crate) struct PublicationFailure {
     pub(crate) cleanup: Option<Box<QuarryError>>,
 }
 
+impl std::fmt::Display for PublicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.cause)?;
+        if let Some(cleanup) = &self.cleanup {
+            write!(
+                formatter,
+                ". Could not remove private output staging: {cleanup}"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PublicationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 pub(crate) struct ExportTarget {
     writer: Option<BufWriter<File>>,
     source_encoding: crate::Encoding,
@@ -2707,7 +2726,13 @@ impl ExportTarget {
         capture_stamp: bool,
     ) -> Result<(FilterExportOutcome, Option<SourceStamp>, Option<String>), QuarryError> {
         self.publish_inner_report(rows_written, bytes_written, cancel_requested, capture_stamp)
-            .map_err(|failure| failure.cleanup.map_or(failure.cause, |cleanup| *cleanup))
+            .map_err(|failure| {
+                if failure.cleanup.is_some() {
+                    QuarryError::Io(io::Error::other(failure))
+                } else {
+                    failure.cause
+                }
+            })
     }
 
     fn publish_inner_report(
@@ -9717,6 +9742,81 @@ mod tests {
             assert!(temporary_exports(&destination).is_empty());
         }
     }
+    #[test]
+    fn publication_wrappers_keep_primary_errors_and_staging_cleanup_context() {
+        for with_stamp in [false, true] {
+            for trigger in ["exists", "source", "cancel"] {
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("source.csv");
+                fs::write(&source, b"id\none\n").unwrap();
+                let stamp = crate::SourceStamp::from_file(&File::open(&source).unwrap()).unwrap();
+                let destination = dir.path().join("result.csv");
+                let mut target =
+                    ExportTarget::new_combined(vec![(source.clone(), stamp)], destination.clone())
+                        .unwrap();
+                target.write_all(b"id\none\n").unwrap();
+                let staged = target.temporary.clone();
+                let other = staged.parent().unwrap().join("foreign");
+                fs::write(&other, b"preserve\n").unwrap();
+                let cause = match trigger {
+                    "exists" => {
+                        fs::write(&destination, b"existing\n").unwrap();
+                        QuarryError::ExportDestinationExists.to_string()
+                    }
+                    "source" => {
+                        fs::write(&source, b"id\nchanged\n").unwrap();
+                        "File changed after validation".into()
+                    }
+                    _ => "File operation cancelled".into(),
+                };
+                let cancel = AtomicBool::new(trigger == "cancel");
+                let failure = if with_stamp {
+                    target
+                        .publish_with_stamp(1, 7, &cancel)
+                        .map(|_| ())
+                        .unwrap_err()
+                } else {
+                    target.publish(1, 7, &cancel).map(|_| ()).unwrap_err()
+                };
+                let message = failure.to_string();
+                assert!(
+                    message.contains(&cause),
+                    "{trigger} {with_stamp}: {message}"
+                );
+                let report = match &failure {
+                    QuarryError::Io(error) => error
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<super::PublicationFailure>())
+                        .unwrap(),
+                    _ => panic!("primary and cleanup errors must both remain structured"),
+                };
+                assert!(report.cleanup.is_some());
+                assert!(match trigger {
+                    "exists" => matches!(report.cause, QuarryError::ExportDestinationExists),
+                    "source" => matches!(report.cause, QuarryError::CombineFile { .. }),
+                    _ => matches!(report.cause, QuarryError::Io(_)),
+                });
+                assert!(message.contains("private output staging"), "{message}");
+                assert!(message.contains(&other.parent().unwrap().display().to_string()));
+                assert!(!staged.exists());
+                assert_eq!(fs::read(&other).unwrap(), b"preserve\n");
+                if trigger == "exists" {
+                    assert_eq!(fs::read(&destination).unwrap(), b"existing\n");
+                } else {
+                    assert!(!destination.exists());
+                }
+                assert_eq!(
+                    fs::read(&source).unwrap(),
+                    if trigger == "source" {
+                        b"id\nchanged\n".as_slice()
+                    } else {
+                        b"id\none\n".as_slice()
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn pinned_publication_reports_cleanup_failure_without_removing_unrelated_data() {
         let dir = tempfile::tempdir().unwrap();

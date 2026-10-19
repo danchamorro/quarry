@@ -49,7 +49,8 @@ pub(super) struct DocumentCleanup {
 
 /// Metadata, not storage ownership: querying a reservation can never become the
 /// final owner that removes a generation on the UI thread.
-struct CleanupReservation {
+#[derive(Clone)]
+pub(super) struct CleanupReservation {
     path: PathBuf,
     #[cfg(unix)]
     metadata: Option<std::fs::Metadata>,
@@ -80,7 +81,7 @@ impl CleanupReservation {
         false
     }
 
-    fn contains(&self, path: &Path) -> bool {
+    pub(super) fn contains(&self, path: &Path) -> bool {
         if self.directory {
             path.starts_with(&self.path) || path.ancestors().any(|parent| self.aliases(parent))
         } else {
@@ -90,6 +91,10 @@ impl CleanupReservation {
 }
 
 impl DocumentCleanup {
+    pub(super) fn path_reservations(&self) -> Vec<CleanupReservation> {
+        self.reservations.clone()
+    }
+
     fn record_warnings(&mut self, errors: impl IntoIterator<Item = String>) {
         for error in errors {
             if self.warnings.len() < 16 {
@@ -786,7 +791,7 @@ impl QuarryApp {
         });
     }
 
-    fn retire_document_tabs_with(
+    pub(super) fn retire_document_tabs_with(
         &mut self,
         ctx: &egui::Context,
         tabs: Vec<DocumentTab>,

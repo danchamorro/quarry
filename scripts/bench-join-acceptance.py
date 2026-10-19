@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic full-result join benchmarks. Requires macOS and a release probe."""
+"""Synthetic full-result join benchmarks. Builds and verifies its release probe from a clean macOS checkout."""
 import argparse
 import datetime
 import hashlib
@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -155,13 +156,55 @@ def parse_metrics(content):
     return result
 
 
+def clean_revision(repo):
+    revision = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    status = subprocess.check_output(
+        ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=normal"], text=True
+    )
+    if status.strip():
+        raise SystemExit("Benchmark builds require a clean checkout. Commit source changes before measuring.")
+    return revision
+
+
+def build_probe(repo, requested_binary):
+    revision = clean_revision(repo)
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        fallback = Path.home() / ".cargo/bin/cargo"
+        cargo = str(fallback) if fallback.is_file() else None
+    if cargo is None:
+        raise SystemExit("Cargo is required to build the measured release probe.")
+    command = [cargo, "build", "-p", "quarry-core", "--release", "--locked",
+               "--example", "join_acceptance", "--message-format=json-render-diagnostics"]
+    built = subprocess.run(command, cwd=repo, text=True, stdout=subprocess.PIPE, check=True)
+    artifacts = [json.loads(line) for line in built.stdout.splitlines() if line.startswith("{")]
+    executables = [item["executable"] for item in artifacts
+                   if item.get("reason") == "compiler-artifact" and item.get("executable")
+                   and item.get("target", {}).get("name") == "join_acceptance"
+                   and "example" in item.get("target", {}).get("kind", [])]
+    if len(executables) != 1:
+        raise SystemExit("Cargo did not identify exactly one built join_acceptance executable.")
+    if clean_revision(repo) != revision:
+        raise SystemExit("Checkout revision changed during the release build; no measurement was started.")
+    artifact = Path(executables[0]).resolve()
+    binary = Path(requested_binary).resolve() if requested_binary else artifact
+    digest = sha256(artifact)
+    if not binary.is_file() or sha256(binary) != digest:
+        raise SystemExit("The requested binary does not match the probe just built from this clean revision.")
+    return binary, revision, digest
+
+
+def verify_measured_build(repo, revision, binary, digest):
+    if clean_revision(repo) != revision or sha256(binary) != digest:
+        raise SystemExit("Source revision or measured binary changed; refusing to publish benchmark provenance.")
+
+
 def run(args):
     if sys.platform != "darwin":
         raise SystemExit("This harness records macOS time -l metrics; run it in VMPal macOS.")
     root = Path(args.root).resolve()
-    binary = Path(args.binary).resolve()
-    if not binary.is_file():
-        raise SystemExit("Build the release join_acceptance example before running this script.")
+    repo = Path(__file__).resolve().parents[1]
+    binary, source_revision, binary_digest = build_probe(repo, args.binary)
     ram = int(subprocess.check_output(["/usr/sbin/sysctl", "-n", "hw.memsize"], text=True))
     if args.reuse:
         manifest = json.loads((root / "fixture.json").read_text())
@@ -187,6 +230,7 @@ def run(args):
         command += ["--cancel-after-rows", str(args.cancel_after_rows)]
     peak_allocated = 0
     last_phase = None
+    verify_measured_build(repo, source_revision, binary, binary_digest)
     measurement_start = time.monotonic()
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with exclusive(stdout_path) as stdout, exclusive(stderr_path) as stderr:
@@ -206,6 +250,7 @@ def run(args):
     metrics = parse_metrics(stdout_path.read_text())
     stderr = stderr_path.read_text(errors="replace")
     resident = re.search(r"(\d+)\s+maximum resident set size", stderr)
+    verify_measured_build(repo, source_revision, binary, binary_digest)
     report = {
         "case": args.case, "smoke": args.smoke, "label": label,
         "fixture_id": manifest["fixture_id"], "command": command, "exit_code": exit_code,
@@ -215,9 +260,11 @@ def run(args):
         "max_rss_macos_time_bytes": int(resident.group(1)) if resident else None,
         "metrics": metrics,
         "started_at_utc": started_at,
-        "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "binary_sha256": sha256(binary),
-        "probe_source_sha256": sha256(Path("crates/quarry-core/examples/join_acceptance.rs")),
+        "source_revision": source_revision,
+        "source_status": "clean",
+        "release_build_verified": True,
+        "binary_sha256": binary_digest,
+        "probe_source_sha256": sha256(repo / "crates/quarry-core/examples/join_acceptance.rs"),
         "harness_sha256": sha256(Path(__file__).resolve()),
     }
     with exclusive(root / (label + ".report.json")) as destination:
@@ -248,7 +295,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", required=True, choices=["large", "skew", "wide"])
     parser.add_argument("--root", required=True)
-    parser.add_argument("--binary", default="target/release/examples/join_acceptance")
+    parser.add_argument("--binary", help="Optional copy; must match the probe built from the clean checkout")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--reuse", action="store_true")
     parser.add_argument("--cancel-after-rows", type=int)

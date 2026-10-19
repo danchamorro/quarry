@@ -6372,14 +6372,12 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
-        job.retain_working_storage(Arc::clone(
-            &self
-                .working_copy
-                .as_ref()
-                .expect("working storage prepared")
-                .directory,
-        ))
-        .map_err(AppMessage::core_error)?;
+        let job = self.retain_private_job_storage(
+            job,
+            &destination,
+            |job, storage| job.retain_working_storage(storage),
+            |job| job.cancel(),
+        )?;
         self.structural_job = Some(StructuralJob::InsertingRows {
             job,
             destination,
@@ -6568,14 +6566,12 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
-        job.retain_working_storage(Arc::clone(
-            &self
-                .working_copy
-                .as_ref()
-                .expect("working storage prepared")
-                .directory,
-        ))
-        .map_err(AppMessage::core_error)?;
+        let job = self.retain_private_job_storage(
+            job,
+            &destination,
+            |job, storage| job.retain_working_storage(storage),
+            |job| job.cancel(),
+        )?;
         self.structural_job = Some(StructuralJob::DeletingRows {
             job,
             destination,
@@ -6684,14 +6680,12 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
-        job.retain_working_storage(Arc::clone(
-            &self
-                .working_copy
-                .as_ref()
-                .expect("working storage prepared")
-                .directory,
-        ))
-        .map_err(AppMessage::core_error)?;
+        let job = self.retain_private_job_storage(
+            job,
+            &destination,
+            |job, storage| job.retain_working_storage(storage),
+            |job| job.cancel(),
+        )?;
         self.structural_job = Some(StructuralJob::Sorting {
             job,
             destination,
@@ -6749,14 +6743,12 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
-        job.retain_working_storage(Arc::clone(
-            &self
-                .working_copy
-                .as_ref()
-                .expect("working storage prepared")
-                .directory,
-        ))
-        .map_err(AppMessage::core_error)?;
+        let job = self.retain_private_job_storage(
+            job,
+            &destination,
+            |job, storage| job.retain_working_storage(storage),
+            |job| job.cancel(),
+        )?;
         self.structural_job = Some(StructuralJob::FindingDuplicates {
             job,
             destination,
@@ -6911,14 +6903,12 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
-        job.retain_working_storage(Arc::clone(
-            &self
-                .working_copy
-                .as_ref()
-                .expect("working storage prepared")
-                .directory,
-        ))
-        .map_err(AppMessage::core_error)?;
+        let job = self.retain_private_job_storage(
+            job,
+            &destination,
+            |job, storage| job.retain_working_storage(storage),
+            |job| job.cancel(),
+        )?;
         self.structural_job = Some(StructuralJob::Materializing {
             job,
             destination,
@@ -6970,14 +6960,12 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
-        job.retain_working_storage(Arc::clone(
-            &self
-                .working_copy
-                .as_ref()
-                .expect("working storage prepared")
-                .directory,
-        ))
-        .map_err(AppMessage::core_error)?;
+        let job = self.retain_private_job_storage(
+            job,
+            &destination,
+            |job, storage| job.retain_working_storage(storage),
+            |job| job.cancel(),
+        )?;
         self.structural_job = Some(StructuralJob::Cleaning {
             job,
             destination,
@@ -7041,14 +7029,12 @@ impl Document {
                 return Err(AppMessage::core_error(error));
             }
         };
-        job.retain_working_storage(Arc::clone(
-            &self
-                .working_copy
-                .as_ref()
-                .expect("working storage prepared")
-                .directory,
-        ))
-        .map_err(AppMessage::core_error)?;
+        let job = self.retain_private_job_storage(
+            job,
+            &destination,
+            |job, storage| job.retain_working_storage(storage),
+            |job| job.cancel(),
+        )?;
         self.structural_job = Some(StructuralJob::Replacing {
             job,
             destination,
@@ -7509,6 +7495,31 @@ impl Document {
             StructuralJob::DuplicatePreview { summary, .. } => Some(&summary.destination),
             StructuralJob::AnalyzingSplit { .. } => None,
         }
+    }
+
+    fn retain_private_job_storage<J>(
+        &mut self,
+        job: J,
+        destination: &Path,
+        retain: impl FnOnce(&J, Arc<quarry_core::WorkingCopyStorage>) -> Result<(), QuarryError>,
+        cancel: impl FnOnce(&J),
+    ) -> Result<J, AppMessage> {
+        let storage = Arc::clone(
+            &self
+                .working_copy
+                .as_ref()
+                .expect("working storage prepared")
+                .directory,
+        );
+        if let Err(error) = retain(&job, storage) {
+            // Reap the worker before releasing a possibly final directory owner.
+            cancel(&job);
+            drop(job);
+            self.remove_working_file(destination);
+            self.cleanup_empty_working_copy();
+            return Err(AppMessage::core_error(error));
+        }
+        Ok(job)
     }
 
     fn remove_working_file(&self, path: &Path) {
@@ -24459,5 +24470,71 @@ mod tests {
         });
         reader.join().unwrap();
         assert_eq!(fs::read(path).unwrap(), b"name,value\nrow,x\n");
+    }
+
+    #[test]
+    fn rejected_private_job_handoff_reaps_worker_and_releases_first_working_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        fs::write(&source, b"name,value\nrow,original\n").unwrap();
+        let mut document = Document::open(
+            &source,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_index(&mut document);
+        document.working_directory = directory.path().to_owned();
+        commit_test_cell(&mut document, 1, 1, "pending");
+        let preparation = document.prepare_materialization().unwrap();
+        let root = document
+            .working_copy
+            .as_ref()
+            .unwrap()
+            .directory
+            .path()
+            .to_owned();
+        let job = document
+            .session
+            .start_create_working_copy(
+                preparation.renames,
+                document.owned_cell_edits(),
+                quarry_core::ColumnTransformation::Arrange {
+                    source_width: 2,
+                    output_columns: vec![1, 0],
+                },
+                &preparation.destination,
+            )
+            .unwrap();
+        job.retain_working_storage(Arc::clone(
+            &document.working_copy.as_ref().unwrap().directory,
+        ))
+        .unwrap();
+        let failure = document
+            .retain_private_job_storage(
+                job,
+                &preparation.destination,
+                |job, storage| job.retain_working_storage(storage),
+                |job| job.cancel(),
+            )
+            .err()
+            .expect("a repeated real handoff must be rejected");
+        assert!(failure.text.contains("already retained"));
+        assert!(
+            document.working_copy.is_none(),
+            "a failed handoff must release a first-time empty working state"
+        );
+        assert!(document.original_session.is_none());
+        assert!(
+            !root.exists(),
+            "the rejected worker must be reaped before its last storage owner drops"
+        );
+        assert!(!preparation.destination.exists());
+        assert!(document.structural_job.is_none());
+        assert_eq!(document.cell_edits[&(1, 1)].as_slice(), b"pending");
+        assert!(document.can_undo());
+        assert_eq!(fs::read(source).unwrap(), b"name,value\nrow,original\n");
     }
 }
