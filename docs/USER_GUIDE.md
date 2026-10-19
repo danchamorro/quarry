@@ -9,6 +9,7 @@ delimited files in the Quarry macOS app.
 - [How to](#how-to)
   - [Work with document tabs](#work-with-document-tabs)
   - [Combine files](#combine-files)
+  - [Join files](#join-files)
   - [Navigate the grid](#navigate-the-grid)
   - [Inspect whitespace](#inspect-whitespace)
   - [Select and copy data](#select-and-copy-data)
@@ -154,7 +155,10 @@ finish before the tab closes; you can keep editing or cancel the operation.
 Quitting reviews every document. Cancelling any quit prompt retains all tabs and
 their edits, including earlier discard approvals. Files already saved stay saved.
 If Combine Files is open, quit keeps its selections and running operation intact.
-Explicitly close that dialog (or cancel its operation) before quitting.
+Explicitly close that dialog (or cancel its operation) before quitting. Join Files
+also offers cancellation and waits for private-data cleanup before closing.
+Final document cleanup runs in the background with visible progress; a cleanup
+failure remains visible and cancels automatic quitting.
 
 Quarry supports eight open tabs and two simultaneous save/export/reshape
 operations. If you reach a limit, close a tab or wait for/cancel an operation.
@@ -206,6 +210,106 @@ Opening the result creates a tab and retains every other document's unsaved work
 Combining creates a separate
 file, so it is not a change in the current document's Undo history. Once opened,
 the result supports the usual editing, Undo/Redo, filtering, Save and Save As.
+
+### Join files
+
+Use **File → Join Files…** to match records from two different files and bring
+their columns into a new file. For example, match an orders file's customer ID
+to a customers file's ID to add the customer's city to each order.
+
+1. Choose the **Main** and **Additional** inputs. Use **Choose Main…** /
+   **Choose Additional…** for saved files, or their open-document menus for
+   current documents. Browsing to an already-open file uses that document's
+   current values too, including unsaved cell, header and structural edits.
+   The dialog identifies current documents and inherits their applied formats.
+2. For saved inputs, check each file's header, delimiter and encoding choices.
+   The two inputs may have different delimiters or supported encodings.
+   Auto detects Unicode BOMs; choose legacy encodings explicitly.
+3. Select the paired key columns. Use **Add key pair** for a compound key,
+   up to sixteen pairs. All pairs must match. Column names need not be equal.
+   Use the pair's move/remove controls to change its position.
+4. Choose **Rows to keep**, then select, order and name the output columns.
+   Both inputs' columns, including both keys, are initially included.
+   Select a column to rename its output heading or use the ordering controls.
+   The source headings stay unchanged. Choose whether to write an output header.
+5. Choose **Analyze & Preview**. Quarry scans the complete inputs in the
+   background. Review the exact row/match/unmatched/empty-key counts, duplicate
+   groups, projected result rows and storage allowance. Result, unmatched and
+   duplicate examples are bounded samples; long values are clipped.
+6. Review any row-expansion or newly discovered-column warning. Check its
+   acknowledgement before creating the file. **Reset Analysis** releases the
+   preview so you can change inputs, keys, mode or columns and analyze again.
+7. Choose **Choose Output…**, select a new destination, then choose
+   **Create Joined File**.
+8. After completion, review the actual saved rows and bytes. Choose
+   **Open Joined File** to open it in an ordinary editable tab.
+
+**Rows to keep**
+
+| Choice | Result |
+|---|---|
+| Keep all Main rows | Every Main row, with matching Additional values or empty Additional fields |
+| Matching rows only | Only matching pairs |
+| Keep all Additional rows | Every Additional row, with matching Main values or empty Main fields |
+| Keep all rows from both files | All Main-driven rows, followed by unmatched Additional rows |
+
+Matching keeps every pair. Two Main rows and three Additional rows with the
+same key produce six rows. If both sides repeat a matching key, Quarry requires
+acknowledgement of the exact expansion. **Require unique Main key** and
+**Require unique Additional key** instead reject repeated nonempty keys in the
+chosen input; they do not discard duplicates or select a first match.
+
+Keys match complete text values. Comparison is case-sensitive by default.
+**Ignore ASCII letter case (A–Z only)** ignores English-letter case in keys.
+Leading zeros, whitespace, non-ASCII case and Unicode normalization differences
+remain significant. Matching never cleans or changes the saved values. A missing
+or zero-length key component never matches another row, including another empty
+key. In the default mode, **001** and **1** are different keys.
+
+Main-retaining and matching-only results follow Main row order, then Additional
+row order for multiple matches. The all-rows mode appends Additional-only rows in
+their original order. The Additional-retaining mode follows Additional row order,
+then Main row order for multiple matches.
+
+Joining uses all current rows, including hidden columns independently of their
+display order. Clear filters and wait for selected inputs to become idle first.
+Commit a valid editor draft before analysis; an invalid or oversized draft must
+be corrected. While analysis, a retained preview or creation owns selected
+documents, Quarry reserves them against editing, saving, reloading and closing.
+Other documents remain usable. Resetting or closing the preview releases those
+reservations after cleanup.
+
+A full scan can find columns beyond those initially shown, including extra
+fields in later ragged rows. New columns are included by default and require
+renewed review. Missing fields become empty output cells. Automatic headings
+identify unnamed columns and disambiguate conflicting names by source and number;
+renaming headings to the same text produces a warning. Select at least one
+output column, with at most 65,536 in the result. The 64 MiB serialized-record
+limit also applies to the result and its header; narrow the selection or shorten
+headings if needed. Header-only inputs are supported. A completely empty file
+needs a usable schema before it can be joined.
+
+The result is UTF-8 without a BOM, uses Main's delimiter and LF record separators,
+and correctly quotes embedded delimiters, quotes and line breaks. Original field
+values are preserved. A separate result does not enter either input's Undo
+history. Once opened, it supports normal editing, Undo/Redo, filtering and saving.
+At the eight-tab limit, the saved result remains available until a slot is freed.
+
+Large joins can need substantial temporary space, especially when duplicate keys
+multiply rows. Choose a suitable **File → Temporary storage…** folder before
+starting. Analysis scans all data and may take time; phase names and counters
+show progress. An idle preview retains private input data but releases its running
+operation slot. Joining participates in Quarry's two-operation limit.
+
+Creation rechecks inputs, destination ownership and available space. It creates a
+new file and never overwrites an existing destination, input, another document's
+working file or an active writer. Changed inputs require renewed analysis.
+Cancellation or failure before publication preserves source files and existing
+destinations and removes owned unpublished data where the filesystem permits.
+After publication, the completed result is retained. If cleanup fails, the
+message identifies the remaining folder; review those files before removing
+anything. Close and quit wait visibly for active cleanup and retain unsaved-work
+reviews.
 
 ### Navigate the grid
 

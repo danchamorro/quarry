@@ -772,6 +772,111 @@ impl JoinDialog {
         }
     }
 
+    /// Render the retained analysis through the same view used by the dialog.
+    fn show_analysis(&mut self, ui: &mut egui::Ui) {
+        if let Some(plan) = &self.plan {
+            let a = plan.analysis();
+            ui.separator();
+            ui.label(format!(
+                "Main: {} rows · Additional: {} rows",
+                a.input_rows[0], a.input_rows[1]
+            ));
+            ui.label(format!(
+                "Matching rows: {} Main, {} Additional",
+                a.matching_rows[0], a.matching_rows[1]
+            ));
+            ui.label(format!(
+                "Matching pairs: {} · Result: {} rows",
+                a.matching_pairs, a.output_rows
+            ));
+            ui.label(format!(
+                "Unmatched: {} Main, {} Additional",
+                a.unmatched_rows[0], a.unmatched_rows[1]
+            ));
+            ui.label(format!(
+                "Empty keys: {} Main, {} Additional",
+                a.empty_key_rows[0], a.empty_key_rows[1]
+            ));
+            ui.label(format!(
+                "Duplicate-key groups: {} Main, {} Additional",
+                a.duplicate_groups[0], a.duplicate_groups[1]
+            ));
+            if a.new_columns != [0, 0] {
+                ui.label(format!("Full scan found {} new Main columns and {} new Additional columns. They are included in the output.", a.new_columns[0], a.new_columns[1]));
+                ui.small("Review the output columns above. Use Reset Analysis to change their selection, order or headings.");
+                ui.checkbox(
+                    &mut self.acknowledge_layout,
+                    "I reviewed the newly discovered output columns.",
+                );
+            }
+            if a.many_to_many_groups > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "{} many-to-many groups produce {} matching pairs.",
+                        a.many_to_many_groups, a.many_to_many_pairs
+                    ))
+                    .strong(),
+                );
+                ui.checkbox(
+                    &mut self.acknowledge_expansion,
+                    format!("I understand this will create {} rows.", a.output_rows),
+                );
+            }
+            if !a.duplicate_samples.is_empty() {
+                ui.small("Duplicate-key examples (sample; clipped comparison keys)");
+            }
+            for sample in &a.duplicate_samples {
+                ui.small(format!(
+                    "Key {}: {} Main × {} Additional",
+                    sample.key, sample.main_rows, sample.additional_rows
+                ));
+            }
+            if a.unmatched_samples
+                .iter()
+                .any(|samples| !samples.is_empty())
+            {
+                ui.small("Unmatched examples (sample; data-row numbers, clipped comparison keys)");
+                for (side, samples) in a.unmatched_samples.iter().enumerate() {
+                    let role = if side == 0 { "Main" } else { "Additional" };
+                    for sample in samples {
+                        let key = sample.key.as_ref().map_or_else(
+                            || "empty or missing key component".into(),
+                            |key| format!("key {key}"),
+                        );
+                        ui.small(format!("{role} data row {} · {key}", sample.data_row));
+                    }
+                }
+            }
+            ui.small(format!(
+                "Output: {} · Conservative additional storage: {}",
+                format_bytes(a.output_bytes),
+                format_bytes(a.additional_temporary_bytes)
+            ));
+            ui.small(
+                "Sample in output order; at most 20 rows and columns. Long values are clipped.",
+            );
+            if a.duplicate_headers && a.include_header {
+                ui.label("The output contains duplicate headings.");
+            }
+            egui::ScrollArea::both().max_height(150.0).show(ui, |ui| {
+                egui::Grid::new("join-preview")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for name in a.output_headers.iter().take(20) {
+                            ui.strong(name.chars().take(64).collect::<String>());
+                        }
+                        ui.end_row();
+                        for row in &a.preview {
+                            for field in row {
+                                ui.label(field);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+    }
+
     /// Pair identity and ordering are shared by both sources.
     fn show_key_pairs(&mut self, ui: &mut egui::Ui) {
         ui.separator();
@@ -955,37 +1060,7 @@ impl JoinDialog {
                     });
                     ui.add_enabled_ui(editable, |ui| self.show_key_pairs(ui));
                     ui.add_enabled_ui(editable, |ui| self.show_output_columns(ui));
-                    if let Some(plan)=&self.plan{
-                        let a=plan.analysis();
-                        ui.separator();
-                        ui.label(format!("Main: {} rows · Additional: {} rows",a.input_rows[0],a.input_rows[1]));
-                        ui.label(format!("Matching pairs: {} · Result: {} rows",a.matching_pairs,a.output_rows));
-                        ui.label(format!("Unmatched: {} Main, {} Additional",a.unmatched_rows[0],a.unmatched_rows[1]));
-                        ui.label(format!("Empty keys: {} Main, {} Additional",a.empty_key_rows[0],a.empty_key_rows[1]));
-                        ui.label(format!("Duplicate-key groups: {} Main, {} Additional",a.duplicate_groups[0],a.duplicate_groups[1]));
-                        if a.new_columns != [0, 0] {
-                            ui.label(format!("Full scan found {} new Main columns and {} new Additional columns. They are included in the output.", a.new_columns[0], a.new_columns[1]));
-                            ui.small("Review the output columns above. Use Reset Analysis to change their selection, order or headings.");
-                            ui.checkbox(&mut self.acknowledge_layout, "I reviewed the newly discovered output columns.");
-                        }
-                        if a.many_to_many_groups > 0 {
-                            ui.label(RichText::new(format!("{} many-to-many groups produce {} matching pairs.",a.many_to_many_groups,a.many_to_many_pairs)).strong());
-                            ui.checkbox(&mut self.acknowledge_expansion,format!("I understand this will create {} rows.",a.output_rows));
-                        }
-                        for sample in &a.duplicate_samples {
-                            ui.small(format!("Key {}: {} Main × {} Additional",sample.key,sample.main_rows,sample.additional_rows));
-                        }
-                        ui.small(format!("Output: {} · Conservative additional storage: {}",format_bytes(a.output_bytes),format_bytes(a.additional_temporary_bytes)));
-                        ui.small("Sample in output order; at most 20 rows and columns. Long values are clipped.");
-                        if a.duplicate_headers && a.include_header { ui.label("The output contains duplicate headings."); }
-                        egui::ScrollArea::both().max_height(150.0).show(ui,|ui|{
-                            egui::Grid::new("join-preview").striped(true).show(ui,|ui|{
-                                for name in a.output_headers.iter().take(20) { ui.strong(name.chars().take(64).collect::<String>()); }
-                                ui.end_row();
-                                for row in &a.preview {for field in row{ui.label(field);}ui.end_row();}
-                            });
-                        });
-                    }
+                    self.show_analysis(ui);
                     if let Some(result)=&self.result {
                         ui.separator();ui.strong(format!("Saved {} rows · {}",result.data_rows,format_bytes(result.bytes_written)));
                         ui.add(egui::Label::new(result.destination.display().to_string()).wrap());
@@ -3181,11 +3256,14 @@ value
         finish(&mut app);
         let dialog = app.join_files.as_ref().unwrap();
         assert!(dialog.plan.is_none() && dialog.writing.is_none() && dialog.result.is_none());
+        let message = dialog
+            .message
+            .as_ref()
+            .expect("source conflict must be visible");
+        assert!(message.contains("changed"), "{message}");
         assert!(
-            dialog
-                .message
-                .as_ref()
-                .is_some_and(|message| message.contains("changed"))
+            message.contains("Main input") && message.contains(&a.display().to_string()),
+            "source conflict must identify its logical input and role: {message}"
         );
         assert!(app.write_slot_available());
         assert!(!output.exists());
@@ -3209,5 +3287,91 @@ value
         }
         assert_eq!(fs::read(a).unwrap(), b"id,value\nx,external-main\n");
         assert_eq!(fs::read(b).unwrap(), b"id,value\nx,saved-additional\n");
+    }
+
+    #[test]
+    fn analysis_shows_matching_row_counts_and_separate_unmatched_examples() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(
+            dir.path(),
+            "review-main.csv",
+            b"id,value\nmatch,Main\nleft-only,Main unmatched\n,Empty\n",
+        );
+        let b = fixture(
+            dir.path(),
+            "review-additional.csv",
+            b"id,city\nmatch,Additional\nright-only,Other unmatched\n,Missing\n",
+        );
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_join_files();
+        for (side, path) in [a.clone(), b.clone()].into_iter().enumerate() {
+            app.join_files.as_mut().unwrap().read_header(side, path);
+            finish(&mut app);
+        }
+        app.join_files.as_mut().unwrap().mode = JoinMode::Inner;
+        let ctx = context();
+        click(&mut app, &ctx, "Analyze & Preview");
+        finish(&mut app);
+        assert_eq!(
+            app.join_files
+                .as_ref()
+                .unwrap()
+                .plan
+                .as_ref()
+                .unwrap()
+                .analysis()
+                .preview,
+            [vec!["match", "Main", "match", "Additional"]]
+        );
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 1800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.join_files.as_mut().unwrap().show_analysis(ui);
+                    });
+                },
+            ));
+        }
+        let output = output.unwrap();
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some(text.galley.text())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for expected in [
+            "Matching rows: 1 Main, 1 Additional",
+            "Unmatched examples (sample; data-row numbers, clipped comparison keys)",
+            "Main data row 2 · key (\"left-only\")",
+            "Main data row 3 · empty or missing key component",
+            "Additional data row 2 · key (\"right-only\")",
+            "Additional data row 3 · empty or missing key component",
+        ] {
+            assert!(
+                labels.contains(&expected),
+                "missing review information: {expected}; {labels:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(a).unwrap(),
+            b"id,value\nmatch,Main\nleft-only,Main unmatched\n,Empty\n"
+        );
+        assert_eq!(
+            fs::read(b).unwrap(),
+            b"id,city\nmatch,Additional\nright-only,Other unmatched\n,Missing\n"
+        );
     }
 }

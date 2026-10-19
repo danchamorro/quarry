@@ -61,7 +61,7 @@ pub use inspection::{
 pub use join::{
     JoinAnalysis, JoinCase, JoinConfig, JoinDuplicateExample, JoinFormat, JoinHeader, JoinInput,
     JoinInputInfo, JoinJob, JoinMode, JoinPhase, JoinPlan, JoinProgress, JoinSourceVersion,
-    JoinSummary, analyze_join,
+    JoinSummary, JoinUnmatchedExample, analyze_join,
 };
 pub use join::{
     JoinCellEdits, JoinHeaderEdits, JoinInputOwner, JoinWorkingSource, analyze_join_with_working,

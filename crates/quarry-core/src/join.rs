@@ -29,6 +29,10 @@ const COLUMN_LIMIT: usize = 65_536;
 const READ_CHUNK: usize = 64 * 1024;
 const MAX_RUN_LEVELS: usize = 64;
 const MAX_KEY_PAIRS: usize = 16;
+const MAX_GROUP_EXAMPLES: usize = 8;
+// Eight duplicate keys plus eight unmatched keys per side, including String
+// capacities, vector storage and row metadata, independent of source length.
+const GROUP_EXAMPLE_RESERVE: usize = 16 * 1024;
 const KEY_FRAME_OVERHEAD: usize = 1 + 8 * MAX_KEY_PAIRS;
 
 /// Interpretation and key selection for one input. Working sources inherit their format.
@@ -400,6 +404,7 @@ pub struct JoinAnalysis {
     pub many_to_many_pairs: u64,
     pub duplicate_samples: Vec<JoinDuplicateExample>,
     pub unmatched_rows: [u64; 2],
+    pub unmatched_samples: [Vec<JoinUnmatchedExample>; 2],
     pub empty_key_rows: [u64; 2],
     pub output_rows: u64,
     pub output_bytes: u64,
@@ -418,6 +423,15 @@ pub struct JoinDuplicateExample {
     pub key: String,
     pub main_rows: u64,
     pub additional_rows: u64,
+}
+
+/// One bounded comparison-key example, including rows omitted by the join mode.
+#[derive(Debug)]
+pub struct JoinUnmatchedExample {
+    /// One-based data-row number, excluding a possible header.
+    pub data_row: u64,
+    /// None means at least one component is empty or missing.
+    pub key: Option<String>,
 }
 
 /// Immutable analysis owns its private sorted inputs until creation or release.
@@ -709,6 +723,7 @@ impl JoinConfig {
             .saturating_add(self.run_memory_bytes)
             .saturating_add(self.group_memory_bytes)
             .saturating_add(self.preview_bytes)
+            .saturating_add(GROUP_EXAMPLE_RESERVE)
             .saturating_add(self.max_record_bytes.min(512 * 1024).saturating_mul(2))
             .saturating_add(self.max_columns.saturating_mul(384))
             .saturating_add(
@@ -729,6 +744,7 @@ impl JoinConfig {
             .saturating_add(self.run_memory_bytes)
             .saturating_add(self.group_memory_bytes)
             .saturating_add(self.preview_bytes)
+            .saturating_add(GROUP_EXAMPLE_RESERVE)
             .saturating_add(self.max_columns.saturating_mul(64))
             .saturating_add(4 * 1024 * 1024);
         let head = max_key.saturating_add(8192 + 64).max(1);
@@ -1055,21 +1071,38 @@ impl<'a> Runs<'a> {
     }
 }
 
-fn check_source(input: &PreparedInput) -> JResult<File> {
-    if let Some(working) = &input.working {
-        working.validate()?;
-    }
-    let file = open_regular_file(&input.physical_path)
-        .map_err(|e| input_error(&input.info.path, None, e))?;
-    if !source_matches_stamp(&file, &input.physical_path, &input.stamp)? {
-        return Err(input_error(
-            &input.info.path,
-            None,
-            "File changed. Analyze the inputs again.",
-        )
-        .into());
-    }
-    Ok(file)
+fn check_source(input: &PreparedInput, role: JoinSource, phase: JoinPhase) -> JResult<File> {
+    let checked: JResult<File> = (|| {
+        if let Some(working) = &input.working {
+            working.validate()?;
+        }
+        let file = open_regular_file(&input.physical_path)
+            .map_err(|e| input_error(&input.info.path, None, e))?;
+        if !source_matches_stamp(&file, &input.physical_path, &input.stamp)? {
+            return Err(input_error(
+                &input.info.path,
+                None,
+                "File changed. Analyze the inputs again.",
+            )
+            .into());
+        }
+        Ok(file)
+    })();
+    checked.map_err(|failure| match failure {
+        Failure::Cancelled => Failure::Cancelled,
+        Failure::Error(cause) => {
+            let (record, reason) = match cause {
+                QuarryError::JoinFile { record, reason, .. } => (record, reason),
+                cause => (None, cause.to_string()),
+            };
+            input_error(
+                &input.info.path,
+                record,
+                format!("{} input during {}: {reason}", role.label(), phase.label()),
+            )
+            .into()
+        }
+    })
 }
 
 /// Scan complete records without retaining the file or assuming the first chunk
@@ -1947,11 +1980,12 @@ struct GroupRange {
 struct Group {
     key: Vec<u8>,
     range: GroupRange,
+    first_ordinal: u64,
 }
 
 impl Group {
     fn into_range(self) -> GroupRange {
-        let Self { key, range } = self;
+        let Self { key, range, .. } = self;
         drop(key);
         range
     }
@@ -2134,6 +2168,7 @@ impl<'a> Groups<'a> {
         self.rows = add(self.rows, rows)?;
         Ok(Some(Group {
             key,
+            first_ordinal: ordinal,
             range: GroupRange {
                 start,
                 end,
@@ -2452,7 +2487,9 @@ fn analyze_prepared(
     let mut duplicate_groups = [0, 0];
     let mut many_to_many_groups = 0;
     let mut many_to_many_pairs = 0;
-    let mut duplicate_samples = Vec::new();
+    let mut duplicate_samples = Vec::with_capacity(MAX_GROUP_EXAMPLES);
+    let mut unmatched_samples: [Vec<JoinUnmatchedExample>; 2] =
+        std::array::from_fn(|_| Vec::with_capacity(MAX_GROUP_EXAMPLES));
     let mut output_rows = 0;
     let mut output_bytes = header_bytes;
     let mut preview = std::collections::BTreeMap::new();
@@ -2462,7 +2499,7 @@ fn analyze_prepared(
                 duplicate_groups[side] = add(duplicate_groups[side], 1)?;
             }
         }
-        if duplicate_samples.len() < 8
+        if duplicate_samples.len() < MAX_GROUP_EXAMPLES
             && (left.as_ref().is_some_and(|g| g.range.rows > 1)
                 || right.as_ref().is_some_and(|g| g.range.rows > 1))
         {
@@ -2472,6 +2509,24 @@ fn analyze_prepared(
                 main_rows: left.as_ref().map_or(0, |g| g.range.rows),
                 additional_rows: right.as_ref().map_or(0, |g| g.range.rows),
             });
+        }
+        let unmatched_example = match (&left, &right) {
+            (Some(group), None) => Some((0, group)),
+            (None, Some(group)) => Some((1, group)),
+            _ => None,
+        };
+        match unmatched_example {
+            Some((side, group)) if unmatched_samples[side].len() < MAX_GROUP_EXAMPLES => {
+                unmatched_samples[side].push(JoinUnmatchedExample {
+                    data_row: group.first_ordinal + 1,
+                    key: if group.key[0] == 0 {
+                        None
+                    } else {
+                        Some(key_label(&group.key)?)
+                    },
+                });
+            }
+            _ => {}
         }
         let left = left.map(Group::into_range);
         let right = right.map(Group::into_range);
@@ -2557,14 +2612,18 @@ fn analyze_prepared(
     })?;
     let frames = add(output_bytes - header_bytes, mul(output_rows, 40)?)?;
     let temporary = add(mul(frames, 2)?, output_bytes)?;
-    for input in inputs {
-        check_source(input)?;
+    for (role, input) in [JoinSource::Main, JoinSource::Additional]
+        .into_iter()
+        .zip(inputs)
+    {
+        check_source(input, role, JoinPhase::Analyzing)?;
     }
     Ok(JoinAnalysis {
         input_rows: [inputs[0].info.data_rows, inputs[1].info.data_rows],
         matching_rows: matching,
         matching_pairs: pairs,
         unmatched_rows: unmatched,
+        unmatched_samples,
         empty_key_rows: [inputs[0].info.empty_key_rows, inputs[1].info.empty_key_rows],
         duplicate_groups,
         many_to_many_groups,
@@ -2849,8 +2908,11 @@ impl JoinPlan {
         }
         let retained = add(self.inputs[0].frame_bytes, self.inputs[1].frame_bytes)?;
         state.add_disk(retained)?;
-        for input in &self.inputs {
-            check_source(input)?;
+        for (role, input) in [JoinSource::Main, JoinSource::Additional]
+            .into_iter()
+            .zip(&self.inputs)
+        {
+            check_source(input, role, JoinPhase::Creating)?;
         }
         let header = output_header(&self.output, self.inputs[0].info.delimiter, self.config)?;
         let frame_bytes = add(
@@ -2975,8 +3037,11 @@ impl JoinPlan {
                     error("Joined output count or size changed before publication.").into(),
                 );
             }
-            for input in &self.inputs {
-                check_source(input)?;
+            for (role, input) in [JoinSource::Main, JoinSource::Additional]
+                .into_iter()
+                .zip(&self.inputs)
+            {
+                check_source(input, role, JoinPhase::Creating)?;
             }
             Ok(())
         })();
@@ -5390,5 +5455,71 @@ mod tests {
             );
         }
         assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn unmatched_examples_are_bounded_in_every_mode_and_do_not_replace_exact_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: [Vec<u8>; 2] = std::array::from_fn(|side| {
+            let mut bytes = b"id,value\n,empty\n".to_vec();
+            for row in 0..40 {
+                bytes.extend_from_slice(
+                    format!("{side}-{row:02}-{}\t,unmatched-{row}\n", "é".repeat(100)).as_bytes(),
+                );
+            }
+            bytes
+        });
+        let args = inputs(dir.path(), &bytes[0], &bytes[1]);
+        for mode in [
+            JoinMode::Left,
+            JoinMode::Inner,
+            JoinMode::Right,
+            JoinMode::Full,
+        ] {
+            let plan = analyze_join(
+                args.clone(),
+                dir.path().to_owned(),
+                JoinConfig { mode, ..config() },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+            let analysis = plan.analysis();
+            assert_eq!(analysis.input_rows, [41, 41]);
+            assert_eq!(analysis.matching_rows, [0, 0]);
+            assert_eq!(analysis.unmatched_rows, [41, 41]);
+            assert_eq!(analysis.empty_key_rows, [1, 1]);
+            assert_eq!(
+                analysis.output_rows,
+                match mode {
+                    JoinMode::Inner => 0,
+                    JoinMode::Full => 82,
+                    _ => 41,
+                }
+            );
+            let mut retained =
+                analysis.duplicate_samples.capacity() * std::mem::size_of::<JoinDuplicateExample>();
+            for (side, samples) in analysis.unmatched_samples.iter().enumerate() {
+                assert_eq!(samples.len(), 8);
+                assert_eq!(samples.capacity(), 8);
+                assert_eq!(samples[0].data_row, 1);
+                assert!(samples[0].key.is_none());
+                retained += samples.capacity() * std::mem::size_of::<JoinUnmatchedExample>();
+                for (index, sample) in samples.iter().enumerate().skip(1) {
+                    assert_eq!(sample.data_row, index as u64 + 1);
+                    let key = sample.key.as_ref().unwrap();
+                    assert!(key.starts_with(&format!("(\"{side}-")));
+                    assert!(key.ends_with("…)") && key.len() <= 132, "{key:?}");
+                    retained += key.capacity();
+                }
+            }
+            assert!(retained <= GROUP_EXAMPLE_RESERVE);
+            plan.release().unwrap();
+            assert!(workspaces(dir.path()).is_empty());
+        }
+        for (side, input) in args.iter().enumerate() {
+            assert_eq!(fs::read(&input.path).unwrap(), bytes[side]);
+        }
     }
 }

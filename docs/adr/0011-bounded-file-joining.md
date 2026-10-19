@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-Accepted implementation direction for [#71](https://github.com/danchamorro/quarry/issues/71), beginning with [#119](https://github.com/danchamorro/quarry/issues/119). This records the algorithm and resource obligations before extracting shared code. The join itself and its large-file acceptance remain unimplemented; existing sort measurements are not join measurements.
+Accepted implementation direction for [#71](https://github.com/danchamorro/quarry/issues/71), beginning with [#119](https://github.com/danchamorro/quarry/issues/119). This records the algorithm and resource obligations before extracting shared code. The integrated join is under review in PR #137. Its dedicated acceptance evidence remains separate from existing sort measurements.
 
 ## Context
 
@@ -249,3 +249,24 @@ the initiating join worker. All instrumentation is compiled only for tests;
 it introduces no production setting, environment variable, global cross-test
 fault switch, or alternative publication path. Actual files, serialization,
 guards, cleanup and atomic rename still run.
+
+
+### Retained analysis examples
+
+The result preview retains at most twenty displayed columns per row with bounded
+UTF-8 text. Separate group examples retain at most eight duplicate keys and
+eight unmatched keys per input. An unmatched example identifies the first
+one-based data row in its group, including groups omitted by the selected mode.
+Examples show clipped, escaped comparison keys; an empty or missing component
+is labelled explicitly. Counts still describe the complete inputs.
+
+Group examples reuse the first source ordinal already validated by the group
+scan; they do not load another record or enumerate extra matching pairs.
+A fixed 16 KiB reservation covers their string capacities, vectors and metadata
+in both the aggregate budget and merge fan-in calculation. These examples do not
+change private frames, serialized output, comparison rules or publication.
+
+The desktop renders exact matching-row counts for each side as well as pairs.
+Source guards preserve the logical input path and Main/Additional role with
+the active phase when reporting a conflict. The display and early-conflict
+regressions failed before these additions and pass afterward.
