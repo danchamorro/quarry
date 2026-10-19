@@ -1,5 +1,6 @@
 //! Bounded, source-preserving joins. The initial desktop slice supports saved,
 //! headered UTF-8 inputs, one unique key per side, and a left join.
+use crate::source_stamp::open_regular_file;
 use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
@@ -79,7 +80,7 @@ fn header_info(path: &Path, state: &Progress) -> JResult<JoinHeader> {
     if !fs::metadata(path)?.is_file() {
         return Err(input_error(path, None, "Select a regular file.").into());
     }
-    let mut file = File::open(path)?;
+    let mut file = open_regular_file(path)?;
     if !file.metadata()?.is_file() {
         return Err(input_error(path, None, "Select a regular file.").into());
     }
@@ -683,7 +684,7 @@ impl<'a> Runs<'a> {
         self.state.check()?;
         let mut readers: Vec<_> = runs
             .iter()
-            .map(|run| File::open(&run.path).map(BufReader::new))
+            .map(|run| open_regular_file(&run.path).map(BufReader::new))
             .collect::<Result<_, _>>()?;
         let mut heap = BinaryHeap::new();
         for (stream, reader) in readers.iter_mut().enumerate() {
@@ -751,7 +752,8 @@ impl<'a> Runs<'a> {
 }
 
 fn check_source(input: &PreparedInput) -> JResult<File> {
-    let file = File::open(&input.info.path).map_err(|e| input_error(&input.info.path, None, e))?;
+    let file =
+        open_regular_file(&input.info.path).map_err(|e| input_error(&input.info.path, None, e))?;
     if !source_matches_stamp(&file, &input.info.path, &input.stamp)? {
         return Err(input_error(
             &input.info.path,
@@ -773,7 +775,7 @@ fn scan(
     state: &Progress,
     mut visit: impl FnMut(&[u8], u64) -> JResult<()>,
 ) -> JResult<()> {
-    let mut file = File::open(path).map_err(|e| input_error(path, None, e))?;
+    let mut file = open_regular_file(path).map_err(|e| input_error(path, None, e))?;
     if !source_matches_stamp(&file, path, stamp)? {
         return Err(QuarryError::SourceChanged.into());
     }
@@ -923,7 +925,7 @@ fn inspect(input: JoinInput, config: JoinConfig, state: &Progress) -> JResult<In
     } else {
         std::env::current_dir()?.join(input.path)
     };
-    let mut file = File::open(&path).map_err(|e| input_error(&path, None, e))?;
+    let mut file = open_regular_file(&path).map_err(|e| input_error(&path, None, e))?;
     if !file.metadata()?.is_file() {
         return Err(input_error(&path, None, "Select a regular file.").into());
     }
@@ -1246,7 +1248,7 @@ struct Stream<'a> {
 }
 impl<'a> Stream<'a> {
     fn new(input: &'a PreparedInput, config: JoinConfig, state: &'a Progress) -> JResult<Self> {
-        let mut reader = BufReader::new(File::open(&input.sorted)?);
+        let mut reader = BufReader::new(open_regular_file(&input.sorted)?);
         let head = read_head(&mut reader, config, state)?;
         Ok(Self {
             input,
@@ -1342,7 +1344,7 @@ fn walk(
 
 /// Reject duplicate keys and malformed ordering before retaining a plan.
 fn validate_keys(input: &PreparedInput, config: JoinConfig, state: &Progress) -> JResult<()> {
-    let mut reader = BufReader::new(File::open(&input.sorted)?);
+    let mut reader = BufReader::new(open_regular_file(&input.sorted)?);
     let mut previous: Option<FrameHead> = None;
     let mut count = 0;
     while let Some(head) = read_head(&mut reader, config, state)? {
@@ -1695,7 +1697,7 @@ impl JoinPlan {
                     error("Join output differs from the analyzed plan. Analyze again.").into(),
                 );
             }
-            let mut reader = BufReader::new(File::open(&ordered.path)?);
+            let mut reader = BufReader::new(open_regular_file(&ordered.path)?);
             let mut ordinal = 0;
             while let Some(head) = read_head(&mut reader, self.config, state)? {
                 if head.ordinal != ordinal || head.key != ordinal.to_be_bytes() {
@@ -1764,6 +1766,109 @@ impl JoinPlan {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    fn replace_with_fifo(path: &Path) {
+        fs::remove_file(path).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_fifo_reopen_returns_promptly<T: Send + 'static>(job: JoinJob<T>, fifo: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !job.progress().done && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let prompt = job.progress().done;
+        // A failing pre-fix test must unblock and reap its worker rather than
+        // leave the suite hanging on a FIFO with no writer.
+        let rescue = if !prompt {
+            job.cancel();
+            Some(
+                rustix::fs::open(
+                    fifo,
+                    rustix::fs::OFlags::RDWR
+                        | rustix::fs::OFlags::NONBLOCK
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let outcome = job.wait();
+        drop(rescue);
+        assert!(
+            prompt,
+            "a source replaced by a FIFO blocked the join worker until a writer rescued it"
+        );
+        assert!(
+            outcome.is_err(),
+            "a non-regular replacement must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_replacement_after_probe_does_not_block_analysis_or_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sources = inputs(
+            dir.path(),
+            b"id,value\nx,Main\n",
+            b"id,value\nx,Additional\n",
+        );
+        sources[0].expected_version = Some(
+            read_join_header(sources[0].path.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap()
+                .source_version,
+        );
+        let source = sources[0].path.clone();
+        replace_with_fifo(&source);
+        let job = analyze_join(sources, dir.path().to_path_buf(), config()).unwrap();
+        assert_fifo_reopen_returns_promptly(job, &source);
+        assert_eq!(
+            fs::read(dir.path().join("additional.csv")).unwrap(),
+            b"id,value\nx,Additional\n"
+        );
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_replacement_after_analysis_does_not_block_creation_or_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = inputs(
+            dir.path(),
+            b"id,value\nx,Main\n",
+            b"id,value\nx,Additional\n",
+        );
+        let source = sources[0].path.clone();
+        let plan = analyze_join(sources, dir.path().to_path_buf(), config())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        replace_with_fifo(&source);
+        let output = dir.path().join("joined.csv");
+        let job = plan.start_write(output.clone()).unwrap();
+        assert_fifo_reopen_returns_promptly(job, &source);
+        assert!(!output.exists());
+        assert_eq!(
+            fs::read(dir.path().join("additional.csv")).unwrap(),
+            b"id,value\nx,Additional\n"
+        );
+        assert!(workspaces(dir.path()).is_empty());
+    }
 
     /// Exercise multiple spill passes with small but valid resource budgets.
     fn config() -> JoinConfig {

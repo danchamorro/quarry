@@ -4,7 +4,29 @@ use std::io;
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::time::SystemTime;
+
+/// Reopening a replaced input must not wait for a FIFO writer before its
+/// type, version and cancellation checks can run. O_NONBLOCK leaves ordinary
+/// file reads unchanged; validate the opened descriptor before using it.
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = File::from(rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?);
+    #[cfg(not(unix))]
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Select a regular file.",
+        ));
+    }
+    Ok(file)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceStamp {

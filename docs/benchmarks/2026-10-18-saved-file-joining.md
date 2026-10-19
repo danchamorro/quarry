@@ -85,3 +85,10 @@ After the current-name, Linux fallback and shared Windows guards were added, all
 
 
 The corrected native Windows tests passed in [the a52ffa1 CI run](https://github.com/danchamorro/quarry/actions/runs/39201382186): all four source-version/directory-locking checks and the separate nonrecursive-cleanup check passed. The additional CLI release-build step failed because peak_rss_bytes uses libc::getrusage without a Windows implementation. That CLI source is unchanged from main (21805ec), so the new Windows job is scoped to its intended core-library checks and core/delimited release builds. Existing macOS and Linux jobs are unchanged; a Windows CLI/application port remains out of scope. The subsequent CI run must pass with this corrected scope.
+
+
+## Replaced-source FIFO regression
+
+Two real Unix FIFO regressions failed before the nonblocking-open fix: replacing the selected file after its header probe blocked analysis, and replacing it after analysis blocked creation. Each test waits for bounded worker completion, then rescues a pre-fix blocked FIFO reader so the failing check cannot strand its thread. Both failed because completion required that rescue; after the fix both reject the replacement and clean up in approximately 0.02 seconds for the combined focused run. The two-second bound is a test timeout, not a general network-I/O latency promise.
+
+Every production join reopen, including private frame reads, now uses O_NONBLOCK on Unix and validates the opened descriptor as a regular file before reading. The shared combined-output source recheck uses the same helper. Symbolic links to regular inputs remain supported. Other export constructors keep their existing source-opening contracts. All 579 workspace tests, formatting, all-target/all-feature Clippy and the workspace release build passed in VMPal. The earlier native UI evidence predates this narrow source-open change; the public worker regressions exercise analysis and creation directly. These checks do not claim interruption of an operating-system regular-file read that has not returned.

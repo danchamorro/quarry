@@ -2559,7 +2559,7 @@ impl ExportTarget {
 
     fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
         for (path, stamp) in &self.additional_sources {
-            let unchanged = File::open(path)
+            let unchanged = crate::source_stamp::open_regular_file(path)
                 .ok()
                 .is_some_and(|file| source_matches_stamp(&file, path, stamp).unwrap_or(false));
             if !unchanged {
