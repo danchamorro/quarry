@@ -1345,4 +1345,51 @@ mod tests {
             utf8.session.file_size
         );
     }
+    #[test]
+    fn join_generation_lease_keeps_pruned_files_until_worker_finishes() {
+        let parent = tempfile::tempdir().unwrap();
+        let next_parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("original.csv");
+        std::fs::write(&source, b"id,value\nx,saved\n").unwrap();
+        let mut state = WorkingCopyState::new_in(parent.path()).unwrap();
+        let working = state.next_path();
+        std::fs::write(&working, b"id,value\nx,working\n").unwrap();
+        let lease = Arc::clone(&state.directory);
+        let private_root = lease.path().to_path_buf();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let worker_start = Arc::clone(&start);
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            // The captured owner keeps the generation available to a real
+            // background reader even after its original tab state is gone.
+            let session = Session::open(
+                lease.path().join("generation-1.csv"),
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    rows: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            session.first_rows[1].fields[1].clone()
+        });
+        state.use_directory(next_parent.path()).unwrap();
+        let current = state.next_path();
+        state.prune_directories(&current);
+        assert!(state.previous_directories.is_empty());
+        drop(state);
+        let retained = working.exists();
+        start.wait();
+        let value = worker.join().unwrap();
+        assert!(
+            retained,
+            "pruning and tab disposal must not invalidate captured input"
+        );
+        assert_eq!(value, b"working");
+        assert!(
+            !private_root.exists(),
+            "last capture release removes owned private storage"
+        );
+        assert_eq!(std::fs::read(source).unwrap(), b"id,value\nx,saved\n");
+    }
 }

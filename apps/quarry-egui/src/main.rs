@@ -5560,8 +5560,10 @@ impl RowSelection {
 }
 
 struct WorkingCopyState {
-    directory: TempDir,
-    previous_directories: Vec<TempDir>,
+    // Captured working inputs must own their private generations independently
+    // of a tab's lifetime and pruning of obsolete storage roots.
+    directory: Arc<TempDir>,
+    previous_directories: Vec<Arc<TempDir>>,
     next_generation: u64,
     undo: Option<WorkingCopySnapshot>,
     redo: Option<WorkingCopySnapshot>,
@@ -5578,6 +5580,7 @@ impl WorkingCopyState {
             directory: tempfile::Builder::new()
                 .prefix("quarry-working-")
                 .tempdir_in(parent)
+                .map(Arc::new)
                 .map_err(|error| format!("Cannot create working files in {}: {error}. Choose another folder in File > Temporary storage.", parent.display()))?,
             previous_directories: Vec::new(),
             next_generation: 1,
