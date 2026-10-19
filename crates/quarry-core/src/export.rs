@@ -1,4 +1,6 @@
 use crate::ColumnCleanup;
+#[cfg(target_os = "macos")]
+use crate::storage::set_macos_acl;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -2092,6 +2094,31 @@ pub(crate) struct ExportTarget {
     additional_sources: Vec<(PathBuf, SourceStamp)>,
 }
 
+/// Reserves private staging on the output volume, including file-only drop folders.
+fn private_staging_directory(parent: &Path) -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    let prefix = format!(".quarry-export-{}-", std::process::id());
+    builder.prefix(&prefix);
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o700));
+    match builder.tempdir_in(parent) {
+        Ok(directory) => Ok(directory),
+        Err(error) => {
+            // Unix file-only ACLs can deny subdirectories while allowing the final
+            // rename. Use the user's temporary directory only on the same volume.
+            #[cfg(unix)]
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                use std::os::unix::fs::MetadataExt;
+                let directory = builder.tempdir()?;
+                if fs::metadata(directory.path())?.dev() == fs::metadata(parent)?.dev() {
+                    return Ok(directory);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 impl ExportTarget {
     pub(crate) fn new_combined(
         sources: Vec<(PathBuf, SourceStamp)>,
@@ -2236,6 +2263,7 @@ impl ExportTarget {
         }
     }
 
+    /// Reserves private staging on the destination volume before writing any CSV data.
     fn create(destination: PathBuf, publication: Publication) -> Result<Self, QuarryError> {
         let parent = destination
             .parent()
@@ -2247,33 +2275,20 @@ impl ExportTarget {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        match &publication {
-            Publication::GuardedCreateWorkingCopy { .. } => {
-                options.mode(0o600);
-            }
-            Publication::ReplaceSource { permissions, .. }
-            | Publication::GuardedReplaceExisting { permissions, .. } => {
-                options.mode(permissions.mode());
-            }
-            Publication::CreateNew | Publication::GuardedCreateNew { .. } => {}
-        }
+        options.mode(0o600);
+        // A shared destination must not expose uncommitted CSV contents, even
+        // when the eventual destination deliberately retains shared permissions.
         let private_directory =
-            if matches!(publication, Publication::GuardedCreateWorkingCopy { .. }) {
-                let mut builder = tempfile::Builder::new();
-                #[cfg(unix)]
-                builder.permissions(fs::Permissions::from_mode(0o700));
-                Some(
-                    builder
-                        .prefix(&format!(".quarry-export-{}-", std::process::id()))
-                        .tempdir_in(parent)
-                        .map_err(|error| storage_error(parent, error))?,
-                )
-            } else {
-                None
-            };
+            Some(private_staging_directory(parent).map_err(|error| storage_error(parent, error))?);
         let staging_parent = private_directory
             .as_ref()
             .map_or(parent, |directory| directory.path());
+        #[cfg(target_os = "macos")]
+        set_macos_acl(
+            &File::open(staging_parent).map_err(|error| storage_error(parent, error))?,
+            None,
+        )
+        .map_err(|error| storage_error(parent, error))?;
         for _ in 0..100 {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let temporary =
@@ -2281,16 +2296,7 @@ impl ExportTarget {
             match options.open(&temporary) {
                 Ok(file) => {
                     #[cfg(unix)]
-                    let permissions = match &publication {
-                        Publication::GuardedCreateWorkingCopy { .. } => {
-                            Some(fs::Permissions::from_mode(0o600))
-                        }
-                        Publication::ReplaceSource { permissions, .. }
-                        | Publication::GuardedReplaceExisting { permissions, .. } => {
-                            Some(permissions.clone())
-                        }
-                        Publication::CreateNew | Publication::GuardedCreateNew { .. } => None,
-                    };
+                    let permissions = Some(fs::Permissions::from_mode(0o600));
                     #[cfg(not(unix))]
                     let permissions: Option<fs::Permissions> = match &publication {
                         Publication::ReplaceSource { permissions, .. }
@@ -2301,6 +2307,12 @@ impl ExportTarget {
                         | Publication::GuardedCreateNew { .. }
                         | Publication::GuardedCreateWorkingCopy { .. } => None,
                     };
+                    #[cfg(target_os = "macos")]
+                    if let Err(error) = set_macos_acl(&file, None) {
+                        drop(file);
+                        let _ = fs::remove_file(&temporary);
+                        return Err(storage_error(parent, error));
+                    }
                     if let Some(permissions) = permissions
                         && let Err(error) = file.set_permissions(permissions)
                     {
@@ -2576,6 +2588,7 @@ impl ExportTarget {
         self.publish_inner(rows_written, bytes_written, cancel_requested, true)
     }
 
+    /// Restores replacement permissions inside private staging, then publishes atomically.
     fn publish_inner(
         mut self,
         rows_written: u64,
@@ -2611,6 +2624,19 @@ impl ExportTarget {
             Publication::CreateNew | Publication::GuardedCreateNew { .. } => {}
             #[cfg(not(unix))]
             Publication::GuardedCreateWorkingCopy { .. } => {}
+        }
+        #[cfg(target_os = "macos")]
+        match &self.publication {
+            Publication::ReplaceSource { source, .. } => {
+                set_macos_acl(&file, Some(source)).map_err(|error| storage_error(parent, error))?;
+            }
+            Publication::GuardedReplaceExisting {
+                destination_file, ..
+            } => {
+                set_macos_acl(&file, Some(destination_file))
+                    .map_err(|error| storage_error(parent, error))?;
+            }
+            _ => {}
         }
         file.sync_all()
             .map_err(|error| storage_error(parent, error))?;
@@ -7313,7 +7339,7 @@ mod tests {
                     .permissions()
                     .mode()
                     & 0o777,
-                0o640
+                0o600
             );
             output.discard().unwrap();
         }
@@ -7559,12 +7585,23 @@ mod tests {
     }
 
     #[test]
+    /// Cancellation removes private staging without changing the original file.
     fn cancelled_save_before_publication_preserves_the_source() {
         let source = fixture(b"original");
         let source_file = File::open(&source).unwrap();
         let stamp = crate::SourceStamp::from_file(&source_file).unwrap();
         let mut output = ExportTarget::replace_source(&source, &source_file, stamp).unwrap();
-        assert_eq!(output.temporary.parent(), source.parent());
+        // Keep the atomic-rename staging on the destination volume, inside
+        // its new private child directory rather than directly beside the CSV.
+        assert_eq!(
+            output.temporary.parent().and_then(|path| path.parent()),
+            source.parent()
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::dev(&fs::metadata(&output.temporary).unwrap()),
+            std::os::unix::fs::MetadataExt::dev(&source_file.metadata().unwrap()),
+        );
         output.write_all(b"replacement").unwrap();
 
         assert_eq!(
@@ -9228,6 +9265,237 @@ mod tests {
             fs::remove_file(&output).unwrap();
             fs::remove_file(&source).unwrap();
             remove_case(&source);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    /// Shared destination folders must not expose new or replacement staging files.
+    fn export_staging_is_private_in_shared_destination_directories() {
+        for replace in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let source = directory.path().join("private.csv");
+            fs::write(&source, b"id,value\n1,private\n").unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+            let output = if replace {
+                let file = File::open(&source).unwrap();
+                let stamp = crate::SourceStamp::from_file(&file).unwrap();
+                ExportTarget::replace_source(&source, &file, stamp).unwrap()
+            } else {
+                ExportTarget::new(&source, directory.path().join("copy.csv")).unwrap()
+            };
+            let staging_directory = output.temporary.parent().unwrap().to_owned();
+            assert_ne!(
+                staging_directory,
+                directory.path(),
+                "unpublished data must have a private directory"
+            );
+            assert_eq!(
+                fs::metadata(&staging_directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+            );
+            output.discard().unwrap();
+            assert!(!staging_directory.exists());
+            assert_eq!(fs::read(&source).unwrap(), b"id,value\n1,private\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// New exports remain owner-only even when the destination directory is shared.
+    fn new_export_files_do_not_gain_group_or_other_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let source = directory.path().join("private.csv");
+        let destination = directory.path().join("copy.csv");
+        let bytes = b"id,value\n1,private\n";
+        fs::write(&source, bytes).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut output = ExportTarget::new(&source, destination.clone()).unwrap();
+        output.write_raw_all(bytes).unwrap();
+        assert!(matches!(
+            output
+                .publish(2, bytes.len() as u64, &AtomicBool::new(false))
+                .unwrap(),
+            FilterExportOutcome::Complete(_)
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600,
+        );
+        assert_eq!(fs::read(source).unwrap(), bytes);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    /// Inherited macOS access grants cannot override private staging or output modes.
+    fn inherited_acl_cannot_share_staging_or_new_output() {
+        use std::process::Command;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("private.csv");
+        fs::write(&source, b"name,id\nAlice,1\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Command::new("/bin/chmod")
+            .args(["+a", "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
+            .arg(directory.path()).status().unwrap().success());
+        let acl_listing = |path: &std::path::Path| {
+            let output = Command::new("/bin/ls")
+                .arg("-lde")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert!(acl_listing(directory.path()).contains("group:everyone"));
+        let destination = directory.path().join("copy.csv");
+        let mut output = ExportTarget::new(&source, destination.clone()).unwrap();
+        let staging_directory = output.temporary.parent().unwrap();
+        assert!(
+            !acl_listing(staging_directory).contains("group:everyone"),
+            "private staging inherited an access grant from the shared folder"
+        );
+        assert!(!acl_listing(&output.temporary).contains("group:everyone"));
+        output.write_raw_all(b"name,id\nAlice,1\n").unwrap();
+        output.publish(2, 16, &AtomicBool::new(false)).unwrap();
+        assert!(!acl_listing(&destination).contains("group:everyone"));
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&destination).unwrap(), fs::read(&source).unwrap());
+        assert!(temporary_exports(&destination).is_empty());
+    }
+    /// File-only destination grants use private staging elsewhere on the same volume.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_only_destination_grants_keep_export_staging_private() {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Command;
+        for replace in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("private.csv");
+            let bytes = b"name,id\nAlice,1\n";
+            fs::write(&source, bytes).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", "everyone deny add_subdirectory"])
+                    .arg(directory.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(fs::create_dir(directory.path().join("blocked-subdirectory")).is_err());
+            let destination = if replace {
+                source.clone()
+            } else {
+                directory.path().join("copy.csv")
+            };
+            let mut output = if replace {
+                let file = File::open(&source).unwrap();
+                let stamp = crate::SourceStamp::from_file(&file).unwrap();
+                ExportTarget::replace_source(&source, &file, stamp).unwrap()
+            } else {
+                ExportTarget::new(&source, destination.clone()).unwrap()
+            };
+            let staging_directory = output.temporary.parent().unwrap().to_owned();
+            assert_ne!(staging_directory.parent(), Some(directory.path()));
+            assert_eq!(
+                fs::metadata(&staging_directory).unwrap().dev(),
+                fs::metadata(directory.path()).unwrap().dev()
+            );
+            assert_eq!(
+                fs::metadata(&staging_directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            output.write_raw_all(bytes).unwrap();
+            output
+                .publish(2, bytes.len() as u64, &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), bytes);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!staging_directory.exists());
+        }
+    }
+    /// Replacements retain the destination's sharing ACL without sharing unpublished data.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replacing_shared_files_preserves_acl_only_at_publication() {
+        use std::process::Command;
+        let acl_entries = |path: &std::path::Path| {
+            let out = Command::new("/bin/ls")
+                .arg("-lde")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        for replace_source in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(Command::new("/bin/chmod")
+                .args(["+a", "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
+                .arg(directory.path()).status().unwrap().success());
+            let source = directory.path().join("source.csv");
+            fs::write(&source, b"source").unwrap();
+            let destination = if replace_source {
+                source.clone()
+            } else {
+                directory.path().join("shared.csv")
+            };
+            if !replace_source {
+                fs::write(&destination, b"destination").unwrap();
+            }
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+            let expected_acl = acl_entries(&destination);
+            assert!(!expected_acl.is_empty());
+            let source_file = File::open(&source).unwrap();
+            let source_stamp = crate::SourceStamp::from_file(&source_file).unwrap();
+            let mut output = if replace_source {
+                ExportTarget::replace_source(&source, &source_file, source_stamp).unwrap()
+            } else {
+                let destination_file = File::open(&destination).unwrap();
+                let stamp = crate::SourceStamp::from_file(&destination_file).unwrap();
+                ExportTarget::replace_existing_guarded(
+                    &source,
+                    destination.clone(),
+                    &source_file,
+                    source_stamp,
+                    stamp,
+                )
+                .unwrap()
+            };
+            assert!(acl_entries(output.temporary.parent().unwrap()).is_empty());
+            assert!(acl_entries(&output.temporary).is_empty());
+            output.write_raw_all(b"replacement").unwrap();
+            output.publish(1, 11, &AtomicBool::new(false)).unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+            assert_eq!(acl_entries(&destination), expected_acl);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            if !replace_source {
+                assert_eq!(fs::read(&source).unwrap(), b"source");
+            }
+            assert!(temporary_exports(&destination).is_empty());
         }
     }
 }

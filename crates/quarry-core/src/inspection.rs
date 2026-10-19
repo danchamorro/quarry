@@ -1646,6 +1646,36 @@ mod tests {
             assert_eq!(std::fs::read(&r.path).unwrap(), raw);
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    /// Recovery preserves confidentiality when copying an owner-only source.
+    fn recovery_copy_does_not_widen_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let source = dir.path().join("private.csv");
+        let bytes = b"name,id\nAlice,1\nBob\n";
+        std::fs::write(&source, bytes).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let report = InspectionJob::start(&source, options(), InspectionEdits::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let output = dir.path().join("recovered.csv");
+        RecoveryJob::start(&report, &BTreeSet::from([0]), &output)
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"name,id\nAlice,1\n");
+        assert_eq!(
+            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600,
+        );
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+
     #[test]
     /// Verifies that recovery can remove invalid utf8 but not leave other blocking rows.
     fn recovery_can_remove_invalid_utf8_but_not_leave_other_blocking_rows() {

@@ -878,6 +878,7 @@ impl RunWorkspace {
         Self::create_in(output_parent(destination))
     }
 
+    /// Reserves private scratch storage before any sort or duplicate values are written.
     fn create_in(parent: &Path) -> Result<Self, QuarryError> {
         for _ in 0..100 {
             let id = NEXT_SORT_ID.fetch_add(1, Ordering::Relaxed);
@@ -887,6 +888,13 @@ impl RunWorkspace {
             builder.mode(0o700);
             match builder.create(&path) {
                 Ok(()) => {
+                    #[cfg(target_os = "macos")]
+                    if let Err(error) = File::open(&path)
+                        .and_then(|directory| crate::storage::set_macos_acl(&directory, None))
+                    {
+                        let _ = fs::remove_dir(&path);
+                        return Err(storage_error(parent, error));
+                    }
                     return Ok(Self {
                         path,
                         next_run: AtomicU64::new(0),
@@ -904,6 +912,7 @@ impl RunWorkspace {
         .into())
     }
 
+    /// Creates an owner-only spill file without inherited macOS access grants.
     fn create_run(&self) -> Result<(PathBuf, BufWriter<File>), QuarryError> {
         let id = self.next_run.fetch_add(1, Ordering::Relaxed);
         let path = self.path.join(format!("run-{id}.bin"));
@@ -914,6 +923,12 @@ impl RunWorkspace {
         let file = options
             .open(&path)
             .map_err(|error| storage_error(&self.path, error))?;
+        #[cfg(target_os = "macos")]
+        if let Err(error) = crate::storage::set_macos_acl(&file, None) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(storage_error(&self.path, error));
+        }
         Ok((path, BufWriter::new(file)))
     }
 
@@ -4069,5 +4084,33 @@ mod tests {
                 fs::remove_dir_all(directory).unwrap();
             }
         }
+    }
+    /// Sort and duplicate spill files must not inherit access grants from shared scratch folders.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sort_spill_files_do_not_inherit_shared_folder_acls() {
+        use std::process::Command;
+        let directory = tempfile::tempdir().unwrap();
+        assert!(Command::new("/bin/chmod")
+            .args(["+a", "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
+            .arg(directory.path()).status().unwrap().success());
+        let workspace = RunWorkspace::create_in(directory.path()).unwrap();
+        let (run_path, mut run) = workspace.create_run().unwrap();
+        run.write_all(b"synthetic CSV values").unwrap();
+        run.flush().unwrap();
+        for path in [&workspace.path, &run_path] {
+            let out = Command::new("/bin/ls")
+                .arg("-lde")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let listing = String::from_utf8(out.stdout).unwrap();
+            assert!(!listing.contains("group:everyone"), "{listing}");
+        }
+        drop(run);
+        let path = workspace.path.clone();
+        workspace.cleanup().unwrap();
+        assert!(!path.exists());
     }
 }

@@ -366,6 +366,77 @@ pub(crate) fn count_records_encoded(
     }
 }
 
+/// Identifies filesystems that cannot store extended ACLs.
+#[cfg(target_os = "macos")]
+fn unsupported_acl(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+    )
+}
+
+/// Uses private POSIX modes when ACLs are unavailable; never masks access errors.
+#[cfg(target_os = "macos")]
+fn validate_acl_update(file: &File, private: bool, result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => {}
+        Err(error) if unsupported_acl(&error) => {}
+        Err(error) => return Err(error),
+    }
+    if private && file.metadata()?.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "filesystem cannot enforce private file permissions",
+        ));
+    }
+    Ok(())
+}
+
+/// Clears staging ACLs, or restores the existing destination ACL just before publication.
+/// Open descriptors keep both operations bound to the intended filesystem objects.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_macos_acl(file: &File, source: Option<&File>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
+        fn acl_set_fd(fd: libc::c_int, acl: *mut libc::c_void) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: source descriptors are live; otherwise zero requests an initialized
+    // empty ACL. Both functions return owned ACL storage and null is checked.
+    let mut acl = unsafe {
+        match source {
+            Some(source) => acl_get_fd(source.as_raw_fd()),
+            None => acl_init(0),
+        }
+    };
+    if acl.is_null() && source.is_some() {
+        let error = io::Error::last_os_error();
+        // ENOENT means no extended ACL; unsupported filesystems have no ACL to copy.
+        if error.raw_os_error() != Some(libc::ENOENT) && !unsupported_acl(&error) {
+            return Err(error);
+        }
+        // SAFETY: no source ACL is equivalent to a new, empty ACL.
+        acl = unsafe { acl_init(0) };
+    }
+    if acl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is live and the ACL remains allocated for this call.
+    let status = unsafe { acl_set_fd(file.as_raw_fd(), acl) };
+    let result = if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    // SAFETY: acl_init or acl_get_fd allocated this object; it has not been freed.
+    unsafe { acl_free(acl) };
+    validate_acl_update(file, source.is_none(), result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +715,45 @@ mod tests {
             ),
             u64::MAX
         );
+    }
+    /// Unsupported ACLs are safe only with private POSIX modes; other failures remain errors.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsupported_acl_requires_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private.csv");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let file = File::open(&path).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        for code in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(
+                validate_acl_update(&file, true, Err(io::Error::from_raw_os_error(code))).is_ok()
+            );
+        }
+        assert!(
+            validate_acl_update(&file, true, Err(io::Error::from_raw_os_error(libc::EPERM)))
+                .is_err()
+        );
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(
+            validate_acl_update(
+                &file,
+                true,
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_acl_update(
+                &file,
+                false,
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            )
+            .is_ok()
+        );
+        assert!(validate_acl_update(&file, true, Ok(())).is_err());
     }
 }

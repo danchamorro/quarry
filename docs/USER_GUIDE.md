@@ -842,6 +842,10 @@ current filename afterward. Its menu contains **Open…**, **Reload from Disk**,
 **Save**, **Save As…**, and **Discard Changes**. A yellow dot beside the filename
 and **Modified (not saved)** in the footer identify unsaved work.
 
+On macOS, newly created CSV copies, exports, and recovery files are readable
+and writable only by your account. Saving over an existing file preserves that
+file's permissions. Unfinished output stays private until it is published.
+
 **Reload from Disk** rereads the current path with the applied format.
 **Reopen with Changes** in the Format menu applies a confirmed delimiter or
 header or encoding change instead.
