@@ -2741,7 +2741,7 @@ impl ExportTarget {
         ))
     }
 
-    fn discard(mut self) -> Result<(), QuarryError> {
+    pub(crate) fn discard(mut self) -> Result<(), QuarryError> {
         drop(self.writer.take());
         self.remove_temporary()
     }

@@ -7,6 +7,7 @@ mod export;
 mod filter;
 mod index;
 mod inspection;
+mod join;
 mod search;
 mod sort;
 mod source_stamp;
@@ -52,6 +53,10 @@ pub use inspection::{
     Diagnostic, DiagnosticKind, InspectionEdits, InspectionJob, InspectionOptions,
     InspectionProgress, InspectionReport, InspectionStatus, RecoveryJob, RecoverySummary,
     SourcePreview,
+};
+pub use join::{
+    JoinAnalysis, JoinConfig, JoinInput, JoinInputInfo, JoinJob, JoinPhase, JoinPlan, JoinProgress,
+    JoinSummary, analyze_join,
 };
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
@@ -126,6 +131,11 @@ pub(crate) fn record_encoding_error(record: u64, error: QuarryError) -> QuarryEr
 
 #[derive(Debug)]
 pub enum QuarryError {
+    JoinFile {
+        path: Option<PathBuf>,
+        record: Option<u64>,
+        reason: String,
+    },
     CombineFile {
         path: PathBuf,
         record: Option<u64>,
@@ -209,6 +219,21 @@ impl fmt::Display for QuarryError {
                 cause => write!(f, "Record {record}: {cause}"),
             },
 
+            Self::JoinFile {
+                path,
+                record,
+                reason,
+            } => {
+                if let Some(path) = path {
+                    write!(f, "{}", path.display())?;
+                } else {
+                    f.write_str("Cannot join files")?;
+                }
+                if let Some(record) = record {
+                    write!(f, ", record {record}")?;
+                }
+                write!(f, ": {reason}")
+            }
             Self::CombineFile {
                 path,
                 record,
