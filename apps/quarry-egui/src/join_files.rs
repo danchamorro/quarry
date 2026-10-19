@@ -350,6 +350,18 @@ impl JoinDialog {
     }
 }
 
+/// Absent output names still have an existing parent. Resolve that parent so
+/// aliases and nested folders cannot escape a live working directory reservation.
+fn output_is_inside_working_directory(path: &Path, directory: &Path) -> bool {
+    if path.starts_with(directory) {
+        return true;
+    }
+    path.parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(directory.canonicalize().ok())
+        .is_some_and(|(parent, directory)| parent.starts_with(directory))
+}
+
 impl QuarryApp {
     /// Apply the existing alias rules to live join input and output reservations.
     pub(super) fn join_reserves_path(&self, path: &Path) -> bool {
@@ -386,6 +398,16 @@ impl QuarryApp {
             tab.document.as_ref().is_some_and(|doc| {
                 tabs::paths_alias(path, &doc.logical_path)
                     || tabs::paths_alias(path, doc.session.path())
+                    || doc.working_copy.as_ref().is_some_and(|state| {
+                        std::iter::once(state.directory.path())
+                            .chain(
+                                state
+                                    .previous_directories
+                                    .iter()
+                                    .map(|directory| directory.path()),
+                            )
+                            .any(|directory| output_is_inside_working_directory(path, directory))
+                    })
             }) || tab
                 .write_destination
                 .as_ref()
@@ -902,5 +924,35 @@ mod tests {
             fs::read(fresh).unwrap(),
             b"id (Main),name,id (Additional),city\nb,Bob,b,LA\na,Alice,a,Seattle\nz,Last,,\n"
         );
+    }
+    #[test]
+    fn join_outputs_cannot_enter_current_or_retained_working_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let source = fixture(directory.path(), "source.csv", b"id,value\na,one\n");
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        let mut state = WorkingCopyState::new_in(directory.path()).unwrap();
+        let previous = state.directory.path().to_owned();
+        state.use_directory(other.path()).unwrap();
+        let current = state.directory.path().to_owned();
+        app.active.document.as_mut().unwrap().working_copy = Some(state);
+        for root in [&previous, &current] {
+            fs::create_dir(root.join("nested")).unwrap();
+            assert!(!app.join_destination_is_available(&root.join("joined.csv")));
+            assert!(!app.join_destination_is_available(&root.join("nested/joined.csv")));
+            assert!(
+                !app.join_destination_is_available(
+                    &root.canonicalize().unwrap().join("joined.csv")
+                )
+            );
+        }
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("working-alias");
+            std::os::unix::fs::symlink(&previous, &alias).unwrap();
+            assert!(!app.join_destination_is_available(&alias.join("joined.csv")));
+            assert!(!app.join_destination_is_available(&alias.join("nested/joined.csv")));
+        }
+        assert!(app.join_destination_is_available(&directory.path().join("normal-result.csv")));
     }
 }

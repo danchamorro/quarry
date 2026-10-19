@@ -114,3 +114,18 @@ All 588 base macOS workspace tests, formatting, all-target/all-feature Clippy an
 Review identified that rejecting a directory without enforceable private permissions leaked an empty reservation and reported a misleading source-change error. A regression changing the real captured directory to a non-private mode failed before the fix because that directory remained. Both tested mode variants now return an actionable storage error and leave no empty reservation. Additional checks cover identity-bound cleanup after a name replacement and cleanup failure with unregistered nested data; unrelated data is preserved and cleanup failure is reported.
 
 All 591 base macOS workspace tests, formatting, all-target/all-feature Clippy and the workspace release build passed in VMPal. The mode condition is injected on real directory handles; no native measurement of a specific unsupported filesystem is claimed. The approved owner-only privacy requirement remains a hard failure with an explicit recovery action.
+
+
+## Live working-directory output reservation
+
+The fresh review regression
+`join_outputs_cannot_enter_current_or_retained_working_directories` first
+failed because a new output beside another document's private generation was
+accepted. The guard now excludes current and retained previous working roots,
+including nested destinations and canonical/symlink aliases. A normal output
+folder remains available. This check protects the first saved-file join slice
+even while unsaved-input ownership is developed separately in #126.
+
+The regression passes against the real application reservation method. The
+complete base workspace passes 592 tests; formatting and all-target/all-feature
+Clippy pass. This does not establish final-feature native or scale acceptance.
