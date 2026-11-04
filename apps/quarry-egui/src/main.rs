@@ -10486,6 +10486,7 @@ fn show_table(
     filter_case_sensitivity: CaseSensitivity,
 ) -> GridInteraction {
     grid_style(ui.style_mut());
+    let digit_padding = theme::digit_padding(ui);
     let palette = theme::ui_palette(ui);
     let mut whitespace = std::mem::take(&mut document.whitespace);
     whitespace.begin_frame();
@@ -10507,11 +10508,17 @@ fn show_table(
         if document.columns.hidden[column] {
             continue;
         }
-        let text_width = |text| {
+        let text_width = |text: String| {
+            let extra = if looks_numeric(&text) {
+                theme::tabular_extra_width(&text, &digit_padding)
+            } else {
+                0.0
+            };
             ui.painter()
                 .layout_no_wrap(text, theme::grid_font(), ui.visuals().text_color())
                 .size()
                 .x
+                + extra
         };
         let header_text = document.header_value(column).map_or_else(
             || document.column_name(column),
@@ -11316,10 +11323,8 @@ fn show_table(
                                             || active_selection_highlight;
                                         let mut rendered = rendered;
                                         let align = if looks_numeric(&rendered.job.text) {
-                                            // Monospaced digits keep right-aligned columns of numbers straight.
-                                            for section in &mut rendered.job.sections {
-                                                section.format.font_id = theme::grid_number_font();
-                                            }
+                                            // Equal-width digits keep right-aligned columns of numbers straight.
+                                            rendered.job = theme::tabular_digits(&rendered.job, &digit_padding);
                                             Align::Max
                                         } else {
                                             Align::Min

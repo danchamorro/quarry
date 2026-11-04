@@ -80,7 +80,7 @@ missing, egui's bundled fonts are used.
 | Small | 11–11.5 | Status bar, captions |
 | Section label (`theme::section_label`) | 12, secondary | Labels above groups of fields |
 | Grid text (`theme::grid_font`) | 13 proportional | Cell and header text |
-| Grid numbers (`theme::grid_number_font`) | 12.5 mono | Numeric cells, so digits line up |
+| Grid numbers (`theme::tabular_digits`) | 13 proportional, equal-width digits | Numeric cells, so digits line up in one font |
 
 egui can't render font weights, so build hierarchy from size, color, and
 spacing, not bold. Write labels in sentence case ("Sort rows", "Match case").
@@ -197,8 +197,10 @@ egui::Modal::new(id)
 
 ### Grid
 
-- Text aligns left; values that `looks_numeric` accepts align right in the
-  number font. Keep that check cheap, since it runs for every visible cell.
+- Text aligns left; values that `looks_numeric` accepts align right, with
+  equal-width digits from `theme::tabular_digits`. Use one font in the grid;
+  don't switch numbers to monospace. Keep `looks_numeric` cheap, since it runs
+  for every visible cell.
 - Cells are square and borderless. Hover is a faint tint, selection is
   `selection`, and the focused cell gets a `selection_strong` ring.
 - Keep 100-row viewport reads and `MAX_RENDERED_COLUMNS`. Visual changes must

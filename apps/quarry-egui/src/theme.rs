@@ -119,9 +119,98 @@ pub(super) fn grid_font() -> FontId {
     FontId::proportional(GRID_FONT_SIZE)
 }
 
-/// Numeric cells use monospaced digits so right-aligned values line up.
-pub(super) fn grid_number_font() -> FontId {
-    FontId::monospace(12.5)
+/// Per-digit padding that widens each digit 0–9 to the widest digit in the grid font.
+///
+/// egui can't enable SF Pro's tabular-figures feature, so numeric cells pad each
+/// digit instead. Right-aligned numbers then line up without a second font.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct DigitPadding {
+    /// Extra width per digit, split evenly before and after it.
+    pub digits: [f32; 10],
+    /// Width of a space in the grid font, used to size trailing padding.
+    pub space: f32,
+}
+
+pub(super) fn digit_padding(ui: &egui::Ui) -> DigitPadding {
+    let font = grid_font();
+    let widths: [f32; 10] = std::array::from_fn(|digit| {
+        let digit = char::from_digit(digit as u32, 10).expect("0-9 are digits");
+        ui.fonts_mut(|fonts| fonts.glyph_width(&font, digit))
+    });
+    let widest = widths.iter().copied().fold(0.0, f32::max);
+    DigitPadding {
+        digits: widths.map(|width| widest - width),
+        space: ui.fonts_mut(|fonts| fonts.glyph_width(&font, ' ')),
+    }
+}
+
+/// Rebuilds `job` so every ASCII digit occupies the same width (tabular figures).
+///
+/// Each digit is centered in its slot: half its padding goes before it (as the
+/// section's leading space) and half after (carried into the next section). A
+/// small trailing space holds the last digit's right half so right-aligned
+/// numbers keep their columns.
+pub(super) fn tabular_digits(
+    job: &egui::text::LayoutJob,
+    padding: &DigitPadding,
+) -> egui::text::LayoutJob {
+    let mut out = job.clone();
+    out.text.clear();
+    out.sections.clear();
+    let mut carry = 0.0;
+    let mut last_format = None;
+    for section in &job.sections {
+        let text = &job.text[section.byte_range.clone()];
+        let mut leading = section.leading_space;
+        let mut run_start = 0;
+        for (index, character) in text.char_indices() {
+            let Some(digit) = character.to_digit(10) else {
+                continue;
+            };
+            if run_start < index {
+                out.append(
+                    &text[run_start..index],
+                    leading + carry,
+                    section.format.clone(),
+                );
+                leading = 0.0;
+                carry = 0.0;
+            }
+            let half = padding.digits[digit as usize] / 2.0;
+            let end = index + character.len_utf8();
+            out.append(
+                &text[index..end],
+                leading + carry + half,
+                section.format.clone(),
+            );
+            leading = 0.0;
+            carry = half;
+            run_start = end;
+        }
+        if run_start < text.len() {
+            out.append(&text[run_start..], leading + carry, section.format.clone());
+            carry = 0.0;
+        }
+        last_format = Some(section.format.clone());
+    }
+    if carry > 0.0
+        && padding.space > 0.0
+        && let Some(mut format) = last_format
+    {
+        // A space scaled to exactly `carry` points wide; the row keeps its height
+        // because the full-size sections set it.
+        format.font_id.size *= carry / padding.space;
+        out.append(" ", 0.0, format);
+    }
+    out
+}
+
+/// Extra width `tabular_digits` adds to `text`.
+pub(super) fn tabular_extra_width(text: &str, padding: &DigitPadding) -> f32 {
+    text.chars()
+        .filter_map(|character| character.to_digit(10))
+        .map(|digit| padding.digits[digit as usize])
+        .sum()
 }
 
 /// Small enough that checkboxes stay square and never read as radio buttons.
@@ -426,4 +515,58 @@ pub(super) fn stat(ui: &mut egui::Ui, value: String, caption: &str) {
                 );
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tabular_digits_center_each_digit_and_keep_the_text() {
+        let mut job = egui::text::LayoutJob::default();
+        job.append("$1,204.50", 0.0, egui::TextFormat::default());
+        let padding = DigitPadding {
+            digits: std::array::from_fn(|digit| 2.0 * digit as f32),
+            space: 4.0,
+        };
+        let tabular = tabular_digits(&job, &padding);
+        assert_eq!(tabular.text, "$1,204.50");
+        let leading: Vec<_> = tabular
+            .sections
+            .iter()
+            .map(|section| {
+                (
+                    &tabular.text[section.byte_range.clone()],
+                    section.leading_space,
+                )
+            })
+            .collect();
+        // Halves: 1→1, 2→2, 0→0, 4→4, 5→5, 0→0, each split before and after.
+        assert_eq!(
+            leading,
+            [
+                ("$", 0.0),
+                ("1", 1.0),
+                (",", 1.0),
+                ("2", 2.0),
+                ("0", 2.0),
+                ("4", 4.0),
+                (".", 4.0),
+                ("5", 5.0),
+                ("0", 5.0),
+            ]
+        );
+        assert_eq!(tabular_extra_width("$1,204.50", &padding), 24.0);
+
+        // A narrow final digit keeps its right half as a scaled trailing space.
+        let mut job = egui::text::LayoutJob::default();
+        job.append("21", 0.0, egui::TextFormat::default());
+        let tabular = tabular_digits(&job, &padding);
+        assert_eq!(tabular.text, "21 ");
+        let trailing = tabular.sections.last().unwrap();
+        assert_eq!(
+            trailing.format.font_id.size,
+            egui::TextFormat::default().font_id.size * 1.0 / 4.0
+        );
+    }
 }
