@@ -51,6 +51,9 @@ remain in `docs/` so they can be reviewed and versioned with the code.
 ## Development expectations
 Rust code should use `rustfmt`, `clippy`, focused tests, clear error handling, and documented unsafe code. Unsafe code is allowed only when justified by measurement and accompanied by invariants and tests.
 
+UI changes follow the [design guide](DESIGN.md): use the shared theme tokens and
+components, support light and dark appearances, and keep VoiceOver labels intact.
+
 ## Performance-sensitive changes
 A pull request affecting parsing, indexing, caching, search, viewport access, sorting, or export should include relevant benchmark results.
 

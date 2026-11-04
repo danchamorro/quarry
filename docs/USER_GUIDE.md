@@ -93,16 +93,22 @@ The CLI accepts **--encoding** on file commands: **auto**, **utf-8**,
 
 - The top ruler contains the one-based file-column numbers for the current
   document. View-only hiding and reordering preserve those identities.
-- The tab strip switches between open documents. A dot marks unsaved changes;
-  an activity marker indicates background work. Hover a tab to see its full path.
+- The macOS menu bar holds every File, Edit, and View command with its
+  standard shortcut, such as Command+S, Command+Shift+S, and Command+F.
+- The toolbar shares the window's title bar. The tab strip below it switches
+  between open documents: an amber dot marks unsaved changes, an activity
+  marker indicates background work, and **+** opens another file. Hover a tab
+  to see its full path.
 - The row below the ruler contains the column names when the file has a header.
 - The numbers on the left identify data rows. The header is not counted as a
   data row.
-- The file menu shows the current filename. A yellow dot marks unsaved changes,
-  and the menu contains **Open…**, **Reload from Disk**, **Save**, **Save As…**,
-  and **Discard Changes**.
-- **Format** shows the applied delimiter and header mode. Opening it also shows
-  what Quarry originally detected and the resolved character encoding.
+- The **File** menu contains **Open…**, **Reload from Disk**, **Save**,
+  **Save As…**, and **Discard Changes**.
+- **Format** shows the delimiter and header mode Quarry is using, such as
+  **Comma · Header row**. Opening it also shows the applied settings, what
+  Quarry originally detected, and the resolved character encoding.
+- Text cells align left and numeric cells align right. Quarry follows the
+  system's light or dark appearance.
 - The footer keeps the visible row range in view, adds file and selection
   metadata when space allows, and reserves its right side for status, progress,
   and the active operation's cancel button.
@@ -117,7 +123,7 @@ after indexing finishes.
 
 1. Double-click a cell.
 2. Change its value and press Enter.
-3. Confirm that the footer says **Modified (not saved)**.
+3. Confirm that the footer says **● Unsaved changes**.
 4. Open the file menu, choose **Save As…**, and select a new filename.
 
 This creates an edited copy and preserves the original file.
@@ -317,8 +323,8 @@ reviews.
 - Scroll horizontally to reach every shown column.
 - Enter a one-based data-row number in **Row**, then click **Go** or press
   Enter.
-- Click **Page Up** or **Page Down**, or use the keyboard Page Up and Page Down
-  keys.
+- Click the up and down arrows beside **Go** (**Page Up** and **Page Down**),
+  or use the keyboard Page Up and Page Down keys.
 
 The number of visible rows follows the available window height. When a filter
 is active, direct row jumping is disabled because the grid is showing matches
@@ -945,10 +951,10 @@ destination folder's capacity. The developer fixture generator is excluded.
 
 ### Save, Save As, and discard
 
-The leftmost toolbar control reads **File** before a file is open and shows the
-current filename afterward. Its menu contains **Open…**, **Reload from Disk**,
-**Save**, **Save As…**, and **Discard Changes**. A yellow dot beside the filename
-and **Modified (not saved)** in the footer identify unsaved work.
+The leftmost toolbar control is the **File** menu. It contains **Open…**,
+**Reload from Disk**, **Save**, **Save As…**, and **Discard Changes**. An amber
+dot on the document's tab and **● Unsaved changes** in the footer identify
+unsaved work.
 
 On macOS, newly created CSV copies, exports, and recovery files are readable
 and writable only by your account. Saving over an existing file preserves that

@@ -17,9 +17,7 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 
-use eframe::egui::{
-    self, Align, AtomExt, Color32, FontFamily, FontId, Layout, RichText, TextStyle,
-};
+use eframe::egui::{self, Align, AtomExt, Color32, FontId, Layout, RichText, TextStyle};
 use egui_extras::{Column, TableBuilder};
 #[cfg(target_os = "macos")]
 use objc2::runtime::{AnyObject, Imp, Sel};
@@ -46,23 +44,29 @@ use quarry_core::{
 
 mod about;
 mod combine_files;
+mod icons;
 mod join_files;
+mod menu;
 mod storage;
 mod tabs;
+mod theme;
 mod whitespace;
 use storage::{PendingStorageOperation, STORAGE_REVIEW_BYTES, StorageReview};
 use tabs::DocumentTab;
 
 const BOOTSTRAP_ROWS: usize = 40;
 const OVERSCAN_ROWS: usize = 16;
-const ROW_HEIGHT: f32 = 17.0;
-const COLUMN_RULER_HEIGHT: f32 = 22.0;
-const HEADER_HEIGHT: f32 = COLUMN_RULER_HEIGHT + ROW_HEIGHT;
-const ROW_NUMBER_WIDTH: f32 = 74.0;
+const ROW_HEIGHT: f32 = 22.0;
+const COLUMN_RULER_HEIGHT: f32 = 18.0;
+const HEADER_NAME_HEIGHT: f32 = 24.0;
+const HEADER_HEIGHT: f32 = COLUMN_RULER_HEIGHT + HEADER_NAME_HEIGHT;
+const ROW_NUMBER_WIDTH: f32 = 64.0;
+/// Horizontal text inset inside grid cells.
+const CELL_PADDING: f32 = 8.0;
 const MAX_RENDERED_COLUMNS: usize = 64;
 // Bound text layout for huge fields without imposing compact-label limits on cells.
 const MAX_GRID_TEXT_CHARS: usize = 16 * 1024;
-const SCROLLBAR_WIDTH: f32 = 18.0;
+const SCROLLBAR_WIDTH: f32 = 12.0;
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EDIT_HISTORY_ENTRIES: usize = 1_000;
@@ -70,15 +74,15 @@ const MAX_EDIT_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 const APP_ID: &str = "io.github.danchamorro.quarry";
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TOOLBAR_HEIGHT: f32 = 38.0;
-const STATUS_BAR_HEIGHT: f32 = 32.0;
+const TRAFFIC_LIGHT_INSET: f32 = 72.0;
+const STATUS_BAR_HEIGHT: f32 = 26.0;
 const STATUS_JOB_WIDTH: f32 = 360.0;
 const STATUS_CANCEL_WIDTH: f32 = 112.0;
-const DOCUMENT_MENU_WIDTH: f32 = 220.0;
-const FORMAT_MENU_WIDTH: f32 = 190.0;
-const COMPACT_DOCUMENT_MENU_WIDTH: f32 = 100.0;
-const COMPACT_FORMAT_MENU_WIDTH: f32 = 78.0;
-const TOOLBAR_JUMP_WIDTH: f32 = 52.0;
-const TOOLBAR_FILTER_WIDTH: f32 = 78.0;
+const DOCUMENT_MENU_WIDTH: f32 = 58.0;
+const FORMAT_MENU_WIDTH: f32 = 176.0;
+const COMPACT_DOCUMENT_MENU_WIDTH: f32 = 54.0;
+const COMPACT_FORMAT_MENU_WIDTH: f32 = 92.0;
+const TOOLBAR_JUMP_WIDTH: f32 = 64.0;
 const JUMP_INPUT_ID: &str = "quarry-jump-input";
 const FIND_INPUT_ID: &str = "quarry-find-input";
 const REPLACE_INPUT_ID: &str = "quarry-replace-input";
@@ -89,12 +93,6 @@ const STRUCTURAL_SEPARATOR_INPUT_ID: &str = "quarry-structural-separator-input";
 const STRUCTURAL_POSITION_INPUT_ID: &str = "quarry-structural-position-input";
 const SOURCE_CHANGED_NOTICE: &str =
     "The source file changed outside Quarry. Discard changes and reopen it.";
-const QUARRY_YELLOW: Color32 = Color32::from_rgb(233, 196, 106);
-const QUARRY_YELLOW_TEXT: Color32 = Color32::from_rgb(122, 88, 20);
-const QUARRY_SELECTED_TEXT: Color32 = Color32::from_rgb(47, 38, 18);
-const ERROR_FILL: Color32 = Color32::from_rgb(250, 232, 229);
-const ERROR_TEXT: Color32 = Color32::from_rgb(171, 65, 53);
-const WARNING_FILL: Color32 = Color32::from_rgb(250, 242, 214);
 
 #[cfg(target_os = "macos")]
 #[derive(Clone)]
@@ -295,7 +293,10 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
             .with_inner_size([1280.0, 780.0])
-            .with_min_inner_size([860.0, 540.0]),
+            .with_min_inner_size([860.0, 540.0])
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false),
         centered: true,
         ..Default::default()
     };
@@ -309,10 +310,13 @@ fn main() -> eframe::Result<()> {
             "Quarry",
             options,
             Box::new(move |creation| {
+                theme::install_fonts(&creation.egui_ctx);
                 configure_style(&creation.egui_ctx);
+                install_unified_titlebar();
                 attach_open_document_context(&creation.egui_ctx);
                 let mut app = QuarryApp::with_paths(initial_paths, started);
                 app.open_document_receiver = Some(open_document_receiver);
+                app.menu_receiver = menu::install(&creation.egui_ctx);
                 Ok(Box::new(app))
             }),
             &event_loop,
@@ -326,6 +330,7 @@ fn main() -> eframe::Result<()> {
         "Quarry",
         options,
         Box::new(move |creation| {
+            theme::install_fonts(&creation.egui_ctx);
             configure_style(&creation.egui_ctx);
             Ok(Box::new(QuarryApp::with_paths(initial_paths, started)))
         }),
@@ -352,6 +357,12 @@ struct QuarryApp {
     logged_first_update: bool,
     #[cfg(target_os = "macos")]
     open_document_receiver: Option<Receiver<PathBuf>>,
+    /// A native menu command waiting for the toolbar's action gate this frame.
+    pending_menu_action: Option<Action>,
+    #[cfg(target_os = "macos")]
+    menu_receiver: Option<Receiver<menu::MenuCommand>>,
+    #[cfg(target_os = "macos")]
+    menu_state: Option<menu::MenuState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,6 +668,95 @@ impl Default for FilterRuleDraft {
 }
 
 impl QuarryApp {
+    /// Turns native menu commands into events or actions, then mirrors availability back.
+    #[cfg(target_os = "macos")]
+    fn handle_menu_commands(&mut self, ctx: &egui::Context) {
+        let commands = self
+            .menu_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for command in commands {
+            match menu::route(
+                command,
+                self.whitespace_preferences.show_all,
+                menu::pasteboard_text,
+            ) {
+                Some(menu::Routed::Events(events)) => {
+                    ctx.input_mut(|input| input.events.extend(events));
+                }
+                Some(menu::Routed::Action(action)) => self.pending_menu_action = Some(action),
+                Some(menu::Routed::Url(url)) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+                None => {}
+            }
+        }
+        if self.menu_receiver.is_some() {
+            let state = self.menu_state();
+            if self.menu_state.as_ref() != Some(&state) {
+                menu::sync(&state);
+                self.menu_state = Some(state);
+            }
+        }
+    }
+
+    /// Menu availability follows the same blocking rules as the toolbar.
+    fn menu_state(&self) -> menu::MenuState {
+        use menu::MenuCommand as M;
+        let document = self.active.document.as_ref();
+        let blocked = self.quitting_cleanup()
+            || self.active.inspection.recovering()
+            || self.active.storage_review.is_some()
+            || self.about.open
+            || self.combine_files.is_some()
+            || self.active.close_after_save
+            || self.active.close_after_jobs
+            || self.active.close_confirmation_open
+            || self.active.structural_dialog.is_some();
+        let files = FileCommands::new(document);
+        let open = document.is_some();
+        let filter_active = document.is_some_and(Document::filter_active);
+        let insertion = |rows| {
+            document.is_some_and(|document| document.insertion_disabled_reason(rows).is_none())
+        };
+        let tabs = self
+            .document_tabs()
+            .filter(|tab| tab.document.is_some())
+            .count();
+        let available = [
+            (M::About, true),
+            (M::Open, true),
+            (M::CombineFiles, files.combine),
+            (M::JoinFiles, true),
+            (M::CloseTab, open),
+            (M::ReloadFromDisk, files.reload),
+            (M::Save, files.save),
+            (M::SaveAs, files.save_as),
+            (M::SaveAsUtf8, files.save_as_utf8),
+            (M::DiscardChanges, files.discard),
+            (M::InspectFile, files.inspect),
+            (M::TemporaryStorage, files.temporary_storage),
+            (M::Undo, document.is_some_and(Document::can_undo)),
+            (M::Redo, document.is_some_and(Document::can_redo)),
+            (M::Find, open && !filter_active),
+            (M::InsertRows, insertion(true)),
+            (M::InsertColumns, insertion(false)),
+            (M::Columns, open),
+            (M::Filters, open),
+            (M::NextTab, tabs > 1),
+            (M::PreviousTab, tabs > 1),
+        ];
+        menu::MenuState {
+            disabled: available
+                .into_iter()
+                .filter(|(_, available)| blocked || !available)
+                .map(|(command, _)| command)
+                .collect(),
+            show_all_whitespace: self.whitespace_preferences.show_all,
+        }
+    }
+}
+
+impl QuarryApp {
     /// Opens each command-line path using the same tab and error policy as file drops.
     fn with_paths(paths: Vec<PathBuf>, started: Instant) -> Self {
         let mut app = Self::new(None, started);
@@ -687,6 +787,11 @@ impl QuarryApp {
             logged_first_update: false,
             #[cfg(target_os = "macos")]
             open_document_receiver: None,
+            pending_menu_action: None,
+            #[cfg(target_os = "macos")]
+            menu_receiver: None,
+            #[cfg(target_os = "macos")]
+            menu_state: None,
         };
         if let Some(path) = initial_path {
             app.open_path_and_report(path);
@@ -2119,6 +2224,8 @@ impl eframe::App for QuarryApp {
         }
 
         self.remember_tab_focus(ctx);
+        #[cfg(target_os = "macos")]
+        self.handle_menu_commands(ctx);
 
         if self.active.storage_review.is_none() {
             self.intercept_dirty_close(ctx);
@@ -2169,7 +2276,6 @@ impl eframe::App for QuarryApp {
             || self.active.close_after_save
             || self.active.close_after_jobs
             || self.active.structural_dialog.is_some();
-        self.show_document_tabs(ctx, tabs_blocked);
         let storage_review_open = self.active.storage_review.is_some();
         let interaction_blocked = self.quitting_cleanup()
             || self.active.inspection.recovering()
@@ -2201,30 +2307,32 @@ impl eframe::App for QuarryApp {
             surrender_find_controls_focus(ctx);
         }
 
-        let mut action = None;
+        let mut action = self.pending_menu_action.take();
+        let palette = theme::ctx_palette(ctx);
+        let titlebar_inset = titlebar_inset(ctx);
         egui::TopBottomPanel::top("quarry-toolbar")
             .exact_height(TOOLBAR_HEIGHT)
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(230, 235, 238))
-                    .inner_margin(egui::Margin::symmetric(10, 6))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgb(200, 209, 213),
-                    )),
-            )
+            .show_separator_line(false)
+            .frame(theme::chrome_frame(palette).inner_margin(egui::Margin {
+                left: (12.0 + titlebar_inset) as i8,
+                right: 12,
+                top: 0,
+                bottom: 0,
+            }))
             .show(ctx, |ui| {
+                theme::hairline(ui.painter(), ui.max_rect().expand2(egui::vec2(200.0, 0.0)), true, palette.separator);
+                titlebar_drag_area(ui);
                 if interaction_blocked {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
+                theme::chrome_controls(ui.style_mut());
                 let document = self.active.document.as_ref();
                 let document_open = document.is_some();
                 let filter_active = document.is_some_and(Document::filter_active);
                 let compact = ui.available_width() < 1_000.0;
-                ui.spacing_mut().item_spacing.x = if compact { 4.0 } else { 6.0 };
-                ui.spacing_mut().button_padding.x = if compact { 5.0 } else { 8.0 };
-                ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = if compact { 2.0 } else { 4.0 };
+                ui.horizontal_centered(|ui| {
                     if let Some(document_action) = document_menu(
                         ui,
                         document,
@@ -2253,37 +2361,14 @@ impl eframe::App for QuarryApp {
                     if let Some(view_action) = whitespace_view_menu(ui, self.whitespace_preferences.show_all) {
                         action = Some(view_action);
                     }
-                    let label = ui.label("Row");
-                    let jump_enabled = ui.is_enabled() && document_open && !filter_active;
-                    let jump = ui
-                        .add_enabled(
-                            jump_enabled,
-                            egui::TextEdit::singleline(&mut self.active.jump_input)
-                                .id(egui::Id::new(JUMP_INPUT_ID))
-                                .horizontal_align(Align::RIGHT)
-                                .desired_width(TOOLBAR_JUMP_WIDTH),
-                        )
-                        .labelled_by(label.id);
-                    if ui
-                        .add_enabled(jump_enabled, egui::Button::new("Go"))
-                        .clicked()
-                        || (jump_enabled
-                            && jump.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                    {
-                        action = Some(Action::Jump);
-                    }
-                    if let Some(page_action) = page_controls(ui, document_open) {
-                        action = Some(page_action);
-                    }
+                    toolbar_separator(ui);
 
                     let can_undo = document.is_some_and(Document::can_undo);
-                    let undo = ui
-                        .add_enabled(can_undo, egui::Button::new("Undo"))
+                    let undo = icons::button(ui, can_undo, icons::Icon::Undo, "Undo", false)
                         .on_disabled_hover_text(
                             "No retained change to undo. Finish editing before using history, and clear filters before whole-file Undo. Edits beyond the history limit can block whole-file Undo. Save to keep changes or discard to restore the source; both reset history.",
                         )
-                        .on_hover_text("Undo the last edit or whole-file change (Command/Ctrl+Z).");
+                        .on_hover_text("Undo the last edit or whole-file change (⌘Z).");
                     undo.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
@@ -2296,8 +2381,8 @@ impl eframe::App for QuarryApp {
                     }
 
                     let can_redo = document.is_some_and(Document::can_redo);
-                    let redo = ui.add_enabled(can_redo, egui::Button::new("Redo"))
-                        .on_hover_text("Redo the last undone change (Command/Ctrl+Shift+Z).");
+                    let redo = icons::button(ui, can_redo, icons::Icon::Redo, "Redo", false)
+                        .on_hover_text("Redo the last undone change (⇧⌘Z).");
                     redo.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
@@ -2308,6 +2393,7 @@ impl eframe::App for QuarryApp {
                     if redo.clicked() {
                         action = Some(Action::Redo);
                     }
+                    toolbar_separator(ui);
 
                     ui.add_enabled_ui(document_open, |ui| {
                         ui.menu_button("Insert", |ui| {
@@ -2324,34 +2410,38 @@ impl eframe::App for QuarryApp {
                             }
                         });
                     });
-                    let columns = ui.add_enabled(document_open, egui::Button::new("Columns…"));
-                    ctx.data_mut(|data| data.insert_temp(egui::Id::new(("quarry-column-manager", "anchor")), columns.rect.right_bottom()));
+                    let columns = icons::button(ui, document_open, icons::Icon::Columns, "Columns…", !compact)
+                        .on_hover_text("Show, hide, reorder, and fit columns.");
+                    ctx.data_mut(|data| data.insert_temp(egui::Id::new(("quarry-column-manager", "anchor")), columns.rect));
                     if columns.clicked() {
                         action = Some(Action::OpenColumns);
                     }
                     let filter_label = filter_button_label(
                         document.and_then(|document| document.filter_query.as_ref()),
                     );
-                    let filters = ui
-                        .add_enabled_ui(document_open, |ui| {
-                            ui.add_sized(
-                                [TOOLBAR_FILTER_WIDTH, 24.0],
-                                egui::Button::new(filter_label).truncate(),
-                            )
-                        })
-                        .inner;
-                    ctx.data_mut(|data| data.insert_temp(egui::Id::new(("quarry-filter-manager", "anchor")), filters.rect.right_bottom()));
+                    let filters = icons::button(ui, document_open, icons::Icon::Filter, &filter_label, !compact)
+                        .on_hover_text("Keep rows that match conditions.");
+                    if filter_active {
+                        ui.painter().rect_stroke(
+                            filters.rect,
+                            theme::CONTROL_RADIUS,
+                            egui::Stroke::new(1.0, palette.selection_strong),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    ctx.data_mut(|data| data.insert_temp(egui::Id::new(("quarry-filter-manager", "anchor")), filters.rect));
                     if filters.clicked() {
                         action = Some(Action::OpenFilters);
                     }
 
+                    let jump_enabled = ui.is_enabled() && document_open && !filter_active;
                     let find_disabled_reason = if document_open {
                         "Clear the filter before using Find."
                     } else {
                         "Open a file first."
                     };
-                    let find = ui
-                        .add_enabled(jump_enabled, egui::Button::new("Find"))
+                    let find = icons::button(ui, jump_enabled, icons::Icon::Search, "Find", !compact)
+                        .on_hover_text("Find and replace (⌘F).")
                         .on_disabled_hover_text(find_disabled_reason);
                     if !jump_enabled {
                         let _ = ui.ctx().accesskit_node_builder(find.id, |node| {
@@ -2362,29 +2452,78 @@ impl eframe::App for QuarryApp {
                         self.active.find_bar_open = true;
                         focus_find = true;
                     }
+
+                    // Navigation sits flush right while keeping left-to-right focus order.
+                    let text_width = |text: &str| {
+                        ui.fonts_mut(|fonts| {
+                            fonts
+                                .layout_no_wrap(text.to_owned(), FontId::proportional(13.0), Color32::WHITE)
+                                .size()
+                                .x
+                        })
+                    };
+                    let text_edit_margin = ui.spacing().button_padding.x.min(4.0) * 2.0;
+                    let nav_width = text_width("Row")
+                        + TOOLBAR_JUMP_WIDTH
+                        + text_edit_margin
+                        + text_width("Go")
+                        + 2.0 * ui.spacing().button_padding.x
+                        + 2.0 * (icons::ICON_SIZE + 2.0 * ui.spacing().button_padding.x).max(26.0)
+                        + 4.0 * ui.spacing().item_spacing.x;
+                    ui.add_space((ui.available_width() - nav_width).max(0.0));
+                    let label = ui.label(RichText::new("Row").color(palette.text_secondary));
+                    let jump = ui
+                        .add_enabled(
+                            jump_enabled,
+                            egui::TextEdit::singleline(&mut self.active.jump_input)
+                                .id(egui::Id::new(JUMP_INPUT_ID))
+                                .horizontal_align(Align::RIGHT)
+                                .vertical_align(Align::Center)
+                                .min_size(egui::vec2(0.0, 24.0))
+                                .desired_width(TOOLBAR_JUMP_WIDTH),
+                        )
+                        .labelled_by(label.id);
+                    if ui
+                        .add_enabled(jump_enabled, egui::Button::new("Go"))
+                        .clicked()
+                        || (jump_enabled
+                            && jump.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                    {
+                        action = Some(Action::Jump);
+                    }
+                    if let Some(page_action) = page_controls(ui, document_open) {
+                        action = Some(page_action);
+                    }
                 });
             });
+
+        // Tabs sit below the title-bar toolbar, as in Safari and Finder.
+        self.show_document_tabs(ctx, tabs_blocked);
 
         let notice_has_details = self.notice_has_inspection_details();
         let mut show_error_details = false;
         if let Some(notice) = self.active.notice.as_ref() {
             let fill = match notice.severity {
-                MessageSeverity::Error => ERROR_FILL,
-                MessageSeverity::Warning => WARNING_FILL,
+                MessageSeverity::Error => palette.error_fill,
+                MessageSeverity::Warning => palette.warning_fill,
                 MessageSeverity::Status => unreachable!("status messages belong in the footer"),
             };
             let mut dismiss = false;
             egui::TopBottomPanel::top("quarry-notice")
-                .frame(panel_frame(fill).inner_margin(egui::Margin::symmetric(10, 5)))
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::symmetric(14, 6)),
+                )
                 .show(ctx, |ui| {
                     if interaction_blocked {
                         ui.disable();
                         ui.set_opacity(1.0);
                     }
-                    dismiss = notice_strip(ui, notice);
-                    if notice_has_details {
-                        show_error_details = ui.small_button("Details / Inspect…").clicked();
-                    }
+                    (dismiss, show_error_details) =
+                        notice_strip_with_details(ui, notice, notice_has_details);
                 });
             if dismiss {
                 self.active.notice = None;
@@ -2406,13 +2545,15 @@ impl eframe::App for QuarryApp {
                     document.cell_edit.is_none() && document.header_edit.is_none()
                 });
             egui::TopBottomPanel::top("quarry-find")
-                .frame(
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(238, 242, 244))
-                        .inner_margin(egui::Margin::symmetric(10, 5))
-                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 209, 213))),
-                )
+                .show_separator_line(false)
+                .frame(theme::chrome_frame(palette).inner_margin(egui::Margin::symmetric(14, 6)))
                 .show(ctx, |ui| {
+                    theme::hairline(
+                        ui.painter(),
+                        ui.max_rect().expand2(egui::vec2(20.0, 6.0)),
+                        true,
+                        palette.separator,
+                    );
                     if interaction_blocked {
                         ui.disable();
                         ui.set_opacity(1.0);
@@ -2465,11 +2606,21 @@ impl eframe::App for QuarryApp {
 
         egui::TopBottomPanel::bottom("quarry-status")
             .exact_height(STATUS_BAR_HEIGHT)
-            .frame(
-                panel_frame(Color32::from_rgb(230, 235, 238))
-                    .inner_margin(egui::Margin::symmetric(14, 4)),
-            )
+            .show_separator_line(false)
+            .frame(theme::chrome_frame(palette).inner_margin(egui::Margin::symmetric(14, 0)))
             .show(ctx, |ui| {
+                theme::hairline(
+                    ui.painter(),
+                    ui.max_rect().expand2(egui::vec2(20.0, 0.0)),
+                    false,
+                    palette.separator,
+                );
+                theme::chrome_controls(ui.style_mut());
+                ui.style_mut().override_text_style = Some(TextStyle::Small);
+                ui.style_mut()
+                    .text_styles
+                    .insert(TextStyle::Small, FontId::proportional(11.5));
+                ui.visuals_mut().override_text_color = Some(palette.text_secondary);
                 if interaction_blocked {
                     ui.disable();
                     ui.set_opacity(1.0);
@@ -2577,7 +2728,7 @@ impl eframe::App for QuarryApp {
         let mut requested_column_edit = None;
         let mut empty_state_action = None;
         egui::CentralPanel::default()
-            .frame(panel_frame(Color32::from_rgb(244, 247, 248)))
+            .frame(egui::Frame::new().fill(palette.canvas))
             .show(ctx, |ui| {
                 if interaction_blocked {
                     ui.disable();
@@ -2668,60 +2819,63 @@ impl eframe::App for QuarryApp {
             let mut keep_editing = false;
             let mut save_and_close = false;
             let mut save_as_and_close = false;
-            let modal =
-                egui::Modal::new(egui::Id::new("quarry-close-confirmation")).show(ctx, |ui| {
+            let save_ready = self
+                .active
+                .document
+                .as_ref()
+                .is_some_and(Document::is_save_ready);
+            let discard_ready = self
+                .active
+                .document
+                .as_ref()
+                .is_none_or(|document| document.save_job.is_none());
+            let message = self
+                .active
+                .document
+                .as_ref()
+                .map(|document| format!("{} has unsaved changes.", document.logical_path.display()))
+                .unwrap_or_default();
+            let modal = egui::Modal::new(egui::Id::new("quarry-close-confirmation"))
+                .frame(tool_dialog_frame(ctx))
+                .show(ctx, |ui| {
+                    tool_dialog_style(ui.style_mut());
+                    ui.set_width(460.0);
                     ui.heading("Unsaved changes");
-                    ui.label(
-                        self.active
-                            .document
-                            .as_ref()
-                            .map(|document| {
-                                format!("{} has unsaved changes.", document.logical_path.display())
-                            })
-                            .unwrap_or_default(),
-                    );
-                    ui.label("Save them, save a new copy, keep editing, or discard them.");
-                    ui.add_space(8.0);
+                    ui.label(message);
+                    ui.weak("Save them, save a new copy, keep editing, or discard them.");
+                    ui.add_space(6.0);
+                    // macOS order: destructive on the left, the default action on the far right.
                     ui.horizontal(|ui| {
-                        if ui.button("Keep Editing").clicked() {
-                            keep_editing = true;
-                        }
+                        let palette = theme::ui_palette(ui);
                         if ui
                             .add_enabled(
-                                self.active
-                                    .document
-                                    .as_ref()
-                                    .is_some_and(Document::is_save_ready),
-                                egui::Button::new("Save and Close"),
-                            )
-                            .clicked()
-                        {
-                            save_and_close = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                self.active
-                                    .document
-                                    .as_ref()
-                                    .is_some_and(Document::is_save_ready),
-                                egui::Button::new("Save As and Close…"),
-                            )
-                            .clicked()
-                        {
-                            save_as_and_close = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                self.active
-                                    .document
-                                    .as_ref()
-                                    .is_none_or(|document| document.save_job.is_none()),
-                                egui::Button::new("Discard Changes and Close"),
+                                discard_ready,
+                                egui::Button::new(
+                                    RichText::new("Discard Changes and Close")
+                                        .color(palette.error_text),
+                                ),
                             )
                             .clicked()
                         {
                             discard_and_close = true;
                         }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(save_ready, theme::primary_button("Save and Close"))
+                                .clicked()
+                            {
+                                save_and_close = true;
+                            }
+                            if ui
+                                .add_enabled(save_ready, egui::Button::new("Save As and Close…"))
+                                .clicked()
+                            {
+                                save_as_and_close = true;
+                            }
+                            if ui.button("Keep Editing").clicked() {
+                                keep_editing = true;
+                            }
+                        });
                     });
                 });
             keep_editing |= modal.should_close();
@@ -3107,22 +3261,40 @@ fn footer_range_text(document: &Document) -> String {
             return "No matching rows".into();
         }
         if visible == 0 {
-            return format!("{total} filter matches");
+            return format!("{} filter matches", group_digits(total));
         }
         let start = document.filter_viewport_start.saturating_add(1);
         let end = document
             .filter_viewport_start
             .saturating_add(visible)
             .min(total);
-        format!("matches {start}–{end} of {total}")
+        format!(
+            "Matches {}–{} of {}",
+            group_digits(start),
+            group_digits(end),
+            group_digits(total)
+        )
     } else {
         format!(
-            "rows {}–{} of {}",
-            document.display_start(),
-            document.display_end(),
-            document.available_data_rows()
+            "Rows {}–{} of {}",
+            group_digits(document.display_start()),
+            group_digits(document.display_end()),
+            group_digits(document.available_data_rows())
         )
     }
+}
+
+/// Formats counts with thousands separators: 50000 → "50,000".
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn active_job_controls(ui: &mut egui::Ui, display: &ActiveJobDisplay) -> Option<Action> {
@@ -3141,17 +3313,42 @@ fn active_job_controls(ui: &mut egui::Ui, display: &ActiveJobDisplay) -> Option<
     clicked.then_some(display.cancel_action)
 }
 
+#[cfg(test)]
 fn notice_strip(ui: &mut egui::Ui, notice: &AppMessage) -> bool {
+    notice_strip_with_details(ui, notice, false).0
+}
+
+/// A one-line banner: severity mark and message on the left, actions on the right.
+/// Returns (dismiss, show details).
+fn notice_strip_with_details(
+    ui: &mut egui::Ui,
+    notice: &AppMessage,
+    details: bool,
+) -> (bool, bool) {
+    let palette = theme::ui_palette(ui);
     let (color, live) = match notice.severity {
-        MessageSeverity::Error => (ERROR_TEXT, egui::accesskit::Live::Assertive),
-        MessageSeverity::Warning => (QUARRY_YELLOW_TEXT, egui::accesskit::Live::Polite),
+        MessageSeverity::Error => (palette.error_text, egui::accesskit::Live::Assertive),
+        MessageSeverity::Warning => (palette.warning_text, egui::accesskit::Live::Polite),
         MessageSeverity::Status => unreachable!("status messages belong in the footer"),
     };
     let mut dismiss = false;
+    let mut show_details = false;
+    let actions_width = if details { 210.0 } else { 90.0 };
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - 90.0).max(0.0);
-        let response = ui.add_sized(
+        let (mark, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        ui.painter().circle_filled(mark.center(), 7.0, color);
+        ui.painter().text(
+            mark.center(),
+            egui::Align2::CENTER_CENTER,
+            "!",
+            FontId::proportional(11.0),
+            palette.canvas,
+        );
+        let width = (ui.available_width() - actions_width).max(0.0);
+        let response = add_aligned(
+            ui,
             egui::vec2(width, 0.0),
+            Align::Min,
             egui::Label::new(RichText::new(&notice.text).color(color)).wrap(),
         );
         let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
@@ -3159,9 +3356,12 @@ fn notice_strip(ui: &mut egui::Ui, notice: &AppMessage) -> bool {
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             dismiss = ui.button("Dismiss").clicked();
+            if details {
+                show_details = ui.button("Details / Inspect…").clicked();
+            }
         });
     });
-    dismiss
+    (dismiss, show_details)
 }
 
 fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) -> Option<Action> {
@@ -3178,40 +3378,43 @@ fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) 
             egui::vec2(metadata_width, height),
             Layout::left_to_right(Align::Center),
             |ui| {
+                let palette = theme::ui_palette(ui);
+                ui.spacing_mut().item_spacing.x = 14.0;
                 if document.is_dirty() {
-                    ui.colored_label(Color32::from_rgb(171, 65, 53), "Modified (not saved)");
-                    ui.separator();
+                    ui.colored_label(palette.accent_text, "● Unsaved changes");
                 }
-                ui.label(footer_range_text(document));
+                ui.label(RichText::new(footer_range_text(document)).color(palette.text));
 
                 if metadata_width >= 540.0 {
-                    ui.separator();
-                    ui.label(format_bytes(document.session.file_size));
-                }
-                if metadata_width >= 650.0 {
-                    ui.separator();
-                    ui.label(format!("{} columns", document.total_columns));
+                    ui.label(format!(
+                        "{} column{}",
+                        group_digits(document.total_columns as u64),
+                        if document.total_columns == 1 { "" } else { "s" }
+                    ));
                 }
                 let shown = document.columns.shown_count();
-                if metadata_width >= 760.0 && shown != document.total_columns {
-                    ui.separator();
-                    ui.label(format!("{shown} shown"));
+                if metadata_width >= 650.0 && shown != document.total_columns {
+                    ui.label(format!("{} shown", group_digits(shown as u64)));
+                }
+                if metadata_width >= 760.0 {
+                    ui.label(format_bytes(document.session.file_size));
                 }
                 let selected_rows = document.selected_rows.count();
                 let selected_columns = document.selected_columns.len();
                 if metadata_width >= 840.0 && (selected_rows > 0 || selected_columns > 0) {
-                    ui.separator();
-                    if selected_rows > 0 {
-                        ui.label(format!(
-                            "{selected_rows} row{} selected",
+                    let text = if selected_rows > 0 {
+                        format!(
+                            "{} row{} selected",
+                            group_digits(selected_rows),
                             if selected_rows == 1 { "" } else { "s" }
-                        ));
+                        )
                     } else {
-                        ui.label(format!(
+                        format!(
                             "{selected_columns} column{} selected",
                             if selected_columns == 1 { "" } else { "s" }
-                        ));
-                    }
+                        )
+                    };
+                    ui.colored_label(palette.accent_text, text);
                 }
             },
         );
@@ -3233,6 +3436,15 @@ fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) 
                     let response = ui
                         .add(egui::Label::new(status).truncate())
                         .on_hover_text(status);
+                    let palette = theme::ui_palette(ui);
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    let color = match status {
+                        "Index complete" => palette.success_text,
+                        "Indexing" => palette.selection_strong,
+                        _ => palette.text_tertiary,
+                    };
+                    ui.painter().circle_filled(dot.center(), 3.0, color);
                     let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
                         node.set_live(egui::accesskit::Live::Polite);
                     });
@@ -3254,21 +3466,24 @@ fn menu_button_with_arrow(
 ) -> egui::Response {
     let arrow_id = ui.id().with(arrow_salt);
     let button = button
-        .right_text(egui::Atom::custom(arrow_id, egui::vec2(10.0, 10.0)))
-        .min_size(egui::vec2(width, 24.0))
+        .right_text(egui::Atom::custom(arrow_id, egui::vec2(9.0, 9.0)))
+        .min_size(egui::vec2(width, 26.0))
         .truncate();
     let direction = ui.layout().main_dir();
     let rendered = ui
         .allocate_ui_with_layout(
-            egui::vec2(width, 24.0),
+            egui::vec2(width, 26.0),
             Layout::centered_and_justified(direction),
             |ui| button.atom_ui(ui),
         )
         .inner;
     if let Some(rect) = rendered.rect(arrow_id) {
-        let mut arrow = rendered.response.clone();
-        arrow.rect = rect;
-        egui::collapsing_header::paint_default_icon(ui, 1.0, &arrow);
+        let color = if ui.is_enabled() {
+            theme::ui_palette(ui).text_secondary
+        } else {
+            theme::ui_palette(ui).text_tertiary
+        };
+        icons::paint(ui.painter(), rect, icons::Icon::ChevronDown, color);
     }
     rendered.response
 }
@@ -3296,11 +3511,28 @@ fn format_menu(
     } else {
         "Format".to_owned()
     };
-    let label = if compact && document_open {
-        applied_delimiter.label().to_owned()
-    } else {
-        accessibility_label.clone()
-    };
+    // Show what Quarry is actually using, not the word "Auto".
+    let label = document.map_or_else(
+        || "Format".to_owned(),
+        |document| {
+            let dialect = document.session.dialect;
+            let delimiter = if applied_delimiter == DelimiterMode::Auto {
+                detected_delimiter_label(dialect.delimiter)
+            } else {
+                applied_delimiter.label()
+            };
+            let header = match applied_header {
+                HeaderMode::Auto if dialect.has_header => "Header row",
+                HeaderMode::Auto => "No header",
+                mode => compact_header_mode_label(mode),
+            };
+            if compact {
+                delimiter.to_owned()
+            } else {
+                format!("{delimiter} · {header}")
+            }
+        },
+    );
     let response = ui
         .add_enabled_ui(document_open, |ui| {
             menu_button_with_arrow(
@@ -3465,10 +3697,7 @@ fn format_menu(
                 let reopen = ui
                     .add_enabled(
                         changed && !dirty && !operation_active,
-                        egui::Button::new(
-                            RichText::new("Reopen with Changes").color(QUARRY_SELECTED_TEXT),
-                        )
-                        .fill(QUARRY_YELLOW),
+                        theme::primary_button("Reopen with Changes"),
                     )
                     .on_disabled_hover_text(if !changed {
                         "Choose a different delimiter, header mode, or encoding first."
@@ -3495,18 +3724,51 @@ fn format_menu(
     menu.and_then(|inner| inner.inner)
 }
 
+/// Which File commands are available; shared by the toolbar File menu and the menu bar.
+struct FileCommands {
+    combine: bool,
+    reload: bool,
+    save: bool,
+    save_as: bool,
+    save_as_utf8: bool,
+    discard: bool,
+    temporary_storage: bool,
+    inspect: bool,
+}
+
+impl FileCommands {
+    fn new(document: Option<&Document>) -> Self {
+        let open = document.is_some();
+        let dirty = document.is_some_and(Document::is_dirty);
+        let file_operation_active = document.is_some_and(|document| {
+            document.export_job.is_some()
+                || document.save_job.is_some()
+                || document.structural_job.is_some()
+        });
+        let join_reserved = document.is_some_and(Document::join_reserved);
+        Self {
+            combine: !file_operation_active,
+            reload: open && !file_operation_active && !dirty,
+            save: document.is_some_and(Document::is_save_ready),
+            save_as: document.is_some_and(Document::is_save_as_ready),
+            save_as_utf8: document.is_some_and(|document| {
+                document.session.encoding() != Encoding::Utf8 && document.save_operations_ready()
+            }),
+            discard: dirty && !file_operation_active && !join_reserved,
+            temporary_storage: !file_operation_active,
+            inspect: !file_operation_active,
+        }
+    }
+}
+
 fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> Option<Action> {
+    let commands = FileCommands::new(document);
     let document_open = document.is_some();
     let dirty = document.is_some_and(Document::is_dirty);
-    let file_operation_active = document.is_some_and(|document| {
-        document.export_job.is_some()
-            || document.save_job.is_some()
-            || document.structural_job.is_some()
-    });
-    let save_ready = document.is_some_and(Document::is_save_ready);
-    let save_as_ready = document.is_some_and(Document::is_save_as_ready);
+    let save_ready = commands.save;
+    let save_as_ready = commands.save_as;
     let join_reserved = document.is_some_and(Document::join_reserved);
-    let discard_ready = dirty && !file_operation_active && !join_reserved;
+    let discard_ready = commands.discard;
     let (filename, full_path) = document.map_or_else(
         || ("File".to_owned(), None),
         |document| {
@@ -3519,15 +3781,11 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             )
         },
     );
-    let marker = RichText::new("●").color(if dirty {
-        QUARRY_YELLOW_TEXT
-    } else {
-        Color32::TRANSPARENT
-    });
+    // The tab names the file; this menu holds file commands.
     let response = menu_button_with_arrow(
         ui,
         "document-menu-arrow",
-        egui::Button::new((marker, RichText::new(filename.clone()).atom_shrink(true))),
+        egui::Button::new(RichText::new("File").atom_shrink(true)),
         width,
     );
     let mut popup = egui::Popup::menu(&response);
@@ -3552,7 +3810,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             }
         });
         if ui
-            .add_enabled(!file_operation_active, egui::Button::new("Combine Files…"))
+            .add_enabled(commands.combine, egui::Button::new("Combine Files…"))
             .clicked()
         {
             action = Some(Action::CombineFiles);
@@ -3568,10 +3826,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             action = Some(Action::CloseTab);
         }
         let reload = ui
-            .add_enabled(
-                document_open && !file_operation_active && !dirty,
-                egui::Button::new("Reload from Disk"),
-            )
+            .add_enabled(commands.reload, egui::Button::new("Reload from Disk"))
             .on_disabled_hover_text(if !document_open {
                 "Open a file first."
             } else if dirty {
@@ -3606,7 +3861,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             action = Some(Action::ChooseSaveAs);
         }
         if ui.add_enabled(
-            document.is_some_and(|doc| doc.session.encoding() != Encoding::Utf8 && doc.save_operations_ready()),
+            commands.save_as_utf8,
             egui::Button::new("Save As UTF-8…"),
         ).on_hover_text("Create a UTF-8 copy with the current edits and column order. The source stays unchanged.")
             .clicked()
@@ -3630,7 +3885,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
         ui.separator();
         if ui
             .add_enabled(
-                !file_operation_active,
+                commands.temporary_storage,
                 egui::Button::new("Temporary storage…"),
             )
             .clicked()
@@ -3638,7 +3893,7 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             action = Some(Action::TemporaryStorage);
         }
         ui.separator();
-        if ui.add_enabled(!file_operation_active, egui::Button::new("Inspect File…")).clicked() {
+        if ui.add_enabled(commands.inspect, egui::Button::new("Inspect File…")).clicked() {
             action = Some(Action::InspectFile);
         }
         if ui.button("About & Feedback…").clicked() {
@@ -3669,11 +3924,11 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
 }
 
 fn page_controls(ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
-    let page_up = ui
-        .add_enabled(enabled, egui::Button::new("Page Up"))
+    let page_up = icons::button(ui, enabled, icons::Icon::ChevronUp, "Page Up", false)
+        .on_hover_text("Previous page (Page Up)")
         .clicked();
-    let page_down = ui
-        .add_enabled(enabled, egui::Button::new("Page Down"))
+    let page_down = icons::button(ui, enabled, icons::Icon::ChevronDown, "Page Down", false)
+        .on_hover_text("Next page (Page Down)")
         .clicked();
     if page_up {
         Some(Action::PageUp)
@@ -3684,42 +3939,73 @@ fn page_controls(ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
     }
 }
 
+const EMPTY_STATE_SIZE: egui::Vec2 = egui::vec2(520.0, 212.0);
+
+/// Drop-zone fill and stroke, highlighted while a file hovers over the window.
+fn empty_state_colors(palette: &theme::Palette, hovered: bool) -> (Color32, egui::Stroke) {
+    if hovered {
+        (
+            palette.selection,
+            egui::Stroke::new(2.0, palette.selection_strong),
+        )
+    } else {
+        (
+            palette.zebra,
+            egui::Stroke::new(1.0, palette.control_border),
+        )
+    }
+}
+
 fn show_empty_state(ui: &mut egui::Ui, local_file_hovered: bool) -> Option<Action> {
     let mut action = None;
-    let fill = if local_file_hovered {
-        WARNING_FILL
-    } else {
-        Color32::from_rgb(250, 251, 251)
-    };
-    let stroke = if local_file_hovered {
-        egui::Stroke::new(2.0, QUARRY_YELLOW)
-    } else {
-        egui::Stroke::new(1.0, Color32::from_rgb(200, 209, 213))
-    };
+    let palette = theme::ui_palette(ui);
+    let (fill, stroke) = empty_state_colors(palette, local_file_hovered);
 
     let available = ui.available_rect_before_wrap();
-    let drop_rect = egui::Rect::from_center_size(
-        available.center(),
-        egui::vec2(available.width().min(520.0), available.height().min(112.0)),
-    );
+    let drop_rect =
+        egui::Rect::from_center_size(available.center(), EMPTY_STATE_SIZE.min(available.size()));
     ui.expand_to_include_rect(drop_rect);
     ui.painter()
-        .rect(drop_rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
+        .rect(drop_rect, 14.0, fill, stroke, egui::StrokeKind::Inside);
     ui.scope_builder(
         egui::UiBuilder::new()
-            .max_rect(drop_rect.shrink(24.0))
-            .layout(egui::Layout::left_to_right(Align::Center).with_main_align(Align::Center)),
+            .max_rect(drop_rect.shrink(28.0))
+            .layout(egui::Layout::top_down(Align::Center)),
         |ui| {
-            ui.label(RichText::new("Drop a delimited file here, or").size(16.0));
-            if ui.button("Open…").clicked() {
-                action = Some(Action::Choose);
-            }
-            if ui.button("Combine Files…").clicked() {
-                action = Some(Action::CombineFiles);
-            }
-            if ui.button("Join Files…").clicked() {
-                action = Some(Action::JoinFiles);
-            }
+            let (icon_rect, _) =
+                ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+            icons::paint(
+                ui.painter(),
+                icon_rect,
+                icons::Icon::Document,
+                palette.text_tertiary,
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Drop a delimited file here, or")
+                    .size(17.0)
+                    .color(palette.text),
+            );
+            ui.label(
+                RichText::new(
+                    "CSV, TSV, pipe, or semicolon. First rows appear while the rest indexes.",
+                )
+                .color(palette.text_secondary),
+            );
+            ui.add_space(10.0);
+            let buttons = egui::vec2(332.0, 28.0);
+            ui.allocate_ui_with_layout(buttons, Layout::left_to_right(Align::Center), |ui| {
+                ui.spacing_mut().interact_size.y = 28.0;
+                if ui.add(theme::primary_button("Open…")).clicked() {
+                    action = Some(Action::Choose);
+                }
+                if ui.button("Combine Files…").clicked() {
+                    action = Some(Action::CombineFiles);
+                }
+                if ui.button("Join Files…").clicked() {
+                    action = Some(Action::JoinFiles);
+                }
+            });
         },
     );
     action
@@ -3889,8 +4175,8 @@ fn show_column_manager(
     egui::Window::new("Columns")
         .id(egui::Id::new("quarry-column-manager"))
         .title_bar(false)
-        .pivot(egui::Align2::RIGHT_TOP)
-        .fixed_pos(compact_tool_anchor(ctx, "quarry-column-manager"))
+        .pivot(compact_tool_placement(ctx, "quarry-column-manager", 390.0).0)
+        .fixed_pos(compact_tool_placement(ctx, "quarry-column-manager", 390.0).1)
         .min_width(360.0)
         .max_width(360.0)
         .resizable(false)
@@ -3978,9 +4264,9 @@ fn show_column_manager(
                                     .fill(if selected {
                                         ui.visuals().selection.bg_fill
                                     } else if filtered_position % 2 == 0 {
-                                        Color32::WHITE
+                                        theme::ui_palette(ui).canvas
                                     } else {
-                                        Color32::from_rgb(239, 243, 245)
+                                        theme::ui_palette(ui).zebra
                                     })
                                     .inner_margin(egui::Margin::symmetric(4, 0))
                                     .show(ui, |ui| {
@@ -4206,8 +4492,9 @@ fn show_cleanup_dialog(
             }
             ui.add(egui::Label::new(format!("Selected columns: {targets}")).truncate()).on_hover_text(&targets);
             ui.separator();
-            ui.label("Operation");
-            ui.horizontal_wrapped(|ui| {
+            theme::section_label(ui, "Operation");
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
                 for (request, name) in [
                     (StructuralRequest::CleanupTrim, "Trim leading/trailing whitespace"),
                     (StructuralRequest::CleanupCollapseSpaces, "Collapse repeated spaces"),
@@ -4215,7 +4502,7 @@ fn show_cleanup_dialog(
                     (StructuralRequest::CleanupLowercase, "Lowercase"),
                     (StructuralRequest::CleanupFill, "Fill Empty Cells"),
                 ] {
-                    ui.selectable_value(&mut dialog.request, request, name);
+                    ui.radio_value(&mut dialog.request, request, name);
                 }
             });
             if dialog.request == StructuralRequest::CleanupFill {
@@ -4250,7 +4537,7 @@ fn show_cleanup_dialog(
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() { action = Some(StructuralDialogAction::Cancel); }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add_enabled(reason.is_none(), egui::Button::new(RichText::new("Apply").color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW)).clicked() {
+                    if ui.add_enabled(reason.is_none(), theme::primary_button("Apply")).clicked() {
                         action = Some(StructuralDialogAction::Apply);
                     }
                 });
@@ -4446,15 +4733,17 @@ fn show_additional_sort_level(
             });
             ui.small(format.description());
         }
-        ui.horizontal(|ui| {
-            for direction in [SortDirection::Ascending, SortDirection::Descending] {
-                let label = sort_direction_label(key.mode, direction);
-                let response = ui.selectable_value(&mut key.direction, direction, label);
-                let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
-                    node.set_label(format!("{label} (level {})", index + 1));
-                });
-            }
-        });
+        let directions = [SortDirection::Ascending, SortDirection::Descending]
+            .map(|direction| (direction, sort_direction_label(key.mode, direction)));
+        for ((_, label), response) in
+            directions
+                .iter()
+                .zip(theme::segmented(ui, &mut key.direction, &directions))
+        {
+            let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_label(format!("{label} (level {})", index + 1));
+            });
+        }
         if key.mode == SortMode::Text {
             let mut sensitive = key.case_sensitivity == CaseSensitivity::Sensitive;
             let response = ui.checkbox(&mut sensitive, "Match case");
@@ -4597,7 +4886,7 @@ fn show_structural_dialog(
                     if rows { document.row_insertion_from_dialog(dialog).map(|_| ()).err() }
                     else { document.column_insertion_from_dialog(dialog).map(|_| ()).err() }
                 });
-                if let Some(reason) = &reason { ui.colored_label(ERROR_TEXT, reason); }
+                if let Some(reason) = &reason { ui.colored_label(ui.visuals().error_fg_color, reason); }
                 (reason.is_none(), focused, reason)
             }
             StructuralRequest::Duplicates => {
@@ -4614,7 +4903,7 @@ fn show_structural_dialog(
                     ui.label("The header stays fixed. Unsaved cell values are included in the comparison.");
                 });
                 let reason = dialog.columns.is_empty().then(|| "Select at least one numbered column first.".to_owned());
-                if let Some(reason) = &reason { ui.colored_label(ERROR_TEXT, reason); }
+                if let Some(reason) = &reason { ui.colored_label(ui.visuals().error_fg_color, reason); }
                 (reason.is_none(), false, reason)
             }
             StructuralRequest::Split | StructuralRequest::Combine => {
@@ -4708,16 +4997,10 @@ fn show_structural_dialog(
                     ui.small("Blank cells sort first oldest, last newest. Other invalid values stop the sort. Surrounding ASCII whitespace is ignored.");
                 }
                 if dialog.sort_mode.uses_column() {
-                    ui.weak("Direction");
-                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                    ui.horizontal(|ui| {
-                        for direction in [SortDirection::Ascending, SortDirection::Descending] {
-                            if ui.add_sized([width, 30.0], egui::Button::selectable(dialog.sort_direction == direction,
-                                sort_direction_label(dialog.sort_mode, direction))).clicked() {
-                                dialog.sort_direction = direction;
-                            }
-                        }
-                    });
+                    theme::section_label(ui, "Direction");
+                    let directions = [SortDirection::Ascending, SortDirection::Descending]
+                        .map(|direction| (direction, sort_direction_label(dialog.sort_mode, direction)));
+                    theme::segmented(ui, &mut dialog.sort_direction, &directions);
                 }
                 if dialog.sort_mode == SortMode::Text { ui.checkbox(sort_match_case, "Match case"); }
                 let values = sort_value_description(dialog.sort_mode, *sort_match_case);
@@ -4763,7 +5046,7 @@ fn show_structural_dialog(
                     "Wait for indexing to finish so Quarry can calculate temporary disk space."
                         .to_owned()
                 }));
-                if let Some(reason) = &reason { ui.colored_label(ERROR_TEXT, reason); }
+                if let Some(reason) = &reason { ui.colored_label(ui.visuals().error_fg_color, reason); }
                 let disk = sort_disk.map_or_else(
                     || reason.clone().unwrap_or_default(),
                     |bytes| format!(
@@ -4794,7 +5077,7 @@ fn show_structural_dialog(
                 _ => unreachable!("cleanup rendered separately"),
             };
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let mut apply = ui.add_enabled(valid, egui::Button::new(RichText::new(submit_label).color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW));
+            let mut apply = ui.add_enabled(valid, theme::primary_button(submit_label));
             if let Some(reason) = disabled_reason {
                 apply = apply.on_disabled_hover_text(reason);
             }
@@ -4832,7 +5115,7 @@ fn show_duplicate_preview(
         ui.heading("Review Duplicates");
         ui.weak("Review the result before changing your document.");
         ui.separator();
-        egui::Frame::new().fill(Color32::WHITE).corner_radius(8).inner_margin(12).show(ui, |ui| {
+        egui::Frame::new().fill(theme::ui_palette(ui).zebra).corner_radius(8).inner_margin(12).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.strong(format!("Extra duplicate rows: {}", summary.duplicate_rows));
             ui.label(format!("Rows to keep: {}", summary.retained_rows));
@@ -4848,7 +5131,7 @@ fn show_duplicate_preview(
                 action = Some(StructuralDialogAction::Cancel);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(egui::Button::new(RichText::new("Remove extra rows").color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW)).clicked() {
+                if ui.add(theme::primary_button("Remove extra rows")).clicked() {
                     action = Some(StructuralDialogAction::Apply);
                 }
             });
@@ -4895,39 +5178,34 @@ fn filter_query_from_rules(
 }
 
 fn tool_dialog_frame(ctx: &egui::Context) -> egui::Frame {
+    let palette = theme::ctx_palette(ctx);
     egui::Frame::window(&ctx.style())
-        .fill(Color32::from_rgb(247, 249, 250))
-        .inner_margin(18)
-        .corner_radius(12)
-        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(211, 219, 224)))
+        .fill(palette.canvas)
+        .inner_margin(20)
+        .corner_radius(theme::WINDOW_RADIUS + 2)
+        .stroke(egui::Stroke::new(1.0, palette.control_border))
 }
 
 fn tool_dialog_style(style: &mut egui::Style) {
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.interact_size.y = 30.0;
+    style.spacing.interact_size.y = 28.0;
+    let palette = theme::palette(&style.visuals);
     let visuals = &mut style.visuals;
-    visuals.override_text_color = Some(Color32::from_rgb(24, 35, 42));
-    visuals.weak_text_color = Some(Color32::from_rgb(92, 105, 114));
-    visuals.text_edit_bg_color = Some(Color32::WHITE);
-    visuals.selection.bg_fill = QUARRY_YELLOW;
-    visuals.selection.stroke = egui::Stroke::new(1.0, QUARRY_SELECTED_TEXT);
-    visuals.widgets.inactive.bg_fill = Color32::WHITE;
-    visuals.widgets.inactive.weak_bg_fill = Color32::WHITE;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(191, 203, 211));
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(237, 242, 245);
-    visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
+    visuals.override_text_color = Some(palette.text);
+    visuals.weak_text_color = Some(palette.text_secondary);
+    visuals.text_edit_bg_color = Some(palette.control);
+    visuals.widgets.inactive.bg_fill = palette.control;
+    visuals.widgets.inactive.weak_bg_fill = palette.control;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.control_border);
+    visuals.widgets.hovered.bg_fill = palette.hover;
+    visuals.widgets.hovered.weak_bg_fill = palette.hover;
 }
 
 fn compact_tool_frame(ctx: &egui::Context) -> egui::Frame {
     tool_dialog_frame(ctx)
-        .inner_margin(12)
-        .corner_radius(6)
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 3],
-            blur: 12,
-            spread: 0,
-            color: Color32::from_black_alpha(24),
-        })
+        .inner_margin(14)
+        .corner_radius(theme::WINDOW_RADIUS)
+        .shadow(ctx.style().visuals.popup_shadow)
 }
 
 fn compact_tool_style(style: &mut egui::Style) {
@@ -4946,9 +5224,29 @@ fn compact_tool_style(style: &mut egui::Style) {
 }
 
 fn compact_tool_anchor(ctx: &egui::Context, window_id: &str) -> egui::Pos2 {
-    ctx.data(|data| data.get_temp::<egui::Pos2>(egui::Id::new((window_id, "anchor"))))
-        .unwrap_or_else(|| ctx.content_rect().right_top() + egui::vec2(-16.0, TOOLBAR_HEIGHT))
-        + egui::vec2(0.0, 6.0)
+    compact_tool_placement(ctx, window_id, 0.0).1
+}
+
+/// Popovers hang below their toolbar button, right-aligned unless that would leave the window.
+fn compact_tool_placement(
+    ctx: &egui::Context,
+    window_id: &str,
+    width: f32,
+) -> (egui::Align2, egui::Pos2) {
+    let gap = egui::vec2(0.0, 6.0);
+    let Some(button) =
+        ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::new((window_id, "anchor"))))
+    else {
+        return (
+            egui::Align2::RIGHT_TOP,
+            ctx.content_rect().right_top() + egui::vec2(-16.0, TOOLBAR_HEIGHT) + gap,
+        );
+    };
+    if button.right() - width >= ctx.content_rect().left() + 8.0 {
+        (egui::Align2::RIGHT_TOP, button.right_bottom() + gap)
+    } else {
+        (egui::Align2::LEFT_TOP, button.left_bottom() + gap)
+    }
 }
 
 fn compact_tool_close(ui: &mut egui::Ui) -> bool {
@@ -5055,8 +5353,8 @@ fn show_filter_manager(
     egui::Window::new("Filters")
         .id(egui::Id::new("quarry-filter-manager"))
         .title_bar(false)
-        .pivot(egui::Align2::RIGHT_TOP)
-        .fixed_pos(compact_tool_anchor(ctx, "quarry-filter-manager"))
+        .pivot(compact_tool_placement(ctx, "quarry-filter-manager", 630.0).0)
+        .fixed_pos(compact_tool_placement(ctx, "quarry-filter-manager", 630.0).1)
         .min_width(600.0)
         .max_width(600.0)
         .resizable(false)
@@ -5174,7 +5472,7 @@ fn show_filter_manager(
                         if rule.operator == FilterOperator::Contains && rule.value_input.is_empty() {
                             ui.weak("Enter text to match.");
                         } else if let Some(error) = error {
-                            ui.colored_label(ERROR_TEXT, error);
+                            ui.colored_label(ui.visuals().error_fg_color, error);
                         } else if rule.operator == FilterOperator::Between {
                             ui.weak("Includes both endpoints.");
                         }
@@ -5241,7 +5539,7 @@ fn show_filter_manager(
                     action = Some(Action::ChooseFilteredExport);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add_enabled(can_apply, egui::Button::new(RichText::new("Apply filters").color(QUARRY_SELECTED_TEXT)).fill(QUARRY_YELLOW)).clicked() {
+                    if ui.add_enabled(can_apply, theme::primary_button("Apply filters")).clicked() {
                         action = Some(Action::ApplyFilter);
                     }
                 });
@@ -9924,6 +10222,85 @@ fn paint_column_selection(ui: &egui::Ui, selected: bool) {
     }
 }
 
+/// Grid cells are square, borderless, and show a hover tint; the focused cell gets an amber ring.
+fn grid_style(style: &mut egui::Style) {
+    let palette = theme::palette(&style.visuals);
+    style.spacing.button_padding.x = CELL_PADDING;
+    let widgets = &mut style.visuals.widgets;
+    for visuals in [
+        &mut widgets.noninteractive,
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        visuals.corner_radius = egui::CornerRadius::ZERO;
+        visuals.expansion = 0.0;
+    }
+    widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    widgets.hovered.weak_bg_fill = palette.hover.gamma_multiply(0.55);
+    widgets.hovered.bg_fill = widgets.hovered.weak_bg_fill;
+    widgets.active.weak_bg_fill = palette.selection;
+    widgets.active.bg_fill = palette.selection;
+    widgets.active.bg_stroke = egui::Stroke::new(1.5, palette.selection_strong);
+}
+
+fn paint_header_fill(ui: &egui::Ui, palette: &theme::Palette) {
+    ui.painter()
+        .rect_filled(ui.max_rect(), 0.0, palette.header_fill);
+}
+
+/// Adds `widget` filling `size`, with its content aligned left or right.
+fn add_aligned(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    align: Align,
+    widget: impl egui::Widget,
+) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        size,
+        Layout::left_to_right(Align::Center)
+            .with_main_align(align)
+            .with_main_justify(true),
+        |ui| ui.add(widget),
+    )
+    .inner
+}
+
+/// A header label inset like the cells below it.
+fn add_padded_label(ui: &mut egui::Ui, width: f32, label: egui::Label) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, HEADER_NAME_HEIGHT),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.add_space(CELL_PADDING);
+            add_aligned(
+                ui,
+                egui::vec2((width - 2.0 * CELL_PADDING).max(0.0), HEADER_NAME_HEIGHT),
+                Align::Min,
+                label,
+            )
+        },
+    )
+    .inner
+}
+
+/// Numbers, amounts, and percentages align right so digits line up.
+fn looks_numeric(text: &str) -> bool {
+    let text = text.trim();
+    let digits = text
+        .trim_start_matches(['-', '+', '$', '€', '£'])
+        .trim_end_matches('%');
+    !digits.is_empty()
+        && digits.len() <= 32
+        && digits.bytes().any(|byte| byte.is_ascii_digit())
+        && digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b','))
+        && digits.bytes().filter(|byte| *byte == b'.').count() <= 1
+}
+
 fn rendered_column_range(
     viewport: egui::Rect,
     column_offsets: &[f32],
@@ -10019,6 +10396,7 @@ fn show_grid_with_filter_case(
                 Layout::top_down(Align::Center),
                 |ui| {
                     ui.spacing_mut().slider_width = grid_height;
+                    scrollbar_style(ui);
                     ui.add_enabled(
                         scroll_enabled,
                         egui::Slider::new(&mut slider_position, 0.0..=1.0)
@@ -10107,6 +10485,8 @@ fn show_table(
     reveal_cell: Option<(u64, usize)>,
     filter_case_sensitivity: CaseSensitivity,
 ) -> GridInteraction {
+    grid_style(ui.style_mut());
+    let palette = theme::ui_palette(ui);
     let mut whitespace = std::mem::take(&mut document.whitespace);
     whitespace.begin_frame();
     let show_all = document.whitespace_all;
@@ -10129,11 +10509,7 @@ fn show_table(
         }
         let text_width = |text| {
             ui.painter()
-                .layout_no_wrap(
-                    text,
-                    FontId::new(13.0, FontFamily::Monospace),
-                    ui.visuals().text_color(),
-                )
+                .layout_no_wrap(text, theme::grid_font(), ui.visuals().text_color())
                 .size()
                 .x
         };
@@ -10265,7 +10641,7 @@ fn show_table(
                     ui.painter()
                         .layout_no_wrap(
                             name.clone(),
-                            FontId::new(13.0, FontFamily::Monospace),
+                            theme::grid_font(),
                             ui.visuals().text_color(),
                         )
                         .size()
@@ -10332,6 +10708,7 @@ fn show_table(
             .header(HEADER_HEIGHT, |mut header| {
                 header.col(|ui| {
                     header_rect = ui.max_rect();
+                    paint_header_fill(ui, palette);
                     fixed_dividers.push(ui.max_rect().right() + column_spacing * 0.5);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
@@ -10353,6 +10730,7 @@ fn show_table(
                         }
                         ui.push_id(("column-header", column), |ui| {
                             let selected = document.selected_columns.contains(&column);
+                            paint_header_fill(ui, palette);
                             paint_column_selection(ui, selected);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
@@ -10360,14 +10738,14 @@ fn show_table(
                                 let mut button = egui::Button::selectable(
                                         selected,
                                         RichText::new(column.saturating_add(1).to_string())
-                                            .monospace()
-                                            .size(11.0),
+                                            .size(10.5)
+                                            .color(if selected { palette.on_accent } else { palette.text_tertiary }),
                                     )
                                     .small();
                                 if selected {
                                     button = button
-                                        .fill(ui.visuals().selection.bg_fill)
-                                        .stroke(ui.visuals().selection.stroke);
+                                        .fill(palette.selection_strong)
+                                        .stroke(egui::Stroke::NONE);
                                 }
                                 let response = ui
                                     .add_sized([width, COLUMN_RULER_HEIGHT], button)
@@ -10594,7 +10972,7 @@ fn show_table(
                                         reset_editor_undo(ui.ctx(), header_edit_id(column));
                                     }
                                     let response = ui.add_sized(
-                                        [width, 17.0],
+                                        [width, HEADER_NAME_HEIGHT],
                                         egui::TextEdit::singleline(&mut edit.draft)
                                             .id(header_edit_id(column))
                                             .margin(egui::Margin::ZERO),
@@ -10631,8 +11009,9 @@ fn show_table(
                                     let indicated = summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
                                     let pending = header_value.is_some() && summary.is_none();
                                     let explanation = header_value.map(|_| whitespace.explanation(summary, show_all));
-                                    let response = ui.add_sized(
-                                        [width, 17.0],
+                                    let response = add_padded_label(
+                                        ui,
+                                        width,
                                         egui::Label::new(rendered.job)
                                             .truncate()
                                             .sense(if editable {
@@ -10696,16 +11075,21 @@ fn show_table(
                                         .selection
                                         .is_some_and(|selection| selection.selects_row(record_row));
                                 let color = if selected {
-                                    ui.visuals().selection.stroke.color
+                                    palette.text
                                 } else {
-                                    QUARRY_YELLOW_TEXT
+                                    palette.text_tertiary
                                 };
-                                let response = ui.add_sized(
-                                    [ui.available_width(), ROW_HEIGHT],
+                                if !selected {
+                                    paint_header_fill(ui, palette);
+                                }
+                                let response = add_aligned(
+                                    ui,
+                                    egui::vec2(ui.available_width(), ROW_HEIGHT),
+                                    Align::Max,
                                     egui::Button::selectable(
                                         selected,
                                         RichText::new(display_row.to_string())
-                                            .monospace()
+                                            .size(11.5)
                                             .color(color),
                                     )
                                     .small(),
@@ -10930,8 +11314,20 @@ fn show_table(
                                         );
                                         let selected = document.selected_rows.contains(record_row)
                                             || active_selection_highlight;
-                                        let response = ui.add_sized(
-                                            [ui.available_width(), ROW_HEIGHT],
+                                        let mut rendered = rendered;
+                                        let align = if looks_numeric(&rendered.job.text) {
+                                            // Monospaced digits keep right-aligned columns of numbers straight.
+                                            for section in &mut rendered.job.sections {
+                                                section.format.font_id = theme::grid_number_font();
+                                            }
+                                            Align::Max
+                                        } else {
+                                            Align::Min
+                                        };
+                                        let response = add_aligned(
+                                            ui,
+                                            egui::vec2(ui.available_width(), ROW_HEIGHT),
+                                            align,
                                             egui::Button::selectable(
                                                 selected,
                                                 rendered.job,
@@ -11164,6 +11560,24 @@ fn show_table(
     interaction
 }
 
+/// A thin overlay-style thumb with no track, like macOS scroll bars.
+fn scrollbar_style(ui: &mut egui::Ui) {
+    let palette = theme::ui_palette(ui);
+    ui.spacing_mut().slider_rail_height = 0.0;
+    let widgets = &mut ui.visuals_mut().widgets;
+    for (visuals, alpha) in [
+        (&mut widgets.inactive, 0.45),
+        (&mut widgets.hovered, 0.7),
+        (&mut widgets.active, 0.9),
+    ] {
+        visuals.bg_fill = palette.text_tertiary.gamma_multiply(alpha);
+        visuals.weak_bg_fill = Color32::TRANSPARENT;
+        visuals.bg_stroke = egui::Stroke::NONE;
+        visuals.fg_stroke = egui::Stroke::NONE;
+        visuals.expansion = 0.0;
+    }
+}
+
 fn scrollbar_thumb_height(track_height: f32, total_rows: u64, visible_rows: usize) -> f32 {
     if total_rows == 0 {
         return track_height;
@@ -11173,40 +11587,63 @@ fn scrollbar_thumb_height(track_height: f32, total_rows: u64, visible_rows: usiz
 }
 
 fn configure_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.text_styles.insert(
-        TextStyle::Heading,
-        FontId::new(20.0, FontFamily::Proportional),
-    );
-    style
-        .text_styles
-        .insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
-    style.text_styles.insert(
-        TextStyle::Monospace,
-        FontId::new(13.0, FontFamily::Monospace),
-    );
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-
-    let mut visuals = egui::Visuals::light();
-    visuals.override_text_color = Some(Color32::from_rgb(24, 35, 42));
-    visuals.hyperlink_color = QUARRY_YELLOW_TEXT;
-    visuals.selection.bg_fill = QUARRY_YELLOW;
-    visuals.selection.stroke = egui::Stroke::new(1.0_f32, QUARRY_SELECTED_TEXT);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(238, 242, 244);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(220, 228, 233);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(204, 218, 227);
-    visuals.faint_bg_color = Color32::from_rgb(235, 240, 242);
-    visuals.extreme_bg_color = Color32::from_rgb(250, 251, 251);
-    style.visuals = visuals;
-    ctx.set_style(style);
+    theme::configure(ctx);
 }
 
-fn panel_frame(fill: Color32) -> egui::Frame {
-    egui::Frame::new()
-        .fill(fill)
-        .inner_margin(egui::Margin::symmetric(14, 10))
-        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 209, 213)))
+/// Width reserved for the macOS traffic lights while the toolbar shares the title bar.
+fn titlebar_inset(ctx: &egui::Context) -> f32 {
+    if cfg!(target_os = "macos") && !ctx.input(|input| input.viewport().fullscreen.unwrap_or(false))
+    {
+        TRAFFIC_LIGHT_INSET
+    } else {
+        0.0
+    }
+}
+
+/// Empty title-bar space moves the window and double-click zooms it, as in native apps.
+fn titlebar_drag_area(ui: &mut egui::Ui) {
+    let response = ui.interact(
+        ui.max_rect(),
+        ui.id().with("titlebar-drag"),
+        egui::Sense::click_and_drag(),
+    );
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    if response.double_clicked() {
+        let maximized = ui.input(|input| input.viewport().maximized.unwrap_or(false));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    }
+}
+
+fn toolbar_separator(ui: &mut egui::Ui) {
+    let palette = theme::ui_palette(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 18.0), egui::Sense::hover());
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range(),
+        egui::Stroke::new(1.0, palette.separator),
+    );
+}
+
+/// Gives the window a unified compact toolbar so the traffic lights center in Quarry's toolbar.
+#[cfg(target_os = "macos")]
+fn install_unified_titlebar() {
+    use objc2_app_kit::NSWindowToolbarStyle;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    for window in NSApplication::sharedApplication(mtm).windows().iter() {
+        // SAFETY: NSToolbar's `new` returns an empty toolbar, and NSWindow's
+        // `setToolbar:` takes one. Untyped calls avoid an extra objc2-app-kit feature.
+        unsafe {
+            let toolbar: objc2::rc::Retained<AnyObject> =
+                objc2::msg_send![objc2::class!(NSToolbar), new];
+            let _: () = objc2::msg_send![&*window, setToolbar: &*toolbar];
+        }
+        window.setToolbarStyle(NSWindowToolbarStyle::UnifiedCompact);
+    }
 }
 
 fn field_text(field: &[u8]) -> String {
@@ -12080,12 +12517,19 @@ mod tests {
         configure_style(&ctx);
         let style = ctx.style();
 
-        assert_eq!(style.visuals.selection.bg_fill, super::QUARRY_YELLOW);
-        assert_eq!(
-            style.visuals.selection.stroke.color,
-            super::QUARRY_SELECTED_TEXT
-        );
-        assert_eq!(style.visuals.hyperlink_color, super::QUARRY_YELLOW_TEXT);
+        for (theme, palette) in [
+            (egui::Theme::Light, &super::theme::LIGHT),
+            (egui::Theme::Dark, &super::theme::DARK),
+        ] {
+            ctx.set_theme(theme);
+            let style = ctx.style();
+            assert_eq!(style.visuals.dark_mode, theme == egui::Theme::Dark);
+            assert_eq!(style.visuals.selection.bg_fill, palette.selection);
+            assert_eq!(style.visuals.selection.stroke.color, palette.text);
+            assert_eq!(style.visuals.hyperlink_color, palette.accent_text);
+            assert_eq!(style.visuals.panel_fill, palette.chrome);
+        }
+        let _ = style;
     }
 
     #[test]
@@ -12620,7 +13064,8 @@ mod tests {
                 .iter()
                 .filter_map(|shape| match &shape.shape {
                     egui::epaint::Shape::Rect(rect)
-                        if rect.fill == egui::Color32::from_rgb(244, 247, 248)
+                        if [super::theme::LIGHT.canvas, super::theme::DARK.canvas]
+                            .contains(&rect.fill)
                             && rect.rect.width() >= width - 1.0
                             && rect.rect.height() > 100.0 =>
                     {
@@ -12686,16 +13131,16 @@ mod tests {
                 );
                 let row_input = row_input.bounds().expect("Row input should have bounds");
                 assert!(
-                    bounds[1].x1 <= row_input.x0,
-                    "Format ended at {}, Row input started at {}",
-                    bounds[1].x1,
+                    bounds[6].x1 <= row_input.x0,
+                    "Find ended at {}, Row input started at {}",
+                    bounds[6].x1,
                     row_input.x0
                 );
                 assert!(
-                    row_input.x1 <= bounds[2].x0,
+                    row_input.x1 <= bounds[7].x0,
                     "Row input ended at {}, Go started at {}",
                     row_input.x1,
-                    bounds[2].x0
+                    bounds[7].x0
                 );
                 assert!(((row_input.y0 + row_input.y1) / 2.0 - first_center).abs() < 1.0);
 
@@ -12705,7 +13150,7 @@ mod tests {
                         .size()
                         .y;
                 assert!(
-                    (height - (super::TOOLBAR_HEIGHT + 2.0)).abs() < 0.1,
+                    (height - super::TOOLBAR_HEIGHT).abs() < 0.1,
                     "toolbar frame height was {height}"
                 );
                 central_panel_top(output, width)
@@ -12718,14 +13163,14 @@ mod tests {
         let empty_labels = [
             "File menu",
             "Format",
-            "Go",
-            "Page Up",
-            "Page Down",
             "Undo Change",
             "Redo Change",
             "Columns…",
             "Filters…",
             "Find",
+            "Go",
+            "Page Up",
+            "Page Down",
         ];
         let widths = [860.0, 1280.0];
         let mut empty_tops = [0.0; 2];
@@ -12764,14 +13209,14 @@ mod tests {
         let document_labels = [
             document_label.as_str(),
             "Format: Auto, Auto",
-            "Go",
-            "Page Up",
-            "Page Down",
             "Undo Change",
             "Redo Change",
             "Columns…",
             "Filters…",
             "Find",
+            "Go",
+            "Page Up",
+            "Page Down",
         ];
         for (index, width) in widths.into_iter().enumerate() {
             let output = ctx.run(grid_input_with_width(width), |ctx| {
@@ -12779,7 +13224,7 @@ mod tests {
             });
             assert_eq!(
                 assert_toolbar(&ctx, &output, &document_labels, width),
-                empty_tops[index] + 30.0
+                empty_tops[index] + super::tabs::TAB_STRIP_HEIGHT
             );
             assert!(
                 app.active
@@ -12800,7 +13245,7 @@ mod tests {
             });
             assert_eq!(
                 assert_toolbar(&ctx, &output, &document_labels, width),
-                empty_tops[index] + 30.0
+                empty_tops[index] + super::tabs::TAB_STRIP_HEIGHT
             );
         }
 
@@ -12816,7 +13261,7 @@ mod tests {
             });
             assert_eq!(
                 assert_toolbar(&ctx, &output, &document_labels, width),
-                empty_tops[index] + 30.0
+                empty_tops[index] + super::tabs::TAB_STRIP_HEIGHT
             );
         }
 
@@ -12834,14 +13279,14 @@ mod tests {
         let filtered_labels = [
             document_label.as_str(),
             "Format: Auto, Auto",
-            "Go",
-            "Page Up",
-            "Page Down",
             "Undo Change",
             "Redo Change",
             "Columns…",
             "Filters (12)…",
             "Find",
+            "Go",
+            "Page Up",
+            "Page Down",
         ];
         for (index, width) in widths.into_iter().enumerate() {
             let output = ctx.run(grid_input_with_width(width), |ctx| {
@@ -12849,7 +13294,7 @@ mod tests {
             });
             assert_eq!(
                 assert_toolbar(&ctx, &output, &filtered_labels, width),
-                empty_tops[index] + 30.0
+                empty_tops[index] + super::tabs::TAB_STRIP_HEIGHT
             );
             assert!(accessible_button(&output, "Find").1.is_disabled());
         }
@@ -12896,8 +13341,11 @@ mod tests {
                 .iter()
                 .find_map(|shape| match &shape.shape {
                     egui::epaint::Shape::Rect(rect)
-                        if rect.fill == egui::Color32::from_rgb(250, 251, 251)
-                            && rect.stroke.color == egui::Color32::from_rgb(200, 209, 213) =>
+                        if (rect.fill, rect.stroke)
+                            == super::empty_state_colors(
+                                super::theme::ctx_palette(&ctx),
+                                false,
+                            ) =>
                     {
                         Some(rect.rect)
                     }
@@ -12906,8 +13354,13 @@ mod tests {
                 .expect("empty-state drop zone should be painted");
             assert!((drop_rect.center().x - available.center().x).abs() < 1.0);
             assert!((drop_rect.center().y - available.center().y).abs() < 1.0);
-            assert!((drop_rect.width() - available.width().min(520.0)).abs() < 1.0);
-            assert!((drop_rect.height() - available.height().min(112.0)).abs() < 1.0);
+            assert!(
+                (drop_rect.width() - available.width().min(super::EMPTY_STATE_SIZE.x)).abs() < 1.0
+            );
+            assert!(
+                (drop_rect.height() - available.height().min(super::EMPTY_STATE_SIZE.y)).abs()
+                    < 1.0
+            );
             assert!(available.contains_rect(drop_rect));
         }
 
@@ -12933,9 +13386,8 @@ mod tests {
             matches!(
                 &shape.shape,
                 egui::epaint::Shape::Rect(rect)
-                    if rect.fill == super::WARNING_FILL
-                        && rect.stroke.color == super::QUARRY_YELLOW
-                        && rect.stroke.width == 2.0
+                    if (rect.fill, rect.stroke)
+                        == super::empty_state_colors(super::theme::ctx_palette(&hover_ctx), true)
             )
         }));
 
@@ -13914,9 +14366,11 @@ mod tests {
                     "{id}: {panel:?}"
                 );
                 let button = accessible_button(&output, label).1.bounds().unwrap();
+                // The popover hangs under its button: edge-aligned when it fits, else kept on screen.
                 assert!(
-                    (f64::from(panel.right()) - button.x1).abs() <= 1.0,
-                    "{id} must follow its toolbar button"
+                    f64::from(panel.left()) <= button.x0 + 1.0
+                        && f64::from(panel.right()) >= button.x1 - 1.0,
+                    "{id} must follow its toolbar button: panel={panel:?}, button={button:?}"
                 );
                 assert!(
                     (f64::from(panel.top()) - button.y1 - 6.0).abs() <= 1.0,
@@ -14428,7 +14882,7 @@ mod tests {
         assert!(
             painted_text
                 .iter()
-                .all(|text| !text.starts_with("matches "))
+                .all(|text| !text.starts_with("Matches "))
         );
 
         app.active.document.as_mut().unwrap().shutdown();

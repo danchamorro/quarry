@@ -49,7 +49,9 @@ impl About {
         }
         let mut close = false;
         let modal = egui::Modal::new(egui::Id::new("quarry-about"))
+            .frame(super::tool_dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::tool_dialog_style(ui.style_mut());
                 ui.set_width(380.0);
                 ui.heading("About Quarry");
                 ui.label(format!("Version {} · Beta", self.version));

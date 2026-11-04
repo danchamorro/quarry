@@ -277,7 +277,7 @@ impl CombineDialog {
                     ui.label(format!("Saved {} rows ({}).", result.data_rows, format_bytes(result.bytes_written)));
                     ui.add(egui::Label::new(result.destination.display().to_string()).wrap());
                     ui.label("All source files were left unchanged.");
-                    if let Some(message) = &self.message { ui.colored_label(ERROR_TEXT, message); }
+                    if let Some(message) = &self.message { ui.colored_label(ui.visuals().error_fg_color, message); }
                     ui.horizontal(|ui| {
                         if ui.button("Close").clicked() { action = DialogAction::Close; }
                         if ui.button("Open Combined File").clicked() {
@@ -353,7 +353,7 @@ impl CombineDialog {
                 }
                 if let Some(space) = &self.space { ui.label(format!("Available space: {}", format_bytes(space.available_bytes))); }
                 if let Some(message) = &self.message {
-                    ui.add(egui::Label::new(RichText::new(message).color(ERROR_TEXT)).wrap());
+                    ui.add(egui::Label::new(RichText::new(message).color(ui.visuals().error_fg_color)).wrap());
                     if ui.button("Copy Details").clicked() { ui.ctx().copy_text(message.clone()); }
                     if ui.add_enabled(!busy && self.problem_path.is_some(), egui::Button::new("Inspect problem file…")).clicked() { action = DialogAction::Inspect; }
                 }
@@ -369,10 +369,10 @@ impl CombineDialog {
                     } else {
                         if ui.button("Close").clicked() { action = DialogAction::Close; }
                         if self.plan.is_none() {
-                            if ui.add_enabled(self.paths.len() >= 2, egui::Button::new("Check Files")).clicked() { self.start_check(); }
+                            if ui.add_enabled(self.paths.len() >= 2, theme::primary_button("Check Files")).clicked() { self.start_check(); }
                         } else {
                             if ui.button(if self.destination.is_some() { "Change Output…" } else { "Choose Output…" }).clicked() { self.choose_destination(); }
-                            if ui.add_enabled(self.space.is_some(), egui::Button::new("Combine and Save")).clicked() { self.start_write(); }
+                            if ui.add_enabled(self.space.is_some(), theme::primary_button("Combine and Save")).clicked() { self.start_write(); }
                         }
                     }
                 });

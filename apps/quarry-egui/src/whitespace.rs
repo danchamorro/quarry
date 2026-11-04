@@ -1,5 +1,5 @@
 //! View-only whitespace inspection. Raw values remain authoritative for data operations.
-use eframe::egui::{self, Color32, FontId, Response, Shape, Stroke, TextFormat, text::LayoutJob};
+use eframe::egui::{self, Color32, Response, Shape, Stroke, TextFormat, text::LayoutJob};
 use quarry_core::{FilterMatch, Row, Session};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,7 +16,7 @@ use std::{
 const MAX_CACHE_CELLS: usize = 16_384;
 const MAX_BATCH_CELLS: usize = 128;
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
-const MARK_COLOR: Color32 = Color32::from_rgb(101, 119, 128);
+const MARK_COLOR: Color32 = Color32::from_rgb(150, 147, 141);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct CellId {
@@ -351,7 +351,7 @@ pub(super) fn render(
 ) -> Rendered {
     let mut job = LayoutJob::default();
     let normal = TextFormat {
-        font_id: FontId::monospace(13.0),
+        font_id: super::theme::grid_font(),
         color: text_color,
         ..Default::default()
     };

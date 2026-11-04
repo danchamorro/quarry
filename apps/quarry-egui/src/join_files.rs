@@ -757,7 +757,10 @@ impl JoinDialog {
             .count();
         ui.small(format!("{selected} output columns selected"));
         if selected == 0 && self.headers.iter().all(Option::is_some) {
-            ui.label(RichText::new("Select at least one output column.").color(ERROR_TEXT));
+            ui.label(
+                RichText::new("Select at least one output column.")
+                    .color(ui.visuals().error_fg_color),
+            );
         }
         if self.output_has_header {
             let mut seen = std::collections::HashSet::new();
@@ -1024,7 +1027,10 @@ impl JoinDialog {
         let mut open = true;
         egui::Window::new("Join Files").id(egui::Id::new("join-files"))
             .open(&mut open).default_width(680.0).min_width(480.0)
+            .collapsible(false)
+            .frame(tool_dialog_frame(ctx))
             .show(ctx,|ui|{
+                tool_dialog_style(ui.style_mut());
                 ui.label("Match key columns and create a separate joined file.");
                 ui.small("Use current open documents or saved files. Retain every matching pair. Empty keys never match.");
                 ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant. Joins use all current rows; clear source filters first.");
@@ -1081,7 +1087,7 @@ impl JoinDialog {
                         ui.add(egui::Label::new(result.destination.display().to_string()).wrap());
                     }
                     if let Some(path)=&self.destination {ui.add(egui::Label::new(format!("Output: {}",path.display())).truncate());}
-                    if let Some(message)=&self.message {ui.add(egui::Label::new(RichText::new(message).color(ERROR_TEXT)).wrap());}
+                    if let Some(message)=&self.message {ui.add(egui::Label::new(RichText::new(message).color(ui.visuals().error_fg_color)).wrap());}
                     if let Some(progress)=self.checking.as_ref().map(JoinJob::progress).or_else(||self.writing.as_ref().map(JoinJob::progress)){
                         ui.horizontal(|ui|{ui.spinner();ui.label(format!("{} · {} rows processed",progress.phase.label(),progress.records));});
                     }else if busy {ui.horizontal(|ui|{ui.spinner();ui.label(if self.cleanup.is_some(){"Releasing private join data…"}else{"Reading header…"});});}
@@ -1093,12 +1099,12 @@ impl JoinDialog {
                     if busy {
                         if ui.add_enabled(!self.cancel_requested && self.cleanup.is_none(),egui::Button::new("Cancel")).clicked(){self.cancel();}
                     }else if self.result.is_some(){
-                        if ui.button("Open Joined File").clicked(){action=DialogAction::OpenResult;}
+                        if ui.add(theme::primary_button("Open Joined File")).clicked(){action=DialogAction::OpenResult;}
                     }else if self.plan.is_some(){
                         if ui.button("Reset Analysis").clicked(){self.reset();}
                         if ui.button("Choose Output…").clicked(){action=DialogAction::ChooseOutput;}
-                        if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| (plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion) && (plan.analysis().new_columns == [0, 0] || self.acknowledge_layout)),egui::Button::new("Create Joined File")).clicked(){action=DialogAction::Create;}
-                    }else if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some) && self.output_columns.iter().any(|column|column.included),egui::Button::new("Analyze & Preview")).clicked(){
+                        if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| (plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion) && (plan.analysis().new_columns == [0, 0] || self.acknowledge_layout)),theme::primary_button("Create Joined File")).clicked(){action=DialogAction::Create;}
+                    }else if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some) && self.output_columns.iter().any(|column|column.included),theme::primary_button("Analyze & Preview")).clicked(){
                         action=DialogAction::Analyze;
                     }
                 });
