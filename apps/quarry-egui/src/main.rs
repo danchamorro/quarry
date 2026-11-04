@@ -2839,7 +2839,18 @@ impl eframe::App for QuarryApp {
                 .frame(tool_dialog_frame(ctx))
                 .show(ctx, |ui| {
                     tool_dialog_style(ui.style_mut());
-                    ui.set_width(460.0);
+                    // Wide enough for all four actions on one row without overlap.
+                    let actions = [
+                        "Discard Changes and Close",
+                        "Keep Editing",
+                        "Save As and Close…",
+                        "Save and Close",
+                    ];
+                    ui.set_width(
+                        theme::buttons_width(ui, &actions)
+                            + 3.0 * ui.spacing().item_spacing.x
+                            + 24.0,
+                    );
                     ui.heading("Unsaved changes");
                     ui.label(message);
                     ui.weak("Save them, save a new copy, keep editing, or discard them.");
