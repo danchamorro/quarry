@@ -369,9 +369,12 @@ impl CombineDialog {
                     } else {
                         if ui.button("Close").clicked() { action = DialogAction::Close; }
                         if self.plan.is_none() {
+                            theme::push_right(ui, theme::buttons_width(ui, &["Check Files"]));
                             if ui.add_enabled(self.paths.len() >= 2, theme::primary_button("Check Files")).clicked() { self.start_check(); }
                         } else {
-                            if ui.button(if self.destination.is_some() { "Change Output…" } else { "Choose Output…" }).clicked() { self.choose_destination(); }
+                            let output = if self.destination.is_some() { "Change Output…" } else { "Choose Output…" };
+                            theme::push_right(ui, theme::buttons_width(ui, &[output, "Combine and Save"]));
+                            if ui.button(output).clicked() { self.choose_destination(); }
                             if ui.add_enabled(self.space.is_some(), theme::primary_button("Combine and Save")).clicked() { self.start_write(); }
                         }
                     }

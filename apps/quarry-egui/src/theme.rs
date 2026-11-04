@@ -124,7 +124,8 @@ pub(super) fn grid_number_font() -> FontId {
     FontId::monospace(12.5)
 }
 
-pub(super) const CONTROL_RADIUS: u8 = 6;
+/// Small enough that checkboxes stay square and never read as radio buttons.
+pub(super) const CONTROL_RADIUS: u8 = 4;
 pub(super) const WINDOW_RADIUS: u8 = 10;
 
 /// Loads the macOS system faces so Quarry reads like a native app.
@@ -344,4 +345,85 @@ pub(super) fn segmented<T: PartialEq + Copy>(
 pub(super) fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let color = ui_palette(ui).text_secondary;
     ui.label(egui::RichText::new(text).size(12.0).color(color))
+}
+
+/// A numbered step in a multi-step dialog: a soft card with a step badge and title.
+pub(super) fn step_card<R>(
+    ui: &mut egui::Ui,
+    step: u8,
+    title: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let palette = ui_palette(ui);
+    egui::Frame::new()
+        .fill(palette.zebra)
+        .stroke(Stroke::new(1.0, palette.grid_line))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (badge, _) =
+                    ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(badge.center(), 10.0, palette.selection);
+                ui.painter().text(
+                    badge.center(),
+                    egui::Align2::CENTER_CENTER,
+                    step.to_string(),
+                    FontId::proportional(12.0),
+                    palette.accent_text,
+                );
+                ui.label(egui::RichText::new(title).size(15.0).color(palette.text));
+            });
+            ui.add_space(2.0);
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// Width of a row of framed buttons with these labels, for right-aligning them
+/// while keeping left-to-right focus order.
+pub(super) fn buttons_width(ui: &egui::Ui, labels: &[&str]) -> f32 {
+    let font = TextStyle::Button.resolve(ui.style());
+    let padding = ui.spacing().button_padding.x;
+    let gaps = labels.len().saturating_sub(1) as f32 * ui.spacing().item_spacing.x;
+    labels
+        .iter()
+        .map(|label| {
+            ui.fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap((*label).to_owned(), font.clone(), Color32::WHITE)
+                    .size()
+                    .x
+            }) + 2.0 * padding
+        })
+        .sum::<f32>()
+        + gaps
+}
+
+/// Moves the cursor so the next `width` points end at the row's right edge.
+pub(super) fn push_right(ui: &mut egui::Ui, width: f32) {
+    ui.add_space((ui.available_width() - width - 1.0).max(0.0));
+}
+
+/// A headline number with a caption, for summaries such as a join review.
+pub(super) fn stat(ui: &mut egui::Ui, value: String, caption: &str) {
+    let palette = ui_palette(ui);
+    egui::Frame::new()
+        .fill(palette.canvas)
+        .stroke(Stroke::new(1.0, palette.grid_line))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(egui::RichText::new(value).size(18.0).color(palette.text));
+                ui.label(
+                    egui::RichText::new(caption)
+                        .size(11.5)
+                        .color(palette.text_secondary),
+                );
+            });
+        });
 }

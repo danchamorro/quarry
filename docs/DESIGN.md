@@ -97,7 +97,7 @@ Menu items and buttons that open another step end with an ellipsis ("Save As…"
 | Header | 18 px column-number row + 24 px name row |
 | Cell padding | 8 px each side |
 | Control height | 24 px in chrome, 28 px in dialogs |
-| Corner radius | 6 controls, 10 popovers and windows, 12 modal dialogs |
+| Corner radius | 4 controls (keeps checkboxes square), 10 popovers and windows, 12 modal dialogs |
 | Spacing | 8 × 6 by default; 10 × 10 inside dialogs |
 
 The layout must work from the minimum window size, 860 × 540. Below 1,000 px
@@ -179,6 +179,13 @@ egui::Modal::new(id)
   button.
 - Put longer explanations behind a collapsed **Details** header, not in the
   main text.
+- Multi-step dialogs (Join Files) wrap each step in `theme::step_card(ui, n,
+  "Title", ...)`. Show the review step only once there is something to review,
+  and lead it with `theme::stat` headline numbers.
+- Footers: the dismiss button (Close, Cancel) on the left; the current step's
+  actions on the right with the primary last. Right-align them with
+  `theme::push_right(ui, theme::buttons_width(ui, &labels))` so Tab order
+  still runs left to right.
 - Show why an action is disabled with `.on_disabled_hover_text(...)`.
 
 ### Choices
