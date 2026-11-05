@@ -2230,9 +2230,21 @@ mod tests {
         let mut app = QuarryApp::with_paths(vec![a], Instant::now());
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
+        // A job stays attached until the app polls it, so these states hold.
+        assert!(app.active.busy(), "the index job should still be attached");
+        assert_eq!(app.active.title(), "a.csv, busy");
         poll_until_idle(&mut app, &ctx);
         assert_eq!(app.active.title(), "a.csv");
         edited(&mut app, "renamed");
+        assert_eq!(app.active.title(), "a.csv, unsaved changes");
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_find_next(b"no-match")
+            .unwrap();
+        assert_eq!(app.active.title(), "a.csv, unsaved changes, busy");
+        poll_until_idle(&mut app, &ctx);
         assert_eq!(app.active.title(), "a.csv, unsaved changes");
 
         let mut frame = eframe::Frame::_new_kittest();
