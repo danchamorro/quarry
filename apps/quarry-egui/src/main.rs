@@ -10343,6 +10343,12 @@ fn looks_numeric(text: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
+/// Classifies a cell's source value. Whitespace rendering turns edge spaces into
+/// marks, so alignment must be decided before it. Long values are never numeric.
+fn source_looks_numeric(value: &[u8]) -> bool {
+    value.len() <= 64 && std::str::from_utf8(value).is_ok_and(looks_numeric)
+}
+
 fn rendered_column_range(
     viewport: egui::Rect,
     column_offsets: &[f32],
@@ -10550,8 +10556,8 @@ fn show_table(
         if document.columns.hidden[column] {
             continue;
         }
-        let text_width = |text: String| {
-            let extra = if looks_numeric(&text) {
+        let text_width = |text: String, numeric: bool| {
+            let extra = if numeric {
                 theme::tabular_extra_width(&text, &digit_padding)
             } else {
                 0.0
@@ -10577,15 +10583,16 @@ fn show_table(
                 .text
             },
         );
-        let mut width = (text_width(header_text) + 16.0).max(80.0);
+        let mut width = (text_width(header_text, false) + 16.0).max(80.0);
         for index in 0..row_count {
             if let Some((row, fields)) = document.visible_row(index)
                 && let Some(source) = fields.get(column)
             {
+                let value = document.cell_value(row, column, source);
                 width = width.max(
                     text_width(
                         whitespace::render(
-                            document.cell_value(row, column, source),
+                            value,
                             None,
                             show_all,
                             MAX_GRID_TEXT_CHARS,
@@ -10594,6 +10601,7 @@ fn show_table(
                         )
                         .job
                         .text,
+                        source_looks_numeric(value),
                     ) + 2.0 * ui.spacing().button_padding.x,
                 );
             }
@@ -11372,7 +11380,7 @@ fn show_table(
                                         let selected = document.selected_rows.contains(record_row)
                                             || active_selection_highlight;
                                         let mut rendered = rendered;
-                                        let align = if looks_numeric(&rendered.job.text) {
+                                        let align = if value.is_some_and(source_looks_numeric) {
                                             // Equal-width digits keep right-aligned columns of numbers straight.
                                             rendered.job = theme::tabular_digits(&rendered.job, &digit_padding);
                                             Align::Max
@@ -12586,6 +12594,11 @@ mod tests {
         ] {
             assert!(!super::looks_numeric(value), "{value} should align as text");
         }
+        // Classification uses the source value, so edge spaces don't hide a number.
+        assert!(super::source_looks_numeric(b" 1e3 "));
+        assert!(super::source_looks_numeric(b"\t42\t"));
+        assert!(!super::source_looks_numeric(&[0xff, b'1']));
+        assert!(!super::source_looks_numeric("1".repeat(65).as_bytes()));
     }
 
     #[test]
