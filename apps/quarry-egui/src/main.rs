@@ -10316,18 +10316,31 @@ fn add_padded_label(ui: &mut egui::Ui, width: f32, label: egui::Label) -> egui::
 }
 
 /// Numbers, amounts, and percentages align right so digits line up.
+///
+/// Accepts an optional exponent (`1e3`, `-2.5E-4`) with up to seven digits, matching
+/// the exponent range the Number sort supports.
 fn looks_numeric(text: &str) -> bool {
     let text = text.trim();
-    let digits = text
+    let body = text
         .trim_start_matches(['-', '+', '$', '€', '£'])
         .trim_end_matches('%');
-    !digits.is_empty()
-        && digits.len() <= 32
-        && digits.bytes().any(|byte| byte.is_ascii_digit())
-        && digits
+    if body.is_empty() || body.len() > 32 {
+        return false;
+    }
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(index) => (&body[..index], Some(&body[index + 1..])),
+        None => (body, None),
+    };
+    let mantissa_ok = mantissa.bytes().any(|byte| byte.is_ascii_digit())
+        && mantissa
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b','))
-        && digits.bytes().filter(|byte| *byte == b'.').count() <= 1
+        && mantissa.bytes().filter(|byte| *byte == b'.').count() <= 1;
+    let exponent_ok = exponent.is_none_or(|exponent| {
+        let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        !digits.is_empty() && digits.len() <= 7 && digits.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    mantissa_ok && exponent_ok
 }
 
 fn rendered_column_range(
@@ -10783,7 +10796,7 @@ fn show_table(
                                         selected,
                                         RichText::new(column.saturating_add(1).to_string())
                                             .size(10.5)
-                                            .color(if selected { palette.on_accent } else { palette.text_tertiary }),
+                                            .color(if selected { palette.on_accent } else { palette.text_secondary }),
                                     )
                                     .small();
                                 if selected {
@@ -11121,7 +11134,7 @@ fn show_table(
                                 let color = if selected {
                                     palette.text
                                 } else {
-                                    palette.text_tertiary
+                                    palette.text_secondary
                                 };
                                 if !selected {
                                     paint_header_fill(ui, palette);
@@ -12552,6 +12565,28 @@ mod tests {
         show_empty_state, show_filter_manager, show_grid, show_grid_with_filter_case,
         show_structural_dialog, sort_progress,
     };
+
+    #[test]
+    fn numeric_detection_accepts_exponents_and_rejects_malformed_values() {
+        for value in ["1e3", "-2.5E-4", "6.02e+23", "$1,204.50", "42%", " 7 "] {
+            assert!(
+                super::looks_numeric(value),
+                "{value} should align as a number"
+            );
+        }
+        for value in [
+            "1e",
+            "e3",
+            "1e3.5",
+            "1ee3",
+            "1e12345678",
+            "2025-12-13",
+            "ABC",
+            "",
+        ] {
+            assert!(!super::looks_numeric(value), "{value} should align as text");
+        }
+    }
 
     #[test]
     fn menu_undo_follows_a_focused_text_field() {

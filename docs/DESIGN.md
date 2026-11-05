@@ -52,7 +52,7 @@ breaks dark mode. If no token fits, add one to `Palette`, with values in both
 | `zebra` | Alternate grid rows; soft inset panels inside dialogs |
 | `grid_line` | Lines between cells |
 | `header_fill` | Column header and row-number gutter; active tab |
-| `text`, `text_secondary`, `text_tertiary` | Primary text, supporting text, row and column numbers and hints |
+| `text`, `text_secondary`, `text_tertiary` | Primary text; supporting text, including row and column numbers; decorative marks and placeholders only (below 4.5:1, never for text people must read) |
 | `hover`, `pressed` | Fills for borderless controls |
 | `control`, `control_border` | Framed buttons, fields, and combo boxes |
 | `selection` | Selected cells, rows, columns, and segments (soft amber) |
