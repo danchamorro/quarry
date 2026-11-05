@@ -10413,7 +10413,6 @@ fn show_grid_with_filter_case(
         let fraction = scroll_fraction_for_row(position, 0, total_rows, document.visible_rows);
         let mut slider_position = 1.0 - fraction;
         let thumb_height = scrollbar_thumb_height(grid_height, total_rows, document.visible_rows);
-        let handle_radius = SCROLLBAR_WIDTH / 2.5;
         let scroll_enabled = total_rows > 0;
         let label = if scroll_enabled && document.filter_active() {
             format!(
@@ -10444,17 +10443,7 @@ fn show_grid_with_filter_case(
                 Layout::top_down(Align::Center),
                 |ui| {
                     ui.spacing_mut().slider_width = grid_height;
-                    scrollbar_style(ui);
-                    ui.add_enabled(
-                        scroll_enabled,
-                        egui::Slider::new(&mut slider_position, 0.0..=1.0)
-                            .vertical()
-                            .show_value(false)
-                            .smart_aim(false)
-                            .handle_shape(egui::style::HandleShape::Rect {
-                                aspect_ratio: thumb_height / (2.0 * handle_radius),
-                            }),
-                    )
+                    scrollbar_slider(ui, &mut slider_position, thumb_height, scroll_enabled)
                 },
             )
             .inner
@@ -11639,6 +11628,39 @@ fn scrollbar_style(ui: &mut egui::Ui) {
         visuals.fg_stroke = egui::Stroke::NONE;
         visuals.expansion = 0.0;
     }
+}
+
+/// The grid's vertical scrollbar: an egui slider drawn as a thin thumb.
+fn scrollbar_slider(
+    ui: &mut egui::Ui,
+    slider_position: &mut f64,
+    thumb_height: f32,
+    enabled: bool,
+) -> egui::Response {
+    scrollbar_style(ui);
+    // egui makes a slider as thick as the larger of the body text height and
+    // `interact_size.y`, and sizes the thumb from that thickness. Pin both to
+    // the scrollbar width (the slider shows no text) so the thumb is exactly
+    // `thumb_height` tall. A taller thumb than intended can outgrow its track,
+    // which makes dragging run backwards.
+    ui.spacing_mut().interact_size.y = SCROLLBAR_WIDTH;
+    ui.style_mut()
+        .text_styles
+        .insert(TextStyle::Body, FontId::proportional(SCROLLBAR_WIDTH / 2.0));
+    let thickness = ui
+        .text_style_height(&TextStyle::Body)
+        .max(ui.spacing().interact_size.y);
+    let handle_radius = thickness / 2.5;
+    ui.add_enabled(
+        enabled,
+        egui::Slider::new(slider_position, 0.0..=1.0)
+            .vertical()
+            .show_value(false)
+            .smart_aim(false)
+            .handle_shape(egui::style::HandleShape::Rect {
+                aspect_ratio: thumb_height / (2.0 * handle_radius),
+            }),
+    )
 }
 
 fn scrollbar_thumb_height(track_height: f32, total_rows: u64, visible_rows: usize) -> f32 {
@@ -22546,6 +22568,61 @@ mod tests {
         }
         assert_eq!(previous, final_row);
         assert_eq!(row_for_scroll_fraction(1.0, 1, u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn scrollbar_thumb_is_drawn_at_its_computed_size() {
+        // A thumb drawn taller than its track makes dragging run backwards.
+        let ctx = egui::Context::default();
+        super::configure_style(&ctx);
+        let track = 300.0;
+        let thumb_height = super::scrollbar_thumb_height(track, 150, 100);
+        assert_eq!(thumb_height, 200.0);
+        let mut slider = None;
+        let output = ctx.run(grid_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(super::SCROLLBAR_WIDTH, track),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().slider_width = track;
+                        let mut position = 1.0;
+                        slider = Some(
+                            super::scrollbar_slider(ui, &mut position, thumb_height, true).rect,
+                        );
+                    },
+                );
+            });
+        });
+        let slider = slider.unwrap();
+        assert_eq!(slider.width(), super::SCROLLBAR_WIDTH);
+        assert_eq!(slider.height(), track);
+
+        let thumb_fill = super::theme::ctx_palette(&ctx)
+            .text_tertiary
+            .gamma_multiply(0.45);
+        // The slider also paints a zero-width rail in the same color; skip it.
+        let thumb = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Rect(rect)
+                    if rect.fill == thumb_fill && rect.rect.width() > 1.0 =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("scrollbar thumb should be painted");
+        assert!(
+            (thumb.height() - thumb_height).abs() < 0.5,
+            "thumb is {} tall, expected {thumb_height}",
+            thumb.height()
+        );
+        assert!(
+            slider.expand(0.5).contains_rect(thumb),
+            "{thumb:?} outside {slider:?}"
+        );
     }
 
     #[test]
