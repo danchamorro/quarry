@@ -312,6 +312,7 @@ fn main() -> eframe::Result<()> {
             Box::new(move |creation| {
                 theme::install_fonts(&creation.egui_ctx);
                 configure_style(&creation.egui_ctx);
+                install_light_appearance();
                 install_unified_titlebar();
                 attach_open_document_context(&creation.egui_ctx);
                 let mut app = QuarryApp::with_paths(initial_paths, started);
@@ -5233,7 +5234,7 @@ fn tool_dialog_frame(ctx: &egui::Context) -> egui::Frame {
 fn tool_dialog_style(style: &mut egui::Style) {
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.interact_size.y = 28.0;
-    let palette = theme::palette(&style.visuals);
+    let palette = &theme::LIGHT;
     let visuals = &mut style.visuals;
     visuals.override_text_color = Some(palette.text);
     visuals.weak_text_color = Some(palette.text_secondary);
@@ -10268,7 +10269,7 @@ fn paint_column_selection(ui: &egui::Ui, selected: bool) {
 
 /// Grid cells are square, borderless, and show a hover tint; the focused cell gets an amber ring.
 fn grid_style(style: &mut egui::Style) {
-    let palette = theme::palette(&style.visuals);
+    let palette = &theme::LIGHT;
     style.spacing.button_padding.x = CELL_PADDING;
     let widgets = &mut style.visuals.widgets;
     for visuals in [
@@ -11727,6 +11728,22 @@ fn toolbar_separator(ui: &mut egui::Ui) {
     );
 }
 
+/// Keeps AppKit windows that Quarry opens, such as the file picker and alerts,
+/// light to match Quarry's light-only interface when the system uses Dark mode.
+/// Menu-bar menus still follow the system, because macOS draws them.
+#[cfg(target_os = "macos")]
+fn install_light_appearance() {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua};
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    // SAFETY: `NSAppearanceNameAqua` is an immutable AppKit string constant.
+    let name = unsafe { NSAppearanceNameAqua };
+    if let Some(appearance) = NSAppearance::appearanceNamed(name) {
+        NSApplication::sharedApplication(mtm).setAppearance(Some(&appearance));
+    }
+}
+
 /// Gives the window a unified compact toolbar so the traffic lights center in Quarry's toolbar.
 #[cfg(target_os = "macos")]
 fn install_unified_titlebar() {
@@ -12683,24 +12700,24 @@ mod tests {
     }
 
     #[test]
-    fn theme_uses_readable_soft_yellow_accents() {
+    fn theme_stays_light_with_soft_yellow_accents_when_the_system_is_dark() {
         let ctx = egui::Context::default();
         configure_style(&ctx);
-        let style = ctx.style();
+        let input = egui::RawInput {
+            system_theme: Some(egui::Theme::Dark),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |_| {});
 
-        for (theme, palette) in [
-            (egui::Theme::Light, &super::theme::LIGHT),
-            (egui::Theme::Dark, &super::theme::DARK),
-        ] {
-            ctx.set_theme(theme);
-            let style = ctx.style();
-            assert_eq!(style.visuals.dark_mode, theme == egui::Theme::Dark);
-            assert_eq!(style.visuals.selection.bg_fill, palette.selection);
-            assert_eq!(style.visuals.selection.stroke.color, palette.text);
-            assert_eq!(style.visuals.hyperlink_color, palette.accent_text);
-            assert_eq!(style.visuals.panel_fill, palette.chrome);
-        }
-        let _ = style;
+        let palette = &super::theme::LIGHT;
+        let style = ctx.style();
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+        assert!(!style.visuals.dark_mode);
+        assert_eq!(style.visuals.selection.bg_fill, palette.selection);
+        assert_eq!(style.visuals.selection.stroke.color, palette.text);
+        assert_eq!(style.visuals.hyperlink_color, palette.accent_text);
+        assert_eq!(style.visuals.panel_fill, palette.chrome);
+        assert_eq!(super::theme::ctx_palette(&ctx), palette);
     }
 
     #[test]
@@ -13235,8 +13252,7 @@ mod tests {
                 .iter()
                 .filter_map(|shape| match &shape.shape {
                     egui::epaint::Shape::Rect(rect)
-                        if [super::theme::LIGHT.canvas, super::theme::DARK.canvas]
-                            .contains(&rect.fill)
+                        if rect.fill == super::theme::LIGHT.canvas
                             && rect.rect.width() >= width - 1.0
                             && rect.rect.height() > 100.0 =>
                     {
@@ -24368,13 +24384,7 @@ mod tests {
             .shapes
             .iter()
             .filter_map(|s| match &s.shape {
-                egui::Shape::Path(path)
-                    if [
-                        super::theme::LIGHT.indicator_fill,
-                        super::theme::DARK.indicator_fill,
-                    ]
-                    .contains(&path.fill) =>
-                {
+                egui::Shape::Path(path) if path.fill == super::theme::LIGHT.indicator_fill => {
                     Some((s.clip_rect, path))
                 }
                 _ => None,

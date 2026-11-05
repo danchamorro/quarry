@@ -1,10 +1,11 @@
-//! Quarry's design tokens: one palette per appearance, typography, and shared frames.
+//! Quarry's design tokens: the palette, typography, and shared frames.
 //!
-//! Every surface reads colors from [`palette`] so light and dark appearances stay
-//! consistent. Brand amber is reserved for selection, focus, and primary actions.
+//! Quarry has one light appearance, whatever the system setting. Every surface
+//! reads colors from [`ui_palette`] or [`ctx_palette`]. Brand amber is reserved
+//! for selection, focus, and primary actions.
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
 
-/// Semantic colors for one appearance.
+/// Quarry's semantic colors.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Palette {
     /// Window chrome: title bar, toolbar, status bar.
@@ -48,7 +49,7 @@ pub(super) struct Palette {
     pub indicator_stroke: Color32,
 }
 
-/// Brand amber shared by both appearances.
+/// Brand amber.
 pub(super) const ACCENT: Color32 = Color32::from_rgb(233, 196, 106);
 
 pub(super) const LIGHT: Palette = Palette {
@@ -79,44 +80,16 @@ pub(super) const LIGHT: Palette = Palette {
     indicator_stroke: Color32::from_rgb(57, 77, 84),
 };
 
-pub(super) const DARK: Palette = Palette {
-    chrome: Color32::from_rgb(40, 40, 38),
-    separator: Color32::from_rgb(22, 22, 21),
-    canvas: Color32::from_rgb(30, 30, 29),
-    zebra: Color32::from_rgb(35, 35, 33),
-    grid_line: Color32::from_rgb(52, 52, 49),
-    header_fill: Color32::from_rgb(38, 38, 36),
-    text: Color32::from_rgb(236, 235, 231),
-    text_secondary: Color32::from_rgb(168, 166, 160),
-    text_tertiary: Color32::from_rgb(120, 118, 113),
-    hover: Color32::from_rgb(56, 56, 53),
-    pressed: Color32::from_rgb(68, 68, 64),
-    control: Color32::from_rgb(52, 52, 49),
-    control_border: Color32::from_rgb(70, 70, 66),
-    selection: Color32::from_rgb(78, 64, 30),
-    selection_strong: ACCENT,
-    on_accent: Color32::from_rgb(43, 33, 10),
-    accent_text: Color32::from_rgb(240, 196, 98),
-    error_text: Color32::from_rgb(255, 128, 115),
-    error_fill: Color32::from_rgb(70, 34, 31),
-    warning_text: Color32::from_rgb(240, 196, 98),
-    warning_fill: Color32::from_rgb(66, 54, 26),
-    success_text: Color32::from_rgb(110, 205, 150),
-    mark: Color32::from_rgb(120, 118, 113),
-    indicator_fill: Color32::from_rgb(104, 150, 156),
-    indicator_stroke: Color32::from_rgb(160, 196, 201),
-};
-
-pub(super) fn palette(visuals: &egui::Visuals) -> &'static Palette {
-    if visuals.dark_mode { &DARK } else { &LIGHT }
+/// The palette for colors drawn inside `_ui`. Quarry is light only, so this is
+/// always [`LIGHT`]; call sites keep the `Ui` so they read like egui's own
+/// style lookups.
+pub(super) fn ui_palette(_ui: &egui::Ui) -> &'static Palette {
+    &LIGHT
 }
 
-pub(super) fn ui_palette(ui: &egui::Ui) -> &'static Palette {
-    palette(ui.visuals())
-}
-
-pub(super) fn ctx_palette(ctx: &egui::Context) -> &'static Palette {
-    palette(&ctx.style().visuals)
+/// The palette when only a `Context` is at hand. Always [`LIGHT`].
+pub(super) fn ctx_palette(_ctx: &egui::Context) -> &'static Palette {
+    &LIGHT
 }
 
 /// Grid cell text. Proportional text reads like a document; whitespace marks stay visible.
@@ -257,16 +230,15 @@ pub(super) fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Applies Quarry's style to both appearances; egui follows the system setting.
+/// Applies Quarry's light style and keeps it when the system uses Dark mode.
 pub(super) fn configure(ctx: &egui::Context) {
-    for (theme, palette) in [(egui::Theme::Light, &LIGHT), (egui::Theme::Dark, &DARK)] {
-        ctx.set_style_of(theme, style(theme, palette));
-    }
+    ctx.set_theme(egui::ThemePreference::Light);
+    ctx.set_style_of(egui::Theme::Light, style(&LIGHT));
 }
 
-fn style(theme: egui::Theme, palette: &Palette) -> egui::Style {
+fn style(palette: &Palette) -> egui::Style {
     let mut style = egui::Style {
-        visuals: theme.default_visuals(),
+        visuals: egui::Visuals::light(),
         ..egui::Style::default()
     };
     style.text_styles = [
@@ -301,13 +273,13 @@ fn style(theme: egui::Theme, palette: &Palette) -> egui::Style {
         offset: [0, 10],
         blur: 30,
         spread: 0,
-        color: Color32::from_black_alpha(if theme == egui::Theme::Dark { 110 } else { 38 }),
+        color: Color32::from_black_alpha(38),
     };
     visuals.popup_shadow = egui::epaint::Shadow {
         offset: [0, 4],
         blur: 16,
         spread: 0,
-        color: Color32::from_black_alpha(if theme == egui::Theme::Dark { 90 } else { 30 }),
+        color: Color32::from_black_alpha(30),
     };
     visuals.menu_corner_radius = CornerRadius::same(8);
     visuals.faint_bg_color = palette.zebra;
@@ -357,7 +329,7 @@ fn style(theme: egui::Theme, palette: &Palette) -> egui::Style {
 
 /// Borderless controls for the toolbar, tab strip, and status bar.
 pub(super) fn chrome_controls(style: &mut egui::Style) {
-    let palette = palette(&style.visuals);
+    let palette = &LIGHT;
     let widgets = &mut style.visuals.widgets;
     widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     widgets.inactive.bg_fill = Color32::TRANSPARENT;
@@ -370,7 +342,7 @@ pub(super) fn chrome_controls(style: &mut egui::Style) {
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
 }
 
-/// A primary button: amber fill with dark text in both appearances.
+/// A primary button: amber fill with dark text.
 pub(super) fn primary_button<'a>(text: impl Into<String>) -> egui::Button<'a> {
     egui::Button::new(egui::RichText::new(text.into()).color(LIGHT.on_accent)).fill(ACCENT)
 }
