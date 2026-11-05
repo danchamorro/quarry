@@ -180,7 +180,8 @@ impl DocumentTab {
         ids
     }
 
-    /// Adds unsaved-change and activity markers to the document's filename.
+    /// The tab's accessible name: the filename plus its unsaved and busy
+    /// states in words. The visible tab shows these as a dot and an ellipsis.
     fn title(&self) -> String {
         self.document.as_ref().map_or_else(
             || "No file".into(),
@@ -192,8 +193,12 @@ impl DocumentTab {
                     .to_string_lossy();
                 format!(
                     "{filename}{}{}",
-                    if document.is_dirty() { " ●" } else { "" },
-                    if self.busy() { " ⋯" } else { "" }
+                    if document.is_dirty() {
+                        ", unsaved changes"
+                    } else {
+                        ""
+                    },
+                    if self.busy() { ", busy" } else { "" }
                 )
             },
         )
@@ -2216,6 +2221,48 @@ mod tests {
             render(&mut app, vec![], width);
         }
         assert_visible(render(&mut app, vec![], width), "document-0.csv");
+    }
+
+    #[test]
+    fn tab_accessible_names_state_unsaved_changes_in_words() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = fixture(directory.path(), "a.csv");
+        let mut app = QuarryApp::with_paths(vec![a], Instant::now());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        // A job stays attached until the app polls it, so these states hold.
+        assert!(app.active.busy(), "the index job should still be attached");
+        assert_eq!(app.active.title(), "a.csv, busy");
+        poll_until_idle(&mut app, &ctx);
+        assert_eq!(app.active.title(), "a.csv");
+        edited(&mut app, "renamed");
+        assert_eq!(app.active.title(), "a.csv, unsaved changes");
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_find_next(b"no-match")
+            .unwrap();
+        assert_eq!(app.active.title(), "a.csv, unsaved changes, busy");
+        poll_until_idle(&mut app, &ctx);
+        assert_eq!(app.active.title(), "a.csv, unsaved changes");
+
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run(input(vec![]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let tree = output.platform_output.accesskit_update.unwrap();
+        for name in [
+            "Document tab: a.csv, unsaved changes",
+            "Close tab: a.csv, unsaved changes",
+        ] {
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(name)),
+                "missing accessible name {name:?}"
+            );
+        }
     }
 
     #[test]
