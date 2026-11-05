@@ -3780,7 +3780,8 @@ impl FileCommands {
         });
         let join_reserved = document.is_some_and(Document::join_reserved);
         Self {
-            combine: write_slot_available && !file_operation_active,
+            // Combining writes a new file, so it needs only a free write slot.
+            combine: write_slot_available,
             reload: open && !file_operation_active && !dirty && !join_reserved,
             save: document.is_some_and(Document::is_save_ready),
             save_as: document.is_some_and(Document::is_save_as_ready),
@@ -3849,11 +3850,9 @@ fn document_menu(
         });
         if ui
             .add_enabled(commands.combine, egui::Button::new("Combine Files…"))
-            .on_disabled_hover_text(if write_slot_available {
-                "Wait for the active file operation to finish."
-            } else {
-                "Two file operations are already running. Wait for one to finish or cancel it."
-            })
+            .on_disabled_hover_text(
+                "Two file operations are already running. Wait for one to finish or cancel it.",
+            )
             .clicked()
         {
             action = Some(Action::CombineFiles);
@@ -12674,7 +12673,7 @@ mod tests {
         reservations.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         assert!(app.menu_state(false).enabled(M::ReloadFromDisk));
 
-        // Combine needs a free write slot as well as an idle document.
+        // Combine needs only a free write slot.
         let document = app.active.document.as_ref();
         assert!(super::FileCommands::new(document, true).combine);
         assert!(!super::FileCommands::new(document, false).combine);
