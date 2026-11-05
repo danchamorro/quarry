@@ -691,7 +691,11 @@ impl QuarryApp {
             }
         }
         if self.menu_receiver.is_some() {
-            let state = self.menu_state();
+            // A focused text field handles its own Undo/Redo through the routed key.
+            let text_field_focused = ctx
+                .memory(|memory| memory.focused())
+                .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
+            let state = self.menu_state(text_field_focused);
             if self.menu_state.as_ref() != Some(&state) {
                 menu::sync(&state);
                 self.menu_state = Some(state);
@@ -700,7 +704,7 @@ impl QuarryApp {
     }
 
     /// Menu availability follows the same blocking rules as the toolbar.
-    fn menu_state(&self) -> menu::MenuState {
+    fn menu_state(&self, text_field_focused: bool) -> menu::MenuState {
         use menu::MenuCommand as M;
         let document = self.active.document.as_ref();
         let blocked = self.quitting_cleanup()
@@ -735,8 +739,14 @@ impl QuarryApp {
             (M::DiscardChanges, files.discard),
             (M::InspectFile, files.inspect),
             (M::TemporaryStorage, files.temporary_storage),
-            (M::Undo, document.is_some_and(Document::can_undo)),
-            (M::Redo, document.is_some_and(Document::can_redo)),
+            (
+                M::Undo,
+                text_field_focused || document.is_some_and(Document::can_undo),
+            ),
+            (
+                M::Redo,
+                text_field_focused || document.is_some_and(Document::can_redo),
+            ),
             (M::Find, open && !filter_active),
             (M::InsertRows, insertion(true)),
             (M::InsertColumns, insertion(false)),
@@ -745,10 +755,12 @@ impl QuarryApp {
             (M::NextTab, tabs > 1),
             (M::PreviousTab, tabs > 1),
         ];
+        // Text-field history is safe to route even while a dialog blocks document commands.
+        let text_history = |command| text_field_focused && matches!(command, M::Undo | M::Redo);
         menu::MenuState {
             disabled: available
                 .into_iter()
-                .filter(|(_, available)| blocked || !available)
+                .filter(|(command, available)| !text_history(*command) && (blocked || !available))
                 .map(|(command, _)| command)
                 .collect(),
             show_all_whitespace: self.whitespace_preferences.show_all,
@@ -2870,23 +2882,29 @@ impl eframe::App for QuarryApp {
                         {
                             discard_and_close = true;
                         }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .add_enabled(save_ready, theme::primary_button("Save and Close"))
-                                .clicked()
-                            {
-                                save_and_close = true;
-                            }
-                            if ui
-                                .add_enabled(save_ready, egui::Button::new("Save As and Close…"))
-                                .clicked()
-                            {
-                                save_as_and_close = true;
-                            }
-                            if ui.button("Keep Editing").clicked() {
-                                keep_editing = true;
-                            }
-                        });
+                        // Reserve the space so Tab order follows the visible left-to-right order.
+                        theme::push_right(
+                            ui,
+                            theme::buttons_width(
+                                ui,
+                                &["Keep Editing", "Save As and Close…", "Save and Close"],
+                            ),
+                        );
+                        if ui.button("Keep Editing").clicked() {
+                            keep_editing = true;
+                        }
+                        if ui
+                            .add_enabled(save_ready, egui::Button::new("Save As and Close…"))
+                            .clicked()
+                        {
+                            save_as_and_close = true;
+                        }
+                        if ui
+                            .add_enabled(save_ready, theme::primary_button("Save and Close"))
+                            .clicked()
+                        {
+                            save_and_close = true;
+                        }
                     });
                 });
             keep_editing |= modal.should_close();
@@ -4543,7 +4561,7 @@ fn show_cleanup_dialog(
             let reason = document.structural_edit_disabled_reason().map(str::to_owned)
                 .or_else(|| cleanup.validate().err().map(|e| e.to_string()))
                 .or(preview.error);
-            if let Some(error) = &reason { ui.colored_label(Color32::DARK_RED, error); }
+            if let Some(error) = &reason { ui.colored_label(ui.visuals().error_fg_color, error); }
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() { action = Some(StructuralDialogAction::Cancel); }
@@ -10534,9 +10552,16 @@ fn show_table(
         let header_text = document.header_value(column).map_or_else(
             || document.column_name(column),
             |value| {
-                whitespace::render(value, None, show_all, 120, ui.visuals().text_color())
-                    .job
-                    .text
+                whitespace::render(
+                    value,
+                    None,
+                    show_all,
+                    120,
+                    ui.visuals().text_color(),
+                    palette.mark,
+                )
+                .job
+                .text
             },
         );
         let mut width = (text_width(header_text) + 16.0).max(80.0);
@@ -10552,6 +10577,7 @@ fn show_table(
                             show_all,
                             MAX_GRID_TEXT_CHARS,
                             ui.visuals().text_color(),
+                            palette.mark,
                         )
                         .job
                         .text,
@@ -11022,7 +11048,7 @@ fn show_table(
                                     ));
                                     let rendered = whitespace::render(
                                         header_value.unwrap_or(name.as_bytes()), summary, show_all && header_value.is_some(), 120,
-                                        ui.visuals().text_color(),
+                                        ui.visuals().text_color(), palette.mark,
                                     );
                                     let indicated = summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
                                     let pending = header_value.is_some() && summary.is_none();
@@ -11312,7 +11338,7 @@ fn show_table(
                                             value.len(), || document.whitespace_input(record_row, column),
                                         ));
                                         let rendered = whitespace::render(value.unwrap_or_default(), summary,
-                                            show_all, MAX_GRID_TEXT_CHARS, ui.visuals().text_color());
+                                            show_all, MAX_GRID_TEXT_CHARS, ui.visuals().text_color(), palette.mark);
                                         let indicated = summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
                                         let pending = value.is_some() && summary.is_none();
                                         let explanation = if value.is_some() {
@@ -12526,6 +12552,20 @@ mod tests {
         show_empty_state, show_filter_manager, show_grid, show_grid_with_filter_case,
         show_structural_dialog, sort_progress,
     };
+
+    #[test]
+    fn menu_undo_follows_a_focused_text_field() {
+        let app = QuarryApp::new(None, Instant::now());
+        let undo = super::menu::MenuCommand::Undo;
+        let redo = super::menu::MenuCommand::Redo;
+        // No document history: Undo and Redo are unavailable...
+        let state = app.menu_state(false);
+        assert!(!state.enabled(undo) && !state.enabled(redo));
+        // ...until a text field owns the typing history.
+        let state = app.menu_state(true);
+        assert!(state.enabled(undo) && state.enabled(redo));
+        assert!(!state.enabled(super::menu::MenuCommand::Save));
+    }
 
     #[test]
     fn theme_uses_readable_soft_yellow_accents() {
@@ -24158,7 +24198,13 @@ mod tests {
             .shapes
             .iter()
             .filter_map(|s| match &s.shape {
-                egui::Shape::Path(path) if path.fill == egui::Color32::from_rgb(111, 145, 150) => {
+                egui::Shape::Path(path)
+                    if [
+                        super::theme::LIGHT.indicator_fill,
+                        super::theme::DARK.indicator_fill,
+                    ]
+                    .contains(&path.fill) =>
+                {
                     Some((s.clip_rect, path))
                 }
                 _ => None,

@@ -62,6 +62,7 @@ breaks dark mode. If no token fits, add one to `Palette`, with values in both
 | `error_text` / `error_fill`, `warning_text` / `warning_fill` | Banners and inline validation |
 | `success_text` | Completed states, such as "Index complete" |
 | `mark` | Whitespace marks inside cells |
+| `indicator_fill`, `indicator_stroke` | The whitespace indicator in a cell's corner |
 
 egui's `ui.visuals().error_fg_color` and `warn_fg_color` map to the same tokens,
 so `ui.colored_label(ui.visuals().error_fg_color, message)` is fine for inline

@@ -16,7 +16,6 @@ use std::{
 const MAX_CACHE_CELLS: usize = 16_384;
 const MAX_BATCH_CELLS: usize = 128;
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
-const MARK_COLOR: Color32 = Color32::from_rgb(150, 147, 141);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct CellId {
@@ -348,6 +347,7 @@ pub(super) fn render(
     all: bool,
     max_chars: usize,
     text_color: Color32,
+    mark_color: Color32,
 ) -> Rendered {
     let mut job = LayoutJob::default();
     let normal = TextFormat {
@@ -356,7 +356,7 @@ pub(super) fn render(
         ..Default::default()
     };
     let marked = TextFormat {
-        color: MARK_COLOR,
+        color: mark_color,
         ..normal.clone()
     };
     let mut offset = 0;
@@ -442,6 +442,7 @@ pub(super) fn paint_indicator(ui: &egui::Ui, response: &Response, indicated: boo
         return;
     }
     let center = egui::pos2(visible.right() - 4.5, visible.top() + 4.5);
+    let palette = super::theme::ui_palette(ui);
     let painter = ui
         .painter()
         .with_clip_rect(response.rect.intersect(ui.clip_rect()));
@@ -453,11 +454,11 @@ pub(super) fn paint_indicator(ui: &egui::Ui, response: &Response, indicated: boo
         ];
         painter.add(Shape::convex_polygon(
             points,
-            Color32::from_rgb(111, 145, 150),
-            Stroke::new(0.7, Color32::from_rgb(57, 77, 84)),
+            palette.indicator_fill,
+            Stroke::new(0.7, palette.indicator_stroke),
         ));
     } else if pending {
-        painter.circle_stroke(center, 2.0, Stroke::new(0.7, MARK_COLOR));
+        painter.circle_stroke(center, 2.0, Stroke::new(0.7, palette.mark));
     }
 }
 
@@ -541,9 +542,16 @@ mod tests {
         analyze(bytes, &AtomicBool::new(false)).unwrap()
     }
     fn text(bytes: &[u8], all: bool, bound: usize) -> String {
-        render(bytes, Some(summary(bytes)), all, bound, Color32::BLACK)
-            .job
-            .text
+        render(
+            bytes,
+            Some(summary(bytes)),
+            all,
+            bound,
+            Color32::BLACK,
+            Color32::GRAY,
+        )
+        .job
+        .text
     }
     fn id(row: u64) -> CellId {
         CellId {
@@ -631,6 +639,7 @@ mod tests {
                     true,
                     bound,
                     Color32::BLACK,
+                    Color32::GRAY,
                 );
                 assert!(rendered.job.text.chars().count() <= bound);
                 for section in &rendered.job.sections {
@@ -649,7 +658,7 @@ mod tests {
         let s = summary(&value);
         assert_eq!((s.spaces, s.tabs, s.trailing), (1, 1, 2));
         assert!(s.likely());
-        let r = render(&value, Some(s), false, 120, Color32::BLACK);
+        let r = render(&value, Some(s), false, 120, Color32::BLACK, Color32::GRAY);
         assert_eq!(r.job.text, "x".repeat(117) + "...");
         assert!(!r.visible_marks);
         assert!(s.description(false).contains("outside the visible cell"));

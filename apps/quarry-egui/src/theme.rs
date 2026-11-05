@@ -43,6 +43,9 @@ pub(super) struct Palette {
     pub success_text: Color32,
     /// Whitespace marks inside cells.
     pub mark: Color32,
+    /// The whitespace indicator triangle in a cell's corner.
+    pub indicator_fill: Color32,
+    pub indicator_stroke: Color32,
 }
 
 /// Brand amber shared by both appearances.
@@ -72,6 +75,8 @@ pub(super) const LIGHT: Palette = Palette {
     warning_fill: Color32::from_rgb(255, 245, 219),
     success_text: Color32::from_rgb(29, 120, 74),
     mark: Color32::from_rgb(150, 147, 141),
+    indicator_fill: Color32::from_rgb(111, 145, 150),
+    indicator_stroke: Color32::from_rgb(57, 77, 84),
 };
 
 pub(super) const DARK: Palette = Palette {
@@ -98,6 +103,8 @@ pub(super) const DARK: Palette = Palette {
     warning_fill: Color32::from_rgb(66, 54, 26),
     success_text: Color32::from_rgb(110, 205, 150),
     mark: Color32::from_rgb(120, 118, 113),
+    indicator_fill: Color32::from_rgb(104, 150, 156),
+    indicator_stroke: Color32::from_rgb(160, 196, 201),
 };
 
 pub(super) fn palette(visuals: &egui::Visuals) -> &'static Palette {
