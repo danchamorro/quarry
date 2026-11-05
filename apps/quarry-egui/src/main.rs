@@ -716,7 +716,7 @@ impl QuarryApp {
             || self.active.close_after_jobs
             || self.active.close_confirmation_open
             || self.active.structural_dialog.is_some();
-        let files = FileCommands::new(document);
+        let files = FileCommands::new(document, self.write_slot_available());
         let open = document.is_some();
         let filter_active = document.is_some_and(Document::filter_active);
         let insertion = |rows| {
@@ -2322,6 +2322,7 @@ impl eframe::App for QuarryApp {
         let mut action = self.pending_menu_action.take();
         let palette = theme::ctx_palette(ctx);
         let titlebar_inset = titlebar_inset(ctx);
+        let write_slot_available = self.write_slot_available();
         egui::TopBottomPanel::top("quarry-toolbar")
             .exact_height(TOOLBAR_HEIGHT)
             .show_separator_line(false)
@@ -2348,6 +2349,7 @@ impl eframe::App for QuarryApp {
                     if let Some(document_action) = document_menu(
                         ui,
                         document,
+                        write_slot_available,
                         if compact {
                             COMPACT_DOCUMENT_MENU_WIDTH
                         } else {
@@ -3766,7 +3768,9 @@ struct FileCommands {
 }
 
 impl FileCommands {
-    fn new(document: Option<&Document>) -> Self {
+    /// `write_slot_available` is false when the app-wide limit on concurrent
+    /// file writes is already reached.
+    fn new(document: Option<&Document>, write_slot_available: bool) -> Self {
         let open = document.is_some();
         let dirty = document.is_some_and(Document::is_dirty);
         let file_operation_active = document.is_some_and(|document| {
@@ -3776,8 +3780,8 @@ impl FileCommands {
         });
         let join_reserved = document.is_some_and(Document::join_reserved);
         Self {
-            combine: !file_operation_active,
-            reload: open && !file_operation_active && !dirty,
+            combine: write_slot_available && !file_operation_active,
+            reload: open && !file_operation_active && !dirty && !join_reserved,
             save: document.is_some_and(Document::is_save_ready),
             save_as: document.is_some_and(Document::is_save_as_ready),
             save_as_utf8: document.is_some_and(|document| {
@@ -3790,8 +3794,13 @@ impl FileCommands {
     }
 }
 
-fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> Option<Action> {
-    let commands = FileCommands::new(document);
+fn document_menu(
+    ui: &mut egui::Ui,
+    document: Option<&Document>,
+    write_slot_available: bool,
+    width: f32,
+) -> Option<Action> {
+    let commands = FileCommands::new(document, write_slot_available);
     let document_open = document.is_some();
     let dirty = document.is_some_and(Document::is_dirty);
     let save_ready = commands.save;
@@ -3840,6 +3849,11 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
         });
         if ui
             .add_enabled(commands.combine, egui::Button::new("Combine Files…"))
+            .on_disabled_hover_text(if write_slot_available {
+                "Wait for the active file operation to finish."
+            } else {
+                "Two file operations are already running. Wait for one to finish or cancel it."
+            })
             .clicked()
         {
             action = Some(Action::CombineFiles);
@@ -3858,6 +3872,8 @@ fn document_menu(ui: &mut egui::Ui, document: Option<&Document>, width: f32) -> 
             .add_enabled(commands.reload, egui::Button::new("Reload from Disk"))
             .on_disabled_hover_text(if !document_open {
                 "Open a file first."
+            } else if join_reserved {
+                join_files::INPUT_RESERVED
             } else if dirty {
                 "Discard or save your changes before reloading the file."
             } else {
@@ -12635,6 +12651,36 @@ mod tests {
         let state = app.menu_state(true);
         assert!(state.enabled(undo) && state.enabled(redo));
         assert!(!state.enabled(super::menu::MenuCommand::Save));
+    }
+
+    #[test]
+    fn file_commands_respect_join_reservations_and_write_slots() {
+        use super::menu::MenuCommand as M;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("file-commands.csv");
+        std::fs::write(&source, "id,name\n1,a\n").unwrap();
+        let mut document = Document::open(&source, OpenOptions::default()).unwrap();
+        finish_index(&mut document);
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.active.document = Some(document);
+        assert!(app.menu_state(false).enabled(M::ReloadFromDisk));
+        assert!(app.menu_state(false).enabled(M::CombineFiles));
+
+        // Join Files holds the document: Reload would only show a warning.
+        let reservations =
+            std::sync::Arc::clone(&app.active.document.as_ref().unwrap().join_reservations);
+        reservations.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(!app.menu_state(false).enabled(M::ReloadFromDisk));
+        reservations.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(app.menu_state(false).enabled(M::ReloadFromDisk));
+
+        // Combine needs a free write slot as well as an idle document.
+        let document = app.active.document.as_ref();
+        assert!(super::FileCommands::new(document, true).combine);
+        assert!(!super::FileCommands::new(document, false).combine);
+        assert!(!super::FileCommands::new(None, false).combine);
+        assert!(super::FileCommands::new(None, true).combine);
+        app.active.document.as_mut().unwrap().shutdown();
     }
 
     #[test]
