@@ -434,7 +434,10 @@ impl QuarryApp {
             .default_size([730.0, 600.0])
             .resizable(true)
             .vscroll(true)
+            .collapsible(false)
+            .frame(tool_dialog_frame(ctx))
             .show(ctx, |ui| {
+                tool_dialog_style(ui.style_mut());
                 command = draw_inspection(ui, state, busy, navigable_source);
             });
         if !open {

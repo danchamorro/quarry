@@ -735,6 +735,10 @@ later distribution boundary.
 bake-off. It selects egui while keeping core independent of the UI. AppKit stays
 in the workspace so the comparison remains reproducible.
 
+The [design guide](DESIGN.md) defines the egui app's visual system: theme
+tokens, typography, window structure, shared components, and the native macOS
+menu bar.
+
 ## Benchmarking
 Generate deterministic 1 GB, 10 GB, 25 GB, and 50 GB datasets locally,
 including multiline quoted fields, wide tables, and long fields. Use separate

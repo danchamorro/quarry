@@ -640,8 +640,7 @@ impl JoinDialog {
     }
 
     fn show_output_columns(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.strong("Output columns");
+        theme::section_label(ui, "Output columns");
         ui.checkbox(
             &mut self.output_has_header,
             "Include a header row in the output",
@@ -757,7 +756,10 @@ impl JoinDialog {
             .count();
         ui.small(format!("{selected} output columns selected"));
         if selected == 0 && self.headers.iter().all(Option::is_some) {
-            ui.label(RichText::new("Select at least one output column.").color(ERROR_TEXT));
+            ui.label(
+                RichText::new("Select at least one output column.")
+                    .color(ui.visuals().error_fg_color),
+            );
         }
         if self.output_has_header {
             let mut seen = std::collections::HashSet::new();
@@ -776,7 +778,16 @@ impl JoinDialog {
     fn show_analysis(&mut self, ui: &mut egui::Ui) {
         if let Some(plan) = &self.plan {
             let a = plan.analysis();
-            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                theme::stat(ui, group_digits(a.output_rows), "rows in the result");
+                theme::stat(ui, group_digits(a.matching_pairs), "matching pairs");
+                theme::stat(ui, group_digits(a.unmatched_rows[0]), "unmatched Main rows");
+                theme::stat(
+                    ui,
+                    group_digits(a.unmatched_rows[1]),
+                    "unmatched Additional rows",
+                );
+            });
             ui.label(format!(
                 "Main: {} rows · Additional: {} rows",
                 a.input_rows[0], a.input_rows[1]
@@ -822,8 +833,24 @@ impl JoinDialog {
                     format!("I understand this will create {} rows.", a.output_rows),
                 );
             }
+            let has_examples = !a.duplicate_samples.is_empty()
+                || a.unmatched_samples
+                    .iter()
+                    .any(|samples| !samples.is_empty());
+            if has_examples {
+                egui::Frame::new()
+                .fill(theme::ui_palette(ui).canvas)
+                .stroke(egui::Stroke::new(1.0, theme::ui_palette(ui).grid_line))
+                .corner_radius(6)
+                .inner_margin(10)
+                .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("join-review-examples")
+                .max_height(180.0)
+                .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             if !a.duplicate_samples.is_empty() {
-                ui.small("Duplicate-key examples (sample; clipped comparison keys)");
+                theme::section_label(ui, "Duplicate-key examples (sample; clipped comparison keys)");
             }
             for sample in &a.duplicate_samples {
                 ui.small(format!(
@@ -835,7 +862,7 @@ impl JoinDialog {
                 .iter()
                 .any(|samples| !samples.is_empty())
             {
-                ui.small("Unmatched examples (sample; data-row numbers, clipped comparison keys)");
+                theme::section_label(ui, "Unmatched examples (sample; data-row numbers, clipped comparison keys)");
                 for (side, samples) in a.unmatched_samples.iter().enumerate() {
                     let role = if side == 0 { "Main" } else { "Additional" };
                     for sample in samples {
@@ -846,6 +873,9 @@ impl JoinDialog {
                         ui.small(format!("{role} data row {} · {key}", sample.data_row));
                     }
                 }
+            }
+                });
+                });
             }
             ui.small(format!(
                 "Output: {} · Conservative additional storage: {}",
@@ -879,8 +909,6 @@ impl JoinDialog {
 
     /// Pair identity and ordering are shared by both sources.
     fn show_key_pairs(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.strong("Key column pairs");
         ui.small("All pairs must match. Empty or missing components never match.");
         ui.checkbox(
             &mut self.ignore_ascii_case,
@@ -1024,82 +1052,113 @@ impl JoinDialog {
         let mut open = true;
         egui::Window::new("Join Files").id(egui::Id::new("join-files"))
             .open(&mut open).default_width(680.0).min_width(480.0)
+            .default_height((ctx.content_rect().height() - 120.0).clamp(360.0, 720.0))
+            .collapsible(false)
+            .frame(tool_dialog_frame(ctx))
             .show(ctx,|ui|{
-                ui.label("Match key columns and create a separate joined file.");
-                ui.small("Use current open documents or saved files. Retain every matching pair. Empty keys never match.");
-                ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant. Joins use all current rows; clear source filters first.");
+                tool_dialog_style(ui.style_mut());
+                ui.weak("Match key columns in two files and write the result to a new file. Both sources stay unchanged.");
+                egui::CollapsingHeader::new("How matching works").id_salt("join-matching-details").show(ui, |ui| {
+                    ui.small("Use current open documents or saved files. Retain every matching pair. Empty keys never match.");
+                    ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant. Joins use all current rows; clear source filters first.");
+                });
                 egui::ScrollArea::vertical().max_height((ui.available_height()-70.0).min(ctx.content_rect().height()-180.0).max(40.0)).show(ui,|ui|{
-                    ui.add_enabled_ui(editable, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Rows to keep:");
-                            egui::ComboBox::from_id_salt("join-mode").selected_text(self.mode.label()).show_ui(ui, |ui| {
-                                for mode in [JoinMode::Left, JoinMode::Inner, JoinMode::Right, JoinMode::Full] {
-                                    ui.selectable_value(&mut self.mode, mode, mode.label());
-                                }
-                            });
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    theme::step_card(ui, 1, "Choose two files", |ui| {
+                        ui.columns(2,|columns|{
+                            for (side,column) in columns.iter_mut().enumerate(){
+                                let palette = theme::ui_palette(column);
+                                theme::section_label(column, if side==0{"Main file"}else{"Additional file"});
+                                let name = self.paths[side].as_ref().and_then(|p|p.file_name()).map(|n|n.to_string_lossy().into_owned());
+                                column.add(egui::Label::new(match &name {
+                                    Some(name) => RichText::new(name).size(15.0).color(palette.text),
+                                    None => RichText::new("No file selected").size(15.0).color(palette.text_tertiary),
+                                }).truncate());
+                                column.horizontal(|ui| {
+                                    if ui.add_enabled(editable && can_start,egui::Button::new(if side==0{"Choose Main…"}else{"Choose Additional…"})).clicked(){action=DialogAction::Select(side);}
+                                    ui.add_enabled_ui(editable && can_start, |ui| {
+                                        let role = if side == 0 { "Main" } else { "Additional" };
+                                        egui::ComboBox::from_id_salt(("join-open-document", side))
+                                            .selected_text(format!("Open {role} document…"))
+                                            .show_ui(ui, |ui| {
+                                                ui.set_max_width(320.0);
+                                                if documents.is_empty() { ui.label("No open documents"); }
+                                                for choice in documents {
+                                                    if ui.selectable_label(false, format!("Use {role} document: {}", choice.label))
+                                                        .on_hover_text(choice.path.display().to_string()).clicked() {
+                                                        action = DialogAction::SelectDocument(side, choice.tab_id);
+                                                    }
+                                                }
+                                            });
+                                    });
+                                });
+                                if self.document_inputs[side].is_some() {
+                                    column.small("Open document · current values · inherited format");
+                                } else { column.small("Saved file"); }
+                                column.add_enabled_ui(editable && can_start,|ui|{
+                                    ui.add_enabled_ui(self.document_inputs[side].is_none(), |ui| {
+                                        if self.show_input_format(ui, side) { action = DialogAction::ReadFormat(side); }
+                                    });
+                                    ui.checkbox(&mut self.require_unique[side], if side == 0 { "Require unique Main key" } else { "Require unique Additional key" });
+                                    if let Some(header)=&self.headers[side]{
+                                        ui.small(format!("{} columns · {} · {}",header.columns.len(),header.encoding.label(),if header.has_header {"header row"} else {"no header"}));
+                                    }else{ui.weak("Key column: choose a file first");}
+                                });
+                            }
                         });
                     });
-                    ui.columns(2,|columns|{
-                        for (side,column) in columns.iter_mut().enumerate(){
-                            column.strong(if side==0{"Main file"}else{"Additional file"});
-                            column.add(egui::Label::new(self.paths[side].as_ref().and_then(|p|p.file_name()).map_or_else(||"No file selected".into(),|n|n.to_string_lossy().into_owned())).truncate());
-                            if column.add_enabled(editable && can_start,egui::Button::new(if side==0{"Choose Main…"}else{"Choose Additional…"})).clicked(){action=DialogAction::Select(side);}
-                            column.add_enabled_ui(editable && can_start, |ui| {
-                                let role = if side == 0 { "Main" } else { "Additional" };
-                                egui::ComboBox::from_id_salt(("join-open-document", side))
-                                    .selected_text(format!("Open {role} document…"))
-                                    .show_ui(ui, |ui| {
-                                        ui.set_max_width(320.0);
-                                        if documents.is_empty() { ui.label("No open documents"); }
-                                        for choice in documents {
-                                            if ui.selectable_label(false, format!("Use {role} document: {}", choice.label))
-                                                .on_hover_text(choice.path.display().to_string()).clicked() {
-                                                action = DialogAction::SelectDocument(side, choice.tab_id);
-                                            }
-                                        }
-                                    });
-                            });
-                            if self.document_inputs[side].is_some() {
-                                column.small("Open document · current values · inherited format");
-                            } else { column.small("Saved file"); }
-                            column.add_enabled_ui(editable && can_start,|ui|{
-                                ui.add_enabled_ui(self.document_inputs[side].is_none(), |ui| {
-                                    if self.show_input_format(ui, side) { action = DialogAction::ReadFormat(side); }
-                                });
-                                ui.checkbox(&mut self.require_unique[side], if side == 0 { "Require unique Main key" } else { "Require unique Additional key" });
-                                if let Some(header)=&self.headers[side]{
-                                    ui.small(format!("{} columns · {} · {}",header.columns.len(),header.encoding.label(),if header.has_header {"header row"} else {"no header"}));
-                                }else{ui.label("Key column: choose a file first");}
-                            });
-                        }
+                    theme::step_card(ui, 2, "Match key columns", |ui| {
+                        ui.add_enabled_ui(editable, |ui| self.show_key_pairs(ui));
                     });
-                    ui.add_enabled_ui(editable, |ui| self.show_key_pairs(ui));
-                    ui.add_enabled_ui(editable, |ui| self.show_output_columns(ui));
-                    self.show_analysis(ui);
-                    if let Some(result)=&self.result {
-                        ui.separator();ui.strong(format!("Saved {} rows · {}",result.data_rows,format_bytes(result.bytes_written)));
-                        ui.add(egui::Label::new(result.destination.display().to_string()).wrap());
+                    theme::step_card(ui, 3, "Choose rows and columns", |ui| {
+                        ui.add_enabled_ui(editable, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Rows to keep:");
+                                egui::ComboBox::from_id_salt("join-mode").selected_text(self.mode.label()).show_ui(ui, |ui| {
+                                    for mode in [JoinMode::Left, JoinMode::Inner, JoinMode::Right, JoinMode::Full] {
+                                        ui.selectable_value(&mut self.mode, mode, mode.label());
+                                    }
+                                });
+                            });
+                        });
+                        ui.add_enabled_ui(editable, |ui| self.show_output_columns(ui));
+                    });
+                    if self.plan.is_some() || self.result.is_some() || self.destination.is_some() {
+                        theme::step_card(ui, 4, "Review and create", |ui| {
+                            self.show_analysis(ui);
+                            if let Some(path)=&self.destination {ui.add(egui::Label::new(format!("Output: {}",path.display())).truncate());}
+                            if let Some(result)=&self.result {
+                                ui.colored_label(theme::ui_palette(ui).success_text, format!("Saved {} rows · {}",result.data_rows,format_bytes(result.bytes_written)));
+                                ui.add(egui::Label::new(result.destination.display().to_string()).wrap());
+                            }
+                        });
                     }
-                    if let Some(path)=&self.destination {ui.add(egui::Label::new(format!("Output: {}",path.display())).truncate());}
-                    if let Some(message)=&self.message {ui.add(egui::Label::new(RichText::new(message).color(ERROR_TEXT)).wrap());}
+                    if let Some(message)=&self.message {ui.add(egui::Label::new(RichText::new(message).color(ui.visuals().error_fg_color)).wrap());}
                     if let Some(progress)=self.checking.as_ref().map(JoinJob::progress).or_else(||self.writing.as_ref().map(JoinJob::progress)){
                         ui.horizontal(|ui|{ui.spinner();ui.label(format!("{} · {} rows processed",progress.phase.label(),progress.records));});
                     }else if busy {ui.horizontal(|ui|{ui.spinner();ui.label(if self.cleanup.is_some(){"Releasing private join data…"}else{"Reading header…"});});}
                     Self::reveal_keyboard_focus(ui);
                 });
                 ui.separator();
-                ui.horizontal_wrapped(|ui|{
+                // Close on the left; the current step's actions on the right, primary last.
+                ui.horizontal(|ui|{
                     if ui.button(if busy{"Cancel and Close"}else{"Close"}).clicked(){self.request_close(false);}
                     if busy {
+                        theme::push_right(ui, theme::buttons_width(ui, &["Cancel"]));
                         if ui.add_enabled(!self.cancel_requested && self.cleanup.is_none(),egui::Button::new("Cancel")).clicked(){self.cancel();}
                     }else if self.result.is_some(){
-                        if ui.button("Open Joined File").clicked(){action=DialogAction::OpenResult;}
+                        theme::push_right(ui, theme::buttons_width(ui, &["Open Joined File"]));
+                        if ui.add(theme::primary_button("Open Joined File")).clicked(){action=DialogAction::OpenResult;}
                     }else if self.plan.is_some(){
+                        theme::push_right(ui, theme::buttons_width(ui, &["Reset Analysis", "Choose Output…", "Create Joined File"]));
                         if ui.button("Reset Analysis").clicked(){self.reset();}
                         if ui.button("Choose Output…").clicked(){action=DialogAction::ChooseOutput;}
-                        if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| (plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion) && (plan.analysis().new_columns == [0, 0] || self.acknowledge_layout)),egui::Button::new("Create Joined File")).clicked(){action=DialogAction::Create;}
-                    }else if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some) && self.output_columns.iter().any(|column|column.included),egui::Button::new("Analyze & Preview")).clicked(){
-                        action=DialogAction::Analyze;
+                        if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| (plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion) && (plan.analysis().new_columns == [0, 0] || self.acknowledge_layout)),theme::primary_button("Create Joined File")).clicked(){action=DialogAction::Create;}
+                    }else {
+                        theme::push_right(ui, theme::buttons_width(ui, &["Analyze & Preview"]));
+                        if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some) && self.output_columns.iter().any(|column|column.included),theme::primary_button("Analyze & Preview")).clicked(){
+                            action=DialogAction::Analyze;
+                        }
                     }
                 });
                 if !can_start && !busy {ui.small("Two file operations are running. Wait for a free slot before starting another.");}

@@ -364,7 +364,7 @@ impl QuarryApp {
                     ui.heading("Temporary storage");
                 }
                 if review.operation.is_some() && !write_slot_available {
-                    ui.colored_label(ERROR_TEXT, "Two file operations are already running. Wait for one to finish or cancel it before continuing.");
+                    ui.colored_label(ui.visuals().error_fg_color, "Two file operations are already running. Wait for one to finish or cancel it before continuing.");
                 }
                 ui.add_space(6.0);
                 if !current {
@@ -372,7 +372,7 @@ impl QuarryApp {
                 } else {
                     match &review.result {
                         Some(Ok(_)) if ready => {
-                            ui.colored_label(Color32::from_rgb(31, 101, 68), "Enough disk space is available.");
+                            ui.colored_label(theme::ui_palette(ui).success_text, "Enough disk space is available.");
                         }
                         Some(Ok(_)) => {
                             ui.label(if working {
@@ -408,7 +408,7 @@ impl QuarryApp {
                                         ui.label(format!("Retained working and Undo/Redo files: {}", format_bytes(*retained)));
                                         ui.small("Retained files already reduce the free space and are not counted twice.");
                                     }
-                                    Some(Err(error)) => { ui.colored_label(ERROR_TEXT, error); }
+                                    Some(Err(error)) => { ui.colored_label(ui.visuals().error_fg_color, error); }
                                     None => {}
                                 }
                             }
@@ -449,7 +449,7 @@ impl QuarryApp {
                     if ui.button("Cancel").clicked() { cancel = true; }
                     if !review.ready() && ui.add_enabled(review.worker.is_none(), egui::Button::new("Check again")).clicked() { check = true; }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add_enabled(review.ready() && !check && (review.operation.is_none() || write_slot_available), egui::Button::new(if review.operation.is_some() { "Continue" } else { "Use folder" }).fill(QUARRY_YELLOW)).clicked() { accept = true; }
+                        if ui.add_enabled(review.ready() && !check && (review.operation.is_none() || write_slot_available), theme::primary_button(if review.operation.is_some() { "Continue" } else { "Use folder" })).clicked() { accept = true; }
                     });
                 });
             });

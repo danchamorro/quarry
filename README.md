@@ -292,6 +292,7 @@ rules, cache declarations, resource measurements, and limitations.
 - [User guide](docs/USER_GUIDE.md)
 - [Product requirements](docs/PRD.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Design guide](docs/DESIGN.md)
 - [Product direction](docs/ROADMAP.md)
 - [Priority checklist before beta](docs/PRE_BETA_CHECKLIST.md)
 - [Beta release checklist and testing guidance](docs/BETA_RELEASE_CHECKLIST.md)

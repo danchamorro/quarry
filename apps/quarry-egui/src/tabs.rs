@@ -353,6 +353,39 @@ fn macos_names_alias(
     }
 }
 
+pub(super) const TAB_STRIP_HEIGHT: f32 = 34.0;
+const TAB_MIN_WIDTH: f32 = 132.0;
+const TAB_MAX_WIDTH: f32 = 232.0;
+
+/// The active tab joins the grid below; inactive tabs show only a hover tint.
+fn paint_tab(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    active: bool,
+    hovered: bool,
+    palette: &theme::Palette,
+) {
+    let painter = ui.painter();
+    if active {
+        let radius = egui::CornerRadius {
+            nw: 8,
+            ne: 8,
+            sw: 0,
+            se: 0,
+        };
+        let outline = rect.expand2(egui::vec2(0.5, 0.0));
+        painter.rect_filled(outline, radius, palette.separator);
+        painter.rect_filled(
+            rect.with_min_y(rect.top() + 1.0)
+                .with_max_y(rect.bottom() + 1.0),
+            radius,
+            palette.header_fill,
+        );
+    } else if hovered {
+        painter.rect_filled(rect.shrink2(egui::vec2(0.0, 3.0)), 6.0, palette.hover);
+    }
+}
+
 impl QuarryApp {
     /// Visits the active slot and every retained tab without changing visible focus.
     pub(super) fn document_tabs(&self) -> impl Iterator<Item = &DocumentTab> {
@@ -976,37 +1009,28 @@ impl QuarryApp {
             .document_tabs()
             .filter(|tab| tab.document.is_some())
             .map(|tab| {
+                let document = tab.document.as_ref().unwrap();
                 (
                     tab.id,
                     tab.title(),
-                    tab.document
-                        .as_ref()
-                        .unwrap()
-                        .logical_path
-                        .display()
-                        .to_string(),
+                    document.logical_path.display().to_string(),
                     format!(
-                        "{}{}{}",
-                        if tab.document.as_ref().unwrap().is_dirty() {
-                            "● "
-                        } else {
-                            ""
-                        },
+                        "{}{}",
                         if tab.busy() { "⋯ " } else { "" },
-                        tab.document
-                            .as_ref()
-                            .unwrap()
+                        document
                             .logical_path
                             .file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                     ),
+                    document.is_dirty(),
                 )
             })
             .collect();
         tabs.sort_by_key(|tab| tab.0);
         let mut select = None;
         let mut close = None;
+        let mut open = false;
         let width = ctx.content_rect().width();
         let resized = ctx.data_mut(|data| {
             let key = egui::Id::new("quarry-tab-strip-width");
@@ -1015,36 +1039,110 @@ impl QuarryApp {
             previous != Some(width)
         });
         let reveal = std::mem::take(&mut self.reveal_tab) || resized;
+        let palette = theme::ctx_palette(ctx);
         if !tabs.is_empty() {
             egui::TopBottomPanel::top("quarry-document-tabs")
-                .exact_height(30.0)
+                .exact_height(TAB_STRIP_HEIGHT)
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(palette.chrome)
+                        .inner_margin(egui::Margin {
+                            left: 8,
+                            right: 8,
+                            top: 4,
+                            bottom: 0,
+                        }),
+                )
                 .show(ctx, |ui| {
+                    let strip = ui.max_rect().expand2(egui::vec2(8.0, 0.0));
+                    theme::hairline(ui.painter(), strip, true, palette.separator);
+                    theme::chrome_controls(ui.style_mut());
                     ui.add_enabled_ui(!blocked, |ui| {
+                        let tab_width = ((ui.available_width() - 40.0) / tabs.len() as f32)
+                            .clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
                         egui::ScrollArea::horizontal()
                             .id_salt("quarry-tab-strip")
                             .animated(false)
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    for (id, title, path, caption) in &tabs {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    for (id, title, path, caption, dirty) in &tabs {
+                                        let active = self.active.id == *id;
                                         ui.push_id(id, |ui| {
+                                            let (rect, background) = ui.allocate_exact_size(
+                                                egui::vec2(tab_width, TAB_STRIP_HEIGHT - 4.0),
+                                                egui::Sense::click(),
+                                            );
+                                            // The whole tab selects; the title stays the accessible control.
+                                            if background.clicked() {
+                                                select = Some(*id);
+                                            }
+                                            let hovered = ui.rect_contains_pointer(rect);
+                                            paint_tab(ui, rect, active, hovered, palette);
+                                            let close_rect = egui::Rect::from_center_size(
+                                                egui::pos2(rect.right() - 15.0, rect.center().y),
+                                                egui::vec2(18.0, 18.0),
+                                            );
+                                            let dot =
+                                                egui::pos2(rect.left() + 13.0, rect.center().y);
+                                            if *dirty {
+                                                ui.painter().circle_filled(
+                                                    dot,
+                                                    3.5,
+                                                    palette.selection_strong,
+                                                );
+                                            } else {
+                                                let icon = egui::Rect::from_center_size(
+                                                    dot,
+                                                    egui::vec2(12.0, 12.0),
+                                                );
+                                                icons::paint(
+                                                    ui.painter(),
+                                                    icon,
+                                                    icons::Icon::Document,
+                                                    palette.text_tertiary,
+                                                );
+                                            }
+                                            let title_rect = rect
+                                                .with_min_x(rect.left() + 24.0)
+                                                .with_max_x(close_rect.left() - 2.0);
                                             let response = ui
-                                                .add_sized(
-                                                    [168.0, 20.0],
-                                                    egui::Button::selectable(
-                                                        self.active.id == *id,
-                                                        egui::RichText::new(caption).size(12.0),
-                                                    )
-                                                    .truncate(),
+                                                .scope_builder(
+                                                    egui::UiBuilder::new()
+                                                        .max_rect(title_rect)
+                                                        .layout(Layout::left_to_right(
+                                                            Align::Center,
+                                                        )),
+                                                    |ui| {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(caption)
+                                                                    .size(12.0)
+                                                                    .color(if active {
+                                                                        palette.text
+                                                                    } else {
+                                                                        palette.text_secondary
+                                                                    }),
+                                                            )
+                                                            .truncate()
+                                                            .sense(egui::Sense::click()),
+                                                        )
+                                                    },
                                                 )
+                                                .inner
                                                 .on_hover_text(path);
-                                            if reveal && self.active.id == *id {
+                                            if reveal && active {
                                                 response.scroll_to_me(Some(Align::Center));
                                             }
                                             response.widget_info(|| {
                                                 egui::WidgetInfo::selected(
                                                     egui::WidgetType::SelectableLabel,
                                                     !blocked,
-                                                    self.active.id == *id,
+                                                    active,
                                                     format!("Document tab: {title}"),
                                                 )
                                             });
@@ -1052,7 +1150,36 @@ impl QuarryApp {
                                                 select = Some(*id);
                                             }
                                             let response = ui
-                                                .small_button("×")
+                                                .scope_builder(
+                                                    egui::UiBuilder::new().max_rect(close_rect),
+                                                    |ui| {
+                                                        ui.spacing_mut().button_padding =
+                                                            egui::vec2(2.0, 2.0);
+                                                        let id = ui.id().with("close");
+                                                        let rendered =
+                                                            egui::Button::new(egui::Atom::custom(
+                                                                id,
+                                                                egui::vec2(10.0, 10.0),
+                                                            ))
+                                                            .min_size(egui::vec2(18.0, 18.0))
+                                                            .corner_radius(4)
+                                                            .atom_ui(ui);
+                                                        if (active
+                                                            || hovered
+                                                            || rendered.response.hovered())
+                                                            && let Some(icon) = rendered.rect(id)
+                                                        {
+                                                            icons::paint(
+                                                                ui.painter(),
+                                                                icon,
+                                                                icons::Icon::Close,
+                                                                palette.text_secondary,
+                                                            );
+                                                        }
+                                                        rendered.response
+                                                    },
+                                                )
+                                                .inner
                                                 .on_hover_text(format!("Close {path}"));
                                             response.widget_info(|| {
                                                 egui::WidgetInfo::labeled(
@@ -1066,10 +1193,22 @@ impl QuarryApp {
                                             }
                                         });
                                     }
+                                    let plus = icons::button(
+                                        ui,
+                                        true,
+                                        icons::Icon::Plus,
+                                        "Open in New Tab…",
+                                        false,
+                                    )
+                                    .on_hover_text("Open a file in a new tab (⌘O)");
+                                    open = plus.clicked();
                                 });
                             });
                     });
                 });
+        }
+        if open {
+            self.choose_file();
         }
         if !blocked {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
@@ -2107,7 +2246,9 @@ mod tests {
                 .clone();
             assert!(node.supports_action(egui::accesskit::Action::Click));
             let bounds = node.bounds().unwrap();
-            assert!(bounds.y1 <= 30.0 && bounds.x1 <= 860.0);
+            assert!(
+                bounds.y1 <= f64::from(TOOLBAR_HEIGHT + TAB_STRIP_HEIGHT) && bounds.x1 <= 860.0
+            );
         }
         ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(FIND_INPUT_ID)));
         let key = |key, modifiers| egui::Event::Key {
