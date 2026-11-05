@@ -107,8 +107,8 @@ The CLI accepts **--encoding** on file commands: **auto**, **utf-8**,
 - **Format** shows the delimiter and header mode Quarry is using, such as
   **Comma · Header row**. Opening it also shows the applied settings, what
   Quarry originally detected, and the resolved character encoding.
-- Text cells align left and numeric cells align right. Quarry follows the
-  system's light or dark appearance.
+- Text cells align left and numeric cells align right. Quarry always uses a
+  light appearance, even when macOS uses Dark mode.
 - The footer keeps the visible row range in view, adds file and selection
   metadata when space allows, and reserves its right side for status, progress,
   and the active operation's cancel button.

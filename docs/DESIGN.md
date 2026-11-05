@@ -19,20 +19,22 @@ The code is the source of truth for exact values:
 1. **The data is the interface.** The grid gets the most space and the most
    contrast. Chrome (toolbar, tabs, status bar) stays quiet and neutral.
 2. **Native first.** Quarry should feel like a Mac app: system fonts, a toolbar
-   in the title bar, a real menu bar, standard shortcuts, and light and dark
-   appearances.
-3. **Amber means "this one."** The brand amber marks selection, focus, the
+   in the title bar, a real menu bar, and standard shortcuts.
+3. **Light only.** Quarry always uses its light appearance, even when macOS uses
+   Dark mode. This is the owner's decision; don't add a dark palette or an
+   appearance setting without the owner's approval.
+4. **Amber means "this one."** The brand amber marks selection, focus, the
    active filter, unsaved work, and the single primary action in a dialog.
    Don't use it for decoration.
-4. **One way to do each thing.** Use the shared components below. Don't style a
+5. **One way to do each thing.** Use the shared components below. Don't style a
    button, frame, or color inline.
-5. **Calm under load.** Progress, cancel, and status messages live in the status
+6. **Calm under load.** Progress, cancel, and status messages live in the status
    bar. Only warnings and errors interrupt, as a banner.
 
 ## Color
 
-Every color comes from `theme::Palette`. Get the palette for the current
-appearance and use its semantic names:
+Every color comes from `theme::Palette`. Get the palette and use its semantic
+names:
 
 ```rust
 let palette = theme::ui_palette(ui);      // inside a Ui
@@ -40,9 +42,14 @@ let palette = theme::ctx_palette(ctx);    // with only a Context
 ui.colored_label(palette.text_secondary, "Detected: Comma");
 ```
 
-**Never write `Color32::from_rgb(...)` outside `theme.rs`.** A hard-coded color
-breaks dark mode. If no token fits, add one to `Palette`, with values in both
-`LIGHT` and `DARK`.
+**Never write `Color32::from_rgb(...)` outside `theme.rs`.** Hard-coded colors
+drift from the palette. If no token fits, add one to `Palette` and give it a
+value in `LIGHT`.
+
+`theme::configure` sets egui's theme to Light. `install_light_appearance` in
+`main.rs` sets AppKit's appearance to Aqua, so native windows such as the file
+picker stay light too. Menu-bar menus still follow macOS, because the system
+draws them.
 
 | Token | Use for |
 |---|---|
@@ -145,8 +152,8 @@ Use these instead of building your own.
 
 ### Buttons
 
-- **Primary:** `theme::primary_button("Sort")`. Amber fill, dark text, in both
-  appearances. Use at most one per dialog, for the action that finishes it.
+- **Primary:** `theme::primary_button("Sort")`. Amber fill, dark text. Use at
+  most one per dialog, for the action that finishes it.
 - **Secondary:** `ui.button("Cancel")`. Framed, neutral.
 - **Destructive:** a framed button with `palette.error_text` text, placed at the
   far left of the footer ("Discard Changes and Close").
@@ -246,8 +253,8 @@ VoiceOver regressions are release blockers ([ADR 0003](adr/0003-select-egui-ui.m
   jump).
 - Don't rely on color alone. The unsaved state is a dot and text; the active
   filter is an outline and a count.
-- Text and background tokens are chosen to stay readable in both appearances.
-  Keep that true when you add tokens.
+- Text and background tokens are chosen to meet 4.5:1 contrast where people
+  read text. Keep that true when you add tokens.
 
 ## Checking your change
 
@@ -255,8 +262,7 @@ VoiceOver regressions are release blockers ([ADR 0003](adr/0003-select-egui-ui.m
    at 860 and 1,280 px, and accessible labels. If a test pins a value you
    meant to change, update the test and keep what it checks.
 2. `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
-3. Run the app and look at the change in both light and dark appearances, at
-   the minimum window size and at full screen. Quarry follows the system
-   appearance live.
+3. Run the app and look at the change at the minimum window size and at full
+   screen.
 4. Update `docs/USER_GUIDE.md` when a visible label, location, or shortcut
    changes.
