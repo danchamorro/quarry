@@ -11733,21 +11733,14 @@ fn toolbar_separator(ui: &mut egui::Ui) {
 /// Menu-bar menus still follow the system, because macOS draws them.
 #[cfg(target_os = "macos")]
 fn install_light_appearance() {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua};
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let app = NSApplication::sharedApplication(mtm);
-    // The value of AppKit's `NSAppearanceNameAqua` constant is its own name.
-    let name = objc2_foundation::NSString::from_str("NSAppearanceNameAqua");
-    // SAFETY: NSAppearance's `appearanceNamed:` takes an NSString and returns an
-    // NSAppearance or nil, and NSApplication's `setAppearance:` takes an
-    // NSAppearance. Untyped calls avoid an extra objc2-app-kit feature.
-    unsafe {
-        let appearance: Option<objc2::rc::Retained<AnyObject>> =
-            objc2::msg_send![objc2::class!(NSAppearance), appearanceNamed: &*name];
-        if let Some(appearance) = appearance {
-            let _: () = objc2::msg_send![&*app, setAppearance: &*appearance];
-        }
+    // SAFETY: `NSAppearanceNameAqua` is an immutable AppKit string constant.
+    let name = unsafe { NSAppearanceNameAqua };
+    if let Some(appearance) = NSAppearance::appearanceNamed(name) {
+        NSApplication::sharedApplication(mtm).setAppearance(Some(&appearance));
     }
 }
 
