@@ -16,6 +16,10 @@ use std::{
 const MAX_CACHE_CELLS: usize = 16_384;
 const MAX_BATCH_CELLS: usize = 128;
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+// Alternating marked and unmarked characters must not turn one bounded preview
+// into thousands of shaping sections. The final slots cover the current run,
+// an unstyled remainder, and a truncation marker.
+const MAX_LAYOUT_SECTIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct CellId {
@@ -340,7 +344,7 @@ pub(super) struct Rendered {
     pub visible_marks: bool,
 }
 
-/// Preserve the existing scalar/output bound, including expansion of visual marks.
+/// Preserve the scalar/output bound and cap shaping sections after visual-mark expansion.
 pub(super) fn render(
     bytes: &[u8],
     summary: Option<Summary>,
@@ -366,6 +370,7 @@ pub(super) fn render(
     let mut visible_marks = false;
     let mut run = String::new();
     let mut run_marked = false;
+    let mut preserve_mark_format = true;
     while offset < bytes.len() && output_chars < max_chars {
         let (c, width) = scalar(bytes, offset);
         let repeated = c == ' ' && (previous_space || bytes.get(offset + width) == Some(&b' '));
@@ -389,19 +394,33 @@ pub(super) fn render(
         if output_chars + count > max_chars {
             break;
         }
-        if !run.is_empty() && mark != run_marked {
-            job.append(
-                &run,
-                0.0,
+        if !run.is_empty() && mark != run_marked && preserve_mark_format {
+            if job.sections.len() < MAX_LAYOUT_SECTIONS.saturating_sub(3) {
+                job.append(
+                    &run,
+                    0.0,
+                    if run_marked {
+                        marked.clone()
+                    } else {
+                        normal.clone()
+                    },
+                );
+                run.clear();
+                run_marked = mark;
+            } else {
+                // Keep the textual marks but flatten the remaining format so
+                // attacker-controlled transitions cannot add more sections.
                 if run_marked {
-                    marked.clone()
-                } else {
-                    normal.clone()
-                },
-            );
-            run.clear();
+                    job.append(&run, 0.0, marked.clone());
+                    run.clear();
+                }
+                preserve_mark_format = false;
+                run_marked = false;
+            }
         }
-        run_marked = mark;
+        if run.is_empty() {
+            run_marked = mark && preserve_mark_format;
+        }
         run.push_str(&text);
         output_chars += count;
         leading &= c.is_whitespace();
@@ -649,6 +668,49 @@ mod tests {
         }
         assert_eq!(text("é界🙂".as_bytes(), false, 3), "é界🙂");
         assert_eq!(text(b"abcdef", false, 5), "ab...");
+    }
+
+    #[test]
+    fn rendering_bounds_sections_without_hiding_whitespace_marks() {
+        for (value, all, mark) in [
+            ("a\t".repeat(20_000), false, "[TAB]"),
+            ("a ".repeat(20_000), true, "·"),
+        ] {
+            let rendered = render(
+                value.as_bytes(),
+                Some(summary(value.as_bytes())),
+                all,
+                16 * 1024,
+                Color32::BLACK,
+                Color32::GRAY,
+            );
+            assert!(rendered.job.sections.len() <= MAX_LAYOUT_SECTIONS);
+            assert!(rendered.job.text.matches(mark).count() > MAX_LAYOUT_SECTIONS);
+            assert!(rendered.job.text.ends_with("..."));
+            assert!(rendered.visible_marks);
+            for section in &rendered.job.sections {
+                assert!(rendered.job.text.get(section.byte_range.clone()).is_some());
+            }
+        }
+        let ordinary = render(
+            b"A\tB",
+            Some(summary(b"A\tB")),
+            false,
+            100,
+            Color32::BLACK,
+            Color32::GRAY,
+        );
+        assert_eq!(ordinary.job.text, "A[TAB]B");
+        assert_eq!(ordinary.job.sections.len(), 3);
+        assert_eq!(
+            ordinary
+                .job
+                .sections
+                .iter()
+                .map(|section| section.format.color)
+                .collect::<Vec<_>>(),
+            [Color32::BLACK, Color32::GRAY, Color32::BLACK]
+        );
     }
 
     #[test]
