@@ -676,6 +676,17 @@ mod tests {
             assert!(app.active.document.is_none());
             assert!(!app.active.inspection.open);
             assert!(leftovers(scratch.path()).is_empty());
+            // A dropped or Finder-opened file names its path once, not twice.
+            app.handle_dropped_paths(vec![Some(path.clone())]);
+            let notice = app.active.notice.take().expect("a failure notice");
+            let shown = path.display().to_string();
+            assert!(notice.text.starts_with(&shown), "{name}: {}", notice.text);
+            assert_eq!(
+                notice.text.matches(&shown).count(),
+                1,
+                "{name}: {}",
+                notice.text
+            );
         }
 
         // Damage after the bootstrap fails the background pass.

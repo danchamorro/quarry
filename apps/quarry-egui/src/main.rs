@@ -391,6 +391,17 @@ struct AppMessage {
     severity: MessageSeverity,
 }
 
+/// Names the path before an open failure unless the message already starts with it, as
+/// compressed-file errors do.
+fn open_failure_line(path: &Path, text: &str) -> String {
+    let name = path.display().to_string();
+    if text.starts_with(&name) {
+        text.to_owned()
+    } else {
+        format!("{name}: {text}")
+    }
+}
+
 impl AppMessage {
     /// Retains the failed path, attempted format and cause independently of the active tab.
     fn file_open_error(
@@ -1255,7 +1266,7 @@ impl QuarryApp {
                         if inspection_target.is_none() {
                             inspection_target = error.inspection_target;
                         }
-                        failures.push(format!("{}: {}", path.display(), error.text));
+                        failures.push(open_failure_line(&path, &error.text));
                     }
                 }
                 None => failures
