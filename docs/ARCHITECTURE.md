@@ -129,12 +129,11 @@ View order and hidden state remain non-dirty UI metadata and never affect saved
 output. Move Selected Columns and Delete Selected Columns are separate document
 operations and do not consult the view metadata.
 
-Header columns are known immediately. If a later ragged row contains more
-fields, the viewer appends those newly known source columns without resetting
-the existing layout. **Find all columns** runs an optional per-document scan
-of the current working source. The encoding-aware record scanner counts field
-separators outside quotes using fixed-size chunks. Only a successful full scan
-of the same source confirms the width and extends the existing layout.
+The opening viewport supplies an initial width. During the ordinary background
+index pass, the encoding-aware scanner counts fields in completed logical records
+and publishes the widest count with progress. The viewer appends newly found
+columns without resetting the layout and confirms the count on successful
+completion. Sort-produced indexes carry the width collected during run creation.
 
 ## Clipboard copying
 The viewer retains a selected cell only while its row and column remain visible,

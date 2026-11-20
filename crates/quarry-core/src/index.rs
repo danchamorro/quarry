@@ -1,11 +1,12 @@
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::Encoding;
-use crate::encoding::RecordScanner;
+use crate::encoding::EncodedScanner;
+use crate::source_stamp::open_regular_file;
 
 use crate::export::source_matches_stamp;
 use crate::{CompletedRecordCount, QuarryError, Session, SourceStamp};
@@ -43,6 +44,7 @@ pub struct StructuralIndex {
     checkpoint_every: u64,
     max_checkpoints: usize,
     indexed_rows: u64,
+    maximum_width: usize,
     indexed_bytes: u64,
 }
 
@@ -65,6 +67,7 @@ impl StructuralIndex {
             checkpoint_every: config.checkpoint_every,
             max_checkpoints,
             indexed_rows: 0,
+            maximum_width: 0,
             indexed_bytes: 0,
         })
     }
@@ -89,8 +92,14 @@ impl StructuralIndex {
         }
     }
 
-    pub(crate) fn finish_output(&mut self, bytes_written: u64) {
+    pub(crate) fn finish_output(&mut self, bytes_written: u64, maximum_width: usize) {
+        self.maximum_width = maximum_width;
         self.indexed_bytes = bytes_written;
+    }
+
+    /// Widest completed logical record in the indexed portion, including the header.
+    pub fn maximum_width(&self) -> usize {
+        self.maximum_width
     }
 
     pub fn indexed_rows(&self) -> u64 {
@@ -179,6 +188,7 @@ impl Session {
 pub struct IndexProgress {
     pub bytes_scanned: u64,
     pub rows_scanned: u64,
+    pub columns_found: usize,
     pub file_size: u64,
     pub elapsed: Duration,
     pub done: bool,
@@ -189,6 +199,7 @@ struct SharedState {
     index: RwLock<StructuralIndex>,
     bytes_scanned: AtomicU64,
     rows_scanned: AtomicU64,
+    columns_found: AtomicUsize,
     finished_nanos: AtomicU64,
     done: AtomicBool,
     cancelled: AtomicBool,
@@ -223,7 +234,7 @@ impl IndexJob {
         let encoding = session.encoding;
         let source_stamp = session.source_stamp.clone();
         let completed_record_count = Arc::clone(&session.completed_record_count);
-        let file = File::open(&path)?;
+        let file = open_regular_file(&path)?;
         if !source_matches_stamp(&file, &path, &source_stamp)? {
             return Err(QuarryError::SourceChanged);
         }
@@ -231,6 +242,7 @@ impl IndexJob {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
             rows_scanned: AtomicU64::new(0),
+            columns_found: AtomicUsize::new(0),
             finished_nanos: AtomicU64::new(0),
             done: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -278,6 +290,7 @@ impl IndexJob {
         IndexProgress {
             bytes_scanned: self.shared.bytes_scanned.load(Ordering::Acquire),
             rows_scanned: self.shared.rows_scanned.load(Ordering::Acquire),
+            columns_found: self.shared.columns_found.load(Ordering::Acquire),
             file_size: self.shared.file_size,
             elapsed: if finished_nanos == 0 {
                 self.shared.started.elapsed()
@@ -330,7 +343,7 @@ fn run_indexer(
     config: IndexConfig,
     shared: &SharedState,
 ) -> Result<(), QuarryError> {
-    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut scanner = EncodedScanner::<true>::new(delimiter, encoding)?;
     let mut chunk = vec![0; encoding.chunk_size(config.chunk_bytes)];
     let mut absolute_start = 0;
 
@@ -342,6 +355,10 @@ fn run_indexer(
         if read == 0 {
             let mut index = shared.index.write().unwrap();
             scanner.finish(absolute_start, |end| index.record_boundary(end))?;
+            index.maximum_width = scanner.maximum_width();
+            shared
+                .columns_found
+                .store(index.maximum_width, Ordering::Release);
             shared
                 .rows_scanned
                 .store(index.indexed_rows, Ordering::Release);
@@ -354,6 +371,10 @@ fn run_indexer(
                 index.record_boundary(end)
             })?;
             index.indexed_bytes = absolute_start + read as u64;
+            index.maximum_width = scanner.maximum_width();
+            shared
+                .columns_found
+                .store(index.maximum_width, Ordering::Release);
             shared
                 .rows_scanned
                 .store(index.indexed_rows, Ordering::Release);
@@ -373,7 +394,7 @@ fn run_indexer(
 mod tests {
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -406,6 +427,7 @@ mod tests {
             index: RwLock::new(StructuralIndex::new(IndexConfig::default()).unwrap()),
             bytes_scanned: AtomicU64::new(0),
             rows_scanned: AtomicU64::new(0),
+            columns_found: AtomicUsize::new(0),
             finished_nanos: AtomicU64::new(0),
             done: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -454,6 +476,8 @@ mod tests {
             thread::yield_now();
         };
         assert!(!progress.done, "test file indexed before drop");
+        assert_eq!(progress.columns_found, 2);
+        assert_eq!(job.snapshot().maximum_width(), 2);
         assert!(job.snapshot().indexed_rows() > 0);
         assert_eq!(session.completed_record_count(), None);
 

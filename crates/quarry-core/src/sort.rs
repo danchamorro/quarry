@@ -1033,6 +1033,7 @@ struct ScanSummary {
     runs: Vec<SpillFile>,
     rows: u64,
     max_key_bytes: usize,
+    maximum_width: usize,
     records: RecordMultisetFingerprint,
 }
 
@@ -1099,6 +1100,7 @@ struct InitialRunBuilder<'a> {
     runs: Vec<SpillFile>,
     rows: u64,
     max_key_bytes: usize,
+    maximum_width: usize,
     records: RecordMultisetFingerprint,
 }
 
@@ -1133,6 +1135,7 @@ impl<'a> InitialRunBuilder<'a> {
             runs: Vec::new(),
             rows: 0,
             max_key_bytes: 0,
+            maximum_width: 0,
             records: RecordMultisetFingerprint::default(),
         }
     }
@@ -1161,6 +1164,7 @@ impl<'a> InitialRunBuilder<'a> {
             self.ending_seen = true;
         }
         let fields = parse_record(body, self.delimiter)?;
+        self.maximum_width = self.maximum_width.max(fields.len());
 
         if self.has_header && physical_row == 0 {
             if self
@@ -1346,6 +1350,7 @@ impl<'a> InitialRunBuilder<'a> {
             runs: self.runs,
             rows: self.rows,
             max_key_bytes: self.max_key_bytes,
+            maximum_width: self.maximum_width,
             records: self.records,
         }))
     }
@@ -1676,7 +1681,7 @@ fn run_sort_inner(
         );
     }
     bytes_written = bytes_written.saturating_add(data_bytes);
-    index.finish_output(bytes_written);
+    index.finish_output(bytes_written, scan.maximum_width);
     shared.bytes_written.store(bytes_written, Ordering::Release);
     Ok(Some((scan.rows, bytes_written, verification, index)))
 }
@@ -2283,6 +2288,7 @@ mod tests {
             (b"key,id\r\nb,2\r\na,1".to_vec(), HeaderMode::FirstRow),
             (b"key,id\nb\rc,2\na,1\n".to_vec(), HeaderMode::FirstRow),
         ];
+        cases.push((b"key\nb\na,late,,tail".to_vec(), HeaderMode::FirstRow));
         let mut many_rows = b"key,value\n".to_vec();
         for row in (0..8_200).rev() {
             many_rows.extend_from_slice(format!("{row:04},\"line\n{row}\"\n").as_bytes());
