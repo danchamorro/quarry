@@ -1,0 +1,514 @@
+{
+  "schema": 1,
+  "issue": 69,
+  "branch": "feat/compressed-delimited-files",
+  "environment": {
+    "ram_bytes": 17179869184,
+    "logical_cpus": 8,
+    "cpu": "Apple M3 Max (Virtual)",
+    "model": "VirtualMac2,1",
+    "macos": "27.2.1",
+    "macos_build": "26B131",
+    "computer": "VMPal macOS VM 1",
+    "architecture": "aarch64-apple-darwin",
+    "rustc": "1.88.0 (6b00bc388 2025-06-23)"
+  },
+  "source_revision": "6bfbab75ea4e6b2aa3c2722cb5c2268e20ffe9f0",
+  "source_status": "clean",
+  "release_build_verified": true,
+  "probe_binary_sha256": "ae690a92514ebeab51a6cc939d39716218774703306815e6a86969492ffd1615",
+  "probe_source_sha256": "83610badff84e241e25847558949f0a714c961aa203b791de7da2546aa28f45c",
+  "harness_sha256": "4841b09322073a8f9f57f8a5b629a1c9f472d366ced5a4ee7fbcb93c3f783e97",
+  "cases": [
+    {
+      "case": "large",
+      "started_at_utc": "2026-11-20T23:33:41.824468+00:00",
+      "fixture": {
+        "schema": 1,
+        "fixture_id": "5422bbeb-8dd2-4c48-80a4-22f919a44a39",
+        "case": "large",
+        "smoke": false,
+        "layout": {
+          "rows": 147456,
+          "payload_bytes": 131072,
+          "target_every": 10000,
+          "embedded_row": 12345
+        },
+        "columns": 4,
+        "data_rows": 147456,
+        "members": 2,
+        "member_uncompressed_bytes": [
+          9663741973,
+          9663610880
+        ],
+        "member_compressed_bytes": [
+          252106225,
+          251930728
+        ],
+        "member_isize_mod_2_32": [
+          1073807381,
+          1073676288
+        ],
+        "member_split": "inside data row 73728",
+        "uncompressed_bytes": 19327352853,
+        "uncompressed_sha256": "03644ea905c2c7fcb42fcda445803533600a75875eed9456fa9654aad8303a79",
+        "compressed_bytes": 504036953,
+        "compressed_sha256": "f8279395d496c02676827a5c16ef62c7970cf4945afcdaaeb6c5b8237c6e8ca5",
+        "filter": {
+          "column": 2,
+          "operator": "contains",
+          "value": "TARGET-MATCH"
+        },
+        "filtered_rows": 15,
+        "filtered_bytes": 1966101,
+        "filtered_sha256": "a9730edaa0b4807f4385bf5461464153cca7173696b131b49766189b2b7b1b61",
+        "ram_bytes": 17179869184,
+        "generation_seconds": 11.850536167
+      },
+      "result": {
+        "command": [
+          "/Users/danielchamorro/Developer/quarry/target/release/examples/compressed_acceptance",
+          "/private/tmp/q69-bench/large/large.csv.gz",
+          "/private/tmp/q69-bench/large/temp-large",
+          "--filter-column",
+          "2",
+          "--filter-value",
+          "TARGET-MATCH",
+          "--export",
+          "/private/tmp/q69-bench/large/filtered.csv",
+          "--save-copy",
+          "/private/tmp/q69-bench/large/copy.csv"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 32.0836545,
+        "max_rss_macos_time_bytes": 50446336,
+        "peak_allocated_bytes_sampled": {
+          "fixture_root": 38799097856,
+          "temp": 19328401408
+        },
+        "du_sample_interval_seconds": 0.5,
+        "metrics": {
+          "bootstrap_ms": 10.078,
+          "bootstrap_first_rows": 100,
+          "bootstrap_compressed_bytes_read": 262144,
+          "bootstrap_decompressed_bytes": 13631488,
+          "compressed_bytes": 504036953,
+          "format": "gzip",
+          "has_header": "true",
+          "bootstrap_first_cell": "id",
+          "bootstrap_second_cell": "row-00000000",
+          "live_viewport_cell": "row-00000031",
+          "live_viewport_rows_indexed": 360,
+          "live_viewport_seconds": 0.002555833,
+          "peak_decompressed_bytes_observed": 19327352853,
+          "compressed_bytes_read": 504036953,
+          "decompress_index_seconds": 13.177122667,
+          "rows_scanned": 147457,
+          "columns_found": 4,
+          "decompressed_bytes": 19327352853,
+          "progress_rows_scanned": 147457,
+          "progress_columns_found": 4,
+          "viewport_first_row": 0,
+          "viewport_first_cell": "id",
+          "viewport_first_fields": 4,
+          "viewport_second_row": 1,
+          "viewport_second_cell": "row-00000000",
+          "viewport_second_fields": 4,
+          "viewport_middle_row": 73728,
+          "viewport_middle_cell": "row-00073727",
+          "viewport_middle_fields": 4,
+          "viewport_last_row": 147456,
+          "viewport_last_cell": "row-00147455",
+          "viewport_last_fields": 4,
+          "viewport_checks": 4,
+          "viewport_slowest_seconds": 0.001119709,
+          "export_seconds": 5.270109958,
+          "export_rows": 15,
+          "export_bytes": 1966101,
+          "save_copy_seconds": 13.22222025,
+          "save_copy_bytes": 19327352853,
+          "gz_destination_refused": "InvalidOption",
+          "source_unchanged": "true",
+          "result": "complete",
+          "residual_workspaces": 0,
+          "cleanup_errors": 0
+        },
+        "verified": [
+          "first rows from bootstrap",
+          "live viewport during decompression",
+          "row and column counts",
+          "first/second/middle/last viewport",
+          "filtered export bytes and SHA-256",
+          "uncompressed copy bytes and SHA-256",
+          ".gz destination refused",
+          "source SHA-256 unchanged",
+          "no private residue"
+        ],
+        "outputs_removed_after_verification": true
+      },
+      "all_checks_passed": true
+    },
+    {
+      "case": "cancel",
+      "started_at_utc": "2026-11-20T23:34:44.380701+00:00",
+      "fixture": {
+        "schema": 1,
+        "fixture_id": "5422bbeb-8dd2-4c48-80a4-22f919a44a39",
+        "case": "large",
+        "smoke": false,
+        "layout": {
+          "rows": 147456,
+          "payload_bytes": 131072,
+          "target_every": 10000,
+          "embedded_row": 12345
+        },
+        "columns": 4,
+        "data_rows": 147456,
+        "members": 2,
+        "member_uncompressed_bytes": [
+          9663741973,
+          9663610880
+        ],
+        "member_compressed_bytes": [
+          252106225,
+          251930728
+        ],
+        "member_isize_mod_2_32": [
+          1073807381,
+          1073676288
+        ],
+        "member_split": "inside data row 73728",
+        "uncompressed_bytes": 19327352853,
+        "uncompressed_sha256": "03644ea905c2c7fcb42fcda445803533600a75875eed9456fa9654aad8303a79",
+        "compressed_bytes": 504036953,
+        "compressed_sha256": "f8279395d496c02676827a5c16ef62c7970cf4945afcdaaeb6c5b8237c6e8ca5",
+        "filter": {
+          "column": 2,
+          "operator": "contains",
+          "value": "TARGET-MATCH"
+        },
+        "filtered_rows": 15,
+        "filtered_bytes": 1966101,
+        "filtered_sha256": "a9730edaa0b4807f4385bf5461464153cca7173696b131b49766189b2b7b1b61",
+        "ram_bytes": 17179869184,
+        "generation_seconds": 11.850536167
+      },
+      "result": {
+        "command": [
+          "/Users/danielchamorro/Developer/quarry/target/release/examples/compressed_acceptance",
+          "/private/tmp/q69-bench/large/large.csv.gz",
+          "/private/tmp/q69-bench/large/temp-cancel",
+          "--cancel-after-bytes",
+          "536870912"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 0.563704,
+        "max_rss_macos_time_bytes": 50315264,
+        "peak_allocated_bytes_sampled": {
+          "temp": 454033408
+        },
+        "du_sample_interval_seconds": 0.1,
+        "metrics": {
+          "bootstrap_ms": 9.73,
+          "bootstrap_first_rows": 100,
+          "bootstrap_compressed_bytes_read": 262144,
+          "bootstrap_decompressed_bytes": 13631488,
+          "compressed_bytes": 504036953,
+          "format": "gzip",
+          "has_header": "true",
+          "bootstrap_first_cell": "id",
+          "bootstrap_second_cell": "row-00000000",
+          "live_viewport_cell": "row-00000031",
+          "live_viewport_rows_indexed": 192,
+          "live_viewport_seconds": 0.000765834,
+          "cancel_requested_after_bytes": 549453824,
+          "cancel_latency_seconds": 0.026250334,
+          "peak_decompressed_bytes_observed": 550502400,
+          "compressed_bytes_read": 14417920,
+          "decompress_index_seconds": 0.329428166,
+          "result": "cancelled",
+          "residual_workspaces": 0,
+          "cleanup_errors": 0
+        },
+        "cancel_after_bytes": 536870912
+      },
+      "all_checks_passed": true
+    },
+    {
+      "case": "limit",
+      "started_at_utc": "2026-11-20T23:34:54.659935+00:00",
+      "fixture": {
+        "bomb": {
+          "path": "/private/tmp/q69-bench/limit/bomb.csv.gz",
+          "uncompressed_bytes": 335544329,
+          "compressed_bytes": 656480,
+          "compressed_sha256": "ae7ac9901754e45a26b4bceaf6101f09bda3cdeeaecd91f10024d546cb7e8339"
+        }
+      },
+      "result": {
+        "command": [
+          "/Users/danielchamorro/Developer/quarry/target/release/examples/compressed_acceptance",
+          "/private/tmp/q69-bench/limit/bomb.csv.gz",
+          "/private/tmp/q69-bench/limit/temp-limit",
+          "--max-decompressed-bytes",
+          "67108864"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 0.13657437499999991,
+        "max_rss_macos_time_bytes": 7749632,
+        "peak_allocated_bytes_sampled": {
+          "temp": 0
+        },
+        "du_sample_interval_seconds": 0.01,
+        "metrics": {
+          "bootstrap_ms": 1.063,
+          "bootstrap_first_rows": 100,
+          "bootstrap_compressed_bytes_read": 262144,
+          "bootstrap_decompressed_bytes": 1048576,
+          "compressed_bytes": 656480,
+          "format": "gzip",
+          "has_header": "true",
+          "bootstrap_first_cell": "id",
+          "bootstrap_second_cell": "1",
+          "live_viewport_cell": "1",
+          "live_viewport_rows_indexed": 56320,
+          "live_viewport_seconds": 0.004184458,
+          "peak_decompressed_bytes_observed": 67108864,
+          "compressed_bytes_read": 262144,
+          "decompress_index_seconds": 0.03347775,
+          "result": "error",
+          "error_stage": "decompress",
+          "error_kind": "DecompressionLimitExceeded",
+          "error_message": "/private/tmp/q69-bench/limit/bomb.csv.gz: decompressed data exceeds the 67108864-byte limit (68157440 bytes reached). No partial copy was kept; raise the limit or use a smaller file.",
+          "residual_workspaces": 0,
+          "cleanup_errors": 0
+        },
+        "limit_bytes": 67108864
+      },
+      "all_checks_passed": true
+    },
+    {
+      "case": "corrupt",
+      "started_at_utc": "2026-11-20T23:34:55.031285+00:00",
+      "fixture": {
+        "valid_control": {
+          "path": "/private/tmp/q69-bench/corrupt/valid_control.csv.gz",
+          "uncompressed_bytes": 7507,
+          "uncompressed_sha256": "34b801fa42ca30af084914b37d30704629c9940c06ea81917471c8e601a49159",
+          "compressed_bytes": 1010,
+          "compressed_sha256": "d62abc74e26e1ebb7ca165e18e177a4762b929a1010cc3f8bf0ed824f394dc3d"
+        },
+        "truncated": {
+          "path": "/private/tmp/q69-bench/corrupt/truncated.csv.gz",
+          "uncompressed_bytes": 7507,
+          "uncompressed_sha256": "34b801fa42ca30af084914b37d30704629c9940c06ea81917471c8e601a49159",
+          "compressed_bytes": 973,
+          "compressed_sha256": "7695b8a77d92884c37b0eb74ec0a3b23f40f894f0d7bef044f6b3f5aaf56c3a8"
+        },
+        "bad_crc32": {
+          "path": "/private/tmp/q69-bench/corrupt/bad_crc32.csv.gz",
+          "uncompressed_bytes": 7507,
+          "uncompressed_sha256": "34b801fa42ca30af084914b37d30704629c9940c06ea81917471c8e601a49159",
+          "compressed_bytes": 1010,
+          "compressed_sha256": "8eaf500faaaf6a2556f4418d7d4cf62b894668204dd0e7ad6e655425925a039b"
+        },
+        "trailing_garbage": {
+          "path": "/private/tmp/q69-bench/corrupt/trailing_garbage.csv.gz",
+          "uncompressed_bytes": 7507,
+          "uncompressed_sha256": "34b801fa42ca30af084914b37d30704629c9940c06ea81917471c8e601a49159",
+          "compressed_bytes": 1036,
+          "compressed_sha256": "4bfee86e76d87bc457702c4a3543f3e5005292c18b939735405144e8dc0f96c0"
+        }
+      },
+      "result": {
+        "valid_control": {
+          "command": [
+            "/Users/danielchamorro/Developer/quarry/target/release/examples/compressed_acceptance",
+            "/private/tmp/q69-bench/corrupt/valid_control.csv.gz",
+            "/private/tmp/q69-bench/corrupt/temp-valid_control"
+          ],
+          "exit_code": 0,
+          "elapsed_seconds": 0.10895779199999997,
+          "max_rss_macos_time_bytes": 2883584,
+          "peak_allocated_bytes_sampled": {
+            "temp": 8192
+          },
+          "du_sample_interval_seconds": 0.01,
+          "metrics": {
+            "bootstrap_ms": 0.279,
+            "bootstrap_first_rows": 100,
+            "bootstrap_compressed_bytes_read": 1010,
+            "bootstrap_decompressed_bytes": 7507,
+            "compressed_bytes": 1010,
+            "format": "gzip",
+            "has_header": "true",
+            "bootstrap_first_cell": "id",
+            "bootstrap_second_cell": "row-00000000",
+            "live_viewport_cell": "row-00000031",
+            "live_viewport_rows_indexed": 201,
+            "live_viewport_seconds": 0.001577917,
+            "peak_decompressed_bytes_observed": 7507,
+            "compressed_bytes_read": 1010,
+            "decompress_index_seconds": 0.017223917,
+            "rows_scanned": 201,
+            "columns_found": 3,
+            "decompressed_bytes": 7507,
+            "progress_rows_scanned": 201,
+            "progress_columns_found": 3,
+            "viewport_first_row": 0,
+            "viewport_first_cell": "id",
+            "viewport_first_fields": 3,
+            "viewport_second_row": 1,
+            "viewport_second_cell": "row-00000000",
+            "viewport_second_fields": 3,
+            "viewport_middle_row": 100,
+            "viewport_middle_cell": "row-00000099",
+            "viewport_middle_fields": 3,
+            "viewport_last_row": 200,
+            "viewport_last_cell": "row-00000199",
+            "viewport_last_fields": 3,
+            "viewport_checks": 4,
+            "viewport_slowest_seconds": 6.6792e-05,
+            "gz_destination_refused": "InvalidOption",
+            "source_unchanged": "true",
+            "result": "complete",
+            "residual_workspaces": 0,
+            "cleanup_errors": 0
+          }
+        },
+        "truncated": {
+          "command": [
+            "/Users/danielchamorro/Developer/quarry/target/release/examples/compressed_acceptance",
+            "/private/tmp/q69-bench/corrupt/truncated.csv.gz",
+            "/private/tmp/q69-bench/corrupt/temp-truncated"
+          ],
+          "exit_code": 0,
+          "elapsed_seconds": 0.05880966700000001,
+          "max_rss_macos_time_bytes": 2572288,
+          "peak_allocated_bytes_sampled": {
+            "temp": 0
+          },
+          "du_sample_interval_seconds": 0.01,
+          "metrics": {
+            "result": "error",
+            "error_stage": "bootstrap",
+            "error_kind": "CompressedFile",
+            "error_message": "/private/tmp/q69-bench/corrupt/truncated.csv.gz: The gzip stream is truncated: the compressed data ends early.",
+            "residual_workspaces": 0,
+            "cleanup_errors": 0
+          }
+        },
+        "bad_crc32": {
+          "command": [
+            "/Users/danielchamorro/Developer/quarry/target/release/examples/compressed_acceptance",
+            "/private/tmp/q69-bench/corrupt/bad_crc32.csv.gz",
+            "/private/tmp/q69-bench/corrupt/temp-bad_crc32"
+          ],
+          "exit_code": 0,
+          "elapsed_seconds": 0.025979207999999976,
+          "max_rss_macos_time_bytes": 2572288,
+          "peak_allocated_bytes_sampled": {
+            "temp": 0
+          },
+          "du_sample_interval_seconds": 0.01,
+          "metrics": {
+            "result": "error",
+            "error_stage": "bootstrap",
+            "error_kind": "CompressedFile",
+            "error_message": "/private/tmp/q69-bench/corrupt/bad_crc32.csv.gz: The gzip CRC-32 checksum does not match the decompressed data; the file is corrupt.",
+            "residual_workspaces": 0,
+            "cleanup_errors": 0
+          }
+        },
+        "trailing_garbage": {
+          "command": [
+            "/Users/danielchamorro/Developer/quarry/target/release/examples/compressed_acceptance",
+            "/private/tmp/q69-bench/corrupt/trailing_garbage.csv.gz",
+            "/private/tmp/q69-bench/corrupt/temp-trailing_garbage"
+          ],
+          "exit_code": 0,
+          "elapsed_seconds": 0.024979958000000024,
+          "max_rss_macos_time_bytes": 2572288,
+          "peak_allocated_bytes_sampled": {
+            "temp": 0
+          },
+          "du_sample_interval_seconds": 0.01,
+          "metrics": {
+            "result": "error",
+            "error_stage": "bootstrap",
+            "error_kind": "CompressedFile",
+            "error_message": "/private/tmp/q69-bench/corrupt/trailing_garbage.csv.gz: Unexpected data follows the end of the gzip stream; the file is corrupt or not entirely gzip data.",
+            "residual_workspaces": 0,
+            "cleanup_errors": 0
+          }
+        }
+      },
+      "all_checks_passed": true
+    }
+  ],
+  "gui": {
+    "bundle": "target/package/Quarry.app",
+    "build": 167,
+    "source_revision": "6bfbab75ea4e6b2aa3c2722cb5c2268e20ffe9f0",
+    "source_status": "clean",
+    "executable_sha256": "2f2b93a50070926942ff73d1ccad97b7a3d9628139cc57a029e76bfb4c29bcf2",
+    "fixtures": {
+      "sample.csv.gz": {
+        "members": 2,
+        "data_rows": 500,
+        "columns": 4,
+        "compressed_bytes": 3818,
+        "uncompressed_bytes": 21595,
+        "compressed_sha256": "12e5f7eccb181ce4c9757e28683f06078d8a041555f5146aced40e4544fbe8cb",
+        "uncompressed_sha256": "9cfae5ddaea97d1e5602443989382977180d7728801422b55f2dffa8efa8256d"
+      },
+      "corrupt.csv.gz": {
+        "damage": "last member CRC-32 trailer byte inverted",
+        "compressed_bytes": 3818,
+        "compressed_sha256": "1a4d0c120a43120e31a3ed3d05a92b231f7feb51f47b8d61e6a97bfcb0b3446c"
+      }
+    },
+    "checks": [
+      {
+        "check": "open sample.csv.gz",
+        "result": "pass",
+        "observed": "500 rows, 4 columns, index complete; footer \"Gzip (read-only) · 3.73 KiB → 21.09 KiB\"; rows 1-29 (member 1) and 472-500 (member 2) shown; embedded newline shown as first line[LF]second line"
+      },
+      {
+        "check": "read-only",
+        "result": "pass",
+        "observed": "File menu: Save disabled, Save As… enabled, Save As UTF-8… disabled, Undo disabled; double-click selected the cell without an editor and typing changed nothing; Replace All refused with \"Compressed files open read-only. Use Save As… to create an editable uncompressed copy.\""
+      },
+      {
+        "check": "find member-2 value",
+        "result": "pass",
+        "observed": "MEMBER2-UNIQUE-ZEBRA found: \"Found row 420, column 3.\""
+      },
+      {
+        "check": "filter",
+        "result": "pass",
+        "observed": "city contains rich: \"250 matching rows\", \"Filter complete. 250 matches.\"; cleared afterwards"
+      },
+      {
+        "check": "save uncompressed copy",
+        "result": "pass",
+        "observed": "panel titled \"Save uncompressed copy as\" suggested sample.csv; saved /tmp/quarry-69-gui/sample-out.csv (21595 bytes) identical to gunzip -c output; sample.csv.gz SHA-256 unchanged; the tab then showed the uncompressed copy and no .quarry-compressed-* directory remained"
+      },
+      {
+        "check": "open corrupt.csv.gz",
+        "result": "pass",
+        "observed": "notice \"<path>: <path>: The gzip CRC-32 checksum does not match the decompressed data; the file is corrupt.\"; no tab opened",
+        "note": "the path is printed twice"
+      },
+      {
+        "check": "quit and residue",
+        "result": "pass",
+        "observed": "Cmd-Q quit without a prompt; no Quarry process; zero .quarry-compressed-* entries under $TMPDIR and /tmp"
+      }
+    ],
+    "observations": [
+      "CJK text (東京) draws as empty boxes in both the gzip tab and a plain CSV tab; the accessibility value is correct, so this is font coverage, not decompression.",
+      "A first Save As attempt produced sample-out.csv.csv because the typed name replaced only the preselected stem; its bytes also matched. The second attempt saved sample-out.csv."
+    ]
+  }
+}

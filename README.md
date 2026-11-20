@@ -223,6 +223,7 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)
 - [Matching-file combination and 20 GB write cancellation in VMPal](docs/benchmarks/2026-10-10-combine-files.md)
 - [Complete file joining, 18 GiB inputs, skewed keys and native workflows](docs/benchmarks/2026-10-19-join-acceptance.md)
+- [Gzip-compressed files: 18 GiB larger than RAM, cancellation, size limit and corrupt input](docs/benchmarks/2026-11-20-compressed-files.md)
 - [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
 
 </details>
