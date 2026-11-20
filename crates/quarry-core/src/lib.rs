@@ -1,5 +1,6 @@
 mod case;
 mod cleanup;
+mod column_discovery;
 mod combine;
 mod date_time_sort;
 mod destination;
@@ -32,6 +33,7 @@ use source_stamp::SourceStamp;
 
 pub use case::CaseSensitivity;
 pub use cleanup::{CleanupOperation, ColumnCleanup};
+pub use column_discovery::ColumnDiscoveryJob;
 pub use combine::{
     CombineInput, CombineJob, CombineOptions, CombinePlan, CombineProgress, CombineSummary,
     check_combine_files, check_combine_files_with_encoding,

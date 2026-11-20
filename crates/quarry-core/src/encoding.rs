@@ -333,9 +333,11 @@ impl std::str::FromStr for Encoding {
 }
 
 /// Encoding-aware structural scanner; record ends remain physical source byte offsets.
+pub(crate) type RecordScanner = EncodedScanner<false>;
+
 #[derive(Debug, Clone)]
-pub(crate) struct RecordScanner {
-    inner: quarry_delimited::RecordScanner,
+pub(crate) struct EncodedScanner<const TRACK_WIDTH: bool> {
+    inner: quarry_delimited::StructuralScanner<TRACK_WIDTH>,
     encoding: Encoding,
     delimiter: u8,
     at_start: bool,
@@ -344,7 +346,7 @@ pub(crate) struct RecordScanner {
     shadow: Vec<u8>,
 }
 
-impl RecordScanner {
+impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
     pub(crate) fn new(delimiter: u8, encoding: Encoding) -> Result<Self, QuarryError> {
         Self::at_offset(delimiter, 0, encoding)
     }
@@ -377,9 +379,9 @@ impl RecordScanner {
         }
         let logical = offset / encoding.width() as u64;
         let inner = if encoding == Encoding::Utf8 {
-            quarry_delimited::RecordScanner::at_offset(delimiter, logical)?
+            quarry_delimited::StructuralScanner::at_offset(delimiter, logical)?
         } else {
-            quarry_delimited::RecordScanner::at_offset_without_bom(delimiter, logical)?
+            quarry_delimited::StructuralScanner::at_offset_without_bom(delimiter, logical)?
         };
         Ok(Self {
             inner,
@@ -421,8 +423,10 @@ impl RecordScanner {
             if self.at_start {
                 self.at_start = false;
                 if unit == 0xfeff {
-                    self.inner =
-                        quarry_delimited::RecordScanner::at_offset_without_bom(self.delimiter, 1)?;
+                    self.inner = quarry_delimited::StructuralScanner::at_offset_without_bom(
+                        self.delimiter,
+                        1,
+                    )?;
                     skip = 1;
                     continue;
                 }
@@ -473,6 +477,12 @@ impl RecordScanner {
                 error.offset *= width;
                 QuarryError::Parse(error)
             })
+    }
+}
+
+impl EncodedScanner<true> {
+    pub(crate) fn maximum_width(&self) -> usize {
+        self.inner.maximum_width()
     }
 }
 

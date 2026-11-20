@@ -1677,18 +1677,7 @@ impl Session {
     }
 
     pub fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
-        let source = File::open(&self.path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                QuarryError::SourceChanged
-            } else {
-                error.into()
-            }
-        })?;
-        if source_matches_stamp(&source, &self.path, &self.source_stamp)? {
-            Ok(())
-        } else {
-            Err(QuarryError::SourceChanged)
-        }
+        open_unchanged_source(&self.path, &self.source_stamp).map(drop)
     }
 
     pub fn start_filtered_export(
@@ -2990,6 +2979,25 @@ impl Drop for ExportTarget {
         drop(self.writer.take());
         let _ = self.remove_temporary();
     }
+}
+
+/// Reopen the named regular file without waiting on a replacement pipe.
+pub(crate) fn open_unchanged_source(path: &Path, stamp: &SourceStamp) -> Result<File, QuarryError> {
+    let file = crate::source_stamp::open_regular_file(path).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+        ) || fs::metadata(path).is_ok_and(|metadata| !metadata.is_file())
+        {
+            QuarryError::SourceChanged
+        } else {
+            error.into()
+        }
+    })?;
+    if !source_matches_stamp(&file, path, stamp)? {
+        return Err(QuarryError::SourceChanged);
+    }
+    Ok(file)
 }
 
 pub(crate) fn source_matches_stamp(
