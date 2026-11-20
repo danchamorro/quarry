@@ -869,12 +869,12 @@ quarry sort-save-as input.csv dates.csv --column 2 --order asc \
 Click **Columns…** to change the view without changing the CSV structure:
 
 - Use **Search columns** to find a known column by name or original number.
-- Choose **Find all columns** to scan the entire file, including filtered-out rows.
-  The count changes from **known** to **confirmed** when the scan finishes.
-  Newly discovered columns appear at the end. Hidden columns, display order,
-  and edits are preserved. **Cancel scan** keeps the existing view. The scan
-  reports the full width. To bound memory use on extremely wide files, the
-  scan automatically adds columns through column 65,536 to the view.
+- As soon as you open a file, indexing counts columns across all rows in the
+  background. The footer shows how many columns have been found so far. Wider
+  rows add columns to the grid automatically, even with a filter active. Your
+  position, edits, column order, and hidden columns are preserved. A completed
+  index confirms the full count. The grid automatically adds columns through
+  column 65,536 to bound memory use on extremely wide files.
 - Uncheck a column to hide it, or check it to show it.
 - Drag a column row using its handle or name to change its displayed position.
 - Click **Reset** to restore the default visibility and order.

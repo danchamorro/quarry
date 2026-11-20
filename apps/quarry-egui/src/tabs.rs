@@ -209,7 +209,6 @@ impl DocumentTab {
         self.inspection.busy()
             || self.document.as_ref().is_some_and(|document| {
                 document.job.is_some()
-                    || document.column_discovery.is_some()
                     || document.search_job.is_some()
                     || document.filter_job.is_some()
                     || document.filter_rows_loading()

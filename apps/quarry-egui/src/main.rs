@@ -1545,13 +1545,6 @@ impl QuarryApp {
             return;
         };
         let result = match command {
-            ColumnCommand::FindAll => document.find_all_columns(),
-            ColumnCommand::CancelDiscovery => {
-                if let Some(job) = &document.column_discovery {
-                    job.cancel();
-                }
-                Ok(())
-            }
             ColumnCommand::SetShown { column, shown } => document.set_column_shown(column, shown),
             ColumnCommand::Move { column, position } => document.move_column(column, position),
             ColumnCommand::Reset => {
@@ -1714,6 +1707,8 @@ impl QuarryApp {
             replacement.progress.bytes_scanned = index.indexed_bytes();
             replacement.progress.rows_scanned = index.indexed_rows();
             replacement.progress.done = true;
+            replacement.progress.columns_found = index.maximum_width();
+            replacement.apply_indexed_width(index.maximum_width());
             replacement.index = Some(index);
             replacement.load_buffer(replacement.viewport_start)?;
         } else {
@@ -1998,11 +1993,6 @@ impl QuarryApp {
             self.active.notice = Some(AppMessage::error(error));
         }
         if let Some(document) = &mut self.active.document {
-            match document.poll_column_discovery() {
-                Ok(Some(status)) => self.active.footer_status = Some(AppMessage::status(status)),
-                Ok(None) => {}
-                Err(error) => self.active.notice = Some(AppMessage::error(error)),
-            }
             let was_active = document.search_job.is_some();
             match document.poll_search() {
                 Ok(()) if was_active && document.search_job.is_none() => {
@@ -3431,13 +3421,18 @@ fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) 
 
                 if metadata_width >= 540.0 {
                     ui.label(format!(
-                        "{} column{}",
-                        group_digits(document.total_columns as u64),
-                        if document.total_columns == 1 { "" } else { "s" }
+                        "{} column{}{}",
+                        group_digits(document.known_width() as u64),
+                        if document.known_width() == 1 { "" } else { "s" },
+                        if document.width_confirmed() {
+                            ""
+                        } else {
+                            " found so far"
+                        }
                     ));
                 }
                 let shown = document.columns.shown_count();
-                if metadata_width >= 650.0 && shown != document.total_columns {
+                if metadata_width >= 650.0 && shown != document.known_width() {
                     ui.label(format!("{} shown", group_digits(shown as u64)));
                 }
                 if metadata_width >= 760.0 {
@@ -4191,8 +4186,6 @@ enum ColumnCommand {
     SetShown { column: usize, shown: bool },
     Move { column: usize, position: usize },
     Reset,
-    FindAll,
-    CancelDiscovery,
     AutoFit,
 }
 
@@ -4262,8 +4255,8 @@ fn show_column_manager(
                 ui.weak(format!(
                     "{} shown of {} {}",
                     document.columns.shown_count(),
-                    document.confirmed_width.unwrap_or(document.total_columns),
-                    if document.confirmed_width.is_some() {
+                    document.known_width(),
+                    if document.width_confirmed() {
                         "confirmed"
                     } else {
                         "known"
@@ -4276,10 +4269,7 @@ fn show_column_manager(
                 });
             });
             ui.separator();
-            if document
-                .confirmed_width
-                .is_some_and(|width| width > document.total_columns)
-            {
+            if document.known_width() > document.total_columns {
                 ui.weak(format!(
                     "First {} columns available in this view",
                     document.total_columns
@@ -4475,25 +4465,6 @@ fn show_column_manager(
             ui.weak("Drag to reorder · Uncheck to hide");
             ui.separator();
             ui.horizontal(|ui| {
-                if let Some(job) = &document.column_discovery {
-                    let fraction =
-                        progress_fraction(job.bytes_scanned(), document.session.file_size, false);
-                    ui.label(format!("Scanning {:.0}%", fraction * 100.0));
-                    if ui.button("Cancel scan").clicked() {
-                        command = Some(ColumnCommand::CancelDiscovery);
-                    }
-                } else if ui
-                    .add_enabled(
-                        !document.source_changed
-                            && !document.saving_in_place
-                            && document.confirmed_width.is_none(),
-                        egui::Button::new("Find all columns"),
-                    )
-                    .on_hover_text("Scan every record for additional columns")
-                    .clicked()
-                {
-                    command = Some(ColumnCommand::FindAll);
-                }
                 if ui
                     .button("Auto-fit columns")
                     .on_hover_text("Fit every shown column to its header and loaded cell values")
@@ -6442,8 +6413,6 @@ struct Document {
     column_focus_requested: Option<usize>,
     total_columns: usize,
     columns: ColumnView,
-    column_discovery: Option<quarry_core::ColumnDiscoveryJob>,
-    confirmed_width: Option<usize>,
     data_start: u64,
     viewport_start: u64,
     buffer_start: u64,
@@ -6546,6 +6515,7 @@ impl Document {
         let progress = IndexProgress {
             bytes_scanned: 0,
             rows_scanned: 0,
+            columns_found: 0,
             file_size: session.file_size,
             elapsed: Duration::ZERO,
             done: false,
@@ -6612,8 +6582,6 @@ impl Document {
             column_focus_requested: None,
             total_columns,
             columns,
-            column_discovery: None,
-            confirmed_width: None,
             data_start,
             viewport_start: data_start,
             buffer_start: data_start,
@@ -8071,8 +8039,28 @@ impl Document {
         self.last_poll = Instant::now();
         self.progress = progress;
         if self.progress.done {
+            // An in-place save can publish a new source before its completion is polled.
+            // Its reload owns the next index. A cancelled save leaves this job to collect.
+            if self.saving_in_place {
+                return Ok(());
+            }
             let job = self.job.take().expect("index job is present");
-            self.index = Some(job.wait().map_err(|error| self.diagnostic_error(error))?);
+            let result = job.wait().and_then(|index| {
+                self.session.ensure_source_unchanged()?;
+                Ok(index)
+            });
+            match result {
+                Ok(index) => self.index = Some(index),
+                Err(error) => {
+                    if matches!(error, QuarryError::SourceChanged) {
+                        self.invalidate_changed_source();
+                    }
+                    return Err(self.diagnostic_error(error));
+                }
+            }
+        }
+        self.apply_indexed_width(self.progress.columns_found);
+        if self.progress.done {
             self.load_buffer(self.viewport_start)?;
         }
         Ok(())
@@ -8764,10 +8752,6 @@ impl Document {
         } else {
             self.session.encoding()
         });
-        if saving_in_place {
-            // This save publishes a new source identity before the next UI poll.
-            self.column_discovery.take();
-        }
         self.save_job = Some(job);
         self.save_status = Some("Saving edited file…".into());
         self.save_cancel_requested = false;
@@ -8816,7 +8800,7 @@ impl Document {
     fn invalidate_changed_source(&mut self) {
         self.shutdown();
         self.source_changed = true;
-        self.confirmed_width = None;
+        self.progress.columns_found = 0;
         self.index = None;
         self.filter_index = None;
         self.filter_query = None;
@@ -9011,61 +8995,23 @@ impl Document {
         self.clear_hidden_selection();
     }
 
-    fn find_all_columns(&mut self) -> Result<(), String> {
-        if self.source_changed {
-            return Err(SOURCE_CHANGED_NOTICE.into());
-        }
-        if self.saving_in_place {
-            return Err("Finish the active save before finding all columns.".into());
-        }
-        if self.column_discovery.is_none() && self.confirmed_width.is_none() {
-            self.column_discovery = Some(
-                self.session
-                    .start_column_discovery()
-                    .map_err(|error| self.diagnostic_error(error))?,
-            );
-        }
-        Ok(())
+    fn known_width(&self) -> usize {
+        self.total_columns.max(self.progress.columns_found)
     }
 
-    fn poll_column_discovery(&mut self) -> Result<Option<String>, String> {
-        if !self
-            .column_discovery
-            .as_ref()
-            .is_some_and(|job| job.is_finished())
-        {
-            return Ok(None);
-        }
-        let result = self
-            .column_discovery
-            .take()
-            .unwrap()
-            .wait()
-            .and_then(|width| {
-                if width.is_some() {
-                    self.session.ensure_source_unchanged()?;
-                }
-                Ok(width)
-            });
-        match result {
-            Ok(Some(width)) => {
-                // The scan counts every field. Bound eager allocation of layout and header
-                // metadata for a remote row containing millions of empty fields.
-                let layout_width = width.min(quarry_core::MAX_TRANSFORMATION_COLUMNS);
-                if layout_width > self.total_columns {
-                    self.ensure_column_count(layout_width);
-                    self.refresh_column_headers();
-                }
-                self.confirmed_width = Some(width);
-                Ok(Some(format!("{width} columns confirmed")))
-            }
-            Ok(None) => Ok(Some("Column scan cancelled".into())),
-            Err(error) => {
-                if matches!(error, QuarryError::SourceChanged) {
-                    self.invalidate_changed_source();
-                }
-                Err(self.diagnostic_error(error))
-            }
+    fn width_confirmed(&self) -> bool {
+        self.index.is_some()
+            && self.progress.done
+            && !self.progress.cancelled
+            && !self.source_changed
+    }
+
+    fn apply_indexed_width(&mut self, width: usize) {
+        // Report the full count but bound eager layout allocations for extremely wide rows.
+        let layout_width = width.min(quarry_core::MAX_TRANSFORMATION_COLUMNS);
+        if layout_width > self.total_columns {
+            self.ensure_column_count(layout_width);
+            self.refresh_column_headers();
         }
     }
 
@@ -9493,7 +9439,6 @@ impl Document {
     }
 
     fn shutdown(&mut self) {
-        self.column_discovery.take();
         self.whitespace.invalidate();
         self.stop_filter_read();
         if let Some(job) = self.structural_job.take() {
@@ -14066,10 +14011,8 @@ mod tests {
     }
 
     fn finish_index(document: &mut Document) {
-        let job = document.job.take().expect("index job should be active");
-        document.index = Some(job.wait().unwrap());
-        document.progress.done = true;
-        document.progress.bytes_scanned = document.session.file_size;
+        await_index_worker(document);
+        document.poll().unwrap();
     }
 
     fn finish_structural_edit(app: &mut QuarryApp) {
@@ -17898,21 +17841,21 @@ mod tests {
         }
     }
 
-    fn await_column_discovery(doc: &Document) {
+    fn await_index_worker(doc: &Document) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !doc.column_discovery.as_ref().unwrap().is_finished() {
-            assert!(Instant::now() < deadline, "column scan timed out");
+        while !doc.job.as_ref().unwrap().progress().done {
+            assert!(Instant::now() < deadline, "index timed out");
             std::thread::yield_now();
         }
     }
 
     #[test]
-    fn column_discovery_preserves_the_working_view_on_cancel_and_completion() {
+    fn opening_discovers_late_columns_and_preserves_the_working_view() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ragged.csv");
         let source = format!("{}4,\"a,b\",\"c\nd\",,,6", "1,2,3\n".repeat(1000));
         fs::write(&path, &source).unwrap();
-        let mut doc = Document::prepare(
+        let mut doc = Document::open(
             &path,
             OpenOptions {
                 header_mode: HeaderMode::NoHeader,
@@ -17921,41 +17864,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doc.total_columns, 3);
-        assert!(doc.column_discovery.is_none());
+        assert!(!doc.width_confirmed());
         doc.move_column(2, 0).unwrap();
         doc.set_column_shown(1, false).unwrap();
         doc.begin_cell_edit(0, 2, b"3".to_vec()).unwrap();
         doc.cell_edit.as_mut().unwrap().draft = "unsaved value".into();
         let selection = doc.selection;
-        let original = doc.columns.clone();
-        assert_eq!(
-            click_column_manager_control(egui::accesskit::Role::Button, "Find all columns", &doc),
-            ColumnCommand::FindAll
-        );
-        doc.find_all_columns().unwrap();
-        assert_eq!(
-            click_column_manager_control(egui::accesskit::Role::Button, "Cancel scan", &doc),
-            ColumnCommand::CancelDiscovery
-        );
-        doc.column_discovery.as_ref().unwrap().cancel();
-        await_column_discovery(&doc);
-        assert_eq!(
-            doc.poll_column_discovery().unwrap().as_deref(),
-            Some("Column scan cancelled")
-        );
-        assert_eq!(doc.columns, original);
-        assert_eq!(doc.confirmed_width, None);
-        doc.find_all_columns().unwrap();
-        await_column_discovery(&doc);
-        assert_eq!(
-            doc.column_discovery.as_ref().unwrap().bytes_scanned(),
-            source.len() as u64
-        );
-        assert_eq!(
-            doc.poll_column_discovery().unwrap().as_deref(),
-            Some("6 columns confirmed")
-        );
-        assert_eq!(doc.confirmed_width, Some(6));
+        await_index_worker(&doc);
+        doc.poll().unwrap();
+        assert!(doc.width_confirmed());
+        assert_eq!(doc.known_width(), 6);
         assert_eq!(doc.columns.visible, [2, 0, 3, 4, 5]);
         assert_eq!(
             doc.headers,
@@ -17977,7 +17895,7 @@ mod tests {
             format!("{}{}", "1,2\n".repeat(1000), ",".repeat(limit + 2)),
         )
         .unwrap();
-        let mut doc = Document::prepare(
+        let mut doc = Document::open(
             &path,
             OpenOptions {
                 delimiter: Some(b','),
@@ -17986,10 +17904,10 @@ mod tests {
             },
         )
         .unwrap();
-        doc.find_all_columns().unwrap();
-        await_column_discovery(&doc);
-        doc.poll_column_discovery().unwrap();
-        assert_eq!(doc.confirmed_width, Some(limit + 3));
+        await_index_worker(&doc);
+        doc.poll().unwrap();
+        assert!(doc.width_confirmed());
+        assert_eq!(doc.known_width(), limit + 3);
         assert_eq!(doc.total_columns, limit);
     }
 
@@ -18000,7 +17918,7 @@ mod tests {
         let copy = dir.path().join("copy.csv");
         for in_place in [true, false] {
             fs::write(&source, "name,id\nAda,1\n").unwrap();
-            let mut doc = Document::prepare(
+            let mut doc = Document::open(
                 &source,
                 OpenOptions {
                     header_mode: HeaderMode::FirstRow,
@@ -18009,14 +17927,11 @@ mod tests {
             )
             .unwrap();
             doc.rename_header(0, "person".into()).unwrap();
+            await_index_worker(&doc);
             if in_place {
-                doc.find_all_columns().unwrap();
-                await_column_discovery(&doc);
                 doc.start_save().unwrap();
             } else {
                 doc.start_save_as(copy.clone()).unwrap();
-                doc.find_all_columns().unwrap();
-                await_column_discovery(&doc);
             }
             let deadline = Instant::now() + Duration::from_secs(5);
             while !doc.save_job.as_ref().unwrap().progress().done {
@@ -18025,12 +17940,12 @@ mod tests {
             }
             // Exercise the same completion order as the app when both workers finished
             // between frames, including the new source identity after in-place save.
-            let discovery = doc.poll_column_discovery().unwrap();
+            doc.poll().unwrap();
             if in_place {
-                assert!(discovery.is_none());
-                assert!(doc.find_all_columns().is_err());
+                assert!(!doc.width_confirmed());
             } else {
-                assert_eq!(discovery.as_deref(), Some("2 columns confirmed"));
+                assert!(doc.width_confirmed());
+                assert_eq!(doc.known_width(), 2);
                 assert_eq!(fs::read_to_string(&source).unwrap(), "name,id\nAda,1\n");
             }
             let destination = if in_place { &source } else { &copy };
@@ -18051,15 +17966,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.csv");
         fs::write(&path, "1,2\n").unwrap();
-        let mut doc = Document::prepare(&path, OpenOptions::default()).unwrap();
-        doc.find_all_columns().unwrap();
-        await_column_discovery(&doc);
+        let mut doc = Document::open(&path, OpenOptions::default()).unwrap();
+        await_index_worker(&doc);
         let replacement = dir.path().join("replacement");
         fs::write(&replacement, "3,4,5\n").unwrap();
         fs::rename(replacement, path).unwrap();
-        assert!(doc.poll_column_discovery().is_err());
+        assert!(doc.poll().is_err());
         assert!(doc.source_changed);
-        assert_eq!(doc.confirmed_width, None);
+        assert!(!doc.width_confirmed());
     }
 
     #[test]
@@ -21143,7 +21057,7 @@ mod tests {
         original.push_str("2,Beta,20,undiscovered,tail\n3\n");
         fs::write(&source, &original).unwrap();
         let mut app = QuarryApp::new(Some(source.clone()), Instant::now());
-        finish_index(app.active.document.as_mut().unwrap());
+        // Reorder before the UI has received the width of the last rows.
         let document = app.active.document.as_mut().unwrap();
         assert_eq!(document.total_columns, 3);
         document.move_column(2, 1).unwrap();

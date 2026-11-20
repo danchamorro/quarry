@@ -145,6 +145,12 @@ mod tests {
                 session.start_column_discovery().unwrap().wait().unwrap(),
                 Some(4)
             );
+            let index = session
+                .start_indexing(crate::IndexConfig::default())
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(index.maximum_width(), 4);
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
         for (csv, width) in [("", 0), ("\n", 1), ("\u{feff}", 0), ("a\n;\"x;y\";;", 4)] {
@@ -153,6 +159,12 @@ mod tests {
                 session.start_column_discovery().unwrap().wait().unwrap(),
                 Some(width)
             );
+            let index = session
+                .start_indexing(crate::IndexConfig::default())
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(index.maximum_width(), width);
         }
     }
 
