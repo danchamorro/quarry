@@ -1,8 +1,7 @@
 //! Read-only discovery of the widest logical record in a session.
 use crate::encoding::EncodedScanner;
-use crate::export::source_matches_stamp;
+use crate::export::{open_unchanged_source, source_matches_stamp};
 use crate::{DEFAULT_READ_CHUNK, QuarryError, Session};
-use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -29,10 +28,7 @@ impl Session {
         let worker = thread::Builder::new()
             .name("quarry-find-columns".into())
             .spawn(move || {
-                let mut file = File::open(&path)?;
-                if !source_matches_stamp(&file, &path, &stamp)? {
-                    return Err(QuarryError::SourceChanged);
-                }
+                let mut file = open_unchanged_source(&path, &stamp)?;
                 let mut scanner = EncodedScanner::<true>::new(delimiter, encoding)?;
                 let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
                 let mut offset = 0;
@@ -157,6 +153,27 @@ mod tests {
                 session.start_column_discovery().unwrap().wait().unwrap(),
                 Some(width)
             );
+        }
+    }
+
+    #[test]
+    fn discovery_and_adoption_report_a_vanished_or_nonregular_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.csv");
+        let session = open(&path, b"a;b");
+        fs::remove_file(&path).unwrap();
+        for missing in [true, false] {
+            if !missing {
+                fs::create_dir(&path).unwrap();
+            }
+            assert!(matches!(
+                session.start_column_discovery().unwrap().wait(),
+                Err(QuarryError::SourceChanged)
+            ));
+            assert!(matches!(
+                session.ensure_source_unchanged(),
+                Err(QuarryError::SourceChanged)
+            ));
         }
     }
 

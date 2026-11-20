@@ -4484,7 +4484,9 @@ fn show_column_manager(
                     }
                 } else if ui
                     .add_enabled(
-                        !document.source_changed && document.confirmed_width.is_none(),
+                        !document.source_changed
+                            && !document.saving_in_place
+                            && document.confirmed_width.is_none(),
                         egui::Button::new("Find all columns"),
                     )
                     .on_hover_text("Scan every record for additional columns")
@@ -8762,6 +8764,10 @@ impl Document {
         } else {
             self.session.encoding()
         });
+        if saving_in_place {
+            // This save publishes a new source identity before the next UI poll.
+            self.column_discovery.take();
+        }
         self.save_job = Some(job);
         self.save_status = Some("Saving edited file…".into());
         self.save_cancel_requested = false;
@@ -9008,6 +9014,9 @@ impl Document {
     fn find_all_columns(&mut self) -> Result<(), String> {
         if self.source_changed {
             return Err(SOURCE_CHANGED_NOTICE.into());
+        }
+        if self.saving_in_place {
+            return Err("Finish the active save before finding all columns.".into());
         }
         if self.column_discovery.is_none() && self.confirmed_width.is_none() {
             self.column_discovery = Some(
@@ -17982,6 +17991,59 @@ mod tests {
         doc.poll_column_discovery().unwrap();
         assert_eq!(doc.confirmed_width, Some(limit + 3));
         assert_eq!(doc.total_columns, limit);
+    }
+
+    #[test]
+    fn column_discovery_respects_the_save_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.csv");
+        let copy = dir.path().join("copy.csv");
+        for in_place in [true, false] {
+            fs::write(&source, "name,id\nAda,1\n").unwrap();
+            let mut doc = Document::prepare(
+                &source,
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            doc.rename_header(0, "person".into()).unwrap();
+            if in_place {
+                doc.find_all_columns().unwrap();
+                await_column_discovery(&doc);
+                doc.start_save().unwrap();
+            } else {
+                doc.start_save_as(copy.clone()).unwrap();
+                doc.find_all_columns().unwrap();
+                await_column_discovery(&doc);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !doc.save_job.as_ref().unwrap().progress().done {
+                assert!(Instant::now() < deadline, "save timed out");
+                std::thread::yield_now();
+            }
+            // Exercise the same completion order as the app when both workers finished
+            // between frames, including the new source identity after in-place save.
+            let discovery = doc.poll_column_discovery().unwrap();
+            if in_place {
+                assert!(discovery.is_none());
+                assert!(doc.find_all_columns().is_err());
+            } else {
+                assert_eq!(discovery.as_deref(), Some("2 columns confirmed"));
+                assert_eq!(fs::read_to_string(&source).unwrap(), "name,id\nAda,1\n");
+            }
+            let destination = if in_place { &source } else { &copy };
+            assert_eq!(
+                doc.poll_save().unwrap(),
+                Some((destination.clone(), in_place))
+            );
+            assert_eq!(
+                fs::read_to_string(destination).unwrap(),
+                "person,id\nAda,1\n"
+            );
+            assert!(!doc.source_changed);
+        }
     }
 
     #[test]
