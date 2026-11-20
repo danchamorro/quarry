@@ -44,6 +44,7 @@ use quarry_core::{
 
 mod about;
 mod combine_files;
+mod compressed;
 mod icons;
 mod join_files;
 mod menu;
@@ -871,8 +872,27 @@ impl QuarryApp {
         {
             return Err(AppMessage::warning(join_files::INPUT_RESERVED));
         }
-        let mut document =
+        if compressed::is_gzip(&path)
+            && !self.write_slot_available()
+            && !self
+                .active
+                .document
+                .as_ref()
+                .is_some_and(Document::decompressing)
+        {
+            return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
+        }
+        let document =
             Document::prepare_with_encoding(&path, options, encoding).map_err(AppMessage::error)?;
+        self.install_replacement_document(document, encoding)
+    }
+
+    /// Starts the prepared replacement's worker, then releases the active tab's old document.
+    fn install_replacement_document(
+        &mut self,
+        mut document: Document,
+        encoding: Option<Encoding>,
+    ) -> Result<(), AppMessage> {
         document.working_directory = self.working_directory.clone();
         document.working_cleanup = self.working_cleanup.clone();
         document.start_indexing().map_err(AppMessage::error)?;
@@ -997,16 +1017,19 @@ impl QuarryApp {
             } else if document.source_changed {
                 SOURCE_CHANGED_NOTICE
             } else {
-                "Make a change or reorder columns before using Save As."
+                document
+                    .compressed_unavailable_reason()
+                    .unwrap_or("Make a change or reorder columns before using Save As.")
             }));
             return false;
         }
         let source = document.logical_path.clone();
         let mut dialog = rfd::FileDialog::new()
-            .set_title(if utf8 {
-                "Save a UTF-8 copy"
-            } else {
-                "Save edited file as"
+            .set_title(match (utf8, document.is_compressed()) {
+                (true, true) => "Save uncompressed UTF-8 copy as",
+                (true, false) => "Save a UTF-8 copy",
+                (false, true) => "Save uncompressed copy as",
+                (false, false) => "Save edited file as",
             })
             .set_file_name(save_as_file_name(&source));
         if let Some(parent) = source.parent() {
@@ -1042,6 +1065,10 @@ impl QuarryApp {
         let Some(destination) = destination else {
             return false;
         };
+        if let Some(warning) = compressed::gzip_destination_warning(&destination) {
+            self.active.notice = Some(warning);
+            return false;
+        }
         if !self.destination_available(&destination) {
             self.active.notice = Some(AppMessage::warning(
                 "This file is open or being written in another tab. Choose another destination or close that tab first.",
@@ -1081,6 +1108,10 @@ impl QuarryApp {
         let Some(destination) = destination else {
             return;
         };
+        if let Some(warning) = compressed::gzip_destination_warning(&destination) {
+            self.active.notice = Some(warning);
+            return;
+        }
         if !self.destination_available(&destination) {
             self.active.notice = Some(AppMessage::warning(
                 "This file is open or being written in another tab. Choose another destination or close that tab first.",
@@ -1134,15 +1165,22 @@ impl QuarryApp {
             self.active.notice = Some(AppMessage::warning("Open a file first."));
             return;
         };
-        let result = self.reopen_current_path_with_encoding(
-            path,
-            OpenOptions {
-                delimiter: delimiter_mode.delimiter(),
-                header_mode,
-                ..OpenOptions::default()
-            },
-            encoding,
-        );
+        let options = OpenOptions {
+            delimiter: delimiter_mode.delimiter(),
+            header_mode,
+            ..OpenOptions::default()
+        };
+        // A decompressed document re-reads its verified private copy, not the source.
+        let reused = self
+            .active
+            .document
+            .as_ref()
+            .filter(|document| document.save_job.is_none() && document.export_job.is_none())
+            .and_then(|document| document.reopen_decompressed_copy(options, encoding));
+        let result = match reused {
+            Some(document) => self.install_replacement_document(document, encoding),
+            None => self.reopen_current_path_with_encoding(path, options, encoding),
+        };
         if result.is_ok() {
             self.active.delimiter_mode = delimiter_mode;
             self.active.header_mode = header_mode;
@@ -1503,10 +1541,14 @@ impl QuarryApp {
                 document.cancel_structural_edit();
                 Ok(())
             }
-            Action::Cancel => {
-                document.cancel();
-                Ok(())
-            }
+            Action::Cancel => match document.cancel_decompression() {
+                Some(Ok(notice)) => Err(AppMessage::warning(notice)),
+                Some(Err(error)) => Err(AppMessage::error(error)),
+                None => {
+                    document.cancel();
+                    Ok(())
+                }
+            },
         };
         if result.is_ok()
             && matches!(
@@ -3134,6 +3176,9 @@ fn progress_fraction(bytes_scanned: u64, total_bytes: u64, done: bool) -> f32 {
 }
 
 fn active_job_display(document: &Document) -> Option<ActiveJobDisplay> {
+    if let Some(display) = compressed::decompression_display(document) {
+        return Some(display);
+    }
     let active = first_active_job([
         document.structural_job.is_some(),
         document.save_job.is_some(),
@@ -3418,6 +3463,9 @@ fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) 
                     ui.colored_label(palette.accent_text, "● Unsaved changes");
                 }
                 ui.label(RichText::new(footer_range_text(document)).color(palette.text));
+                if let Some(label) = document.compressed_label() {
+                    ui.label(label);
+                }
 
                 if metadata_width >= 540.0 {
                     ui.label(format!(
@@ -3435,7 +3483,7 @@ fn status_bar(ui: &mut egui::Ui, document: &Document, app_status: Option<&str>) 
                 if metadata_width >= 650.0 && shown != document.known_width() {
                     ui.label(format!("{} shown", group_digits(shown as u64)));
                 }
-                if metadata_width >= 760.0 {
+                if metadata_width >= 760.0 && !document.is_compressed() {
                     ui.label(format_bytes(document.session.file_size));
                 }
                 let selected_rows = document.selected_rows.count();
@@ -5807,6 +5855,8 @@ fn search_controls(
 }
 
 fn filtered_export_file_name(source: &Path) -> String {
+    let source = compressed::uncompressed_name(source);
+    let source = source.as_path();
     let stem = source
         .file_stem()
         .or_else(|| source.file_name())
@@ -5819,6 +5869,13 @@ fn filtered_export_file_name(source: &Path) -> String {
 }
 
 fn save_as_file_name(source: &Path) -> String {
+    // A compressed source suggests its uncompressed name: sales.csv.gz -> sales.csv.
+    let uncompressed = compressed::uncompressed_name(source);
+    if uncompressed != source
+        && let Some(name) = uncompressed.file_name()
+    {
+        return name.to_string_lossy().into_owned();
+    }
     let stem = source
         .file_stem()
         .or_else(|| source.file_name())
@@ -6361,6 +6418,8 @@ struct Document {
     working_cleanup: quarry_core::WorkingCopyCleanup,
     pending_materialization: Option<(ColumnTransformation, BTreeSet<usize>, u64)>,
     session: Arc<Session>,
+    /// Present when the document reads a gzip-compressed file; it is then read-only.
+    compressed: Option<compressed::CompressedDocument>,
     logical_path: PathBuf,
     original_session: Option<Session>,
     working_copy: Option<WorkingCopyState>,
@@ -6485,16 +6544,21 @@ impl Document {
         options: OpenOptions,
         encoding: Option<Encoding>,
     ) -> Result<Self, String> {
+        let options = OpenOptions {
+            rows: BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS + 1,
+            ..options
+        };
+        if compressed::is_gzip(path) {
+            return Self::prepare_compressed(path, options, encoding);
+        }
+        let session = Session::open_with_encoding(path, options, encoding)
+            .map_err(|error| error.to_string())?;
+        Ok(Self::from_session(session, path))
+    }
+
+    /// Builds the view over an opened session; no worker starts here.
+    fn from_session(session: Session, path: &Path) -> Self {
         let buffer_rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS;
-        let session = Session::open_with_encoding(
-            path,
-            OpenOptions {
-                rows: buffer_rows + 1,
-                ..options
-            },
-            encoding,
-        )
-        .map_err(|error| error.to_string())?;
         let data_start = u64::from(session.dialect.has_header);
         let total_columns = session
             .first_rows
@@ -6522,8 +6586,9 @@ impl Document {
             cancelled: false,
         };
 
-        Ok(Self {
+        Self {
             session: Arc::new(session),
+            compressed: None,
             logical_path: path.to_path_buf(),
             pending_diagnostic: None,
             pending_diagnostic_message: None,
@@ -6596,7 +6661,7 @@ impl Document {
             scroll_points: 0.0,
             last_viewport_read: None,
             last_poll: Instant::now() - POLL_INTERVAL,
-        })
+        }
     }
 
     fn current_open_options(&self) -> OpenOptions {
@@ -6612,6 +6677,9 @@ impl Document {
     }
 
     fn structural_edit_disabled_reason(&self) -> Option<&'static str> {
+        if let Some(reason) = self.compressed_read_only_reason() {
+            return Some(reason);
+        }
         if self.join_reserved() {
             return Some(join_files::INPUT_RESERVED);
         }
@@ -8018,6 +8086,9 @@ impl Document {
     }
 
     fn start_indexing(&mut self) -> Result<(), String> {
+        if self.start_decompression()? {
+            return Ok(());
+        }
         let job = self
             .session
             .start_indexing(IndexConfig::default())
@@ -8029,6 +8100,9 @@ impl Document {
     }
 
     fn poll(&mut self) -> Result<(), String> {
+        if self.poll_decompression()? {
+            return Ok(());
+        }
         let Some(job) = &self.job else {
             return Ok(());
         };
@@ -8086,7 +8160,10 @@ impl Document {
             return Err("A search is already running.".into());
         }
         if !self.is_search_ready() {
-            return Err("Search is available after indexing completes.".into());
+            return Err(self
+                .compressed_unavailable_reason()
+                .unwrap_or("Search is available after indexing completes.")
+                .into());
         }
         self.commit_edits();
         if self.search_query != query || self.search_case_sensitivity != case_sensitivity {
@@ -8173,6 +8250,7 @@ impl Document {
         case_sensitivity: CaseSensitivity,
     ) -> bool {
         if query.is_empty()
+            || self.is_compressed()
             || self.search_job.is_some()
             || self.save_job.is_some()
             || self.structural_job.is_some()
@@ -8302,6 +8380,9 @@ impl Document {
         }
         if self.search_job.is_some() {
             return Err("Cancel the active search before filtering.".into());
+        }
+        if let Some(reason) = self.compressed_unavailable_reason() {
+            return Err(reason.into());
         }
         if !self.is_filter_ready() {
             return Err("Open a file with at least one column before filtering.".into());
@@ -8631,7 +8712,7 @@ impl Document {
     }
 
     fn is_save_ready(&self) -> bool {
-        self.is_dirty() && self.save_operations_ready()
+        !self.is_compressed() && self.is_dirty() && self.save_operations_ready()
     }
 
     fn has_reordered_columns(&self) -> bool {
@@ -8648,7 +8729,8 @@ impl Document {
     }
 
     fn is_save_as_ready(&self) -> bool {
-        (self.is_dirty() || self.has_reordered_columns()) && self.save_operations_ready()
+        (self.is_dirty() || self.has_reordered_columns() || self.compressed_save_as_ready())
+            && self.save_operations_ready()
     }
 
     fn save_operations_ready(&self) -> bool {
@@ -8657,6 +8739,7 @@ impl Document {
             && self.save_job.is_none()
             && self.export_job.is_none()
             && self.structural_job.is_none()
+            && self.compressed_unavailable_reason().is_none()
     }
 
     fn start_save(&mut self) -> Result<(), AppMessage> {
@@ -8695,8 +8778,26 @@ impl Document {
                 "Cancel the active export before saving.",
             ));
         }
+        if let Some(warning) = destination
+            .as_deref()
+            .and_then(compressed::gzip_destination_warning)
+        {
+            return Err(warning);
+        }
+        if self.is_compressed() {
+            if destination.is_none() {
+                return Err(AppMessage::warning(compressed::READ_ONLY));
+            }
+            if let Some(reason) = self.compressed_unavailable_reason() {
+                return Err(AppMessage::warning(reason));
+            }
+        }
         self.commit_edits();
-        if !(self.is_dirty() || destination.is_some() && (self.has_reordered_columns() || utf8)) {
+        // A compressed document has no edits; its Save As writes an uncompressed copy.
+        if !(self.is_dirty()
+            || destination.is_some()
+                && (self.has_reordered_columns() || utf8 || self.is_compressed()))
+        {
             return Err(AppMessage::warning("Make a change before saving."));
         }
         let renames = self
@@ -8877,6 +8978,7 @@ impl Document {
 
     fn is_filter_ready(&self) -> bool {
         !self.source_changed
+            && self.compressed_unavailable_reason().is_none()
             && self.total_columns > 0
             && self.structural_job.is_none()
             && self.save_job.is_none()
@@ -9066,7 +9168,8 @@ impl Document {
     }
 
     fn header_is_editable(&self, column: usize) -> bool {
-        !self.join_reserved()
+        !self.is_compressed()
+            && !self.join_reserved()
             && self.save_job.is_none()
             && self.export_job.is_none()
             && self.search_job.is_none()
@@ -9103,6 +9206,9 @@ impl Document {
     }
 
     fn rename_header(&mut self, column: usize, name: String) -> Result<(), String> {
+        if let Some(reason) = self.compressed_read_only_reason() {
+            return Err(reason.into());
+        }
         if self.join_reserved() {
             return Err(join_files::INPUT_RESERVED.into());
         }
@@ -9147,6 +9253,9 @@ impl Document {
     }
 
     fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
+        if let Some(reason) = self.compressed_read_only_reason() {
+            return Some(reason);
+        }
         if self.join_reserved() {
             return Some(join_files::INPUT_RESERVED);
         }
@@ -9225,6 +9334,9 @@ impl Document {
     }
 
     fn record_value_edit(&mut self, target: EditTarget, after: Option<Vec<u8>>) {
+        if self.is_compressed() {
+            return;
+        }
         if self.join_reserved() {
             return;
         }
@@ -9359,7 +9471,7 @@ impl Document {
     }
 
     fn has_structural_edits(&self) -> bool {
-        self.session.path() != self.logical_path
+        !self.is_compressed() && self.session.path() != self.logical_path
     }
 
     fn history_ready(&self) -> bool {
@@ -9427,6 +9539,8 @@ impl Document {
     fn index_status(&self) -> &'static str {
         if self.source_changed {
             "Source changed"
+        } else if let Some(status) = self.compressed_index_status() {
+            status
         } else if self.job.is_none() && self.index.is_none() {
             "Index failed"
         } else if self.progress.cancelled {
@@ -9439,6 +9553,7 @@ impl Document {
     }
 
     fn shutdown(&mut self) {
+        self.stop_decompression();
         self.whitespace.invalidate();
         self.stop_filter_read();
         if let Some(job) = self.structural_job.take() {
@@ -9672,6 +9787,8 @@ impl Document {
             self.session
                 .read_rows(index, start, count)
                 .map_err(|error| self.diagnostic_error(error))?
+        } else if let Some(rows) = self.read_decompressed_rows(start, count) {
+            rows.map_err(|error| self.diagnostic_error(error))?
         } else if let Some(job) = &self.job {
             self.session
                 .read_rows(&job.snapshot(), start, count)

@@ -8,6 +8,7 @@ delimited files in the Quarry macOS app.
 - [Getting started](#getting-started)
 - [How to](#how-to)
   - [Work with document tabs](#work-with-document-tabs)
+  - [Open compressed files](#open-compressed-files)
   - [Combine files](#combine-files)
   - [Join files](#join-files)
   - [Navigate the grid](#navigate-the-grid)
@@ -47,8 +48,9 @@ platform status, the acceptance workflow, current limits, and the feedback form.
 
 ### 2. Open a file
 
-Quarry supports comma, tab, pipe, and semicolon-delimited files. Open a file in
-any of these ways:
+Quarry supports comma, tab, pipe, and semicolon-delimited files. It also opens
+gzip-compressed (`.gz`) files read-only; see
+[Open compressed files](#open-compressed-files). Open a file in any of these ways:
 
 - Double-click it in Finder after associating its file type with Quarry.
 - Open Quarry's file menu, choose **Open…**, and select the file.
@@ -172,6 +174,51 @@ Indexing, searches, and filters can continue in background tabs. Temporary files
 and history remain available until their owning tab closes. Save As and export
 cannot write to a file open or being written in another tab; choose another
 destination or close that tab first.
+
+### Open compressed files
+
+Quarry opens gzip-compressed delimited files, such as `sales.csv.gz`, read-only.
+Open them like any other file: **Open…**, **Open with Encoding…**, Finder, or
+drag-and-drop.
+
+1. The first rows appear at once. Quarry then decompresses the file once into a
+   private temporary copy and indexes it in the same pass. The status bar shows
+   progress, and **Cancel** stops it.
+2. When decompression finishes, the footer shows **Gzip (read-only)** with the
+   compressed and expanded sizes. Scrolling, jumping, column views, copying,
+   Find, **Filters…**, **Export Filtered…**, and **Inspect File…** then work as
+   usual. Commands that need the whole file wait until decompression finishes.
+3. To edit the data, choose **Save As…**. Quarry suggests the name without `.gz`
+   (`sales.csv`) and writes an uncompressed copy, which then opens as an
+   ordinary, editable document. **Save As UTF-8…** also converts the encoding.
+
+A compressed document never changes. Save, cell and header editing, Replace,
+inserting or deleting rows and columns, column tools, sorting, duplicates, Undo,
+and Discard Changes are unavailable. Quarry writes only uncompressed files, so
+it refuses output names that end in `.gz`. Join Files and Combine Files need an
+uncompressed copy.
+
+The temporary copy needs free space equal to the expanded size. It goes in the
+folder chosen in **File → Temporary Storage…**, and Quarry removes it when you
+close the tab or quit. Decompression counts toward the two simultaneous file
+operations. If you cancel, or the file is damaged or the disk fills, Quarry
+removes the copy and keeps only the first rows as a preview; choose
+**File → Reload from Disk** to try again. Changing the delimiter, header, or
+encoding reuses the finished copy instead of decompressing again.
+
+Quarry checks every gzip member's checksum and length, and rejects truncated,
+damaged, or trailing data. It does not open Zstandard (`.zst`), bzip2, XZ, ZIP,
+or tar archives (`.tar.gz`, `.tgz`). Decompress those first, or recompress the
+file with gzip.
+
+In the CLI, `open`, `inspect`, `viewport`, `search`, `filter`, `export`, and
+`convert-utf8` read `.gz` files. `--temp-dir DIRECTORY` chooses the folder for
+the temporary copy, and `--max-decompressed-bytes` caps its size (for example
+`1GB`). `quarry open FILE.gz --no-wait` reads only the first rows and writes no
+temporary file. The CLI removes the copy when the command ends, fails, or is
+interrupted with Ctrl-C.
+
+    quarry convert-utf8 sales.csv.gz --output sales.csv --max-decompressed-bytes 20GB
 
 ### Combine files
 

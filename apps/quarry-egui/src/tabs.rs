@@ -209,6 +209,7 @@ impl DocumentTab {
         self.inspection.busy()
             || self.document.as_ref().is_some_and(|document| {
                 document.job.is_some()
+                    || document.decompressing()
                     || document.search_job.is_some()
                     || document.filter_job.is_some()
                     || document.filter_rows_loading()
@@ -216,6 +217,11 @@ impl DocumentTab {
                     || document.export_job.is_some()
                     || document.structural_job.is_some()
             })
+    }
+
+    /// Decompression shares the global job limit but never delays closing the tab.
+    fn decompressing(&self) -> bool {
+        self.document.as_ref().is_some_and(Document::decompressing)
     }
 
     /// Counts file operations and structural analysis against the global job limit.
@@ -554,10 +560,15 @@ impl QuarryApp {
                 "Quarry supports eight open tabs. Close a tab before opening another file.",
             ));
         }
+        if compressed::is_gzip(&path) && !self.write_slot_available() {
+            return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
+        }
         let mut document = match Document::prepare_with_encoding(&path, options, encoding) {
             Ok(d) => d,
             Err(message) => {
-                if !self.active.inspection.busy() {
+                // Raw inspection would read compressed bytes as text, so it is not offered.
+                let compressed_input = compressed::compressed_source(&path);
+                if !self.active.inspection.busy() && !compressed_input {
                     self.active.inspection = inspection_ui::InspectionUi::failed(
                         path.clone(),
                         options,
@@ -565,9 +576,11 @@ impl QuarryApp {
                         message.clone(),
                     );
                 }
-                return Err(AppMessage::file_open_error(
-                    path, options, encoding, message,
-                ));
+                return Err(if compressed_input {
+                    AppMessage::error(message)
+                } else {
+                    AppMessage::file_open_error(path, options, encoding, message)
+                });
             }
         };
         document.working_directory = self.working_directory.clone();
@@ -614,7 +627,10 @@ impl QuarryApp {
     /// Applies the shared two-operation limit to document tabs and Combine Files.
     pub(super) fn write_slot_available(&self) -> bool {
         !self.quitting_cleanup()
-            && self.document_tabs().filter(|tab| tab.writing()).count()
+            && self
+                .document_tabs()
+                .filter(|tab| tab.writing() || tab.decompressing())
+                .count()
                 + usize::from(
                     self.combine_files
                         .as_ref()
@@ -844,10 +860,13 @@ impl QuarryApp {
                     document.logical_path.clone(),
                     false,
                 ));
-                reservations.push(CleanupReservation::new(
-                    document.session.path().to_owned(),
-                    false,
-                ));
+                // A compressed preview has no readable file to reserve.
+                if !document.session.path().as_os_str().is_empty() {
+                    reservations.push(CleanupReservation::new(
+                        document.session.path().to_owned(),
+                        false,
+                    ));
+                }
                 if let Some(state) = &document.working_copy {
                     for storage in
                         std::iter::once(&state.directory).chain(state.previous_directories.iter())

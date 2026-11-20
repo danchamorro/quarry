@@ -86,6 +86,9 @@ impl Document {
     }
 
     fn join_capture_disabled_reason(&self) -> Option<&'static str> {
+        if let Some(reason) = self.compressed_join_reason() {
+            return Some(reason);
+        }
         if self.join_reserved() {
             return Some(INPUT_RESERVED);
         }

@@ -1,6 +1,6 @@
 # ADR 0012: Bounded access to compressed delimited files
 
-- Status: Accepted (core engine, Slice 1)
+- Status: Accepted (core engine, Slice 1; app and CLI, Slice 2)
 - Date: 2026-11-20
 - Issue: [#69](https://github.com/danchamorro/quarry/issues/69)
 
@@ -109,14 +109,40 @@ because those four characters are ordinary text.
 ### Slice 1 contract
 
 A compressed document is read-only. In-place Save and Save to Original reject
-it with `CompressedReadOnly`. Editing still works on private working copies,
-as for any document. Save Copy As and Export Filtered write uncompressed
+it with `CompressedReadOnly`. The core still accepts cell edits in Save Copy As,
+but the app and CLI expose none (see Slice 2). Save Copy As and Export Filtered write uncompressed
 delimited output. They reject a destination that names the compressed source
 (`ExportDestinationIsSource`) or ends in `.gz` (`InvalidOption`). The `.gz`
 rule applies to every document, because Quarry never writes gzip. Recovery
 output follows the same `.gz` rule. Inspection runs on the private copy.
 Combine Files and Join Files reject compressed inputs with a message that
 says to save an uncompressed copy first.
+
+### Slice 2: application and CLI
+
+The app routes every `.gz` open through `CompressedBootstrap`.
+`CompressedBootstrap::preview_session` gives the document a session over the
+bootstrap rows that names no readable file, so the rows show before any
+temporary file exists and nothing can read compressed bytes as text. The tab
+then starts the job in the configured temporary-storage folder, reads rows past
+the bootstrap from the job while it runs, and adopts the completed session and
+index. Decompression counts against the two-operation limit of ADR 0007;
+opening another compressed file while both slots are busy is refused before any
+temporary file exists. Cancel, failure, tab close, and quit drop the job, which
+deletes the copy; cancel and failure leave the bootstrap rows as a read-only
+preview. Format changes call `reopen_compressed_backing`; Reload from Disk
+decompresses the source again.
+
+Compressed documents allow no edits of any kind. Save As and Save As UTF-8 are
+available without edits, suggest the name without `.gz`, and open the
+uncompressed result as an ordinary document.
+
+The CLI's `open`, `inspect`, `viewport`, `search`, `filter`, `export`, and
+`convert-utf8` accept `.gz` inputs with `--temp-dir` and
+`--max-decompressed-bytes`; `open --no-wait` stops after the bootstrap. Ctrl-C
+cancels the job, which removes the copy. Commands that change data reject
+compressed inputs, and every command refuses `.gz` output names. The macOS
+bundle declares `org.gnu.gnu-zip-archive` with the Viewer role.
 
 ## Alternatives considered
 
@@ -135,14 +161,6 @@ says to save an uncompressed copy first.
 - Zstandard (`.zst`) and other formats.
 - Writing compressed output.
 - Combine Files and Join Files over compressed inputs.
-- Application wiring: routing `.gz` opens to the bootstrap and job, progress UI,
-  a suggested uncompressed name for Save Copy As
-  (`CompressionFormat::suggested_uncompressed_path`), and showing a working
-  copy's compressed origin when saving.
-- Regenerating the license manifest. The notices already list flate2,
-  miniz_oxide and crc32fast, but `packaging/licenses/manifest.json` hashes
-  `Cargo.lock` and `crates/quarry-core/Cargo.toml`, so it must be regenerated
-  with cargo-about 0.9.2 before packaging.
 
 ## Consequences and validation
 
@@ -156,5 +174,7 @@ opened uncompressed, live reads during decompression, cancellation and drop
 cleanup, the decompressed cap, the free-space reserve, a source changed during
 decompression, private permissions and cleanup after the private folder is
 renamed, the read-only contract, exact Save Copy As and Export Filtered output,
-and Combine and Join rejection. Application and installed-app checks belong to
-the later wiring slice.
+and Combine and Join rejection. App and CLI tests cover the progressive open,
+live reads, cancellation and failure previews, the read-only commands, Save As,
+format reuse, the job limit, and cleanup on close and on Ctrl-C. Installed-app
+checks run in the macOS VM.

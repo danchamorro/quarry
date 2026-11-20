@@ -749,6 +749,30 @@ impl CompressedBootstrap {
         self.decompressed_size
     }
 
+    /// A session over the bootstrap rows alone, for showing them before (or instead
+    /// of) the private copy. It names no readable file, so every operation that would
+    /// read data fails, and in-place saves are rejected as for any compressed document.
+    pub fn preview_session(&self) -> Session {
+        Session {
+            path: PathBuf::new(),
+            source_stamp: self.source_stamp.clone(),
+            encoding: self.encoding,
+            completed_record_count: Arc::new(Mutex::new(None)),
+            compressed: Some(Arc::new(CompressedBacking {
+                format: self.format,
+                source_path: self.path.clone(),
+                source_stamp: self.source_stamp.clone(),
+                workspace: None,
+                _file: None,
+                cleanup: WorkingCopyCleanup::default(),
+            })),
+            file_size: 0,
+            dialect: self.dialect,
+            first_rows: self.first_rows.clone(),
+            metrics: self.metrics,
+        }
+    }
+
     /// Start the single background pass that writes the private copy and its index.
     pub fn start_decompression(
         &self,
@@ -881,7 +905,8 @@ pub(crate) struct CompressedBacking {
     source_path: PathBuf,
     source_stamp: SourceStamp,
     workspace: Option<SpillWorkspace>,
-    _file: SpillFile,
+    /// None for a preview session, which has no private copy.
+    _file: Option<SpillFile>,
     cleanup: WorkingCopyCleanup,
 }
 
@@ -1202,7 +1227,7 @@ fn run_worker(worker: Worker, shared: &SharedState) -> Result<CompressedOpenOutc
         source_path,
         source_stamp,
         workspace: Some(workspace),
-        _file: file,
+        _file: Some(file),
         cleanup,
     });
     let session = Session {

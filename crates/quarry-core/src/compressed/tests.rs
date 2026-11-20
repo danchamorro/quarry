@@ -1315,3 +1315,52 @@ fn combine_and_join_explain_that_compressed_inputs_are_not_supported_yet() {
     );
     assert!(error.to_string().contains("Join Files"), "{error}");
 }
+
+#[test]
+fn a_preview_session_shows_bootstrap_rows_and_reads_nothing() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let data = b"name,value\nalpha,1\nbeta,2\n";
+    let path = write(source_dir.path(), "preview.csv.gz", &gzip(data));
+    let bootstrap = CompressedBootstrap::open(&path, OpenOptions::default(), None, None).unwrap();
+    let preview = bootstrap.preview_session();
+    assert!(preview.is_compressed());
+    assert_eq!(preview.compression(), Some(CompressionFormat::Gzip));
+    assert_eq!(preview.compressed_source_path(), Some(path.as_path()));
+    assert_eq!(
+        preview.compressed_file_size(),
+        Some(bootstrap.compressed_size())
+    );
+    assert_eq!(preview.path(), Path::new(""));
+    assert_eq!(preview.file_size, 0);
+    assert_eq!(preview.first_rows, bootstrap.first_rows);
+    assert_eq!(preview.dialect.delimiter, bootstrap.dialect.delimiter);
+    assert_eq!(preview.dialect.has_header, bootstrap.dialect.has_header);
+    assert_eq!(preview.encoding(), bootstrap.encoding());
+
+    // Nothing can read the compressed bytes as text or write over the source.
+    assert!(
+        preview
+            .start_indexing(IndexConfig::default())
+            .and_then(|job| job.wait())
+            .is_err()
+    );
+    assert!(matches!(
+        preview.start_save_with_edits(BTreeMap::new(), BTreeMap::new()),
+        Err(QuarryError::CompressedReadOnly)
+    ));
+    let destination = source_dir.path().join("copy.csv");
+    assert!(
+        preview
+            .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &destination)
+            .and_then(|job| job.wait())
+            .is_err()
+    );
+    assert!(!destination.exists());
+    assert!(
+        preview
+            .reopen_compressed_backing(OpenOptions::default(), None)
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), gzip(data));
+    assert_eq!(entries(source_dir.path()), vec![path]);
+}

@@ -97,6 +97,14 @@ verify_app() {
         printf 'error: CSV document support is missing from %s\n' "$app" >&2
         return 1
     }
+    [[ "$(plist_value CFBundleDocumentTypes.1.CFBundleTypeRole "$plist")" == Viewer ]] || {
+        printf 'error: gzip viewer role is missing from %s\n' "$app" >&2
+        return 1
+    }
+    [[ "$(plist_value CFBundleDocumentTypes.1.LSItemContentTypes.0 "$plist")" == org.gnu.gnu-zip-archive ]] || {
+        printf 'error: gzip document support is missing from %s\n' "$app" >&2
+        return 1
+    }
 }
 
 verify_app_licenses() {

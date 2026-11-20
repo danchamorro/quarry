@@ -67,6 +67,8 @@ impl Snapshot {
 pub(super) struct InspectionUi {
     pub open: bool,
     path: Option<PathBuf>,
+    /// The compressed file the user opened, when `path` names its private copy.
+    display_path: Option<PathBuf>,
     options: InspectionOptions,
     snapshot: Option<Snapshot>,
     job: Option<InspectionJob>,
@@ -90,6 +92,7 @@ impl Default for InspectionUi {
         Self {
             open: false,
             path: None,
+            display_path: None,
             options: Default::default(),
             snapshot: None,
             job: None,
@@ -110,6 +113,10 @@ impl Default for InspectionUi {
     }
 }
 impl InspectionUi {
+    #[cfg(test)]
+    pub(super) fn display_path(&self) -> Option<&Path> {
+        self.display_path.as_deref()
+    }
     /// Reports whether inspection or recovery still owns a worker.
     pub fn busy(&self) -> bool {
         self.job.is_some() || self.recovery.is_some()
@@ -274,6 +281,10 @@ impl QuarryApp {
             return;
         }
         if let Some(doc) = self.active.document.as_mut() {
+            if let Some(reason) = doc.compressed_unavailable_reason() {
+                self.active.notice = Some(AppMessage::warning(reason));
+                return;
+            }
             if doc.save_job.is_some()
                 || doc.export_job.is_some()
                 || doc.structural_job.is_some()
@@ -291,6 +302,7 @@ impl QuarryApp {
             self.active.inspection = InspectionUi {
                 open: true,
                 path: Some(doc.session.path().to_owned()),
+                display_path: doc.is_compressed().then(|| doc.logical_path.clone()),
                 options: InspectionOptions {
                     delimiter: Some(doc.session.dialect.delimiter),
                     header_mode: if doc.session.dialect.has_header {
@@ -458,12 +470,14 @@ impl QuarryApp {
                         Some("Wait for an active file operation to finish.".into());
                     return;
                 }
-                let name = self
-                    .active
-                    .inspection
-                    .path
+                let inspection = &self.active.inspection;
+                let name = inspection
+                    .display_path
                     .as_ref()
-                    .and_then(|p| p.file_stem())
+                    .or(inspection.path.as_ref())
+                    .map(|path| compressed::uncompressed_name(path))
+                    .as_deref()
+                    .and_then(Path::file_stem)
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string()
@@ -657,7 +671,7 @@ fn draw_inspection(
     navigable_source: bool,
 ) -> Option<Command> {
     let mut command = None;
-    if let Some(path) = &state.path {
+    if let Some(path) = state.display_path.as_ref().or(state.path.as_ref()) {
         ui.label(path.display().to_string());
     }
     if let Some(message) = &state.message {

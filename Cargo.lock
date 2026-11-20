@@ -2068,6 +2068,7 @@ dependencies = [
 name = "quarry-cli"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "libc",
  "quarry-core",
 ]
@@ -2098,6 +2099,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui_extras",
+ "flate2",
  "libc",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
