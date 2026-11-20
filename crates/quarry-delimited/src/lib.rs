@@ -65,8 +65,13 @@ enum ScanState {
 }
 
 /// Stateful scanner shared by viewport reads and structural indexing.
+pub type RecordScanner = StructuralScanner<false>;
+
+/// The width-tracking variant counts unquoted field separators without retaining field data.
 #[derive(Debug, Clone)]
-pub struct RecordScanner {
+pub struct StructuralScanner<const TRACK_WIDTH: bool> {
+    separators: usize,
+    maximum_width: usize,
     delimiter: u8,
     state: ScanState,
     record_start: u64,
@@ -75,7 +80,7 @@ pub struct RecordScanner {
     bom_checked: bool,
 }
 
-impl RecordScanner {
+impl<const TRACK_WIDTH: bool> StructuralScanner<TRACK_WIDTH> {
     pub fn new(delimiter: u8) -> Result<Self, ParseError> {
         Self::at_offset(delimiter, 0)
     }
@@ -83,6 +88,8 @@ impl RecordScanner {
     pub fn at_offset(delimiter: u8, record_start: u64) -> Result<Self, ParseError> {
         validate_delimiter(delimiter)?;
         Ok(Self {
+            separators: 0,
+            maximum_width: 0,
             delimiter,
             state: ScanState::FieldStart,
             record_start,
@@ -97,6 +104,19 @@ impl RecordScanner {
         let mut scanner = Self::at_offset(delimiter, record_start)?;
         scanner.bom_checked = true;
         Ok(scanner)
+    }
+
+    fn end_field(&mut self) {
+        if TRACK_WIDTH {
+            self.separators = self.separators.saturating_add(1);
+        }
+    }
+
+    fn end_record(&mut self) {
+        if TRACK_WIDTH {
+            self.maximum_width = self.maximum_width.max(self.separators.saturating_add(1));
+            self.separators = 0;
+        }
     }
 
     pub fn record_start(&self) -> u64 {
@@ -186,6 +206,7 @@ impl RecordScanner {
 
                     match bytes[found] {
                         byte if byte == self.delimiter => {
+                            self.end_field();
                             self.state = ScanState::FieldStart;
                             index = found + 1;
                         }
@@ -201,6 +222,7 @@ impl RecordScanner {
                         }
                         b'\n' => {
                             let end = absolute_start + found as u64 + 1;
+                            self.end_record();
                             on_record_end(end);
                             records += 1;
                             self.record_start = end;
@@ -223,6 +245,7 @@ impl RecordScanner {
                         index += 1;
                     }
                     byte if byte == self.delimiter => {
+                        self.end_field();
                         self.state = ScanState::FieldStart;
                         index += 1;
                     }
@@ -232,6 +255,7 @@ impl RecordScanner {
                     }
                     b'\n' => {
                         let end = absolute_start + index as u64 + 1;
+                        self.end_record();
                         on_record_end(end);
                         records += 1;
                         self.record_start = end;
@@ -253,6 +277,7 @@ impl RecordScanner {
                         ));
                     }
                     let end = absolute_start + index as u64 + 1;
+                    self.end_record();
                     on_record_end(end);
                     records += 1;
                     self.record_start = end;
@@ -295,12 +320,20 @@ impl RecordScanner {
         }
 
         if absolute_end > self.record_start {
+            self.end_record();
             on_record_end(absolute_end);
             self.record_start = absolute_end;
             self.state = ScanState::FieldStart;
             return Ok(true);
         }
         Ok(false)
+    }
+}
+
+impl StructuralScanner<true> {
+    /// Widest completed logical record, or zero when no record has ended.
+    pub fn maximum_width(&self) -> usize {
+        self.maximum_width
     }
 }
 

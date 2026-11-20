@@ -1545,6 +1545,13 @@ impl QuarryApp {
             return;
         };
         let result = match command {
+            ColumnCommand::FindAll => document.find_all_columns(),
+            ColumnCommand::CancelDiscovery => {
+                if let Some(job) = &document.column_discovery {
+                    job.cancel();
+                }
+                Ok(())
+            }
             ColumnCommand::SetShown { column, shown } => document.set_column_shown(column, shown),
             ColumnCommand::Move { column, position } => document.move_column(column, position),
             ColumnCommand::Reset => {
@@ -1991,6 +1998,11 @@ impl QuarryApp {
             self.active.notice = Some(AppMessage::error(error));
         }
         if let Some(document) = &mut self.active.document {
+            match document.poll_column_discovery() {
+                Ok(Some(status)) => self.active.footer_status = Some(AppMessage::status(status)),
+                Ok(None) => {}
+                Err(error) => self.active.notice = Some(AppMessage::error(error)),
+            }
             let was_active = document.search_job.is_some();
             match document.poll_search() {
                 Ok(()) if was_active && document.search_job.is_none() => {
@@ -4179,6 +4191,8 @@ enum ColumnCommand {
     SetShown { column: usize, shown: bool },
     Move { column: usize, position: usize },
     Reset,
+    FindAll,
+    CancelDiscovery,
     AutoFit,
 }
 
@@ -4246,9 +4260,14 @@ fn show_column_manager(
             });
             ui.horizontal(|ui| {
                 ui.weak(format!(
-                    "{} shown of {}",
+                    "{} shown of {} {}",
                     document.columns.shown_count(),
-                    document.total_columns
+                    document.confirmed_width.unwrap_or(document.total_columns),
+                    if document.confirmed_width.is_some() {
+                        "confirmed"
+                    } else {
+                        "known"
+                    }
                 ));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if column_action_button(ui, "Reset", true, "Reset columns".into()) {
@@ -4257,6 +4276,15 @@ fn show_column_manager(
                 });
             });
             ui.separator();
+            if document
+                .confirmed_width
+                .is_some_and(|width| width > document.total_columns)
+            {
+                ui.weak(format!(
+                    "First {} columns available in this view",
+                    document.total_columns
+                ));
+            }
             let query = search.trim().to_lowercase();
             let filtered_positions = document
                 .columns
@@ -4447,6 +4475,23 @@ fn show_column_manager(
             ui.weak("Drag to reorder · Uncheck to hide");
             ui.separator();
             ui.horizontal(|ui| {
+                if let Some(job) = &document.column_discovery {
+                    let fraction =
+                        progress_fraction(job.bytes_scanned(), document.session.file_size, false);
+                    ui.label(format!("Scanning {:.0}%", fraction * 100.0));
+                    if ui.button("Cancel scan").clicked() {
+                        command = Some(ColumnCommand::CancelDiscovery);
+                    }
+                } else if ui
+                    .add_enabled(
+                        !document.source_changed && document.confirmed_width.is_none(),
+                        egui::Button::new("Find all columns"),
+                    )
+                    .on_hover_text("Scan every record for additional columns")
+                    .clicked()
+                {
+                    command = Some(ColumnCommand::FindAll);
+                }
                 if ui
                     .button("Auto-fit columns")
                     .on_hover_text("Fit every shown column to its header and loaded cell values")
@@ -6395,6 +6440,8 @@ struct Document {
     column_focus_requested: Option<usize>,
     total_columns: usize,
     columns: ColumnView,
+    column_discovery: Option<quarry_core::ColumnDiscoveryJob>,
+    confirmed_width: Option<usize>,
     data_start: u64,
     viewport_start: u64,
     buffer_start: u64,
@@ -6563,6 +6610,8 @@ impl Document {
             column_focus_requested: None,
             total_columns,
             columns,
+            column_discovery: None,
+            confirmed_width: None,
             data_start,
             viewport_start: data_start,
             buffer_start: data_start,
@@ -8761,6 +8810,7 @@ impl Document {
     fn invalidate_changed_source(&mut self) {
         self.shutdown();
         self.source_changed = true;
+        self.confirmed_width = None;
         self.index = None;
         self.filter_index = None;
         self.filter_query = None;
@@ -8953,6 +9003,61 @@ impl Document {
             .copied()
             .map(|column| (self.current_source_row(), column));
         self.clear_hidden_selection();
+    }
+
+    fn find_all_columns(&mut self) -> Result<(), String> {
+        if self.source_changed {
+            return Err(SOURCE_CHANGED_NOTICE.into());
+        }
+        if self.column_discovery.is_none() && self.confirmed_width.is_none() {
+            self.column_discovery = Some(
+                self.session
+                    .start_column_discovery()
+                    .map_err(|error| self.diagnostic_error(error))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn poll_column_discovery(&mut self) -> Result<Option<String>, String> {
+        if !self
+            .column_discovery
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            return Ok(None);
+        }
+        let result = self
+            .column_discovery
+            .take()
+            .unwrap()
+            .wait()
+            .and_then(|width| {
+                if width.is_some() {
+                    self.session.ensure_source_unchanged()?;
+                }
+                Ok(width)
+            });
+        match result {
+            Ok(Some(width)) => {
+                // The scan counts every field. Bound eager allocation of layout and header
+                // metadata for a remote row containing millions of empty fields.
+                let layout_width = width.min(quarry_core::MAX_TRANSFORMATION_COLUMNS);
+                if layout_width > self.total_columns {
+                    self.ensure_column_count(layout_width);
+                    self.refresh_column_headers();
+                }
+                self.confirmed_width = Some(width);
+                Ok(Some(format!("{width} columns confirmed")))
+            }
+            Ok(None) => Ok(Some("Column scan cancelled".into())),
+            Err(error) => {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                }
+                Err(self.diagnostic_error(error))
+            }
+        }
     }
 
     fn ensure_column_count(&mut self, total_columns: usize) {
@@ -9379,6 +9484,7 @@ impl Document {
     }
 
     fn shutdown(&mut self) {
+        self.column_discovery.take();
         self.whitespace.invalidate();
         self.stop_filter_read();
         if let Some(job) = self.structural_job.take() {
@@ -17781,6 +17887,117 @@ mod tests {
                 "column start is off-screen: {bounds:?}"
             );
         }
+    }
+
+    fn await_column_discovery(doc: &Document) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !doc.column_discovery.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline, "column scan timed out");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn column_discovery_preserves_the_working_view_on_cancel_and_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ragged.csv");
+        let source = format!("{}4,\"a,b\",\"c\nd\",,,6", "1,2,3\n".repeat(1000));
+        fs::write(&path, &source).unwrap();
+        let mut doc = Document::prepare(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(doc.total_columns, 3);
+        assert!(doc.column_discovery.is_none());
+        doc.move_column(2, 0).unwrap();
+        doc.set_column_shown(1, false).unwrap();
+        doc.begin_cell_edit(0, 2, b"3".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "unsaved value".into();
+        let selection = doc.selection;
+        let original = doc.columns.clone();
+        assert_eq!(
+            click_column_manager_control(egui::accesskit::Role::Button, "Find all columns", &doc),
+            ColumnCommand::FindAll
+        );
+        doc.find_all_columns().unwrap();
+        assert_eq!(
+            click_column_manager_control(egui::accesskit::Role::Button, "Cancel scan", &doc),
+            ColumnCommand::CancelDiscovery
+        );
+        doc.column_discovery.as_ref().unwrap().cancel();
+        await_column_discovery(&doc);
+        assert_eq!(
+            doc.poll_column_discovery().unwrap().as_deref(),
+            Some("Column scan cancelled")
+        );
+        assert_eq!(doc.columns, original);
+        assert_eq!(doc.confirmed_width, None);
+        doc.find_all_columns().unwrap();
+        await_column_discovery(&doc);
+        assert_eq!(
+            doc.column_discovery.as_ref().unwrap().bytes_scanned(),
+            source.len() as u64
+        );
+        assert_eq!(
+            doc.poll_column_discovery().unwrap().as_deref(),
+            Some("6 columns confirmed")
+        );
+        assert_eq!(doc.confirmed_width, Some(6));
+        assert_eq!(doc.columns.visible, [2, 0, 3, 4, 5]);
+        assert_eq!(
+            doc.headers,
+            ["Column 3", "Column 1", "Column 4", "Column 5", "Column 6"]
+        );
+        assert_eq!(doc.selection, selection);
+        assert_eq!(doc.cell_edit.as_ref().unwrap().draft, "unsaved value");
+        assert_eq!(doc.viewport_start, 0);
+        assert_eq!(fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[test]
+    fn discovery_counts_columns_beyond_the_eager_layout_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.csv");
+        let limit = quarry_core::MAX_TRANSFORMATION_COLUMNS;
+        fs::write(
+            &path,
+            format!("{}{}", "1,2\n".repeat(1000), ",".repeat(limit + 2)),
+        )
+        .unwrap();
+        let mut doc = Document::prepare(
+            &path,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        doc.find_all_columns().unwrap();
+        await_column_discovery(&doc);
+        doc.poll_column_discovery().unwrap();
+        assert_eq!(doc.confirmed_width, Some(limit + 3));
+        assert_eq!(doc.total_columns, limit);
+    }
+
+    #[test]
+    fn a_replaced_source_cannot_confirm_a_completed_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.csv");
+        fs::write(&path, "1,2\n").unwrap();
+        let mut doc = Document::prepare(&path, OpenOptions::default()).unwrap();
+        doc.find_all_columns().unwrap();
+        await_column_discovery(&doc);
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, "3,4,5\n").unwrap();
+        fs::rename(replacement, path).unwrap();
+        assert!(doc.poll_column_discovery().is_err());
+        assert!(doc.source_changed);
+        assert_eq!(doc.confirmed_width, None);
     }
 
     #[test]

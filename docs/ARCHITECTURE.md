@@ -131,9 +131,10 @@ operations and do not consult the view metadata.
 
 Header columns are known immediately. If a later ragged row contains more
 fields, the viewer appends those newly known source columns without resetting
-the existing layout. Discovering the maximum width of an entire headerless
-ragged file would require a separate full scan and remains deferred.
-[Issue #76](https://github.com/danchamorro/quarry/issues/76) tracks the proposal.
+the existing layout. **Find all columns** runs an optional per-document scan
+of the current working source. The encoding-aware record scanner counts field
+separators outside quotes using fixed-size chunks. Only a successful full scan
+of the same source confirms the width and extends the existing layout.
 
 ## Clipboard copying
 The viewer retains a selected cell only while its row and column remain visible,
