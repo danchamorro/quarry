@@ -218,6 +218,11 @@ pub fn check_combine_files_with_encoding(
                     "This file was selected more than once.",
                 ));
             }
+            if let Some(problem) =
+                crate::compressed::compressed_input_problem(&canonical, "Combine Files")
+            {
+                return Err(input_error(&path, None, problem));
+            }
             let mut file =
                 File::open(&canonical).map_err(|error| input_error(&path, None, error))?;
             if !file.metadata()?.is_file() {
@@ -240,7 +245,7 @@ pub fn check_combine_files_with_encoding(
             } else {
                 detect_file_delimiter(
                     &mut file,
-                    stamp.file_size(),
+                    Some(stamp.file_size()),
                     DEFAULT_SAMPLE_BYTES,
                     DEFAULT_MAX_RECORD_BYTES,
                     encoding,

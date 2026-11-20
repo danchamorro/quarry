@@ -1639,6 +1639,15 @@ impl CleanupJob {
 }
 
 impl Session {
+    /// Uncompressed copies must not claim .gz or name the compressed source.
+    fn check_uncompressed_destination(&self, destination: &Path) -> Result<(), QuarryError> {
+        crate::compressed::reject_compressed_destination(destination)?;
+        if let Some(source) = self.compressed_source_path() {
+            validate_distinct_paths(source, destination)?;
+        }
+        Ok(())
+    }
+
     fn export_config(&self) -> ExportConfig {
         ExportConfig {
             source_encoding: self.encoding,
@@ -1655,6 +1664,7 @@ impl Session {
         transformation: Option<ColumnTransformation>,
         destination: impl AsRef<Path>,
     ) -> Result<SaveAsJob, QuarryError> {
+        self.check_uncompressed_destination(destination.as_ref())?;
         SaveAsJob::start_with_edits(
             self.path.clone(),
             self.file_size,
@@ -1696,6 +1706,7 @@ impl Session {
         headers: BTreeMap<usize, Vec<u8>>,
         destination: impl AsRef<Path>,
     ) -> Result<FilterExportJob, QuarryError> {
+        self.check_uncompressed_destination(destination.as_ref())?;
         self.ensure_source_unchanged()?;
         FilterExportJob::start_with_edits(
             self.path.clone(),
@@ -1775,6 +1786,7 @@ impl Session {
         transformation: Option<ColumnTransformation>,
         destination: impl AsRef<Path>,
     ) -> Result<SaveAsJob, QuarryError> {
+        self.check_uncompressed_destination(destination.as_ref())?;
         SaveAsJob::start_with_edits(
             self.path.clone(),
             self.file_size,
@@ -1940,6 +1952,9 @@ impl Session {
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
         original: &Session,
     ) -> Result<SaveAsJob, QuarryError> {
+        if self.is_compressed() || original.is_compressed() {
+            return Err(QuarryError::CompressedReadOnly);
+        }
         SaveAsJob::start_with_edits(
             self.path.clone(),
             self.file_size,
@@ -1999,6 +2014,9 @@ impl Session {
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
         transformation: Option<ColumnTransformation>,
     ) -> Result<SaveAsJob, QuarryError> {
+        if self.is_compressed() {
+            return Err(QuarryError::CompressedReadOnly);
+        }
         SaveAsJob::start_with_edits(
             self.path.clone(),
             self.file_size,

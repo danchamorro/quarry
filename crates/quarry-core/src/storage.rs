@@ -98,13 +98,13 @@ pub fn check_storage(
 }
 
 #[cfg(unix)]
-fn available_space(directory: &Path) -> io::Result<u64> {
+pub(crate) fn available_space(directory: &Path) -> io::Result<u64> {
     let space = rustix::fs::statvfs(directory)?;
     Ok(space.f_bavail.saturating_mul(space.f_frsize))
 }
 
 #[cfg(windows)]
-fn available_space(directory: &Path) -> io::Result<u64> {
+pub(crate) fn available_space(directory: &Path) -> io::Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let path: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -133,7 +133,7 @@ fn available_space(directory: &Path) -> io::Result<u64> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn available_space(_: &Path) -> io::Result<u64> {
+pub(crate) fn available_space(_: &Path) -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "available-space checks are unsupported on this platform",

@@ -92,9 +92,9 @@ impl Diagnostic {
                 d.byte_offset = Some(*offset);
             }
             QuarryError::Encoding(_) => d.kind = DiagnosticKind::Encoding,
-            QuarryError::RecordTooLarge { .. } | QuarryError::BootstrapLimitExceeded { .. } => {
-                d.kind = DiagnosticKind::Limit
-            }
+            QuarryError::RecordTooLarge { .. }
+            | QuarryError::BootstrapLimitExceeded { .. }
+            | QuarryError::DecompressionLimitExceeded { .. } => d.kind = DiagnosticKind::Limit,
             QuarryError::Parse(_) => d.kind = DiagnosticKind::Structure,
             _ => {}
         }
@@ -494,7 +494,7 @@ fn scan(
         // with comma selected; the report explicitly carries that format.
         report.delimiter = crate::detect_file_delimiter(
             file,
-            total,
+            Some(total),
             crate::DEFAULT_SAMPLE_BYTES,
             crate::DEFAULT_BOOTSTRAP_LIMIT,
             encoding,
@@ -1240,6 +1240,7 @@ impl RecoveryJob {
         selection: &BTreeSet<usize>,
         destination: impl AsRef<Path>,
     ) -> Result<Self, QuarryError> {
+        crate::compressed::reject_compressed_destination(destination.as_ref())?;
         let records = report.selected_records(selection)?;
         if !report.is_current() {
             return Err(QuarryError::SourceChanged);

@@ -128,6 +128,12 @@ fn header_info_using(
     if !fs::metadata(path)?.is_file() {
         return Err(input_error(path, None, "Select a regular file.").into());
     }
+    if working.is_some_and(|source| source.session.is_compressed()) {
+        return Err(input_error(path, None, COMPRESSED_JOIN_INPUT).into());
+    }
+    if let Some(problem) = crate::compressed::compressed_input_problem(path, "Join Files") {
+        return Err(input_error(path, None, problem).into());
+    }
     let mut file = open_regular_file(path)?;
     if !file.metadata()?.is_file() {
         return Err(input_error(path, None, "Select a regular file.").into());
@@ -147,7 +153,7 @@ fn header_info_using(
         } else {
             crate::detect_file_delimiter(
                 &mut reader,
-                stamp.file_size(),
+                Some(stamp.file_size()),
                 crate::DEFAULT_SAMPLE_BYTES,
                 crate::DEFAULT_BOOTSTRAP_LIMIT,
                 encoding,
@@ -156,7 +162,7 @@ fn header_info_using(
         reader.seek(SeekFrom::Start(0))?;
         let (bytes, ends) = crate::read_initial_records(
             &mut reader,
-            stamp.file_size(),
+            Some(stamp.file_size()),
             delimiter,
             1,
             crate::DEFAULT_BOOTSTRAP_LIMIT,
@@ -663,6 +669,8 @@ fn error(reason: impl ToString) -> QuarryError {
     }
 }
 /// Retain the input path and physical record in user-facing failures.
+const COMPRESSED_JOIN_INPUT: &str = "Compressed files are not supported in Join Files yet. Use Save Copy As to write an uncompressed copy first.";
+
 fn input_error(path: &Path, record: Option<u64>, reason: impl ToString) -> QuarryError {
     QuarryError::JoinFile {
         path: Some(path.to_path_buf()),
@@ -1457,6 +1465,15 @@ fn inspect(
     } else {
         path
     };
+    if working
+        .as_ref()
+        .is_some_and(|source| source.session.is_compressed())
+    {
+        return Err(input_error(&path, None, COMPRESSED_JOIN_INPUT).into());
+    }
+    if let Some(problem) = crate::compressed::compressed_input_problem(&path, "Join Files") {
+        return Err(input_error(&path, None, problem).into());
+    }
     let physical_path = working
         .as_ref()
         .map_or_else(|| path.clone(), |source| source.session.path.clone());
@@ -1491,7 +1508,7 @@ fn inspect(
         }
         None => crate::detect_file_delimiter(
             &mut file,
-            stamp.file_size(),
+            Some(stamp.file_size()),
             crate::DEFAULT_SAMPLE_BYTES,
             crate::DEFAULT_BOOTSTRAP_LIMIT,
             encoding,

@@ -92,7 +92,14 @@ impl Encoding {
             used += count;
         }
         file.seek(SeekFrom::Start(position))?;
-        let prefix = &prefix[..used];
+        Self::detect_prefix(&prefix[..used], requested)
+    }
+
+    /// Choose an encoding from the first (up to four) bytes of a source.
+    pub(crate) fn detect_prefix(
+        prefix: &[u8],
+        requested: Option<Self>,
+    ) -> Result<Self, QuarryError> {
         if requested.is_none()
             && (prefix.starts_with(b"\xff\xfe\0\0") || prefix.starts_with(b"\0\0\xfe\xff"))
         {
