@@ -12,6 +12,35 @@ use std::thread::{self, JoinHandle};
 pub(super) const INPUT_RESERVED: &str =
     "This document is being used by Join Files. Reset or close the join before changing it.";
 
+/// Maximum unfinished superseded header probes kept off-thread at once.
+const MAX_RETIRED_HEADER_JOBS: usize = 2;
+const RETIRED_HEADER_BUSY: &str =
+    "Wait for the previous column read to finish before choosing another file.";
+
+enum RetiredHeader {
+    Job(JoinJob<HeaderInfo>),
+    #[cfg(test)]
+    Pending(Arc<std::sync::atomic::AtomicBool>),
+}
+
+impl RetiredHeader {
+    fn is_done(&self) -> bool {
+        match self {
+            Self::Job(job) => job.progress().done,
+            #[cfg(test)]
+            Self::Pending(done) => done.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            Self::Job(job) => job.cancel(),
+            #[cfg(test)]
+            Self::Pending(_) => {}
+        }
+    }
+}
+
 struct DocumentLease {
     counter: Arc<std::sync::atomic::AtomicUsize>,
     generation: Option<Arc<quarry_core::WorkingCopyStorage>>,
@@ -196,6 +225,53 @@ struct OutputColumnDraft {
     name: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunIntent {
+    /// Stop after analysis to show counts, examples, and sample rows.
+    Preview,
+    /// Analyze, write immediately if no safety gate triggers, and open the result tab.
+    JoinAndOpen,
+}
+
+fn include_unmatched(mode: JoinMode, side: usize) -> bool {
+    matches!(
+        (mode, side),
+        (JoinMode::Left | JoinMode::Full, 0) | (JoinMode::Right | JoinMode::Full, 1)
+    )
+}
+
+fn mode_from_unmatched(include_main: bool, include_additional: bool) -> JoinMode {
+    match (include_main, include_additional) {
+        (true, false) => JoinMode::Left,
+        (false, false) => JoinMode::Inner,
+        (false, true) => JoinMode::Right,
+        (true, true) => JoinMode::Full,
+    }
+}
+
+fn mode_summary(mode: JoinMode) -> &'static str {
+    match mode {
+        JoinMode::Left => "Left join · keep all Main rows",
+        JoinMode::Inner => "Inner join · matching rows only",
+        JoinMode::Right => "Right join · keep all Additional rows",
+        JoinMode::Full => "Full join · keep all rows from both files",
+    }
+}
+
+fn column_display_name(header: &HeaderInfo, column: usize) -> String {
+    match header.columns.get(column) {
+        Some(name) if !name.is_empty() => name.clone(),
+        _ => format!("Column {}", column + 1),
+    }
+}
+
+fn column_choice_label(header: &HeaderInfo, column: usize) -> String {
+    match header.columns.get(column) {
+        Some(name) if !name.is_empty() => format!("{}: {name}", column + 1),
+        _ => format!("Column {}", column + 1),
+    }
+}
+
 /// Modeless join draft; source and destination reservations live with this state.
 pub(super) struct JoinDialog {
     paths: [Option<PathBuf>; 2],
@@ -212,7 +288,8 @@ pub(super) struct JoinDialog {
     acknowledge_layout: bool,
     mode: JoinMode,
     temporary: PathBuf,
-    header_job: Option<(usize, JoinJob<HeaderInfo>)>,
+    header_jobs: [Option<JoinJob<HeaderInfo>>; 2],
+    retired_headers: Vec<RetiredHeader>,
     checking: Option<JoinJob<JoinPlan>>,
     writing: Option<JoinJob<JoinSummary>>,
     cleanup: Option<JoinHandle<Result<(), String>>>,
@@ -220,18 +297,24 @@ pub(super) struct JoinDialog {
     result: Option<JoinSummary>,
     destination: Option<PathBuf>,
     output_delimiter: u8,
+    intent: RunIntent,
+    pending_auto_write: bool,
+    pending_auto_open: bool,
+    expand_advanced: Option<bool>,
     message: Option<String>,
     closing: bool,
     quit_after_close: bool,
     cancel_requested: bool,
 }
 
+#[derive(PartialEq, Eq)]
 enum DialogAction {
     None,
     Select(usize),
     SelectDocument(usize, u64),
     ReadFormat(usize),
-    Analyze,
+    Preview,
+    JoinNow,
     ChooseOutput,
     Create,
     OpenResult,
@@ -256,7 +339,8 @@ impl JoinDialog {
             acknowledge_layout: false,
             mode: JoinMode::Left,
             temporary,
-            header_job: None,
+            header_jobs: [None, None],
+            retired_headers: Vec::new(),
             checking: None,
             writing: None,
             cleanup: None,
@@ -264,6 +348,10 @@ impl JoinDialog {
             result: None,
             destination: None,
             output_delimiter: b',',
+            intent: RunIntent::Preview,
+            pending_auto_write: false,
+            pending_auto_open: false,
+            expand_advanced: None,
             message: None,
             closing: false,
             quit_after_close: false,
@@ -273,7 +361,35 @@ impl JoinDialog {
 
     /// Count header, analysis and creation work against the shared operation limit.
     pub(super) fn running_operation(&self) -> bool {
-        self.header_job.is_some() || self.checking.is_some() || self.writing.is_some()
+        self.has_header_job() || self.checking.is_some() || self.writing.is_some()
+    }
+
+    fn has_header_job(&self) -> bool {
+        self.header_jobs.iter().any(Option::is_some) || !self.retired_headers.is_empty()
+    }
+
+    fn can_retire_header_job(&self) -> bool {
+        self.retired_headers.len() < MAX_RETIRED_HEADER_JOBS
+    }
+
+    fn retire_header_job(&mut self, side: usize) -> bool {
+        self.retired_headers.retain(|job| !job.is_done());
+        let Some(previous) = self.header_jobs[side].as_ref() else {
+            return true;
+        };
+        if previous.progress().done {
+            self.header_jobs[side].take();
+            return true;
+        }
+        if !self.can_retire_header_job() {
+            previous.cancel();
+            self.message = Some(RETIRED_HEADER_BUSY.into());
+            return false;
+        }
+        let previous = self.header_jobs[side].take().unwrap();
+        previous.cancel();
+        self.retired_headers.push(RetiredHeader::Job(previous));
+        true
     }
 
     /// Keep the dialog alive until both workers and explicit cleanup have finished.
@@ -285,6 +401,39 @@ impl JoinDialog {
         !self.busy() && !self.closing && self.plan.is_none() && self.result.is_none()
     }
 
+    /// Replacing an input can supersede an in-flight header probe, but never analysis or writes.
+    fn can_change_input(&self) -> bool {
+        self.checking.is_none()
+            && self.writing.is_none()
+            && self.cleanup.is_none()
+            && !self.closing
+            && self.plan.is_none()
+            && self.result.is_none()
+    }
+
+    fn plan_needs_confirmation(&self) -> bool {
+        self.plan.as_ref().is_some_and(|plan| {
+            plan.analysis().many_to_many_groups > 0 || plan.analysis().new_columns != [0, 0]
+        })
+    }
+
+    fn confirmations_complete(&self) -> bool {
+        self.plan.as_ref().is_none_or(|plan| {
+            (plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion)
+                && (plan.analysis().new_columns == [0, 0] || self.acknowledge_layout)
+        })
+    }
+
+    fn suggested_delimiter(&self) -> u8 {
+        if self.plan.is_some() {
+            self.output_delimiter
+        } else {
+            self.headers[0]
+                .as_ref()
+                .map_or(self.output_delimiter, |header| header.delimiter)
+        }
+    }
+
     /// Protect selected paths only while a worker or valid preview uses them.
     pub(super) fn reserved_inputs(&self) -> impl Iterator<Item = &Path> {
         let retained = self.busy() || self.plan.is_some();
@@ -294,9 +443,9 @@ impl JoinDialog {
             .filter_map(|path| path.as_deref())
     }
 
-    /// Reserve the chosen destination until the retained plan is released.
+    /// Reserve the chosen destination until the active check, retained plan, or write finishes.
     pub(super) fn reserved_output(&self) -> Option<&Path> {
-        if self.plan.is_some() || self.writing.is_some() {
+        if self.checking.is_some() || self.plan.is_some() || self.writing.is_some() {
             self.destination.as_deref()
         } else {
             None
@@ -307,6 +456,9 @@ impl JoinDialog {
     fn reset(&mut self) {
         self.acknowledge_expansion = false;
         self.acknowledge_layout = false;
+        self.pending_auto_write = false;
+        self.pending_auto_open = false;
+        self.intent = RunIntent::Preview;
         if let Some(plan) = self.plan.take() {
             self.cleanup = Some(thread::spawn(move || {
                 plan.release().map_err(|e| e.to_string())
@@ -321,6 +473,8 @@ impl JoinDialog {
     pub(super) fn request_close(&mut self, quit: bool) {
         self.closing = true;
         self.quit_after_close |= quit;
+        self.pending_auto_write = false;
+        self.pending_auto_open = false;
         self.cancel();
         if self.plan.is_some() {
             self.reset();
@@ -330,7 +484,10 @@ impl JoinDialog {
 
     /// Request worker cancellation without dropping a running writer on the UI thread.
     fn cancel(&mut self) {
-        if let Some((_, job)) = &self.header_job {
+        for job in self.header_jobs.iter().flatten() {
+            job.cancel();
+        }
+        for job in &self.retired_headers {
             job.cancel();
         }
         if let Some(job) = &self.checking {
@@ -339,6 +496,9 @@ impl JoinDialog {
         if let Some(job) = &self.writing {
             job.cancel();
         }
+        self.intent = RunIntent::Preview;
+        self.pending_auto_write = false;
+        self.pending_auto_open = false;
         self.cancel_requested = true;
     }
 
@@ -346,34 +506,86 @@ impl JoinDialog {
     fn worker_failed(&mut self, message: String) {
         self.closing = false;
         self.quit_after_close = false;
+        self.pending_auto_write = false;
+        self.pending_auto_open = false;
         self.message = Some(message);
+    }
+
+    fn swap_inputs(&mut self) {
+        if !self.inputs_editable() {
+            return;
+        }
+        let main_len = self.headers[0].as_ref().map_or(0, |h| h.columns.len());
+        let additional_len = self.headers[1].as_ref().map_or(0, |h| h.columns.len());
+        let default_order = self.output_columns.len() == main_len + additional_len
+            && self.output_columns[..main_len]
+                .iter()
+                .enumerate()
+                .all(|(i, c)| c.source == JoinSource::Main && c.column == i)
+            && self.output_columns[main_len..]
+                .iter()
+                .enumerate()
+                .all(|(i, c)| c.source == JoinSource::Additional && c.column == i);
+
+        self.paths.swap(0, 1);
+        self.document_inputs.swap(0, 1);
+        self.headers.swap(0, 1);
+        self.formats.swap(0, 1);
+        self.require_unique.swap(0, 1);
+        for pair in &mut self.keys {
+            pair.swap(0, 1);
+        }
+        for column in &mut self.output_columns {
+            column.source = match column.source {
+                JoinSource::Main => JoinSource::Additional,
+                JoinSource::Additional => JoinSource::Main,
+            };
+        }
+        if default_order && main_len > 0 && additional_len > 0 {
+            self.output_columns.rotate_left(main_len);
+            self.output_selected = self.output_selected.map(|selected| {
+                if selected < main_len {
+                    selected + additional_len
+                } else {
+                    selected - main_len
+                }
+            });
+        }
+        self.message = None;
     }
 
     /// Adopt completed workers and retain published results even after cancellation.
     fn poll(&mut self) {
-        if self
-            .header_job
-            .as_ref()
-            .is_some_and(|(_, job)| job.progress().done)
-        {
-            let (side, job) = self.header_job.take().unwrap();
-            let result = job.wait();
-            if self.cancel_requested {
-                self.message = Some("Header reading cancelled.".into());
-            } else {
-                match result {
-                    Ok(Some(header)) => {
-                        self.headers[side] = Some(header);
-                        for pair in &mut self.keys {
-                            pair[side] = 0;
+        self.retired_headers.retain(|job| !job.is_done());
+        for side in 0..2 {
+            if self.header_jobs[side]
+                .as_ref()
+                .is_some_and(|job| job.progress().done)
+            {
+                let job = self.header_jobs[side].take().unwrap();
+                let result = job.wait();
+                if self.cancel_requested {
+                    self.message = Some("Header reading cancelled.".into());
+                } else {
+                    match result {
+                        Ok(Some(header)) => {
+                            self.headers[side] = Some(header);
+                            for pair in &mut self.keys {
+                                pair[side] = 0;
+                            }
+                            self.refresh_output_columns();
                         }
-                        self.refresh_output_columns();
+                        Ok(None) => self.message = Some("Header reading cancelled.".into()),
+                        Err(error) => {
+                            let text = error.to_string();
+                            if text.contains("UTF-8") || text.contains("encoding") {
+                                self.expand_advanced = Some(true);
+                            }
+                            self.worker_failed(text);
+                        }
                     }
-                    Ok(None) => self.message = Some("Header reading cancelled.".into()),
-                    Err(error) => self.worker_failed(error.to_string()),
                 }
             }
-            self.cancel_requested = false;
         }
         if self
             .checking
@@ -390,23 +602,50 @@ impl JoinDialog {
                 Ok(Some(plan)) => {
                     self.output_delimiter = plan.inputs()[0].delimiter;
                     if self.closing {
+                        self.destination = None;
+                        self.intent = RunIntent::Preview;
                         self.cleanup = Some(thread::spawn(move || {
                             plan.release().map_err(|e| e.to_string())
                         }));
                     } else {
+                        let needs_review = plan.analysis().many_to_many_groups > 0
+                            || plan.analysis().new_columns != [0, 0];
+                        let auto_write = !self.cancel_requested
+                            && self.intent == RunIntent::JoinAndOpen
+                            && self.destination.is_some()
+                            && !needs_review;
                         self.plan = Some(plan);
+                        self.pending_auto_write = auto_write;
                     }
                 }
                 Ok(None) => {
-                    self.message = Some("Analysis cancelled. No output was created.".into())
+                    let text = if self.intent == RunIntent::JoinAndOpen {
+                        "Join cancelled. No output was created."
+                    } else {
+                        "Analysis cancelled. No output was created."
+                    };
+                    self.destination = None;
+                    self.intent = RunIntent::Preview;
+                    self.message = Some(text.into());
                 }
-                Err(error) => self.worker_failed(error.to_string()),
+                Err(error) => {
+                    let text = error.to_string();
+                    if text.contains("UTF-8") || text.contains("encoding") {
+                        self.expand_advanced = Some(true);
+                    }
+                    self.destination = None;
+                    self.intent = RunIntent::Preview;
+                    self.worker_failed(text);
+                }
             }
-            self.cancel_requested = false;
         }
         if self.writing.as_ref().is_some_and(|job| job.progress().done) {
             match self.writing.take().unwrap().wait() {
                 Ok(Some(result)) => {
+                    let auto_open = !self.cancel_requested
+                        && self.intent == RunIntent::JoinAndOpen
+                        && result.cleanup_warning.is_none()
+                        && !self.closing;
                     if let Some(warning) = &result.cleanup_warning {
                         self.worker_failed(format!(
                             "The joined file is saved. Cleanup needs attention: {warning}"
@@ -415,10 +654,19 @@ impl JoinDialog {
                         self.message = None;
                     }
                     self.result = Some(result);
+                    self.pending_auto_open = auto_open;
                 }
-                Ok(None) => self.message = Some("Join cancelled. No output was created.".into()),
-                Err(error) => self.worker_failed(error.to_string()),
+                Ok(None) => {
+                    self.intent = RunIntent::Preview;
+                    self.message = Some("Join cancelled. No output was created.".into());
+                }
+                Err(error) => {
+                    self.intent = RunIntent::Preview;
+                    self.worker_failed(error.to_string());
+                }
             }
+        }
+        if !self.running_operation() {
             self.cancel_requested = false;
         }
         if self.cleanup.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -440,7 +688,14 @@ impl JoinDialog {
 
     /// Read picker metadata off-thread with a separate bounded label budget.
     fn read_header(&mut self, side: usize, path: PathBuf) {
-        self.document_inputs[side] = None;
+        if !self.retire_header_job(side) {
+            return;
+        }
+        let switching_source = self.document_inputs[side].take().is_some()
+            || self.paths[side].as_deref() != Some(path.as_path());
+        if switching_source {
+            self.formats[side] = JoinFormat::default();
+        }
         self.paths[side] = Some(path.clone());
         self.headers[side] = None;
         self.refresh_output_columns();
@@ -449,12 +704,15 @@ impl JoinDialog {
         self.destination = None;
         self.cancel_requested = false;
         match read_join_header_with_format(path, self.formats[side]) {
-            Ok(job) => self.header_job = Some((side, job)),
+            Ok(job) => self.header_jobs[side] = Some(job),
             Err(error) => self.message = Some(error.to_string()),
         }
     }
 
     fn read_document_header(&mut self, side: usize, captured: CapturedDocument) {
+        if !self.retire_header_job(side) {
+            return;
+        }
         let CapturedDocument {
             path,
             source,
@@ -471,7 +729,7 @@ impl JoinDialog {
         self.destination = None;
         self.cancel_requested = false;
         match read_join_working_header(source, columns) {
-            Ok(job) => self.header_job = Some((side, job)),
+            Ok(job) => self.header_jobs[side] = Some(job),
             Err(error) => self.message = Some(error.to_string()),
         }
     }
@@ -480,6 +738,8 @@ impl JoinDialog {
     fn start_analysis(&mut self, working: [Option<JoinWorkingSource>; 2]) {
         self.acknowledge_expansion = false;
         self.acknowledge_layout = false;
+        self.pending_auto_write = false;
+        self.pending_auto_open = false;
         let inputs = std::array::from_fn(|side| JoinInput {
             path: self.paths[side].as_ref().unwrap().clone(),
             delimiter: Some(self.headers[side].as_ref().unwrap().delimiter),
@@ -529,7 +789,11 @@ impl JoinDialog {
             output,
         ) {
             Ok(job) => self.checking = Some(job),
-            Err(error) => self.message = Some(error.to_string()),
+            Err(error) => {
+                self.destination = None;
+                self.intent = RunIntent::Preview;
+                self.message = Some(error.to_string());
+            }
         }
     }
 
@@ -608,6 +872,348 @@ impl JoinDialog {
         }
     }
 
+    fn show_key_selector(
+        ui: &mut egui::Ui,
+        header: Option<&HeaderInfo>,
+        selected_column: &mut usize,
+        side: usize,
+        pair_index: usize,
+        width: f32,
+    ) {
+        let role = if side == 0 { "Main" } else { "Additional" };
+        if let Some(header) = header {
+            let choice = column_choice_label(header, *selected_column);
+            let accessible = format!("Pair {} · {role} key: {choice}", pair_index + 1);
+            let combo = egui::ComboBox::from_id_salt(("join-key", pair_index, side))
+                .selected_text(&choice)
+                .width(width)
+                .show_ui(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(220.0).show_rows(
+                        ui,
+                        22.0,
+                        header.columns.len(),
+                        |ui, range| {
+                            for i in range {
+                                ui.selectable_value(
+                                    selected_column,
+                                    i,
+                                    format!("{role} {}", column_choice_label(header, i)),
+                                );
+                            }
+                        },
+                    );
+                });
+            combo.response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::ComboBox,
+                    ui.is_enabled(),
+                    accessible.clone(),
+                )
+            });
+        } else {
+            ui.add_enabled_ui(false, |ui| {
+                egui::ComboBox::from_id_salt(("join-key-empty", pair_index, side))
+                    .selected_text("Choose a file first")
+                    .width(width)
+                    .show_ui(ui, |_| {});
+            });
+        }
+    }
+
+    fn show_source_panels(
+        &mut self,
+        ui: &mut egui::Ui,
+        editable: bool,
+        source_editable: bool,
+        can_pick_source: bool,
+        documents: &[OpenDocumentChoice],
+    ) -> DialogAction {
+        let mut action = DialogAction::None;
+        let mut include = [
+            include_unmatched(self.mode, 0),
+            include_unmatched(self.mode, 1),
+        ];
+        ui.columns(2, |columns| {
+            for (side, column) in columns.iter_mut().enumerate() {
+                let role = if side == 0 { "Main" } else { "Additional" };
+                theme::inset_card(column, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    let palette = theme::ui_palette(ui);
+                    ui.horizontal(|ui| {
+                        theme::section_label(
+                            ui,
+                            if side == 0 {
+                                "Main file"
+                            } else {
+                                "Additional file"
+                            },
+                        );
+                        if let Some(header) = &self.headers[side] {
+                            let summary = if self.document_inputs[side].is_some() {
+                                format!("· Open · {} cols", header.columns.len())
+                            } else {
+                                format!(
+                                    "· {} cols · {}",
+                                    header.columns.len(),
+                                    header.encoding.label()
+                                )
+                            };
+                            ui.label(
+                                RichText::new(summary)
+                                    .size(11.0)
+                                    .color(palette.text_secondary),
+                            );
+                        } else if self.header_jobs[side].is_some() {
+                            ui.spinner();
+                        }
+                    });
+
+                    let selected_label = self.paths[side]
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("Choose {role} file…"));
+                    let full_path_hover = self.paths[side].as_ref().map(|path| {
+                        if self.document_inputs[side].is_some() {
+                            format!("{} (open tab · current values)", path.display())
+                        } else {
+                            format!("{} (saved file)", path.display())
+                        }
+                    });
+                    let picker_enabled = source_editable && can_pick_source;
+                    ui.add_enabled_ui(picker_enabled, |ui| {
+                        let combo_width = (ui.available_width() - 2.0).max(100.0);
+                        let combo = egui::ComboBox::from_id_salt(("join-source", side))
+                            .selected_text(&selected_label)
+                            .width(combo_width)
+                            .show_ui(ui, |ui| {
+                                ui.set_max_width(320.0);
+                                if !documents.is_empty() {
+                                    theme::section_label(ui, "Open tabs");
+                                    for choice in documents {
+                                        let is_selected = self.document_inputs[side]
+                                            .as_ref()
+                                            .is_some_and(|probe| probe.tab_id == choice.tab_id);
+                                        let item = ui
+                                            .selectable_label(is_selected, &choice.label)
+                                            .on_hover_text(choice.path.display().to_string());
+                                        let access_label =
+                                            format!("Use {role} document: {}", choice.label);
+                                        item.widget_info(|| {
+                                            egui::WidgetInfo::selected(
+                                                egui::WidgetType::SelectableLabel,
+                                                true,
+                                                is_selected,
+                                                access_label.clone(),
+                                            )
+                                        });
+                                        if item.clicked() {
+                                            action =
+                                                DialogAction::SelectDocument(side, choice.tab_id);
+                                        }
+                                    }
+                                    ui.separator();
+                                }
+                                let browse = ui.selectable_label(false, "Browse file…");
+                                let browse_label = format!("Choose {role}…");
+                                browse.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        true,
+                                        browse_label.clone(),
+                                    )
+                                });
+                                if browse.clicked() {
+                                    action = DialogAction::Select(side);
+                                }
+                            });
+                        let source_access = format!("{role} file: {selected_label}");
+                        combo.response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::ComboBox,
+                                picker_enabled,
+                                source_access.clone(),
+                            )
+                        });
+                        if let Some(hover) = full_path_hover {
+                            combo.response.on_hover_text(hover);
+                        }
+                    });
+
+                    ui.add_enabled_ui(editable, |ui| {
+                        theme::section_label(
+                            ui,
+                            if self.keys.len() > 1 {
+                                "Key 1"
+                            } else {
+                                "Key column"
+                            },
+                        );
+                        let key_width = (ui.available_width() - 2.0).max(100.0);
+                        Self::show_key_selector(
+                            ui,
+                            self.headers[side].as_ref(),
+                            &mut self.keys[0][side],
+                            side,
+                            0,
+                            key_width,
+                        );
+                        ui.checkbox(
+                            &mut include[side],
+                            if side == 0 {
+                                "Include unmatched Main rows"
+                            } else {
+                                "Include unmatched Additional rows"
+                            },
+                        );
+                    });
+                });
+            }
+        });
+        if editable {
+            self.mode = mode_from_unmatched(include[0], include[1]);
+        }
+        action
+    }
+
+    fn show_extra_key_pairs(&mut self, ui: &mut egui::Ui) {
+        if self.keys.len() <= 1 {
+            return;
+        }
+        let count = self.keys.len();
+        let mut edit = None;
+        theme::inset_card(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.horizontal(|ui| {
+                theme::section_label(ui, "Additional key pairs");
+                ui.small("All pairs must match.");
+            });
+            for index in 1..count {
+                let pair = &mut self.keys[index];
+                ui.push_id(("join-extra-key", index), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            RichText::new(format!("Key {}", index + 1))
+                                .size(12.0)
+                                .color(theme::ui_palette(ui).text_secondary),
+                        );
+                        let picker_width = ((ui.available_width() - 156.0) / 2.0).max(90.0);
+                        Self::show_key_selector(
+                            ui,
+                            self.headers[0].as_ref(),
+                            &mut pair[0],
+                            0,
+                            index,
+                            picker_width,
+                        );
+                        Self::show_key_selector(
+                            ui,
+                            self.headers[1].as_ref(),
+                            &mut pair[1],
+                            1,
+                            index,
+                            picker_width,
+                        );
+                        let up_label = format!("Move pair {} up", index + 1);
+                        let up = ui
+                            .add_enabled(
+                                index > 0,
+                                egui::Button::new("↑").min_size(egui::vec2(26.0, 24.0)),
+                            )
+                            .on_hover_text(&up_label);
+                        up.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled() && index > 0,
+                                up_label.clone(),
+                            )
+                        });
+                        if up.clicked() {
+                            edit = Some((index, 0));
+                        }
+                        let down_enabled = index + 1 < count;
+                        let down_label = format!("Move pair {} down", index + 1);
+                        let down = ui
+                            .add_enabled(
+                                down_enabled,
+                                egui::Button::new("↓").min_size(egui::vec2(26.0, 24.0)),
+                            )
+                            .on_hover_text(&down_label);
+                        down.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled() && down_enabled,
+                                down_label.clone(),
+                            )
+                        });
+                        if down.clicked() {
+                            edit = Some((index, 1));
+                        }
+                        let remove_label = format!("Remove pair {}", index + 1);
+                        let remove = ui
+                            .add(egui::Button::new("×").min_size(egui::vec2(26.0, 24.0)))
+                            .on_hover_text(&remove_label);
+                        remove.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                remove_label.clone(),
+                            )
+                        });
+                        if remove.clicked() {
+                            edit = Some((index, 2));
+                        }
+                    });
+                });
+            }
+        });
+        if let Some((index, action)) = edit {
+            match action {
+                0 => self.keys.swap(index, index - 1),
+                1 => self.keys.swap(index, index + 1),
+                _ => {
+                    self.keys.remove(index);
+                }
+            }
+        }
+    }
+
+    fn show_match_options(&mut self, ui: &mut egui::Ui) {
+        let palette = theme::ui_palette(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.ignore_ascii_case, "Ignore case (A–Z)")
+                .on_hover_text(
+                    "Ignore ASCII letter case (A–Z only) when matching keys. Leading zeros and whitespace remain significant.",
+                );
+            ui.checkbox(&mut self.output_has_header, "Include header row");
+            let can_add_key = self.keys.len() < 16 && self.headers.iter().all(Option::is_some);
+            if ui
+                .add_enabled(can_add_key, egui::Button::new("+ Add key"))
+                .on_hover_text("Match on an additional pair of key columns (up to 16).")
+                .clicked()
+            {
+                let next = self.keys.len();
+                self.keys.push(std::array::from_fn(|side| {
+                    next.min(self.headers[side].as_ref().unwrap().columns.len() - 1)
+                }));
+            }
+            let can_swap = self.paths.iter().any(Option::is_some);
+            if ui
+                .add_enabled(can_swap, egui::Button::new("Swap"))
+                .on_hover_text("Swap Main and Additional files.")
+                .clicked()
+            {
+                self.swap_inputs();
+            }
+        });
+        ui.label(
+            RichText::new(mode_summary(self.mode))
+                .size(11.5)
+                .color(palette.text_secondary),
+        );
+    }
+
     /// Format changes use the same asynchronous, version-bound metadata path.
     fn show_input_format(&mut self, ui: &mut egui::Ui, side: usize) -> bool {
         let role = if side == 0 { "Main" } else { "Additional" };
@@ -643,122 +1249,250 @@ impl JoinDialog {
     }
 
     fn show_output_columns(&mut self, ui: &mut egui::Ui) {
-        theme::section_label(ui, "Output columns");
-        ui.checkbox(
-            &mut self.output_has_header,
-            "Include a header row in the output",
-        );
-        ui.horizontal_wrapped(|ui| {
-            for source in [JoinSource::Main, JoinSource::Additional] {
-                for include in [true, false] {
-                    let label = format!(
-                        "Select {} {} columns",
-                        if include { "all" } else { "no" },
-                        source.label()
-                    );
-                    if ui.button(label).clicked() {
-                        for column in &mut self.output_columns {
-                            if column.source == source {
-                                column.included = include;
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        let palette = theme::ui_palette(ui);
         let count = self.output_columns.len();
-        let selected = self.output_selected;
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
-                    selected.is_some_and(|i| i > 0),
-                    egui::Button::new("Move output column up"),
-                )
-                .clicked()
-            {
-                let i = selected.unwrap();
-                self.output_columns.swap(i, i - 1);
-                self.output_selected = Some(i - 1);
-            }
-            if ui
-                .add_enabled(
-                    selected.is_some_and(|i| i + 1 < count),
-                    egui::Button::new("Move output column down"),
-                )
-                .clicked()
-            {
-                let i = selected.unwrap();
-                self.output_columns.swap(i, i + 1);
-                self.output_selected = Some(i + 1);
-            }
-        });
-        let headers = &self.headers;
-        let row_height = ui.spacing().interact_size.y.max(
-            ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
-        );
-        let list_height = ((row_height + ui.spacing().item_spacing.y) * count as f32).min(180.0);
-        egui::ScrollArea::vertical()
-            .id_salt("join-output-columns")
-            .max_height(180.0)
-            .min_scrolled_height(list_height)
-            .show_rows(ui, row_height, count, |ui, range| {
-                for i in range {
-                    let column = &mut self.output_columns[i];
-                    let role = column.source.label();
-                    let original =
-                        &headers[column.source.index()].as_ref().unwrap().columns[column.column];
-                    let original = if original.is_empty() {
-                        format!("Column {}", column.column + 1)
-                    } else {
-                        original.clone()
-                    };
-                    ui.horizontal(|ui| {
-                        let included = ui.checkbox(
-                            &mut column.included,
-                            format!("Include {role} {}", column.column + 1),
-                        );
-                        if included.has_focus() || included.clicked() {
-                            self.output_selected = Some(i);
-                        }
-                        if ui
-                            .add(
-                                egui::Button::selectable(
-                                    self.output_selected == Some(i),
-                                    format!(
-                                        "Output from {role} column {}: {original}",
-                                        column.column + 1
-                                    ),
-                                )
-                                .truncate(),
-                            )
-                            .clicked()
-                        {
-                            self.output_selected = Some(i);
-                        }
-                    });
-                }
-            });
-        if let Some(i) = self.output_selected.filter(|&i| i < count) {
-            let column = &mut self.output_columns[i];
-            ui.label(format!(
-                "New heading for {} column {} (optional)",
-                column.source.label(),
-                column.column + 1
-            ));
-            ui.add(
-                egui::TextEdit::singleline(&mut column.name)
-                    .id_salt("join-output-heading")
-                    .hint_text("Keep original heading")
-                    .desired_width(280.0),
-            );
-        }
-        let selected = self
+        let selected_count = self
             .output_columns
             .iter()
             .filter(|column| column.included)
             .count();
-        ui.small(format!("{selected} output columns selected"));
-        if selected == 0 && self.headers.iter().all(Option::is_some) {
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "Output columns");
+            if count > 0 {
+                ui.label(
+                    RichText::new(format!("{selected_count} of {count}"))
+                        .size(11.5)
+                        .color(palette.text_secondary),
+                );
+            }
+            if count > 0 {
+                let labels = ["All", "Main only", "None"];
+                theme::push_right(ui, theme::buttons_width(ui, &labels) + 8.0);
+                if ui
+                    .button("All")
+                    .on_hover_text("Select all columns")
+                    .clicked()
+                {
+                    for column in &mut self.output_columns {
+                        column.included = true;
+                    }
+                }
+                if ui
+                    .button("Main only")
+                    .on_hover_text("Select Main columns and uncheck Additional columns")
+                    .clicked()
+                {
+                    for column in &mut self.output_columns {
+                        column.included = column.source == JoinSource::Main;
+                    }
+                }
+                if ui
+                    .button("None")
+                    .on_hover_text("Uncheck all columns")
+                    .clicked()
+                {
+                    for column in &mut self.output_columns {
+                        column.included = false;
+                    }
+                }
+            }
+        });
+
+        if count == 0 {
+            ui.label(
+                RichText::new("Select files above to choose output columns.")
+                    .size(12.0)
+                    .color(palette.text_secondary),
+            );
+            return;
+        }
+
+        let headers = &self.headers;
+        let row_height = ui.spacing().interact_size.y.max(24.0);
+        let list_height = ((row_height + 2.0) * count as f32).clamp(112.0, 168.0);
+        let rail_width = 66.0;
+        let list_width =
+            (ui.available_width() - rail_width - ui.spacing().item_spacing.x - 20.0).max(160.0);
+
+        ui.horizontal_top(|ui| {
+            egui::Frame::new()
+                .fill(palette.canvas)
+                .stroke(egui::Stroke::new(1.0, palette.control_border))
+                .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS + 2))
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_min_width(list_width);
+                        ui.set_max_width(list_width);
+                        egui::ScrollArea::vertical()
+                            .id_salt("join-output-columns")
+                            .max_width(list_width)
+                            .max_height(168.0)
+                            .min_scrolled_height(list_height)
+                            .show_rows(ui, row_height, count, |ui, range| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                let button_width = (list_width - 46.0).max(100.0);
+                                for i in range {
+                                    let column = &mut self.output_columns[i];
+                                    let role = column.source.label();
+                                    let original = column_display_name(
+                                        headers[column.source.index()].as_ref().unwrap(),
+                                        column.column,
+                                    );
+                                    let is_selected = self.output_selected == Some(i);
+                                    ui.horizontal(|ui| {
+                                        let mut included = column.included;
+                                        let checkbox = ui.checkbox(&mut included, "");
+                                        let check_label =
+                                            format!("Include {role} {}", column.column + 1);
+                                        checkbox.widget_info(|| {
+                                            egui::WidgetInfo::selected(
+                                                egui::WidgetType::Checkbox,
+                                                ui.is_enabled(),
+                                                included,
+                                                check_label.clone(),
+                                            )
+                                        });
+                                        column.included = included;
+                                        if checkbox.has_focus() || checkbox.clicked() {
+                                            self.output_selected = Some(i);
+                                        }
+
+                                        let mut job = egui::text::LayoutJob::default();
+                                        job.append(
+                                            &format!("{role}  "),
+                                            0.0,
+                                            egui::TextFormat {
+                                                font_id: egui::FontId::proportional(11.5),
+                                                color: palette.text_secondary,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        job.append(
+                                            &original,
+                                            0.0,
+                                            egui::TextFormat {
+                                                font_id: egui::FontId::proportional(13.0),
+                                                color: if column.included {
+                                                    palette.text
+                                                } else {
+                                                    palette.text_tertiary
+                                                },
+                                                ..Default::default()
+                                            },
+                                        );
+                                        if !column.name.is_empty() {
+                                            job.append(
+                                                &format!(" → {}", column.name),
+                                                0.0,
+                                                egui::TextFormat {
+                                                    font_id: egui::FontId::proportional(12.0),
+                                                    color: palette.accent_text,
+                                                    ..Default::default()
+                                                },
+                                            );
+                                        }
+                                        let row_access = format!(
+                                            "{role} column {}: {original}",
+                                            column.column + 1
+                                        );
+                                        let row_btn = ui
+                                            .allocate_ui_with_layout(
+                                                egui::vec2(button_width, row_height),
+                                                egui::Layout::top_down_justified(egui::Align::LEFT),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Button::selectable(is_selected, job)
+                                                            .truncate(),
+                                                    )
+                                                },
+                                            )
+                                            .inner;
+                                        row_btn.widget_info(|| {
+                                            egui::WidgetInfo::selected(
+                                                egui::WidgetType::SelectableLabel,
+                                                ui.is_enabled(),
+                                                is_selected,
+                                                row_access.clone(),
+                                            )
+                                        });
+                                        if row_btn.clicked() {
+                                            self.output_selected = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                    });
+                });
+
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let selected = self.output_selected.filter(|&i| i < count);
+                let can_up = selected.is_some_and(|i| i > 0);
+                let can_down = selected.is_some_and(|i| i + 1 < count);
+                let size = egui::vec2(rail_width, 26.0);
+
+                let top = ui.add_enabled(can_up, egui::Button::new("Top").min_size(size));
+                top.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        ui.is_enabled() && can_up,
+                        "Move output column to top",
+                    )
+                });
+                if top.clicked() {
+                    let i = selected.unwrap();
+                    let item = self.output_columns.remove(i);
+                    self.output_columns.insert(0, item);
+                    self.output_selected = Some(0);
+                }
+
+                let up = ui.add_enabled(can_up, egui::Button::new("Up").min_size(size));
+                up.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        ui.is_enabled() && can_up,
+                        "Move output column up",
+                    )
+                });
+                if up.clicked() {
+                    let i = selected.unwrap();
+                    self.output_columns.swap(i, i - 1);
+                    self.output_selected = Some(i - 1);
+                }
+
+                let down = ui.add_enabled(can_down, egui::Button::new("Down").min_size(size));
+                down.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        ui.is_enabled() && can_down,
+                        "Move output column down",
+                    )
+                });
+                if down.clicked() {
+                    let i = selected.unwrap();
+                    self.output_columns.swap(i, i + 1);
+                    self.output_selected = Some(i + 1);
+                }
+
+                let bottom = ui.add_enabled(can_down, egui::Button::new("Bottom").min_size(size));
+                bottom.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        ui.is_enabled() && can_down,
+                        "Move output column to bottom",
+                    )
+                });
+                if bottom.clicked() {
+                    let i = selected.unwrap();
+                    let item = self.output_columns.remove(i);
+                    self.output_columns.push(item);
+                    self.output_selected = Some(count - 1);
+                }
+            });
+        });
+
+        if selected_count == 0 && self.headers.iter().all(Option::is_some) {
             ui.label(
                 RichText::new("Select at least one output column.")
                     .color(ui.visuals().error_fg_color),
@@ -777,6 +1511,72 @@ impl JoinDialog {
         }
     }
 
+    fn show_advanced(
+        &mut self,
+        ui: &mut egui::Ui,
+        editable: bool,
+        can_start: bool,
+    ) -> DialogAction {
+        let mut action = DialogAction::None;
+        egui::CollapsingHeader::new("Advanced")
+            .id_salt("join-advanced")
+            .open(self.expand_advanced.take())
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                theme::section_label(ui, "Saved-file format");
+                ui.columns(2, |columns| {
+                    for (side, column) in columns.iter_mut().enumerate() {
+                        column.add_enabled_ui(
+                            editable && can_start && self.document_inputs[side].is_none(),
+                            |ui| {
+                                if self.show_input_format(ui, side) {
+                                    action = DialogAction::ReadFormat(side);
+                                }
+                            },
+                        );
+                        if self.document_inputs[side].is_some() {
+                            column.small("Open tab · inherits applied format");
+                        }
+                    }
+                });
+
+                ui.add_enabled_ui(editable, |ui| {
+                    theme::section_label(ui, "Key constraints");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut self.require_unique[0], "Require unique Main key");
+                        ui.checkbox(
+                            &mut self.require_unique[1],
+                            "Require unique Additional key",
+                        );
+                    });
+
+                    theme::section_label(ui, "Rename selected output column");
+                    let count = self.output_columns.len();
+                    if let Some(i) = self.output_selected.filter(|&i| i < count) {
+                        let column = &mut self.output_columns[i];
+                        ui.label(format!(
+                            "New heading for {} column {} (optional)",
+                            column.source.label(),
+                            column.column + 1
+                        ));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut column.name)
+                                .id_salt("join-output-heading")
+                                .hint_text("Keep original heading")
+                                .desired_width(280.0),
+                        );
+                    } else {
+                        ui.small("Select an output column above to rename its heading.");
+                    }
+                });
+
+                ui.small(
+                    "Keys match whole values. Empty keys never match. Leading zeros, whitespace, and non-ASCII case remain significant. Clear source filters before joining open tabs.",
+                );
+            });
+        action
+    }
+
     /// Render the retained analysis through the same view used by the dialog.
     fn show_analysis(&mut self, ui: &mut egui::Ui) {
         if let Some(plan) = &self.plan {
@@ -791,33 +1591,14 @@ impl JoinDialog {
                     "unmatched Additional rows",
                 );
             });
-            ui.label(format!(
-                "Main: {} rows · Additional: {} rows",
-                a.input_rows[0], a.input_rows[1]
-            ));
-            ui.label(format!(
-                "Matching rows: {} Main, {} Additional",
-                a.matching_rows[0], a.matching_rows[1]
-            ));
-            ui.label(format!(
-                "Matching pairs: {} · Result: {} rows",
-                a.matching_pairs, a.output_rows
-            ));
-            ui.label(format!(
-                "Unmatched: {} Main, {} Additional",
-                a.unmatched_rows[0], a.unmatched_rows[1]
-            ));
-            ui.label(format!(
-                "Empty keys: {} Main, {} Additional",
-                a.empty_key_rows[0], a.empty_key_rows[1]
-            ));
-            ui.label(format!(
-                "Duplicate-key groups: {} Main, {} Additional",
-                a.duplicate_groups[0], a.duplicate_groups[1]
-            ));
             if a.new_columns != [0, 0] {
-                ui.label(format!("Full scan found {} new Main columns and {} new Additional columns. They are included in the output.", a.new_columns[0], a.new_columns[1]));
-                ui.small("Review the output columns above. Use Reset Analysis to change their selection, order or headings.");
+                ui.label(format!(
+                    "Full scan found {} new Main columns and {} new Additional columns. They are included in the output.",
+                    a.new_columns[0], a.new_columns[1]
+                ));
+                ui.small(
+                    "Review the output columns above. Use Back to Edit to change their selection, order, or headings.",
+                );
                 ui.checkbox(
                     &mut self.acknowledge_layout,
                     "I reviewed the newly discovered output columns.",
@@ -829,56 +1610,80 @@ impl JoinDialog {
                         "{} many-to-many groups produce {} matching pairs.",
                         a.many_to_many_groups, a.many_to_many_pairs
                     ))
-                    .strong(),
+                    .color(theme::ui_palette(ui).warning_text),
                 );
                 ui.checkbox(
                     &mut self.acknowledge_expansion,
                     format!("I understand this will create {} rows.", a.output_rows),
                 );
             }
+            ui.label(format!(
+                "Main: {} rows · Additional: {} rows",
+                a.input_rows[0], a.input_rows[1]
+            ));
+            ui.label(format!(
+                "Matching rows: {} Main, {} Additional",
+                a.matching_rows[0], a.matching_rows[1]
+            ));
+            ui.label(format!(
+                "Empty keys: {} Main, {} Additional · Duplicate-key groups: {} Main, {} Additional",
+                a.empty_key_rows[0],
+                a.empty_key_rows[1],
+                a.duplicate_groups[0],
+                a.duplicate_groups[1]
+            ));
             let has_examples = !a.duplicate_samples.is_empty()
                 || a.unmatched_samples
                     .iter()
                     .any(|samples| !samples.is_empty());
             if has_examples {
                 egui::Frame::new()
-                .fill(theme::ui_palette(ui).canvas)
-                .stroke(egui::Stroke::new(1.0, theme::ui_palette(ui).grid_line))
-                .corner_radius(6)
-                .inner_margin(10)
-                .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("join-review-examples")
-                .max_height(180.0)
-                .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            if !a.duplicate_samples.is_empty() {
-                theme::section_label(ui, "Duplicate-key examples (sample; clipped comparison keys)");
-            }
-            for sample in &a.duplicate_samples {
-                ui.small(format!(
-                    "Key {}: {} Main × {} Additional",
-                    sample.key, sample.main_rows, sample.additional_rows
-                ));
-            }
-            if a.unmatched_samples
-                .iter()
-                .any(|samples| !samples.is_empty())
-            {
-                theme::section_label(ui, "Unmatched examples (sample; data-row numbers, clipped comparison keys)");
-                for (side, samples) in a.unmatched_samples.iter().enumerate() {
-                    let role = if side == 0 { "Main" } else { "Additional" };
-                    for sample in samples {
-                        let key = sample.key.as_ref().map_or_else(
-                            || "empty or missing key component".into(),
-                            |key| format!("key {key}"),
-                        );
-                        ui.small(format!("{role} data row {} · {key}", sample.data_row));
-                    }
-                }
-            }
-                });
-                });
+                    .fill(theme::ui_palette(ui).canvas)
+                    .stroke(egui::Stroke::new(1.0, theme::ui_palette(ui).grid_line))
+                    .corner_radius(6)
+                    .inner_margin(10)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("join-review-examples")
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                if !a.duplicate_samples.is_empty() {
+                                    theme::section_label(
+                                        ui,
+                                        "Duplicate-key examples (sample; clipped comparison keys)",
+                                    );
+                                }
+                                for sample in &a.duplicate_samples {
+                                    ui.small(format!(
+                                        "Key {}: {} Main × {} Additional",
+                                        sample.key, sample.main_rows, sample.additional_rows
+                                    ));
+                                }
+                                if a.unmatched_samples
+                                    .iter()
+                                    .any(|samples| !samples.is_empty())
+                                {
+                                    theme::section_label(
+                                        ui,
+                                        "Unmatched examples (sample; data-row numbers, clipped comparison keys)",
+                                    );
+                                    for (side, samples) in a.unmatched_samples.iter().enumerate() {
+                                        let role = if side == 0 { "Main" } else { "Additional" };
+                                        for sample in samples {
+                                            let key = sample.key.as_ref().map_or_else(
+                                                || "empty or missing key component".into(),
+                                                |key| format!("key {key}"),
+                                            );
+                                            ui.small(format!(
+                                                "{role} data row {} · {key}",
+                                                sample.data_row
+                                            ));
+                                        }
+                                    }
+                                }
+                            });
+                    });
             }
             ui.small(format!(
                 "Output: {} · Conservative additional storage: {}",
@@ -891,7 +1696,7 @@ impl JoinDialog {
             if a.duplicate_headers && a.include_header {
                 ui.label("The output contains duplicate headings.");
             }
-            egui::ScrollArea::both().max_height(150.0).show(ui, |ui| {
+            egui::ScrollArea::both().max_height(140.0).show(ui, |ui| {
                 egui::Grid::new("join-preview")
                     .striped(true)
                     .show(ui, |ui| {
@@ -907,119 +1712,6 @@ impl JoinDialog {
                         }
                     });
             });
-        }
-    }
-
-    /// Pair identity and ordering are shared by both sources.
-    fn show_key_pairs(&mut self, ui: &mut egui::Ui) {
-        ui.small("All pairs must match. Empty or missing components never match.");
-        ui.checkbox(
-            &mut self.ignore_ascii_case,
-            "Ignore ASCII letter case (A–Z only)",
-        );
-        let count = self.keys.len();
-        let mut edit = None;
-        for (index, pair) in self.keys.iter_mut().enumerate() {
-            ui.push_id(("join-key-pair", index), |ui| {
-                ui.label(format!("Pair {}", index + 1));
-                ui.columns(2, |columns| {
-                    for (side, column) in columns.iter_mut().enumerate() {
-                        let role = if side == 0 { "Main" } else { "Additional" };
-                        if let Some(header) = &self.headers[side] {
-                            let label = header
-                                .columns
-                                .get(pair[side])
-                                .map(|name| {
-                                    format!(
-                                        "{role} {}: {}",
-                                        pair[side] + 1,
-                                        if name.is_empty() {
-                                            format!("Column {}", pair[side] + 1)
-                                        } else {
-                                            name.clone()
-                                        }
-                                    )
-                                })
-                                .unwrap_or_else(|| format!("{role}: choose a column"));
-                            egui::ComboBox::from_id_salt(("column", side))
-                                .selected_text(format!("Pair {} · {label}", index + 1))
-                                .width(245.0)
-                                .show_ui(column, |ui| {
-                                    egui::ScrollArea::vertical().max_height(220.0).show_rows(
-                                        ui,
-                                        22.0,
-                                        header.columns.len(),
-                                        |ui, range| {
-                                            for i in range {
-                                                ui.selectable_value(
-                                                    &mut pair[side],
-                                                    i,
-                                                    format!(
-                                                        "{role} {}: {}",
-                                                        i + 1,
-                                                        header.columns[i]
-                                                    ),
-                                                );
-                                            }
-                                        },
-                                    );
-                                });
-                        } else {
-                            column.label(format!("{role}: choose a file first"));
-                        }
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            index > 0,
-                            egui::Button::new(format!("Move pair {} up", index + 1)),
-                        )
-                        .clicked()
-                    {
-                        edit = Some((index, 0));
-                    }
-                    if ui
-                        .add_enabled(
-                            index + 1 < count,
-                            egui::Button::new(format!("Move pair {} down", index + 1)),
-                        )
-                        .clicked()
-                    {
-                        edit = Some((index, 1));
-                    }
-                    if ui
-                        .add_enabled(
-                            count > 1,
-                            egui::Button::new(format!("Remove pair {}", index + 1)),
-                        )
-                        .clicked()
-                    {
-                        edit = Some((index, 2));
-                    }
-                });
-            });
-        }
-        if let Some((index, action)) = edit {
-            match action {
-                0 => self.keys.swap(index, index - 1),
-                1 => self.keys.swap(index, index + 1),
-                _ => {
-                    self.keys.remove(index);
-                }
-            }
-        }
-        if ui
-            .add_enabled(
-                self.keys.len() < 16 && self.headers.iter().all(Option::is_some),
-                egui::Button::new("Add key pair"),
-            )
-            .clicked()
-        {
-            let next = self.keys.len();
-            self.keys.push(std::array::from_fn(|side| {
-                next.min(self.headers[side].as_ref().unwrap().columns.len() - 1)
-            }));
         }
     }
 
@@ -1043,133 +1735,265 @@ impl JoinDialog {
         &mut self,
         ctx: &egui::Context,
         can_start: bool,
+        can_pick_source: bool,
         documents: &[OpenDocumentChoice],
     ) -> DialogAction {
         self.poll();
         if self.closing && !self.busy() && self.plan.is_none() {
             return DialogAction::Closed(self.quit_after_close);
         }
-        let busy = self.busy();
+        let busy = self.busy() || self.pending_auto_write;
         let editable = self.inputs_editable();
+        let source_editable = self.can_change_input() && !self.pending_auto_write;
         let mut action = DialogAction::None;
         let mut open = true;
-        egui::Window::new("Join Files").id(egui::Id::new("join-files"))
-            .open(&mut open).default_width(680.0).min_width(480.0)
-            .default_height((ctx.content_rect().height() - 120.0).clamp(360.0, 720.0))
+        egui::Window::new("Join Files")
+            .id(egui::Id::new("join-files"))
+            .open(&mut open)
+            .default_width(640.0)
+            .min_width(480.0)
+            .max_width((ctx.content_rect().width() - 32.0).max(480.0))
+            .default_height((ctx.content_rect().height() - 120.0).clamp(360.0, 680.0))
             .collapsible(false)
             .frame(tool_dialog_frame(ctx))
-            .show(ctx,|ui|{
+            .show(ctx, |ui| {
                 tool_dialog_style(ui.style_mut());
-                ui.weak("Match key columns in two files and write the result to a new file. Both sources stay unchanged.");
-                egui::CollapsingHeader::new("How matching works").id_salt("join-matching-details").show(ui, |ui| {
-                    ui.small("Use current open documents or saved files. Retain every matching pair. Empty keys never match.");
-                    ui.small("Keys match whole values. Leading zeros, whitespace and non-ASCII case remain significant. Joins use all current rows; clear source filters first.");
-                });
-                egui::ScrollArea::vertical().max_height((ui.available_height()-70.0).min(ctx.content_rect().height()-180.0).max(40.0)).show(ui,|ui|{
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    theme::step_card(ui, 1, "Choose two files", |ui| {
-                        ui.columns(2,|columns|{
-                            for (side,column) in columns.iter_mut().enumerate(){
-                                let palette = theme::ui_palette(column);
-                                theme::section_label(column, if side==0{"Main file"}else{"Additional file"});
-                                let name = self.paths[side].as_ref().and_then(|p|p.file_name()).map(|n|n.to_string_lossy().into_owned());
-                                column.add(egui::Label::new(match &name {
-                                    Some(name) => RichText::new(name).size(15.0).color(palette.text),
-                                    None => RichText::new("No file selected").size(15.0).color(palette.text_tertiary),
-                                }).truncate());
-                                column.horizontal(|ui| {
-                                    if ui.add_enabled(editable && can_start,egui::Button::new(if side==0{"Choose Main…"}else{"Choose Additional…"})).clicked(){action=DialogAction::Select(side);}
-                                    ui.add_enabled_ui(editable && can_start, |ui| {
-                                        let role = if side == 0 { "Main" } else { "Additional" };
-                                        egui::ComboBox::from_id_salt(("join-open-document", side))
-                                            .selected_text(format!("Open {role} document…"))
-                                            .show_ui(ui, |ui| {
-                                                ui.set_max_width(320.0);
-                                                if documents.is_empty() { ui.label("No open documents"); }
-                                                for choice in documents {
-                                                    if ui.selectable_label(false, format!("Use {role} document: {}", choice.label))
-                                                        .on_hover_text(choice.path.display().to_string()).clicked() {
-                                                        action = DialogAction::SelectDocument(side, choice.tab_id);
-                                                    }
-                                                }
-                                            });
-                                    });
-                                });
-                                if self.document_inputs[side].is_some() {
-                                    column.small("Open document · current values · inherited format");
-                                } else { column.small("Saved file"); }
-                                column.add_enabled_ui(editable && can_start,|ui|{
-                                    ui.add_enabled_ui(self.document_inputs[side].is_none(), |ui| {
-                                        if self.show_input_format(ui, side) { action = DialogAction::ReadFormat(side); }
-                                    });
-                                    ui.checkbox(&mut self.require_unique[side], if side == 0 { "Require unique Main key" } else { "Require unique Additional key" });
-                                    if let Some(header)=&self.headers[side]{
-                                        ui.small(format!("{} columns · {} · {}",header.columns.len(),header.encoding.label(),if header.has_header {"header row"} else {"no header"}));
-                                    }else{ui.weak("Key column: choose a file first");}
-                                });
-                            }
-                        });
-                    });
-                    theme::step_card(ui, 2, "Match key columns", |ui| {
-                        ui.add_enabled_ui(editable, |ui| self.show_key_pairs(ui));
-                    });
-                    theme::step_card(ui, 3, "Choose rows and columns", |ui| {
+                ui.weak("Match key columns in two files and write the joined result to a new file. Sources stay unchanged.");
+                egui::ScrollArea::vertical()
+                    .max_height(
+                        (ui.available_height() - 72.0)
+                            .min(ctx.content_rect().height() - 180.0)
+                            .max(40.0),
+                    )
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+
+                        let source_action = self.show_source_panels(
+                            ui,
+                            editable,
+                            source_editable,
+                            can_pick_source,
+                            documents,
+                        );
+                        if source_action != DialogAction::None {
+                            action = source_action;
+                        }
+
                         ui.add_enabled_ui(editable, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Rows to keep:");
-                                egui::ComboBox::from_id_salt("join-mode").selected_text(self.mode.label()).show_ui(ui, |ui| {
-                                    for mode in [JoinMode::Left, JoinMode::Inner, JoinMode::Right, JoinMode::Full] {
-                                        ui.selectable_value(&mut self.mode, mode, mode.label());
+                            self.show_extra_key_pairs(ui);
+                            self.show_match_options(ui);
+                            self.show_output_columns(ui);
+                        });
+
+                        let advanced_action = self.show_advanced(ui, editable, can_start);
+                        if advanced_action != DialogAction::None {
+                            action = advanced_action;
+                        }
+
+                        if (self.plan.is_some() && !self.pending_auto_write)
+                            || self.result.is_some()
+                        {
+                            let palette = theme::ui_palette(ui);
+                            let needs_confirm = self.plan_needs_confirmation();
+                            theme::inset_card(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 6.0;
+                                if self.plan.is_some() && !self.pending_auto_write {
+                                    ui.label(
+                                        RichText::new(if needs_confirm {
+                                            "Confirmation required"
+                                        } else {
+                                            "Preview"
+                                        })
+                                        .size(14.0)
+                                        .color(if needs_confirm {
+                                            palette.warning_text
+                                        } else {
+                                            palette.text
+                                        }),
+                                    );
+                                    self.show_analysis(ui);
+                                    if let Some(path) = self.destination.clone() {
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::Label::new(format!(
+                                                    "Output: {}",
+                                                    path.display()
+                                                ))
+                                                .truncate(),
+                                            );
+                                            if ui.button("Change…").clicked() {
+                                                action = DialogAction::ChooseOutput;
+                                            }
+                                        });
                                     }
+                                }
+                                if let Some(result) = &self.result {
+                                    ui.colored_label(
+                                        palette.success_text,
+                                        format!(
+                                            "Saved {} rows · {}",
+                                            result.data_rows,
+                                            format_bytes(result.bytes_written)
+                                        ),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(result.destination.display().to_string())
+                                            .wrap(),
+                                    );
+                                }
+                            });
+                        }
+
+                        if let Some(message) = &self.message {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(message).color(ui.visuals().error_fg_color),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        if let Some(progress) = self
+                            .checking
+                            .as_ref()
+                            .map(JoinJob::progress)
+                            .or_else(|| self.writing.as_ref().map(JoinJob::progress))
+                        {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!(
+                                    "{} · {} rows processed",
+                                    progress.phase.label(),
+                                    progress.records
+                                ));
+                            });
+                        } else if busy {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(if self.cleanup.is_some() {
+                                    "Releasing private join data…"
+                                } else if self.pending_auto_write {
+                                    "Preparing joined file…"
+                                } else {
+                                    "Reading columns…"
                                 });
                             });
-                        });
-                        ui.add_enabled_ui(editable, |ui| self.show_output_columns(ui));
+                        }
+                        Self::reveal_keyboard_focus(ui);
                     });
-                    if self.plan.is_some() || self.result.is_some() || self.destination.is_some() {
-                        theme::step_card(ui, 4, "Review and create", |ui| {
-                            self.show_analysis(ui);
-                            if let Some(path)=&self.destination {ui.add(egui::Label::new(format!("Output: {}",path.display())).truncate());}
-                            if let Some(result)=&self.result {
-                                ui.colored_label(theme::ui_palette(ui).success_text, format!("Saved {} rows · {}",result.data_rows,format_bytes(result.bytes_written)));
-                                ui.add(egui::Label::new(result.destination.display().to_string()).wrap());
-                            }
-                        });
-                    }
-                    if let Some(message)=&self.message {ui.add(egui::Label::new(RichText::new(message).color(ui.visuals().error_fg_color)).wrap());}
-                    if let Some(progress)=self.checking.as_ref().map(JoinJob::progress).or_else(||self.writing.as_ref().map(JoinJob::progress)){
-                        ui.horizontal(|ui|{ui.spinner();ui.label(format!("{} · {} rows processed",progress.phase.label(),progress.records));});
-                    }else if busy {ui.horizontal(|ui|{ui.spinner();ui.label(if self.cleanup.is_some(){"Releasing private join data…"}else{"Reading header…"});});}
-                    Self::reveal_keyboard_focus(ui);
-                });
+
                 ui.separator();
-                // Close on the left; the current step's actions on the right, primary last.
-                ui.horizontal(|ui|{
-                    if ui.button(if busy{"Cancel and Close"}else{"Close"}).clicked(){self.request_close(false);}
+                // Close on the left; current actions on the right, primary last.
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if busy { "Cancel and Close" } else { "Close" })
+                        .clicked()
+                    {
+                        self.request_close(false);
+                    }
                     if busy {
-                        theme::push_right(ui, theme::buttons_width(ui, &["Cancel"]));
-                        if ui.add_enabled(!self.cancel_requested && self.cleanup.is_none(),egui::Button::new("Cancel")).clicked(){self.cancel();}
-                    }else if self.result.is_some(){
-                        theme::push_right(ui, theme::buttons_width(ui, &["Open Joined File"]));
-                        if ui.add(theme::primary_button("Open Joined File")).clicked(){action=DialogAction::OpenResult;}
-                    }else if self.plan.is_some(){
-                        theme::push_right(ui, theme::buttons_width(ui, &["Reset Analysis", "Choose Output…", "Create Joined File"]));
-                        if ui.button("Reset Analysis").clicked(){self.reset();}
-                        if ui.button("Choose Output…").clicked(){action=DialogAction::ChooseOutput;}
-                        if ui.add_enabled(can_start && self.destination.is_some() && self.plan.as_ref().is_none_or(|plan| (plan.analysis().many_to_many_groups == 0 || self.acknowledge_expansion) && (plan.analysis().new_columns == [0, 0] || self.acknowledge_layout)),theme::primary_button("Create Joined File")).clicked(){action=DialogAction::Create;}
-                    }else {
-                        theme::push_right(ui, theme::buttons_width(ui, &["Analyze & Preview"]));
-                        if ui.add_enabled(can_start && self.headers.iter().all(Option::is_some) && self.output_columns.iter().any(|column|column.included),theme::primary_button("Analyze & Preview")).clicked(){
-                            action=DialogAction::Analyze;
+                        theme::push_right(ui, theme::buttons_width(ui, &["Cancel"]) + 6.0);
+                        if ui
+                            .add_enabled(
+                                !self.cancel_requested && self.cleanup.is_none(),
+                                egui::Button::new("Cancel"),
+                            )
+                            .clicked()
+                        {
+                            let cancelling_auto_write = self.pending_auto_write;
+                            self.cancel();
+                            if cancelling_auto_write && self.plan.is_some() {
+                                self.reset();
+                                self.message = Some("Join cancelled. No output was created.".into());
+                            }
+                        }
+                    } else if self.result.is_some() {
+                        theme::push_right(
+                            ui,
+                            theme::buttons_width(ui, &["Open Joined File"]) + 6.0,
+                        );
+                        if ui.add(theme::primary_button("Open Joined File")).clicked() {
+                            action = DialogAction::OpenResult;
+                        }
+                    } else if self.plan.is_some() {
+                        let ready = can_start && self.confirmations_complete();
+                        let primary_label = if self.destination.is_some() {
+                            "Create Joined File"
+                        } else {
+                            "Join…"
+                        };
+                        theme::push_right(
+                            ui,
+                            theme::buttons_width(ui, &["Back to Edit", primary_label]) + 6.0,
+                        );
+                        if ui.button("Back to Edit").clicked() {
+                            self.reset();
+                        }
+                        let disabled_hint = if !can_start {
+                            "Two file operations are running. Wait for a free slot."
+                        } else {
+                            "Confirm the warning above before creating the file."
+                        };
+                        if ui
+                            .add_enabled(ready, theme::primary_button(primary_label))
+                            .on_disabled_hover_text(disabled_hint)
+                            .clicked()
+                        {
+                            action = if self.destination.is_some() {
+                                DialogAction::Create
+                            } else {
+                                DialogAction::JoinNow
+                            };
+                        }
+                    } else {
+                        let ready = can_start
+                            && self.headers.iter().all(Option::is_some)
+                            && self.output_columns.iter().any(|column| column.included);
+                        let disabled_hint = if !can_start {
+                            "Two file operations are running. Wait for a free slot."
+                        } else if !self.headers.iter().all(Option::is_some) {
+                            "Choose both files first."
+                        } else {
+                            "Select at least one output column."
+                        };
+                        theme::push_right(
+                            ui,
+                            theme::buttons_width(ui, &["Preview", "Join…"]) + 6.0,
+                        );
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Preview"))
+                            .on_disabled_hover_text(disabled_hint)
+                            .clicked()
+                        {
+                            action = DialogAction::Preview;
+                        }
+                        if ui
+                            .add_enabled(ready, theme::primary_button("Join…"))
+                            .on_disabled_hover_text(disabled_hint)
+                            .clicked()
+                        {
+                            action = DialogAction::JoinNow;
                         }
                     }
                 });
-                if !can_start && !busy {ui.small("Two file operations are running. Wait for a free slot before starting another.");}
+                if !can_start && !busy {
+                    ui.small(
+                        "Two file operations are running. Wait for a free slot before starting another.",
+                    );
+                }
             });
         if !open {
             self.request_close(false);
         }
-        if self.busy() {
+        if action == DialogAction::None && !self.closing {
+            if self.pending_auto_write {
+                self.pending_auto_write = false;
+                action = DialogAction::Create;
+            } else if self.pending_auto_open {
+                self.pending_auto_open = false;
+                action = DialogAction::OpenResult;
+            }
+        }
+        if self.busy() || self.pending_auto_write || self.pending_auto_open {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
         action
@@ -1266,11 +2090,25 @@ impl QuarryApp {
         Ok(tab)
     }
 
+    fn can_start_join_header(&self) -> bool {
+        let Some(dialog) = self.join_files.as_ref() else {
+            return false;
+        };
+        if !dialog.can_retire_header_job() {
+            return false;
+        }
+        self.write_slot_available() || (!self.quitting_cleanup() && dialog.has_header_job())
+    }
+
     fn select_join_document(&mut self, side: usize, id: u64) -> Result<(), String> {
-        if !self.join_files.as_ref().unwrap().inputs_editable() {
+        self.join_files.as_mut().unwrap().poll();
+        if !self.join_files.as_ref().unwrap().can_change_input() {
             return Err("Reset the retained analysis before changing inputs.".into());
         }
-        if !self.write_slot_available() || self.join_files.as_ref().is_some_and(JoinDialog::busy) {
+        if !self.join_files.as_ref().unwrap().can_retire_header_job() {
+            return Err(RETIRED_HEADER_BUSY.into());
+        }
+        if !self.can_start_join_header() {
             return Err("Wait for an operation slot before reading this input.".into());
         }
         if self.join_files.as_ref().unwrap().document_inputs[1 - side]
@@ -1278,6 +2116,21 @@ impl QuarryApp {
             .is_some_and(|probe| probe.tab_id == id)
         {
             return Err("Choose two different inputs. Self joins are not supported.".into());
+        }
+        let already_loading_same = self.join_files.as_ref().unwrap().header_jobs[side].is_some()
+            && self.join_files.as_ref().unwrap().document_inputs[side]
+                .as_ref()
+                .is_some_and(|probe| {
+                    self.document_tabs().any(|tab| {
+                        tab.id == id
+                            && tab
+                                .document
+                                .as_ref()
+                                .is_some_and(|doc| probe.matches(id, doc))
+                    })
+                });
+        if already_loading_same {
+            return Ok(());
         }
         let captured = self
             .join_tab_for_capture(id)?
@@ -1303,7 +2156,8 @@ impl QuarryApp {
         side: usize,
         path: PathBuf,
     ) -> Result<(), String> {
-        if !self.join_files.as_ref().unwrap().inputs_editable() {
+        self.join_files.as_mut().unwrap().poll();
+        if !self.join_files.as_ref().unwrap().can_change_input() {
             return Err("Reset the retained analysis before changing inputs.".into());
         }
         if self.join_input_writer_busy(&path) {
@@ -1317,7 +2171,9 @@ impl QuarryApp {
                 .is_some_and(|document| private_working_path(document, &path))
         }) {
             Err("This is a private history file. Select the current document from the open-document menu instead.".into())
-        } else if self.write_slot_available() && !self.join_files.as_ref().unwrap().busy() {
+        } else if !self.join_files.as_ref().unwrap().can_retire_header_job() {
+            Err(RETIRED_HEADER_BUSY.into())
+        } else if self.can_start_join_header() {
             self.join_files.as_mut().unwrap().read_header(side, path);
             Ok(())
         } else {
@@ -1397,16 +2253,63 @@ impl QuarryApp {
     }
 
     /// Accept a picked output only when it is uncompressed, new and unreserved.
-    fn choose_join_output(&mut self, path: PathBuf) {
+    fn choose_join_output(&mut self, path: PathBuf) -> bool {
         let message = if quarry_core::is_compressed_destination(&path) {
             compressed::COMPRESSED_DESTINATION
         } else if self.join_destination_is_available(&path) {
             self.join_files.as_mut().unwrap().destination = Some(path);
-            return;
+            return true;
         } else {
             "Choose a new output path. Existing files, open documents and active output destinations cannot be replaced."
         };
         self.join_files.as_mut().unwrap().message = Some(message.into());
+        false
+    }
+
+    fn start_join_write(&mut self) {
+        let path = self.join_files.as_ref().unwrap().destination.clone();
+        if path
+            .as_ref()
+            .is_some_and(|path| self.join_destination_is_available(path))
+            && self.write_slot_available()
+        {
+            self.join_files.as_mut().unwrap().start_write();
+        } else {
+            self.join_files.as_mut().unwrap().message = Some(
+                "The output or operation slot is no longer available. Choose another output or wait."
+                    .into(),
+            );
+        }
+    }
+
+    /// Run a one-click join to `path`: either writes a retained plan or scans, writes, and opens.
+    fn start_join_to(&mut self, path: PathBuf) {
+        if !self.choose_join_output(path) {
+            return;
+        }
+        let has_plan = self.join_files.as_ref().unwrap().plan.is_some();
+        self.join_files.as_mut().unwrap().intent = RunIntent::JoinAndOpen;
+        if has_plan {
+            self.start_join_write();
+        } else if let Err(error) = self.analyze_join_draft() {
+            let dialog = self.join_files.as_mut().unwrap();
+            dialog.destination = None;
+            dialog.intent = RunIntent::Preview;
+            dialog.message = Some(error);
+        }
+    }
+
+    fn pick_join_output(&self) -> Option<PathBuf> {
+        let dialog = self.join_files.as_ref()?;
+        let delimiter = dialog.suggested_delimiter();
+        let extension = if delimiter == b'\t' { "tsv" } else { "csv" };
+        let mut picker = rfd::FileDialog::new()
+            .set_title("Save joined file")
+            .set_file_name(format!("joined.{extension}"));
+        if let Some(parent) = dialog.paths[0].as_deref().and_then(Path::parent) {
+            picker = picker.set_directory(parent);
+        }
+        picker.save_file()
     }
 
     /// Recheck all live document and writer paths before starting output.
@@ -1439,16 +2342,59 @@ impl QuarryApp {
                 .is_some_and(|destination| tabs::paths_alias(path, destination))
     }
 
+    fn preselect_open_join_documents(&mut self) {
+        if !self.write_slot_available() {
+            return;
+        }
+        let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
+        for tab in self.document_tabs() {
+            if candidates.len() >= 2 {
+                break;
+            }
+            if tab.close_confirmation_open
+                || tab.close_ready
+                || tab.close_after_jobs
+                || tab.close_after_save
+                || tab.storage_review.is_some()
+                || tab.inspection.recovering()
+            {
+                continue;
+            }
+            let Some(doc) = tab.document.as_ref() else {
+                continue;
+            };
+            if doc.join_capture_disabled_reason().is_some()
+                || doc.header_edit.is_some()
+                || doc.cell_edit.is_some()
+                || self.join_input_writer_busy(&doc.logical_path)
+            {
+                continue;
+            }
+            if candidates
+                .iter()
+                .any(|(_, path)| tabs::paths_alias(path, &doc.logical_path))
+            {
+                continue;
+            }
+            candidates.push((tab.id, doc.logical_path.clone()));
+        }
+        for (side, (tab_id, _)) in candidates.into_iter().enumerate() {
+            let _ = self.select_join_document(side, tab_id);
+        }
+    }
+
     /// Keep one join draft, using the configured private-storage location.
     pub(super) fn open_join_files(&mut self) {
         if self.join_files.is_none() {
             self.join_files = Some(JoinDialog::new(self.working_directory.clone()));
+            self.preselect_open_join_documents();
         }
     }
 
     /// Route UI actions through fresh capacity and path-reservation checks.
     pub(super) fn show_join_files(&mut self, ctx: &egui::Context) {
         let can_start = self.write_slot_available();
+        let can_pick_source = self.can_start_join_header();
         let documents: Vec<_> = self
             .document_tabs()
             .filter_map(|tab| {
@@ -1477,7 +2423,7 @@ impl QuarryApp {
         let Some(dialog) = self.join_files.as_mut() else {
             return;
         };
-        let action = dialog.show(ctx, can_start, &documents);
+        let action = dialog.show(ctx, can_start, can_pick_source, &documents);
         match action {
             DialogAction::None => {}
             DialogAction::Closed(quit) => {
@@ -1507,33 +2453,26 @@ impl QuarryApp {
                     self.join_files.as_mut().unwrap().message = Some(error);
                 }
             }
-            DialogAction::Analyze => {
+            DialogAction::Preview => {
+                let dialog = self.join_files.as_mut().unwrap();
+                dialog.destination = None;
+                dialog.intent = RunIntent::Preview;
                 if let Err(error) = self.analyze_join_draft() {
                     self.join_files.as_mut().unwrap().message = Some(error);
                 }
             }
+            DialogAction::JoinNow => {
+                if let Some(path) = self.pick_join_output() {
+                    self.start_join_to(path);
+                }
+            }
             DialogAction::ChooseOutput => {
-                let delimiter = self.join_files.as_ref().unwrap().output_delimiter;
-                let extension = if delimiter == b'\t' { "tsv" } else { "csv" };
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Save joined file")
-                    .set_file_name(format!("joined.{extension}"))
-                    .save_file()
-                {
+                if let Some(path) = self.pick_join_output() {
                     self.choose_join_output(path);
                 }
             }
             DialogAction::Create => {
-                let path = self.join_files.as_ref().unwrap().destination.clone();
-                if path
-                    .as_ref()
-                    .is_some_and(|path| self.join_destination_is_available(path))
-                    && self.write_slot_available()
-                {
-                    self.join_files.as_mut().unwrap().start_write();
-                } else {
-                    self.join_files.as_mut().unwrap().message=Some("The output or operation slot is no longer available. Choose another output or wait.".into());
-                }
+                self.start_join_write();
             }
             DialogAction::OpenResult => {
                 let dialog = self.join_files.take().unwrap();
@@ -1709,7 +2648,29 @@ mod tests {
 
     fn choose_open_document(app: &mut QuarryApp, ctx: &egui::Context, side: usize, filename: &str) {
         let role = if side == 0 { "Main" } else { "Additional" };
-        click(app, ctx, &format!("Open {role} document…"));
+        frame(app, ctx, vec![]);
+        let output = frame(app, ctx, vec![]);
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let source_prefix = format!("{role} file:");
+        let (combo_id, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.starts_with(&source_prefix))
+            })
+            .unwrap_or_else(|| panic!("missing source selector {source_prefix}"));
+        frame(
+            app,
+            ctx,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: *combo_id,
+                    data: None,
+                },
+            )],
+        );
         let output = frame(app, ctx, vec![]);
         let tree = output.platform_output.accesskit_update.unwrap();
         let prefix = format!("Use {role} document: {filename}");
@@ -1778,7 +2739,7 @@ mod tests {
         let other_id = app.active.id;
         let ctx = context();
         let (a, b) = prepare(&mut app, dir.path());
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.join_files.as_ref().unwrap().plan.is_some());
         assert!(app.open_new_path(a.clone()).is_err());
@@ -1814,7 +2775,7 @@ mod tests {
         let (a, _) = prepare(&mut app, dir.path());
         app.open_new_path(a.clone()).unwrap();
         finish_document(&mut app);
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         assert!(app.join_files.as_ref().unwrap().checking.is_none());
         assert!(
             app.join_files
@@ -1828,12 +2789,12 @@ mod tests {
         finish(&mut app);
         assert!(app.join_files.as_ref().unwrap().document_inputs[0].is_some());
         assert!(!app.active.document.as_ref().unwrap().join_reserved());
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.join_reserves_path(&a));
         let other = fixture(dir.path(), "unrelated.csv", b"id\nok\n");
         app.open_new_path(other).unwrap();
-        click(&mut app, &ctx, "Reset Analysis");
+        click(&mut app, &ctx, "Back to Edit");
         finish(&mut app);
         assert!(!app.join_reserves_path(&a));
         assert!(app.open_new_path(a).is_ok());
@@ -1851,7 +2812,7 @@ mod tests {
         let mut app = QuarryApp::new(Some(other), Instant::now());
         let ctx = context();
         prepare(&mut app, dir.path());
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.write_slot_available());
         app.active
@@ -1888,7 +2849,7 @@ mod tests {
                 .unwrap();
         }
         prepare(&mut app, dir.path());
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let output = dir.path().join("joined.csv");
         app.join_files.as_mut().unwrap().destination = Some(output.clone());
@@ -1973,7 +2934,7 @@ mod tests {
         let path = fixture(dir.path(), "header.csv", b"id,name\nx,A\n");
         let mut dialog = JoinDialog::new(dir.path().to_path_buf());
         dialog.read_header(0, path);
-        while !dialog.header_job.as_ref().unwrap().1.progress().done {
+        while !dialog.header_jobs[0].as_ref().unwrap().progress().done {
             thread::yield_now();
         }
         dialog.cancel();
@@ -1997,7 +2958,7 @@ mod tests {
             b"name,id\nBob,b\nAlice,a\nLast,z\n",
         );
         fs::rename(replacement, &a).unwrap();
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let dialog = app.join_files.as_ref().unwrap();
         assert!(
@@ -2022,7 +2983,7 @@ mod tests {
         let mut app = QuarryApp::new(None, Instant::now());
         let ctx = context();
         prepare(&mut app, dir.path());
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let workspace = fs::read_dir(dir.path())
             .unwrap()
@@ -2070,7 +3031,7 @@ mod tests {
         finish(&mut app);
         app.join_files.as_mut().unwrap().read_header(1, b);
         finish(&mut app);
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert_eq!(
             app.join_files
@@ -2090,10 +3051,10 @@ mod tests {
         assert!(!output.exists());
         click(&mut app, &ctx, "I understand this will create 4 rows.");
         assert!(app.join_files.as_ref().unwrap().acknowledge_expansion);
-        click(&mut app, &ctx, "Reset Analysis");
+        click(&mut app, &ctx, "Back to Edit");
         finish(&mut app);
         assert!(!app.join_files.as_ref().unwrap().acknowledge_expansion);
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         app.join_files.as_mut().unwrap().destination = Some(output.clone());
         click(&mut app, &ctx, "I understand this will create 4 rows.");
@@ -2114,8 +3075,9 @@ mod tests {
         fs::write(&a, b"id,name\nx,A\nx,B\n").unwrap();
         app.join_files.as_mut().unwrap().read_header(0, a);
         finish(&mut app);
+        click(&mut app, &ctx, "Advanced");
         click(&mut app, &ctx, "Require unique Main key");
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.join_files.as_ref().unwrap().plan.is_none());
         assert!(
@@ -2152,12 +3114,21 @@ mod tests {
             let mut app = QuarryApp::new(None, Instant::now());
             let ctx = context();
             prepare(&mut app, dir.path());
-            if mode != JoinMode::Left {
-                click(&mut app, &ctx, JoinMode::Left.label());
-                click(&mut app, &ctx, mode.label());
+            match mode {
+                JoinMode::Left => {}
+                JoinMode::Inner => {
+                    click(&mut app, &ctx, "Include unmatched Main rows");
+                }
+                JoinMode::Right => {
+                    click(&mut app, &ctx, "Include unmatched Main rows");
+                    click(&mut app, &ctx, "Include unmatched Additional rows");
+                }
+                JoinMode::Full => {
+                    click(&mut app, &ctx, "Include unmatched Additional rows");
+                }
             }
             assert_eq!(app.join_files.as_ref().unwrap().mode, mode);
-            click(&mut app, &ctx, "Analyze & Preview");
+            click(&mut app, &ctx, "Preview");
             finish(&mut app);
             let output = dir.path().join("mode.csv");
             app.join_files.as_mut().unwrap().destination = Some(output.clone());
@@ -2189,14 +3160,14 @@ mod tests {
         finish(&mut app);
         app.join_files.as_mut().unwrap().read_header(1, b.clone());
         finish(&mut app);
-        click(&mut app, &ctx, "Pair 1 · Additional 1: acct");
+        click(&mut app, &ctx, "Pair 1 · Additional key: 1: acct");
         click(&mut app, &ctx, "Additional 2: area");
-        click(&mut app, &ctx, "Add key pair");
-        click(&mut app, &ctx, "Pair 2 · Additional 2: area");
+        click(&mut app, &ctx, "+ Add key");
+        click(&mut app, &ctx, "Pair 2 · Additional key: 2: area");
         click(&mut app, &ctx, "Additional 1: acct");
         click(&mut app, &ctx, "Move pair 2 up");
         assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[1, 0], [0, 1]]);
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert_eq!(
             app.join_files
@@ -2209,10 +3180,10 @@ mod tests {
                 .matching_pairs,
             2
         );
-        click(&mut app, &ctx, "Reset Analysis");
+        click(&mut app, &ctx, "Back to Edit");
         finish(&mut app);
-        click(&mut app, &ctx, "Ignore ASCII letter case (A–Z only)");
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Ignore case (A–Z)");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert_eq!(
             app.join_files
@@ -2247,14 +3218,12 @@ mod tests {
         let mut app = QuarryApp::new(None, Instant::now());
         let ctx = context();
         prepare(&mut app, dir.path());
-        click(&mut app, &ctx, "Add key pair");
+        click(&mut app, &ctx, "+ Add key");
         assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[0, 0], [1, 1]]);
-        click(&mut app, &ctx, "Move pair 1 down");
+        click(&mut app, &ctx, "Move pair 2 up");
         assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[1, 1], [0, 0]]);
         click(&mut app, &ctx, "Remove pair 2");
         assert_eq!(app.join_files.as_ref().unwrap().keys, vec![[1, 1]]);
-        click(&mut app, &ctx, "Remove pair 1");
-        assert_eq!(app.join_files.as_ref().unwrap().keys.len(), 1);
         let replacement = fixture(dir.path(), "replacement.csv", b"only\nvalue\n");
         app.join_files.as_mut().unwrap().read_header(0, replacement);
         finish(&mut app);
@@ -2291,10 +3260,41 @@ mod tests {
             .iter()
             .filter(|clipped| {
                 matches!(&clipped.shape,
-            egui::Shape::Text(text) if text.galley.job.text=="Reset Analysis")
+            egui::Shape::Text(text) if text.galley.job.text=="Back to Edit")
             })
             .collect::<Vec<_>>();
-        assert!(!labels.is_empty(), "the footer must be painted");
+        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+        let node_bounds: Vec<_> = tree
+            .nodes
+            .iter()
+            .filter_map(|(_, n)| {
+                let label = n.label()?;
+                if matches!(
+                    label,
+                    "Close" | "Back to Edit" | "Join…" | "Preview" | "Cancel"
+                ) {
+                    Some((label, n.bounds()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            !labels.is_empty(),
+            "the footer must be painted; window_nodes={node_bounds:?}; texts: {:?}",
+            output
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) => Some((
+                        t.galley.job.text.as_str(),
+                        c.clip_rect,
+                        c.shape.visual_bounding_rect()
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
         assert!(
             labels.iter().all(|shape| shape
                 .clip_rect
@@ -2319,17 +3319,18 @@ mod tests {
         );
         keyboard_activate(&mut app, &ctx, "Include Main 1");
         keyboard_activate(&mut app, &ctx, "Include Additional 1");
-        keyboard_activate(&mut app, &ctx, "Output from Additional column 2: city");
+        keyboard_activate(&mut app, &ctx, "Additional column 2: city");
         for _ in 0..3 {
             keyboard_activate(&mut app, &ctx, "Move output column up");
         }
+        click(&mut app, &ctx, "Advanced");
         type_heading(&mut app, &ctx, "Destination");
         let draft = app.join_files.as_ref().unwrap();
         assert_eq!(draft.output_columns[0].source, JoinSource::Additional);
         assert_eq!(draft.output_columns[0].column, 1);
         assert_eq!(draft.output_columns[0].name, "Destination");
-        keyboard_activate(&mut app, &ctx, "Include a header row in the output");
-        click(&mut app, &ctx, "Analyze & Preview");
+        keyboard_activate(&mut app, &ctx, "Include header row");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let plan = app
             .join_files
@@ -2391,16 +3392,15 @@ b,LA
         let mut app = QuarryApp::new(None, Instant::now());
         let ctx = context();
         prepare(&mut app, dir.path());
-        click(&mut app, &ctx, "Select no Main columns");
-        click(&mut app, &ctx, "Select no Additional columns");
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "None");
+        click(&mut app, &ctx, "Preview");
         assert!(!app.join_files.as_ref().unwrap().busy());
         assert!(app.join_files.as_ref().unwrap().plan.is_none());
-        click(&mut app, &ctx, "Select all Main columns");
-        click(&mut app, &ctx, "Select all Additional columns");
-        click(&mut app, &ctx, "Output from Main column 2: name");
+        click(&mut app, &ctx, "All");
+        click(&mut app, &ctx, "Advanced");
+        click(&mut app, &ctx, "Main column 2: name");
         type_heading(&mut app, &ctx, "same");
-        click(&mut app, &ctx, "Output from Additional column 2: city");
+        click(&mut app, &ctx, "Additional column 2: city");
         type_heading(&mut app, &ctx, "same");
         assert_eq!(
             app.join_files.as_ref().unwrap().output_columns[1].name,
@@ -2433,7 +3433,7 @@ b,LA
                 .any(|s| matches!(&s.shape, egui::Shape::Text(t)
             if t.galley.text().contains("Some renamed headings are identical")))
         );
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let plan = app.join_files.as_ref().unwrap().plan.as_ref().unwrap();
         assert_eq!(
@@ -2441,7 +3441,7 @@ b,LA
             ["id (Main)", "same", "id (Additional)", "same"]
         );
         assert!(plan.analysis().duplicate_headers);
-        click(&mut app, &ctx, "Reset Analysis");
+        click(&mut app, &ctx, "Back to Edit");
         finish(&mut app);
         let replacement = fixture(
             dir.path(),
@@ -2468,7 +3468,7 @@ value
         let mut app = QuarryApp::new(None, Instant::now());
         let ctx = context();
         prepare(&mut app, dir.path());
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let output = fixture(dir.path(), "existing.csv", b"keep,this\n");
         app.join_files.as_mut().unwrap().destination = Some(output.clone());
@@ -2545,6 +3545,7 @@ value
         app.join_files.as_mut().unwrap().temporary = dir.path().to_path_buf();
         app.join_files.as_mut().unwrap().read_header(0, ap.clone());
         finish(&mut app);
+        click(&mut app, &ctx, "Advanced");
         click(&mut app, &ctx, "Main has a header row");
         finish(&mut app);
         click(&mut app, &ctx, "Main delimiter: Auto");
@@ -2560,7 +3561,7 @@ value
             Encoding::Utf8,
             "Auto does not guess a legacy encoding from an ASCII header"
         );
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.join_files.as_ref().unwrap().plan.is_none());
         assert!(
@@ -2589,8 +3590,8 @@ value
             d.output_has_header,
             "either source header enables the output header"
         );
-        click(&mut app, &ctx, "Add key pair");
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "+ Add key");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let p = app.join_files.as_ref().unwrap().plan.as_ref().unwrap();
         assert_eq!(p.analysis().matching_pairs, 1);
@@ -2620,7 +3621,7 @@ value
             finish(&mut app);
             app.join_files.as_mut().unwrap().read_header(1, bp);
             finish(&mut app);
-            click(&mut app, &ctx, "Analyze & Preview");
+            click(&mut app, &ctx, "Preview");
             finish(&mut app);
             let d = app.join_files.as_ref().unwrap();
             assert_eq!(d.headers[0].as_ref().unwrap().columns.len(), 2);
@@ -2641,10 +3642,10 @@ value
                     "I reviewed the newly discovered output columns.",
                 );
             } else {
-                click(&mut app, &ctx, "Reset Analysis");
+                click(&mut app, &ctx, "Back to Edit");
                 finish(&mut app);
                 click(&mut app, &ctx, "Include Main 2");
-                click(&mut app, &ctx, "Analyze & Preview");
+                click(&mut app, &ctx, "Preview");
                 finish(&mut app);
                 assert_eq!(
                     app.join_files
@@ -2725,10 +3726,9 @@ value
         assert!(d.plan.is_none());
         assert!(d.message.as_ref().unwrap().contains("column limit"));
         assert_eq!(d.output_columns.len(), 4);
-        click(&mut app, &ctx, "Select no Main columns");
-        click(&mut app, &ctx, "Select no Additional columns");
+        click(&mut app, &ctx, "None");
         click(&mut app, &ctx, "Include Additional 2");
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let output = dir.path().join("recovered.csv");
         app.join_files.as_mut().unwrap().destination = Some(output.clone());
@@ -2820,7 +3820,7 @@ value
                     .map(|doc| (tab.id, doc.edit_history.clone()))
             })
             .collect();
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.join_files.as_ref().unwrap().plan.is_some());
         for tab in app.document_tabs() {
@@ -2966,7 +3966,7 @@ value
         }
         app.select_join_input_path(1, b).unwrap();
         finish(&mut app);
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.join_files.as_ref().unwrap().plan.is_none());
         assert!(
@@ -2978,10 +3978,10 @@ value
                 .unwrap()
                 .contains("refreshed columns")
         );
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.active.document.as_ref().unwrap().join_reserved());
-        click(&mut app, &ctx, "Reset Analysis");
+        click(&mut app, &ctx, "Back to Edit");
         finish(&mut app);
         assert!(!app.active.document.as_ref().unwrap().join_reserved());
         app.active
@@ -3019,7 +4019,7 @@ value
             JoinConfig::default().max_record_bytes + 1
         );
         assert!(doc.cell_edits.is_empty());
-        assert!(app.join_files.as_ref().unwrap().header_job.is_none());
+        assert!(!app.join_files.as_ref().unwrap().has_header_job());
     }
     #[test]
     fn current_native_encoding_and_unrepresentable_unsaved_values_join_as_utf8() {
@@ -3064,7 +4064,7 @@ value
         app.select_join_input_path(1, b).unwrap();
         finish(&mut app);
         let ctx = context();
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let output = dir.path().join("current-utf8.tsv");
         app.join_files.as_mut().unwrap().destination = Some(output.clone());
@@ -3144,7 +4144,7 @@ value
         app.select_join_input_path(1, b).unwrap();
         finish(&mut app);
         let ctx = context();
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let history = app.active.document.as_ref().unwrap().edit_history.clone();
         assert!(app.active.document.as_ref().unwrap().join_reserved());
@@ -3189,7 +4189,7 @@ value
             doc.cell_edit.as_mut().unwrap().draft = "current".into();
         }
         let ctx = context();
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(
             app.join_files.as_ref().unwrap().plan.is_some(),
@@ -3317,7 +4317,7 @@ value
             finish(&mut app);
         }
         let ctx = context();
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert!(app.join_files.as_ref().unwrap().plan.is_some());
         let histories: Vec<_> = ids
@@ -3397,7 +4397,7 @@ value
         }
         app.join_files.as_mut().unwrap().mode = JoinMode::Inner;
         let ctx = context();
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert_eq!(
             app.join_files
@@ -3476,7 +4476,7 @@ value
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(1000.0, 750.0),
+                        egui::vec2(1000.0, 500.0),
                     )),
                     events,
                     ..Default::default()
@@ -3494,7 +4494,7 @@ value
         let visible = |output: &egui::FullOutput| {
             output.shapes.iter().any(|shape| {
                 matches!(&shape.shape, egui::Shape::Text(text)
-                if text.galley.text() == "Ignore ASCII letter case (A–Z only)"
+                if text.galley.text() == "Ignore case (A–Z)"
                 && shape.clip_rect.contains_rect(shape.shape.visual_bounding_rect()))
             })
         };
@@ -3519,7 +4519,7 @@ value
             for (id, node) in &tree.nodes {
                 if let Some(label) = node.label() {
                     labels.insert(id.0, label.to_owned());
-                    if label == "Ignore ASCII letter case (A–Z only)" {
+                    if label == "Ignore case (A–Z)" {
                         target = Some(id.0);
                     }
                 }
@@ -3627,7 +4627,7 @@ value
         app.select_join_input_path(1, b).unwrap();
         finish(&mut app);
         let ctx = context();
-        click(&mut app, &ctx, "Analyze & Preview");
+        click(&mut app, &ctx, "Preview");
         finish(&mut app);
         let history = app.active.document.as_ref().unwrap().edit_history.clone();
         assert!(app.active.document.as_ref().unwrap().join_reserved());
@@ -3682,5 +4682,429 @@ value
         let out = dir.path().join("joined.csv");
         app.choose_join_output(out.clone());
         assert_eq!(app.join_files.as_ref().unwrap().destination, Some(out));
+    }
+
+    #[test]
+    fn one_click_join_analyzes_writes_and_auto_opens_in_new_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = fixture(dir.path(), "other.csv", b"name,id\nOther,1\n");
+        let mut app = QuarryApp::new(Some(other), Instant::now());
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .rename_header(0, "Edited".into())
+            .unwrap();
+        let other_id = app.active.id;
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        let output = dir.path().join("direct.csv");
+        app.start_join_to(output.clone());
+        assert!(app.join_reserves_path(&output));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.join_files.is_some() {
+            if Instant::now() >= deadline {
+                let d = app.join_files.as_ref().unwrap();
+                panic!(
+                    "one-click join timed out: plan={} result={} checking={} writing={} cleanup={} intent={:?} dest={:?} msg={:?}",
+                    d.plan.is_some(),
+                    d.result.is_some(),
+                    d.checking.is_some(),
+                    d.writing.is_some(),
+                    d.cleanup.is_some(),
+                    d.intent,
+                    d.destination,
+                    d.message,
+                );
+            }
+            frame(&mut app, &ctx, vec![]);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            b"id (Main),name,id (Additional),city\nb,Bob,b,LA\na,Alice,a,Seattle\nz,Last,,\n"
+        );
+        assert_eq!(app.active.document.as_ref().unwrap().logical_path, output);
+        assert!(
+            app.document_tabs()
+                .any(|tab| tab.id == other_id && tab.document.as_ref().unwrap().is_dirty())
+        );
+    }
+
+    #[test]
+    fn one_click_join_pauses_for_confirmation_gates_then_creates_and_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        let (a, b) = prepare(&mut app, dir.path());
+        fs::write(&a, b"id,name\nx,A\nx,B\n").unwrap();
+        fs::write(&b, b"id,city\nx,One\nx,Two\n").unwrap();
+        app.join_files.as_mut().unwrap().read_header(0, a);
+        app.join_files.as_mut().unwrap().read_header(1, b);
+        finish(&mut app);
+        let output = dir.path().join("gated.csv");
+        app.start_join_to(output.clone());
+        finish(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(
+            dialog.plan.is_some(),
+            "many-to-many join must pause for review"
+        );
+        assert!(dialog.writing.is_none());
+        assert!(!output.exists());
+        click(&mut app, &ctx, "I understand this will create 4 rows.");
+        click(&mut app, &ctx, "Create Joined File");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.join_files.is_some() {
+            assert!(Instant::now() < deadline, "confirmed join timed out");
+            frame(&mut app, &ctx, vec![]);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            b"id (Main),name,id (Additional),city\nx,A,x,One\nx,A,x,Two\nx,B,x,One\nx,B,x,Two\n"
+        );
+        assert_eq!(app.active.document.as_ref().unwrap().logical_path, output);
+    }
+
+    #[test]
+    fn open_join_files_preselects_idle_open_tabs_and_swap_switches_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "orders.csv", b"id,total\n1,50\n");
+        let b = fixture(dir.path(), "customers.csv", b"id,city\n1,Paris\n");
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_path_with_options(
+            a.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finish_document(&mut app);
+        app.open_document_tab_with_encoding(
+            b.clone(),
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Utf8),
+        )
+        .unwrap();
+        finish_document(&mut app);
+        app.open_join_files();
+        finish(&mut app);
+        let dialog = app.join_files.as_mut().unwrap();
+        assert_eq!(dialog.paths[0].as_ref(), Some(&b));
+        assert_eq!(dialog.paths[1].as_ref(), Some(&a));
+        assert!(dialog.headers[0].is_some() && dialog.headers[1].is_some());
+        dialog.output_columns[1].included = false;
+        dialog.output_columns[1].name = "Town".into();
+        dialog.output_has_header = false;
+        let ctx = context();
+        click(&mut app, &ctx, "Swap");
+        let dialog = app.join_files.as_ref().unwrap();
+        assert_eq!(dialog.paths[0].as_ref(), Some(&a));
+        assert_eq!(dialog.paths[1].as_ref(), Some(&b));
+        assert_eq!(dialog.output_columns[0].source, JoinSource::Main);
+        assert!(!dialog.output_has_header);
+        assert!(
+            dialog
+                .output_columns
+                .iter()
+                .any(|c| c.source == JoinSource::Additional
+                    && c.column == 1
+                    && !c.included
+                    && c.name == "Town"),
+            "swap must preserve output column selection, renames, and header choice"
+        );
+    }
+
+    #[test]
+    fn cancelling_one_click_join_as_analysis_completes_does_not_auto_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        let output = dir.path().join("cancelled.csv");
+        app.start_join_to(output.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .join_files
+            .as_ref()
+            .unwrap()
+            .checking
+            .as_ref()
+            .unwrap()
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline, "analysis timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Cancel after the worker completed but before poll adopts the plan.
+        app.join_files.as_mut().unwrap().cancel();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(dialog.writing.is_none());
+        assert!(!dialog.pending_auto_write);
+        assert!(
+            !output.exists(),
+            "cancelled join must not automatically write"
+        );
+    }
+
+    #[test]
+    fn output_column_rail_supports_top_bottom_and_main_only_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        click(&mut app, &ctx, "Main only");
+        let draft = app.join_files.as_ref().unwrap();
+        assert!(draft.output_columns[0].included);
+        assert!(draft.output_columns[1].included);
+        assert!(!draft.output_columns[2].included);
+        assert!(!draft.output_columns[3].included);
+        click(&mut app, &ctx, "All");
+        click(&mut app, &ctx, "Additional column 2: city");
+        click(&mut app, &ctx, "Move output column to top");
+        let draft = app.join_files.as_ref().unwrap();
+        assert_eq!(draft.output_columns[0].source, JoinSource::Additional);
+        assert_eq!(draft.output_columns[0].column, 1);
+        click(&mut app, &ctx, "Move output column to bottom");
+        let draft = app.join_files.as_ref().unwrap();
+        assert_eq!(draft.output_columns[3].source, JoinSource::Additional);
+        assert_eq!(draft.output_columns[3].column, 1);
+    }
+
+    #[test]
+    fn join_window_width_stays_stable_across_repeated_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let assert_stable = |label: &str, app: &mut QuarryApp, ctx: &egui::Context| {
+            let mut widths = Vec::new();
+            for i in 0..16 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 800.0),
+                        )),
+                        events: vec![egui::Event::PointerMoved(egui::pos2(
+                            100.0 + (i as f32) * 5.0,
+                            150.0,
+                        ))],
+                        ..Default::default()
+                    },
+                    |ctx| app.show_join_files(ctx),
+                );
+                let width = output
+                    .shapes
+                    .iter()
+                    .map(|c| c.shape.visual_bounding_rect().right())
+                    .fold(0.0_f32, f32::max);
+                widths.push(width);
+            }
+            let settled = widths[2];
+            let final_w = *widths.last().unwrap();
+            assert!(
+                (final_w - settled).abs() <= 0.5,
+                "{label}: join dialog width grew across frames: {widths:?}"
+            );
+        };
+
+        // 1. Empty dialog (no files chosen).
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        app.open_join_files();
+        assert_stable("empty", &mut app, &ctx);
+
+        // 2. Two files loaded.
+        prepare(&mut app, dir.path());
+        assert_stable("loaded", &mut app, &ctx);
+
+        // 3. Compound keys (+ Add key).
+        click(&mut app, &ctx, "+ Add key");
+        assert_stable("compound-keys", &mut app, &ctx);
+
+        // 4. Advanced expanded.
+        click(&mut app, &ctx, "Advanced");
+        assert_stable("advanced", &mut app, &ctx);
+
+        // 5. Preview open.
+        click(&mut app, &ctx, "Preview");
+        finish(&mut app);
+        assert_stable("preview", &mut app, &ctx);
+    }
+
+    #[test]
+    fn replacing_preselected_tsv_tab_with_saved_csv_resets_delimiter_to_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = fixture(dir.path(), "tab.tsv", b"id\tname\n1\tTab\n");
+        let csv = fixture(dir.path(), "saved.csv", b"id,name\n1,Alice\n");
+        let other = fixture(dir.path(), "other.csv", b"id,city\n1,Paris\n");
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_document_tab_with_encoding(
+            tsv,
+            OpenOptions {
+                delimiter: Some(b'\t'),
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Utf8),
+        )
+        .unwrap();
+        finish_document(&mut app);
+        app.open_join_files();
+        finish(&mut app);
+        assert_eq!(
+            app.join_files.as_ref().unwrap().formats[0].delimiter,
+            Some(b'\t')
+        );
+        // Replace the preselected TSV tab with a saved CSV file.
+        app.select_join_input_path(0, csv).unwrap();
+        finish(&mut app);
+        app.select_join_input_path(1, other).unwrap();
+        finish(&mut app);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert_eq!(dialog.formats[0].delimiter, None);
+        assert_eq!(dialog.headers[0].as_ref().unwrap().delimiter, b',');
+        assert_eq!(dialog.headers[0].as_ref().unwrap().columns, ["id", "name"]);
+        let ctx = context();
+        let output = dir.path().join("joined-csv.csv");
+        app.start_join_to(output.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.join_files.is_some() {
+            assert!(Instant::now() < deadline, "join timed out");
+            frame(&mut app, &ctx, vec![]);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fs::read(output).unwrap(),
+            b"id (Main),name,id (Additional),city\n1,Alice,1,Paris\n"
+        );
+    }
+
+    #[test]
+    fn clicking_cancel_on_the_frame_analysis_completes_blocks_auto_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        // Capture the Cancel button's AccessKit ID deterministically while busy.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        app.join_files.as_mut().unwrap().cleanup = Some(thread::spawn(move || {
+            let _ = rx.recv();
+            Ok(())
+        }));
+        let rendered = frame(&mut app, &ctx, vec![]);
+        let cancel_id = rendered
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|tree| {
+                tree.nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some("Cancel"))
+                    .map(|(id, _)| *id)
+            })
+            .expect("busy join dialog should expose a Cancel button");
+        drop(tx);
+        finish(&mut app);
+
+        let output = dir.path().join("cancel-click.csv");
+        app.start_join_to(output.clone());
+        // Wait for checking to finish before the next frame so poll() sets
+        // pending_auto_write on the exact frame the queued Cancel click arrives.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .join_files
+            .as_ref()
+            .unwrap()
+            .checking
+            .as_ref()
+            .is_some_and(|job| !job.progress().done)
+        {
+            assert!(Instant::now() < deadline, "analysis timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: cancel_id,
+                    data: None,
+                },
+            )],
+        );
+        finish(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(dialog.writing.is_none());
+        assert!(dialog.plan.is_none());
+        assert_eq!(
+            dialog.message.as_deref(),
+            Some("Join cancelled. No output was created.")
+        );
+        assert!(
+            !output.exists(),
+            "Cancel click must prevent automatic write"
+        );
+    }
+
+    #[test]
+    fn superseded_header_workers_are_bounded_and_tracked_until_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = fixture(dir.path(), "ready.csv", b"id,name\n1,Alice\n");
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        app.open_join_files();
+
+        let done_flags: Vec<_> = (0..MAX_RETIRED_HEADER_JOBS)
+            .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .collect();
+        for flag in &done_flags {
+            app.join_files
+                .as_mut()
+                .unwrap()
+                .retired_headers
+                .push(RetiredHeader::Pending(Arc::clone(flag)));
+        }
+
+        // While retired header workers are at the limit, the dialog stays
+        // responsive, counts the active slot, and refuses additional probes.
+        assert!(!app.can_start_join_header());
+        assert!(app.join_files.as_ref().unwrap().has_header_job());
+        assert!(app.join_files.as_ref().unwrap().busy());
+        frame(&mut app, &ctx, vec![]);
+        let err = app
+            .select_join_input_path(0, csv.clone())
+            .expect_err("replacement must be refused once retired header limit is reached");
+        assert_eq!(err, RETIRED_HEADER_BUSY);
+        assert_eq!(
+            app.join_files.as_ref().unwrap().retired_headers.len(),
+            MAX_RETIRED_HEADER_JOBS
+        );
+
+        // Once a retired worker completes, poll() removes it and allows a new read.
+        done_flags[0].store(true, std::sync::atomic::Ordering::Release);
+        app.select_join_input_path(0, csv).unwrap();
+        assert_eq!(
+            app.join_files.as_ref().unwrap().retired_headers.len(),
+            MAX_RETIRED_HEADER_JOBS - 1
+        );
+
+        for flag in &done_flags {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        finish(&mut app);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(dialog.retired_headers.is_empty());
+        assert!(app.can_start_join_header());
+        assert_eq!(dialog.headers[0].as_ref().unwrap().columns, ["id", "name"]);
     }
 }

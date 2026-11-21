@@ -415,36 +415,18 @@ pub(super) fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.label(egui::RichText::new(text).size(12.0).color(color))
 }
 
-/// A numbered step in a multi-step dialog: a soft card with a step badge and title.
-pub(super) fn step_card<R>(
-    ui: &mut egui::Ui,
-    step: u8,
-    title: &str,
-    add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
+/// A soft inset card used to group related controls inside a dialog.
+pub(super) fn inset_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let palette = ui_palette(ui);
+    let inner_width = (ui.available_width() - 22.0).max(0.0);
     egui::Frame::new()
         .fill(palette.zebra)
         .stroke(Stroke::new(1.0, palette.grid_line))
         .corner_radius(CornerRadius::same(8))
-        .inner_margin(egui::Margin::same(14))
+        .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let (badge, _) =
-                    ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
-                ui.painter()
-                    .circle_filled(badge.center(), 10.0, palette.selection);
-                ui.painter().text(
-                    badge.center(),
-                    egui::Align2::CENTER_CENTER,
-                    step.to_string(),
-                    FontId::proportional(12.0),
-                    palette.accent_text,
-                );
-                ui.label(egui::RichText::new(title).size(15.0).color(palette.text));
-            });
-            ui.add_space(2.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
             add_contents(ui)
         })
         .inner

@@ -8,6 +8,12 @@ Tagged beta releases are noted on the day they were published, with exact
 checksums and verification details under `docs/releases/`. Numbers in
 parentheses are GitHub pull requests.
 
+## [2026-11-21]
+
+### Changed
+
+- Simplified **File → Join Files…** into a single-screen layout: side-by-side **Main file** and **Additional file** cards combine open-tab selection (auto-preselecting up to two idle open tabs) with **Browse file…**, **Key column**, and **Include unmatched Main/Additional rows** checkboxes; a compact options bar provides **Ignore case (A–Z)**, **Include header row**, **+ Add key**, **Swap**, and a live join-type summary; **Output columns** offers **All** / **Main only** / **None** and a vertical **Top** / **Up** / **Down** / **Bottom** rail; saved-file format overrides, unique-key constraints, and column heading renaming move into a collapsed **Advanced** section; and **Join…** scans, writes, and opens the result in a new tab in one pass (pausing only when many-to-many expansion or newly discovered columns require confirmation, with an optional **Preview** button). Updated `docs/DESIGN.md` and `docs/USER_GUIDE.md`. (#146)
+
 ## [2026-11-20]
 
 ### Added
