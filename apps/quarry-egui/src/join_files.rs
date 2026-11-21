@@ -12,6 +12,35 @@ use std::thread::{self, JoinHandle};
 pub(super) const INPUT_RESERVED: &str =
     "This document is being used by Join Files. Reset or close the join before changing it.";
 
+/// Maximum unfinished superseded header probes kept off-thread at once.
+const MAX_RETIRED_HEADER_JOBS: usize = 2;
+const RETIRED_HEADER_BUSY: &str =
+    "Wait for the previous column read to finish before choosing another file.";
+
+enum RetiredHeader {
+    Job(JoinJob<HeaderInfo>),
+    #[cfg(test)]
+    Pending(Arc<std::sync::atomic::AtomicBool>),
+}
+
+impl RetiredHeader {
+    fn is_done(&self) -> bool {
+        match self {
+            Self::Job(job) => job.progress().done,
+            #[cfg(test)]
+            Self::Pending(done) => done.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            Self::Job(job) => job.cancel(),
+            #[cfg(test)]
+            Self::Pending(_) => {}
+        }
+    }
+}
+
 struct DocumentLease {
     counter: Arc<std::sync::atomic::AtomicUsize>,
     generation: Option<Arc<quarry_core::WorkingCopyStorage>>,
@@ -260,7 +289,7 @@ pub(super) struct JoinDialog {
     mode: JoinMode,
     temporary: PathBuf,
     header_jobs: [Option<JoinJob<HeaderInfo>>; 2],
-    retired_headers: Vec<JoinJob<HeaderInfo>>,
+    retired_headers: Vec<RetiredHeader>,
     checking: Option<JoinJob<JoinPlan>>,
     writing: Option<JoinJob<JoinSummary>>,
     cleanup: Option<JoinHandle<Result<(), String>>>,
@@ -337,6 +366,30 @@ impl JoinDialog {
 
     fn has_header_job(&self) -> bool {
         self.header_jobs.iter().any(Option::is_some) || !self.retired_headers.is_empty()
+    }
+
+    fn can_retire_header_job(&self) -> bool {
+        self.retired_headers.len() < MAX_RETIRED_HEADER_JOBS
+    }
+
+    fn retire_header_job(&mut self, side: usize) -> bool {
+        self.retired_headers.retain(|job| !job.is_done());
+        let Some(previous) = self.header_jobs[side].as_ref() else {
+            return true;
+        };
+        if previous.progress().done {
+            self.header_jobs[side].take();
+            return true;
+        }
+        if !self.can_retire_header_job() {
+            previous.cancel();
+            self.message = Some(RETIRED_HEADER_BUSY.into());
+            return false;
+        }
+        let previous = self.header_jobs[side].take().unwrap();
+        previous.cancel();
+        self.retired_headers.push(RetiredHeader::Job(previous));
+        true
     }
 
     /// Keep the dialog alive until both workers and explicit cleanup have finished.
@@ -431,12 +484,10 @@ impl JoinDialog {
 
     /// Request worker cancellation without dropping a running writer on the UI thread.
     fn cancel(&mut self) {
-        for job in self
-            .header_jobs
-            .iter()
-            .flatten()
-            .chain(&self.retired_headers)
-        {
+        for job in self.header_jobs.iter().flatten() {
+            job.cancel();
+        }
+        for job in &self.retired_headers {
             job.cancel();
         }
         if let Some(job) = &self.checking {
@@ -505,7 +556,7 @@ impl JoinDialog {
 
     /// Adopt completed workers and retain published results even after cancellation.
     fn poll(&mut self) {
-        self.retired_headers.retain(|job| !job.progress().done);
+        self.retired_headers.retain(|job| !job.is_done());
         for side in 0..2 {
             if self.header_jobs[side]
                 .as_ref()
@@ -637,9 +688,8 @@ impl JoinDialog {
 
     /// Read picker metadata off-thread with a separate bounded label budget.
     fn read_header(&mut self, side: usize, path: PathBuf) {
-        if let Some(previous) = self.header_jobs[side].take() {
-            previous.cancel();
-            self.retired_headers.push(previous);
+        if !self.retire_header_job(side) {
+            return;
         }
         let switching_source = self.document_inputs[side].take().is_some()
             || self.paths[side].as_deref() != Some(path.as_path());
@@ -660,9 +710,8 @@ impl JoinDialog {
     }
 
     fn read_document_header(&mut self, side: usize, captured: CapturedDocument) {
-        if let Some(previous) = self.header_jobs[side].take() {
-            previous.cancel();
-            self.retired_headers.push(previous);
+        if !self.retire_header_job(side) {
+            return;
         }
         let CapturedDocument {
             path,
@@ -2042,18 +2091,22 @@ impl QuarryApp {
     }
 
     fn can_start_join_header(&self) -> bool {
-        self.write_slot_available()
-            || (!self.quitting_cleanup()
-                && self
-                    .join_files
-                    .as_ref()
-                    .is_some_and(JoinDialog::has_header_job))
+        let Some(dialog) = self.join_files.as_ref() else {
+            return false;
+        };
+        if !dialog.can_retire_header_job() {
+            return false;
+        }
+        self.write_slot_available() || (!self.quitting_cleanup() && dialog.has_header_job())
     }
 
     fn select_join_document(&mut self, side: usize, id: u64) -> Result<(), String> {
         self.join_files.as_mut().unwrap().poll();
         if !self.join_files.as_ref().unwrap().can_change_input() {
             return Err("Reset the retained analysis before changing inputs.".into());
+        }
+        if !self.join_files.as_ref().unwrap().can_retire_header_job() {
+            return Err(RETIRED_HEADER_BUSY.into());
         }
         if !self.can_start_join_header() {
             return Err("Wait for an operation slot before reading this input.".into());
@@ -2103,6 +2156,7 @@ impl QuarryApp {
         side: usize,
         path: PathBuf,
     ) -> Result<(), String> {
+        self.join_files.as_mut().unwrap().poll();
         if !self.join_files.as_ref().unwrap().can_change_input() {
             return Err("Reset the retained analysis before changing inputs.".into());
         }
@@ -2117,6 +2171,8 @@ impl QuarryApp {
                 .is_some_and(|document| private_working_path(document, &path))
         }) {
             Err("This is a private history file. Select the current document from the open-document menu instead.".into())
+        } else if !self.join_files.as_ref().unwrap().can_retire_header_job() {
+            Err(RETIRED_HEADER_BUSY.into())
         } else if self.can_start_join_header() {
             self.join_files.as_mut().unwrap().read_header(side, path);
             Ok(())
@@ -4998,5 +5054,57 @@ value
             !output.exists(),
             "Cancel click must prevent automatic write"
         );
+    }
+
+    #[test]
+    fn superseded_header_workers_are_bounded_and_tracked_until_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = fixture(dir.path(), "ready.csv", b"id,name\n1,Alice\n");
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        app.open_join_files();
+
+        let done_flags: Vec<_> = (0..MAX_RETIRED_HEADER_JOBS)
+            .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .collect();
+        for flag in &done_flags {
+            app.join_files
+                .as_mut()
+                .unwrap()
+                .retired_headers
+                .push(RetiredHeader::Pending(Arc::clone(flag)));
+        }
+
+        // While retired header workers are at the limit, the dialog stays
+        // responsive, counts the active slot, and refuses additional probes.
+        assert!(!app.can_start_join_header());
+        assert!(app.join_files.as_ref().unwrap().has_header_job());
+        assert!(app.join_files.as_ref().unwrap().busy());
+        frame(&mut app, &ctx, vec![]);
+        let err = app
+            .select_join_input_path(0, csv.clone())
+            .expect_err("replacement must be refused once retired header limit is reached");
+        assert_eq!(err, RETIRED_HEADER_BUSY);
+        assert_eq!(
+            app.join_files.as_ref().unwrap().retired_headers.len(),
+            MAX_RETIRED_HEADER_JOBS
+        );
+
+        // Once a retired worker completes, poll() removes it and allows a new read.
+        done_flags[0].store(true, std::sync::atomic::Ordering::Release);
+        app.select_join_input_path(0, csv).unwrap();
+        assert_eq!(
+            app.join_files.as_ref().unwrap().retired_headers.len(),
+            MAX_RETIRED_HEADER_JOBS - 1
+        );
+
+        for flag in &done_flags {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        finish(&mut app);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(dialog.retired_headers.is_empty());
+        assert!(app.can_start_join_header());
+        assert_eq!(dialog.headers[0].as_ref().unwrap().columns, ["id", "name"]);
     }
 }
