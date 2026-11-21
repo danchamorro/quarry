@@ -617,6 +617,10 @@ mod tests {
         assert_eq!(index.nearest_checkpoint(u64::MAX).row, 1_u64 << 63);
     }
 
+    /// Unix filesystems (APFS, ext4, XFS, btrfs) create zero-allocation sparse holes on
+    /// seek + write; on Windows a non-sparse file would physically allocate the entire gap
+    /// without `FSCTL_SET_SPARSE`, so this test is restricted to Unix targets.
+    #[cfg(unix)]
     #[test]
     fn sparse_file_seek_and_read_near_large_offset_without_scanning_hole() {
         use std::io::{Read, Seek, SeekFrom, Write};
