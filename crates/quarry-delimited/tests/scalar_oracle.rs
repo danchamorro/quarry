@@ -501,3 +501,49 @@ fn scanner_and_parser_handle_records_below_at_and_above_64_mib() {
         assert_eq!(parsed[1].as_ref(), b"z");
     }
 }
+
+#[test]
+fn scalar_oracle_matches_parse_record_on_malformed_inputs_and_invalid_delimiters() {
+    let malformed: &[&[u8]] = &[
+        b"bad\"quote,2\n",
+        b"a,bad\"quote\r\n",
+        b"\"ok\"x,2\n",
+        b"\"ok\" \n",
+        b"\"unterminated,2",
+        b"a,\"unterminated\n",
+        b"\"a\"\"b\"c,d\n",
+        b"\"ok\"\rx\n",
+        b"\"\"\"x,2\n",
+    ];
+
+    for &delimiter in b",\t;|\"\r\n" {
+        for &record in malformed {
+            let actual = parse_record(record, delimiter)
+                .map(|fields| fields.into_iter().map(Cow::into_owned).collect::<Vec<_>>());
+            let expected = scalar_oracle_parse_record(record, delimiter);
+            assert_eq!(
+                actual, expected,
+                "parse_record diverged for delimiter={delimiter:?} record={record:?}"
+            );
+        }
+    }
+
+    // Also compare random byte records (both valid and malformed) directly against the parser oracle.
+    let mut rng = XorShift64(0x9A1F_0202_6112_1002);
+    let alphabet: &[u8] = b"ab,\"\r\n\t;|x ";
+    for case_idx in 0..250 {
+        let delimiter = b",\t;|"[case_idx % 4];
+        let len = rng.gen_range(48);
+        let mut record = Vec::with_capacity(len);
+        for _ in 0..len {
+            record.push(alphabet[rng.gen_range(alphabet.len())]);
+        }
+        let actual = parse_record(&record, delimiter)
+            .map(|fields| fields.into_iter().map(Cow::into_owned).collect::<Vec<_>>());
+        let expected = scalar_oracle_parse_record(&record, delimiter);
+        assert_eq!(
+            actual, expected,
+            "random parse_record case={case_idx} delimiter={delimiter:?} record={record:?}"
+        );
+    }
+}
