@@ -99,6 +99,7 @@ Reproduce in the VM from a clean checkout. Each `--root` must not exist yet
 (the cancel case reuses the large fixture):
 
 ```sh
+mkdir -p /tmp/q69
 python3 scripts/bench-compressed-acceptance.py --case large --root /tmp/q69/large
 python3 scripts/bench-compressed-acceptance.py --case cancel --root /tmp/q69/large --reuse
 python3 scripts/bench-compressed-acceptance.py --case limit --root /tmp/q69/limit

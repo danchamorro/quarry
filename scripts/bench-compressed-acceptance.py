@@ -374,7 +374,8 @@ def run_limit(binary, root, fixtures, smoke):
         assert metrics["error_stage"] == "decompress", metrics
     # The bootstrap stops a smaller bomb before any private copy exists.
     assert metrics.get("peak_decompressed_bytes_observed", 0) <= limit, metrics
-    assert run["peak_allocated_bytes_sampled"]["temp"] <= limit, run
+    # Sampled allocation stays in the report as its own measurement. It is not held
+    # to the logical limit: file systems allocate in blocks and may preallocate.
     assert metrics["residual_workspaces"] == 0 and metrics["cleanup_errors"] == 0, metrics
     assert not list(temp.iterdir()), "partial decompressed data remains"
     assert not residue(root), residue(root)
@@ -474,6 +475,11 @@ def run(args):
             fixtures = generate_small(root, args.case, args.smoke)
             manifest = {name: {key: (str(value) if key == "path" else value)
                                for key, value in fixture.items()} for name, fixture in fixtures.items()}
+    if args.case == "large" and not args.smoke:
+        # Checked for fresh and reused fixtures alike: a fixture made on a smaller
+        # machine must not pass as larger than this machine's RAM.
+        assert manifest["uncompressed_bytes"] > machine["ram_bytes"], (
+            "The large fixture must be larger than this machine's RAM.")
     if (root / (args.case + ".report.json")).exists():
         raise SystemExit("Refusing to overwrite an existing report for " + args.case)
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()

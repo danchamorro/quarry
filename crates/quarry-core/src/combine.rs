@@ -218,15 +218,16 @@ pub fn check_combine_files_with_encoding(
                     "This file was selected more than once.",
                 ));
             }
-            if let Some(problem) =
-                crate::compressed::compressed_input_problem(&canonical, "Combine Files")
-            {
-                return Err(input_error(&path, None, problem));
-            }
             let mut file =
                 File::open(&canonical).map_err(|error| input_error(&path, None, error))?;
             if !file.metadata()?.is_file() {
                 return Err(input_error(&path, None, "Select a regular file."));
+            }
+            // Classify the handle that is read below, not a second open of the path.
+            if let Some(problem) =
+                crate::compressed::compressed_file_problem(&mut file, &canonical, "Combine Files")
+            {
+                return Err(input_error(&path, None, problem));
             }
             let stamp = SourceStamp::from_file(&file)?;
             let encoding = Encoding::detect(&mut file, requested_encoding)

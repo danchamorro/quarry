@@ -113,7 +113,9 @@ no second scan runs, and search, filters, filtered export, Save As, and
 inspection read the copy unchanged.
 
 The pass verifies every gzip member's CRC-32 and length and rejects trailing
-data. It rechecks free space every 64 MiB against a 256 MiB reserve and honours
+data. It keeps a 256 MiB free-space reserve, checked before the first write and
+every 64 MiB (and up front with the exact size when the bootstrap verified it),
+and honours
 an optional decompressed-size cap (`--max-decompressed-bytes` in the CLI).
 Cancelling, a failure, or closing the document deletes the copy; the CLI also
 cancels on Ctrl-C. In the app, a cancelled or failed open keeps only the

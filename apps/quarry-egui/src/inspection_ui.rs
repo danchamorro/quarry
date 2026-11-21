@@ -7,6 +7,13 @@ use quarry_core::{
     SourcePreview, WorkingCopyCleanup,
 };
 
+/// A raw decompression and the file-operation slot it holds until its worker exits.
+struct RawDecompression {
+    job: CompressedRawDecompressJob,
+    /// Declared after the job, so it is freed only once the worker has exited.
+    _slot: compressed::DecompressionSlot,
+}
+
 const DECOMPRESSION_CANCELLED: &str =
     "Decompression cancelled; temporary files were removed. Choose Inspect again to retry.";
 
@@ -90,10 +97,12 @@ pub(super) struct InspectionUi {
     encoding: Option<Encoding>,
     confirm_destination: Option<PathBuf>,
     /// A gzip target is first decompressed, without parsing, into a private copy.
-    decompression: Option<CompressedRawDecompressJob>,
+    decompression: Option<RawDecompression>,
     /// Where that copy is written, and where its cleanup failures are reported.
     working_directory: PathBuf,
     working_cleanup: WorkingCopyCleanup,
+    /// The app's decompression slots, which the raw pass claims.
+    decompression_slots: compressed::DecompressionSlots,
     /// The verified copy that the report, previews and recovery read. Declared last so
     /// it drops after every worker that reads it.
     private_copy: Option<DecompressedCopy>,
@@ -124,6 +133,7 @@ impl Default for InspectionUi {
             decompression: None,
             working_directory: std::env::temp_dir(),
             working_cleanup: WorkingCopyCleanup::default(),
+            decompression_slots: compressed::DecompressionSlots::default(),
             private_copy: None,
         }
     }
@@ -158,7 +168,7 @@ impl InspectionUi {
             j.cancel();
         }
         if let Some(j) = &self.decompression {
-            j.cancel();
+            j.job.cancel();
         }
     }
     /// Retains a failed-open target and a bounded preview without replacing the current document.
@@ -232,14 +242,14 @@ impl InspectionUi {
     /// Replaces any old private copy; inspection starts when the new copy is verified.
     fn start_decompression(&mut self, path: &Path) -> Result<(), String> {
         self.private_copy = None;
-        self.decompression = Some(
-            CompressedRawDecompressJob::start(
-                path,
-                CompressedOpenConfig::new(self.working_directory.clone()),
-                self.working_cleanup.clone(),
-            )
-            .map_err(|e| e.to_string())?,
-        );
+        let slot = self.decompression_slots.claim();
+        let job = CompressedRawDecompressJob::start(
+            path,
+            CompressedOpenConfig::new(self.working_directory.clone()),
+            self.working_cleanup.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        self.decompression = Some(RawDecompression { job, _slot: slot });
         self.report = None;
         self.selected.clear();
         self.focused = 0;
@@ -281,9 +291,9 @@ impl InspectionUi {
         if self
             .decompression
             .as_ref()
-            .is_some_and(|j| j.progress().done)
+            .is_some_and(|j| j.job.progress().done)
         {
-            match self.decompression.take().unwrap().wait() {
+            match self.decompression.take().unwrap().job.wait() {
                 Ok(Some(copy)) => {
                     self.private_copy = Some(copy);
                     if let Err(e) = self.start() {
@@ -422,6 +432,7 @@ impl QuarryApp {
         let state = &mut self.active.inspection;
         state.working_directory = self.working_directory.clone();
         state.working_cleanup = self.working_cleanup.clone();
+        state.decompression_slots = self.decompression_slots.clone();
         if let Err(e) = state.start() {
             state.message = Some(e);
         }
@@ -787,8 +798,8 @@ fn draw_inspection(
             ),
         );
     }
-    if let Some(job) = &state.decompression {
-        let p = job.progress();
+    if let Some(decompression) = &state.decompression {
+        let p = decompression.job.progress();
         ui.add(
             egui::ProgressBar::new(progress_fraction(
                 p.compressed_bytes_read,

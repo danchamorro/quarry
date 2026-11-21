@@ -68,12 +68,14 @@ disk space equal to the decompressed size, which the bounds below control.
   writes a chunk that would exceed it, then fails with
   `DecompressionLimitExceeded` and deletes the partial copy. The bootstrap
   applies the same cap to its in-memory bytes.
-- Before starting, the job inspects the temporary folder and requires at least
-  the compressed size in free space. While writing, it rechecks free space
-  every `space_check_interval_bytes` (64 MiB by default). It stops with
-  `InsufficientStorage` when free space falls below
-  `min_free_space_reserve_bytes` (256 MiB by default). The first check happens
-  only after 64 MiB, so small files work in tight test folders.
+- Before starting, the job inspects the temporary folder. When the bootstrap
+  verified the exact decompressed size, it requires that size plus
+  `min_free_space_reserve_bytes` (256 MiB by default); otherwise it requires
+  the reserve alone. The compressed size is not used: a file with many empty
+  gzip members can be larger than its output. While writing, the reserve plus
+  the next chunk must be free before the first write and again every
+  `space_check_interval_bytes` (64 MiB by default), so even a short copy keeps
+  the reserve. A failed check stops with `InsufficientStorage`.
 - The job checks for cancellation on every chunk. The gzip reader shares the
   job's cancellation flag and also checks it before each inflate step, at each
   member boundary, and every 4 KiB of a long header field.
@@ -103,8 +105,9 @@ is deleted with the failed job.
 Detection runs on every ordinary open as well, so `Session::open` never reads
 compressed bytes as text. It rejects:
 
-- tar archives, by `.tar.gz`/`.tgz` name or a `ustar` header in the first
-  decompressed block;
+- tar archives, by `.tar.gz`/`.tgz` name or a complete 512-byte tar header
+  (the `ustar` magic and a matching header checksum) at the start of the
+  decompressed data, so text that merely contains `ustar` still opens;
 - ZIP, Zstandard, bzip2 and XZ, by signature or extension, naming the format
   and stating that Quarry opens gzip (`.gz`);
 - a `.gz` name without a gzip signature, as corrupt or renamed.
@@ -140,9 +143,12 @@ bootstrap rows that names no readable file, so the rows show before any
 temporary file exists and nothing can read compressed bytes as text. The tab
 then starts the job in the configured temporary-storage folder, reads rows past
 the bootstrap from the job while it runs, and adopts the completed session and
-index. Decompression counts against the two-operation limit of ADR 0007;
-opening another compressed file while both slots are busy is refused before any
-temporary file exists. Cancel, failure, tab close, and quit drop the job, which
+index. Decompression counts against the two-operation limit of ADR 0007.
+Admission is decided from the prepared document, just before its pass starts,
+so opening another compressed file while both slots are busy is refused before
+any temporary file exists, and plain files still open. A running pass holds a
+slot until its worker exits, including while a closed tab's cleanup stops it.
+Reload from Disk stops the tab's own pass before starting the new one. Cancel, failure, tab close, and quit drop the job, which
 deletes the copy; cancel and failure leave the bootstrap rows as a read-only
 preview. Format changes call `reopen_compressed_backing`; Reload from Disk
 decompresses the source again.

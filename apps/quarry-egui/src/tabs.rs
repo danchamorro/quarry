@@ -225,6 +225,14 @@ impl DocumentTab {
             || self.inspection.decompressing()
     }
 
+    /// A running decompression is counted by its worker slot rather than by its tab.
+    fn holds_decompression_slot(&self) -> bool {
+        self.document
+            .as_ref()
+            .is_some_and(Document::decompression_running)
+            || self.inspection.decompressing()
+    }
+
     /// Counts file operations and structural analysis against the global job limit.
     fn writing(&self) -> bool {
         self.inspection.recovering()
@@ -561,9 +569,6 @@ impl QuarryApp {
                 "Quarry supports eight open tabs. Close a tab before opening another file.",
             ));
         }
-        if compressed::is_gzip(&path) && !self.write_slot_available() {
-            return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
-        }
         let mut document = match Document::prepare_checked(&path, options, encoding) {
             Ok(d) => d,
             Err(failure) => {
@@ -588,8 +593,15 @@ impl QuarryApp {
                 });
             }
         };
+        // Admit decompression from the prepared document, immediately before its pass
+        // starts, so a file replaced after an earlier check cannot bypass the limit.
+        // Plain files need no slot and open even when both are in use.
+        if document.awaiting_decompression() && !self.write_slot_available() {
+            return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
+        }
         document.working_directory = self.working_directory.clone();
         document.working_cleanup = self.working_cleanup.clone();
+        document.decompression_slots = self.decompression_slots.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
             current.commit_edits();
@@ -631,22 +643,29 @@ impl QuarryApp {
 
     /// Applies the shared two-operation limit to document tabs and Combine Files.
     pub(super) fn write_slot_available(&self) -> bool {
-        !self.quitting_cleanup()
-            && self
-                .document_tabs()
-                .filter(|tab| tab.writing() || tab.decompressing())
-                .count()
-                + usize::from(
-                    self.combine_files
-                        .as_ref()
-                        .is_some_and(combine_files::CombineDialog::busy),
-                )
-                + usize::from(
-                    self.join_files
-                        .as_ref()
-                        .is_some_and(join_files::JoinDialog::running_operation),
-                )
-                < MAX_WRITE_JOBS
+        self.write_slot_available_releasing(0)
+    }
+
+    /// Like `write_slot_available`, as if `released` running decompressions had
+    /// already stopped. Running decompressions count through their worker slots,
+    /// which a closed tab keeps until its cleanup has stopped the worker.
+    pub(super) fn write_slot_available_releasing(&self, released: usize) -> bool {
+        let in_use = self
+            .document_tabs()
+            .filter(|tab| (tab.writing() || tab.decompressing()) && !tab.holds_decompression_slot())
+            .count()
+            + self.decompression_slots.active()
+            + usize::from(
+                self.combine_files
+                    .as_ref()
+                    .is_some_and(combine_files::CombineDialog::busy),
+            )
+            + usize::from(
+                self.join_files
+                    .as_ref()
+                    .is_some_and(join_files::JoinDialog::running_operation),
+            );
+        !self.quitting_cleanup() && in_use.saturating_sub(released) < MAX_WRITE_JOBS
     }
 
     /// Polls jobs against their owning tab, surfaces failed reloads, and advances closes.

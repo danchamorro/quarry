@@ -12,6 +12,7 @@ use quarry_core::{
     CompressedBootstrap, CompressedDecompressJob, CompressedOpenConfig, CompressedOpenOutcome,
     CompressedProgress, CompressionFormat,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) const READ_ONLY: &str =
     "Compressed files open read-only. Use Save As… to create an editable uncompressed copy.";
@@ -23,6 +24,47 @@ pub(super) const WRITE_SLOTS_FULL: &str =
 pub(super) const CANCELLED: &str = "Decompression cancelled; temporary files were removed. Showing initial preview rows. Use File > Reload from Disk to load the full file.";
 const JOIN_READ_ONLY: &str = "Compressed files cannot be joined directly. Use Save As… to create an uncompressed copy, then join that copy.";
 const FAILED_PREVIEW: &str = "Showing the initial preview rows only; no temporary files were kept.";
+
+/// Counts running decompression workers, including a closed tab's worker that its
+/// cleanup is still stopping, so the shared file-operation limit holds until every
+/// worker has exited.
+#[derive(Clone, Default)]
+pub(super) struct DecompressionSlots {
+    active: Arc<AtomicUsize>,
+    #[cfg(test)]
+    peak: Arc<AtomicUsize>,
+}
+
+impl DecompressionSlots {
+    pub(super) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// The most workers that ever ran at once.
+    #[cfg(test)]
+    pub(super) fn peak(&self) -> usize {
+        self.peak.load(Ordering::Acquire)
+    }
+
+    /// Claims a slot for a worker about to start; it is freed when the slot drops.
+    pub(super) fn claim(&self) -> DecompressionSlot {
+        let running = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(test)]
+        self.peak.fetch_max(running, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let _ = running;
+        DecompressionSlot(Arc::clone(&self.active))
+    }
+}
+
+/// Held beside a decompression job and dropped after it, once its worker has exited.
+pub(super) struct DecompressionSlot(Arc<AtomicUsize>);
+
+impl Drop for DecompressionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Why a file could not be opened, and whether Inspect File can examine it.
 pub(super) struct OpenFailure {
@@ -58,6 +100,8 @@ enum Phase {
     Decompressing {
         job: CompressedDecompressJob,
         progress: CompressedProgress,
+        /// Declared after the job, so it is freed only once the worker has exited.
+        slot: DecompressionSlot,
     },
     /// The session reads the verified private copy.
     Complete,
@@ -167,6 +211,20 @@ impl Document {
         self.compressed.is_some()
     }
 
+    /// True for a prepared compressed document whose pass has not started yet.
+    pub(super) fn awaiting_decompression(&self) -> bool {
+        self.compressed
+            .as_ref()
+            .is_some_and(|compressed| matches!(compressed.phase, Phase::Pending(_)))
+    }
+
+    /// True while a background worker runs and holds a decompression slot.
+    pub(super) fn decompression_running(&self) -> bool {
+        self.compressed
+            .as_ref()
+            .is_some_and(|compressed| matches!(compressed.phase, Phase::Decompressing { .. }))
+    }
+
     /// True until the background pass has finished or stopped.
     pub(super) fn decompressing(&self) -> bool {
         self.compressed.as_ref().is_some_and(|compressed| {
@@ -245,10 +303,15 @@ impl Document {
             unreachable!("the phase was checked above");
         };
         let config = CompressedOpenConfig::new(self.working_directory.clone());
+        let slot = self.decompression_slots.claim();
         match bootstrap.start_decompression(config, self.working_cleanup.clone()) {
             Ok(job) => {
                 let progress = job.progress();
-                compressed.phase = Phase::Decompressing { job, progress };
+                compressed.phase = Phase::Decompressing {
+                    job,
+                    progress,
+                    slot,
+                };
                 self.last_poll = Instant::now() - POLL_INTERVAL;
                 Ok(true)
             }
@@ -258,7 +321,7 @@ impl Document {
 
     /// Follows the background pass. Returns true while decompression owns this document.
     pub(super) fn poll_decompression(&mut self) -> Result<bool, String> {
-        let Some(Phase::Decompressing { job, progress }) = self
+        let Some(Phase::Decompressing { job, progress, .. }) = self
             .compressed
             .as_mut()
             .map(|compressed| &mut compressed.phase)
@@ -312,6 +375,14 @@ impl Document {
         )
     }
 
+    /// Stops a running pass and waits for its worker before a replacement starts, so
+    /// its slot is free when this returns. The document keeps the bootstrap preview,
+    /// or the verified copy if the pass finished first, and stays usable.
+    pub(super) fn release_decompression(&mut self) {
+        // The outcome is already reflected in the document's phase and rows.
+        let _ = self.cancel_decompression();
+    }
+
     /// Abandons decompression when the document closes; dropping the job removes its copy.
     pub(super) fn stop_decompression(&mut self) {
         if let Some(compressed) = self.compressed.as_mut()
@@ -319,11 +390,12 @@ impl Document {
                 compressed.phase,
                 Phase::Pending(_) | Phase::Decompressing { .. }
             )
-            && let Phase::Decompressing { job, .. } =
+            && let Phase::Decompressing { job, slot, .. } =
                 std::mem::replace(&mut compressed.phase, Phase::Preview)
         {
             job.cancel();
             drop(job);
+            drop(slot);
         }
     }
 
@@ -363,12 +435,14 @@ impl Document {
         if !matches!(compressed.phase, Phase::Decompressing { .. }) {
             return Ok(None);
         }
-        let Phase::Decompressing { job, .. } =
+        let Phase::Decompressing { job, slot, .. } =
             std::mem::replace(&mut compressed.phase, Phase::Preview)
         else {
             unreachable!("the phase was checked above");
         };
-        match job.wait() {
+        let outcome = job.wait();
+        drop(slot);
+        match outcome {
             Ok(CompressedOpenOutcome::Complete { session, index }) => {
                 self.adopt_decompressed(session, index)?;
                 Ok(None)
@@ -448,6 +522,7 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use quarry_core::compressed_test_pause::{Checkpoint, Pause};
     use quarry_core::{CaseSensitivity, FilterOperator, FilterQuery};
     use std::fs;
     use std::io::Write;
@@ -525,6 +600,29 @@ mod tests {
 
     fn active(app: &mut QuarryApp) -> &mut Document {
         app.active.document.as_mut().unwrap()
+    }
+
+    /// Holds a worker once it has published about 4,000 rows of `large_gzip` data.
+    const HELD: Checkpoint = Checkpoint::Published {
+        min_bytes: 64 * 1024,
+    };
+
+    /// `count` four-member `large_gzip` sources, each about 4 MiB once expanded.
+    fn large_sources(directory: &Path, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|index| {
+                let path = directory.join(format!("large-{index}.csv.gz"));
+                large_gzip(&path, 4, &[]);
+                path
+            })
+            .collect()
+    }
+
+    fn close_all(app: &mut QuarryApp, ctx: &egui::Context) {
+        while app.active.document.is_some() {
+            app.request_tab_close(ctx);
+            crate::tests::finish_document_cleanup(app, ctx);
+        }
     }
 
     #[test]
@@ -615,10 +713,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let source = directory.path().join("large.csv.gz");
-        large_gzip(&source, 256, &[]);
+        large_gzip(&source, 8, &[]);
+        // The worker is held after publishing about 65,000 rows, so the live read and
+        // the cancel below always happen while decompression is still running.
+        let pause = Pause::new(&source, Checkpoint::Published { min_bytes: 1 << 20 });
         let (mut app, ctx) = app_with(&source, scratch.path());
         let first_rows = active(&mut app).session.first_rows.len() as u64;
         assert_eq!(leftovers(scratch.path()).len(), 1);
+        assert!(pause.wait_for(1), "no rows were decompressed");
 
         // Rows beyond the bootstrap come from the copy while it is being written.
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -673,9 +775,10 @@ mod tests {
         assert_eq!(app.active.notice.as_ref().unwrap().text, PREVIEW_ONLY);
         assert!(!app.active.inspection.open);
 
-        // Reload reads the compressed source again.
+        // Reload reads the compressed source again; the new pass is held as well.
         app.reload_document();
         assert!(active(&mut app).decompressing());
+        assert!(pause.wait_for(2), "the reloaded pass did not start");
         assert_eq!(leftovers(scratch.path()).len(), 1);
         app.request_tab_close(&ctx);
         crate::tests::finish_document_cleanup(&mut app, &ctx);
@@ -956,15 +1059,14 @@ mod tests {
     fn decompression_shares_the_job_limit_and_closing_removes_its_copy() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        let paths: Vec<_> = (0..3)
-            .map(|index| {
-                let path = directory.path().join(format!("large-{index}.csv.gz"));
-                large_gzip(&path, 256, &[]);
-                path
-            })
+        let paths = large_sources(directory.path(), 3);
+        let pauses: Vec<_> = paths[..2]
+            .iter()
+            .map(|path| Pause::new(path, HELD))
             .collect();
         let (mut app, ctx) = app_with(&paths[0], scratch.path());
         app.open_path(paths[1].clone()).unwrap();
+        assert!(pauses.iter().all(|pause| pause.wait_for(1)));
         assert!(app.document_tabs().all(DocumentTab::busy));
         assert!(!app.write_slot_available());
         assert_eq!(
@@ -981,6 +1083,89 @@ mod tests {
         app.request_tab_close(&ctx);
         crate::tests::finish_document_cleanup(&mut app, &ctx);
         assert!(app.active.document.is_none());
+        assert!(leftovers(scratch.path()).is_empty());
+    }
+
+    #[test]
+    fn reloading_a_decompressing_tab_never_runs_a_third_decompression() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = large_sources(directory.path(), 2);
+        let pauses: Vec<_> = paths.iter().map(|path| Pause::new(path, HELD)).collect();
+        let (mut app, ctx) = app_with(&paths[0], scratch.path());
+        app.open_path(paths[1].clone()).unwrap();
+        assert!(pauses.iter().all(|pause| pause.wait_for(1)));
+        assert_eq!(app.decompression_slots.active(), 2);
+        assert!(!app.write_slot_available());
+
+        // The active tab stops its own pass before the reloaded pass starts.
+        app.reload_document();
+        assert!(
+            app.active.notice.is_none(),
+            "{:?}",
+            app.active.notice.as_ref().map(|notice| notice.text.clone())
+        );
+        assert!(active(&mut app).decompressing());
+        assert!(pauses[1].wait_for(2), "the reloaded pass did not start");
+        assert_eq!(app.decompression_slots.active(), 2);
+        assert_eq!(app.decompression_slots.peak(), 2);
+        assert_eq!(leftovers(scratch.path()).len(), 2);
+
+        // A plain file needs no slot and still opens while both are in use.
+        let plain = directory.path().join("plain.csv");
+        fs::write(&plain, csv(5)).unwrap();
+        app.open_path(plain).unwrap();
+        assert!(!active(&mut app).is_compressed());
+
+        close_all(&mut app, &ctx);
+        assert_eq!(app.decompression_slots.active(), 0);
+        assert_eq!(app.decompression_slots.peak(), 2);
+        assert!(leftovers(scratch.path()).is_empty());
+    }
+
+    #[test]
+    fn a_closed_tab_keeps_its_decompression_slot_until_cleanup_stops_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = large_sources(directory.path(), 3);
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.working_directory = scratch.path().to_path_buf();
+        let ctx = egui::Context::default();
+        let running = Pause::new(&paths[0], HELD);
+        // The closing tab's worker stays held even once cancelled, as a slow stop
+        // would, until the pause is released.
+        let closing = Pause::holding_cancelled(&paths[1], HELD);
+        app.open_path(paths[0].clone()).unwrap();
+        app.open_path(paths[1].clone()).unwrap();
+        assert!(running.wait_for(1) && closing.wait_for(1));
+
+        // Closing returns at once; the worker is still stopping in the cleanup thread.
+        app.request_tab_close(&ctx);
+        assert!(app.document_cleanup.is_some());
+        assert_eq!(
+            app.document_tabs()
+                .filter(|tab| tab.document.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(app.decompression_slots.active(), 2);
+        assert!(!app.write_slot_available());
+        assert_eq!(
+            app.open_path(paths[2].clone()).unwrap_err(),
+            WRITE_SLOTS_FULL
+        );
+
+        // Once the retiring worker exits, its slot is free again.
+        closing.release();
+        crate::tests::finish_document_cleanup(&mut app, &ctx);
+        assert_eq!(app.decompression_slots.active(), 1);
+        assert!(app.write_slot_available());
+        app.open_path(paths[2].clone()).unwrap();
+        assert!(active(&mut app).decompressing());
+        assert_eq!(app.decompression_slots.peak(), 2);
+
+        close_all(&mut app, &ctx);
+        assert_eq!(app.decompression_slots.active(), 0);
         assert!(leftovers(scratch.path()).is_empty());
     }
 }

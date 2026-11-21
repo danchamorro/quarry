@@ -341,6 +341,8 @@ fn main() -> eframe::Result<()> {
 
 struct QuarryApp {
     working_cleanup: quarry_core::WorkingCopyCleanup,
+    /// Every running decompression worker of this app, including retiring ones.
+    decompression_slots: compressed::DecompressionSlots,
     document_cleanup: Option<tabs::DocumentCleanup>,
     whitespace_preferences: whitespace::Preferences,
     about: about::About,
@@ -798,6 +800,7 @@ impl QuarryApp {
             combine_files: None,
             join_files: None,
             working_cleanup: quarry_core::WorkingCopyCleanup::default(),
+            decompression_slots: compressed::DecompressionSlots::default(),
             document_cleanup: None,
             working_directory: std::env::temp_dir(),
             active: DocumentTab::new(1),
@@ -883,22 +886,17 @@ impl QuarryApp {
         {
             return Err(AppMessage::warning(join_files::INPUT_RESERVED));
         }
-        if compressed::is_gzip(&path)
-            && !self.write_slot_available()
-            && !self
-                .active
-                .document
-                .as_ref()
-                .is_some_and(Document::decompressing)
-        {
-            return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
-        }
+        // Only the bootstrap runs here; a failure leaves the current document intact.
         let document =
             Document::prepare_with_encoding(&path, options, encoding).map_err(AppMessage::error)?;
         self.install_replacement_document(document, encoding)
     }
 
     /// Starts the prepared replacement's worker, then releases the active tab's old document.
+    /// A replacement that must decompress is admitted from the prepared document itself.
+    /// The old document's own pass is stopped first, so the shared file-operation limit
+    /// is never exceeded, even briefly; if the new pass then fails to start, the old
+    /// document stays open as a usable preview.
     fn install_replacement_document(
         &mut self,
         mut document: Document,
@@ -906,6 +904,20 @@ impl QuarryApp {
     ) -> Result<(), AppMessage> {
         document.working_directory = self.working_directory.clone();
         document.working_cleanup = self.working_cleanup.clone();
+        document.decompression_slots = self.decompression_slots.clone();
+        if document.awaiting_decompression() {
+            let outgoing = self
+                .active
+                .document
+                .as_ref()
+                .is_some_and(Document::decompression_running);
+            if !self.write_slot_available_releasing(usize::from(outgoing)) {
+                return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
+            }
+            if let Some(current) = self.active.document.as_mut() {
+                current.release_decompression();
+            }
+        }
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
             current.shutdown();
@@ -6427,6 +6439,8 @@ struct Document {
     pending_diagnostic_message: Option<String>,
     working_directory: PathBuf,
     working_cleanup: quarry_core::WorkingCopyCleanup,
+    /// The app's decompression slots, which a compressed document's pass claims.
+    decompression_slots: compressed::DecompressionSlots,
     pending_materialization: Option<(ColumnTransformation, BTreeSet<usize>, u64)>,
     session: Arc<Session>,
     /// Present when the document reads a gzip-compressed file; it is then read-only.
@@ -6618,6 +6632,7 @@ impl Document {
             pending_diagnostic_message: None,
             working_directory: std::env::temp_dir(),
             working_cleanup: quarry_core::WorkingCopyCleanup::default(),
+            decompression_slots: compressed::DecompressionSlots::default(),
             join_reservations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_materialization: None,
             original_session: None,

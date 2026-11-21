@@ -39,6 +39,10 @@ pub use combine::{
     CombineInput, CombineJob, CombineOptions, CombinePlan, CombineProgress, CombineSummary,
     check_combine_files, check_combine_files_with_encoding,
 };
+/// Debug-build checkpoints for tests of decompression workers; absent in release builds.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use compressed::test_pause as compressed_test_pause;
 pub use compressed::{
     CompressedBootstrap, CompressedDecompressJob, CompressedOpenConfig, CompressedOpenOutcome,
     CompressedProgress, CompressedRawDecompressJob, CompressionFormat, DecompressedCopy,
@@ -614,6 +618,7 @@ impl Session {
             count,
             DEFAULT_MAX_RECORD_BYTES,
             self.encoding,
+            u64::MAX,
         )
     }
 }
@@ -922,6 +927,7 @@ fn cell_kind(value: &[u8]) -> CellKind {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_rows_from_index(
     path: &Path,
     delimiter: u8,
@@ -930,6 +936,9 @@ fn read_rows_from_index(
     count: usize,
     max_record_bytes: usize,
     encoding: Encoding,
+    // Bytes at or past this offset are never read, as when a live index has not
+    // reached them yet.
+    end: u64,
 ) -> Result<Vec<Row>, QuarryError> {
     if count == 0 {
         return Ok(Vec::new());
@@ -955,6 +964,8 @@ fn read_rows_from_index(
 
     while row_number < target_end {
         let read = encoding.read_chunk(&mut file, &mut chunk)?;
+        let read =
+            read.min(usize::try_from(end.saturating_sub(absolute_start)).unwrap_or(usize::MAX));
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
                 let fields = parse_encoded_record(&record, delimiter, row_number, encoding)?

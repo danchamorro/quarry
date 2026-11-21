@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use flate2::Compression;
 use flate2::write::{DeflateEncoder, GzEncoder};
 
+use super::test_pause::{Checkpoint, Pause};
 use super::*;
 use crate::{
     CaseSensitivity, CombineOptions, FilterExportOutcome, FilterOperator, FilterPredicate,
@@ -559,15 +560,56 @@ fn bootstrap_stays_within_its_limit_and_detects_exact_end_of_data() {
     assert!(bootstrap.reached_eof());
 }
 
+/// A valid 512-byte POSIX tar header for one four-byte file.
+fn tar_header(name: &[u8]) -> Vec<u8> {
+    let mut header = vec![0_u8; 512];
+    header[..name.len()].copy_from_slice(name);
+    header[100..108].copy_from_slice(b"0000644\0");
+    header[108..116].copy_from_slice(b"0001750\0");
+    header[116..124].copy_from_slice(b"0001750\0");
+    header[124..136].copy_from_slice(b"00000000004\0");
+    header[136..148].copy_from_slice(b"14701234567\0");
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    header[148..156].fill(b' ');
+    let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    header
+}
+
 #[test]
 fn bootstrap_rejects_tar_payloads_and_honours_the_decompressed_cap() {
     let dir = tempfile::tempdir().unwrap();
-    let mut tar = vec![0_u8; 1024];
-    tar[..8].copy_from_slice(b"data.csv");
-    tar[257..263].copy_from_slice(b"ustar\0");
+    let mut tar = tar_header(b"data.csv");
+    tar.extend(b"a,b\n");
+    tar.resize(2048, 0);
+    assert!(looks_like_tar(&tar));
     let path = write(dir.path(), "archive.gz", &gzip(&tar));
     let error = CompressedBootstrap::open(&path, OpenOptions::default(), None, None).unwrap_err();
     assert!(reason(&error).contains("tar archive"));
+    // The magic alone, without a matching checksum, is not a tar header.
+    let mut damaged = tar_header(b"data.csv");
+    damaged[0] ^= 1;
+    assert!(!looks_like_tar(&damaged));
+    assert!(!looks_like_tar(&tar[..511]));
+
+    // Delimited text that merely holds "ustar " at offset 257 opens normally.
+    let mut text = b"a,".to_vec();
+    text.extend(std::iter::repeat_n(b'x', 255));
+    text.extend(b"ustar value\n");
+    assert_eq!(&text[257..263], b"ustar ");
+    for row in 0..100 {
+        text.extend(format!("{row},{row}\n").as_bytes());
+    }
+    assert!(text.len() > 512);
+    let path = write(dir.path(), "ustar.csv.gz", &gzip(&text));
+    let bootstrap = CompressedBootstrap::open(&path, OpenOptions::default(), None, None).unwrap();
+    assert!(bootstrap.reached_eof());
+    assert_eq!(
+        bootstrap.first_rows[0].fields[1],
+        [vec![b'x'; 255], b"ustar value".to_vec()].concat()
+    );
 
     let bomb = write(dir.path(), "bomb.csv.gz", &gzip(&b"0,0\n".repeat(1 << 20)));
     let error = CompressedBootstrap::open(
@@ -772,8 +814,27 @@ fn empty_compressed_data_opens_as_an_empty_document() {
 
 fn slow_job(source_dir: &Path, temp: &Path, rows: usize) -> (PathBuf, CompressedDecompressJob) {
     let path = write(source_dir, "live.csv.gz", &gzip(&numbered_rows(rows)));
+    let job = start_slow(&path, temp);
+    (path, job)
+}
+
+/// Like `slow_job`, with the worker held at `checkpoint` until the pause is released.
+fn paused_job(
+    source_dir: &Path,
+    temp: &Path,
+    rows: usize,
+    checkpoint: Checkpoint,
+) -> (PathBuf, CompressedDecompressJob, Pause) {
+    let path = write(source_dir, "live.csv.gz", &gzip(&numbered_rows(rows)));
+    let pause = Pause::new(&path, checkpoint);
+    let job = start_slow(&path, temp);
+    (path, job, pause)
+}
+
+/// Decompress through tiny chunks with a small bootstrap.
+fn start_slow(path: &Path, temp: &Path) -> CompressedDecompressJob {
     let bootstrap = CompressedBootstrap::open(
-        &path,
+        path,
         OpenOptions {
             rows: 5,
             sample_bytes: 1024,
@@ -784,7 +845,7 @@ fn slow_job(source_dir: &Path, temp: &Path, rows: usize) -> (PathBuf, Compressed
         None,
     )
     .unwrap();
-    let job = bootstrap
+    bootstrap
         .start_decompression(
             CompressedOpenConfig {
                 index_config: IndexConfig {
@@ -796,24 +857,23 @@ fn slow_job(source_dir: &Path, temp: &Path, rows: usize) -> (PathBuf, Compressed
             },
             WorkingCopyCleanup::default(),
         )
-        .unwrap();
-    (path, job)
+        .unwrap()
 }
+
+/// The worker is held once it has published at least this many bytes of rows.
+const LIVE_ROWS: Checkpoint = Checkpoint::Published {
+    min_bytes: 16 * 1024,
+};
 
 #[test]
 fn reads_rows_live_and_cancellation_removes_every_temporary_file() {
     let source_dir = tempfile::tempdir().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let (_, job) = slow_job(source_dir.path(), temp.path(), 300_000);
-    wait_for(
-        || job.progress().rows_scanned >= 1_000 || job.progress().done,
-        "live rows",
-    );
+    let (_, job, pause) = paused_job(source_dir.path(), temp.path(), 300_000, LIVE_ROWS);
+    assert!(pause.wait_for(1), "the worker published no rows");
     let progress = job.progress();
-    assert!(
-        !progress.done,
-        "decompression finished before the live read"
-    );
+    assert!(!progress.done);
+    assert!(progress.rows_scanned >= 1_000, "{progress:?}");
     assert!(!entries(temp.path()).is_empty());
     let snapshot = job.snapshot();
     assert!(snapshot.indexed_bytes() <= job.progress().decompressed_bytes_written);
@@ -835,6 +895,38 @@ fn reads_rows_live_and_cancellation_removes_every_temporary_file() {
 }
 
 #[test]
+fn live_reads_stop_at_the_published_index_boundary() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (_, job, pause) = paused_job(source_dir.path(), temp.path(), 300_000, LIVE_ROWS);
+    assert!(pause.wait_for(1), "the worker published no rows");
+    let snapshot = job.snapshot();
+    let indexed = snapshot.indexed_rows();
+    // Malformed bytes past the boundary, as a write the index has not reached yet.
+    let mut copy = fs::OpenOptions::new()
+        .append(true)
+        .open(&job.backing_path)
+        .unwrap();
+    copy.write_all(b"\n\"bad\"x,1\n\"unterminated").unwrap();
+    drop(copy);
+    assert!(fs::metadata(&job.backing_path).unwrap().len() > snapshot.indexed_bytes());
+    // The last two indexed records hold ids `indexed - 3` and `indexed - 2`.
+    let rows = job.read_rows(indexed - 2, 2).unwrap();
+    for (row, id) in rows.iter().zip([indexed - 3, indexed - 2]) {
+        assert_eq!(
+            row.fields,
+            [id.to_string().into_bytes(), format!("v{id}").into_bytes()]
+        );
+    }
+    job.cancel();
+    assert!(matches!(
+        job.wait().unwrap(),
+        CompressedOpenOutcome::Cancelled
+    ));
+    assert!(entries(temp.path()).is_empty());
+}
+
+#[test]
 fn dropping_an_active_job_removes_its_private_copy() {
     let source_dir = tempfile::tempdir().unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -848,10 +940,17 @@ fn dropping_an_active_job_removes_its_private_copy() {
 fn a_source_changed_mid_decompression_is_rejected_and_cleaned_up() {
     let source_dir = tempfile::tempdir().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let (path, job) = slow_job(source_dir.path(), temp.path(), 100_000);
-    wait_for(|| job.progress().rows_scanned >= 100, "progress");
+    let (path, job, pause) = paused_job(
+        source_dir.path(),
+        temp.path(),
+        100_000,
+        Checkpoint::BeforeSourceCheck,
+    );
+    // The copy is complete and held just before its final source check.
+    assert!(pause.wait_for(1), "the worker never finished copying");
     fs::rename(&path, source_dir.path().join("moved.gz")).unwrap();
     fs::write(&path, gzip(b"different,source\n")).unwrap();
+    pause.release();
     assert!(matches!(job.wait(), Err(QuarryError::SourceChanged)));
     assert!(entries(temp.path()).is_empty());
 
@@ -910,18 +1009,14 @@ fn free_space_below_the_reserve_stops_decompression_and_cleans_up() {
         &gzip(&numbered_rows(1_000)),
     );
     let bootstrap = CompressedBootstrap::open(&path, OpenOptions::default(), None, None).unwrap();
-    let error = bootstrap
-        .start_decompression(
-            CompressedOpenConfig {
-                min_free_space_reserve_bytes: u64::MAX,
-                space_check_interval_bytes: 1,
-                ..config(temp.path())
-            },
-            WorkingCopyCleanup::default(),
-        )
-        .unwrap()
-        .wait()
-        .unwrap_err();
+    let error = expect_err(bootstrap.start_decompression(
+        CompressedOpenConfig {
+            min_free_space_reserve_bytes: u64::MAX,
+            space_check_interval_bytes: 1,
+            ..config(temp.path())
+        },
+        WorkingCopyCleanup::default(),
+    ));
     assert!(
         matches!(
             &error,
@@ -941,6 +1036,80 @@ fn free_space_below_the_reserve_stops_decompression_and_cleans_up() {
         ),
         Err(QuarryError::InvalidOption(_))
     ));
+}
+
+#[test]
+fn free_space_checks_use_the_output_size_and_keep_the_reserve_before_writing() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let cleanup = WorkingCopyCleanup::default();
+    // Many empty members make the compressed file far larger than its output.
+    let data = b"a,b\n1,2\n";
+    let mut bytes = gzip(data);
+    for _ in 0..1_000 {
+        bytes.extend(gzip(b""));
+    }
+    assert!(bytes.len() > 10_000);
+    let path = write(source_dir.path(), "members.csv.gz", &bytes);
+    let tight = CompressedOpenConfig {
+        available_space_override: Some(100),
+        ..config(temp.path())
+    };
+    let (session, index) = open_compressed(
+        &path,
+        OpenOptions::default(),
+        None,
+        tight.clone(),
+        cleanup.clone(),
+    )
+    .unwrap();
+    assert_eq!(session.file_size, data.len() as u64);
+    assert_eq!(index.indexed_rows(), 2);
+    drop(session);
+    let copy = CompressedRawDecompressJob::start(&path, tight, cleanup.clone())
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(copy.path()).unwrap(), data);
+    drop(copy);
+    assert!(entries(temp.path()).is_empty());
+
+    // A copy shorter than one check interval still keeps the reserve: its first
+    // write is refused, so nothing is written.
+    let rows = write(source_dir.path(), "rows.csv.gz", &gzip(&numbered_rows(100)));
+    let reserved = CompressedOpenConfig {
+        min_free_space_reserve_bytes: 990,
+        available_space_override: Some(1_000),
+        ..config(temp.path())
+    };
+    let job = CompressedRawDecompressJob::start(&rows, reserved.clone(), cleanup.clone()).unwrap();
+    wait_for(|| job.progress().done, "the reserve check");
+    assert_eq!(job.progress().decompressed_bytes_written, 0);
+    let error = job.wait().unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            QuarryError::InsufficientStorage { directory, required_bytes, available_bytes: 1_000 }
+                if directory == temp.path() && *required_bytes > 1_000
+        ),
+        "{error:?}"
+    );
+    assert!(entries(temp.path()).is_empty());
+
+    // With the size verified, the whole output and the reserve are required up front.
+    let bootstrap = CompressedBootstrap::open(&rows, OpenOptions::default(), None, None).unwrap();
+    let exact = bootstrap.decompressed_size().unwrap();
+    let error = expect_err(bootstrap.start_decompression(reserved, cleanup.clone()));
+    assert!(
+        matches!(
+            error,
+            QuarryError::InsufficientStorage { required_bytes, .. } if required_bytes == 990 + exact
+        ),
+        "{error:?}"
+    );
+    assert!(entries(temp.path()).is_empty());
+    assert!(cleanup.take_errors().is_empty());
 }
 
 #[test]
@@ -1520,6 +1689,7 @@ fn cancelling_while_crossing_members_stops_promptly_without_leftovers() {
         bytes.extend(&small);
     }
     let path = write(source_dir.path(), "members.csv.gz", &bytes);
+    let pause = Pause::new(&path, Checkpoint::Published { min_bytes: 4_096 });
     let slow = CompressedOpenConfig {
         index_config: IndexConfig {
             chunk_bytes: 8,
@@ -1543,11 +1713,8 @@ fn cancelling_while_crossing_members_stops_promptly_without_leftovers() {
     let job = bootstrap
         .start_decompression(slow.clone(), WorkingCopyCleanup::default())
         .unwrap();
-    wait_for(
-        || job.progress().rows_scanned >= 1_000 || job.progress().done,
-        "members",
-    );
-    assert!(!job.progress().done, "decompression finished before cancel");
+    assert!(pause.wait_for(1), "no members were decompressed");
+    assert!(!job.progress().done);
     let started = Instant::now();
     job.cancel();
     assert!(matches!(
@@ -1559,14 +1726,8 @@ fn cancelling_while_crossing_members_stops_promptly_without_leftovers() {
 
     let job =
         CompressedRawDecompressJob::start(&path, slow, WorkingCopyCleanup::default()).unwrap();
-    wait_for(
-        || job.progress().decompressed_bytes_written >= 4_096 || job.progress().done,
-        "raw members",
-    );
-    assert!(
-        !job.progress().done,
-        "raw decompression finished before cancel"
-    );
+    assert!(pause.wait_for(2), "no raw members were decompressed");
+    assert!(!job.progress().done);
     let started = Instant::now();
     job.cancel();
     assert!(job.wait().unwrap().is_none());
@@ -1863,7 +2024,7 @@ fn raw_decompression_keeps_malformed_text_for_inspection() {
     ));
     assert!(entries(temp.path()).is_empty());
 
-    let error = CompressedRawDecompressJob::start(
+    let error = expect_err(CompressedRawDecompressJob::start(
         &rows,
         CompressedOpenConfig {
             min_free_space_reserve_bytes: u64::MAX,
@@ -1871,10 +2032,7 @@ fn raw_decompression_keeps_malformed_text_for_inspection() {
             ..config(temp.path())
         },
         cleanup.clone(),
-    )
-    .unwrap()
-    .wait()
-    .unwrap_err();
+    ));
     assert!(
         matches!(error, QuarryError::InsufficientStorage { .. }),
         "{error:?}"
@@ -1905,6 +2063,7 @@ fn raw_decompression_keeps_malformed_text_for_inspection() {
         "big.csv.gz",
         &gzip(&numbered_rows(100_000)),
     );
+    let pause = Pause::new(&big, Checkpoint::BeforeSourceCheck);
     let job = CompressedRawDecompressJob::start(
         &big,
         CompressedOpenConfig {
@@ -1917,12 +2076,11 @@ fn raw_decompression_keeps_malformed_text_for_inspection() {
         cleanup.clone(),
     )
     .unwrap();
-    wait_for(
-        || job.progress().decompressed_bytes_written >= 1_000,
-        "raw progress",
-    );
+    // The raw copy is complete and held just before its final source check.
+    assert!(pause.wait_for(1), "the raw worker never finished copying");
     fs::rename(&big, source_dir.path().join("moved.gz")).unwrap();
     fs::write(&big, gzip(b"different,source\n")).unwrap();
+    pause.release();
     assert!(matches!(job.wait(), Err(QuarryError::SourceChanged)));
     assert!(entries(temp.path()).is_empty());
     assert!(cleanup.take_errors().is_empty());

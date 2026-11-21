@@ -28,10 +28,17 @@ use crate::{
     QuarryError, Row, Session, StructuralIndex, WorkingCopyCleanup,
 };
 
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod test_pause;
+
 /// Bytes read from a compressed source per buffered read.
 const COMPRESSED_READ_BUFFER: usize = 256 * 1024;
-/// A tar header is 512 bytes; its magic sits at offset 257.
+/// A tar header is 512 bytes: its checksum field sits at 148..156 and its magic
+/// at 257..263.
 const TAR_PROBE_BYTES: usize = 512;
+const TAR_CHECKSUM: std::ops::Range<usize> = 148..156;
+const TAR_MAGIC: std::ops::Range<usize> = 257..263;
 const DEFAULT_FREE_SPACE_RESERVE: u64 = 256 * 1024 * 1024;
 const DEFAULT_SPACE_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
 
@@ -232,7 +239,25 @@ fn classify(path: &Path, prefix: &[u8]) -> Result<Option<CompressionFormat>, Qua
 /// Explain why an operation that reads saved files cannot use this input yet.
 /// I/O failures are left for the operation's own open to report.
 pub(crate) fn compressed_input_problem(path: &Path, operation: &str) -> Option<String> {
-    match detect_compression(path) {
+    input_problem(detect_compression(path), operation)
+}
+
+/// Like [`compressed_input_problem`], for an input the operation has already
+/// opened: the same handle it then reads is classified, so the file cannot be
+/// replaced between the check and the read.
+pub(crate) fn compressed_file_problem(
+    file: &mut File,
+    path: &Path,
+    operation: &str,
+) -> Option<String> {
+    input_problem(compression_of(file, path), operation)
+}
+
+fn input_problem(
+    detected: Result<Option<CompressionFormat>, QuarryError>,
+    operation: &str,
+) -> Option<String> {
+    match detected {
         Ok(None) | Err(QuarryError::Io(_)) => None,
         Ok(Some(format)) => Some(format!(
             "Compressed {format} (.{}) files are not supported in {operation} yet. Open the file in Quarry and use Save Copy As to write an uncompressed copy first.",
@@ -261,8 +286,49 @@ pub fn reject_compressed_destination(path: &Path) -> Result<(), QuarryError> {
     Ok(())
 }
 
+/// A complete POSIX or GNU tar header: the `ustar` magic and a checksum that
+/// matches the header. Delimited text that merely contains `ustar` at offset 257
+/// is not mistaken for an archive.
 fn looks_like_tar(prefix: &[u8]) -> bool {
-    prefix.len() >= 263 && matches!(&prefix[257..263], b"ustar\0" | b"ustar ")
+    let Some(header) = prefix.get(..TAR_PROBE_BYTES) else {
+        return false;
+    };
+    if !matches!(&header[TAR_MAGIC], b"ustar\0" | b"ustar ") {
+        return false;
+    }
+    let Some(stored) = tar_octal(&header[TAR_CHECKSUM]) else {
+        return false;
+    };
+    // The checksum counts its own field as eight ASCII spaces.
+    let sum: u64 = header
+        .iter()
+        .enumerate()
+        .map(|(offset, byte)| {
+            if TAR_CHECKSUM.contains(&offset) {
+                u64::from(b' ')
+            } else {
+                u64::from(*byte)
+            }
+        })
+        .sum();
+    sum == stored
+}
+
+/// A tar numeric field: optional leading spaces, octal digits, then NUL or space.
+fn tar_octal(field: &[u8]) -> Option<u64> {
+    let mut value = 0_u64;
+    let mut digits = 0;
+    for byte in field.iter().skip_while(|byte| **byte == b' ') {
+        match byte {
+            b'0'..=b'7' => {
+                value = value.checked_mul(8)? + u64::from(byte - b'0');
+                digits += 1;
+            }
+            0 | b' ' => break,
+            _ => return None,
+        }
+    }
+    (digits > 0).then_some(value)
 }
 
 /// Marks a gzip integrity failure apart from ordinary I/O errors.
@@ -924,11 +990,17 @@ pub struct CompressedOpenConfig {
     pub temp_dir: PathBuf,
     /// Stop before writing more decompressed bytes than this.
     pub max_decompressed_bytes: Option<u64>,
-    /// Stop when free space in `temp_dir` falls below this many bytes.
+    /// Keep at least this many bytes free in `temp_dir`. Starting requires the
+    /// reserve plus the exact decompressed size when the bootstrap verified it, or
+    /// the reserve alone otherwise. While writing, the reserve plus the next chunk
+    /// must be free before the first write and after every check interval.
     pub min_free_space_reserve_bytes: u64,
     /// How many decompressed bytes may be written between free-space checks.
     pub space_check_interval_bytes: u64,
     pub index_config: IndexConfig,
+    /// Free space that tests report instead of the volume's.
+    #[cfg(test)]
+    pub(crate) available_space_override: Option<u64>,
 }
 
 impl CompressedOpenConfig {
@@ -939,6 +1011,8 @@ impl CompressedOpenConfig {
             min_free_space_reserve_bytes: DEFAULT_FREE_SPACE_RESERVE,
             space_check_interval_bytes: DEFAULT_SPACE_CHECK_INTERVAL,
             index_config: IndexConfig::default(),
+            #[cfg(test)]
+            available_space_override: None,
         }
     }
 }
@@ -1038,10 +1112,14 @@ struct SharedState {
     error: Mutex<Option<String>>,
     started: Instant,
     compressed_total: u64,
+    #[cfg(any(test, debug_assertions))]
+    pause: Option<test_pause::Hold>,
 }
 
 impl SharedState {
-    fn new(index: StructuralIndex, compressed_total: u64) -> Arc<Self> {
+    fn new(index: StructuralIndex, compressed_total: u64, source: &Path) -> Arc<Self> {
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = source;
         Arc::new(Self {
             index: RwLock::new(index),
             compressed_bytes_read: Arc::new(AtomicU64::new(0)),
@@ -1054,10 +1132,23 @@ impl SharedState {
             error: Mutex::new(None),
             started: Instant::now(),
             compressed_total,
+            #[cfg(any(test, debug_assertions))]
+            pause: test_pause::hold_for(source),
         })
     }
 
+    /// Holds the worker here while a test pause for its source asks for it.
+    #[cfg(any(test, debug_assertions))]
+    fn pause_at(&self, point: test_pause::Reached, written: u64) {
+        if let Some(hold) = &self.pause {
+            hold.reach(point, written, &self.cancelled);
+        }
+    }
+
     fn progress(&self) -> CompressedProgress {
+        // Load `done` first: its Acquire pairs with the worker's final Release, so a
+        // poll that sees the job finished also sees its final totals and time.
+        let done = self.done.load(Ordering::Acquire);
         let finished_nanos = self.finished_nanos.load(Ordering::Acquire);
         CompressedProgress {
             compressed_bytes_read: self.compressed_bytes_read.load(Ordering::Relaxed),
@@ -1070,7 +1161,7 @@ impl SharedState {
             } else {
                 Duration::from_nanos(finished_nanos)
             },
-            done: self.done.load(Ordering::Acquire),
+            done,
             cancelled: self.cancelled.load(Ordering::Acquire),
         }
     }
@@ -1129,7 +1220,9 @@ struct FinishedCopy {
 
 impl CopyWorker {
     /// Reserve a private workspace for `source`, which must match `source_stamp`
-    /// and be positioned at its start.
+    /// and be positioned at its start. `required_bytes` must be free in the
+    /// temporary folder before anything is written.
+    #[allow(clippy::too_many_arguments)]
     fn create(
         source_path: PathBuf,
         source_stamp: SourceStamp,
@@ -1138,9 +1231,18 @@ impl CopyWorker {
         config: CompressedOpenConfig,
         cleanup: WorkingCopyCleanup,
         shared: &SharedState,
+        required_bytes: u64,
     ) -> Result<Self, QuarryError> {
         let source_check = source.try_clone()?;
-        crate::inspect_storage(&config.temp_dir)?.require(source_stamp.file_size())?;
+        let space = crate::inspect_storage(&config.temp_dir)?;
+        #[cfg(test)]
+        let space = crate::storage::StorageSpace {
+            available_bytes: config
+                .available_space_override
+                .unwrap_or(space.available_bytes),
+            ..space
+        };
+        space.require(required_bytes)?;
         let workspace = SpillWorkspace::create_in(&config.temp_dir, "compressed")?;
         let (file, writer) = workspace.create_run()?;
         let output = writer
@@ -1201,6 +1303,8 @@ impl CopyWorker {
             output
                 .sync_all()
                 .map_err(|error| storage_error(&workspace.path, error))?;
+            #[cfg(any(test, debug_assertions))]
+            shared.pause_at(test_pause::Reached::BeforeSourceCheck, written);
             if !source_matches_stamp(&source_check, &source_path, &source_stamp)? {
                 return Err(QuarryError::SourceChanged);
             }
@@ -1270,7 +1374,14 @@ impl CompressedDecompressJob {
         let index = StructuralIndex::new(config.index_config)?;
         validate_copy_config(&config)?;
         let source = open_unchanged_source(&bootstrap.path, &bootstrap.source_stamp)?;
-        let shared = SharedState::new(index, bootstrap.compressed_size());
+        let shared = SharedState::new(index, bootstrap.compressed_size(), &bootstrap.path);
+        // A verified size needs that much room up front. Otherwise only the reserve is
+        // checked now: a multi-member file can be larger than its output, and the
+        // copy checks the reserve again before its first write.
+        let reserve = config.min_free_space_reserve_bytes;
+        let required_bytes = bootstrap
+            .decompressed_size
+            .map_or(reserve, |exact| exact.saturating_add(reserve));
         let copy = CopyWorker::create(
             bootstrap.path.clone(),
             bootstrap.source_stamp.clone(),
@@ -1279,6 +1390,7 @@ impl CompressedDecompressJob {
             config,
             cleanup,
             &shared,
+            required_bytes,
         )?;
         let backing_path = copy.file.to_path_buf();
         let worker = Worker {
@@ -1321,16 +1433,20 @@ impl CompressedDecompressJob {
         self.shared.index.read().unwrap().clone()
     }
 
-    /// Read rows that are already decompressed while the job continues.
+    /// Read rows that are already decompressed and indexed while the job continues.
+    /// Reading stops at the published index boundary, so bytes written after it are
+    /// never parsed.
     pub fn read_rows(&self, start: u64, count: usize) -> Result<Vec<Row>, QuarryError> {
+        let snapshot = self.snapshot();
         crate::read_rows_from_index(
             &self.backing_path,
             self.delimiter,
-            &self.snapshot(),
+            &snapshot,
             start,
             count,
             crate::DEFAULT_MAX_RECORD_BYTES,
             self.encoding,
+            snapshot.indexed_bytes(),
         )
     }
 
@@ -1426,9 +1542,19 @@ impl CompressedRawDecompressJob {
                 "This file is not compressed. Read it directly instead of decompressing it.",
             )
         })?;
-        let shared = SharedState::new(index, source_stamp.file_size());
-        let copy =
-            CopyWorker::create(path, source_stamp, source, format, config, cleanup, &shared)?;
+        let shared = SharedState::new(index, source_stamp.file_size(), &path);
+        // The final size is unknown, so only the reserve is checked before starting.
+        let required_bytes = config.min_free_space_reserve_bytes;
+        let copy = CopyWorker::create(
+            path,
+            source_stamp,
+            source,
+            format,
+            config,
+            cleanup,
+            &shared,
+            required_bytes,
+        )?;
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("quarry-decompress".into())
@@ -1559,7 +1685,9 @@ fn decompress(
     };
     let mut chunk = vec![0; chunk_bytes];
     let mut written = 0_u64;
-    let mut next_space_check = config.space_check_interval_bytes;
+    // Free space is checked before the first write and then once per interval, so
+    // even a copy shorter than one interval keeps the reserve.
+    let mut next_space_check = 0_u64;
     loop {
         if shared.cancelled.load(Ordering::Acquire) {
             return Ok(None);
@@ -1582,16 +1710,16 @@ fn decompress(
                 decompressed_bytes: total,
             });
         }
+        if written >= next_space_check {
+            ensure_free_space(config, read as u64)?;
+            next_space_check = written.saturating_add(config.space_check_interval_bytes);
+        }
         // Write before indexing: live readers only see rows already on disk.
         output
             .write_all(&chunk[..read])
             .map_err(|error| storage_error(workspace_path, error))?;
         let chunk_start = written;
         written = total;
-        if written >= next_space_check {
-            ensure_free_space(&config.temp_dir, config.min_free_space_reserve_bytes)?;
-            next_space_check = written.saturating_add(config.space_check_interval_bytes);
-        }
         if let Some((scanner, encoding)) = scanner.as_mut() {
             // A short UTF-16 read can only be the final chunk; finish rejects its odd byte.
             let scan_len = if encoding.is_utf16() { read & !1 } else { read };
@@ -1606,8 +1734,15 @@ fn decompress(
             shared
                 .rows_scanned
                 .store(index.indexed_rows(), Ordering::Release);
+            // Publish the byte count before releasing the index, so a reader that
+            // sees these rows never sees an older byte count.
+            shared.decompressed_bytes.store(written, Ordering::Release);
+            drop(index);
+        } else {
+            shared.decompressed_bytes.store(written, Ordering::Release);
         }
-        shared.decompressed_bytes.store(written, Ordering::Release);
+        #[cfg(any(test, debug_assertions))]
+        shared.pause_at(test_pause::Reached::Published, written);
     }
     if let Some((scanner, _)) = scanner.as_mut() {
         let mut index = shared.index.write().unwrap();
@@ -1623,12 +1758,17 @@ fn decompress(
     Ok(Some(written))
 }
 
-fn ensure_free_space(directory: &Path, reserve: u64) -> Result<(), QuarryError> {
+/// Require the reserve plus `incoming` bytes to be free before writing them.
+fn ensure_free_space(config: &CompressedOpenConfig, incoming: u64) -> Result<(), QuarryError> {
+    let directory = &config.temp_dir;
     let available = available_space(directory).map_err(|error| storage_error(directory, error))?;
-    if available < reserve {
+    #[cfg(test)]
+    let available = config.available_space_override.unwrap_or(available);
+    let required = config.min_free_space_reserve_bytes.saturating_add(incoming);
+    if available < required {
         return Err(QuarryError::InsufficientStorage {
             directory: directory.to_path_buf(),
-            required_bytes: reserve,
+            required_bytes: required,
             available_bytes: available,
         });
     }
