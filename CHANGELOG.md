@@ -12,7 +12,7 @@ parentheses are GitHub pull requests.
 
 ### Added
 
-- Added native `ubuntu-24.04-arm` (`linux-arm64-core-cli`) and `macos-15-intel` (`macos-intel-core-cli`) CI jobs plus package-scoped Clippy (`-D warnings`) on `linux-core-cli` in `.github/workflows/ci.yml`, logging the executed host architecture in every CI job. (#153)
+- Added native `ubuntu-24.04-arm` (`linux-arm64-core-cli`) and `macos-15-intel` (`macos-intel-core-cli`) CI jobs plus package-scoped Clippy (`-D warnings`) on `linux-core-cli` in `.github/workflows/ci.yml`, logging the executed host architecture in every CI job and boxing `PredicateMatcher::Text` in `quarry-core` to resolve an `x86_64` `clippy::large_enum_variant` warning. (#153)
 - Published **[Quarry 0.1.0 beta 3](docs/releases/v0.1.0-beta.3.md)** (build 167, tag `v0.1.0-beta.3`, clean `f5402e4`), Developer ID signed, notarized, and stapled for Apple Silicon macOS, with the build 167 verification report and updated release documentation. (#147)
 
 ### Changed

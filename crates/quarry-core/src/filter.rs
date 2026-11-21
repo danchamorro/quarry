@@ -699,7 +699,7 @@ pub(crate) fn validate_query(query: &FilterQuery) -> Result<(), QuarryError> {
 }
 
 pub(crate) enum PredicateMatcher<'a> {
-    Text(ByteMatcher<'a>),
+    Text(Box<ByteMatcher<'a>>),
     Numeric {
         lower: Vec<u8>,
         upper: Option<Vec<u8>>,
@@ -730,10 +730,10 @@ pub(crate) fn compile_matchers(
                 if predicate.operator == FilterOperator::Contains && predicate.value.is_empty() {
                     return Err(invalid("contains filter value must not be empty"));
                 }
-                return Ok(PredicateMatcher::Text(ByteMatcher::new(
+                return Ok(PredicateMatcher::Text(Box::new(ByteMatcher::new(
                     &predicate.value,
                     query.case_sensitivity,
-                )));
+                ))));
             }
             let invalid_lower = if predicate.operator == FilterOperator::Between {
                 "lower bound must be a nonblank number (for example -12.5 or 1e3; exponent -1000000 to 1000000)"
