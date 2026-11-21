@@ -260,6 +260,7 @@ pub(super) struct JoinDialog {
     mode: JoinMode,
     temporary: PathBuf,
     header_jobs: [Option<JoinJob<HeaderInfo>>; 2],
+    retired_headers: Vec<JoinJob<HeaderInfo>>,
     checking: Option<JoinJob<JoinPlan>>,
     writing: Option<JoinJob<JoinSummary>>,
     cleanup: Option<JoinHandle<Result<(), String>>>,
@@ -310,6 +311,7 @@ impl JoinDialog {
             mode: JoinMode::Left,
             temporary,
             header_jobs: [None, None],
+            retired_headers: Vec::new(),
             checking: None,
             writing: None,
             cleanup: None,
@@ -334,7 +336,7 @@ impl JoinDialog {
     }
 
     fn has_header_job(&self) -> bool {
-        self.header_jobs.iter().any(Option::is_some)
+        self.header_jobs.iter().any(Option::is_some) || !self.retired_headers.is_empty()
     }
 
     /// Keep the dialog alive until both workers and explicit cleanup have finished.
@@ -429,7 +431,12 @@ impl JoinDialog {
 
     /// Request worker cancellation without dropping a running writer on the UI thread.
     fn cancel(&mut self) {
-        for job in self.header_jobs.iter().flatten() {
+        for job in self
+            .header_jobs
+            .iter()
+            .flatten()
+            .chain(&self.retired_headers)
+        {
             job.cancel();
         }
         if let Some(job) = &self.checking {
@@ -498,6 +505,7 @@ impl JoinDialog {
 
     /// Adopt completed workers and retain published results even after cancellation.
     fn poll(&mut self) {
+        self.retired_headers.retain(|job| !job.progress().done);
         for side in 0..2 {
             if self.header_jobs[side]
                 .as_ref()
@@ -631,8 +639,13 @@ impl JoinDialog {
     fn read_header(&mut self, side: usize, path: PathBuf) {
         if let Some(previous) = self.header_jobs[side].take() {
             previous.cancel();
+            self.retired_headers.push(previous);
         }
-        self.document_inputs[side] = None;
+        let switching_source = self.document_inputs[side].take().is_some()
+            || self.paths[side].as_deref() != Some(path.as_path());
+        if switching_source {
+            self.formats[side] = JoinFormat::default();
+        }
         self.paths[side] = Some(path.clone());
         self.headers[side] = None;
         self.refresh_output_columns();
@@ -649,6 +662,7 @@ impl JoinDialog {
     fn read_document_header(&mut self, side: usize, captured: CapturedDocument) {
         if let Some(previous) = self.header_jobs[side].take() {
             previous.cancel();
+            self.retired_headers.push(previous);
         }
         let CapturedDocument {
             path,
@@ -861,7 +875,8 @@ impl JoinDialog {
         &mut self,
         ui: &mut egui::Ui,
         editable: bool,
-        can_start: bool,
+        source_editable: bool,
+        can_pick_source: bool,
         documents: &[OpenDocumentChoice],
     ) -> DialogAction {
         let mut action = DialogAction::None;
@@ -916,7 +931,7 @@ impl JoinDialog {
                             format!("{} (saved file)", path.display())
                         }
                     });
-                    let picker_enabled = editable && can_start;
+                    let picker_enabled = source_editable && can_pick_source;
                     ui.add_enabled_ui(picker_enabled, |ui| {
                         let combo_width = (ui.available_width() - 2.0).max(100.0);
                         let combo = egui::ComboBox::from_id_salt(("join-source", side))
@@ -1671,14 +1686,16 @@ impl JoinDialog {
         &mut self,
         ctx: &egui::Context,
         can_start: bool,
+        can_pick_source: bool,
         documents: &[OpenDocumentChoice],
     ) -> DialogAction {
         self.poll();
         if self.closing && !self.busy() && self.plan.is_none() {
             return DialogAction::Closed(self.quit_after_close);
         }
-        let busy = self.busy();
+        let busy = self.busy() || self.pending_auto_write;
         let editable = self.inputs_editable();
+        let source_editable = self.can_change_input() && !self.pending_auto_write;
         let mut action = DialogAction::None;
         let mut open = true;
         egui::Window::new("Join Files")
@@ -1702,8 +1719,13 @@ impl JoinDialog {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
 
-                        let source_action =
-                            self.show_source_panels(ui, editable, can_start, documents);
+                        let source_action = self.show_source_panels(
+                            ui,
+                            editable,
+                            source_editable,
+                            can_pick_source,
+                            documents,
+                        );
                         if source_action != DialogAction::None {
                             action = source_action;
                         }
@@ -1719,12 +1741,14 @@ impl JoinDialog {
                             action = advanced_action;
                         }
 
-                        if self.plan.is_some() || self.result.is_some() {
+                        if (self.plan.is_some() && !self.pending_auto_write)
+                            || self.result.is_some()
+                        {
                             let palette = theme::ui_palette(ui);
                             let needs_confirm = self.plan_needs_confirmation();
                             theme::inset_card(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 6.0;
-                                if self.plan.is_some() {
+                                if self.plan.is_some() && !self.pending_auto_write {
                                     ui.label(
                                         RichText::new(if needs_confirm {
                                             "Confirmation required"
@@ -1798,6 +1822,8 @@ impl JoinDialog {
                                 ui.spinner();
                                 ui.label(if self.cleanup.is_some() {
                                     "Releasing private join data…"
+                                } else if self.pending_auto_write {
+                                    "Preparing joined file…"
                                 } else {
                                     "Reading columns…"
                                 });
@@ -1824,7 +1850,12 @@ impl JoinDialog {
                             )
                             .clicked()
                         {
+                            let cancelling_auto_write = self.pending_auto_write;
                             self.cancel();
+                            if cancelling_auto_write && self.plan.is_some() {
+                                self.reset();
+                                self.message = Some("Join cancelled. No output was created.".into());
+                            }
                         }
                     } else if self.result.is_some() {
                         theme::push_right(
@@ -2307,6 +2338,7 @@ impl QuarryApp {
     /// Route UI actions through fresh capacity and path-reservation checks.
     pub(super) fn show_join_files(&mut self, ctx: &egui::Context) {
         let can_start = self.write_slot_available();
+        let can_pick_source = self.can_start_join_header();
         let documents: Vec<_> = self
             .document_tabs()
             .filter_map(|tab| {
@@ -2335,7 +2367,7 @@ impl QuarryApp {
         let Some(dialog) = self.join_files.as_mut() else {
             return;
         };
-        let action = dialog.show(ctx, can_start, &documents);
+        let action = dialog.show(ctx, can_start, can_pick_source, &documents);
         match action {
             DialogAction::None => {}
             DialogAction::Closed(quit) => {
@@ -4849,5 +4881,122 @@ value
         click(&mut app, &ctx, "Preview");
         finish(&mut app);
         assert_stable("preview", &mut app, &ctx);
+    }
+
+    #[test]
+    fn replacing_preselected_tsv_tab_with_saved_csv_resets_delimiter_to_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = fixture(dir.path(), "tab.tsv", b"id\tname\n1\tTab\n");
+        let csv = fixture(dir.path(), "saved.csv", b"id,name\n1,Alice\n");
+        let other = fixture(dir.path(), "other.csv", b"id,city\n1,Paris\n");
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_document_tab_with_encoding(
+            tsv,
+            OpenOptions {
+                delimiter: Some(b'\t'),
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Utf8),
+        )
+        .unwrap();
+        finish_document(&mut app);
+        app.open_join_files();
+        finish(&mut app);
+        assert_eq!(
+            app.join_files.as_ref().unwrap().formats[0].delimiter,
+            Some(b'\t')
+        );
+        // Replace the preselected TSV tab with a saved CSV file.
+        app.select_join_input_path(0, csv).unwrap();
+        finish(&mut app);
+        app.select_join_input_path(1, other).unwrap();
+        finish(&mut app);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert_eq!(dialog.formats[0].delimiter, None);
+        assert_eq!(dialog.headers[0].as_ref().unwrap().delimiter, b',');
+        assert_eq!(dialog.headers[0].as_ref().unwrap().columns, ["id", "name"]);
+        let ctx = context();
+        let output = dir.path().join("joined-csv.csv");
+        app.start_join_to(output.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.join_files.is_some() {
+            assert!(Instant::now() < deadline, "join timed out");
+            frame(&mut app, &ctx, vec![]);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fs::read(output).unwrap(),
+            b"id (Main),name,id (Additional),city\n1,Alice,1,Paris\n"
+        );
+    }
+
+    #[test]
+    fn clicking_cancel_on_the_frame_analysis_completes_blocks_auto_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        // Capture the Cancel button's AccessKit ID deterministically while busy.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        app.join_files.as_mut().unwrap().cleanup = Some(thread::spawn(move || {
+            let _ = rx.recv();
+            Ok(())
+        }));
+        let rendered = frame(&mut app, &ctx, vec![]);
+        let cancel_id = rendered
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|tree| {
+                tree.nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some("Cancel"))
+                    .map(|(id, _)| *id)
+            })
+            .expect("busy join dialog should expose a Cancel button");
+        drop(tx);
+        finish(&mut app);
+
+        let output = dir.path().join("cancel-click.csv");
+        app.start_join_to(output.clone());
+        // Wait for checking to finish before the next frame so poll() sets
+        // pending_auto_write on the exact frame the queued Cancel click arrives.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .join_files
+            .as_ref()
+            .unwrap()
+            .checking
+            .as_ref()
+            .is_some_and(|job| !job.progress().done)
+        {
+            assert!(Instant::now() < deadline, "analysis timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: cancel_id,
+                    data: None,
+                },
+            )],
+        );
+        finish(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(dialog.writing.is_none());
+        assert!(dialog.plan.is_none());
+        assert_eq!(
+            dialog.message.as_deref(),
+            Some("Join cancelled. No output was created.")
+        );
+        assert!(
+            !output.exists(),
+            "Cancel click must prevent automatic write"
+        );
     }
 }
