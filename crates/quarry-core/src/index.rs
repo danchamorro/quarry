@@ -524,4 +524,157 @@ mod tests {
             assert_eq!(session.completed_record_count(), None);
         }
     }
+
+    #[test]
+    fn scale_arithmetic_handles_1_1_trillion_rows_and_over_16_tb_offsets() {
+        const TARGET_ROWS: u64 = 1_099_511_627_776; // 2^40 (~1.0995 trillion lines)
+        const TARGET_BYTES: u64 = 20 * 1024_u64 * 1024 * 1024 * 1024; // 20 TiB (> 16 TiB)
+        const AVG_BYTES_PER_ROW: u64 = TARGET_BYTES / TARGET_ROWS; // 20 bytes/row
+
+        let mut index = StructuralIndex::new(IndexConfig::default()).unwrap();
+        assert_eq!(index.max_checkpoints, 1_048_576); // 16 MiB / 16 bytes
+
+        // Compute the compacted checkpoint spacing that keeps <= max_checkpoints across TARGET_ROWS.
+        let mut interval = index.checkpoint_every;
+        while TARGET_ROWS / interval >= index.max_checkpoints as u64 {
+            interval = interval.checked_mul(2).expect("interval must not overflow");
+        }
+        assert_eq!(interval, 2_097_152); // 2^21 rows per checkpoint
+
+        // Populate a representative compacted checkpoint table obeying StructuralIndex invariants.
+        let count = (TARGET_ROWS / interval) as usize + 1;
+        assert!(count <= index.max_checkpoints);
+        index.checkpoint_every = interval;
+        index.checkpoints = (0..count as u64)
+            .map(|slot| {
+                let row = slot.checked_mul(interval).unwrap();
+                let offset = row.checked_mul(AVG_BYTES_PER_ROW).unwrap();
+                super::Checkpoint { row, offset }
+            })
+            .collect();
+        index.checkpoints.shrink_to_fit();
+        index.indexed_rows = TARGET_ROWS;
+        index.indexed_bytes = TARGET_BYTES;
+
+        assert!(index.memory_bytes() <= IndexConfig::default().memory_budget_bytes);
+
+        // Deterministic sampling across small, 32-bit boundary, 100M, 1.1T, and u64::MAX queries.
+        let mut probes = vec![
+            0,
+            1,
+            4095,
+            4096,
+            u32::MAX as u64 - 1,
+            u32::MAX as u64,
+            u32::MAX as u64 + 1,
+            100_000_000,
+            TARGET_ROWS - 1,
+            TARGET_ROWS,
+            TARGET_ROWS + 123_456,
+            u64::MAX,
+        ];
+        let mut state = 0x167B_1100_0000_0001_u64;
+        for _ in 0..2_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            probes.push(state % (TARGET_ROWS + 1));
+        }
+
+        for row in probes {
+            let cp = index.nearest_checkpoint(row);
+            assert!(cp.row <= row, "checkpoint row {} > query row {row}", cp.row);
+            assert_eq!(cp.row % index.checkpoint_every(), 0);
+            assert_eq!(cp.offset, cp.row.checked_mul(AVG_BYTES_PER_ROW).unwrap());
+            if row <= TARGET_ROWS {
+                assert!(
+                    row - cp.row < index.checkpoint_every(),
+                    "gap {} >= interval {}",
+                    row - cp.row,
+                    index.checkpoint_every()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_interval_doubling_saturates_safely_near_u64_max() {
+        let mut index = StructuralIndex::new(IndexConfig {
+            chunk_bytes: 1,
+            checkpoint_every: 1_u64 << 62,
+            memory_budget_bytes: 2 * std::mem::size_of::<super::Checkpoint>(),
+        })
+        .unwrap();
+        index.checkpoints.push(super::Checkpoint {
+            row: 1_u64 << 62,
+            offset: 1_u64 << 62,
+        });
+        index.indexed_rows = (1_u64 << 63) - 1;
+        // Trigger compaction at 2^63: doubling 2^62 yields 2^63 cleanly without overflow.
+        index.record_boundary(u64::MAX - 1);
+        assert_eq!(index.checkpoint_every(), 1_u64 << 63);
+        assert!(index.checkpoints().len() <= index.max_checkpoints);
+        assert_eq!(index.nearest_checkpoint(u64::MAX).row, 1_u64 << 63);
+    }
+
+    /// Unix filesystems (APFS, ext4, XFS, btrfs) create zero-allocation sparse holes on
+    /// seek + write; on Windows a non-sparse file would physically allocate the entire gap
+    /// without `FSCTL_SET_SPARSE`, so this test is restricted to Unix targets.
+    #[cfg(unix)]
+    #[test]
+    fn sparse_file_seek_and_read_near_large_offset_without_scanning_hole() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sparse-scale.csv");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        let head = b"id,value\n0,head\n";
+        file.write_all(head).unwrap();
+
+        // Try a >16 TB-class offset (16 TiB - 64 KiB fits APFS, ext4, XFS, btrfs), falling
+        // back to >4 GiB (u32::MAX + 1 MiB) if the host test filesystem caps smaller.
+        let candidates = [
+            16_u64 * 1024 * 1024 * 1024 * 1024 - 64 * 1024,
+            u64::from(u32::MAX) + 1024 * 1024,
+        ];
+        let tail = b"1099511627775,\"tail,quoted\"\n";
+        let mut tail_offset = None;
+        for offset in candidates {
+            if file.seek(SeekFrom::Start(offset)).is_ok() && file.write_all(tail).is_ok() {
+                tail_offset = Some(offset);
+                break;
+            }
+        }
+        let tail_offset = tail_offset.expect("filesystem must support >4 GiB sparse seek");
+        assert!(tail_offset > u64::from(u32::MAX));
+
+        // Seek directly to the tail offset and scan/parse without touching the sparse hole.
+        file.seek(SeekFrom::Start(tail_offset)).unwrap();
+        let mut buf = vec![0u8; tail.len()];
+        file.read_exact(&mut buf).unwrap();
+
+        let mut scanner = quarry_delimited::RecordScanner::at_offset(b',', tail_offset).unwrap();
+        let mut ends = Vec::new();
+        scanner
+            .scan_chunk(&buf, tail_offset, |end| ends.push(end))
+            .unwrap();
+        assert!(
+            !scanner
+                .finish(tail_offset + buf.len() as u64, |end| ends.push(end))
+                .unwrap()
+        );
+        assert_eq!(ends, vec![tail_offset + tail.len() as u64]);
+
+        let parsed = quarry_delimited::parse_record(&buf, b',').unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].as_ref(), b"1099511627775");
+        assert_eq!(parsed[1].as_ref(), b"tail,quoted");
+    }
 }
