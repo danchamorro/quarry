@@ -41,7 +41,8 @@ pub use combine::{
 };
 pub use compressed::{
     CompressedBootstrap, CompressedDecompressJob, CompressedOpenConfig, CompressedOpenOutcome,
-    CompressedProgress, CompressionFormat, detect_compression,
+    CompressedProgress, CompressedRawDecompressJob, CompressionFormat, DecompressedCopy,
+    detect_compression, is_compressed_destination, reject_compressed_destination,
 };
 pub use date_time_sort::DateTimeFormat;
 pub use encoding::Encoding;
@@ -668,6 +669,11 @@ fn read_initial_records(
         })?;
     }
 
+    // A stream that fills the limit may still end exactly there; one probe byte
+    // (never kept) tells it apart from a longer stream.
+    if file_size.is_none() && !stream_ended && ends.len() < wanted {
+        stream_ended = stream_ends_here(file)?;
+    }
     let reached_eof = match file_size {
         Some(file_size) => bytes.len() as u64 == file_size,
         None => stream_ended,
@@ -733,10 +739,7 @@ fn detect_file_delimiter(
             return Ok(delimiter);
         }
         if sample.len() >= limit {
-            return Err(QuarryError::BootstrapLimitExceeded {
-                limit,
-                rows_found: 0,
-            });
+            return delimiter_at_limit(file, file_size, at_eof, &sample, limit, encoding);
         }
         if sample.len() < target {
             return Err(QuarryError::SourceChanged);
@@ -746,10 +749,43 @@ fn detect_file_delimiter(
         let next = target.saturating_mul(2).min(limit);
         target = if encoding.is_utf16() { next & !1 } else { next };
         if target <= sample.len() {
-            return Err(QuarryError::BootstrapLimitExceeded {
-                limit,
-                rows_found: 0,
-            });
+            return delimiter_at_limit(file, file_size, at_eof, &sample, limit, encoding);
+        }
+    }
+}
+
+/// A stream sample that filled the bootstrap limit may still be the whole stream:
+/// probe one byte past it and, at the end, detect from the complete sample.
+fn delimiter_at_limit(
+    file: &mut impl Read,
+    file_size: Option<u64>,
+    at_eof: bool,
+    sample: &[u8],
+    limit: usize,
+    encoding: Encoding,
+) -> Result<u8, QuarryError> {
+    if file_size.is_none()
+        && !at_eof
+        && stream_ends_here(file)?
+        && let Some(delimiter) = detect_delimiter(sample, true, encoding)
+    {
+        return Ok(delimiter);
+    }
+    Err(QuarryError::BootstrapLimitExceeded {
+        limit,
+        rows_found: 0,
+    })
+}
+
+/// Read one byte past a bounded prefix to learn whether a stream ends there.
+/// The byte is discarded; callers either stop or seek back.
+fn stream_ends_here(file: &mut impl Read) -> io::Result<bool> {
+    let mut probe = [0_u8; 1];
+    loop {
+        match file.read(&mut probe) {
+            Ok(read) => return Ok(read == 0),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
 }

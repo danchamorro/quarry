@@ -222,6 +222,7 @@ impl DocumentTab {
     /// Decompression shares the global job limit but never delays closing the tab.
     fn decompressing(&self) -> bool {
         self.document.as_ref().is_some_and(Document::decompressing)
+            || self.inspection.decompressing()
     }
 
     /// Counts file operations and structural analysis against the global job limit.
@@ -563,12 +564,16 @@ impl QuarryApp {
         if compressed::is_gzip(&path) && !self.write_slot_available() {
             return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
         }
-        let mut document = match Document::prepare_with_encoding(&path, options, encoding) {
+        let mut document = match Document::prepare_checked(&path, options, encoding) {
             Ok(d) => d,
-            Err(message) => {
-                // Raw inspection would read compressed bytes as text, so it is not offered.
-                let compressed_input = compressed::compressed_source(&path);
-                if !self.active.inspection.busy() && !compressed_input {
+            Err(failure) => {
+                let message = failure.message;
+                // Raw inspection would read compressed bytes as text. Only text problems
+                // inside valid gzip are inspected, through a raw private copy; damaged or
+                // unsupported compressed files are reported as they are.
+                let inspectable = failure.inspectable
+                    && (!compressed::compressed_source(&path) || compressed::is_gzip(&path));
+                if !self.active.inspection.busy() && inspectable {
                     self.active.inspection = inspection_ui::InspectionUi::failed(
                         path.clone(),
                         options,
@@ -576,10 +581,10 @@ impl QuarryApp {
                         message.clone(),
                     );
                 }
-                return Err(if compressed_input {
-                    AppMessage::error(message)
-                } else {
+                return Err(if inspectable {
                     AppMessage::file_open_error(path, options, encoding, message)
+                } else {
+                    AppMessage::error(message)
                 });
             }
         };

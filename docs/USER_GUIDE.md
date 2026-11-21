@@ -195,8 +195,14 @@ drag-and-drop.
 A compressed document never changes. Save, cell and header editing, Replace,
 inserting or deleting rows and columns, column tools, sorting, duplicates, Undo,
 and Discard Changes are unavailable. Quarry writes only uncompressed files, so
-it refuses output names that end in `.gz`. Join Files and Combine Files need an
-uncompressed copy.
+it refuses output names that end in `.gz` or `.tgz`. Join Files and Combine Files
+need an uncompressed copy.
+
+If a valid gzip file fails to open because its delimited text is malformed,
+the error offers **Inspect File…**. Quarry decompresses the file, without
+reading it as rows, into a private temporary copy and reports where the text is
+malformed. Quarry removes the copy when you inspect another file, close the
+tab, or quit.
 
 The temporary copy needs free space equal to the expanded size. It goes in the
 folder chosen in **File → Temporary Storage…**, and Quarry removes it when you
@@ -215,7 +221,8 @@ In the CLI, `open`, `inspect`, `viewport`, `search`, `filter`, `export`, and
 `convert-utf8` read `.gz` files. `--temp-dir DIRECTORY` chooses the folder for
 the temporary copy, and `--max-decompressed-bytes` caps its size (for example
 `1GB`). `quarry open FILE.gz --no-wait` reads only the first rows and writes no
-temporary file. The CLI removes the copy when the command ends, fails, or is
+temporary file. `quarry inspect FILE.gz` also reports malformed text inside a
+valid gzip file. The CLI removes the copy when the command ends, fails, or is
 interrupted with Ctrl-C.
 
     quarry convert-utf8 sales.csv.gz --output sales.csv --max-decompressed-bytes 20GB

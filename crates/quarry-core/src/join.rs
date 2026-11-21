@@ -2824,6 +2824,10 @@ impl JoinPlan {
         acknowledge_expansion: bool,
         acknowledge_layout: bool,
     ) -> Result<JoinJob<JoinSummary>, QuarryError> {
+        if let Err(error) = crate::compressed::reject_compressed_destination(&destination) {
+            self.release()?;
+            return Err(error);
+        }
         if self.analysis.new_columns != [0, 0] && !acknowledge_layout {
             self.release()?;
             return Err(error(

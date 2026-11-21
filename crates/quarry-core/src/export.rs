@@ -3055,7 +3055,10 @@ fn validate_destination(source: &Path, destination: &Path) -> Result<(), QuarryE
     }
 }
 
+/// Every writer validates its destination here, so none can publish a file that
+/// claims compressed output.
 fn validate_distinct_paths(source: &Path, destination: &Path) -> Result<(), QuarryError> {
+    crate::compressed::reject_compressed_destination(destination)?;
     let current_dir = std::env::current_dir()?;
     if normalize_path(source, &current_dir) == normalize_path(destination, &current_dir) {
         return Err(QuarryError::ExportDestinationIsSource);

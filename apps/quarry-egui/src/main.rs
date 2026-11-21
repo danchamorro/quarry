@@ -6555,6 +6555,15 @@ impl Document {
         options: OpenOptions,
         encoding: Option<Encoding>,
     ) -> Result<Self, String> {
+        Self::prepare_checked(path, options, encoding).map_err(|failure| failure.message)
+    }
+
+    /// Like `prepare_with_encoding`, and also says whether Inspect File can examine a failure.
+    fn prepare_checked(
+        path: &Path,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+    ) -> Result<Self, compressed::OpenFailure> {
         let options = OpenOptions {
             rows: BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS + 1,
             ..options
@@ -6562,8 +6571,12 @@ impl Document {
         if compressed::is_gzip(path) {
             return Self::prepare_compressed(path, options, encoding);
         }
-        let session = Session::open_with_encoding(path, options, encoding)
-            .map_err(|error| error.to_string())?;
+        let session = Session::open_with_encoding(path, options, encoding).map_err(|error| {
+            compressed::OpenFailure {
+                message: error.to_string(),
+                inspectable: true,
+            }
+        })?;
         Ok(Self::from_session(session, path))
     }
 

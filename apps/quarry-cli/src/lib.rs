@@ -10,15 +10,16 @@ use std::time::{Duration, Instant};
 use quarry_core::{
     CaseSensitivity, ColumnTransformation, CompletedIndex, CompressedBootstrap,
     CompressedDecompressJob, CompressedOpenConfig, CompressedOpenOutcome, CompressedProgress,
-    CompressionFormat, DateTimeFormat, Dialect, DuplicateJob, DuplicateOutcome, DuplicateSpec,
-    Encoding, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
-    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, HeaderMode,
-    IndexConfig, IndexJob, IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS,
-    OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob, SaveAsOutcome, SaveAsProgress,
-    SearchJob, SearchOutcome, SearchPosition, SearchProgress, Session, SortDirection, SortJob,
-    SortMode, SortOutcome, SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
-    SplitAnalysisProgress, StructuralIndex, WorkingCopyCleanup, check_storage, detect_compression,
-    estimate_edited_output_bytes, estimate_sort_temporary_bytes, inspect_storage,
+    CompressedRawDecompressJob, CompressionFormat, DateTimeFormat, DecompressedCopy, Dialect,
+    DuplicateJob, DuplicateOutcome, DuplicateSpec, Encoding, FilterExportJob, FilterExportOutcome,
+    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
+    FilterProgress, FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress,
+    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome,
+    SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition,
+    SearchProgress, Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
+    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex,
+    WorkingCopyCleanup, check_storage, detect_compression, estimate_edited_output_bytes,
+    estimate_sort_temporary_bytes, inspect_storage, is_compressed_destination,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -123,23 +124,15 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
     if let Some(output) = &output {
         reject_compressed_output(output)?;
     }
-    // A compressed source is inspected through its verified private copy.
+    // A compressed source is inspected through a verified private copy that is not
+    // parsed while it is made, so malformed text inside valid gzip is still diagnosed.
     let compressed_input = match detect_compression(&path)? {
-        Some(_) => Some(open_input(
-            &path,
-            OpenOptions {
-                delimiter: options.delimiter,
-                header_mode: options.header_mode,
-                ..OpenOptions::default()
-            },
-            options.encoding,
-            &compressed,
-        )?),
+        Some(_) => Some(decompress_for_inspection(&path, &compressed)?),
         None => None,
     };
     let scan_path = compressed_input
         .as_ref()
-        .map_or(path.as_path(), |input| input.session.path());
+        .map_or(path.as_path(), |input| input.copy.path());
     let job = InspectionJob::start(scan_path, options, InspectionEdits::default())?;
     loop {
         let p = job.progress();
@@ -152,6 +145,7 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
         thread::sleep(Duration::from_millis(1));
     }
     let report = job.wait()?;
+    interrupt::check()?;
     println!(
         "File: {}\nEncoding: {}\nDelimiter: {:?}\nHeader: {}\nInspection: {:?}\nCoverage: {} of {} source bytes\nRecords: {}\nFindings: {} ({} shown)",
         path.display(),
@@ -169,10 +163,8 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
         report.total_findings,
         report.findings.len()
     );
-    if let Some(input) = &compressed_input
-        && let Some(summary) = &input.compressed
-    {
-        print_compressed_summary(summary);
+    if let Some(input) = &compressed_input {
+        input.print_summary();
     }
     for (i, d) in report.findings.iter().enumerate() {
         println!("\nFinding {}\n{}", i + 1, d.details());
@@ -184,6 +176,9 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
     if let Some(output) = output {
         let job = RecoveryJob::start(&report, &omitted, &output)?;
         while !job.progress().done {
+            if interrupt::requested() {
+                job.cancel();
+            }
             thread::sleep(Duration::from_millis(1));
         }
         match job.wait()? {
@@ -193,7 +188,10 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
                 s.removed_records,
                 s.retained_records
             ),
-            None => return Err("recovery cancelled; no output published".into()),
+            None => {
+                interrupt::check()?;
+                return Err("recovery cancelled; no output published".into());
+            }
         }
         return Ok(());
     }
@@ -3341,6 +3339,8 @@ fn benchmark_viewports(
     let mut samples = Vec::with_capacity(iterations);
     let mut checksum = 0_u64;
     for iteration in 0..iterations {
+        // Ctrl-C ends the run so the input, and any private copy, is dropped cleanly.
+        interrupt::check()?;
         let start = start(iteration);
         let began = Instant::now();
         let selected = session.read_rows(index, start, rows)?;
@@ -3728,6 +3728,7 @@ fn print_jump(
     live_progress: Option<IndexProgress>,
     render_rows: bool,
 ) -> CliResult<()> {
+    interrupt::check()?;
     let began = Instant::now();
     let selected = session.read_rows(index, start, count)?;
     let read_ms = began.elapsed().as_secs_f64() * 1000.0;
@@ -3746,6 +3747,7 @@ fn print_jump(
     }
     if render_rows {
         for (offset, row) in selected.iter().enumerate() {
+            interrupt::check()?;
             println!(
                 "row {} @{}: {}",
                 start + offset as u64,
@@ -3785,6 +3787,7 @@ fn generate_command(args: Vec<String>) -> CliResult<()> {
 
     let requested = size.ok_or("generate requires --size")?;
     let output = output.ok_or("generate requires --output")?;
+    reject_compressed_output(&output)?;
     let began = Instant::now();
     let actual = generate_file(&output, requested, columns, delimiter, seed)?;
     println!(
@@ -4067,18 +4070,88 @@ fn decompression_progress_line(progress: &CompressedProgress) -> String {
 }
 
 /// Quarry writes uncompressed delimited text, so an output name must not claim gzip.
+/// The rule (`.gz` or `.tgz`, any case) is the one every core writer enforces.
 fn reject_compressed_output(path: &Path) -> CliResult<()> {
-    if path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"))
-    {
+    if is_compressed_destination(path) {
         return Err(format!(
-            "{}: Quarry writes uncompressed delimited files; choose an output name without .gz",
+            "{}: Quarry writes uncompressed delimited files; choose an output name without .gz or .tgz",
             path.display()
         )
         .into());
     }
     Ok(())
+}
+
+/// A verified private copy of a compressed input, not parsed as delimited text.
+/// Fields drop in order, so the copy is removed before cleanup errors are printed.
+struct DecompressedInput {
+    copy: DecompressedCopy,
+    decompression: Duration,
+    _cleanup: CleanupReport,
+}
+
+impl DecompressedInput {
+    fn print_summary(&self) {
+        println!("Compression: {}", compression_name(self.copy.format()));
+        println!(
+            "Compressed size: {} ({} bytes)",
+            human_bytes(self.copy.compressed_size()),
+            self.copy.compressed_size()
+        );
+        println!(
+            "Decompressed size: {} ({} bytes)",
+            human_bytes(self.copy.decompressed_size()),
+            self.copy.decompressed_size()
+        );
+        println!(
+            "Decompression time: {:.3} s",
+            self.decompression.as_secs_f64()
+        );
+    }
+}
+
+/// Decompresses a gzip input into a verified private copy without parsing it, so
+/// inspection can locate malformed delimited data inside valid gzip. Ctrl-C stops
+/// the job, which removes its private copy before this returns.
+fn decompress_for_inspection(
+    path: &Path,
+    compressed: &CompressedArgs,
+) -> CliResult<DecompressedInput> {
+    interrupt::install();
+    let cleanup = CleanupReport(WorkingCopyCleanup::default());
+    let job = CompressedRawDecompressJob::start(path, compressed.config(), cleanup.0.clone())?;
+    let mut last_report = Instant::now();
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if interrupt::requested() {
+            job.cancel();
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            // No rows are counted: the copy is not parsed while it is made.
+            eprintln!(
+                "  {:>6.2}%  {} of {} compressed  {} expanded",
+                progress.compressed_bytes_read as f64 * 100.0
+                    / progress.compressed_total_bytes.max(1) as f64,
+                human_bytes(progress.compressed_bytes_read),
+                human_bytes(progress.compressed_total_bytes),
+                human_bytes(progress.decompressed_bytes_written)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let decompression = job.progress().elapsed;
+    match job.wait()? {
+        Some(copy) => Ok(DecompressedInput {
+            copy,
+            decompression,
+            _cleanup: cleanup,
+        }),
+        None => Err(interrupt::MESSAGE.into()),
+    }
 }
 
 /// Commands that change data accept only uncompressed files; compressed files are read-only.

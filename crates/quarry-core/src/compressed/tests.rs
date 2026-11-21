@@ -1364,3 +1364,566 @@ fn a_preview_session_shows_bootstrap_rows_and_reads_nothing() {
     assert_eq!(fs::read(&path).unwrap(), gzip(data));
     assert_eq!(entries(source_dir.path()), vec![path]);
 }
+
+// ---- Bounded headers, cancellation, exact limits and raw copies ----------------
+
+/// A member whose filename or comment never ends within the cap, followed by
+/// megabytes of non-NUL bytes that an unbounded reader would scan for a NUL.
+fn oversized_header_text(flag: u8) -> Vec<u8> {
+    let mut bytes = vec![0x1f, 0x8b, 8, flag, 0, 0, 0, 0, 0, 255];
+    bytes.extend(std::iter::repeat_n(b'n', 8 << 20));
+    bytes
+}
+
+/// Sets a cancellation flag once `after` bytes have been read from it.
+struct TripReader<'a> {
+    inner: io::Cursor<&'a [u8]>,
+    cancel: Arc<AtomicBool>,
+    after: u64,
+}
+
+impl Read for TripReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.inner.position() >= self.after {
+            self.cancel.store(true, Ordering::Release);
+        }
+        self.inner.read(buffer)
+    }
+}
+
+#[test]
+fn oversized_header_text_fails_fast_in_bootstrap_and_decompression() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let options = OpenOptions {
+        rows: 5,
+        sample_bytes: 1024,
+        bootstrap_limit: 64 * 1024,
+        ..OpenOptions::default()
+    };
+    let body = gzip(&numbered_rows(200_000));
+    for (flag, field) in [(FLAG_NAME, "filename"), (FLAG_COMMENT, "comment")] {
+        let expected = format!("The gzip header {field} exceeds the 65536-byte limit.");
+
+        // Text exactly at the cap is still valid gzip.
+        let text = vec![b'n'; MAX_GZIP_HEADER_TEXT];
+        let header = if flag == FLAG_NAME {
+            Header {
+                name: Some(&text),
+                ..Header::default()
+            }
+        } else {
+            Header {
+                comment: Some(&text),
+                ..Header::default()
+            }
+        };
+        assert_eq!(decode(&member(b"a,b\n", header)).unwrap(), b"a,b\n");
+
+        // The reader stops just past the cap instead of scanning 8 MiB for a NUL.
+        let oversized = oversized_header_text(flag);
+        let mut reader = GzipMembers::new(BufReader::with_capacity(4096, oversized.as_slice()));
+        let error = reader.read(&mut [0_u8; 64]).unwrap_err();
+        let reason_text = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<CorruptGzip>())
+            .map(|corrupt| corrupt.0.clone());
+        assert_eq!(reason_text.as_deref(), Some(expected.as_str()));
+        let consumed = oversized.len() - reader.input.get_ref().len();
+        assert!(
+            consumed <= 10 + MAX_GZIP_HEADER_TEXT + 1 + 4096,
+            "{consumed}"
+        );
+
+        // In the bootstrap: the first member's header.
+        let path = write(source_dir.path(), &format!("{field}.csv.gz"), &oversized);
+        let error =
+            CompressedBootstrap::open(&path, OpenOptions::default(), None, None).unwrap_err();
+        assert_eq!(reason(&error), expected);
+
+        // In decompression: a later member the bootstrap never reaches.
+        let mut bytes = body.clone();
+        bytes.extend(&oversized);
+        let path = write(source_dir.path(), &format!("late-{field}.csv.gz"), &bytes);
+        let bootstrap = CompressedBootstrap::open(&path, options, None, None).unwrap();
+        assert!(!bootstrap.reached_eof());
+        let error = bootstrap
+            .start_decompression(config(temp.path()), WorkingCopyCleanup::default())
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert_eq!(reason(&error), expected);
+        assert!(entries(temp.path()).is_empty(), "{field}");
+        let error = CompressedRawDecompressJob::start(
+            &path,
+            config(temp.path()),
+            WorkingCopyCleanup::default(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap_err();
+        assert_eq!(reason(&error), expected);
+        assert!(entries(temp.path()).is_empty(), "{field}");
+    }
+}
+
+#[test]
+fn cancellation_stops_at_member_boundaries_and_inside_long_headers() {
+    // Between members: the next header is never read once cancelled.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut bytes = gzip(b"first\n");
+    bytes.extend(gzip(b"second\n"));
+    let mut reader =
+        GzipMembers::new(BufReader::new(bytes.as_slice())).with_cancel(Arc::clone(&cancel));
+    let mut buffer = [0_u8; 64];
+    assert_eq!(reader.read(&mut buffer).unwrap(), 6);
+    assert_eq!(reader.members(), 1);
+    cancel.store(true, Ordering::Release);
+    assert!(is_cancelled(&reader.read(&mut buffer).unwrap_err()));
+    assert_eq!(reader.members(), 1);
+
+    // Inside a long (valid) filename: stopped within one check interval.
+    let name = vec![b'n'; 60 * 1024];
+    let long = member(
+        b"a,b\n",
+        Header {
+            name: Some(&name),
+            ..Header::default()
+        },
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let trip = 10 + 1_000;
+    let mut reader = GzipMembers::new(BufReader::with_capacity(
+        64,
+        TripReader {
+            inner: io::Cursor::new(long.as_slice()),
+            cancel: Arc::clone(&cancel),
+            after: trip,
+        },
+    ))
+    .with_cancel(cancel);
+    assert!(is_cancelled(&reader.read(&mut buffer).unwrap_err()));
+    let position = reader.input.get_ref().inner.position();
+    assert!(
+        position <= trip + HEADER_CANCEL_CHECK_BYTES as u64 + 64,
+        "read {position} bytes after cancelling at {trip}"
+    );
+}
+
+#[test]
+fn cancelling_while_crossing_members_stops_promptly_without_leftovers() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let small = gzip(&b"1,x\n".repeat(16));
+    let mut bytes = gzip(b"id,v\n");
+    for _ in 0..50_000 {
+        bytes.extend(&small);
+    }
+    let path = write(source_dir.path(), "members.csv.gz", &bytes);
+    let slow = CompressedOpenConfig {
+        index_config: IndexConfig {
+            chunk_bytes: 8,
+            checkpoint_every: 64,
+            memory_budget_bytes: 64 * 1024,
+        },
+        ..config(temp.path())
+    };
+    let bootstrap = CompressedBootstrap::open(
+        &path,
+        OpenOptions {
+            rows: 5,
+            sample_bytes: 1024,
+            bootstrap_limit: 64 * 1024,
+            ..OpenOptions::default()
+        },
+        None,
+        None,
+    )
+    .unwrap();
+    let job = bootstrap
+        .start_decompression(slow.clone(), WorkingCopyCleanup::default())
+        .unwrap();
+    wait_for(
+        || job.progress().rows_scanned >= 1_000 || job.progress().done,
+        "members",
+    );
+    assert!(!job.progress().done, "decompression finished before cancel");
+    let started = Instant::now();
+    job.cancel();
+    assert!(matches!(
+        job.wait().unwrap(),
+        CompressedOpenOutcome::Cancelled
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(entries(temp.path()).is_empty());
+
+    let job =
+        CompressedRawDecompressJob::start(&path, slow, WorkingCopyCleanup::default()).unwrap();
+    wait_for(
+        || job.progress().decompressed_bytes_written >= 4_096 || job.progress().done,
+        "raw members",
+    );
+    assert!(
+        !job.progress().done,
+        "raw decompression finished before cancel"
+    );
+    let started = Instant::now();
+    job.cancel();
+    assert!(job.wait().unwrap().is_none());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(entries(temp.path()).is_empty());
+}
+
+#[test]
+fn a_stream_that_ends_exactly_at_the_bootstrap_limit_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let options = OpenOptions {
+        rows: 100,
+        sample_bytes: 8,
+        bootstrap_limit: 8,
+        ..OpenOptions::default()
+    };
+    let exact = write(dir.path(), "exact.csv.gz", &gzip(b"a,b\n1,2\n"));
+    let bootstrap = CompressedBootstrap::open(&exact, options, None, None).unwrap();
+    assert!(bootstrap.reached_eof());
+    assert_eq!(bootstrap.decompressed_size(), Some(8));
+    assert_eq!(bootstrap.dialect.delimiter, b',');
+    assert_eq!(bootstrap.first_rows.len(), 2);
+    assert_eq!(
+        bootstrap.first_rows[1].fields,
+        [b"1".to_vec(), b"2".to_vec()]
+    );
+    assert!(bootstrap.metrics.bootstrap_bytes_read <= 8);
+    match bootstrap
+        .start_decompression(config(temp.path()), WorkingCopyCleanup::default())
+        .unwrap()
+        .wait()
+        .unwrap()
+    {
+        CompressedOpenOutcome::Complete { session, index } => {
+            assert_eq!(session.file_size, 8);
+            assert_eq!(index.indexed_rows(), 2);
+        }
+        CompressedOpenOutcome::Cancelled => panic!("unexpected cancellation"),
+    }
+    assert!(entries(temp.path()).is_empty());
+
+    // Delimiter detection also needs the end: this sample holds no complete record.
+    let unterminated = write(dir.path(), "semicolon.csv.gz", &gzip(b"a;b;c;dd"));
+    let bootstrap = CompressedBootstrap::open(&unterminated, options, None, None).unwrap();
+    assert!(bootstrap.reached_eof());
+    assert_eq!(bootstrap.dialect.delimiter, b';');
+    assert_eq!(bootstrap.first_rows.len(), 1);
+    assert_eq!(bootstrap.first_rows[0].fields.len(), 4);
+
+    // One more byte is genuinely past the limit.
+    for data in [&b"a,b\n1,2\n3"[..], b"a;b;c;ddd"] {
+        let longer = write(dir.path(), "longer.csv.gz", &gzip(data));
+        assert!(
+            matches!(
+                CompressedBootstrap::open(&longer, options, None, None),
+                Err(QuarryError::BootstrapLimitExceeded { limit: 8, .. })
+            ),
+            "{data:?}"
+        );
+    }
+}
+
+#[test]
+fn every_writer_rejects_compressed_destination_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["out.csv.gz", "OUT.TGZ", "out.tgz", "Out.Csv.Gz"] {
+        assert!(is_compressed_destination(Path::new(name)), "{name}");
+        assert!(
+            matches!(
+                reject_compressed_destination(Path::new(name)),
+                Err(QuarryError::InvalidOption(message))
+                    if message.contains("without .gz or .tgz")
+            ),
+            "{name}"
+        );
+    }
+    for name in ["out.csv", "out.gzip", "gz", "out.gz.csv", "out.tgz.tsv"] {
+        assert!(!is_compressed_destination(Path::new(name)), "{name}");
+        assert!(
+            reject_compressed_destination(Path::new(name)).is_ok(),
+            "{name}"
+        );
+    }
+
+    let first = write(dir.path(), "first.csv", b"id,a\n1,x\n2,y\n");
+    let second = write(dir.path(), "second.csv", b"id,a\n3,z\n");
+    let other = write(dir.path(), "other.csv", b"id,b\n1,p\n2,q\n");
+    let input = |path: &Path| JoinInput {
+        path: path.to_path_buf(),
+        delimiter: None,
+        has_header: true,
+        encoding: None,
+        key_columns: vec![0],
+        expected_version: None,
+        require_unique: false,
+    };
+    let invalid = |error: &QuarryError| matches!(error, QuarryError::InvalidOption(message) if message.contains(".tgz"));
+    let (session, _) = plain(&first, OpenOptions::default(), None);
+    let report = InspectionJob::start(
+        &first,
+        InspectionOptions::default(),
+        InspectionEdits::default(),
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    for name in ["combined.csv.gz", "combined.TGZ"] {
+        let destination = dir.path().join(name);
+
+        let plan = check_combine_files(
+            vec![first.clone(), second.clone()],
+            CombineOptions::default(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        let error = expect_err(plan.start_write(destination.clone()));
+        assert!(invalid(&error), "combine {name}: {error:?}");
+
+        let plan = analyze_join(
+            [input(&first), input(&other)],
+            temp.path().to_path_buf(),
+            JoinConfig::default(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        let error = expect_err(plan.start_write(destination.clone()));
+        assert!(invalid(&error), "join {name}: {error:?}");
+        assert!(
+            entries(temp.path()).is_empty(),
+            "join {name} left its workspace"
+        );
+
+        let spec = crate::SortSpec {
+            column: 0,
+            mode: crate::SortMode::Text,
+            direction: crate::SortDirection::Ascending,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        let error = expect_err(session.start_create_sorted_working_copy(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            spec,
+            &destination,
+        ));
+        assert!(invalid(&error), "sort {name}: {error:?}");
+        let error = expect_err(session.start_find_duplicates(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            crate::DuplicateSpec {
+                columns: vec![0],
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
+            &destination,
+        ));
+        assert!(invalid(&error), "duplicates {name}: {error:?}");
+        let error = expect_err(
+            session
+                .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &destination)
+                .and_then(|job| job.wait()),
+        );
+        assert!(invalid(&error), "save as {name}: {error:?}");
+        let error = expect_err(RecoveryJob::start(&report, &BTreeSet::new(), &destination));
+        assert!(invalid(&error), "recovery {name}: {error:?}");
+
+        assert!(!destination.exists(), "{name} was written");
+    }
+}
+
+#[test]
+fn raw_decompression_keeps_malformed_text_for_inspection() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let data = b"id,name\n1,good\n2,\"bad\"x\n";
+    let path = write(source_dir.path(), "bad.csv.gz", &gzip(data));
+    // Opening parses the text, so malformed data fails before anything can be inspected.
+    assert!(CompressedBootstrap::open(&path, OpenOptions::default(), None, None).is_err());
+
+    let cleanup = WorkingCopyCleanup::default();
+    let job =
+        CompressedRawDecompressJob::start(&path, config(temp.path()), cleanup.clone()).unwrap();
+    let copy = job.wait().unwrap().expect("not cancelled");
+    assert_eq!(fs::read(copy.path()).unwrap(), data);
+    assert!(copy.path().starts_with(temp.path()));
+    assert_eq!(copy.decompressed_size(), data.len() as u64);
+    assert_eq!(copy.source_path(), path);
+    assert_eq!(copy.format(), CompressionFormat::Gzip);
+    assert_eq!(copy.compressed_size(), fs::metadata(&path).unwrap().len());
+    copy.ensure_source_unchanged().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(copy.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "private copy mode {mode:o}");
+    }
+    let report = InspectionJob::start(
+        copy.path(),
+        InspectionOptions::default(),
+        InspectionEdits::default(),
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    // The same diagnosis as for the uncompressed text: a structural error stops
+    // inspection, so recovery is refused exactly as it is for a plain file.
+    assert_eq!(report.status, InspectionStatus::Stopped);
+    assert_eq!(report.total_findings, 1);
+    let finding = &report.findings[0];
+    assert_eq!(finding.record, Some(3));
+    assert_eq!(finding.column, Some(2));
+    assert_eq!(finding.physical_line, Some(3));
+    assert_eq!(finding.byte_offset, Some(22));
+    let recovered = source_dir.path().join("recovered.csv");
+    assert!(matches!(
+        RecoveryJob::start(&report, &BTreeSet::from([0]), &recovered),
+        Err(QuarryError::InvalidOption(_))
+    ));
+    assert!(!recovered.exists());
+    drop(report);
+    drop(copy);
+    assert!(entries(temp.path()).is_empty());
+
+    // A recoverable finding: omit the record from an uncompressed recovery copy.
+    let encoded = write(
+        source_dir.path(),
+        "encoding.csv.gz",
+        &gzip(b"id,name\n1,good\n2,b\xffd\n3,ok\n"),
+    );
+    let copy = CompressedRawDecompressJob::start(&encoded, config(temp.path()), cleanup.clone())
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+    let report = InspectionJob::start(
+        copy.path(),
+        InspectionOptions::default(),
+        InspectionEdits::default(),
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    assert_eq!(report.status, InspectionStatus::Complete);
+    assert_eq!(report.total_findings, 1);
+    assert_eq!(report.findings[0].byte_offset, Some(18));
+    let summary = RecoveryJob::start(&report, &BTreeSet::from([0]), &recovered)
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.removed_records, 1);
+    assert_eq!(fs::read(&recovered).unwrap(), b"id,name\n1,good\n3,ok\n");
+    drop(report);
+    drop(copy);
+    assert!(entries(temp.path()).is_empty());
+    assert!(cleanup.take_errors().is_empty());
+
+    // Corruption, the size cap, the free-space reserve, a plain file and bad options
+    // all fail before anything outlives the job.
+    let valid = gzip(&numbered_rows(1_000));
+    let mut bad_crc = valid.clone();
+    let at = bad_crc.len() - 8;
+    bad_crc[at] ^= 1;
+    let bad = write(source_dir.path(), "crc.csv.gz", &bad_crc);
+    let error = CompressedRawDecompressJob::start(&bad, config(temp.path()), cleanup.clone())
+        .unwrap()
+        .wait()
+        .unwrap_err();
+    assert!(reason(&error).contains("CRC-32"), "{error:?}");
+    assert!(entries(temp.path()).is_empty());
+
+    let rows = write(source_dir.path(), "rows.csv.gz", &valid);
+    let job = CompressedRawDecompressJob::start(
+        &rows,
+        CompressedOpenConfig {
+            max_decompressed_bytes: Some(100),
+            ..config(temp.path())
+        },
+        cleanup.clone(),
+    )
+    .unwrap();
+    wait_for(|| job.progress().done, "cap");
+    assert!(job.error().unwrap().contains("limit"));
+    assert!(matches!(
+        job.wait(),
+        Err(QuarryError::DecompressionLimitExceeded {
+            limit_bytes: 100,
+            ..
+        })
+    ));
+    assert!(entries(temp.path()).is_empty());
+
+    let error = CompressedRawDecompressJob::start(
+        &rows,
+        CompressedOpenConfig {
+            min_free_space_reserve_bytes: u64::MAX,
+            space_check_interval_bytes: 1,
+            ..config(temp.path())
+        },
+        cleanup.clone(),
+    )
+    .unwrap()
+    .wait()
+    .unwrap_err();
+    assert!(
+        matches!(error, QuarryError::InsufficientStorage { .. }),
+        "{error:?}"
+    );
+    assert!(entries(temp.path()).is_empty());
+
+    let plain_file = write(source_dir.path(), "plain.csv", data);
+    assert!(matches!(
+        CompressedRawDecompressJob::start(&plain_file, config(temp.path()), cleanup.clone()),
+        Err(QuarryError::CompressedFile { .. })
+    ));
+    assert!(matches!(
+        CompressedRawDecompressJob::start(
+            &rows,
+            CompressedOpenConfig {
+                max_decompressed_bytes: Some(0),
+                ..config(temp.path())
+            },
+            cleanup.clone(),
+        ),
+        Err(QuarryError::InvalidOption(_))
+    ));
+    assert!(entries(temp.path()).is_empty());
+
+    // A source replaced during decompression is caught by the final stamp check.
+    let big = write(
+        source_dir.path(),
+        "big.csv.gz",
+        &gzip(&numbered_rows(100_000)),
+    );
+    let job = CompressedRawDecompressJob::start(
+        &big,
+        CompressedOpenConfig {
+            index_config: IndexConfig {
+                chunk_bytes: 8,
+                ..IndexConfig::default()
+            },
+            ..config(temp.path())
+        },
+        cleanup.clone(),
+    )
+    .unwrap();
+    wait_for(
+        || job.progress().decompressed_bytes_written >= 1_000,
+        "raw progress",
+    );
+    fs::rename(&big, source_dir.path().join("moved.gz")).unwrap();
+    fs::write(&big, gzip(b"different,source\n")).unwrap();
+    assert!(matches!(job.wait(), Err(QuarryError::SourceChanged)));
+    assert!(entries(temp.path()).is_empty());
+    assert!(cleanup.take_errors().is_empty());
+}

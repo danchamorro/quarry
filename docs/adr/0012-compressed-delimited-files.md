@@ -22,7 +22,9 @@ None of these may produce a document that silently differs from the source.
 Support gzip first, read-only. Quarry detects gzip by its signature
 (`1f 8b 08`), not by its name. It decodes single-member and concatenated
 multi-member streams (RFC 1952), including optional `FEXTRA`, `FNAME`,
-`FCOMMENT` and `FHCRC` header fields. The decoder is flate2 1.1.9 with its
+`FCOMMENT` and `FHCRC` header fields. `FNAME` and `FCOMMENT` may each hold at
+most 64 KiB, so a damaged header cannot make the reader scan the whole file for
+its terminating NUL byte. The decoder is flate2 1.1.9 with its
 pure-Rust `miniz_oxide` backend. Both crates and `crc32fast` were already in
 `Cargo.lock` through image dependencies, so the lockfile gains no packages.
 
@@ -72,7 +74,11 @@ disk space equal to the decompressed size, which the bounds below control.
   `InsufficientStorage` when free space falls below
   `min_free_space_reserve_bytes` (256 MiB by default). The first check happens
   only after 64 MiB, so small files work in tight test folders.
-- The job checks for cancellation on every chunk.
+- The job checks for cancellation on every chunk. The gzip reader shares the
+  job's cancellation flag and also checks it before each inflate step, at each
+  member boundary, and every 4 KiB of a long header field.
+- When a stream fills the bootstrap limit exactly, the bootstrap reads one
+  more byte, which it never keeps, to learn whether the stream ended there.
 
 ### Strict integrity
 
@@ -112,9 +118,17 @@ A compressed document is read-only. In-place Save and Save to Original reject
 it with `CompressedReadOnly`. The core still accepts cell edits in Save Copy As,
 but the app and CLI expose none (see Slice 2). Save Copy As and Export Filtered write uncompressed
 delimited output. They reject a destination that names the compressed source
-(`ExportDestinationIsSource`) or ends in `.gz` (`InvalidOption`). The `.gz`
-rule applies to every document, because Quarry never writes gzip. Recovery
-output follows the same `.gz` rule. Inspection runs on the private copy.
+(`ExportDestinationIsSource`) or ends in `.gz` or `.tgz` (`InvalidOption`).
+The rule applies to every writer (Save As, exports, Replace All, transforms,
+sorting, duplicates, Combine Files, Join Files and recovery), because Quarry
+never writes gzip. `is_compressed_destination` and
+`reject_compressed_destination` expose it to the app and CLI. Inspection runs
+on the private copy.
+
+`CompressedRawDecompressJob` makes a private copy with the same validation,
+bounds, cancellation, source check and cleanup, but does not parse it. It lets
+inspection locate malformed delimited text inside valid gzip, which the
+bootstrap would reject before any copy exists.
 Combine Files and Join Files reject compressed inputs with a message that
 says to save an uncompressed copy first.
 
@@ -141,7 +155,11 @@ The CLI's `open`, `inspect`, `viewport`, `search`, `filter`, `export`, and
 `convert-utf8` accept `.gz` inputs with `--temp-dir` and
 `--max-decompressed-bytes`; `open --no-wait` stops after the bootstrap. Ctrl-C
 cancels the job, which removes the copy. Commands that change data reject
-compressed inputs, and every command refuses `.gz` output names. The macOS
+compressed inputs, and every command refuses `.gz` and `.tgz` output names.
+`inspect` reads a gzip input through `CompressedRawDecompressJob`, so it
+reports malformed text inside valid gzip. The app's Inspect File does the same
+when valid gzip fails to open because of its text; damaged gzip is reported
+without an inspection offer. The macOS
 bundle declares `org.gnu.gnu-zip-archive` with the Viewer role.
 
 ## Alternatives considered

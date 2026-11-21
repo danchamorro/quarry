@@ -1396,6 +1396,19 @@ impl QuarryApp {
         Ok(())
     }
 
+    /// Accept a picked output only when it is uncompressed, new and unreserved.
+    fn choose_join_output(&mut self, path: PathBuf) {
+        let message = if quarry_core::is_compressed_destination(&path) {
+            compressed::COMPRESSED_DESTINATION
+        } else if self.join_destination_is_available(&path) {
+            self.join_files.as_mut().unwrap().destination = Some(path);
+            return;
+        } else {
+            "Choose a new output path. Existing files, open documents and active output destinations cannot be replaced."
+        };
+        self.join_files.as_mut().unwrap().message = Some(message.into());
+    }
+
     /// Recheck all live document and writer paths before starting output.
     pub(super) fn join_destination_is_available(&self, path: &Path) -> bool {
         // Keep the retained analysis when a picker chooses an existing output.
@@ -1507,11 +1520,7 @@ impl QuarryApp {
                     .set_file_name(format!("joined.{extension}"))
                     .save_file()
                 {
-                    if self.join_destination_is_available(&path) {
-                        self.join_files.as_mut().unwrap().destination = Some(path);
-                    } else {
-                        self.join_files.as_mut().unwrap().message=Some("Choose a new output path. Existing files, open documents and active output destinations cannot be replaced.".into());
-                    }
+                    self.choose_join_output(path);
                 }
             }
             DialogAction::Create => {
@@ -3650,5 +3659,28 @@ value
         assert!(!doc.can_undo());
         assert!(app.active.notice.is_none());
         assert_eq!(fs::read(a).unwrap(), original);
+    }
+
+    #[test]
+    fn compressed_output_names_are_rejected_when_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_join_files();
+        for name in ["joined.csv.gz", "joined.TGZ"] {
+            app.choose_join_output(dir.path().join(name));
+            let dialog = app.join_files.as_ref().unwrap();
+            assert!(dialog.destination.is_none(), "{name}");
+            assert!(
+                dialog
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("without .gz or .tgz")),
+                "{name}: {:?}",
+                dialog.message
+            );
+        }
+        let out = dir.path().join("joined.csv");
+        app.choose_join_output(out.clone());
+        assert_eq!(app.join_files.as_ref().unwrap().destination, Some(out));
     }
 }

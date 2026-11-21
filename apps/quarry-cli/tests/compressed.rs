@@ -414,34 +414,187 @@ fn interrupting_decompression_removes_the_private_copy() {
     }
     drop(file);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_quarry"))
-        .arg("open")
-        .arg(&source)
-        .arg("--temp-dir")
-        .arg(fixture.scratch())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let started = Instant::now();
-    while fixture.leftovers().is_empty() {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "quarry finished before it could be interrupted"
+    // `inspect` makes its private copy without parsing it; both stop the same way.
+    for command in ["open", "inspect"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quarry"))
+            .arg(command)
+            .arg(&source)
+            .arg("--temp-dir")
+            .arg(fixture.scratch())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while fixture.leftovers().is_empty() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "quarry {command} finished before it could be interrupted"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "no private copy appeared for {command}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // SAFETY: the pid belongs to the child this test spawned and still owns.
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+            0
         );
+        let output = child.wait_with_output().unwrap();
+        let error = failure(&output);
+        assert!(error.contains("interrupted"), "{command}: {error}");
         assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "no private copy appeared"
+            fixture.leftovers().is_empty(),
+            "{command}: {:?}",
+            fixture.leftovers()
         );
-        std::thread::sleep(Duration::from_millis(5));
     }
-    // SAFETY: the pid belongs to the child this test spawned and still owns.
-    assert_eq!(
-        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
-        0
-    );
-    let output = child.wait_with_output().unwrap();
+}
+
+/// The finding lines of an inspection report, without the file-specific header.
+fn findings(report: &str) -> &str {
+    &report[report.find("\nFinding 1\n").expect("a finding")..]
+}
+
+#[test]
+fn inspect_diagnoses_malformed_text_inside_valid_gzip() {
+    let fixture = Fixture::new();
+    let data = b"id,name\n1,good\n2,\"bad\"x\n";
+    let plain = fixture.path("bad.csv");
+    std::fs::write(&plain, data).unwrap();
+    let source = fixture.path("bad.csv.gz");
+    std::fs::write(&source, gzip(data)).unwrap();
+    let gz = text(&source);
+
+    // Opening parses the text, so it fails; inspection reads the raw private copy.
+    let open = failure(&fixture.run(&["open", &gz]));
+    assert!(open.starts_with("error:"), "{open}");
+
+    let output = fixture.run(&["inspect", &gz]);
     let error = failure(&output);
-    assert!(error.contains("interrupted"), "{error}");
-    assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+    assert!(error.contains("inspection did not complete"), "{error}");
+    let report = String::from_utf8(output.stdout).unwrap();
+    for line in [
+        format!("File: {gz}"),
+        "Inspection: Stopped".into(),
+        "Coverage: 22 of 24 source bytes".into(),
+        "Findings: 1 (1 shown)".into(),
+        "Compression: Gzip".into(),
+        format!("Decompressed size: {} B ({} bytes)", "24.00", data.len()),
+        "Unexpected text follows a closing quote.".into(),
+        "Record: 3".into(),
+        "Column: 2".into(),
+        "Physical line: 3".into(),
+        "Source byte offset (zero-based): 22".into(),
+    ] {
+        assert!(report.contains(&line), "missing {line:?} in:\n{report}");
+    }
+    // Exactly the diagnosis of the same text stored uncompressed.
+    let plain_output = Command::new(env!("CARGO_BIN_EXE_quarry"))
+        .args(["inspect", &text(&plain)])
+        .output()
+        .unwrap();
+    let plain_report = String::from_utf8(plain_output.stdout).unwrap();
+    assert_eq!(findings(&report), findings(&plain_report));
+
+    // A structural stop cannot be recovered, exactly as for the uncompressed file.
+    let recovered = fixture.path("recovered.csv");
+    let error = failure(&fixture.run(&[
+        "inspect",
+        &gz,
+        "--omit-findings",
+        "1",
+        "--output",
+        &text(&recovered),
+    ]));
+    assert!(
+        error.contains("recovery requires a completed inspection"),
+        "{error}"
+    );
+    assert!(!recovered.exists());
+
+    // A recoverable finding inside gzip: omit the record from an uncompressed copy.
+    let encoded = fixture.path("encoding.csv.gz");
+    std::fs::write(&encoded, gzip(b"id,name\n1,good\n2,b\xffd\n3,ok\n")).unwrap();
+    let report = success(&fixture.run(&[
+        "inspect",
+        &text(&encoded),
+        "--omit-findings",
+        "1",
+        "--output",
+        &text(&recovered),
+    ]));
+    for line in [
+        "Inspection: Complete",
+        "Record: 3",
+        "Column: 2",
+        "Physical line: 3",
+        "Source byte offset (zero-based): 18",
+        "Removed records: 1",
+        "Retained records: 3",
+    ] {
+        assert!(report.contains(line), "missing {line:?} in:\n{report}");
+    }
+    assert_eq!(
+        std::fs::read(&recovered).unwrap(),
+        b"id,name\n1,good\n3,ok\n"
+    );
+
+    // Recovery output must not claim to be compressed.
+    for name in ["recovered.csv.gz", "recovered.TGZ"] {
+        let destination = fixture.path(name);
+        let error = failure(&fixture.run(&[
+            "inspect",
+            &text(&encoded),
+            "--omit-findings",
+            "1",
+            "--output",
+            &text(&destination),
+        ]));
+        assert!(error.contains("without .gz or .tgz"), "{name}: {error}");
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn generate_and_other_writers_reject_compressed_output_names() {
+    let fixture = Fixture::new();
+    let plain = fixture.path("plain.csv");
+    std::fs::write(&plain, CSV).unwrap();
+    let plain = text(&plain);
+    for name in ["out.csv.gz", "out.tgz", "OUT.CSV.GZ", "Out.Tgz"] {
+        let destination = fixture.path(name);
+        let out = text(&destination);
+        for args in [
+            vec!["generate", "--size", "1KB", "--output", out.as_str()],
+            vec!["convert-utf8", plain.as_str(), "--output", out.as_str()],
+            vec![
+                "sort-save-as",
+                plain.as_str(),
+                out.as_str(),
+                "--column",
+                "1",
+                "--order",
+                "asc",
+            ],
+            vec![
+                "duplicates",
+                plain.as_str(),
+                "--columns",
+                "1",
+                "--output",
+                out.as_str(),
+            ],
+        ] {
+            let result = Command::new(env!("CARGO_BIN_EXE_quarry"))
+                .args(&args)
+                .output()
+                .unwrap();
+            let error = failure(&result);
+            assert!(error.contains("without .gz or .tgz"), "{args:?}: {error}");
+            assert!(!destination.exists(), "{args:?} wrote {name}");
+        }
+    }
 }

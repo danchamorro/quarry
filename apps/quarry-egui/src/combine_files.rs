@@ -197,6 +197,12 @@ impl CombineDialog {
     }
 
     fn prepare_destination(&mut self, destination: PathBuf) {
+        if quarry_core::is_compressed_destination(&destination) {
+            self.space = None;
+            self.destination = None;
+            self.message = Some(compressed::COMPRESSED_DESTINATION.into());
+            return;
+        }
         if self.output_is_protected(&destination) {
             self.space = None;
             self.destination = None;
@@ -861,5 +867,38 @@ mod tests {
         app.inspect_combine_problem();
         assert!(app.active.inspection.open);
         assert_eq!(app.combine_files.as_ref().unwrap().paths, paths);
+    }
+
+    #[test]
+    fn compressed_output_names_are_rejected_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.csv");
+        let b = dir.path().join("b.csv");
+        fs::write(&a, b"ID,Name\n1,a\n").unwrap();
+        fs::write(&b, b"ID,Name\n2,b\n").unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        app.open_combine_files();
+        let dialog = app.combine_files.as_mut().unwrap();
+        dialog.add_paths(vec![a, b]);
+        dialog.start_check();
+        finish(dialog);
+        for name in ["combined.csv.gz", "combined.TGZ"] {
+            let out = dir.path().join(name);
+            dialog.prepare_destination(out.clone());
+            finish(dialog);
+            assert!(dialog.destination.is_none(), "{name}");
+            assert!(
+                dialog
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("without .gz or .tgz")),
+                "{name}: {:?}",
+                dialog.message
+            );
+            dialog.start_write();
+            finish(dialog);
+            assert!(dialog.result.is_none());
+            assert!(!out.exists(), "{name}");
+        }
     }
 }

@@ -42,6 +42,11 @@ const FLAG_EXTRA: u8 = 0x04;
 const FLAG_NAME: u8 = 0x08;
 const FLAG_COMMENT: u8 = 0x10;
 const FLAG_RESERVED: u8 = 0xe0;
+/// RFC 1952 leaves FNAME and FCOMMENT unbounded. Each is capped so a damaged or
+/// hostile header cannot make the reader scan the whole file for a NUL byte.
+const MAX_GZIP_HEADER_TEXT: usize = 64 * 1024;
+/// Header text bytes read between cancellation checks.
+const HEADER_CANCEL_CHECK_BYTES: usize = 4 * 1024;
 const TRAILING_DATA: &str = "Unexpected data follows the end of the gzip stream; the file is corrupt or not entirely gzip data.";
 
 /// Compressed source formats that Quarry can open read-only.
@@ -238,17 +243,19 @@ pub(crate) fn compressed_input_problem(path: &Path, operation: &str) -> Option<S
     }
 }
 
-/// True when a destination name would claim compressed output.
-pub(crate) fn has_gzip_extension(path: &Path) -> bool {
+/// True when a destination name would claim compressed output (`.gz` or `.tgz`,
+/// in any letter case).
+pub fn is_compressed_destination(path: &Path) -> bool {
     let name = lowercase_name(path);
     name.ends_with(".gz") || name.ends_with(".tgz")
 }
 
-/// Uncompressed writers must not produce a file that claims to be gzip.
-pub(crate) fn reject_compressed_destination(path: &Path) -> Result<(), QuarryError> {
-    if has_gzip_extension(path) {
+/// Every Quarry writer produces uncompressed delimited text, so no output may be
+/// named as if it were gzip. Apps and the CLI use this rule to pre-check names.
+pub fn reject_compressed_destination(path: &Path) -> Result<(), QuarryError> {
+    if is_compressed_destination(path) {
         return Err(QuarryError::InvalidOption(
-            "Quarry writes uncompressed delimited files; choose a filename without .gz",
+            "Quarry writes uncompressed delimited files; choose a filename without .gz or .tgz",
         ));
     }
     Ok(())
@@ -272,6 +279,29 @@ impl std::error::Error for CorruptGzip {}
 
 fn corrupt(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, CorruptGzip(reason.into()))
+}
+
+/// Marks a read that stopped because its job was cancelled.
+#[derive(Debug)]
+struct GzipCancelled;
+
+impl fmt::Display for GzipCancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("gzip decompression was cancelled")
+    }
+}
+
+impl std::error::Error for GzipCancelled {}
+
+/// Not `Interrupted`: `read_exact` and `read_full` would retry that kind forever.
+fn cancelled() -> io::Error {
+    io::Error::other(GzipCancelled)
+}
+
+fn is_cancelled(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<GzipCancelled>())
 }
 
 /// Convert a decoder failure into a path-bearing error, keeping real I/O errors.
@@ -301,11 +331,17 @@ impl<R: Read> Read for CountingReader<R> {
 
 type SourceReader = BufReader<CountingReader<File>>;
 
-fn source_reader(file: File, count: Arc<AtomicU64>) -> GzipMembers<SourceReader> {
-    GzipMembers::new(BufReader::with_capacity(
+fn source_reader(
+    file: File,
+    count: Arc<AtomicU64>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> GzipMembers<SourceReader> {
+    let mut reader = GzipMembers::new(BufReader::with_capacity(
         COMPRESSED_READ_BUFFER,
         CountingReader { inner: file, count },
-    ))
+    ));
+    reader.cancel = cancel;
+    reader
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,7 +358,9 @@ enum MemberState {
 /// cannot be told apart from a failing disk. This reader drives `Decompress`
 /// directly so every integrity failure carries a specific `CorruptGzip` reason:
 /// it requires a stream end and a matching trailer for every member, and allows
-/// nothing but another complete member after it.
+/// nothing but another complete member after it. Header text fields are bounded,
+/// and an optional cancellation flag is checked before every inflate step, at
+/// every member boundary and while reading long header fields.
 pub(crate) struct GzipMembers<R> {
     input: R,
     inflater: Decompress,
@@ -330,6 +368,7 @@ pub(crate) struct GzipMembers<R> {
     member_bytes: u64,
     members: u64,
     state: MemberState,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<R: BufRead> GzipMembers<R> {
@@ -341,7 +380,25 @@ impl<R: BufRead> GzipMembers<R> {
             member_bytes: 0,
             members: 0,
             state: MemberState::Header,
+            cancel: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Acquire))
+        {
+            return Err(cancelled());
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -350,6 +407,7 @@ impl<R: BufRead> GzipMembers<R> {
     }
 
     fn read_header(&mut self) -> io::Result<()> {
+        self.check_cancelled()?;
         let mut header_crc = Crc::new();
         let mut fixed = [0_u8; 10];
         header_bytes(&mut self.input, &mut fixed, &mut header_crc)?;
@@ -378,18 +436,29 @@ impl<R: BufRead> GzipMembers<R> {
             let mut remaining = usize::from(u16::from_le_bytes(length));
             let mut skip = [0_u8; 256];
             while remaining > 0 {
+                self.check_cancelled()?;
                 let step = remaining.min(skip.len());
                 header_bytes(&mut self.input, &mut skip[..step], &mut header_crc)?;
                 remaining -= step;
             }
         }
-        for flag in [FLAG_NAME, FLAG_COMMENT] {
+        for (flag, field) in [(FLAG_NAME, "filename"), (FLAG_COMMENT, "comment")] {
             if flags & flag != 0 {
                 let mut byte = [0_u8; 1];
+                let mut length = 0_usize;
                 loop {
                     header_bytes(&mut self.input, &mut byte, &mut header_crc)?;
                     if byte[0] == 0 {
                         break;
+                    }
+                    length += 1;
+                    if length > MAX_GZIP_HEADER_TEXT {
+                        return Err(corrupt(format!(
+                            "The gzip header {field} exceeds the {MAX_GZIP_HEADER_TEXT}-byte limit."
+                        )));
+                    }
+                    if length % HEADER_CANCEL_CHECK_BYTES == 0 {
+                        self.check_cancelled()?;
                     }
                 }
             }
@@ -454,6 +523,9 @@ impl<R: BufRead> Read for GzipMembers<R> {
             return Ok(0);
         }
         loop {
+            if self.state != MemberState::End {
+                self.check_cancelled()?;
+            }
             match self.state {
                 MemberState::End => return Ok(0),
                 MemberState::Header => {
@@ -532,12 +604,14 @@ fn read_full(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
 }
 
 /// An in-memory, lazily filled view of the first decompressed bytes. It never
-/// holds more than the bootstrap limit and never writes to disk.
+/// writes to disk and holds at most the bootstrap limit plus one lookahead byte,
+/// which tells a stream that ends exactly at the limit from a longer one.
 struct BootstrapStream<'a> {
     path: &'a Path,
     decoder: GzipMembers<SourceReader>,
     bytes: Vec<u8>,
     position: usize,
+    /// The bootstrap limit plus the lookahead byte.
     capacity: usize,
     max_decompressed_bytes: Option<u64>,
     eof: bool,
@@ -674,10 +748,10 @@ impl CompressedBootstrap {
         let counter = Arc::new(AtomicU64::new(0));
         let mut stream = BootstrapStream {
             path: &path,
-            decoder: source_reader(file, Arc::clone(&counter)),
+            decoder: source_reader(file, Arc::clone(&counter), None),
             bytes: Vec::new(),
             position: 0,
-            capacity: options.bootstrap_limit,
+            capacity: options.bootstrap_limit.saturating_add(1),
             max_decompressed_bytes,
             eof: false,
             failure: None,
@@ -959,10 +1033,51 @@ struct SharedState {
     columns_found: AtomicUsize,
     finished_nanos: AtomicU64,
     done: AtomicBool,
-    cancelled: AtomicBool,
+    /// Shared with the gzip reader, so cancellation also stops long header reads.
+    cancelled: Arc<AtomicBool>,
     error: Mutex<Option<String>>,
     started: Instant,
     compressed_total: u64,
+}
+
+impl SharedState {
+    fn new(index: StructuralIndex, compressed_total: u64) -> Arc<Self> {
+        Arc::new(Self {
+            index: RwLock::new(index),
+            compressed_bytes_read: Arc::new(AtomicU64::new(0)),
+            decompressed_bytes: AtomicU64::new(0),
+            rows_scanned: AtomicU64::new(0),
+            columns_found: AtomicUsize::new(0),
+            finished_nanos: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            error: Mutex::new(None),
+            started: Instant::now(),
+            compressed_total,
+        })
+    }
+
+    fn progress(&self) -> CompressedProgress {
+        let finished_nanos = self.finished_nanos.load(Ordering::Acquire);
+        CompressedProgress {
+            compressed_bytes_read: self.compressed_bytes_read.load(Ordering::Relaxed),
+            compressed_total_bytes: self.compressed_total,
+            decompressed_bytes_written: self.decompressed_bytes.load(Ordering::Acquire),
+            rows_scanned: self.rows_scanned.load(Ordering::Acquire),
+            columns_found: self.columns_found.load(Ordering::Acquire),
+            elapsed: if finished_nanos == 0 {
+                self.started.elapsed()
+            } else {
+                Duration::from_nanos(finished_nanos)
+            },
+            done: self.done.load(Ordering::Acquire),
+            cancelled: self.cancelled.load(Ordering::Acquire),
+        }
+    }
+
+    fn record_failure(&self, error: &QuarryError) {
+        *self.error.lock().unwrap() = Some(error.to_string());
+    }
 }
 
 struct WorkerCompletion<'a>(&'a SharedState);
@@ -977,8 +1092,22 @@ impl Drop for WorkerCompletion<'_> {
     }
 }
 
-/// Everything the worker needs; it owns the private workspace until handoff.
-struct Worker {
+fn validate_copy_config(config: &CompressedOpenConfig) -> Result<(), QuarryError> {
+    if config.max_decompressed_bytes == Some(0) {
+        return Err(QuarryError::InvalidOption(
+            "decompressed size limit must be non-zero",
+        ));
+    }
+    if config.space_check_interval_bytes == 0 {
+        return Err(QuarryError::InvalidOption(
+            "free-space check interval must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
+/// Everything a private-copy worker needs; it owns the private workspace until handoff.
+struct CopyWorker {
     source_path: PathBuf,
     source_stamp: SourceStamp,
     source_check: File,
@@ -987,12 +1116,140 @@ struct Worker {
     file: SpillFile,
     output: File,
     format: CompressionFormat,
+    config: CompressedOpenConfig,
+    cleanup: WorkingCopyCleanup,
+}
+
+/// A flushed private copy whose size and compressed source were verified.
+struct FinishedCopy {
+    path: PathBuf,
+    stamp: SourceStamp,
+    backing: CompressedBacking,
+}
+
+impl CopyWorker {
+    /// Reserve a private workspace for `source`, which must match `source_stamp`
+    /// and be positioned at its start.
+    fn create(
+        source_path: PathBuf,
+        source_stamp: SourceStamp,
+        source: File,
+        format: CompressionFormat,
+        config: CompressedOpenConfig,
+        cleanup: WorkingCopyCleanup,
+        shared: &SharedState,
+    ) -> Result<Self, QuarryError> {
+        let source_check = source.try_clone()?;
+        crate::inspect_storage(&config.temp_dir)?.require(source_stamp.file_size())?;
+        let workspace = SpillWorkspace::create_in(&config.temp_dir, "compressed")?;
+        let (file, writer) = workspace.create_run()?;
+        let output = writer
+            .into_inner()
+            .map_err(|error| storage_error(&workspace.path, error.into_error()))?;
+        let decoder = source_reader(
+            source,
+            Arc::clone(&shared.compressed_bytes_read),
+            Some(Arc::clone(&shared.cancelled)),
+        );
+        Ok(Self {
+            source_path,
+            source_stamp,
+            source_check,
+            decoder,
+            workspace,
+            file,
+            output,
+            format,
+            config,
+            cleanup,
+        })
+    }
+
+    /// Stream the source into the private copy, indexing it in the same pass when
+    /// `scan` names a delimiter and encoding. Returns None when cancelled. The
+    /// workspace is removed on every path except a successful handoff.
+    fn run(
+        self,
+        scan: Option<(u8, Encoding)>,
+        shared: &SharedState,
+    ) -> Result<Option<FinishedCopy>, QuarryError> {
+        let Self {
+            source_path,
+            source_stamp,
+            source_check,
+            mut decoder,
+            workspace,
+            file,
+            mut output,
+            format,
+            config,
+            cleanup,
+        } = self;
+        let written = (|| {
+            let finished = decompress(
+                &mut decoder,
+                &mut output,
+                &source_path,
+                &workspace.path,
+                scan,
+                &config,
+                shared,
+            )?;
+            let Some(written) = finished else {
+                return Ok(None);
+            };
+            output
+                .sync_all()
+                .map_err(|error| storage_error(&workspace.path, error))?;
+            if !source_matches_stamp(&source_check, &source_path, &source_stamp)? {
+                return Err(QuarryError::SourceChanged);
+            }
+            if shared.cancelled.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let backing_stamp = SourceStamp::from_file(&output)?;
+            if backing_stamp.file_size() != written {
+                return Err(QuarryError::SourceChanged);
+            }
+            Ok(Some(backing_stamp))
+        })();
+        drop(output);
+        drop(decoder);
+        let stamp = match written {
+            Ok(Some(stamp)) => stamp,
+            Ok(None) => {
+                drop(file);
+                release_workspace(workspace, &cleanup);
+                return Ok(None);
+            }
+            Err(error) => {
+                drop(file);
+                release_workspace(workspace, &cleanup);
+                return Err(error);
+            }
+        };
+        Ok(Some(FinishedCopy {
+            path: file.to_path_buf(),
+            stamp,
+            backing: CompressedBacking {
+                format,
+                source_path,
+                source_stamp,
+                workspace: Some(workspace),
+                _file: Some(file),
+                cleanup,
+            },
+        }))
+    }
+}
+
+/// The indexing job's worker: a private copy plus the bootstrap's text format.
+struct Worker {
+    copy: CopyWorker,
     encoding: Encoding,
     dialect: Dialect,
     first_rows: Vec<Row>,
     metrics: OpenMetrics,
-    config: CompressedOpenConfig,
-    cleanup: WorkingCopyCleanup,
 }
 
 /// Background decompression into a private file with single-pass indexing.
@@ -1011,54 +1268,25 @@ impl CompressedDecompressJob {
         cleanup: WorkingCopyCleanup,
     ) -> Result<Self, QuarryError> {
         let index = StructuralIndex::new(config.index_config)?;
-        if config.max_decompressed_bytes == Some(0) {
-            return Err(QuarryError::InvalidOption(
-                "decompressed size limit must be non-zero",
-            ));
-        }
-        if config.space_check_interval_bytes == 0 {
-            return Err(QuarryError::InvalidOption(
-                "free-space check interval must be non-zero",
-            ));
-        }
+        validate_copy_config(&config)?;
         let source = open_unchanged_source(&bootstrap.path, &bootstrap.source_stamp)?;
-        let source_check = source.try_clone()?;
-        crate::inspect_storage(&config.temp_dir)?.require(bootstrap.compressed_size())?;
-        let workspace = SpillWorkspace::create_in(&config.temp_dir, "compressed")?;
-        let (file, writer) = workspace.create_run()?;
-        let output = writer
-            .into_inner()
-            .map_err(|error| storage_error(&workspace.path, error.into_error()))?;
-        let backing_path = file.to_path_buf();
-        let compressed_bytes_read = Arc::new(AtomicU64::new(0));
-        let shared = Arc::new(SharedState {
-            index: RwLock::new(index),
-            compressed_bytes_read: Arc::clone(&compressed_bytes_read),
-            decompressed_bytes: AtomicU64::new(0),
-            rows_scanned: AtomicU64::new(0),
-            columns_found: AtomicUsize::new(0),
-            finished_nanos: AtomicU64::new(0),
-            done: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
-            error: Mutex::new(None),
-            started: Instant::now(),
-            compressed_total: bootstrap.compressed_size(),
-        });
+        let shared = SharedState::new(index, bootstrap.compressed_size());
+        let copy = CopyWorker::create(
+            bootstrap.path.clone(),
+            bootstrap.source_stamp.clone(),
+            source,
+            bootstrap.format,
+            config,
+            cleanup,
+            &shared,
+        )?;
+        let backing_path = copy.file.to_path_buf();
         let worker = Worker {
-            source_path: bootstrap.path.clone(),
-            source_stamp: bootstrap.source_stamp.clone(),
-            source_check,
-            decoder: source_reader(source, compressed_bytes_read),
-            workspace,
-            file,
-            output,
-            format: bootstrap.format,
+            copy,
             encoding: bootstrap.encoding,
             dialect: bootstrap.dialect,
             first_rows: bootstrap.first_rows.clone(),
             metrics: bootstrap.metrics,
-            config,
-            cleanup,
         };
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -1070,9 +1298,7 @@ impl CompressedDecompressJob {
                     Ok(CompressedOpenOutcome::Cancelled) => {
                         worker_state.cancelled.store(true, Ordering::Release);
                     }
-                    Err(error) => {
-                        *worker_state.error.lock().unwrap() = Some(error.to_string());
-                    }
+                    Err(error) => worker_state.record_failure(error),
                     Ok(CompressedOpenOutcome::Complete { .. }) => {}
                 }
                 result
@@ -1087,21 +1313,7 @@ impl CompressedDecompressJob {
     }
 
     pub fn progress(&self) -> CompressedProgress {
-        let finished_nanos = self.shared.finished_nanos.load(Ordering::Acquire);
-        CompressedProgress {
-            compressed_bytes_read: self.shared.compressed_bytes_read.load(Ordering::Relaxed),
-            compressed_total_bytes: self.shared.compressed_total,
-            decompressed_bytes_written: self.shared.decompressed_bytes.load(Ordering::Acquire),
-            rows_scanned: self.shared.rows_scanned.load(Ordering::Acquire),
-            columns_found: self.shared.columns_found.load(Ordering::Acquire),
-            elapsed: if finished_nanos == 0 {
-                self.shared.started.elapsed()
-            } else {
-                Duration::from_nanos(finished_nanos)
-            },
-            done: self.shared.done.load(Ordering::Acquire),
-            cancelled: self.shared.cancelled.load(Ordering::Acquire),
-        }
+        self.shared.progress()
     }
 
     /// The rows indexed so far; every indexed byte is already in the private copy.
@@ -1149,6 +1361,137 @@ impl Drop for CompressedDecompressJob {
     }
 }
 
+/// A verified private decompressed copy of a compressed source, never parsed as
+/// delimited text. Dropping it removes the copy and its private folder.
+#[derive(Debug)]
+pub struct DecompressedCopy {
+    path: PathBuf,
+    size: u64,
+    backing: CompressedBacking,
+}
+
+impl DecompressedCopy {
+    /// The owner-only private file that holds the decompressed bytes.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn decompressed_size(&self) -> u64 {
+        self.size
+    }
+
+    /// The compressed file the copy was made from.
+    pub fn source_path(&self) -> &Path {
+        self.backing.source_path()
+    }
+
+    pub fn format(&self) -> CompressionFormat {
+        self.backing.format()
+    }
+
+    pub fn compressed_size(&self) -> u64 {
+        self.backing.compressed_size()
+    }
+
+    /// Confirm the compressed source still matches the version decompressed.
+    pub fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
+        self.backing.ensure_source_unchanged()
+    }
+}
+
+/// Background decompression of a compressed source into a private copy without
+/// parsing it, so tools such as inspection can diagnose malformed delimited data
+/// inside a valid gzip file. It applies the same strict gzip validation, size cap,
+/// free-space reserve, cancellation, source check and cleanup as
+/// [`CompressedDecompressJob`].
+pub struct CompressedRawDecompressJob {
+    shared: Arc<SharedState>,
+    handle: Option<JoinHandle<Result<Option<DecompressedCopy>, QuarryError>>>,
+}
+
+impl CompressedRawDecompressJob {
+    pub fn start(
+        path: impl AsRef<Path>,
+        config: CompressedOpenConfig,
+        cleanup: WorkingCopyCleanup,
+    ) -> Result<Self, QuarryError> {
+        let index = StructuralIndex::new(config.index_config)?;
+        validate_copy_config(&config)?;
+        let path = path.as_ref().to_path_buf();
+        let mut source = open_regular_file(&path)?;
+        let source_stamp = SourceStamp::from_file(&source)?;
+        let format = compression_of(&mut source, &path)?.ok_or_else(|| {
+            compressed_error(
+                &path,
+                "This file is not compressed. Read it directly instead of decompressing it.",
+            )
+        })?;
+        let shared = SharedState::new(index, source_stamp.file_size());
+        let copy =
+            CopyWorker::create(path, source_stamp, source, format, config, cleanup, &shared)?;
+        let worker_state = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("quarry-decompress".into())
+            .spawn(move || {
+                let _completion = WorkerCompletion(&worker_state);
+                let result = copy.run(None, &worker_state).map(|copy| {
+                    copy.map(
+                        |FinishedCopy {
+                             path,
+                             stamp,
+                             backing,
+                         }| DecompressedCopy {
+                            path,
+                            size: stamp.file_size(),
+                            backing,
+                        },
+                    )
+                });
+                match &result {
+                    Ok(None) => worker_state.cancelled.store(true, Ordering::Release),
+                    Err(error) => worker_state.record_failure(error),
+                    Ok(Some(_)) => {}
+                }
+                result
+            })?;
+        Ok(Self {
+            shared,
+            handle: Some(handle),
+        })
+    }
+
+    pub fn progress(&self) -> CompressedProgress {
+        self.shared.progress()
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.shared.error.lock().unwrap().clone()
+    }
+
+    pub fn cancel(&self) {
+        self.shared.cancelled.store(true, Ordering::Release);
+    }
+
+    /// The verified private copy, or None when the job was cancelled.
+    pub fn wait(mut self) -> Result<Option<DecompressedCopy>, QuarryError> {
+        self.handle
+            .take()
+            .expect("decompression handle is present")
+            .join()
+            .map_err(|_| QuarryError::WorkerPanicked)?
+    }
+}
+
+impl Drop for CompressedRawDecompressJob {
+    /// Abandoning the job stops the worker and removes its private copy.
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel();
+            let _ = handle.join();
+        }
+    }
+}
+
 fn release_workspace(workspace: SpillWorkspace, cleanup: &WorkingCopyCleanup) {
     let root = workspace.path.clone();
     if let Err(error) = workspace.cleanup() {
@@ -1161,115 +1504,71 @@ fn release_workspace(workspace: SpillWorkspace, cleanup: &WorkingCopyCleanup) {
 
 fn run_worker(worker: Worker, shared: &SharedState) -> Result<CompressedOpenOutcome, QuarryError> {
     let Worker {
-        source_path,
-        source_stamp,
-        source_check,
-        mut decoder,
-        workspace,
-        file,
-        mut output,
-        format,
+        copy,
         encoding,
         dialect,
         first_rows,
         metrics,
-        config,
-        cleanup,
     } = worker;
-    let written = (|| {
-        let finished = decompress(
-            &mut decoder,
-            &mut output,
-            &source_path,
-            &workspace.path,
-            dialect.delimiter,
-            encoding,
-            &config,
-            shared,
-        )?;
-        let Some(written) = finished else {
-            return Ok(None);
-        };
-        output
-            .sync_all()
-            .map_err(|error| storage_error(&workspace.path, error))?;
-        if !source_matches_stamp(&source_check, &source_path, &source_stamp)? {
-            return Err(QuarryError::SourceChanged);
-        }
-        if shared.cancelled.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        let backing_stamp = SourceStamp::from_file(&output)?;
-        if backing_stamp.file_size() != written {
-            return Err(QuarryError::SourceChanged);
-        }
-        Ok(Some(backing_stamp))
-    })();
-    drop(output);
-    drop(decoder);
-    let backing_stamp = match written {
-        Ok(Some(stamp)) => stamp,
-        Ok(None) => {
-            drop(file);
-            release_workspace(workspace, &cleanup);
-            return Ok(CompressedOpenOutcome::Cancelled);
-        }
-        Err(error) => {
-            drop(file);
-            release_workspace(workspace, &cleanup);
-            return Err(error);
-        }
+    let Some(FinishedCopy {
+        path,
+        stamp,
+        backing,
+    }) = copy.run(Some((dialect.delimiter, encoding)), shared)?
+    else {
+        return Ok(CompressedOpenOutcome::Cancelled);
     };
-    let backing_path = file.to_path_buf();
-    let file_size = backing_stamp.file_size();
-    let backing = Arc::new(CompressedBacking {
-        format,
-        source_path,
-        source_stamp,
-        workspace: Some(workspace),
-        _file: Some(file),
-        cleanup,
-    });
+    let file_size = stamp.file_size();
     let session = Session {
-        path: backing_path,
-        source_stamp: backing_stamp.clone(),
+        path,
+        source_stamp: stamp.clone(),
         encoding,
         completed_record_count: Arc::new(Mutex::new(None)),
-        compressed: Some(backing),
+        compressed: Some(Arc::new(backing)),
         file_size,
         dialect,
         first_rows,
         metrics,
     };
     let index = shared.index.read().unwrap().clone();
-    let completed = CompletedIndex::from_output(index, backing_stamp, dialect.delimiter, encoding)
+    let completed = CompletedIndex::from_output(index, stamp, dialect.delimiter, encoding)
         .ok_or(QuarryError::SourceChanged)?;
     let index = session.adopt_completed_index(completed)?;
     Ok(CompressedOpenOutcome::Complete { session, index })
 }
 
-/// Returns the decompressed length, or None when cancelled.
-#[allow(clippy::too_many_arguments)]
+/// Returns the decompressed length, or None when cancelled. With `scan`, the
+/// structural index is built in the same pass.
 fn decompress(
     decoder: &mut GzipMembers<SourceReader>,
     output: &mut File,
     source_path: &Path,
     workspace_path: &Path,
-    delimiter: u8,
-    encoding: Encoding,
+    scan: Option<(u8, Encoding)>,
     config: &CompressedOpenConfig,
     shared: &SharedState,
 ) -> Result<Option<u64>, QuarryError> {
-    let mut scanner = EncodedScanner::<true>::new(delimiter, encoding)?;
-    let mut chunk = vec![0; encoding.chunk_size(config.index_config.chunk_bytes)];
+    let mut scanner = scan
+        .map(|(delimiter, encoding)| {
+            EncodedScanner::<true>::new(delimiter, encoding).map(|scanner| (scanner, encoding))
+        })
+        .transpose()?;
+    let chunk_bytes = match scan {
+        Some((_, encoding)) => encoding.chunk_size(config.index_config.chunk_bytes),
+        None => config.index_config.chunk_bytes,
+    };
+    let mut chunk = vec![0; chunk_bytes];
     let mut written = 0_u64;
     let mut next_space_check = config.space_check_interval_bytes;
     loop {
         if shared.cancelled.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let read =
-            read_full(decoder, &mut chunk).map_err(|error| decode_error(source_path, error))?;
+        let read = match read_full(decoder, &mut chunk) {
+            Ok(read) => read,
+            Err(error) if is_cancelled(&error) => return Ok(None),
+            Err(error) => return Err(decode_error(source_path, error)),
+        };
         if read == 0 {
             break;
         }
@@ -1293,9 +1592,9 @@ fn decompress(
             ensure_free_space(&config.temp_dir, config.min_free_space_reserve_bytes)?;
             next_space_check = written.saturating_add(config.space_check_interval_bytes);
         }
-        // A short UTF-16 read can only be the final chunk; finish rejects its odd byte.
-        let scan_len = if encoding.is_utf16() { read & !1 } else { read };
-        {
+        if let Some((scanner, encoding)) = scanner.as_mut() {
+            // A short UTF-16 read can only be the final chunk; finish rejects its odd byte.
+            let scan_len = if encoding.is_utf16() { read & !1 } else { read };
             let mut index = shared.index.write().unwrap();
             scanner.scan_chunk(&chunk[..scan_len], chunk_start, |end| {
                 index.record_boundary(end)
@@ -1310,15 +1609,17 @@ fn decompress(
         }
         shared.decompressed_bytes.store(written, Ordering::Release);
     }
-    let mut index = shared.index.write().unwrap();
-    scanner.finish(written, |end| index.record_boundary(end))?;
-    index.set_scan_progress(written, scanner.maximum_width());
-    shared
-        .columns_found
-        .store(index.maximum_width(), Ordering::Release);
-    shared
-        .rows_scanned
-        .store(index.indexed_rows(), Ordering::Release);
+    if let Some((scanner, _)) = scanner.as_mut() {
+        let mut index = shared.index.write().unwrap();
+        scanner.finish(written, |end| index.record_boundary(end))?;
+        index.set_scan_progress(written, scanner.maximum_width());
+        shared
+            .columns_found
+            .store(index.maximum_width(), Ordering::Release);
+        shared
+            .rows_scanned
+            .store(index.indexed_rows(), Ordering::Release);
+    }
     Ok(Some(written))
 }
 

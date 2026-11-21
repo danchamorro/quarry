@@ -397,6 +397,7 @@ impl CombinePlan {
         self,
         destination: PathBuf,
     ) -> Result<CombineJob<CombineSummary>, QuarryError> {
+        crate::compressed::reject_compressed_destination(&destination)?;
         if self
             .inputs
             .iter()

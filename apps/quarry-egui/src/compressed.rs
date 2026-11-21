@@ -24,6 +24,27 @@ pub(super) const CANCELLED: &str = "Decompression cancelled; temporary files wer
 const JOIN_READ_ONLY: &str = "Compressed files cannot be joined directly. Use Save As… to create an uncompressed copy, then join that copy.";
 const FAILED_PREVIEW: &str = "Showing the initial preview rows only; no temporary files were kept.";
 
+/// Why a file could not be opened, and whether Inspect File can examine it.
+pub(super) struct OpenFailure {
+    pub(super) message: String,
+    pub(super) inspectable: bool,
+}
+
+/// True when valid gzip held text that could not be read. Inspect File then reads a
+/// raw private copy to locate the problem. Damaged or unsupported compressed data,
+/// size limits and storage failures are reported as they are.
+fn text_failure(error: &QuarryError) -> bool {
+    matches!(
+        error,
+        QuarryError::Parse(_)
+            | QuarryError::Encoding(_)
+            | QuarryError::RecordEncoding { .. }
+            | QuarryError::EncodingAt { .. }
+            | QuarryError::BootstrapLimitExceeded { .. }
+            | QuarryError::RecordTooLarge { .. }
+    )
+}
+
 /// The compressed origin of a read-only document.
 pub(super) struct CompressedDocument {
     format: CompressionFormat,
@@ -76,13 +97,14 @@ pub(super) fn uncompressed_name(path: &Path) -> PathBuf {
     }
 }
 
-/// Quarry never writes gzip, so an output name must not claim it.
+pub(super) const COMPRESSED_DESTINATION: &str =
+    "Quarry writes uncompressed delimited files. Choose a file name without .gz or .tgz.";
+
+/// Quarry never writes gzip, so an output name must not claim it. This is the core
+/// rule every writer enforces, checked early for a clear message.
 pub(super) fn gzip_destination_warning(path: &Path) -> Option<AppMessage> {
-    has_gzip_extension(path).then(|| {
-        AppMessage::warning(
-            "Quarry writes uncompressed delimited files. Choose a file name without .gz.",
-        )
-    })
+    quarry_core::is_compressed_destination(path)
+        .then(|| AppMessage::warning(COMPRESSED_DESTINATION))
 }
 
 /// Footer progress for decompression, which runs before any other operation.
@@ -124,9 +146,14 @@ impl Document {
         path: &Path,
         options: OpenOptions,
         encoding: Option<Encoding>,
-    ) -> Result<Self, String> {
-        let bootstrap = CompressedBootstrap::open(path, options, encoding, None)
-            .map_err(|error| error.to_string())?;
+    ) -> Result<Self, OpenFailure> {
+        let bootstrap =
+            CompressedBootstrap::open(path, options, encoding, None).map_err(|error| {
+                OpenFailure {
+                    inspectable: text_failure(&error),
+                    message: error.to_string(),
+                }
+            })?;
         let mut document = Self::from_session(bootstrap.preview_session(), path);
         document.compressed = Some(CompressedDocument {
             format: bootstrap.format(),
@@ -516,7 +543,12 @@ mod tests {
                 "{source}"
             );
         }
-        assert!(gzip_destination_warning(Path::new("/out/copy.csv.GZ")).is_some());
+        for name in ["/out/copy.csv.GZ", "/out/copy.tgz", "/out/COPY.TGZ"] {
+            assert!(
+                gzip_destination_warning(Path::new(name)).is_some(),
+                "{name}"
+            );
+        }
         assert!(gzip_destination_warning(Path::new("/out/copy.csv")).is_none());
     }
 
