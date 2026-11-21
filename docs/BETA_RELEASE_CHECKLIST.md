@@ -1,38 +1,37 @@
 # Beta release checklist
 
-**Public release status, 2026-10-06:** [v0.1.0-beta.2](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.2)
-is published with clean **0.1.0 (140)** at
-`fc0a0b8b59278c96ad69756e0e20b2bffed7001d`. The exact signed archive and checksum
-passed an anonymous public download check. See its
-[verification report](benchmarks/2026-10-06-beta-build140.md) and
-[release notes](releases/v0.1.0-beta.2.md).
+**Public release status, 2026-11-21:** [v0.1.0-beta.3](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3)
+is published with clean **0.1.0 (167)** at
+`f5402e41a1dd0397e43a074d739404906290a430`. The exact signed archive and
+checksum passed an anonymous public download check. See its
+[verification report](benchmarks/2026-11-21-beta-build167.md) and
+[release notes](releases/v0.1.0-beta.3.md).
 
 ## Platform matrix
 
-This matrix describes **build 140** only. Build 127's historical matrix is below.
+This matrix describes **build 167** only. Historical matrices for build 140 and
+build 127 are below.
 
-| Platform | Build 140 evidence | Remaining acceptance |
+| Platform | Build 167 evidence | Remaining acceptance |
 |---|---|---|
-| macOS 27, Apple Silicon | VMPal 27.0.1 (26A434): update, signature/Gatekeeper, launch and the bounded native checks listed below passed | Complete workflows, wide-grid accessibility, large-file GUI, temporary-storage recovery, browser quarantine, clean-environment and offline first launch |
-| macOS 26, Apple Silicon | Not tested for this archive | Installation, launch and native acceptance |
+| macOS 27, Apple Silicon | VMPal 27.2.1 (26B131): SHA-256, strict signature/Gatekeeper (`Notarized Developer ID`), installation, launch, synthetic CSV opening, and Join Files dialog open passed | Complete workflows, wide-grid accessibility, large-file GUI, temporary-storage recovery, browser quarantine, clean-environment, and offline first launch |
+| macOS 26, Apple Silicon | Not tested for this archive | Installation, launch, and native acceptance |
 | Intel Mac, Linux desktop, Windows | No packaged-release acceptance | Outside this beta's scope |
 
-## Current beta 2 acceptance
+## Current beta 3 acceptance
 
-The following applies only to build 140. Publication with documented validation
+The following applies only to build 167. Publication with documented validation
 limits does not mark the unchecked items as passed.
 
-- [x] Freeze the clean revision, build, toolchain and archive SHA-256.
+- [x] Freeze the clean revision, build, toolchain, and archive SHA-256.
 - [x] Verify Developer ID signature, hardened runtime, notarization, staple,
-  Gatekeeper and the extracted app against the frozen bundle.
-- [x] Verify a VMPal update from build 127 on macOS 27.0.1 (26A434), retaining
-  a signature-checked rollback copy.
-- [x] Verify launch, cell grid lines, auto-fit and long-value display/copy,
-  cell edit/Undo/Redo, unsaved quit, exact Save As/reopen and About details.
-- [x] Publish the approved prerelease and verify tag, public ZIP size and checksum.
+  Gatekeeper, and the extracted app against the frozen bundle.
+- [x] Verify installation, Gatekeeper, launch, synthetic CSV opening, and
+  redesigned Join Files dialog in VMPal on macOS 27.2.1 (26B131).
+- [x] Publish the approved prerelease and verify tag, public ZIP size, and checksum.
 - [ ] Validate this archive on macOS 26.
 - [ ] Complete connected native workflows, wide-grid accessibility, large-file
-  GUI and temporary-storage recovery checks for this archive.
+  GUI, and temporary-storage recovery checks for this archive.
 - [ ] Verify first launch after a browser download with quarantine.
 - [ ] Verify first launch in a clean environment and first launch while offline.
 - [ ] Retest the earlier CJK font-rendering limitation.
@@ -46,10 +45,26 @@ follow-up work, not a claim that every version in those families has passed.
 Keep app bundles out of Git source history; upload approved archives as release
 assets. The main application remains egui.
 
+## Historical beta 2 acceptance
+
+The following summary applies only to **build 140** (`fc0a0b8b59278c96ad69756e0e20b2bffed7001d`),
+not the current build 167. The older archive remains available as
+[v0.1.0-beta.2](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.2).
+See its [verification report](benchmarks/2026-10-06-beta-build140.md) and
+[beta 2 release notes](releases/v0.1.0-beta.2.md).
+
+- Passed on macOS 27.0.1 (26A434) in VMPal: update from build 127 with rollback
+  backup, signature/Gatekeeper checks, launch, cell grid lines, auto-fit and
+  long-value display/copy, edit/Undo/Redo, unsaved quit, exact Save As/reopen,
+  and About details.
+- Remained unverified for build 140: macOS 26, complete connected workflows,
+  wide-grid accessibility, large-file GUI, temporary-storage recovery, browser
+  quarantine, clean-environment/offline first launch, and CJK retest.
+
 ## Historical beta 1 acceptance
 
 Everything in the next two subsections applies only to **build 127**, not the
-current build 140. The older archive remains available as
+current build 167. The older archive remains available as
 [v0.1.0-beta.1](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.1).
 
 See the [build 127 evidence](benchmarks/2026-10-05-beta-build127.md),

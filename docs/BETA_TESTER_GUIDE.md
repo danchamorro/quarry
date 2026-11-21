@@ -10,31 +10,32 @@ below identifies what has passed. Intel Macs, Linux desktop and Windows are outs
 
 ## Release and compatibility
 
-- Current release: **0.1.0 beta 2, build 140**, clean revision
-  `fc0a0b8b59278c96ad69756e0e20b2bffed7001d`.
-- Tested: **macOS 27.0.1 (26A434), Apple Silicon**. A VMPal update from build
-  127 passed signature/Gatekeeper checks, launch, grid lines, auto-fit and
-  long-cell display/copy, editing and Undo/Redo, unsaved-quit protection, exact
-  Save As/reopen, and About build details.
+- Current release: **0.1.0 beta 3, build 167**, clean revision
+  `f5402e41a1dd0397e43a074d739404906290a430`.
+- Tested: **macOS 27.2.1 (26B131), Apple Silicon**. In VMPal, the signed
+  archive passed SHA-256, strict signature/Gatekeeper (`Notarized Developer
+  ID`) checks, installation, launch, opening a synthetic CSV with unchanged
+  source hash, and opening the redesigned **Join Files** dialog.
 - macOS 26 validation remains outstanding for this archive. Browser download
-  with quarantine, clean-environment first launch and offline first launch
-  are each unverified for build 140. Beta 1 results do not count as beta 2 passes.
-- Complete connected workflows, wide-grid accessibility, large-file GUI and
+  with quarantine, clean-environment first launch, and offline first launch
+  are each unverified for build 167. Beta 1 and beta 2 results do not count as
+  beta 3 passes.
+- Complete connected workflows, wide-grid accessibility, large-file GUI, and
   temporary-storage recovery remain open for this archive. The previous CJK
   font-rendering limitation has not been retested.
-- Archive: `Quarry-0.1.0-beta.2-macos-arm64.zip`, **3,629,137 bytes**, signed,
-  notarized and stapled.
-- SHA-256: `4b7ef0e0afbf0c4724b1a85d748562038b61b011cd047e798183898db9335bc6`.
-- Read the [release notes](releases/v0.1.0-beta.2.md) and
-  [build 140 verification report](benchmarks/2026-10-06-beta-build140.md).
+- Archive: `Quarry-0.1.0-beta.3-macos-arm64.zip`, **4,367,099 bytes**, signed,
+  notarized, and stapled.
+- SHA-256: `d5c2dc84b1da0900c4594e56217335e1202a64ed8a182cc912d1bedf56bb8677`.
+- Read the [release notes](releases/v0.1.0-beta.3.md) and
+  [build 167 verification report](benchmarks/2026-11-21-beta-build167.md).
 
 ## Install or update
 
 1. Save any open work and quit Quarry completely before replacing the app.
    Keep a copy of your previous app until the new copy works.
 2. Download the ZIP from
-   [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.2). To check a copy in Downloads, run
-   `shasum -a 256 ~/Downloads/Quarry-0.1.0-beta.2-macos-arm64.zip` in Terminal and compare the
+   [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3). To check a copy in Downloads, run
+   `shasum -a 256 ~/Downloads/Quarry-0.1.0-beta.3-macos-arm64.zip` in Terminal and compare the
    result with the SHA-256 above. Report a mismatch before proceeding.
 3. Extract the ZIP and move `Quarry.app` into Applications.
 4. Open Quarry normally from Applications. Record any macOS first-launch
@@ -76,23 +77,19 @@ include elapsed time, memory, available disk, and the displayed operation phase.
 GitHub reports are public: redact paths, screenshots, logs, and values. Share
 only synthetic reproductions, never private datasets or credentials.
 
-In the published build 140, clear active filters before editing; save or discard
-cell edits before filtering. **Current source builds after
-[#78](https://github.com/danchamorro/quarry/issues/78)** include unsaved cell
-values in filters. In those builds, editing a cell or using value Undo/Redo
+Filters include unsaved cell values; editing a cell or using value Undo/Redo
 refreshes completed results while preserving your page where possible. Clear
-filters before structural changes or Find/Replace. These changes are not in
-the build 140 download linked above.
+filters before structural changes or Find/Replace.
 Undo history is bounded, and case-insensitive matching folds ASCII letters only.
 Read the [documented limits](USER_GUIDE.md#undo-and-redo-changes) and
-[filter rules](USER_GUIDE.md#filter-rows). Current source builds also include
-[Combine Files](USER_GUIDE.md#combine-files) and
-[document tabs](USER_GUIDE.md#work-with-document-tabs); existing beta downloads
-may predate them. A TUI remains [future work](ROADMAP.md#post-beta-sequence). The
+[filter rules](USER_GUIDE.md#filter-rows). Build 167 also includes
+[document tabs](USER_GUIDE.md#work-with-document-tabs),
+[Combine Files](USER_GUIDE.md#combine-files),
+[Join Files](USER_GUIDE.md#join-files), and
+[compressed `.gz` files](USER_GUIDE.md#open-compressed-files). A TUI remains
+[future work](ROADMAP.md#post-beta-sequence). The
 [beta checklist](BETA_RELEASE_CHECKLIST.md) tracks acceptance still outstanding.
 
 ## Character encoding checks
-
-These checks require a source build containing #61 / PR #108. The downloadable build 140 described above does not include the encoding controls.
 
 Open UTF-16 files with BOMs using Auto. For BOM-less UTF-16 and Windows-1252 or Latin-1 files, select the encoding under Format or File → Open with Encoding. Check accented values after filtering, editing, saving, and reopening. Try Save As UTF-8 with an emoji added to a legacy file; the original must stay unchanged. Report the selected encoding and whether the file has a BOM, using a synthetic sample.
