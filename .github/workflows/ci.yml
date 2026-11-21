@@ -15,6 +15,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy,rustfmt
+      - name: Record host architecture
+        run: |
+          uname -sm
+          rustc -vV
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -24,11 +28,58 @@ jobs:
 
   linux-core-cli:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+      - name: Record host architecture
+        run: |
+          uname -sm
+          rustc -vV
+      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli --all-targets --locked -- -D warnings
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
+      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
+
+  linux-arm64-core-cli:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+      - name: Record host architecture
+        run: |
+          uname -sm
+          rustc -vV
+      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli --all-targets --locked -- -D warnings
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
+      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
+
+  macos-intel-core-cli:
+    runs-on: macos-15-intel
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+      - name: Record host architecture
+        run: |
+          uname -sm
+          rustc -vV
+      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli --all-targets --locked -- -D warnings
       - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
       - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
 
@@ -41,6 +92,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Record host architecture
+        shell: pwsh
+        run: |
+          [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+          rustc -vV
       - run: cargo test -p quarry-core --locked windows_
       - run: cargo test -p quarry-core --locked pinned_publication_reports_cleanup_failure
       - run: cargo test -p quarry-core --locked publication_wrappers_keep_primary_errors_and_staging_cleanup_context
