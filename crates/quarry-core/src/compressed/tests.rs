@@ -2396,10 +2396,17 @@ fn recovery_publishes_only_while_the_compressed_source_is_unchanged() {
 fn join_classifies_a_saved_input_by_the_handle_it_reads() {
     let dir = tempfile::tempdir().unwrap();
     let csv = write(dir.path(), "right.csv", b"id,a\n2,y\n");
-    let plain_file = write(dir.path(), "plain.csv", b"id,a\n1,x\n");
     let gz = write(dir.path(), "left.csv", &gzip(b"id,a\n1,x\n"));
-    let link = dir.path().join("link.csv.gz");
-    std::os::unix::fs::symlink(&plain_file, &link).unwrap();
+    // Gzip bytes under a plain name, and (on Unix) plain bytes under a .gz name.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut cases = vec![(gz, "Join Files")];
+    #[cfg(unix)]
+    {
+        let plain_file = write(dir.path(), "plain.csv", b"id,a\n1,x\n");
+        let link = dir.path().join("link.csv.gz");
+        std::os::unix::fs::symlink(&plain_file, &link).unwrap();
+        cases.push((link, "gzip signature"));
+    }
     let input = |path: &Path| JoinInput {
         path: path.to_path_buf(),
         delimiter: None,
@@ -2410,8 +2417,7 @@ fn join_classifies_a_saved_input_by_the_handle_it_reads() {
         require_unique: false,
     };
     let temp = tempfile::tempdir().unwrap();
-    // Gzip bytes under a plain name, and plain bytes under a .gz name.
-    for (chosen, expected) in [(&gz, "Join Files"), (&link, "gzip signature")] {
+    for (chosen, expected) in &cases {
         let error = expect_err(
             analyze_join(
                 [input(&csv), input(chosen)],
