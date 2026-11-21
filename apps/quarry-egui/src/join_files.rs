@@ -438,6 +438,7 @@ impl JoinDialog {
         if let Some(job) = &self.writing {
             job.cancel();
         }
+        self.intent = RunIntent::Preview;
         self.pending_auto_write = false;
         self.pending_auto_open = false;
         self.cancel_requested = true;
@@ -456,6 +457,18 @@ impl JoinDialog {
         if !self.inputs_editable() {
             return;
         }
+        let main_len = self.headers[0].as_ref().map_or(0, |h| h.columns.len());
+        let additional_len = self.headers[1].as_ref().map_or(0, |h| h.columns.len());
+        let default_order = self.output_columns.len() == main_len + additional_len
+            && self.output_columns[..main_len]
+                .iter()
+                .enumerate()
+                .all(|(i, c)| c.source == JoinSource::Main && c.column == i)
+            && self.output_columns[main_len..]
+                .iter()
+                .enumerate()
+                .all(|(i, c)| c.source == JoinSource::Additional && c.column == i);
+
         self.paths.swap(0, 1);
         self.document_inputs.swap(0, 1);
         self.headers.swap(0, 1);
@@ -464,7 +477,22 @@ impl JoinDialog {
         for pair in &mut self.keys {
             pair.swap(0, 1);
         }
-        self.refresh_output_columns();
+        for column in &mut self.output_columns {
+            column.source = match column.source {
+                JoinSource::Main => JoinSource::Additional,
+                JoinSource::Additional => JoinSource::Main,
+            };
+        }
+        if default_order && main_len > 0 && additional_len > 0 {
+            self.output_columns.rotate_left(main_len);
+            self.output_selected = self.output_selected.map(|selected| {
+                if selected < main_len {
+                    selected + additional_len
+                } else {
+                    selected - main_len
+                }
+            });
+        }
         self.message = None;
     }
 
@@ -523,7 +551,8 @@ impl JoinDialog {
                     } else {
                         let needs_review = plan.analysis().many_to_many_groups > 0
                             || plan.analysis().new_columns != [0, 0];
-                        let auto_write = self.intent == RunIntent::JoinAndOpen
+                        let auto_write = !self.cancel_requested
+                            && self.intent == RunIntent::JoinAndOpen
                             && self.destination.is_some()
                             && !needs_review;
                         self.plan = Some(plan);
@@ -554,7 +583,8 @@ impl JoinDialog {
         if self.writing.as_ref().is_some_and(|job| job.progress().done) {
             match self.writing.take().unwrap().wait() {
                 Ok(Some(result)) => {
-                    let auto_open = self.intent == RunIntent::JoinAndOpen
+                    let auto_open = !self.cancel_requested
+                        && self.intent == RunIntent::JoinAndOpen
                         && result.cleanup_warning.is_none()
                         && !self.closing;
                     if let Some(warning) = &result.cleanup_warning {
@@ -1023,7 +1053,10 @@ impl JoinDialog {
                         );
                         let up_label = format!("Move pair {} up", index + 1);
                         let up = ui
-                            .add_enabled(index > 0, egui::Button::new("↑").min_size(egui::vec2(26.0, 24.0)))
+                            .add_enabled(
+                                index > 0,
+                                egui::Button::new("↑").min_size(egui::vec2(26.0, 24.0)),
+                            )
                             .on_hover_text(&up_label);
                         up.widget_info(|| {
                             egui::WidgetInfo::labeled(
@@ -1171,7 +1204,11 @@ impl JoinDialog {
             if count > 0 {
                 let labels = ["All", "Main only", "None"];
                 theme::push_right(ui, theme::buttons_width(ui, &labels) + 8.0);
-                if ui.button("All").on_hover_text("Select all columns").clicked() {
+                if ui
+                    .button("All")
+                    .on_hover_text("Select all columns")
+                    .clicked()
+                {
                     for column in &mut self.output_columns {
                         column.included = true;
                     }
@@ -3144,7 +3181,10 @@ mod tests {
             .iter()
             .filter_map(|(_, n)| {
                 let label = n.label()?;
-                if matches!(label, "Close" | "Back to Edit" | "Join…" | "Preview" | "Cancel") {
+                if matches!(
+                    label,
+                    "Close" | "Back to Edit" | "Join…" | "Preview" | "Cancel"
+                ) {
                     Some((label, n.bounds()))
                 } else {
                     None
@@ -3158,7 +3198,11 @@ mod tests {
                 .shapes
                 .iter()
                 .filter_map(|c| match &c.shape {
-                    egui::Shape::Text(t) => Some((t.galley.job.text.as_str(), c.clip_rect, c.shape.visual_bounding_rect())),
+                    egui::Shape::Text(t) => Some((
+                        t.galley.job.text.as_str(),
+                        c.clip_rect,
+                        c.shape.visual_bounding_rect()
+                    )),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -4615,7 +4659,10 @@ value
         finish(&mut app);
         frame(&mut app, &ctx, vec![]);
         let dialog = app.join_files.as_ref().unwrap();
-        assert!(dialog.plan.is_some(), "many-to-many join must pause for review");
+        assert!(
+            dialog.plan.is_some(),
+            "many-to-many join must pause for review"
+        );
         assert!(dialog.writing.is_none());
         assert!(!output.exists());
         click(&mut app, &ctx, "I understand this will create 4 rows.");
@@ -4660,16 +4707,65 @@ value
         finish_document(&mut app);
         app.open_join_files();
         finish(&mut app);
-        let dialog = app.join_files.as_ref().unwrap();
+        let dialog = app.join_files.as_mut().unwrap();
         assert_eq!(dialog.paths[0].as_ref(), Some(&b));
         assert_eq!(dialog.paths[1].as_ref(), Some(&a));
         assert!(dialog.headers[0].is_some() && dialog.headers[1].is_some());
+        dialog.output_columns[1].included = false;
+        dialog.output_columns[1].name = "Town".into();
+        dialog.output_has_header = false;
         let ctx = context();
         click(&mut app, &ctx, "Swap");
         let dialog = app.join_files.as_ref().unwrap();
         assert_eq!(dialog.paths[0].as_ref(), Some(&a));
         assert_eq!(dialog.paths[1].as_ref(), Some(&b));
         assert_eq!(dialog.output_columns[0].source, JoinSource::Main);
+        assert!(!dialog.output_has_header);
+        assert!(
+            dialog
+                .output_columns
+                .iter()
+                .any(|c| c.source == JoinSource::Additional
+                    && c.column == 1
+                    && !c.included
+                    && c.name == "Town"),
+            "swap must preserve output column selection, renames, and header choice"
+        );
+    }
+
+    #[test]
+    fn cancelling_one_click_join_as_analysis_completes_does_not_auto_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = QuarryApp::new(None, Instant::now());
+        let ctx = context();
+        prepare(&mut app, dir.path());
+        let output = dir.path().join("cancelled.csv");
+        app.start_join_to(output.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .join_files
+            .as_ref()
+            .unwrap()
+            .checking
+            .as_ref()
+            .unwrap()
+            .progress()
+            .done
+        {
+            assert!(Instant::now() < deadline, "analysis timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Cancel after the worker completed but before poll adopts the plan.
+        app.join_files.as_mut().unwrap().cancel();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let dialog = app.join_files.as_ref().unwrap();
+        assert!(dialog.writing.is_none());
+        assert!(!dialog.pending_auto_write);
+        assert!(
+            !output.exists(),
+            "cancelled join must not automatically write"
+        );
     }
 
     #[test]
