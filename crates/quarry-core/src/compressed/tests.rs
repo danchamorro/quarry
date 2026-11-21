@@ -912,6 +912,7 @@ fn live_reads_stop_at_the_published_index_boundary() {
     assert!(fs::metadata(&job.backing_path).unwrap().len() > snapshot.indexed_bytes());
     // The last two indexed records hold ids `indexed - 3` and `indexed - 2`.
     let rows = job.read_rows(indexed - 2, 2).unwrap();
+    assert_eq!(rows.len(), 2);
     for (row, id) in rows.iter().zip([indexed - 3, indexed - 2]) {
         assert_eq!(
             row.fields,
@@ -2084,4 +2085,174 @@ fn raw_decompression_keeps_malformed_text_for_inspection() {
     assert!(matches!(job.wait(), Err(QuarryError::SourceChanged)));
     assert!(entries(temp.path()).is_empty());
     assert!(cleanup.take_errors().is_empty());
+}
+
+#[test]
+fn classifying_an_open_input_rewinds_it_and_reports_read_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "plain.csv", b"id,a\n1,x\n");
+    let mut file = fs::File::open(&path).unwrap();
+    file.seek(SeekFrom::Start(5)).unwrap();
+    assert_eq!(
+        compressed_file_problem(&mut file, &path, "Combine Files").unwrap(),
+        None
+    );
+    assert_eq!(file.stream_position().unwrap(), 0);
+
+    // A handle that cannot be read fails instead of passing as plain text.
+    let mut unreadable = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    assert!(matches!(
+        compression_of(&mut unreadable, &path),
+        Err(QuarryError::Io(_))
+    ));
+    assert!(matches!(
+        compressed_file_problem(&mut unreadable, &path, "Combine Files"),
+        Err(QuarryError::Io(_))
+    ));
+    // A path-only check leaves I/O failures to the operation's own open.
+    assert_eq!(
+        compressed_input_problem(&dir.path().join("missing.csv"), "Combine Files"),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn combine_judges_a_linked_input_by_the_name_that_was_chosen() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain_file = write(dir.path(), "plain.csv", b"id,a\n1,x\n");
+    let other = write(dir.path(), "other.csv", b"id,a\n2,y\n");
+    let link = dir.path().join("link.csv.gz");
+    std::os::unix::fs::symlink(&plain_file, &link).unwrap();
+    assert!(detect_compression(&link).is_err());
+
+    let error = expect_err(
+        check_combine_files(vec![other, link.clone()], CombineOptions::default())
+            .unwrap()
+            .wait(),
+    );
+    assert!(
+        matches!(&error, QuarryError::CombineFile { path, reason, .. }
+            if path == &link && reason.contains("gzip signature")),
+        "{error:?}"
+    );
+}
+
+/// `data` followed by `empty` empty gzip members.
+fn with_empty_members(data: &[u8], empty: usize) -> Vec<u8> {
+    let mut bytes = if data.is_empty() {
+        Vec::new()
+    } else {
+        gzip(data)
+    };
+    for _ in 0..empty {
+        bytes.extend(gzip(b""));
+    }
+    bytes
+}
+
+#[test]
+fn bootstrap_bounds_compressed_work_and_leaves_the_rest_to_the_background_pass() {
+    const BUDGET: u64 = 4 * 1024;
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let data = b"a,b\n1,2\n";
+    let bytes = with_empty_members(data, 2_000);
+    assert!(bytes.len() as u64 > 4 * BUDGET);
+    let path = write(source_dir.path(), "members.csv.gz", &bytes);
+
+    // The budget runs out while reading rows, and again during the end-of-data
+    // lookahead once every requested row is buffered.
+    for rows in [OpenOptions::default().rows, 2] {
+        let options = OpenOptions {
+            rows,
+            ..OpenOptions::default()
+        };
+        let bootstrap =
+            CompressedBootstrap::open_with_budget(&path, options, None, None, BUDGET).unwrap();
+        assert_eq!(bootstrap.decompressed_size(), None);
+        assert!(bootstrap.compressed_bytes_read() <= BUDGET + data.len() as u64);
+        assert_eq!(bootstrap.dialect.delimiter, b',');
+        assert_eq!(
+            bootstrap.first_rows[1].fields,
+            [b"1".to_vec(), b"2".to_vec()]
+        );
+        assert_eq!(bootstrap.first_rows.len(), 2);
+        let job = bootstrap
+            .start_decompression(config(temp.path()), WorkingCopyCleanup::default())
+            .unwrap();
+        let CompressedOpenOutcome::Complete { session, index } = job.wait().unwrap() else {
+            panic!("unexpected cancellation");
+        };
+        assert_eq!(session.file_size, data.len() as u64);
+        assert_eq!(index.indexed_rows(), 2);
+        drop(session);
+        assert!(entries(temp.path()).is_empty());
+    }
+
+    // Without a complete row inside the budget, the open fails at once.
+    for (name, data) in [("empty.csv.gz", &b""[..]), ("partial.csv.gz", b"a,b")] {
+        let path = write(source_dir.path(), name, &with_empty_members(data, 2_000));
+        let error = expect_err(CompressedBootstrap::open_with_budget(
+            &path,
+            OpenOptions::default(),
+            None,
+            None,
+            BUDGET,
+        ));
+        assert!(reason(&error).contains("No complete row"), "{error:?}");
+    }
+
+    // A stream that ends within the budget is still verified to its exact end.
+    let short = write(
+        source_dir.path(),
+        "short.csv.gz",
+        &with_empty_members(data, 3),
+    );
+    let bootstrap =
+        CompressedBootstrap::open_with_budget(&short, OpenOptions::default(), None, None, BUDGET)
+            .unwrap();
+    assert_eq!(bootstrap.decompressed_size(), Some(data.len() as u64));
+    let bootstrap = CompressedBootstrap::open(&path, OpenOptions::default(), None, None).unwrap();
+    assert_eq!(bootstrap.decompressed_size(), Some(data.len() as u64));
+}
+
+#[test]
+fn free_space_is_checked_again_when_a_chunk_exceeds_the_remaining_headroom() {
+    const MIB: u64 = 1024 * 1024;
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let data = numbered_rows(300_000);
+    assert!(data.len() as u64 > 3 * MIB);
+    let path = write(source_dir.path(), "rows.csv.gz", &gzip(&data));
+    let reserve = 4 * MIB;
+    let job = CompressedRawDecompressJob::start(
+        &path,
+        CompressedOpenConfig {
+            min_free_space_reserve_bytes: reserve,
+            space_check_interval_bytes: 64 * MIB,
+            available_space_override: Some(reserve + 3 * MIB / 2),
+            index_config: IndexConfig {
+                chunk_bytes: MIB as usize,
+                ..IndexConfig::default()
+            },
+            ..config(temp.path())
+        },
+        WorkingCopyCleanup::default(),
+    )
+    .unwrap();
+    wait_for(|| job.progress().done, "the free-space check");
+    // The first chunk fits; the second is checked again and refused before it
+    // could reach into the reserve.
+    assert_eq!(job.progress().decompressed_bytes_written, MIB);
+    let error = job.wait().unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            QuarryError::InsufficientStorage { required_bytes, available_bytes, .. }
+                if *required_bytes == reserve + MIB && *available_bytes == reserve + MIB / 2
+        ),
+        "{error:?}"
+    );
+    assert!(entries(temp.path()).is_empty());
 }

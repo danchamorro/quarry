@@ -219,18 +219,17 @@ impl DocumentTab {
             })
     }
 
-    /// Decompression shares the global job limit but never delays closing the tab.
-    fn decompressing(&self) -> bool {
-        self.document.as_ref().is_some_and(Document::decompressing)
-            || self.inspection.decompressing()
-    }
-
-    /// A running decompression is counted by its worker slot rather than by its tab.
-    fn holds_decompression_slot(&self) -> bool {
-        self.document
-            .as_ref()
-            .is_some_and(Document::decompression_running)
-            || self.inspection.decompressing()
+    /// File operations this tab counts against the global job limit itself: a
+    /// writer, and a compressed document whose pass has not claimed its slot yet.
+    /// Running decompressions, the document's and the inspection's, count through
+    /// their worker slots instead, so a writer beside one is still counted.
+    fn unslotted_operations(&self) -> usize {
+        usize::from(self.writing())
+            + usize::from(
+                self.document
+                    .as_ref()
+                    .is_some_and(Document::awaiting_decompression),
+            )
     }
 
     /// Counts file operations and structural analysis against the global job limit.
@@ -652,8 +651,8 @@ impl QuarryApp {
     pub(super) fn write_slot_available_releasing(&self, released: usize) -> bool {
         let in_use = self
             .document_tabs()
-            .filter(|tab| (tab.writing() || tab.decompressing()) && !tab.holds_decompression_slot())
-            .count()
+            .map(DocumentTab::unslotted_operations)
+            .sum::<usize>()
             + self.decompression_slots.active()
             + usize::from(
                 self.combine_files

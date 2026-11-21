@@ -41,6 +41,10 @@ const TAR_CHECKSUM: std::ops::Range<usize> = 148..156;
 const TAR_MAGIC: std::ops::Range<usize> = 257..263;
 const DEFAULT_FREE_SPACE_RESERVE: u64 = 256 * 1024 * 1024;
 const DEFAULT_SPACE_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
+/// Compressed bytes the synchronous bootstrap may read beyond the decompressed
+/// bytes it has produced. Real data never comes near it; it bounds input that
+/// decompresses to almost nothing, such as a long run of empty gzip members.
+const DEFAULT_BOOTSTRAP_COMPRESSED_BUDGET: u64 = 16 * 1024 * 1024;
 
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const GZIP_DEFLATE: u8 = 8;
@@ -160,10 +164,12 @@ pub(crate) fn compression_of(
     let mut prefix = [0_u8; 12];
     let mut used = 0;
     while used < prefix.len() {
-        let read = file.read(&mut prefix[used..])?;
-        if read == 0 {
-            break;
-        }
+        let read = match file.read(&mut prefix[used..]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
         used += read;
     }
     file.seek(SeekFrom::Start(0))?;
@@ -244,13 +250,18 @@ pub(crate) fn compressed_input_problem(path: &Path, operation: &str) -> Option<S
 
 /// Like [`compressed_input_problem`], for an input the operation has already
 /// opened: the same handle it then reads is classified, so the file cannot be
-/// replaced between the check and the read.
+/// replaced between the check and the read. `path` is the name the user chose,
+/// which decides whether a `.gz` suffix without gzip bytes is rejected. An I/O
+/// failure is returned, because the handle's position is then unknown.
 pub(crate) fn compressed_file_problem(
     file: &mut File,
     path: &Path,
     operation: &str,
-) -> Option<String> {
-    input_problem(compression_of(file, path), operation)
+) -> Result<Option<String>, QuarryError> {
+    match compression_of(file, path) {
+        Err(QuarryError::Io(error)) => Err(QuarryError::Io(error)),
+        detected => Ok(input_problem(detected, operation)),
+    }
 }
 
 fn input_problem(
@@ -370,6 +381,24 @@ fn is_cancelled(error: &io::Error) -> bool {
         .is_some_and(|inner| inner.is::<GzipCancelled>())
 }
 
+/// Marks a read that stopped because the bootstrap's compressed-input budget ran out.
+#[derive(Debug)]
+struct BudgetSpent;
+
+impl fmt::Display for BudgetSpent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the compressed bootstrap budget was spent")
+    }
+}
+
+impl std::error::Error for BudgetSpent {}
+
+fn is_budget_spent(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<BudgetSpent>())
+}
+
 /// Convert a decoder failure into a path-bearing error, keeping real I/O errors.
 fn decode_error(path: &Path, error: io::Error) -> QuarryError {
     match error
@@ -381,14 +410,28 @@ fn decode_error(path: &Path, error: io::Error) -> QuarryError {
     }
 }
 
-/// Counts compressed bytes as they leave the file, for progress reporting.
+/// Counts compressed bytes as they leave the file, for progress reporting. With a
+/// limit, it reads no further than that many bytes in total.
 struct CountingReader<R> {
     inner: R,
     count: Arc<AtomicU64>,
+    limit: Option<u64>,
 }
 
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let buffer = match self.limit {
+            Some(limit) => {
+                let remaining = limit.saturating_sub(self.count.load(Ordering::Relaxed));
+                if remaining == 0 && !buffer.is_empty() {
+                    return Err(io::Error::other(BudgetSpent));
+                }
+                let allowed = usize::try_from(remaining).unwrap_or(usize::MAX);
+                let allowed = buffer.len().min(allowed);
+                &mut buffer[..allowed]
+            }
+            None => buffer,
+        };
         let read = self.inner.read(buffer)?;
         self.count.fetch_add(read as u64, Ordering::Relaxed);
         Ok(read)
@@ -404,7 +447,11 @@ fn source_reader(
 ) -> GzipMembers<SourceReader> {
     let mut reader = GzipMembers::new(BufReader::with_capacity(
         COMPRESSED_READ_BUFFER,
-        CountingReader { inner: file, count },
+        CountingReader {
+            inner: file,
+            count,
+            limit: None,
+        },
     ));
     reader.cancel = cancel;
     reader
@@ -682,6 +729,11 @@ struct BootstrapStream<'a> {
     max_decompressed_bytes: Option<u64>,
     eof: bool,
     failure: Option<QuarryError>,
+    /// Compressed bytes that may be read beyond the decompressed bytes produced.
+    compressed_budget: u64,
+    /// The budget ran out: the bytes so far are all that is read here, and the
+    /// end of the stream is left for the background pass to find and verify.
+    budget_spent: bool,
 }
 
 impl BootstrapStream<'_> {
@@ -693,22 +745,34 @@ impl BootstrapStream<'_> {
 
     fn fill_to(&mut self, wanted: usize) -> io::Result<()> {
         let wanted = wanted.min(self.capacity);
-        while !self.eof && self.bytes.len() < wanted {
+        while !self.eof && !self.budget_spent && self.bytes.len() < wanted {
             let start = self.bytes.len();
             let step = (wanted - start).min(crate::DEFAULT_READ_CHUNK);
             self.bytes.resize(start + step, 0);
-            let read = match read_full(&mut self.decoder, &mut self.bytes[start..]) {
-                Ok(read) => read,
-                Err(error) => {
-                    self.bytes.truncate(start);
-                    let error = decode_error(self.path, error);
-                    return Err(self.fail(error));
+            self.decoder.input.get_mut().limit =
+                Some((start as u64).saturating_add(self.compressed_budget));
+            let mut read = 0;
+            while read < step {
+                match self.decoder.read(&mut self.bytes[start + read..]) {
+                    Ok(0) => {
+                        self.eof = true;
+                        break;
+                    }
+                    Ok(count) => read += count,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    // Keep what was decompressed; the decoder is not read again.
+                    Err(error) if is_budget_spent(&error) => {
+                        self.budget_spent = true;
+                        break;
+                    }
+                    Err(error) => {
+                        self.bytes.truncate(start);
+                        let error = decode_error(self.path, error);
+                        return Err(self.fail(error));
+                    }
                 }
-            };
-            self.bytes.truncate(start + read);
-            if read < step {
-                self.eof = true;
             }
+            self.bytes.truncate(start + read);
             if let Some(limit) = self.max_decompressed_bytes
                 && self.bytes.len() as u64 > limit
             {
@@ -788,11 +852,31 @@ impl CompressedBootstrap {
     /// Decompress at most `options.bootstrap_limit` bytes in memory, detect the
     /// text format and materialize the first rows. When the whole stream ends
     /// within that bound, its complete gzip integrity is verified before success.
+    /// The compressed input read here is bounded too; past that budget, the rest
+    /// of the stream is left for the cancellable background pass.
     pub fn open(
         path: impl AsRef<Path>,
         options: OpenOptions,
         requested_encoding: Option<Encoding>,
         max_decompressed_bytes: Option<u64>,
+    ) -> Result<Self, QuarryError> {
+        Self::open_with_budget(
+            path,
+            options,
+            requested_encoding,
+            max_decompressed_bytes,
+            DEFAULT_BOOTSTRAP_COMPRESSED_BUDGET,
+        )
+    }
+
+    /// Like [`Self::open`], reading at most `compressed_budget` compressed bytes
+    /// beyond the decompressed bytes produced.
+    pub(crate) fn open_with_budget(
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+        requested_encoding: Option<Encoding>,
+        max_decompressed_bytes: Option<u64>,
+        compressed_budget: u64,
     ) -> Result<Self, QuarryError> {
         crate::validate_open_options(&options)?;
         if max_decompressed_bytes == Some(0) {
@@ -821,6 +905,8 @@ impl CompressedBootstrap {
             max_decompressed_bytes,
             eof: false,
             failure: None,
+            compressed_budget,
+            budget_spent: false,
         };
         let opened = bootstrap_text(&mut stream, options, requested_encoding);
         let (encoding, dialect, first_rows, bootstrap_bytes) = match opened {
@@ -923,22 +1009,12 @@ impl CompressedBootstrap {
     }
 }
 
-fn bootstrap_text(
+/// Detect the delimiter and read the first records from the bootstrap stream.
+fn leading_records(
     stream: &mut BootstrapStream<'_>,
     options: OpenOptions,
-    requested_encoding: Option<Encoding>,
-) -> Result<(Encoding, Dialect, Vec<Row>, u64), QuarryError> {
-    stream.fill_to(TAR_PROBE_BYTES)?;
-    if looks_like_tar(&stream.bytes) {
-        return Err(tar_archive(stream.path));
-    }
-    let prefix = &stream.bytes[..stream.bytes.len().min(4)];
-    let encoding = Encoding::detect_prefix(prefix, requested_encoding)?;
-    if encoding.is_utf16() && options.bootstrap_limit < 2 {
-        return Err(QuarryError::InvalidOption(
-            "UTF-16 bootstrap limit must fit a code unit",
-        ));
-    }
+    encoding: Encoding,
+) -> Result<(u8, Vec<u8>, Vec<u64>), QuarryError> {
     let delimiter = match options.delimiter {
         Some(delimiter) => {
             RecordScanner::new(delimiter, encoding)?;
@@ -961,6 +1037,63 @@ fn bootstrap_text(
         options.bootstrap_limit,
         encoding,
     )?;
+    Ok((delimiter, bootstrap, ends))
+}
+
+/// The compressed budget ran out before the first rows were complete: show the
+/// complete records decompressed so far, and fail when there are none.
+fn budget_records(
+    stream: &BootstrapStream<'_>,
+    options: OpenOptions,
+    encoding: Encoding,
+) -> Result<(u8, Vec<u8>, Vec<u64>), QuarryError> {
+    let no_rows = || {
+        compressed_error(
+            stream.path,
+            "No complete row was found near the start of the compressed data. The file holds too much compressed data that decompresses to little or nothing, such as many empty gzip members.",
+        )
+    };
+    let mut buffered = &stream.bytes[..stream.bytes.len().min(options.bootstrap_limit)];
+    if encoding.is_utf16() {
+        buffered = &buffered[..buffered.len() & !1];
+    }
+    let delimiter = match options.delimiter {
+        Some(delimiter) => delimiter,
+        None => crate::detect_delimiter(buffered, false, encoding).ok_or_else(no_rows)?,
+    };
+    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut ends = Vec::new();
+    scanner.scan_chunk(buffered, 0, |end| {
+        if ends.len() < options.rows {
+            ends.push(end);
+        }
+    })?;
+    let last = *ends.last().ok_or_else(no_rows)?;
+    Ok((delimiter, buffered[..last as usize].to_vec(), ends))
+}
+
+fn bootstrap_text(
+    stream: &mut BootstrapStream<'_>,
+    options: OpenOptions,
+    requested_encoding: Option<Encoding>,
+) -> Result<(Encoding, Dialect, Vec<Row>, u64), QuarryError> {
+    stream.fill_to(TAR_PROBE_BYTES)?;
+    if looks_like_tar(&stream.bytes) {
+        return Err(tar_archive(stream.path));
+    }
+    let prefix = &stream.bytes[..stream.bytes.len().min(4)];
+    let encoding = Encoding::detect_prefix(prefix, requested_encoding)?;
+    if encoding.is_utf16() && options.bootstrap_limit < 2 {
+        return Err(QuarryError::InvalidOption(
+            "UTF-16 bootstrap limit must fit a code unit",
+        ));
+    }
+    let (delimiter, bootstrap, ends) = match leading_records(stream, options, encoding) {
+        Err(_) if stream.budget_spent && stream.failure.is_none() => {
+            budget_records(stream, options, encoding)?
+        }
+        result => result?,
+    };
     let first_rows = crate::materialize_rows(
         &bootstrap,
         &ends[..ends.len().min(options.rows)],
@@ -993,12 +1126,14 @@ pub struct CompressedOpenConfig {
     /// Keep at least this many bytes free in `temp_dir`. Starting requires the
     /// reserve plus the exact decompressed size when the bootstrap verified it, or
     /// the reserve alone otherwise. While writing, the reserve plus the next chunk
-    /// must be free before the first write and after every check interval.
+    /// must be free before the first write, after every check interval, and
+    /// whenever the next chunk exceeds the headroom that the last check found.
     pub min_free_space_reserve_bytes: u64,
     /// How many decompressed bytes may be written between free-space checks.
     pub space_check_interval_bytes: u64,
     pub index_config: IndexConfig,
-    /// Free space that tests report instead of the volume's.
+    /// Free space that tests report instead of the volume's, before the copy
+    /// writes anything; the copy's own writes then use it up.
     #[cfg(test)]
     pub(crate) available_space_override: Option<u64>,
 }
@@ -1685,9 +1820,11 @@ fn decompress(
     };
     let mut chunk = vec![0; chunk_bytes];
     let mut written = 0_u64;
-    // Free space is checked before the first write and then once per interval, so
-    // even a copy shorter than one interval keeps the reserve.
+    // Free space is checked before the first write, once per interval, and whenever
+    // the next chunk exceeds the headroom above the reserve that the last check
+    // found, so even a copy shorter than one interval keeps the reserve.
     let mut next_space_check = 0_u64;
+    let mut headroom = 0_u64;
     loop {
         if shared.cancelled.load(Ordering::Acquire) {
             return Ok(None);
@@ -1710,14 +1847,17 @@ fn decompress(
                 decompressed_bytes: total,
             });
         }
-        if written >= next_space_check {
-            ensure_free_space(config, read as u64)?;
+        // A chunk larger than the headroom left by the last check is checked again
+        // first, so a write never reaches into the reserve between intervals.
+        if written >= next_space_check || read as u64 > headroom {
+            headroom = ensure_free_space(config, read as u64, written)?;
             next_space_check = written.saturating_add(config.space_check_interval_bytes);
         }
         // Write before indexing: live readers only see rows already on disk.
         output
             .write_all(&chunk[..read])
             .map_err(|error| storage_error(workspace_path, error))?;
+        headroom = headroom.saturating_sub(read as u64);
         let chunk_start = written;
         written = total;
         if let Some((scanner, encoding)) = scanner.as_mut() {
@@ -1758,12 +1898,22 @@ fn decompress(
     Ok(Some(written))
 }
 
-/// Require the reserve plus `incoming` bytes to be free before writing them.
-fn ensure_free_space(config: &CompressedOpenConfig, incoming: u64) -> Result<(), QuarryError> {
+/// Require the reserve plus `incoming` bytes to be free before writing them, and
+/// return the free space above the reserve. `written` is what this copy has
+/// already written.
+fn ensure_free_space(
+    config: &CompressedOpenConfig,
+    incoming: u64,
+    written: u64,
+) -> Result<u64, QuarryError> {
     let directory = &config.temp_dir;
     let available = available_space(directory).map_err(|error| storage_error(directory, error))?;
     #[cfg(test)]
-    let available = config.available_space_override.unwrap_or(available);
+    let available = config
+        .available_space_override
+        .map_or(available, |space| space.saturating_sub(written));
+    #[cfg(not(test))]
+    let _ = written;
     let required = config.min_free_space_reserve_bytes.saturating_add(incoming);
     if available < required {
         return Err(QuarryError::InsufficientStorage {
@@ -1772,7 +1922,7 @@ fn ensure_free_space(config: &CompressedOpenConfig, incoming: u64) -> Result<(),
             available_bytes: available,
         });
     }
-    Ok(())
+    Ok(available - config.min_free_space_reserve_bytes)
 }
 
 impl Session {

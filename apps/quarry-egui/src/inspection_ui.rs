@@ -10,12 +10,17 @@ use quarry_core::{
 /// A raw decompression and the file-operation slot it holds until its worker exits.
 struct RawDecompression {
     job: CompressedRawDecompressJob,
+    /// Cancel or Close was chosen: a copy that completes anyway is discarded.
+    cancelled: bool,
     /// Declared after the job, so it is freed only once the worker has exited.
     _slot: compressed::DecompressionSlot,
 }
 
 const DECOMPRESSION_CANCELLED: &str =
     "Decompression cancelled; temporary files were removed. Choose Inspect again to retry.";
+const WRITE_SLOT_BUSY: &str = "Wait for an active file operation to finish.";
+const STALE_FINDINGS: &str =
+    "The document or source changed. Inspect again before using these findings.";
 
 struct Snapshot {
     session: Arc<Session>,
@@ -147,13 +152,18 @@ impl InspectionUi {
     pub fn busy(&self) -> bool {
         self.job.is_some() || self.recovery.is_some() || self.decompression.is_some()
     }
-    /// Decompression of a gzip target shares the global file-operation limit.
+    /// Decompression of a gzip target shares the global file-operation limit
+    /// through its worker slot.
+    #[cfg(test)]
     pub fn decompressing(&self) -> bool {
         self.decompression.is_some()
     }
-    /// A gzip target is read through a raw private copy, never as compressed bytes.
-    fn compressed_target(&self) -> bool {
-        self.path.as_deref().is_some_and(compressed::is_gzip)
+    /// True when a standalone gzip target's original file changed after its
+    /// private copy was made, so findings and recovery would use old data.
+    fn compressed_source_changed(&self) -> bool {
+        self.private_copy
+            .as_ref()
+            .is_some_and(|copy| copy.ensure_source_unchanged().is_err())
     }
     /// Reports whether this tab currently reserves a recovery output.
     pub fn recovering(&self) -> bool {
@@ -167,7 +177,8 @@ impl InspectionUi {
         if let Some(j) = &self.recovery {
             j.cancel();
         }
-        if let Some(j) = &self.decompression {
+        if let Some(j) = &mut self.decompression {
+            j.cancelled = true;
             j.job.cancel();
         }
     }
@@ -196,25 +207,47 @@ impl InspectionUi {
             .into_iter()
             .find(|m| m.delimiter() == options.delimiter)
             .unwrap_or(DelimiterMode::Auto);
-        // Compressed bytes are not text; a gzip target shows its report previews instead.
-        if !compressed::is_gzip(&path) {
-            s.preview = SourcePreview::prefix(&path, encoding).ok();
+        // Only plain text has a prefix preview. Compressed bytes are not text, so a
+        // gzip target shows its report previews instead, and a file that is not
+        // usable compressed data names its problem.
+        match quarry_core::detect_compression(&path) {
+            Ok(None) => s.preview = SourcePreview::prefix(&path, encoding).ok(),
+            Ok(Some(_)) => {}
+            Err(e) => {
+                if s.message.as_deref().is_none_or(str::is_empty) {
+                    s.message = Some(e.to_string());
+                }
+            }
         }
         s
     }
     /// Starts inspection of the retained target and clears previous selections. A gzip
-    /// target is first decompressed, without parsing, into a verified private copy.
-    fn start(&mut self) -> Result<(), String> {
+    /// target is first decompressed, without parsing, into a verified private copy;
+    /// only that needs a free file-operation slot. A file that is not usable
+    /// compressed data is reported, never scanned as text.
+    fn start(&mut self, write_slot_available: bool) -> Result<(), String> {
         let path = self.path.clone().ok_or("Choose a file to inspect.")?;
-        if !self.compressed_target() {
-            self.private_copy = None;
-        } else if self
-            .private_copy
-            .as_ref()
-            .is_none_or(|copy| copy.ensure_source_unchanged().is_err())
-        {
-            return self.start_decompression(&path);
+        match quarry_core::detect_compression(&path) {
+            Ok(None) => self.private_copy = None,
+            Ok(Some(_)) => {
+                if self
+                    .private_copy
+                    .as_ref()
+                    .is_none_or(|copy| copy.ensure_source_unchanged().is_err())
+                {
+                    if !write_slot_available {
+                        return Err(WRITE_SLOT_BUSY.into());
+                    }
+                    return self.start_decompression(&path);
+                }
+            }
+            Err(e) => return Err(e.to_string()),
         }
+        self.start_scan()
+    }
+    /// Scans the plain target, or the private copy of a gzip target.
+    fn start_scan(&mut self) -> Result<(), String> {
+        let path = self.path.clone().ok_or("Choose a file to inspect.")?;
         let scan_path = self
             .private_copy
             .as_ref()
@@ -249,7 +282,11 @@ impl InspectionUi {
             self.working_cleanup.clone(),
         )
         .map_err(|e| e.to_string())?;
-        self.decompression = Some(RawDecompression { job, _slot: slot });
+        self.decompression = Some(RawDecompression {
+            job,
+            cancelled: false,
+            _slot: slot,
+        });
         self.report = None;
         self.selected.clear();
         self.focused = 0;
@@ -267,9 +304,7 @@ impl InspectionUi {
         self.preview = None;
         self.confirm_destination = None;
         self.stale = true;
-        self.message = Some(
-            "The document or source changed. Inspect again before using these findings.".into(),
-        );
+        self.message = Some(STALE_FINDINGS.into());
     }
     /// Adopts completed work only while its snapshot is current.
     fn poll(&mut self, doc: Option<&Document>) {
@@ -285,7 +320,11 @@ impl InspectionUi {
         {
             self.invalidate();
         }
-        if self.report.as_ref().is_some_and(|r| !r.is_current()) && !self.stale {
+        // A gzip target's report reads the private copy, so its original is checked too.
+        if (self.report.as_ref().is_some_and(|r| !r.is_current())
+            || self.compressed_source_changed())
+            && !self.stale
+        {
             self.invalidate();
         }
         if self
@@ -293,14 +332,21 @@ impl InspectionUi {
             .as_ref()
             .is_some_and(|j| j.job.progress().done)
         {
-            match self.decompression.take().unwrap().job.wait() {
-                Ok(Some(copy)) => {
-                    self.private_copy = Some(copy);
-                    if let Err(e) = self.start() {
-                        self.message = Some(e);
+            let raw = self.decompression.take().unwrap();
+            let cancelled = raw.cancelled;
+            match raw.job.wait() {
+                // A copy that completed after Cancel or Close is dropped, which
+                // removes it, and no scan starts.
+                Ok(Some(copy)) if !cancelled => match copy.ensure_source_unchanged() {
+                    Ok(()) => {
+                        self.private_copy = Some(copy);
+                        if let Err(e) = self.start_scan() {
+                            self.message = Some(e);
+                        }
                     }
-                }
-                Ok(None) => self.message = Some(DECOMPRESSION_CANCELLED.into()),
+                    Err(e) => self.message = Some(e.to_string()),
+                },
+                Ok(_) => self.message = Some(DECOMPRESSION_CANCELLED.into()),
                 Err(e) => self.message = Some(e.to_string()),
             }
         }
@@ -421,19 +467,16 @@ impl QuarryApp {
         }
         self.start_inspection_target();
     }
-    /// Starts the retained target. A gzip target needs a free file-operation slot and
-    /// writes its private copy to this app's working folder.
+    /// Starts the retained target. A gzip target that must be decompressed needs a
+    /// free file-operation slot and writes its private copy to this app's working
+    /// folder; the target is classified once, where that pass would start.
     fn start_inspection_target(&mut self) {
-        if self.active.inspection.compressed_target() && !self.write_slot_available() {
-            self.active.inspection.message =
-                Some("Wait for an active file operation to finish.".into());
-            return;
-        }
+        let write_slot_available = self.write_slot_available();
         let state = &mut self.active.inspection;
         state.working_directory = self.working_directory.clone();
         state.working_cleanup = self.working_cleanup.clone();
         state.decompression_slots = self.decompression_slots.clone();
-        if let Err(e) = state.start() {
+        if let Err(e) = state.start(write_slot_available) {
             state.message = Some(e);
         }
     }
@@ -600,52 +643,48 @@ impl QuarryApp {
                     }
                 }
             }
-            Some(Command::CreateCopy) => {
-                if self
-                    .active
-                    .inspection
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snap| {
-                        self.active
-                            .document
-                            .as_ref()
-                            .is_none_or(|doc| !snap.current(doc))
-                    })
-                {
-                    self.active.inspection.invalidate();
-                    return;
-                }
-                if !self.write_slot_available() {
-                    self.active.inspection.message =
-                        Some("Wait for another writer to finish.".into());
-                    return;
-                }
-                if self
-                    .active
-                    .inspection
-                    .confirm_destination
-                    .as_ref()
-                    .is_some_and(|p| !self.destination_available(p))
-                {
-                    self.active.inspection.message =
-                        Some("This destination is in use by another document or writer.".into());
-                    return;
-                }
-                let state = &mut self.active.inspection;
-                if let (Some(report), Some(path)) =
-                    (&state.report, state.confirm_destination.take())
-                {
-                    match RecoveryJob::start(report, &state.selected, &path) {
-                        Ok(job) => {
-                            state.recovery = Some(job);
-                            self.active.write_destination = Some(path);
-                        }
-                        Err(e) => state.message = Some(e.to_string()),
-                    }
-                }
-            }
+            Some(Command::CreateCopy) => self.create_recovery_copy(),
             None => {}
+        }
+    }
+    /// Publishes the confirmed recovery copy, unless its findings no longer match the
+    /// document, the scanned file or a gzip target's original file.
+    fn create_recovery_copy(&mut self) {
+        let state = &self.active.inspection;
+        if state.snapshot.as_ref().is_some_and(|snap| {
+            self.active
+                .document
+                .as_ref()
+                .is_none_or(|doc| !snap.current(doc))
+        }) || state.compressed_source_changed()
+        {
+            self.active.inspection.invalidate();
+            return;
+        }
+        if !self.write_slot_available() {
+            self.active.inspection.message = Some("Wait for another writer to finish.".into());
+            return;
+        }
+        if self
+            .active
+            .inspection
+            .confirm_destination
+            .as_ref()
+            .is_some_and(|p| !self.destination_available(p))
+        {
+            self.active.inspection.message =
+                Some("This destination is in use by another document or writer.".into());
+            return;
+        }
+        let state = &mut self.active.inspection;
+        if let (Some(report), Some(path)) = (&state.report, state.confirm_destination.take()) {
+            match RecoveryJob::start(report, &state.selected, &path) {
+                Ok(job) => {
+                    state.recovery = Some(job);
+                    self.active.write_destination = Some(path);
+                }
+                Err(e) => state.message = Some(e.to_string()),
+            }
         }
     }
     /// Retries the selected format without discarding unsaved work on failure.
@@ -1164,7 +1203,7 @@ mod tests {
             None,
             "bad quoting".into(),
         );
-        app.active.inspection.start().unwrap();
+        app.active.inspection.start(true).unwrap();
         wait_report(&mut app);
         let report = app.active.inspection.report.as_ref().unwrap();
         assert_eq!(report.status, InspectionStatus::Stopped);
@@ -1687,5 +1726,248 @@ mod tests {
         assert!(app.active.inspection.report.is_none());
         assert!(scratch_entries(scratch.path()).is_empty());
         assert!(app.working_cleanup.take_errors().is_empty());
+    }
+    /// A gzip source of 8 MiB that takes many chunks to decompress.
+    fn large_gzip(dir: &Path) -> PathBuf {
+        let mut block = b"id,name,amount\n".to_vec();
+        while block.len() < (1 << 20) - 64 {
+            block.extend_from_slice(b"1,customer,7.00\n");
+        }
+        let path = dir.join("large.csv.gz");
+        std::fs::write(&path, gzip(&block).repeat(8)).unwrap();
+        path
+    }
+    fn poll_now(app: &mut QuarryApp) {
+        app.active.inspection.last_poll = Instant::now() - POLL_INTERVAL;
+        app.poll_inspections(&egui::Context::default());
+    }
+    fn inspect_target(app: &mut QuarryApp, path: &Path) {
+        app.active.inspection =
+            InspectionUi::failed(path.to_owned(), OpenOptions::default(), None, String::new());
+        app.restart_visible_inspection();
+    }
+    #[test]
+    /// An archive or a truncated gzip header is reported, never scanned as text.
+    fn unusable_compressed_targets_are_reported_instead_of_scanned_as_text() {
+        let (dir, mut app) = app(b"name,id\nAlice,1\n");
+        let scratch = tempfile::tempdir().unwrap();
+        app.working_directory = scratch.path().to_path_buf();
+        let zip = dir.path().join("archive.csv");
+        std::fs::write(&zip, b"PK\x03\x04name,id\nAlice,1\n").unwrap();
+        let truncated = dir.path().join("short.csv.gz");
+        std::fs::write(&truncated, [0x1f, 0x8b]).unwrap();
+        for (path, problem) in [(zip, "ZIP"), (truncated, "truncated")] {
+            app.active.inspection =
+                InspectionUi::failed(path.clone(), OpenOptions::default(), None, String::new());
+            let state = &app.active.inspection;
+            assert!(state.preview.is_none(), "compressed bytes shown as text");
+            assert!(
+                state
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains(problem)),
+                "{:?}",
+                state.message
+            );
+            app.restart_visible_inspection();
+            let state = &app.active.inspection;
+            assert!(state.job.is_none() && state.decompression.is_none());
+            assert!(state.report.is_none() && state.preview.is_none());
+            assert!(
+                state
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains(problem)),
+                "{:?}",
+                state.message
+            );
+        }
+        assert!(scratch_entries(scratch.path()).is_empty());
+    }
+    #[test]
+    /// Changing a gzip target's original file invalidates findings read from its copy.
+    fn a_changed_gzip_source_invalidates_findings_and_refuses_recovery() {
+        let (dir, mut app) = app(b"name,id\nAlice,1\n");
+        let scratch = tempfile::tempdir().unwrap();
+        app.working_directory = scratch.path().to_path_buf();
+        let path = dir.path().join("bad.csv.gz");
+        std::fs::write(&path, gzip(b"id,name\n1,good\n2,\"bad\"x\n")).unwrap();
+        inspect_target(&mut app, &path);
+        wait_idle(&mut app);
+        assert!(
+            app.active
+                .inspection
+                .report
+                .as_ref()
+                .is_some_and(InspectionReport::is_current)
+        );
+
+        // Recovery checks the original file again before it starts.
+        std::fs::write(&path, gzip(b"id,name\n1,changed\n2,\"bad\"x\n3,more\n")).unwrap();
+        let recovered = dir.path().join("recovered.csv");
+        app.active.inspection.selected.insert(0);
+        app.active.inspection.confirm_destination = Some(recovered.clone());
+        app.create_recovery_copy();
+        let state = &app.active.inspection;
+        assert!(state.recovery.is_none() && state.stale && state.selected.is_empty());
+        assert_eq!(state.message.as_deref(), Some(STALE_FINDINGS));
+        assert!(!recovered.exists());
+
+        // Inspecting again decompresses the new source; polling then notices a change.
+        app.restart_visible_inspection();
+        assert!(app.active.inspection.decompressing());
+        wait_idle(&mut app);
+        assert!(!app.active.inspection.stale);
+        assert!(app.active.inspection.report.is_some());
+        app.active.inspection.selected.insert(0);
+        std::fs::write(&path, gzip(b"id,name\n1,again\n")).unwrap();
+        poll_now(&mut app);
+        let state = &app.active.inspection;
+        assert!(state.stale && state.selected.is_empty());
+        assert_eq!(state.message.as_deref(), Some(STALE_FINDINGS));
+        app.active.inspection = InspectionUi::default();
+        assert!(scratch_entries(scratch.path()).is_empty());
+        assert!(app.working_cleanup.take_errors().is_empty());
+    }
+    #[test]
+    /// A raw copy is discarded, and no scan starts, after Cancel or Close.
+    fn cancel_or_close_discards_a_raw_copy_before_any_scan_starts() {
+        use quarry_core::compressed_test_pause::{Checkpoint, Pause};
+        let (dir, mut app) = app(b"name,id\nAlice,1\n");
+        let scratch = tempfile::tempdir().unwrap();
+        app.working_directory = scratch.path().to_path_buf();
+        let path = large_gzip(dir.path());
+
+        // Cancelled while the worker is held partway through the copy.
+        let pause = Pause::new(&path, Checkpoint::Published { min_bytes: 1 });
+        inspect_target(&mut app, &path);
+        assert!(pause.wait_for(1), "decompression did not start");
+        app.active.inspection.cancel();
+        drop(pause);
+        wait_idle(&mut app);
+        let state = &app.active.inspection;
+        assert_eq!(state.message.as_deref(), Some(DECOMPRESSION_CANCELLED));
+        assert!(state.job.is_none() && state.report.is_none() && state.private_copy.is_none());
+        assert!(scratch_entries(scratch.path()).is_empty());
+
+        // The copy is complete, but Cancel or Close comes before a poll adopts it.
+        for close in [false, true] {
+            let pause = Pause::new(&path, Checkpoint::BeforeSourceCheck);
+            inspect_target(&mut app, &path);
+            assert!(pause.wait_for(1), "the copy was not completed");
+            pause.release();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !app
+                .active
+                .inspection
+                .decompression
+                .as_ref()
+                .is_some_and(|raw| raw.job.progress().done)
+            {
+                assert!(Instant::now() < deadline, "decompression did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            app.active.inspection.cancel();
+            if close {
+                app.active.inspection.open = false;
+            }
+            poll_now(&mut app);
+            let state = &app.active.inspection;
+            assert!(!state.busy(), "a scan started after Cancel or Close");
+            assert!(state.report.is_none() && state.private_copy.is_none());
+            assert_eq!(state.message.as_deref(), Some(DECOMPRESSION_CANCELLED));
+            assert!(scratch_entries(scratch.path()).is_empty());
+        }
+        assert!(app.working_cleanup.take_errors().is_empty());
+    }
+    #[test]
+    /// Only a gzip target that must be decompressed waits for a file-operation slot.
+    fn only_a_new_raw_decompression_needs_a_write_slot() {
+        let (dir, mut app) = app(b"name,id\nAlice,1\n");
+        let scratch = tempfile::tempdir().unwrap();
+        app.working_directory = scratch.path().to_path_buf();
+        let gz = dir.path().join("bad.csv.gz");
+        std::fs::write(&gz, gzip(b"id,name\n1,good\n2,\"bad\"x\n")).unwrap();
+        inspect_target(&mut app, &gz);
+        wait_idle(&mut app);
+        let copy = app.active.inspection.report.as_ref().unwrap().path.clone();
+
+        let held = [
+            app.decompression_slots.claim(),
+            app.decompression_slots.claim(),
+        ];
+        assert!(!app.write_slot_available());
+        // The unchanged private copy is scanned again without a slot.
+        app.restart_visible_inspection();
+        assert!(app.active.inspection.job.is_some());
+        assert!(!app.active.inspection.decompressing());
+        wait_idle(&mut app);
+        assert_eq!(app.active.inspection.report.as_ref().unwrap().path, copy);
+
+        // A plain target is scanned without a slot.
+        let plain = dir.path().join("plain.csv");
+        std::fs::write(&plain, b"a,b\nx,\"bad\n").unwrap();
+        inspect_target(&mut app, &plain);
+        assert!(app.active.inspection.job.is_some());
+        wait_idle(&mut app);
+        assert!(app.active.inspection.report.is_some());
+        assert!(scratch_entries(scratch.path()).is_empty());
+
+        // A target that is gzip when inspection starts needs a slot, even though it
+        // held plain text when it was chosen.
+        let swapped = dir.path().join("swapped.csv");
+        std::fs::write(&swapped, b"a,b\n1,2\n").unwrap();
+        app.active.inspection =
+            InspectionUi::failed(swapped.clone(), OpenOptions::default(), None, String::new());
+        assert!(app.active.inspection.preview.is_some());
+        std::fs::write(&swapped, gzip(b"a,b\n1,\"bad\"x\n")).unwrap();
+        app.restart_visible_inspection();
+        let state = &app.active.inspection;
+        assert!(state.job.is_none() && state.decompression.is_none());
+        assert_eq!(state.message.as_deref(), Some(WRITE_SLOT_BUSY));
+        assert_eq!(app.decompression_slots.active(), 2);
+        assert!(scratch_entries(scratch.path()).is_empty());
+
+        drop(held);
+        app.restart_visible_inspection();
+        assert!(app.active.inspection.decompressing());
+        wait_idle(&mut app);
+        assert!(app.active.inspection.report.is_some());
+        app.active.inspection = InspectionUi::default();
+        assert!(scratch_entries(scratch.path()).is_empty());
+    }
+    #[test]
+    /// A writer and a raw gzip inspection on one tab hold both file-operation slots.
+    fn a_writer_and_a_raw_inspection_on_one_tab_use_both_slots() {
+        use quarry_core::compressed_test_pause::{Checkpoint, Pause};
+        let (dir, mut app) = app(b"name,id\nAlice,1\n");
+        let scratch = tempfile::tempdir().unwrap();
+        app.working_directory = scratch.path().to_path_buf();
+        // An edited plain document's Save As holds a writer on this tab.
+        let document = app.active.document.as_mut().unwrap();
+        Arc::make_mut(&mut document.cell_edits).insert((1, 1), Arc::new(b"2".to_vec()));
+        document
+            .start_save_as(dir.path().join("copy.csv"))
+            .map_err(|error| error.text)
+            .unwrap();
+        assert!(app.write_slot_available());
+
+        let path = large_gzip(dir.path());
+        let pause = Pause::new(&path, Checkpoint::Published { min_bytes: 1 });
+        inspect_target(&mut app, &path);
+        assert!(pause.wait_for(1), "decompression did not start");
+        assert!(app.active.inspection.decompressing());
+        assert!(!app.write_slot_available());
+        let other = dir.path().join("other.csv.gz");
+        std::fs::write(&other, gzip(b"a,b\n1,2\n")).unwrap();
+        assert_eq!(
+            app.open_path(other).unwrap_err(),
+            compressed::WRITE_SLOTS_FULL
+        );
+
+        app.active.inspection.cancel();
+        drop(pause);
+        wait_idle(&mut app);
+        assert!(scratch_entries(scratch.path()).is_empty());
     }
 }

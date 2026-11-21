@@ -223,9 +223,12 @@ pub fn check_combine_files_with_encoding(
             if !file.metadata()?.is_file() {
                 return Err(input_error(&path, None, "Select a regular file."));
             }
-            // Classify the handle that is read below, not a second open of the path.
+            // Classify the handle that is read below, not a second open of the path,
+            // under the name the user chose: a link named `.gz` to plain text is
+            // rejected here as it is everywhere else.
             if let Some(problem) =
-                crate::compressed::compressed_file_problem(&mut file, &canonical, "Combine Files")
+                crate::compressed::compressed_file_problem(&mut file, &path, "Combine Files")
+                    .map_err(|error| input_error(&path, None, error))?
             {
                 return Err(input_error(&path, None, problem));
             }

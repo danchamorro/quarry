@@ -74,13 +74,22 @@ disk space equal to the decompressed size, which the bounds below control.
   the reserve alone. The compressed size is not used: a file with many empty
   gzip members can be larger than its output. While writing, the reserve plus
   the next chunk must be free before the first write and again every
-  `space_check_interval_bytes` (64 MiB by default), so even a short copy keeps
-  the reserve. A failed check stops with `InsufficientStorage`.
+  `space_check_interval_bytes` (64 MiB by default), and whenever the next
+  chunk is larger than the headroom above the reserve that the last check
+  found, so a write never reaches into the reserve. A failed check stops with
+  `InsufficientStorage`.
 - The job checks for cancellation on every chunk. The gzip reader shares the
   job's cancellation flag and also checks it before each inflate step, at each
   member boundary, and every 4 KiB of a long header field.
 - When a stream fills the bootstrap limit exactly, the bootstrap reads one
   more byte, which it never keeps, to learn whether the stream ended there.
+- The bootstrap runs on the caller's thread without a cancellation flag, so
+  it also has a compressed-input budget: it reads at most 16 MiB of compressed
+  data beyond the decompressed bytes it has produced. Real data never comes
+  near it; a long run of empty gzip members does. When the budget runs out,
+  the bootstrap shows the complete records it already has, leaves the exact
+  size unknown, and lets the cancellable job read and verify the rest. With no
+  complete record yet, it fails with `CompressedFile`.
 
 ### Strict integrity
 
