@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 memchr.workspace = true
 quarry-delimited = { path = "../quarry-delimited" }
 tempfile = "3.27.0"

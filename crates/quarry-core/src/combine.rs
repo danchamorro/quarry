@@ -223,6 +223,15 @@ pub fn check_combine_files_with_encoding(
             if !file.metadata()?.is_file() {
                 return Err(input_error(&path, None, "Select a regular file."));
             }
+            // Classify the handle that is read below, not a second open of the path,
+            // under the name the user chose: a link named `.gz` to plain text is
+            // rejected here as it is everywhere else.
+            if let Some(problem) =
+                crate::compressed::compressed_file_problem(&mut file, &path, "Combine Files")
+                    .map_err(|error| input_error(&path, None, error))?
+            {
+                return Err(input_error(&path, None, problem));
+            }
             let stamp = SourceStamp::from_file(&file)?;
             let encoding = Encoding::detect(&mut file, requested_encoding)
                 .map_err(|error| input_error(&path, None, error))?;
@@ -240,7 +249,7 @@ pub fn check_combine_files_with_encoding(
             } else {
                 detect_file_delimiter(
                     &mut file,
-                    stamp.file_size(),
+                    Some(stamp.file_size()),
                     DEFAULT_SAMPLE_BYTES,
                     DEFAULT_MAX_RECORD_BYTES,
                     encoding,
@@ -392,6 +401,7 @@ impl CombinePlan {
         self,
         destination: PathBuf,
     ) -> Result<CombineJob<CombineSummary>, QuarryError> {
+        crate::compressed::reject_compressed_destination(&destination)?;
         if self
             .inputs
             .iter()

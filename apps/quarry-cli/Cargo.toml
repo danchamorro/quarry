@@ -17,3 +17,6 @@ path = "src/main.rs"
 [[bin]]
 name = "quarry-bench"
 path = "src/bin/quarry-bench.rs"
+
+[dev-dependencies]
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }

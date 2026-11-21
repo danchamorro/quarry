@@ -2,6 +2,7 @@ mod case;
 mod cleanup;
 mod column_discovery;
 mod combine;
+mod compressed;
 mod date_time_sort;
 mod destination;
 mod encoding;
@@ -37,6 +38,15 @@ pub use column_discovery::ColumnDiscoveryJob;
 pub use combine::{
     CombineInput, CombineJob, CombineOptions, CombinePlan, CombineProgress, CombineSummary,
     check_combine_files, check_combine_files_with_encoding,
+};
+/// Debug-build checkpoints for tests of decompression workers; absent in release builds.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use compressed::test_pause as compressed_test_pause;
+pub use compressed::{
+    CompressedBootstrap, CompressedDecompressJob, CompressedOpenConfig, CompressedOpenOutcome,
+    CompressedProgress, CompressedRawDecompressJob, CompressedSourceGuard, CompressionFormat,
+    DecompressedCopy, detect_compression, is_compressed_destination, reject_compressed_destination,
 };
 pub use date_time_sort::DateTimeFormat;
 pub use encoding::Encoding;
@@ -219,6 +229,18 @@ pub enum QuarryError {
     ExportDestinationExists,
     SourceChanged,
     WorkerPanicked,
+    /// A compressed input that Quarry cannot read: unsupported, corrupt or truncated.
+    CompressedFile {
+        path: PathBuf,
+        reason: String,
+    },
+    DecompressionLimitExceeded {
+        path: PathBuf,
+        limit_bytes: u64,
+        decompressed_bytes: u64,
+    },
+    /// Compressed documents are read-only; write an uncompressed copy instead.
+    CompressedReadOnly,
 }
 
 impl fmt::Display for QuarryError {
@@ -338,6 +360,20 @@ impl fmt::Display for QuarryError {
             Self::ExportDestinationExists => write!(f, "export destination already exists"),
             Self::SourceChanged => write!(f, "source file changed since it was opened"),
             Self::WorkerPanicked => write!(f, "background worker panicked"),
+            Self::CompressedFile { path, reason } => write!(f, "{}: {reason}", path.display()),
+            Self::DecompressionLimitExceeded {
+                path,
+                limit_bytes,
+                decompressed_bytes,
+            } => write!(
+                f,
+                "{}: decompressed data exceeds the {limit_bytes}-byte limit ({decompressed_bytes} bytes reached). No partial copy was kept; raise the limit or use a smaller file.",
+                path.display()
+            ),
+            Self::CompressedReadOnly => write!(
+                f,
+                "Compressed files open read-only. Use Save Copy As to write an uncompressed copy; the compressed file is unchanged."
+            ),
         }
     }
 }
@@ -420,6 +456,8 @@ pub struct Session {
     source_stamp: SourceStamp,
     encoding: Encoding,
     completed_record_count: Arc<Mutex<Option<CompletedRecordCount>>>,
+    /// Present when this document reads a private copy of a compressed source.
+    compressed: Option<Arc<compressed::CompressedBacking>>,
     pub file_size: u64,
     pub dialect: Dialect,
     pub first_rows: Vec<Row>,
@@ -440,26 +478,44 @@ impl Session {
     }
 
     /// Open using an explicit encoding, or detect only Unicode BOMs when None.
+    /// Compressed sources are rejected; open them with `CompressedBootstrap`.
     pub fn open_with_encoding(
         path: impl AsRef<Path>,
         options: OpenOptions,
         requested_encoding: Option<Encoding>,
     ) -> Result<Self, QuarryError> {
-        if options.rows == 0 || options.sample_bytes == 0 || options.bootstrap_limit == 0 {
-            return Err(QuarryError::InvalidOption(
-                "rows, sample bytes, and bootstrap limit must be non-zero",
-            ));
-        }
-        if options.sample_bytes > options.bootstrap_limit {
-            return Err(QuarryError::InvalidOption(
-                "sample bytes cannot exceed bootstrap limit",
-            ));
-        }
+        Self::open_checked(path.as_ref(), options, requested_encoding, true)
+    }
+
+    /// Open a private decompressed copy, which is plain text by construction.
+    pub(crate) fn open_uncompressed(
+        path: &Path,
+        options: OpenOptions,
+        requested_encoding: Option<Encoding>,
+    ) -> Result<Self, QuarryError> {
+        Self::open_checked(path, options, requested_encoding, false)
+    }
+
+    fn open_checked(
+        path: &Path,
+        options: OpenOptions,
+        requested_encoding: Option<Encoding>,
+        reject_compressed: bool,
+    ) -> Result<Self, QuarryError> {
+        validate_open_options(&options)?;
 
         let started = Instant::now();
         let open_started = Instant::now();
-        let mut file = File::open(path.as_ref())?;
+        let mut file = File::open(path)?;
         let file_open = open_started.elapsed();
+        if reject_compressed && let Some(format) = compressed::compression_of(&mut file, path)? {
+            return Err(QuarryError::CompressedFile {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "This file is {format}-compressed. Open it as a compressed file so Quarry can decompress it safely."
+                ),
+            });
+        }
         let source_stamp = SourceStamp::from_file(&file)?;
         let file_size = source_stamp.file_size();
         let encoding = Encoding::detect(&mut file, requested_encoding)?;
@@ -476,7 +532,7 @@ impl Session {
             }
             None => detect_file_delimiter(
                 &mut file,
-                file_size,
+                Some(file_size),
                 options.sample_bytes,
                 options.bootstrap_limit,
                 encoding,
@@ -486,7 +542,7 @@ impl Session {
         file.seek(SeekFrom::Start(0))?;
         let (bootstrap, ends) = read_initial_records(
             &mut file,
-            file_size,
+            Some(file_size),
             delimiter,
             options.rows,
             options.bootstrap_limit,
@@ -505,10 +561,11 @@ impl Session {
         };
 
         Ok(Self {
-            path: path.as_ref().to_path_buf(),
+            path: path.to_path_buf(),
             source_stamp,
             encoding,
             completed_record_count: Arc::new(Mutex::new(None)),
+            compressed: None,
             file_size,
             dialect: Dialect {
                 delimiter,
@@ -561,13 +618,29 @@ impl Session {
             count,
             DEFAULT_MAX_RECORD_BYTES,
             self.encoding,
+            u64::MAX,
         )
     }
 }
 
+fn validate_open_options(options: &OpenOptions) -> Result<(), QuarryError> {
+    if options.rows == 0 || options.sample_bytes == 0 || options.bootstrap_limit == 0 {
+        return Err(QuarryError::InvalidOption(
+            "rows, sample bytes, and bootstrap limit must be non-zero",
+        ));
+    }
+    if options.sample_bytes > options.bootstrap_limit {
+        return Err(QuarryError::InvalidOption(
+            "sample bytes cannot exceed bootstrap limit",
+        ));
+    }
+    Ok(())
+}
+
+/// `file_size` is None for a stream whose end is known only when a read returns zero.
 fn read_initial_records(
     file: &mut (impl Read + Seek),
-    file_size: u64,
+    file_size: Option<u64>,
     delimiter: u8,
     wanted: usize,
     limit: usize,
@@ -578,6 +651,7 @@ fn read_initial_records(
     let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK.min(limit))];
     let mut ends = Vec::with_capacity(wanted);
 
+    let mut stream_ended = false;
     while ends.len() < wanted && bytes.len() < limit {
         let mut allowed = (limit - bytes.len()).min(chunk.len());
         if encoding.is_utf16() {
@@ -588,6 +662,7 @@ fn read_initial_records(
         }
         let read = encoding.read_chunk(file, &mut chunk[..allowed])?;
         if read == 0 {
+            stream_ended = true;
             break;
         }
         let absolute_start = bytes.len() as u64;
@@ -599,9 +674,17 @@ fn read_initial_records(
         })?;
     }
 
-    let reached_eof = bytes.len() as u64 == file_size;
+    // A stream that fills the limit may still end exactly there; one probe byte
+    // (never kept) tells it apart from a longer stream.
+    if file_size.is_none() && !stream_ended && ends.len() < wanted {
+        stream_ended = stream_ends_here(file)?;
+    }
+    let reached_eof = match file_size {
+        Some(file_size) => bytes.len() as u64 == file_size,
+        None => stream_ended,
+    };
     if reached_eof && ends.len() < wanted {
-        scanner.finish(file_size, |end| ends.push(end))?;
+        scanner.finish(bytes.len() as u64, |end| ends.push(end))?;
     }
     if !reached_eof && ends.len() < wanted {
         return Err(QuarryError::BootstrapLimitExceeded {
@@ -636,9 +719,10 @@ fn materialize_rows(
     Ok(rows)
 }
 
+/// `file_size` is None for a stream; a short sample then marks its end.
 fn detect_file_delimiter(
     file: &mut (impl Read + Seek),
-    file_size: u64,
+    file_size: Option<u64>,
     sample_bytes: usize,
     limit: usize,
     encoding: Encoding,
@@ -652,15 +736,15 @@ fn detect_file_delimiter(
         file.by_ref()
             .take((target - sample.len()) as u64)
             .read_to_end(&mut sample)?;
-        let at_eof = sample.len() as u64 == file_size;
+        let at_eof = match file_size {
+            Some(file_size) => sample.len() as u64 == file_size,
+            None => sample.len() < target,
+        };
         if let Some(delimiter) = detect_delimiter(&sample, at_eof, encoding) {
             return Ok(delimiter);
         }
         if sample.len() >= limit {
-            return Err(QuarryError::BootstrapLimitExceeded {
-                limit,
-                rows_found: 0,
-            });
+            return delimiter_at_limit(file, file_size, at_eof, &sample, limit, encoding);
         }
         if sample.len() < target {
             return Err(QuarryError::SourceChanged);
@@ -670,10 +754,43 @@ fn detect_file_delimiter(
         let next = target.saturating_mul(2).min(limit);
         target = if encoding.is_utf16() { next & !1 } else { next };
         if target <= sample.len() {
-            return Err(QuarryError::BootstrapLimitExceeded {
-                limit,
-                rows_found: 0,
-            });
+            return delimiter_at_limit(file, file_size, at_eof, &sample, limit, encoding);
+        }
+    }
+}
+
+/// A stream sample that filled the bootstrap limit may still be the whole stream:
+/// probe one byte past it and, at the end, detect from the complete sample.
+fn delimiter_at_limit(
+    file: &mut impl Read,
+    file_size: Option<u64>,
+    at_eof: bool,
+    sample: &[u8],
+    limit: usize,
+    encoding: Encoding,
+) -> Result<u8, QuarryError> {
+    if file_size.is_none()
+        && !at_eof
+        && stream_ends_here(file)?
+        && let Some(delimiter) = detect_delimiter(sample, true, encoding)
+    {
+        return Ok(delimiter);
+    }
+    Err(QuarryError::BootstrapLimitExceeded {
+        limit,
+        rows_found: 0,
+    })
+}
+
+/// Read one byte past a bounded prefix to learn whether a stream ends there.
+/// The byte is discarded; callers either stop or seek back.
+fn stream_ends_here(file: &mut impl Read) -> io::Result<bool> {
+    let mut probe = [0_u8; 1];
+    loop {
+        match file.read(&mut probe) {
+            Ok(read) => return Ok(read == 0),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
 }
@@ -810,6 +927,7 @@ fn cell_kind(value: &[u8]) -> CellKind {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_rows_from_index(
     path: &Path,
     delimiter: u8,
@@ -818,6 +936,9 @@ fn read_rows_from_index(
     count: usize,
     max_record_bytes: usize,
     encoding: Encoding,
+    // Bytes at or past this offset are never read, as when a live index has not
+    // reached them yet.
+    end: u64,
 ) -> Result<Vec<Row>, QuarryError> {
     if count == 0 {
         return Ok(Vec::new());
@@ -842,7 +963,17 @@ fn read_rows_from_index(
     let mut rows = Vec::with_capacity(count);
 
     while row_number < target_end {
-        let read = encoding.read_chunk(&mut file, &mut chunk)?;
+        // Bound the read itself, so bytes past `end` (such as half of a UTF-16
+        // code unit still being written) are never read.
+        let remaining = end.saturating_sub(absolute_start);
+        let read = if remaining == 0 {
+            0
+        } else {
+            let limit = chunk
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            encoding.read_chunk(&mut file, &mut chunk[..limit])?
+        };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
                 let fields = parse_encoded_record(&record, delimiter, row_number, encoding)?
@@ -909,7 +1040,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{HeaderMode, IndexConfig, OpenOptions, QuarryError, Session};
+    use super::{Encoding, HeaderMode, IndexConfig, OpenOptions, QuarryError, Session};
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -919,6 +1050,48 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         file.write_all(bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn live_utf16_reads_never_read_past_the_snapshot_boundary() {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "id,name\n1,a\n2,b\n".encode_utf16() {
+            bytes.extend(unit.to_le_bytes());
+        }
+        let path = fixture(&bytes);
+        let session =
+            Session::open_with_encoding(&path, OpenOptions::default(), Some(Encoding::Utf16Le))
+                .unwrap();
+        let index = session
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        // A writer has written half of the next code unit past the snapshot.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"3")
+            .unwrap();
+        let rows = super::read_rows_from_index(
+            &path,
+            b',',
+            &index,
+            0,
+            10,
+            super::DEFAULT_MAX_RECORD_BYTES,
+            Encoding::Utf16Le,
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let fields: Vec<_> = rows.into_iter().map(|row| row.fields).collect();
+        assert_eq!(
+            fields,
+            [["id", "name"], ["1", "a"], ["2", "b"]]
+                .map(|row| row.map(|field| field.as_bytes().to_vec()).to_vec())
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -64,6 +64,7 @@ acceptance or discovery criteria. Propose a feature through
 |---|---|
 | Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
 | Document tabs | Up to eight independent files; retain edits, selection, view, filters and background progress; safe per-tab close and session quit; two concurrent file operations |
+| [Compressed files](docs/USER_GUIDE.md#open-compressed-files) | Open gzip (`.gz`) files read-only: first rows at once, then one private decompression and indexing pass; search, filter, export, and inspect; Save As writes an uncompressed, editable copy; corrupt, truncated, and unsupported formats are refused |
 | Combine files | Combine two or more matching saved files in a chosen order; validate every record; keep one header and all data rows; save to a new file with progress and cancellation |
 | [Join files](docs/USER_GUIDE.md#join-files) | Match one to sixteen key pairs across two saved or current documents; choose retained rows and output columns; review duplicates and exact counts; create a separate UTF-8 file |
 | Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
@@ -222,6 +223,7 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)
 - [Matching-file combination and 20 GB write cancellation in VMPal](docs/benchmarks/2026-10-10-combine-files.md)
 - [Complete file joining, 18 GiB inputs, skewed keys and native workflows](docs/benchmarks/2026-10-19-join-acceptance.md)
+- [Gzip-compressed files: 18 GiB larger than RAM, cancellation, size limit and corrupt input](docs/benchmarks/2026-11-20-compressed-files.md)
 - [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
 
 </details>

@@ -209,6 +209,7 @@ impl DocumentTab {
         self.inspection.busy()
             || self.document.as_ref().is_some_and(|document| {
                 document.job.is_some()
+                    || document.decompressing()
                     || document.search_job.is_some()
                     || document.filter_job.is_some()
                     || document.filter_rows_loading()
@@ -218,8 +219,21 @@ impl DocumentTab {
             })
     }
 
+    /// File operations this tab counts against the global job limit itself: a
+    /// writer, and a compressed document whose pass has not claimed its slot yet.
+    /// Running decompressions, the document's and the inspection's, count through
+    /// their worker slots instead, so a writer beside one is still counted.
+    fn unslotted_operations(&self) -> usize {
+        usize::from(self.writing())
+            + usize::from(
+                self.document
+                    .as_ref()
+                    .is_some_and(Document::awaiting_decompression),
+            )
+    }
+
     /// Counts file operations and structural analysis against the global job limit.
-    fn writing(&self) -> bool {
+    pub(super) fn writing(&self) -> bool {
         self.inspection.recovering()
             || self.document.as_ref().is_some_and(|document| {
                 document.save_job.is_some()
@@ -554,10 +568,16 @@ impl QuarryApp {
                 "Quarry supports eight open tabs. Close a tab before opening another file.",
             ));
         }
-        let mut document = match Document::prepare_with_encoding(&path, options, encoding) {
+        let mut document = match Document::prepare_checked(&path, options, encoding) {
             Ok(d) => d,
-            Err(message) => {
-                if !self.active.inspection.busy() {
+            Err(failure) => {
+                let message = failure.message;
+                // Raw inspection would read compressed bytes as text. Only text problems
+                // inside valid gzip are inspected, through a raw private copy; damaged or
+                // unsupported compressed files are reported as they are.
+                let inspectable = failure.inspectable
+                    && (!compressed::compressed_source(&path) || compressed::is_gzip(&path));
+                if !self.active.inspection.busy() && inspectable {
                     self.active.inspection = inspection_ui::InspectionUi::failed(
                         path.clone(),
                         options,
@@ -565,13 +585,22 @@ impl QuarryApp {
                         message.clone(),
                     );
                 }
-                return Err(AppMessage::file_open_error(
-                    path, options, encoding, message,
-                ));
+                return Err(if inspectable {
+                    AppMessage::file_open_error(path, options, encoding, message)
+                } else {
+                    AppMessage::error(message)
+                });
             }
         };
+        // Admit decompression from the prepared document, immediately before its pass
+        // starts, so a file replaced after an earlier check cannot bypass the limit.
+        // Plain files need no slot and open even when both are in use.
+        if document.awaiting_decompression() && !self.write_slot_available() {
+            return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
+        }
         document.working_directory = self.working_directory.clone();
         document.working_cleanup = self.working_cleanup.clone();
+        document.decompression_slots = self.decompression_slots.clone();
         document.start_indexing().map_err(AppMessage::error)?;
         if let Some(current) = self.active.document.as_mut() {
             current.commit_edits();
@@ -613,19 +642,29 @@ impl QuarryApp {
 
     /// Applies the shared two-operation limit to document tabs and Combine Files.
     pub(super) fn write_slot_available(&self) -> bool {
-        !self.quitting_cleanup()
-            && self.document_tabs().filter(|tab| tab.writing()).count()
-                + usize::from(
-                    self.combine_files
-                        .as_ref()
-                        .is_some_and(combine_files::CombineDialog::busy),
-                )
-                + usize::from(
-                    self.join_files
-                        .as_ref()
-                        .is_some_and(join_files::JoinDialog::running_operation),
-                )
-                < MAX_WRITE_JOBS
+        self.write_slot_available_releasing(0)
+    }
+
+    /// Like `write_slot_available`, as if `released` running decompressions had
+    /// already stopped. Running decompressions count through their worker slots,
+    /// which a closed tab keeps until its cleanup has stopped the worker.
+    pub(super) fn write_slot_available_releasing(&self, released: usize) -> bool {
+        let in_use = self
+            .document_tabs()
+            .map(DocumentTab::unslotted_operations)
+            .sum::<usize>()
+            + self.decompression_slots.active()
+            + usize::from(
+                self.combine_files
+                    .as_ref()
+                    .is_some_and(combine_files::CombineDialog::busy),
+            )
+            + usize::from(
+                self.join_files
+                    .as_ref()
+                    .is_some_and(join_files::JoinDialog::running_operation),
+            );
+        !self.quitting_cleanup() && in_use.saturating_sub(released) < MAX_WRITE_JOBS
     }
 
     /// Polls jobs against their owning tab, surfaces failed reloads, and advances closes.
@@ -844,10 +883,13 @@ impl QuarryApp {
                     document.logical_path.clone(),
                     false,
                 ));
-                reservations.push(CleanupReservation::new(
-                    document.session.path().to_owned(),
-                    false,
-                ));
+                // A compressed preview has no readable file to reserve.
+                if !document.session.path().as_os_str().is_empty() {
+                    reservations.push(CleanupReservation::new(
+                        document.session.path().to_owned(),
+                        false,
+                    ));
+                }
                 if let Some(state) = &document.working_copy {
                     for storage in
                         std::iter::once(&state.directory).chain(state.previous_directories.iter())

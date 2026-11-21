@@ -11,7 +11,9 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 use crate::export::{ExportTarget, source_matches_stamp};
-use crate::{Encoding, HeaderMode, QuarryError, RecordScanner, Row, SourceStamp};
+use crate::{
+    CompressedSourceGuard, Encoding, HeaderMode, QuarryError, RecordScanner, Row, SourceStamp,
+};
 use quarry_delimited::ParseErrorKind;
 
 const FINDING_LIMIT: usize = 1000;
@@ -92,9 +94,9 @@ impl Diagnostic {
                 d.byte_offset = Some(*offset);
             }
             QuarryError::Encoding(_) => d.kind = DiagnosticKind::Encoding,
-            QuarryError::RecordTooLarge { .. } | QuarryError::BootstrapLimitExceeded { .. } => {
-                d.kind = DiagnosticKind::Limit
-            }
+            QuarryError::RecordTooLarge { .. }
+            | QuarryError::BootstrapLimitExceeded { .. }
+            | QuarryError::DecompressionLimitExceeded { .. } => d.kind = DiagnosticKind::Limit,
             QuarryError::Parse(_) => d.kind = DiagnosticKind::Structure,
             _ => {}
         }
@@ -494,7 +496,7 @@ fn scan(
         // with comma selected; the report explicitly carries that format.
         report.delimiter = crate::detect_file_delimiter(
             file,
-            total,
+            Some(total),
             crate::DEFAULT_SAMPLE_BYTES,
             crate::DEFAULT_BOOTSTRAP_LIMIT,
             encoding,
@@ -1240,12 +1242,34 @@ impl RecoveryJob {
         selection: &BTreeSet<usize>,
         destination: impl AsRef<Path>,
     ) -> Result<Self, QuarryError> {
+        Self::start_guarded(report, selection, destination.as_ref(), None)
+    }
+    /// Like [`start`](Self::start) for a report read from a private copy of a
+    /// compressed file: the copy is published only while that file is unchanged.
+    pub fn start_with_source_guard(
+        report: &InspectionReport,
+        selection: &BTreeSet<usize>,
+        destination: impl AsRef<Path>,
+        source: CompressedSourceGuard,
+    ) -> Result<Self, QuarryError> {
+        Self::start_guarded(report, selection, destination.as_ref(), Some(source))
+    }
+    fn start_guarded(
+        report: &InspectionReport,
+        selection: &BTreeSet<usize>,
+        destination: &Path,
+        compressed_source: Option<CompressedSourceGuard>,
+    ) -> Result<Self, QuarryError> {
+        crate::compressed::reject_compressed_destination(destination)?;
         let records = report.selected_records(selection)?;
         if !report.is_current() {
             return Err(QuarryError::SourceChanged);
         }
+        if let Some(source) = &compressed_source {
+            source.ensure_unchanged()?;
+        }
         let report = report.clone();
-        let destination = destination.as_ref().to_owned();
+        let destination = destination.to_owned();
         let source = File::open(&report.path)?;
         let edit_bytes = report
             .edits
@@ -1263,12 +1287,15 @@ impl RecoveryJob {
                 .saturating_add(edit_bytes)
                 .saturating_mul(3),
         )?;
-        let output = ExportTarget::new_guarded(
+        let mut output = ExportTarget::new_guarded(
             &report.path,
             destination.clone(),
             &source,
             report.stamp.clone(),
         )?;
+        if let Some(compressed_source) = compressed_source {
+            output.guard_compressed_source(compressed_source);
+        }
         let shared = Arc::new(Progress::new());
         let worker = Arc::clone(&shared);
         worker.total.store(report.total_bytes, Ordering::Release);

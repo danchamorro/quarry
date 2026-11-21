@@ -96,6 +96,41 @@ tracks that conditional investigation.
 ## Progressive open
 Bootstrap by sampling a bounded region and parsing enough rows for the first viewport. Return that viewport immediately. Continue structural indexing in background workers.
 
+## Compressed files
+
+Quarry opens gzip (`.gz`) delimited files read-only; see
+[ADR 0012](adr/0012-compressed-delimited-files.md). Detection uses the gzip
+signature, not the name. Zstandard, bzip2, XZ, ZIP, and tar archives are
+rejected with a message that names the format.
+
+`CompressedBootstrap` decompresses only as far as the first rows need, in
+memory. The app shows those rows at once through an inert preview session that
+names no readable file. `CompressedDecompressJob` then streams the source once
+into an owner-only private copy in the temporary-storage folder and builds the
+structural index in the same pass. Rows already written can be read while the
+pass runs. On completion the document adopts the copy's `Session` and index, so
+no second scan runs, and search, filters, filtered export, Save As, and
+inspection read the copy unchanged.
+
+The pass verifies every gzip member's CRC-32 and length and rejects trailing
+data. It keeps a 256 MiB free-space reserve, checked before the first write and
+every 64 MiB (and up front with the exact size when the bootstrap verified it),
+and honours
+an optional decompressed-size cap (`--max-decompressed-bytes` in the CLI).
+Cancelling, a failure, or closing the document deletes the copy; the CLI also
+cancels on Ctrl-C. In the app, a cancelled or failed open keeps only the
+bootstrap rows as a preview, and an active decompression counts against the
+two-operation limit. A delimiter, header, or encoding change re-reads the
+existing copy while the source is unchanged; Reload from Disk always
+decompresses the source again.
+
+A compressed document has no in-place Save and no editing, structural, sort,
+duplicate, or replace commands. Save As and Save As UTF-8 write an uncompressed
+copy, which then opens as an ordinary document. Quarry never writes gzip, so
+every output name ending in `.gz` is refused. Join Files and Combine Files need
+an uncompressed copy first. The macOS bundle declares gzip archives
+(`org.gnu.gnu-zip-archive`) with the Viewer role.
+
 ## Structural indexing
 Delimited files cannot be indexed correctly by blindly finding newline bytes because quoted fields may contain line breaks. The indexer must track dialect and quote state.
 

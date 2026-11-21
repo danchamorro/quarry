@@ -8,15 +8,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, CompletedIndex, DateTimeFormat, Dialect, DuplicateJob,
-    DuplicateOutcome, DuplicateSpec, Encoding, FilterExportJob, FilterExportOutcome,
+    CaseSensitivity, ColumnTransformation, CompletedIndex, CompressedBootstrap,
+    CompressedDecompressJob, CompressedOpenConfig, CompressedOpenOutcome, CompressedProgress,
+    CompressedRawDecompressJob, CompressionFormat, DateTimeFormat, DecompressedCopy, Dialect,
+    DuplicateJob, DuplicateOutcome, DuplicateSpec, Encoding, FilterExportJob, FilterExportOutcome,
     FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
     FilterProgress, FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress,
     LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome,
     SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition,
     SearchProgress, Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
-    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex, check_storage,
-    estimate_edited_output_bytes, estimate_sort_temporary_bytes, inspect_storage,
+    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex,
+    WorkingCopyCleanup, check_storage, detect_compression, estimate_edited_output_bytes,
+    estimate_sort_temporary_bytes, inspect_storage, is_compressed_destination,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -71,6 +74,7 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
     let mut omitted = BTreeSet::new();
     let mut output = None;
     let mut cancel_after = None;
+    let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
     while cursor < args.len() {
         let arg = &args[cursor];
@@ -81,6 +85,8 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
             | "--encoding"
             | "--omit-findings"
             | "--output"
+            | "--temp-dir"
+            | "--max-decompressed-bytes"
             | "--cancel-after-bytes" => {
                 cursor += 1;
                 let value = args.get(cursor).ok_or("missing option value")?;
@@ -99,6 +105,10 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
                         }
                     }
                     "--cancel-after-bytes" => cancel_after = Some(value.parse::<u64>()?),
+                    "--temp-dir" => compressed.temp_dir = Some(PathBuf::from(value)),
+                    "--max-decompressed-bytes" => {
+                        compressed.max_decompressed_bytes = Some(parse_size(value)?)
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -111,10 +121,22 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
         return Err("recovery needs both --omit-findings and --output".into());
     }
     let path = path.ok_or("inspect requires a file")?;
-    let job = InspectionJob::start(&path, options, InspectionEdits::default())?;
+    if let Some(output) = &output {
+        reject_compressed_output(output)?;
+    }
+    // A compressed source is inspected through a verified private copy that is not
+    // parsed while it is made, so malformed text inside valid gzip is still diagnosed.
+    let compressed_input = match detect_compression(&path)? {
+        Some(_) => Some(decompress_for_inspection(&path, &compressed)?),
+        None => None,
+    };
+    let scan_path = compressed_input
+        .as_ref()
+        .map_or(path.as_path(), |input| input.copy.path());
+    let job = InspectionJob::start(scan_path, options, InspectionEdits::default())?;
     loop {
         let p = job.progress();
-        if cancel_after.is_some_and(|n| p.bytes_scanned >= n) {
+        if cancel_after.is_some_and(|n| p.bytes_scanned >= n) || interrupt::requested() {
             job.cancel();
         }
         if p.done {
@@ -123,6 +145,7 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
         thread::sleep(Duration::from_millis(1));
     }
     let report = job.wait()?;
+    interrupt::check()?;
     println!(
         "File: {}\nEncoding: {}\nDelimiter: {:?}\nHeader: {}\nInspection: {:?}\nCoverage: {} of {} source bytes\nRecords: {}\nFindings: {} ({} shown)",
         path.display(),
@@ -140,6 +163,9 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
         report.total_findings,
         report.findings.len()
     );
+    if let Some(input) = &compressed_input {
+        input.print_summary();
+    }
     for (i, d) in report.findings.iter().enumerate() {
         println!("\nFinding {}\n{}", i + 1, d.details());
         if details {
@@ -148,8 +174,21 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
         }
     }
     if let Some(output) = output {
-        let job = RecoveryJob::start(&report, &omitted, &output)?;
+        // A copy recovered from a compressed input is published only while that
+        // input is unchanged.
+        let job = match &compressed_input {
+            Some(input) => RecoveryJob::start_with_source_guard(
+                &report,
+                &omitted,
+                &output,
+                input.copy.source_guard(),
+            )?,
+            None => RecoveryJob::start(&report, &omitted, &output)?,
+        };
         while !job.progress().done {
+            if interrupt::requested() {
+                job.cancel();
+            }
             thread::sleep(Duration::from_millis(1));
         }
         match job.wait()? {
@@ -159,7 +198,10 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
                 s.removed_records,
                 s.retained_records
             ),
-            None => return Err("recovery cancelled; no output published".into()),
+            None => {
+                interrupt::check()?;
+                return Err("recovery cancelled; no output published".into());
+            }
         }
         return Ok(());
     }
@@ -178,23 +220,26 @@ fn print_help() {
         "Quarry\n\n\
          Usage:\n  \
            quarry inspect <FILE> [--delimiter ,] [--header auto|first-row|none] [--details] \
-         [--omit-findings 1,2 --output FILE] [--cancel-after-bytes N]\n  \
+         [--omit-findings 1,2 --output FILE] [--cancel-after-bytes N] \
+         [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry open <FILE> [--rows 100] [--delimiter ,] [--jump ROW] \
-         [--jump-count 5] [--cache-state unknown|cold|warm] [--metrics-only] [--no-wait]\n  \
+         [--jump-count 5] [--cache-state unknown|cold|warm] [--metrics-only] [--no-wait] \
+         [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry viewport <FILE> [--iterations 500] [--rows 100] \
          [--seed 1] [--cache-state unknown|cold|warm] [--live] \
-         [--interval-ms 16] [--chunk-bytes 1048576]\n  \
+         [--interval-ms 16] [--chunk-bytes 1048576] \
+         [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry search <FILE> --query LITERAL [--start-row 1] \
          [--start-column 1] [--cancel-after-bytes N] \
-         [--cache-state unknown|warm]\n  \
+         [--cache-state unknown|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry filter <FILE> --column N --operator contains|equals|not-equals|gt|gte|lt|lte|between \
          --value VALUE [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... \
          [--cancel-after-bytes N] \
-         [--cache-state unknown|cold|warm]\n  \
+         [--cache-state unknown|cold|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry export <FILE> --output FILE --column N \
          --operator contains|equals|not-equals|gt|gte|lt|lte|between --value VALUE \
          [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... [--cancel-after-bytes N] \
-         [--cache-state unknown|cold|warm]\n  \
+         [--cache-state unknown|cold|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry edit-save-as <FILE> --output FILE \
          --edit DATA_ROW COLUMN VALUE [--edit DATA_ROW COLUMN VALUE]... \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
@@ -216,11 +261,20 @@ fn print_help() {
          [--temp-dir DIRECTORY] \
          [--delimiter ,] [--header auto|first-row|none] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
-           quarry convert-utf8 <FILE> --output FILE [--edit DATA_ROW COLUMN VALUE]...\n  \
+           quarry convert-utf8 <FILE> --output FILE [--edit DATA_ROW COLUMN VALUE]... \
+         [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]\n\n\
          Commands that read an input file accept --encoding auto|utf8|utf16le|utf16be|windows1252|latin1; generate does not.\n\
          Auto detects Unicode BOMs and otherwise uses UTF-8; no legacy guessing.\n\n\
+         Compressed input: inspect, open, viewport, search, filter, export, and convert-utf8 read gzip (.gz) files.\n\
+         Quarry decompresses the file once into a private temporary copy and indexes it in the same pass.\n\
+         The copy goes in --temp-dir (default: the system temporary folder) and is removed when the command ends.\n\
+         --max-decompressed-bytes caps the copy (for example 512MB, 1GB, or a byte count).\n\
+         open --no-wait reads only the first rows and writes no temporary file.\n\
+         Compressed files are read-only: edit-save-as, replace-all-save-as, transform-save-as, sort-save-as,\n\
+         and duplicates reject them; convert-utf8 writes an uncompressed copy to use instead.\n\
+         Outputs are always uncompressed and must not end in .gz. Zstandard, bzip2, XZ, ZIP, and tar are not supported.\n\n\
          Duplicates: count only by default; --output explicitly removes extra occurrences.\n\
          The first row is kept. Matching ignores ASCII case unless --match-case is set.\n\
          Blank and missing selected fields match; whitespace is significant.\n\
@@ -296,6 +350,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     let mut and_predicates = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -329,6 +384,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
             }
@@ -356,17 +412,18 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     query.predicates[0].upper_bound = upper_bound;
     query.predicates.extend(and_predicates);
     query.validate()?;
-    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
+    let input = open_input(&path, OpenOptions::default(), encoding, &compressed)?;
+    let session = &input.session;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
     let job = session.start_filter(query)?;
     let (index, progress, cancellation) =
         wait_for_filter(job, cancel_after_bytes, Duration::from_millis(1))?;
-    let samples = sample_filtered_rows(&session, &index)?;
+    let samples = sample_filtered_rows(session, &index)?;
 
     println!("Quarry filter benchmark\n");
-    println!("File: {}", session.path().display());
+    input.print_source("File");
     println!("Encoding: {}", session.encoding());
     println!(
         "File size: {} ({} bytes)",
@@ -494,11 +551,15 @@ fn wait_for_filter(
             job.cancel();
             cancellation = Some((progress.bytes_scanned, started));
         }
+        if interrupt::requested() {
+            job.cancel();
+        }
         thread::sleep(poll_interval);
     }
 
     let progress = job.progress();
     let index = job.wait()?;
+    interrupt::check()?;
     let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
     if cancel_after_bytes.is_some() && cancellation.is_none() {
         return Err("filter finished before cancellation threshold".into());
@@ -523,6 +584,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     let mut and_predicates = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -557,6 +619,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
             }
@@ -568,6 +631,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
 
     let path = path.ok_or("export requires a file path")?;
     let destination = destination.ok_or("export requires --output")?;
+    reject_compressed_output(&destination)?;
     let column = column.ok_or("export requires --column")?;
     let operator = operator.ok_or("export requires --operator")?;
     let filter_value = filter_value.ok_or("export requires --value")?;
@@ -585,7 +649,8 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     query.predicates[0].upper_bound = upper_bound;
     query.predicates.extend(and_predicates);
     query.validate()?;
-    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
+    let input = open_input(&path, OpenOptions::default(), encoding, &compressed)?;
+    let session = &input.session;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -618,7 +683,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     };
 
     println!("Quarry filtered export benchmark\n");
-    println!("Source: {}", session.path().display());
+    input.print_source("Source");
     println!(
         "Source size: {} ({} bytes)",
         human_bytes(source_size_before),
@@ -733,11 +798,15 @@ fn wait_for_export(
             job.cancel();
             cancellation = Some((progress.bytes_scanned, started));
         }
+        if interrupt::requested() {
+            job.cancel();
+        }
         thread::sleep(poll_interval);
     }
 
     let progress = job.progress();
     let outcome = job.wait()?;
+    interrupt::check()?;
     let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
     if cancel_after_bytes.is_some() && cancellation.is_none() {
         return Err("export finished before cancellation threshold".into());
@@ -769,6 +838,7 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
     let mut requested_edits = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -801,6 +871,9 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--temp-dir" | "--max-decompressed-bytes" if utf8 => {
+                compressed.parse(&args, &mut cursor)?
+            }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
             }
@@ -819,7 +892,17 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
-    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
+    reject_compressed_output(&destination)?;
+    if !utf8 {
+        reject_compressed_input(&path, "edit-save-as")?;
+    } else if !requested_edits.is_empty() && detect_compression(&path)?.is_some() {
+        return Err(
+            "convert-utf8 cannot apply --edit to a compressed file because compressed files open read-only; convert it without --edit, then edit the uncompressed copy"
+                .into(),
+        );
+    }
+    let input = open_input(&path, OpenOptions::default(), encoding, &compressed)?;
+    let session = &input.session;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -901,7 +984,7 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
             session.encoding()
         }
     );
-    println!("Source: {}", session.path().display());
+    input.print_source("Source");
     println!(
         "Source size: {} ({} bytes)",
         human_bytes(source_size_before),
@@ -1042,6 +1125,8 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
+    reject_compressed_output(&destination)?;
+    reject_compressed_input(&path, "replace-all-save-as")?;
     let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
@@ -1244,6 +1329,10 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes == Some(0) {
         return Err("cancel-after-bytes must be non-zero".into());
     }
+    if let Some(destination) = &destination {
+        reject_compressed_output(destination)?;
+    }
+    reject_compressed_input(&source, "duplicates")?;
     let session = Session::open_with_encoding(
         &source,
         OpenOptions {
@@ -1593,6 +1682,8 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
+    reject_compressed_output(&destination)?;
+    reject_compressed_input(&source, "sort-save-as")?;
     let session = Session::open_with_encoding(
         &source,
         OpenOptions {
@@ -2292,6 +2383,8 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
+    reject_compressed_output(&destination)?;
+    reject_compressed_input(&path, "transform-save-as")?;
     let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
@@ -2717,11 +2810,15 @@ fn wait_for_save_as(
             job.cancel();
             cancellation = Some((progress.bytes_scanned, started));
         }
+        if interrupt::requested() {
+            job.cancel();
+        }
         thread::sleep(poll_interval);
     }
 
     let progress = job.progress();
     let outcome = job.wait()?;
+    interrupt::check()?;
     let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
     if cancel_after_bytes.is_some() && cancellation.is_none() {
         return Err("Save As finished before cancellation threshold".into());
@@ -2892,6 +2989,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     let mut start_column = 1_usize;
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -2912,6 +3010,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
             }
@@ -2936,10 +3035,15 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
         return Err("search cannot be cold because indexing reads the file first".into());
     }
 
-    let session = Session::open_with_encoding(&path, OpenOptions::default(), encoding)?;
+    let mut input = open_input(&path, OpenOptions::default(), encoding, &compressed)?;
+    let prepared_index = input.index.take();
+    let session = &input.session;
     let start = data_search_position(start_row, start_column, session.dialect.has_header)?;
     let index_started = Instant::now();
-    let index = session.start_indexing(IndexConfig::default())?.wait()?;
+    let index = match prepared_index {
+        Some(index) => index,
+        None => session.start_indexing(IndexConfig::default())?.wait()?,
+    };
     let index_elapsed = index_started.elapsed();
     let search_bytes = session
         .file_size
@@ -2952,7 +3056,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
         wait_for_search(job, cancel_after_bytes, Duration::from_millis(1))?;
 
     println!("Quarry search benchmark\n");
-    println!("File: {}", session.path().display());
+    input.print_source("File");
     println!("Encoding: {}", session.encoding());
     println!(
         "File size: {} ({} bytes)",
@@ -3066,11 +3170,15 @@ fn wait_for_search(
             job.cancel();
             cancellation = Some((progress.bytes_scanned, started));
         }
+        if interrupt::requested() {
+            job.cancel();
+        }
         thread::sleep(poll_interval);
     }
 
     let progress = job.progress();
     let outcome = job.wait()?;
+    interrupt::check()?;
     let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
     if cancel_after_bytes.is_some() && cancellation.is_none() {
         return Err("search finished before cancellation threshold".into());
@@ -3091,6 +3199,7 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     let mut live = false;
     let mut interval_ms = 16_u64;
     let mut chunk_bytes = IndexConfig::default().chunk_bytes;
+    let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -3108,6 +3217,7 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
             }
@@ -3127,31 +3237,45 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
         return Err("live viewport schedule must not exceed 60 seconds".into());
     }
     let path = path.ok_or("viewport requires a file path")?;
-    let session = Session::open_with_encoding(
+    if live && detect_compression(&path)?.is_some() {
+        return Err(
+            "--live measures indexing of an ordinary file; a compressed file is indexed while it is decompressed, so run viewport without --live"
+                .into(),
+        );
+    }
+    let mut input = open_input(
         &path,
         OpenOptions {
             rows,
             ..OpenOptions::default()
         },
         encoding,
+        &compressed,
     )?;
+    let prepared_index = input.index.take();
+    let session = &input.session;
     let index_started = Instant::now();
-    let job = session.start_indexing(IndexConfig {
-        chunk_bytes,
-        ..IndexConfig::default()
-    })?;
-    if live {
-        return benchmark_live_viewports(
-            &session,
-            job,
-            iterations,
-            rows,
-            Duration::from_millis(interval_ms),
-            chunk_bytes,
-            &cache_state,
-        );
-    }
-    let index = job.wait()?;
+    let index = match prepared_index {
+        Some(index) => index,
+        None => {
+            let job = session.start_indexing(IndexConfig {
+                chunk_bytes,
+                ..IndexConfig::default()
+            })?;
+            if live {
+                return benchmark_live_viewports(
+                    session,
+                    job,
+                    iterations,
+                    rows,
+                    Duration::from_millis(interval_ms),
+                    chunk_bytes,
+                    &cache_state,
+                );
+            }
+            job.wait()?
+        }
+    };
     let index_elapsed = index_started.elapsed();
     if index.indexed_rows() < rows as u64 {
         return Err(format!(
@@ -3164,11 +3288,11 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     let max_start = index.indexed_rows() - rows as u64;
     let repeated_start = max_start / 2;
     let (repeated, repeated_checksum) =
-        benchmark_viewports(&session, &index, iterations, rows, |_| repeated_start)?;
+        benchmark_viewports(session, &index, iterations, rows, |_| repeated_start)?;
 
     let mut sequential_start = repeated_start;
     let (sequential, sequential_checksum) =
-        benchmark_viewports(&session, &index, iterations, rows, |_| {
+        benchmark_viewports(session, &index, iterations, rows, |_| {
             let start = sequential_start;
             sequential_start = sequential_start
                 .checked_add(rows as u64)
@@ -3179,12 +3303,12 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
 
     let mut random = XorShift64::new(seed);
     let (random_stats, random_checksum) =
-        benchmark_viewports(&session, &index, iterations, rows, |_| {
+        benchmark_viewports(session, &index, iterations, rows, |_| {
             random.next() % max_start.saturating_add(1)
         })?;
 
     println!("Quarry viewport benchmark\n");
-    println!("File: {}", session.path().display());
+    input.print_source("File");
     println!("Encoding: {}", session.encoding());
     println!("File size: {}", human_bytes(session.file_size));
     println!("Rows indexed: {}", index.indexed_rows());
@@ -3225,6 +3349,8 @@ fn benchmark_viewports(
     let mut samples = Vec::with_capacity(iterations);
     let mut checksum = 0_u64;
     for iteration in 0..iterations {
+        // Ctrl-C ends the run so the input, and any private copy, is dropped cleanly.
+        interrupt::check()?;
         let start = start(iteration);
         let began = Instant::now();
         let selected = session.read_rows(index, start, rows)?;
@@ -3413,6 +3539,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     let mut cache_state = "unknown".to_owned();
     let mut wait_for_index = true;
     let mut metrics_only = false;
+    let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -3432,6 +3559,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
             }
             "--metrics-only" => metrics_only = true,
             "--no-wait" => wait_for_index = false,
+            "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
             }
@@ -3442,6 +3570,24 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     }
 
     let path = path.ok_or("open requires a file path")?;
+    if let Some(format) = detect_compression(&path)? {
+        return open_compressed(CompressedOpenRequest {
+            path: &path,
+            format,
+            options: OpenOptions {
+                rows,
+                delimiter,
+                ..OpenOptions::default()
+            },
+            encoding,
+            jump,
+            jump_count,
+            cache_state: &cache_state,
+            metrics_only,
+            wait: wait_for_index,
+            compressed: &compressed,
+        });
+    }
     let memory_before = current_rss_bytes();
     let session = Session::open_with_encoding(
         &path,
@@ -3592,6 +3738,7 @@ fn print_jump(
     live_progress: Option<IndexProgress>,
     render_rows: bool,
 ) -> CliResult<()> {
+    interrupt::check()?;
     let began = Instant::now();
     let selected = session.read_rows(index, start, count)?;
     let read_ms = began.elapsed().as_secs_f64() * 1000.0;
@@ -3610,6 +3757,7 @@ fn print_jump(
     }
     if render_rows {
         for (offset, row) in selected.iter().enumerate() {
+            interrupt::check()?;
             println!(
                 "row {} @{}: {}",
                 start + offset as u64,
@@ -3649,6 +3797,7 @@ fn generate_command(args: Vec<String>) -> CliResult<()> {
 
     let requested = size.ok_or("generate requires --size")?;
     let output = output.ok_or("generate requires --output")?;
+    reject_compressed_output(&output)?;
     let began = Instant::now();
     let actual = generate_file(&output, requested, columns, delimiter, seed)?;
     println!(
@@ -3733,6 +3882,530 @@ impl XorShift64 {
         value ^= value << 17;
         self.0 = value;
         value
+    }
+}
+
+/// Options for commands that can read a gzip-compressed input.
+#[derive(Debug, Default)]
+struct CompressedArgs {
+    /// Folder for the private decompressed copy; the system temporary folder by default.
+    temp_dir: Option<PathBuf>,
+    max_decompressed_bytes: Option<u64>,
+}
+
+impl CompressedArgs {
+    /// Reads the value of `--temp-dir` or `--max-decompressed-bytes` at `cursor`.
+    fn parse(&mut self, args: &[String], cursor: &mut usize) -> CliResult<()> {
+        let option = args[*cursor].as_str();
+        let raw = value(args, cursor, option)?;
+        match option {
+            "--temp-dir" => self.temp_dir = Some(PathBuf::from(raw)),
+            "--max-decompressed-bytes" => self.max_decompressed_bytes = Some(parse_size(raw)?),
+            _ => unreachable!("only compressed-input options are parsed here"),
+        }
+        Ok(())
+    }
+
+    fn config(&self) -> CompressedOpenConfig {
+        let mut config =
+            CompressedOpenConfig::new(self.temp_dir.clone().unwrap_or_else(std::env::temp_dir));
+        config.max_decompressed_bytes = self.max_decompressed_bytes;
+        config
+    }
+}
+
+/// Facts about a compressed input, printed by read-only commands.
+struct CompressedSummary {
+    format: CompressionFormat,
+    compressed_size: u64,
+    decompressed_size: u64,
+    bootstrap: Duration,
+    decompression: Duration,
+    records: u64,
+    columns: usize,
+}
+
+/// Prints private-copy cleanup failures once the session that owned the copy is gone.
+struct CleanupReport(WorkingCopyCleanup);
+
+impl Drop for CleanupReport {
+    fn drop(&mut self) {
+        for error in self.0.take_errors() {
+            eprintln!("warning: {error}");
+        }
+    }
+}
+
+/// A readable document: an ordinary file, or the private copy of a compressed one.
+/// Fields drop in order, so the session (which owns any private copy) goes first.
+struct OpenedInput {
+    session: Session,
+    /// Built during decompression, so a compressed input needs no second scan.
+    index: Option<StructuralIndex>,
+    compressed: Option<CompressedSummary>,
+    _cleanup: CleanupReport,
+}
+
+impl OpenedInput {
+    /// Prints the file the user named; a compressed session reads a private copy.
+    fn print_source(&self, label: &str) {
+        let path = self
+            .session
+            .compressed_source_path()
+            .unwrap_or_else(|| self.session.path());
+        println!("{label}: {}", path.display());
+        if let Some(summary) = &self.compressed {
+            print_compressed_summary(summary);
+        }
+    }
+}
+
+fn print_compressed_summary(summary: &CompressedSummary) {
+    println!("Compression: {}", compression_name(summary.format));
+    println!(
+        "Compressed size: {} ({} bytes)",
+        human_bytes(summary.compressed_size),
+        summary.compressed_size
+    );
+    println!(
+        "Decompressed size: {} ({} bytes)",
+        human_bytes(summary.decompressed_size),
+        summary.decompressed_size
+    );
+    println!(
+        "Bootstrap time: {:.3} ms",
+        summary.bootstrap.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Decompression and indexing time: {:.3} s",
+        summary.decompression.as_secs_f64()
+    );
+    println!("Records indexed: {}", summary.records);
+    println!("Columns: {}", summary.columns);
+}
+
+fn compression_name(format: CompressionFormat) -> &'static str {
+    match format {
+        CompressionFormat::Gzip => "Gzip",
+    }
+}
+
+/// Opens a file for reading. A gzip file is decompressed once, with its index built in
+/// the same pass, into a private copy that is removed when the returned input drops.
+fn open_input(
+    path: &Path,
+    options: OpenOptions,
+    encoding: Option<Encoding>,
+    compressed: &CompressedArgs,
+) -> CliResult<OpenedInput> {
+    let cleanup = CleanupReport(WorkingCopyCleanup::default());
+    let Some(format) = detect_compression(path)? else {
+        return Ok(OpenedInput {
+            session: Session::open_with_encoding(path, options, encoding)?,
+            index: None,
+            compressed: None,
+            _cleanup: cleanup,
+        });
+    };
+    interrupt::install();
+    let bootstrap =
+        CompressedBootstrap::open(path, options, encoding, compressed.max_decompressed_bytes)?;
+    let (session, index, progress) =
+        run_decompression(&bootstrap, compressed, &cleanup.0, |_, progress, report| {
+            if report {
+                eprintln!("{}", decompression_progress_line(&progress));
+            }
+            Ok(())
+        })?;
+    let summary = CompressedSummary {
+        format,
+        compressed_size: bootstrap.compressed_size(),
+        decompressed_size: session.file_size,
+        bootstrap: bootstrap.metrics.first_rows,
+        decompression: progress.elapsed,
+        records: index.indexed_rows(),
+        columns: index.maximum_width(),
+    };
+    Ok(OpenedInput {
+        session,
+        index: Some(index),
+        compressed: Some(summary),
+        _cleanup: cleanup,
+    })
+}
+
+/// Runs the single decompression and indexing pass. `on_poll` sees each progress sample,
+/// with `report` set about once a second. Ctrl-C or an error from `on_poll` stops the job,
+/// which removes its private copy before this returns.
+fn run_decompression(
+    bootstrap: &CompressedBootstrap,
+    compressed: &CompressedArgs,
+    cleanup: &WorkingCopyCleanup,
+    mut on_poll: impl FnMut(&CompressedDecompressJob, CompressedProgress, bool) -> CliResult<()>,
+) -> CliResult<(Session, StructuralIndex, CompressedProgress)> {
+    let job = bootstrap.start_decompression(compressed.config(), cleanup.clone())?;
+    let mut last_report = Instant::now();
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if interrupt::requested() {
+            job.cancel();
+        }
+        let report = last_report.elapsed() >= Duration::from_secs(1);
+        if report {
+            last_report = Instant::now();
+        }
+        on_poll(&job, progress, report)?;
+        thread::sleep(Duration::from_millis(10));
+    }
+    let progress = job.progress();
+    match job.wait()? {
+        CompressedOpenOutcome::Complete { session, index } => Ok((session, index, progress)),
+        CompressedOpenOutcome::Cancelled => Err(interrupt::MESSAGE.into()),
+    }
+}
+
+fn decompression_progress_line(progress: &CompressedProgress) -> String {
+    format!(
+        "  {:>6.2}%  {} of {} compressed  {} expanded  {} rows",
+        progress.compressed_bytes_read as f64 * 100.0
+            / progress.compressed_total_bytes.max(1) as f64,
+        human_bytes(progress.compressed_bytes_read),
+        human_bytes(progress.compressed_total_bytes),
+        human_bytes(progress.decompressed_bytes_written),
+        progress.rows_scanned
+    )
+}
+
+/// Quarry writes uncompressed delimited text, so an output name must not claim gzip.
+/// The rule (`.gz` or `.tgz`, any case) is the one every core writer enforces.
+fn reject_compressed_output(path: &Path) -> CliResult<()> {
+    if is_compressed_destination(path) {
+        return Err(format!(
+            "{}: Quarry writes uncompressed delimited files; choose an output name without .gz or .tgz",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A verified private copy of a compressed input, not parsed as delimited text.
+/// Fields drop in order, so the copy is removed before cleanup errors are printed.
+struct DecompressedInput {
+    copy: DecompressedCopy,
+    decompression: Duration,
+    _cleanup: CleanupReport,
+}
+
+impl DecompressedInput {
+    fn print_summary(&self) {
+        println!("Compression: {}", compression_name(self.copy.format()));
+        println!(
+            "Compressed size: {} ({} bytes)",
+            human_bytes(self.copy.compressed_size()),
+            self.copy.compressed_size()
+        );
+        println!(
+            "Decompressed size: {} ({} bytes)",
+            human_bytes(self.copy.decompressed_size()),
+            self.copy.decompressed_size()
+        );
+        println!(
+            "Decompression time: {:.3} s",
+            self.decompression.as_secs_f64()
+        );
+    }
+}
+
+/// Decompresses a gzip input into a verified private copy without parsing it, so
+/// inspection can locate malformed delimited data inside valid gzip. Ctrl-C stops
+/// the job, which removes its private copy before this returns.
+fn decompress_for_inspection(
+    path: &Path,
+    compressed: &CompressedArgs,
+) -> CliResult<DecompressedInput> {
+    interrupt::install();
+    let cleanup = CleanupReport(WorkingCopyCleanup::default());
+    let job = CompressedRawDecompressJob::start(path, compressed.config(), cleanup.0.clone())?;
+    let mut last_report = Instant::now();
+    loop {
+        let progress = job.progress();
+        if progress.done {
+            break;
+        }
+        if interrupt::requested() {
+            job.cancel();
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            // No rows are counted: the copy is not parsed while it is made.
+            eprintln!(
+                "  {:>6.2}%  {} of {} compressed  {} expanded",
+                progress.compressed_bytes_read as f64 * 100.0
+                    / progress.compressed_total_bytes.max(1) as f64,
+                human_bytes(progress.compressed_bytes_read),
+                human_bytes(progress.compressed_total_bytes),
+                human_bytes(progress.decompressed_bytes_written)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let decompression = job.progress().elapsed;
+    match job.wait()? {
+        Some(copy) => Ok(DecompressedInput {
+            copy,
+            decompression,
+            _cleanup: cleanup,
+        }),
+        None => Err(interrupt::MESSAGE.into()),
+    }
+}
+
+/// Commands that change data accept only uncompressed files; compressed files are read-only.
+fn reject_compressed_input(path: &Path, command: &str) -> CliResult<()> {
+    if let Some(format) = detect_compression(path)? {
+        return Err(format!(
+            "{command} cannot change {}: {format}-compressed files open read-only. Run quarry convert-utf8 FILE --output COPY.csv to write an uncompressed copy, then use that copy.",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+struct CompressedOpenRequest<'a> {
+    path: &'a Path,
+    format: CompressionFormat,
+    options: OpenOptions,
+    encoding: Option<Encoding>,
+    jump: Option<u64>,
+    jump_count: usize,
+    cache_state: &'a str,
+    metrics_only: bool,
+    wait: bool,
+    compressed: &'a CompressedArgs,
+}
+
+/// `quarry open` for a gzip file: the first rows come from a bounded in-memory bootstrap;
+/// unless `--no-wait` is set, one pass then writes the private copy and its index.
+fn open_compressed(request: CompressedOpenRequest<'_>) -> CliResult<()> {
+    let memory_before = current_rss_bytes();
+    let bootstrap = CompressedBootstrap::open(
+        request.path,
+        request.options,
+        request.encoding,
+        request.compressed.max_decompressed_bytes,
+    )?;
+    let memory_at_first_rows = current_rss_bytes();
+
+    println!("Quarry\n");
+    println!("File: {}", request.path.display());
+    println!("Compression: {}", compression_name(request.format));
+    println!(
+        "Compressed size: {} ({} bytes)",
+        human_bytes(bootstrap.compressed_size()),
+        bootstrap.compressed_size()
+    );
+    match bootstrap.decompressed_size() {
+        Some(size) => println!("Decompressed size: {} ({size} bytes)", human_bytes(size)),
+        None => println!("Decompressed size: unknown until decompression finishes"),
+    }
+    println!("Encoding: {}", bootstrap.encoding());
+    println!(
+        "Build: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!("Cache state: {}", request.cache_state);
+    println!(
+        "Detected delimiter: {}",
+        display_delimiter(bootstrap.dialect.delimiter)
+    );
+    println!(
+        "Detected header: {}",
+        if bootstrap.dialect.has_header {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "Time to open: {:.3} ms",
+        bootstrap.metrics.file_open.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Time to first {} rows (bootstrap): {:.3} ms",
+        bootstrap.first_rows.len(),
+        bootstrap.metrics.first_rows.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Bootstrap compressed bytes read: {}",
+        human_bytes(bootstrap.compressed_bytes_read())
+    );
+    println!(
+        "Bootstrap decompressed bytes: {}",
+        human_bytes(bootstrap.metrics.bootstrap_bytes_read)
+    );
+    println!("Current memory: {}", optional_bytes(memory_at_first_rows));
+    println!("Memory before open: {}", optional_bytes(memory_before));
+    println!();
+    if !request.metrics_only {
+        for (number, row) in bootstrap.first_rows.iter().take(5).enumerate() {
+            println!("row {number} @{}: {}", row.offset, render_row(row));
+        }
+    }
+
+    if !request.wait {
+        println!("\nDecompression skipped (--no-wait); no temporary file was written.");
+        return Ok(());
+    }
+
+    interrupt::install();
+    let cleanup = CleanupReport(WorkingCopyCleanup::default());
+    println!("\nDecompressing and indexing...");
+    let mut pending_jump = request.jump;
+    let (session, index, progress) = run_decompression(
+        &bootstrap,
+        request.compressed,
+        &cleanup.0,
+        |job, progress, report| {
+            if let Some(start) = pending_jump
+                && progress.rows_scanned >= start.saturating_add(request.jump_count as u64)
+            {
+                let began = Instant::now();
+                let rows = job.read_rows(start, request.jump_count)?;
+                println!(
+                    "Live jump to row {start} during decompression ({:.3} s): {} rows in {:.3} ms",
+                    progress.elapsed.as_secs_f64(),
+                    rows.len(),
+                    began.elapsed().as_secs_f64() * 1000.0
+                );
+                if !request.metrics_only {
+                    for (offset, row) in rows.iter().enumerate() {
+                        println!(
+                            "row {} @{}: {}",
+                            start + offset as u64,
+                            row.offset,
+                            render_row(row)
+                        );
+                    }
+                }
+                pending_jump = None;
+            }
+            if report {
+                println!("{}", decompression_progress_line(&progress));
+            }
+            Ok(())
+        },
+    )?;
+
+    println!(
+        "Decompressed size: {} ({} bytes)",
+        human_bytes(session.file_size),
+        session.file_size
+    );
+    println!("Rows parsed: {}", index.indexed_rows());
+    println!("Columns: {}", index.maximum_width());
+    println!(
+        "Decompression and indexing time: {:.3} s",
+        progress.elapsed.as_secs_f64()
+    );
+    println!(
+        "Decompression throughput: {}/s compressed, {}/s expanded",
+        human_bytes(rate(bootstrap.compressed_size(), progress.elapsed)),
+        human_bytes(rate(session.file_size, progress.elapsed))
+    );
+    println!(
+        "Index: {} checkpoints, every {} rows, {} memory",
+        index.checkpoints().len(),
+        index.checkpoint_every(),
+        human_bytes(index.memory_bytes() as u64)
+    );
+    if let Some(start) = pending_jump {
+        print_jump(
+            &session,
+            &index,
+            start,
+            request.jump_count,
+            None,
+            !request.metrics_only,
+        )?;
+    }
+    println!("Current memory: {}", optional_bytes(current_rss_bytes()));
+    println!("Peak memory: {}", optional_bytes(peak_rss_bytes()));
+    println!("Temporary copy: removed on exit");
+    Ok(())
+}
+
+fn render_row(row: &quarry_core::Row) -> String {
+    row.fields
+        .iter()
+        .map(|field| render_field(field))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Ctrl-C (or SIGTERM) asks a running compressed command to stop and remove its private
+/// copy; a second signal ends the process at once.
+#[cfg(unix)]
+mod interrupt {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub const MESSAGE: &str = "interrupted; the private decompressed copy was removed";
+    static REQUESTED: AtomicBool = AtomicBool::new(false);
+    static INSTALL: Once = Once::new();
+
+    extern "C" fn handle(signal: libc::c_int) {
+        REQUESTED.store(true, Ordering::SeqCst);
+        // SAFETY: signal() is async-signal-safe; restoring the default makes a second
+        // signal terminate the process.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
+
+    pub fn install() {
+        INSTALL.call_once(|| {
+            let handler = handle as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            // SAFETY: the handler only stores an atomic flag and calls signal().
+            unsafe {
+                libc::signal(libc::SIGINT, handler);
+                libc::signal(libc::SIGTERM, handler);
+            }
+        });
+    }
+
+    pub fn requested() -> bool {
+        REQUESTED.load(Ordering::SeqCst)
+    }
+
+    pub fn check() -> super::CliResult<()> {
+        if requested() {
+            return Err(MESSAGE.into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+mod interrupt {
+    pub const MESSAGE: &str = "interrupted; the private decompressed copy was removed";
+
+    pub fn install() {}
+
+    pub fn requested() -> bool {
+        false
+    }
+
+    pub fn check() -> super::CliResult<()> {
+        Ok(())
     }
 }
 

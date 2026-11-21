@@ -92,6 +92,12 @@ impl StructuralIndex {
         }
     }
 
+    /// Record bytes scanned so far by an external single-pass writer.
+    pub(crate) fn set_scan_progress(&mut self, indexed_bytes: u64, maximum_width: usize) {
+        self.indexed_bytes = indexed_bytes;
+        self.maximum_width = maximum_width;
+    }
+
     pub(crate) fn finish_output(&mut self, bytes_written: u64, maximum_width: usize) {
         self.maximum_width = maximum_width;
         self.indexed_bytes = bytes_written;

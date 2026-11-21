@@ -214,3 +214,18 @@ The lockfile, selected notice terms, supplemental text/font hashes, and Rust
 runtime resources are unchanged. The affected inputs are the core manifest and
 this audit record. The regenerated manifest hash records this bounded source
 and inventory review; it is not a change of license terms or release approval.
+
+## 2026-11-20 compressed delimited files
+
+Gzip support ([ADR 0012](../../docs/adr/0012-compressed-delimited-files.md))
+makes `quarry-core` depend directly on `flate2@1.1.9` with only its pure-Rust
+`miniz_oxide` backend. `flate2@1.1.9`, `miniz_oxide@0.8.9`, and
+`crc32fast@1.5.0` were already locked and listed through image dependencies,
+so no crate was added to `Cargo.lock`. `quarry-cli` and `quarry-egui` use the
+same `flate2` only as a development dependency for tests. Regeneration with the
+checksum-verified cargo-about 0.9.2 ARM64 tool produced byte-identical notice
+HTML (SHA-256
+`6a816f8e7da6ec6ff2fed36f8a666c1d6eeab062ed927aaf3915a8da5615a3e3`). The
+affected inputs are the lockfile's dependency lists, the core, CLI, and egui
+manifests, and this audit record. The regenerated manifest hash records this
+bounded review; it is not a change of license terms or release approval.
