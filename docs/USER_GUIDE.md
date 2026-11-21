@@ -202,7 +202,9 @@ If a valid gzip file fails to open because its delimited text is malformed,
 the error offers **Inspect File…**. Quarry decompresses the file, without
 reading it as rows, into a private temporary copy and reports where the text is
 malformed. Quarry removes the copy when you inspect another file, close the
-tab, or quit.
+tab, or quit. When the malformed text comes after the first rows, the tab keeps
+those rows as a preview, and **Details / Inspect…** or **File → Inspect File…**
+inspects the whole file the same way. Reloading the same file would fail again.
 
 The temporary copy needs free space equal to the expanded size. It goes in the
 folder chosen in **File → Temporary Storage…**, and Quarry removes it when you

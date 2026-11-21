@@ -76,8 +76,11 @@ disk space equal to the decompressed size, which the bounds below control.
   the next chunk must be free before the first write and again every
   `space_check_interval_bytes` (64 MiB by default), and whenever the next
   chunk is larger than the headroom above the reserve that the last check
-  found, so a write never reaches into the reserve. A failed check stops with
-  `InsufficientStorage`.
+  found, so this job's own writes never reach into the reserve. A failed check
+  stops with `InsufficientStorage`. Each job tracks only its own headroom
+  between checks, so on a shared volume the reserve is a target, not a
+  guarantee: concurrent decompressions, other Quarry writers or other
+  processes can use space between one job's checks.
 - The job checks for cancellation on every chunk. The gzip reader shares the
   job's cancellation flag and also checks it before each inflate step, at each
   member boundary, and every 4 KiB of a long header field.

@@ -1218,6 +1218,46 @@ impl CompressedBacking {
     pub(crate) fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
         open_unchanged_source(&self.source_path, &self.source_stamp).map(drop)
     }
+
+    pub(crate) fn source_guard(&self) -> CompressedSourceGuard {
+        CompressedSourceGuard {
+            path: self.source_path.clone(),
+            stamp: self.source_stamp.clone(),
+        }
+    }
+}
+
+/// The compressed file a private copy was made from, as it was then. A writer that
+/// reads the copy checks it again just before publishing, so a source replaced
+/// while the writer ran never yields output from the old data.
+#[derive(Clone, Debug)]
+pub struct CompressedSourceGuard {
+    path: PathBuf,
+    stamp: SourceStamp,
+}
+
+impl CompressedSourceGuard {
+    /// The compressed file the user opened.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Confirm the compressed file still matches the version decompressed.
+    pub fn ensure_unchanged(&self) -> Result<(), QuarryError> {
+        open_unchanged_source(&self.path, &self.stamp).map(drop)
+    }
+
+    /// Debug builds can hold a writer here, so tests can change the source first.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn pause_before_check(&self) {
+        if let Some(hold) = test_pause::hold_for(&self.path) {
+            hold.reach(
+                test_pause::Reached::BeforeGuardedPublication,
+                0,
+                &AtomicBool::new(false),
+            );
+        }
+    }
 }
 
 impl Drop for CompressedBacking {
@@ -1648,6 +1688,11 @@ impl DecompressedCopy {
     pub fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
         self.backing.ensure_source_unchanged()
     }
+
+    /// A guard that a writer reading this copy checks before it publishes.
+    pub fn source_guard(&self) -> CompressedSourceGuard {
+        self.backing.source_guard()
+    }
 }
 
 /// Background decompression of a compressed source into a private copy without
@@ -1953,6 +1998,14 @@ impl Session {
             Some(backing) => backing.ensure_source_unchanged(),
             None => Ok(()),
         }
+    }
+
+    /// For a compressed document, a guard that a writer reading the private copy
+    /// checks before it publishes; None for a plain file.
+    pub fn compressed_source_guard(&self) -> Option<CompressedSourceGuard> {
+        self.compressed
+            .as_ref()
+            .map(|backing| backing.source_guard())
     }
 
     /// Reinterpret the verified private copy with another delimiter, header or

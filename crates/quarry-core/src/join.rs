@@ -1471,7 +1471,9 @@ fn inspect(
     {
         return Err(input_error(&path, None, COMPRESSED_JOIN_INPUT).into());
     }
-    if let Some(problem) = crate::compressed::compressed_input_problem(&path, "Join Files") {
+    if working.is_some()
+        && let Some(problem) = crate::compressed::compressed_input_problem(&path, "Join Files")
+    {
         return Err(input_error(&path, None, problem).into());
     }
     let physical_path = working
@@ -1480,6 +1482,14 @@ fn inspect(
     let mut file = open_regular_file(&physical_path).map_err(|e| input_error(&path, None, e))?;
     if !file.metadata()?.is_file() {
         return Err(input_error(&path, None, "Select a regular file.").into());
+    }
+    // A saved input is classified by the handle that is read and stamped, so it
+    // cannot be replaced by compressed data after a check by name.
+    if working.is_none()
+        && let Some(problem) =
+            crate::compressed::compressed_file_problem(&mut file, &path, "Join Files")?
+    {
+        return Err(input_error(&path, None, problem).into());
     }
     let stamp = SourceStamp::from_file(&file)?;
     if input

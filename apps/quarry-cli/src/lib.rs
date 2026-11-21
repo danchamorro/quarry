@@ -174,7 +174,17 @@ fn inspect_command(args: Vec<String>) -> CliResult<()> {
         }
     }
     if let Some(output) = output {
-        let job = RecoveryJob::start(&report, &omitted, &output)?;
+        // A copy recovered from a compressed input is published only while that
+        // input is unchanged.
+        let job = match &compressed_input {
+            Some(input) => RecoveryJob::start_with_source_guard(
+                &report,
+                &omitted,
+                &output,
+                input.copy.source_guard(),
+            )?,
+            None => RecoveryJob::start(&report, &omitted, &output)?,
+        };
         while !job.progress().done {
             if interrupt::requested() {
                 job.cancel();

@@ -1,5 +1,6 @@
-//! Debug-build checkpoints that hold a decompression worker at a known point, so
-//! tests can observe a running pass without racing a fast machine. A held worker
+//! Debug-build checkpoints that hold a decompression worker, or a writer that
+//! reads its private copy, at a known point, so tests can observe a running pass
+//! without racing a fast machine. A held worker
 //! continues when its pause is released or dropped, when its job is cancelled
 //! (unless the pause also holds cancelled workers), or after a safety timeout.
 //! Release builds leave this module out.
@@ -22,6 +23,9 @@ pub enum Checkpoint {
     Published { min_bytes: u64 },
     /// After the complete copy is flushed, before the source is checked again.
     BeforeSourceCheck,
+    /// In a writer that reads a private copy, just before it checks the compressed
+    /// source and publishes.
+    BeforeGuardedPublication,
 }
 
 /// A point that a worker passes.
@@ -29,6 +33,7 @@ pub enum Checkpoint {
 pub(crate) enum Reached {
     Published,
     BeforeSourceCheck,
+    BeforeGuardedPublication,
 }
 
 #[derive(Debug)]
@@ -149,7 +154,8 @@ impl Hold {
     pub(crate) fn reach(&self, point: Reached, written: u64, cancelled: &AtomicBool) {
         let here = match (self.gate.checkpoint, point) {
             (Checkpoint::Published { min_bytes }, Reached::Published) => written >= min_bytes,
-            (Checkpoint::BeforeSourceCheck, Reached::BeforeSourceCheck) => true,
+            (Checkpoint::BeforeSourceCheck, Reached::BeforeSourceCheck)
+            | (Checkpoint::BeforeGuardedPublication, Reached::BeforeGuardedPublication) => true,
             _ => false,
         };
         if !here || self.stopped.swap(true, Ordering::AcqRel) {

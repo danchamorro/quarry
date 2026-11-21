@@ -19,11 +19,14 @@ pub(super) const READ_ONLY: &str =
 pub(super) const DECOMPRESSING: &str =
     "Wait for decompression to finish before using this command.";
 pub(super) const PREVIEW_ONLY: &str = "Only the first rows of this compressed file are loaded. Use File > Reload from Disk to load the full file.";
+/// Reloading the same file would fail again, so this names Inspect File instead.
+pub(super) const UNREADABLE_PREVIEW: &str = "Only the first rows of this compressed file are loaded because later rows are not valid delimited text. Choose File > Inspect File… to locate the problem.";
 pub(super) const WRITE_SLOTS_FULL: &str =
     "Wait for an active file operation to finish before opening another compressed file.";
 pub(super) const CANCELLED: &str = "Decompression cancelled; temporary files were removed. Showing initial preview rows. Use File > Reload from Disk to load the full file.";
 const JOIN_READ_ONLY: &str = "Compressed files cannot be joined directly. Use Save As… to create an uncompressed copy, then join that copy.";
 const FAILED_PREVIEW: &str = "Showing the initial preview rows only; no temporary files were kept.";
+const FAILED_TEXT_PREVIEW: &str = "Showing the initial preview rows only; no temporary files were kept. Choose Details / Inspect… to locate the malformed text.";
 
 /// Counts running decompression workers, including a closed tab's worker that its
 /// cleanup is still stopping, so the shared file-operation limit holds until every
@@ -40,8 +43,9 @@ impl DecompressionSlots {
         self.active.load(Ordering::Acquire)
     }
 
-    /// The most workers that ever ran at once.
-    #[cfg(test)]
+    /// The most workers that ever ran at once; read by debug-build tests that hold
+    /// workers at a checkpoint.
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn peak(&self) -> usize {
         self.peak.load(Ordering::Acquire)
     }
@@ -92,6 +96,9 @@ pub(super) struct CompressedDocument {
     format: CompressionFormat,
     compressed_size: u64,
     phase: Phase,
+    /// The background pass stopped at text it could not read, so only a raw copy
+    /// of the whole file can show where.
+    unreadable_text: bool,
 }
 
 enum Phase {
@@ -203,6 +210,7 @@ impl Document {
             format: bootstrap.format(),
             compressed_size: bootstrap.compressed_size(),
             phase: Phase::Pending(Box::new(bootstrap)),
+            unreadable_text: false,
         });
         Ok(document)
     }
@@ -237,11 +245,24 @@ impl Document {
 
     /// Why a command that needs the whole file cannot run yet.
     pub(super) fn compressed_unavailable_reason(&self) -> Option<&'static str> {
-        match self.compressed.as_ref()?.phase {
+        let compressed = self.compressed.as_ref()?;
+        match compressed.phase {
             Phase::Pending(_) | Phase::Decompressing { .. } => Some(DECOMPRESSING),
+            Phase::Preview if compressed.unreadable_text => Some(UNREADABLE_PREVIEW),
             Phase::Preview => Some(PREVIEW_ONLY),
             Phase::Complete => None,
         }
+    }
+
+    /// The gzip file that Inspect File reads through a raw copy, when the background
+    /// pass stopped at text it could not read and only the preview rows remain.
+    pub(super) fn raw_inspection_target(&self) -> Option<&Path> {
+        self.compressed
+            .as_ref()
+            .filter(|compressed| {
+                compressed.unreadable_text && matches!(compressed.phase, Phase::Preview)
+            })
+            .map(|_| self.logical_path.as_path())
     }
 
     /// Every change to a compressed document is unavailable.
@@ -423,6 +444,7 @@ impl Document {
             format: compressed.format,
             compressed_size: compressed.compressed_size,
             phase: Phase::Complete,
+            unreadable_text: false,
         });
         Some(document)
     }
@@ -452,7 +474,19 @@ impl Document {
                 Ok(Some(CANCELLED))
             }
             Err(error) => {
-                let message = format!("{} {FAILED_PREVIEW}", self.compressed_failure(error));
+                let unreadable_text = text_failure(&error);
+                let message = format!(
+                    "{} {}",
+                    self.compressed_failure(error),
+                    if unreadable_text {
+                        FAILED_TEXT_PREVIEW
+                    } else {
+                        FAILED_PREVIEW
+                    }
+                );
+                if let Some(compressed) = self.compressed.as_mut() {
+                    compressed.unreadable_text = unreadable_text;
+                }
                 self.show_preview()?;
                 Err(message)
             }
@@ -522,6 +556,8 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    // Worker checkpoints exist only in debug builds of quarry-core.
+    #[cfg(debug_assertions)]
     use quarry_core::compressed_test_pause::{Checkpoint, Pause};
     use quarry_core::{CaseSensitivity, FilterOperator, FilterQuery};
     use std::fs;
@@ -603,11 +639,13 @@ mod tests {
     }
 
     /// Holds a worker once it has published about 4,000 rows of `large_gzip` data.
+    #[cfg(debug_assertions)]
     const HELD: Checkpoint = Checkpoint::Published {
         min_bytes: 64 * 1024,
     };
 
     /// `count` four-member `large_gzip` sources, each about 4 MiB once expanded.
+    #[cfg(debug_assertions)]
     fn large_sources(directory: &Path, count: usize) -> Vec<PathBuf> {
         (0..count)
             .map(|index| {
@@ -618,6 +656,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(debug_assertions)]
     fn close_all(app: &mut QuarryApp, ctx: &egui::Context) {
         while app.active.document.is_some() {
             app.request_tab_close(ctx);
@@ -709,6 +748,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn cancelling_keeps_preview_rows_and_removes_the_private_copy() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
@@ -1056,6 +1096,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn decompression_shares_the_job_limit_and_closing_removes_its_copy() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
@@ -1087,6 +1128,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn reloading_a_decompressing_tab_never_runs_a_third_decompression() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
@@ -1124,6 +1166,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn a_closed_tab_keeps_its_decompression_slot_until_cleanup_stops_it() {
         let directory = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();

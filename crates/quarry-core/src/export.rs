@@ -742,6 +742,8 @@ struct FilteredEdits {
 pub struct FilterExportJob {
     shared: Arc<SharedState>,
     handle: Option<JoinHandle<Result<FilterExportOutcome, QuarryError>>>,
+    /// A compressed document's private copy, kept until the worker is joined.
+    _compressed: Option<Arc<crate::compressed::CompressedBacking>>,
 }
 
 impl FilterExportJob {
@@ -830,7 +832,15 @@ impl FilterExportJob {
         Ok(Self {
             shared,
             handle: Some(handle),
+            _compressed: None,
         })
+    }
+
+    /// Keeps a compressed document's private copy until the worker is joined, even
+    /// when the session that owned it closes first.
+    fn retaining(mut self, compressed: Option<Arc<crate::compressed::CompressedBacking>>) -> Self {
+        self._compressed = compressed;
+        self
     }
 
     pub fn progress(&self) -> FilterExportProgress {
@@ -1034,6 +1044,8 @@ pub struct SaveAsJob {
     publication: Option<Arc<PrivatePublication>>,
     shared: Arc<SharedState>,
     handle: Option<JoinHandle<Result<SaveWorkerOutcome, QuarryError>>>,
+    /// A compressed document's private copy, kept until the worker is joined.
+    _compressed: Option<Arc<crate::compressed::CompressedBacking>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1489,7 +1501,15 @@ impl SaveAsJob {
             publication,
             shared,
             handle: Some(handle),
+            _compressed: None,
         })
+    }
+
+    /// Keeps a compressed document's private copy until the worker is joined, even
+    /// when the session that owned it closes first.
+    fn retaining(mut self, compressed: Option<Arc<crate::compressed::CompressedBacking>>) -> Self {
+        self._compressed = compressed;
+        self
     }
 
     pub fn progress(&self) -> SaveAsProgress {
@@ -1684,6 +1704,7 @@ impl Session {
                 ..self.export_config()
             },
         )
+        .map(|job| job.retaining(self.compressed.clone()))
     }
 
     pub fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
@@ -1719,6 +1740,7 @@ impl Session {
             FilteredEdits { cells, headers },
             Some(self.source_stamp.clone()),
         )
+        .map(|job| job.retaining(self.compressed.clone()))
     }
 
     pub fn start_analyze_split(
@@ -1803,6 +1825,7 @@ impl Session {
             ),
             self.export_config(),
         )
+        .map(|job| job.retaining(self.compressed.clone()))
     }
 
     pub fn start_create_working_copy(
@@ -2179,6 +2202,8 @@ pub(crate) struct ExportTarget {
     publication: Publication,
     first_record_bom_guard: FirstRecordBomGuard,
     additional_sources: Vec<(PathBuf, SourceStamp)>,
+    /// The compressed file whose private copy this target's source is.
+    compressed_source: Option<crate::CompressedSourceGuard>,
 }
 
 /// Reserves private staging on the output volume, including file-only drop folders.
@@ -2248,6 +2273,7 @@ impl ExportTarget {
             publication: Publication::CreateNew,
             first_record_bom_guard: FirstRecordBomGuard::Inactive,
             additional_sources: Vec::new(),
+            compressed_source: None,
         };
         target.additional_sources = sources;
         target.ensure_source_unchanged()?;
@@ -2456,6 +2482,7 @@ impl ExportTarget {
                         publication,
                         first_record_bom_guard: FirstRecordBomGuard::Inactive,
                         additional_sources: Vec::new(),
+                        compressed_source: None,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -2647,7 +2674,18 @@ impl ExportTarget {
         }
     }
 
+    /// Publish only while the compressed file this target's source was
+    /// decompressed from is unchanged.
+    pub(crate) fn guard_compressed_source(&mut self, source: crate::CompressedSourceGuard) {
+        self.compressed_source = Some(source);
+    }
+
     fn ensure_source_unchanged(&self) -> Result<(), QuarryError> {
+        if let Some(source) = &self.compressed_source {
+            #[cfg(any(test, debug_assertions))]
+            source.pause_before_check();
+            source.ensure_unchanged()?;
+        }
         for (path, stamp) in &self.additional_sources {
             let unchanged = crate::source_stamp::open_regular_file(path)
                 .ok()
@@ -8623,6 +8661,7 @@ mod tests {
         let job = FilterExportJob {
             shared: Arc::clone(&shared),
             handle: Some(handle),
+            _compressed: None,
         };
 
         drop(job);

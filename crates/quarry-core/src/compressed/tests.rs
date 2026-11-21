@@ -2256,3 +2256,175 @@ fn free_space_is_checked_again_when_a_chunk_exceeds_the_remaining_headroom() {
     );
     assert!(entries(temp.path()).is_empty());
 }
+
+#[test]
+fn exports_keep_a_closed_documents_private_copy_until_they_finish() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let data = b"id,flag\n1,keep\n2,drop\n3,keep\n";
+    let path = write(source_dir.path(), "rows.csv.gz", &gzip(data));
+    let (session, _) = open_compressed(
+        &path,
+        OpenOptions::default(),
+        None,
+        config(temp.path()),
+        WorkingCopyCleanup::default(),
+    )
+    .unwrap();
+    let private_copy = session.path().to_owned();
+    let copy = out.path().join("copy.csv");
+    let utf8 = out.path().join("utf8.csv");
+    let filtered = out.path().join("kept.csv");
+    let save = session
+        .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &copy)
+        .unwrap();
+    let save_utf8 = session
+        .start_save_as_utf8(BTreeMap::new(), BTreeMap::new(), None, &utf8)
+        .unwrap();
+    let query = FilterQuery {
+        predicates: vec![FilterPredicate {
+            column: 1,
+            operator: FilterOperator::Equals,
+            value: b"keep".to_vec(),
+            upper_bound: None,
+        }],
+        case_sensitivity: CaseSensitivity::Sensitive,
+    };
+    let export = session.start_filtered_export(query, &filtered).unwrap();
+
+    // Closing the document while its writers run keeps the copy they read.
+    drop(session);
+    assert!(private_copy.exists());
+    for (job, destination) in [(save, &copy), (save_utf8, &utf8)] {
+        let SaveAsOutcome::Complete(_) = job.wait().unwrap() else {
+            panic!("save copy was cancelled");
+        };
+        assert_eq!(fs::read(destination).unwrap(), data);
+    }
+    assert!(private_copy.exists());
+    let FilterExportOutcome::Complete(_) = export.wait().unwrap() else {
+        panic!("filtered export was cancelled");
+    };
+    assert_eq!(fs::read(&filtered).unwrap(), b"id,flag\n1,keep\n3,keep\n");
+    // The last writer to finish removes the copy and its private folder.
+    assert!(!private_copy.exists());
+    assert!(entries(temp.path()).is_empty());
+}
+
+#[test]
+fn recovery_publishes_only_while_the_compressed_source_is_unchanged() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let data = b"id,name\n1,good\n2,extra,field\n3,ok\n";
+    let path = write(source_dir.path(), "rows.csv.gz", &gzip(data));
+    let copy = CompressedRawDecompressJob::start(
+        &path,
+        config(temp.path()),
+        WorkingCopyCleanup::default(),
+    )
+    .unwrap()
+    .wait()
+    .unwrap()
+    .expect("not cancelled");
+    let (session, _) = open_compressed(
+        &path,
+        OpenOptions::default(),
+        None,
+        config(temp.path()),
+        WorkingCopyCleanup::default(),
+    )
+    .unwrap();
+    let guard = session.compressed_source_guard().unwrap();
+    assert_eq!(guard.path(), path);
+    let reports = [
+        (copy.path().to_owned(), copy.source_guard()),
+        (session.path().to_owned(), guard),
+    ]
+    .map(|(scanned, guard)| {
+        let report = InspectionJob::start(
+            &scanned,
+            InspectionOptions::default(),
+            InspectionEdits::default(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert_eq!(report.status, InspectionStatus::Complete);
+        assert_eq!(report.total_findings, 1);
+        (report, guard)
+    });
+    let selection = BTreeSet::from([0]);
+
+    // While the source is unchanged, both kinds of private copy publish cleanly.
+    for (index, (report, guard)) in reports.iter().enumerate() {
+        let destination = out.path().join(format!("recovered-{index}.csv"));
+        let summary =
+            RecoveryJob::start_with_source_guard(report, &selection, &destination, guard.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .expect("not cancelled");
+        assert_eq!(summary.removed_records, 1);
+        assert_eq!(fs::read(&destination).unwrap(), b"id,name\n1,good\n3,ok\n");
+        fs::remove_file(destination).unwrap();
+    }
+
+    // The source is replaced after recovery starts and before it publishes.
+    let (report, guard) = &reports[0];
+    let destination = out.path().join("recovered.csv");
+    let pause = Pause::new(&path, Checkpoint::BeforeGuardedPublication);
+    let job = RecoveryJob::start_with_source_guard(report, &selection, &destination, guard.clone())
+        .unwrap();
+    assert!(pause.wait_for(1), "recovery did not reach publication");
+    fs::write(&path, gzip(&numbered_rows(3))).unwrap();
+    pause.release();
+    assert!(matches!(job.wait(), Err(QuarryError::SourceChanged)));
+    assert!(entries(out.path()).is_empty());
+    // A recovery that starts after the change is refused at once.
+    for (report, guard) in &reports {
+        assert!(matches!(
+            RecoveryJob::start_with_source_guard(report, &selection, &destination, guard.clone()),
+            Err(QuarryError::SourceChanged)
+        ));
+    }
+    assert!(entries(out.path()).is_empty());
+}
+
+#[test]
+fn join_classifies_a_saved_input_by_the_handle_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = write(dir.path(), "right.csv", b"id,a\n2,y\n");
+    let plain_file = write(dir.path(), "plain.csv", b"id,a\n1,x\n");
+    let gz = write(dir.path(), "left.csv", &gzip(b"id,a\n1,x\n"));
+    let link = dir.path().join("link.csv.gz");
+    std::os::unix::fs::symlink(&plain_file, &link).unwrap();
+    let input = |path: &Path| JoinInput {
+        path: path.to_path_buf(),
+        delimiter: None,
+        has_header: true,
+        encoding: None,
+        key_columns: vec![0],
+        expected_version: None,
+        require_unique: false,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    // Gzip bytes under a plain name, and plain bytes under a .gz name.
+    for (chosen, expected) in [(&gz, "Join Files"), (&link, "gzip signature")] {
+        let error = expect_err(
+            analyze_join(
+                [input(&csv), input(chosen)],
+                temp.path().to_path_buf(),
+                JoinConfig::default(),
+            )
+            .unwrap()
+            .wait(),
+        );
+        assert!(
+            matches!(&error, QuarryError::JoinFile { path: Some(path), reason, .. }
+                if path == chosen && reason.contains(expected)),
+            "{error:?}"
+        );
+    }
+}

@@ -45,8 +45,8 @@ pub use combine::{
 pub use compressed::test_pause as compressed_test_pause;
 pub use compressed::{
     CompressedBootstrap, CompressedDecompressJob, CompressedOpenConfig, CompressedOpenOutcome,
-    CompressedProgress, CompressedRawDecompressJob, CompressionFormat, DecompressedCopy,
-    detect_compression, is_compressed_destination, reject_compressed_destination,
+    CompressedProgress, CompressedRawDecompressJob, CompressedSourceGuard, CompressionFormat,
+    DecompressedCopy, detect_compression, is_compressed_destination, reject_compressed_destination,
 };
 pub use date_time_sort::DateTimeFormat;
 pub use encoding::Encoding;
@@ -963,9 +963,17 @@ fn read_rows_from_index(
     let mut rows = Vec::with_capacity(count);
 
     while row_number < target_end {
-        let read = encoding.read_chunk(&mut file, &mut chunk)?;
-        let read =
-            read.min(usize::try_from(end.saturating_sub(absolute_start)).unwrap_or(usize::MAX));
+        // Bound the read itself, so bytes past `end` (such as half of a UTF-16
+        // code unit still being written) are never read.
+        let remaining = end.saturating_sub(absolute_start);
+        let read = if remaining == 0 {
+            0
+        } else {
+            let limit = chunk
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            encoding.read_chunk(&mut file, &mut chunk[..limit])?
+        };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
                 let fields = parse_encoded_record(&record, delimiter, row_number, encoding)?
@@ -1032,7 +1040,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{HeaderMode, IndexConfig, OpenOptions, QuarryError, Session};
+    use super::{Encoding, HeaderMode, IndexConfig, OpenOptions, QuarryError, Session};
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1042,6 +1050,48 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         file.write_all(bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn live_utf16_reads_never_read_past_the_snapshot_boundary() {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "id,name\n1,a\n2,b\n".encode_utf16() {
+            bytes.extend(unit.to_le_bytes());
+        }
+        let path = fixture(&bytes);
+        let session =
+            Session::open_with_encoding(&path, OpenOptions::default(), Some(Encoding::Utf16Le))
+                .unwrap();
+        let index = session
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        // A writer has written half of the next code unit past the snapshot.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"3")
+            .unwrap();
+        let rows = super::read_rows_from_index(
+            &path,
+            b',',
+            &index,
+            0,
+            10,
+            super::DEFAULT_MAX_RECORD_BYTES,
+            Encoding::Utf16Le,
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let fields: Vec<_> = rows.into_iter().map(|row| row.fields).collect();
+        assert_eq!(
+            fields,
+            [["id", "name"], ["1", "a"], ["2", "b"]]
+                .map(|row| row.map(|field| field.as_bytes().to_vec()).to_vec())
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

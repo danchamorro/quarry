@@ -233,7 +233,7 @@ impl DocumentTab {
     }
 
     /// Counts file operations and structural analysis against the global job limit.
-    fn writing(&self) -> bool {
+    pub(super) fn writing(&self) -> bool {
         self.inspection.recovering()
             || self.document.as_ref().is_some_and(|document| {
                 document.save_job.is_some()
