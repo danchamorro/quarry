@@ -243,14 +243,29 @@ def workloads(dataset: str, source: str, output: str) -> list[tuple[str, list[st
 
 
 def verify_expected_input_hashes(before: dict, expected_hashes: dict) -> None:
-    for name, expected in expected_hashes.items():
-        if name not in before:
-            continue
+    if not isinstance(expected_hashes, dict):
+        raise ValueError("Expected input hashes must be a JSON object mapping dataset names to SHA-256 digests")
+    expected_keys = set(expected_hashes.keys())
+    required_keys = set(DATASETS.keys())
+    unknown = sorted(expected_keys - required_keys)
+    missing = sorted(required_keys - expected_keys)
+    if unknown or missing:
+        raise ValueError(
+            f"Expected input hashes must match datasets {sorted(required_keys)} "
+            f"(missing={missing}, unknown={unknown})"
+        )
+    for name in sorted(required_keys):
+        expected = expected_hashes[name]
         actual = before[name]["sha256"]
         if actual != expected:
             raise RuntimeError(
                 f"Input SHA-256 mismatch for {name} ({before[name]['file']}): expected {expected}, got {actual}"
             )
+
+
+def cli_supports_threads(binary: Path) -> bool:
+    probe = subprocess.run([str(binary), "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return "--threads" in (probe.stdout or "")
 
 
 def verify_output_entry(case_key: str, entry: dict, expected_outputs: dict | None, expects_output: bool) -> str | None:
@@ -301,9 +316,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--cache-state",
-        choices=("warm", "cold"),
+        choices=("warm",),
         default="warm",
-        help="Cache protocol label forwarded to quarry-bench (default: warm)",
+        help="Cache protocol label forwarded to quarry-bench (warm-only until an OS cache eviction protocol is approved)",
     )
     args = parser.parse_args()
     if args.repeats < 1:
@@ -355,6 +370,10 @@ def main() -> int:
         and artifact["target"]["name"] == "quarry-bench"
         and artifact.get("executable")
     )
+    if args.threads is not None and not cli_supports_threads(binary):
+        raise RuntimeError(
+            "quarry-bench does not support --threads in this revision; omit --threads until CLI thread control lands"
+        )
 
     results.mkdir(parents=True, exist_ok=False)
     frozen_binary = results / "quarry-bench"

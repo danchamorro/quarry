@@ -56,7 +56,16 @@ def main():
 import os, sys
 from pathlib import Path
 args = sys.argv[1:]
+if args == ["--help"]:
+    if os.environ.get("QUARRY_RUNNER_SMOKE_SUPPORTS_THREADS"):
+        print("usage: quarry-bench [--threads N]")
+    else:
+        print("usage: quarry-bench")
+    sys.exit(0)
 assert "--join" not in args or args.count("--output-header") == 1, "join requires exactly one --output-header value"
+if "--threads" in args and not os.environ.get("QUARRY_RUNNER_SMOKE_SUPPORTS_THREADS"):
+    print("unknown option --threads", file=sys.stderr)
+    sys.exit(2)
 output = (Path(args[args.index("--output") + 1]) if "--output" in args else
           Path(args[2]) if args[0] == "sort-save-as" else None)
 if output and "--cancel-after-bytes" not in args:
@@ -108,8 +117,10 @@ print("mock CLI success")
             fail=False,
             wrong_output_control=False,
             use_default_hashes=False,
+            expected_hashes_override=None,
             expected_outputs=None,
             threads=None,
+            supports_threads=True,
             during_build=None,
         ):
             def build_or_run(command, **kwargs):
@@ -146,7 +157,9 @@ print("mock CLI success")
                 )
 
             argv = [str(script), str(data), str(results)]
-            if not use_default_hashes:
+            if expected_hashes_override is not None:
+                argv.extend(["--expected-hashes", str(expected_hashes_override)])
+            elif not use_default_hashes:
                 argv.extend(["--expected-hashes", str(expected_hashes_file)])
             if expected_outputs is not None:
                 argv.extend(["--expected-outputs", str(expected_outputs)])
@@ -156,6 +169,7 @@ print("mock CLI success")
             env_patch = {
                 "QUARRY_RUNNER_SMOKE_FAIL": "1" if fail else "",
                 "QUARRY_RUNNER_SMOKE_WRONG_OUTPUT": "1" if wrong_output_control else "",
+                "QUARRY_RUNNER_SMOKE_SUPPORTS_THREADS": "1" if supports_threads else "",
             }
             with patch("sys.argv", argv), \
                  patch.dict("os.environ", env_patch), \
@@ -163,7 +177,7 @@ print("mock CLI success")
                  contextlib.redirect_stdout(io.StringIO()):
                 return runner["main"]()
 
-        # 1. Input SHA-256 mismatch must fail immediately before building.
+        # 1. Input SHA-256 mismatch and incomplete/unknown override maps must fail before building.
         rejected = repo / "results/rejected"
         try:
             run(rejected, use_default_hashes=True)
@@ -172,6 +186,26 @@ print("mock CLI success")
         else:
             raise AssertionError("Runner accepted mismatched input SHA-256")
         assert not builds and not rejected.exists()
+
+        incomplete_hashes = fixtures_dir / "incomplete-hashes.json"
+        incomplete_hashes.write_text(json.dumps({"weather": original_sha, "typo": original_sha}) + "\n")
+        try:
+            run(rejected, expected_hashes_override=incomplete_hashes)
+        except ValueError as error:
+            assert "missing=" in str(error) and "unknown=" in str(error)
+        else:
+            raise AssertionError("Runner accepted incomplete/unknown expected hashes map")
+        assert not builds and not rejected.exists()
+
+        # 1b. --threads rejected cleanly when CLI binary does not advertise --threads support.
+        try:
+            run(rejected, threads=4, supports_threads=False)
+        except RuntimeError as error:
+            assert "does not support --threads" in str(error)
+        else:
+            raise AssertionError("Runner forwarded unsupported --threads flag")
+        assert len(builds) == 1 and not rejected.exists()
+        builds.clear()
 
         # 2. Dirty checkout rejection (unstaged, staged, untracked).
         for dirty in ("unstaged", "staged", "untracked"):
