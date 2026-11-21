@@ -12,6 +12,7 @@ parentheses are GitHub pull requests.
 
 ### Added
 
+- Added an independent pure-scalar reference tokenizer and parser oracle in `crates/quarry-delimited/tests/scalar_oracle.rs`, a deterministic seeded torture corpus generator (`scripts/generate-torture-corpus.py`, writing to gitignored `fixtures/generated/torture-corpus/`) with typed expectations in `crates/quarry-core/tests/torture_corpus.rs`, and 64-bit checkpoint/seek arithmetic plus sparse-file tests around 1.1T rows / >16 TB offsets in `crates/quarry-core/src/index.rs`. (#154)
 - Published **[Quarry 0.1.0 beta 3](docs/releases/v0.1.0-beta.3.md)** (build 167, tag `v0.1.0-beta.3`, clean `f5402e4`), Developer ID signed, notarized, and stapled for Apple Silicon macOS, with the build 167 verification report and updated release documentation. (#147)
 
 ### Changed
