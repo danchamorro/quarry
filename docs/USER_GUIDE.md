@@ -279,50 +279,48 @@ Use **File → Join Files…** to match records from two different files and bri
 their columns into a new file. For example, match an orders file's customer ID
 to a customers file's ID to add the customer's city to each order.
 
-1. Choose the **Main** and **Additional** inputs. Use **Choose Main…** /
-   **Choose Additional…** for saved files, or their open-document menus for
-   current documents. Browsing to an already-open file uses that document's
-   current values too, including unsaved cell, header and structural edits.
-   The dialog identifies current documents and inherits their applied formats.
-2. For saved inputs, check each file's header, delimiter and encoding choices.
-   The two inputs may have different delimiters or supported encodings.
-   Auto detects Unicode BOMs; choose legacy encodings explicitly.
-3. Select the paired key columns. Use **Add key pair** for a compound key,
-   up to sixteen pairs. All pairs must match. Column names need not be equal.
-   Use the pair's move/remove controls to change its position.
-4. Choose **Rows to keep**, then select, order and name the output columns.
-   Both inputs' columns, including both keys, are initially included.
-   Select a column to rename its output heading or use the ordering controls.
-   The source headings stay unchanged. Choose whether to write an output header.
-5. Choose **Analyze & Preview**. Quarry scans the complete inputs in the
-   background. Review the exact row/match/unmatched/empty-key counts, duplicate
-   groups, projected result rows and storage allowance. Result, unmatched and
-   duplicate examples are bounded samples; long values are clipped.
-6. Review any row-expansion or newly discovered-column warning. Check its
-   acknowledgement before creating the file. **Reset Analysis** releases the
-   preview so you can change inputs, keys, mode or columns and analyze again.
-7. Choose **Choose Output…**, select a new destination, then choose
-   **Create Joined File**.
-8. After completion, review the actual saved rows and bytes. Choose
-   **Open Joined File** to open it in an ordinary editable tab.
+1. Choose the **Main file** and **Additional file** from the unified file menus
+   at the top of the dialog. When open tabs are ready to join, Quarry preselects
+   up to two open documents automatically. Each menu lists open tabs (using
+   current values, including unsaved cell, header, and structural edits) and
+   **Browse file…** for saved files on disk. Use **Swap** to switch sides.
+2. Under each file, select its **Key column** and choose whether to check
+   **Include unmatched Main rows** / **Include unmatched Additional rows**.
+   Use **+ Add key** for a compound key (up to sixteen pairs; all pairs must
+   match). Use **Ignore case (A–Z)** for ASCII case-insensitive key matching and
+   **Include header row** to control whether the output writes a header row.
+3. In **Output columns**, check the columns to include and use **All**,
+   **Main only**, or **None** for quick selection. Reorder the selected column
+   with **Top**, **Up**, **Down**, and **Bottom**.
+4. Open **Advanced** only when you need saved-file header, delimiter, or
+   encoding overrides, **Require unique Main key** / **Require unique Additional
+   key**, or a custom heading for the selected output column.
+5. Choose **Join…** to pick a new output file, scan and write in one pass, and
+   open the joined file in a new tab automatically. If Quarry detects a
+   many-to-many row expansion or newly discovered ragged columns, it pauses to
+   show counts, sample rows, and a confirmation checkbox before writing. You can
+   also choose **Preview** first to inspect counts, duplicate/unmatched
+   examples, and sample rows before creating the output; use **Back to Edit** to
+   change settings and try again.
 
-**Rows to keep**
+**Unmatched row checkboxes (join type)**
 
-| Choice | Result |
-|---|---|
-| Keep all Main rows | Every Main row, with matching Additional values or empty Additional fields |
-| Matching rows only | Only matching pairs |
-| Keep all Additional rows | Every Additional row, with matching Main values or empty Main fields |
-| Keep all rows from both files | All Main-driven rows, followed by unmatched Additional rows |
+| Main checked | Additional checked | Result |
+|---|---|---|
+| Yes (default) | No | **Left join** — every Main row, with matching Additional values or empty Additional fields |
+| No | No | **Inner join** — matching pairs only |
+| No | Yes | **Right join** — every Additional row, with matching Main values or empty Main fields |
+| Yes | Yes | **Full join** — all Main-driven rows, followed by unmatched Additional rows |
 
 Matching keeps every pair. Two Main rows and three Additional rows with the
-same key produce six rows. If both sides repeat a matching key, Quarry requires
-acknowledgement of the exact expansion. **Require unique Main key** and
-**Require unique Additional key** instead reject repeated nonempty keys in the
-chosen input; they do not discard duplicates or select a first match.
+same key produce six rows. If both sides repeat a matching key, Quarry pauses
+and requires acknowledgement of the exact expansion. **Require unique Main key**
+and **Require unique Additional key** (in **Advanced**) instead reject repeated
+nonempty keys in the chosen input; they do not discard duplicates or select a
+first match.
 
 Keys match complete text values. Comparison is case-sensitive by default.
-**Ignore ASCII letter case (A–Z only)** ignores English-letter case in keys.
+**Ignore case (A–Z)** ignores English-letter case in keys.
 Leading zeros, whitespace, non-ASCII case and Unicode normalization differences
 remain significant. Matching never cleans or changes the saved values. A missing
 or zero-length key component never matches another row, including another empty

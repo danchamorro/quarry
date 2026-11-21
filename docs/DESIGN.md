@@ -187,9 +187,10 @@ egui::Modal::new(id)
   button.
 - Put longer explanations behind a collapsed **Details** header, not in the
   main text.
-- Multi-step dialogs (Join Files) wrap each step in `theme::step_card(ui, n,
-  "Title", ...)`. Show the review step only once there is something to review,
-  and lead it with `theme::stat` headline numbers.
+- Dialogs that group panels side-by-side or show a conditional review section
+  (such as Join Files) use `theme::inset_card(ui, ...)`. Show the review or
+  confirmation panel only when the user asks for a preview or a safety gate
+  needs confirmation, and lead it with `theme::stat` headline numbers.
 - Footers: the dismiss button (Close, Cancel) on the left; the current step's
   actions on the right with the primary last. Right-align them with
   `theme::push_right(ui, theme::buttons_width(ui, &labels))` so Tab order
