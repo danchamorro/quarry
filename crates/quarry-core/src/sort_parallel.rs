@@ -898,16 +898,20 @@ fn row_edit_bytes(
         .fold(0_usize, |acc, (_, v)| acc.saturating_add(v.len()))
 }
 
-/// Conservative upper bound on decoded record + effective record + sort-key memory before
-/// `evaluate_record` allocates, accounting for encoding expansion (Windows-1252, Latin-1, UTF-16),
-/// cell edits (with CSV quote doubling), and multi-column composite-key escaping (`0x00`/`0xFF`
-/// byte doubling) so workers acquire `LargeRecordGate` prior to allocation.
+/// Conservative upper bound on decoded record + effective record + sort-key + parsed field
+/// descriptor memory before `evaluate_record` allocates, accounting for encoding expansion
+/// (Windows-1252, Latin-1, UTF-16), cell edits (with CSV quote doubling), multi-column
+/// composite-key escaping (`0x00`/`0xFF` byte doubling), and `parse_record`'s `Vec<Cow<[u8]>>`
+/// field descriptors (with capacity-doubling headroom) so workers acquire `LargeRecordGate`
+/// prior to allocation.
 pub(super) fn conservative_record_expansion_bound(
-    raw_len: usize,
+    raw_record: &[u8],
+    delimiter: u8,
     edit_bytes: usize,
     encoding: Encoding,
     composite_key: bool,
 ) -> usize {
+    let raw_len = raw_record.len();
     let decode_multiplier = match encoding {
         Encoding::Windows1252 => 3,
         Encoding::Latin1 | Encoding::Utf16Le | Encoding::Utf16Be => 2,
@@ -928,9 +932,28 @@ pub(super) fn conservative_record_expansion_bound(
     let key_bound = decoded_bound
         .saturating_add(edit_bytes)
         .saturating_mul(key_multiplier);
+    // For rows >= 64 KiB, count actual delimiters with SIMD `memchr` so wide text rows with
+    // few columns do not falsely serialize while delimiter-heavy rows account for every
+    // `Cow<[u8]>` descriptor (plus ~2x Vec capacity-doubling headroom).
+    let field_count_bound = if raw_len >= 64 * 1024 {
+        match encoding {
+            Encoding::Utf8 | Encoding::Latin1 | Encoding::Windows1252 => {
+                memchr::memchr_iter(delimiter, raw_record)
+                    .count()
+                    .saturating_add(1)
+            }
+            Encoding::Utf16Le | Encoding::Utf16Be => (raw_len / 2).saturating_add(1),
+        }
+    } else {
+        raw_len.saturating_add(1)
+    };
+    let field_descriptor_bound = field_count_bound
+        .saturating_mul(std::mem::size_of::<Cow<'static, [u8]>>())
+        .saturating_mul(2);
     temp_decode_buffer
         .saturating_add(effective_record_bound)
         .saturating_add(key_bound)
+        .saturating_add(field_descriptor_bound)
         .saturating_add(ARENA_ENTRY_BYTES)
 }
 
@@ -1091,7 +1114,8 @@ fn create_initial_runs_serial(
                              large_guard: &mut Option<LargeRecordGuard>|
      -> Result<bool, QuarryError> {
         let pre_bound = conservative_record_expansion_bound(
-            raw_record.len(),
+            raw_record,
+            delimiter,
             row_edit_bytes(cell_edits, header_renames, has_header, row_num),
             config.encoding,
             spec.keys.len() > 1,
@@ -1523,7 +1547,8 @@ fn create_initial_runs_parallel(
                         return Ok(false);
                     }
                     let pre_bound = conservative_record_expansion_bound(
-                        raw_record.len(),
+                        raw_record,
+                        delimiter,
                         row_edit_bytes(&cell_edits, &header_renames, has_header, row_num),
                         config.encoding,
                         spec.keys.len() > 1,

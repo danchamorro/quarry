@@ -4741,7 +4741,8 @@ mod tests {
     fn pre_evaluation_bound_includes_row_cell_edits() {
         // A tiny raw row with a multi-megabyte cell edit must trigger LargeRecordGate pre-evaluation.
         let bound = parallel::conservative_record_expansion_bound(
-            12,
+            b"0001,short\n",
+            b',',
             2 * 1024 * 1024,
             Encoding::Utf8,
             false,
@@ -4751,11 +4752,39 @@ mod tests {
             "expected pre-evaluation bound ({bound}) to exceed LARGE_RECORD_GATE_BYTES"
         );
         // A 1.5 MiB UTF-8 row in a multi-column composite sort can expand up to ~3x due to NUL escaping.
+        let nul_row = vec![0_u8; 1_500_000];
         let composite_bound =
-            parallel::conservative_record_expansion_bound(1_500_000, 0, Encoding::Utf8, true);
+            parallel::conservative_record_expansion_bound(&nul_row, b',', 0, Encoding::Utf8, true);
         assert!(
             composite_bound > crate::pool::LARGE_RECORD_GATE_BYTES,
             "expected composite pre-evaluation bound ({composite_bound}) to exceed LARGE_RECORD_GATE_BYTES"
+        );
+        // A 200 KiB delimiter-heavy row (< 4 MiB raw) allocates millions of bytes of `Cow<[u8]>`
+        // descriptors in `parse_record` and must take the large-record admission path, while a
+        // 200 KiB two-column row stays below the gate.
+        let comma_row = vec![b','; 200 * 1024];
+        let delimiter_bound = parallel::conservative_record_expansion_bound(
+            &comma_row,
+            b',',
+            0,
+            Encoding::Utf8,
+            false,
+        );
+        assert!(
+            delimiter_bound > crate::pool::LARGE_RECORD_GATE_BYTES,
+            "expected delimiter-heavy bound ({delimiter_bound}) to exceed LARGE_RECORD_GATE_BYTES"
+        );
+        let wide_two_col = vec![b'a'; 200 * 1024];
+        let wide_bound = parallel::conservative_record_expansion_bound(
+            &wide_two_col,
+            b',',
+            0,
+            Encoding::Utf8,
+            false,
+        );
+        assert!(
+            wide_bound < crate::pool::LARGE_RECORD_GATE_BYTES,
+            "expected wide two-column row bound ({wide_bound}) to remain below LARGE_RECORD_GATE_BYTES"
         );
 
         // Verify an indexed parallel sort with short source rows and large cell edits succeeds
@@ -4940,25 +4969,38 @@ mod tests {
 
     #[test]
     fn foreign_index_with_matching_size_and_rows_falls_back_to_serial_cleanly() {
-        // Two distinct CSVs with identical byte size, row count, delimiter, and encoding,
-        // where file_a's checkpoints fall inside a quoted multiline record of file_b.
-        // Passing file_a's index when sorting file_b must reject the foreign provenance and
-        // fall back cleanly to serial scanning instead of failing with `SourceChanged`.
+        // Two distinct CSVs (> 2 * 64 KiB so the local index uses multiple parallel stripes)
+        // with identical byte size, row count, delimiter, and encoding, where file_a's
+        // checkpoints fall inside quoted multiline records of file_b.
+        // Sorting file_b with its own index must run in parallel; passing file_a's index must
+        // reject the foreign provenance and fall back cleanly to serial scanning instead of
+        // failing with `SourceChanged`.
         let directory = tempfile::tempdir().unwrap();
         let file_a = directory.path().join("a.csv");
         let file_b = directory.path().join("b.csv");
 
-        let a_bytes = b"k,v\n3,aaaaaaaaaa\n2,bbbbbbbbbb\n1,cccccccccc\n";
-        let b_bytes = b"k,v\n3,\"aa\nbbbbbb\"\n2,ccccccccc\n1,dddddddddd\n";
+        let mut a_bytes = String::from("k,v\n");
+        let mut b_bytes = String::from("k,v\n");
+        for i in (0..256).rev() {
+            // Each row in both files has identical length (600 bytes), but file_b embeds a
+            // quoted newline at a different offset so file_a's checkpoints fall mid-quote.
+            a_bytes.push_str(&format!("{i:04},{}\n", "a".repeat(594)));
+            b_bytes.push_str(&format!(
+                "{i:04},\"{}\n{}\"\n",
+                "b".repeat(200),
+                "c".repeat(391)
+            ));
+        }
         assert_eq!(a_bytes.len(), b_bytes.len());
-        fs::write(&file_a, a_bytes).unwrap();
-        fs::write(&file_b, b_bytes).unwrap();
+        assert!(a_bytes.len() > 140 * 1024);
+        fs::write(&file_a, a_bytes.as_bytes()).unwrap();
+        fs::write(&file_b, b_bytes.as_bytes()).unwrap();
 
         let sa = session(&file_a, HeaderMode::FirstRow);
         let sb = session(&file_b, HeaderMode::FirstRow);
         let idx_a = sa
             .start_indexing(IndexConfig {
-                checkpoint_every: 1,
+                checkpoint_every: 16,
                 ..IndexConfig::default()
             })
             .unwrap()
@@ -4966,7 +5008,7 @@ mod tests {
             .unwrap();
         let idx_b = sb
             .start_indexing(IndexConfig {
-                checkpoint_every: 1,
+                checkpoint_every: 16,
                 ..IndexConfig::default()
             })
             .unwrap()
@@ -4977,18 +5019,45 @@ mod tests {
         assert!(idx_b.matches_provenance(&sb.source_stamp, sb.dialect.delimiter, sb.encoding));
         assert!(!idx_a.matches_provenance(&sb.source_stamp, sb.dialect.delimiter, sb.encoding));
 
-        let dest = directory.path().join("sorted_b.csv");
-        let job = sb
+        let spec = SortSpec {
+            column: 0,
+            mode: SortMode::Number,
+            direction: SortDirection::Ascending,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        let dest_local = directory.path().join("sorted_b_local.csv");
+        let SortOutcome::Complete(local_summary) = sb
             .start_create_sorted_working_copy_with_options(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                SortSpec {
-                    column: 0,
-                    mode: SortMode::Number,
-                    direction: SortDirection::Ascending,
-                    case_sensitivity: CaseSensitivity::Sensitive,
+                spec,
+                &dest_local,
+                SortOptions {
+                    temporary_directory: Some(directory.path()),
+                    threads: Some(4),
+                    source_index: Some(&idx_b),
+                    memory_budget_bytes: Some(1024 * 1024),
                 },
-                &dest,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("local sort cancelled");
+        };
+        assert!(
+            local_summary.effective_workers >= 2,
+            "local index should enable parallel workers, got {}",
+            local_summary.effective_workers
+        );
+
+        let dest_foreign = directory.path().join("sorted_b_foreign.csv");
+        let SortOutcome::Complete(foreign_summary) = sb
+            .start_create_sorted_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                spec,
+                &dest_foreign,
                 SortOptions {
                     temporary_directory: Some(directory.path()),
                     threads: Some(4),
@@ -4996,15 +5065,60 @@ mod tests {
                     memory_budget_bytes: Some(1024 * 1024),
                 },
             )
-            .unwrap();
-        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
-            panic!("sort cancelled");
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("foreign sort cancelled");
         };
-        assert_eq!(summary.effective_workers, 1);
-        assert_eq!(summary.rows_sorted, 3);
+        assert_eq!(foreign_summary.effective_workers, 1);
+        assert_eq!(foreign_summary.rows_sorted, 256);
         assert_eq!(
-            fs::read(&dest).unwrap(),
-            b"k,v\n1,dddddddddd\n2,ccccccccc\n3,\"aa\nbbbbbb\"\n"
+            fs::read(&dest_foreign).unwrap(),
+            fs::read(&dest_local).unwrap()
+        );
+
+        // Also exercise parallel sorting on delimiter-heavy rows (< 4 MiB raw, > 4 MiB descriptors).
+        let delim_source = directory.path().join("delimiter-heavy.csv");
+        let commas = ",".repeat(120 * 1024);
+        let mut delim_content = format!("k{commas}\n");
+        for key in (0..4).rev() {
+            delim_content.push_str(&format!("{key}{commas}\n"));
+        }
+        fs::write(&delim_source, delim_content.as_bytes()).unwrap();
+        let sd = session(&delim_source, HeaderMode::FirstRow);
+        let idx_d = sd
+            .start_indexing(IndexConfig {
+                checkpoint_every: 1,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let dest_delim = directory.path().join("sorted-delim.csv");
+        let SortOutcome::Complete(delim_summary) = sd
+            .start_create_sorted_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                spec,
+                &dest_delim,
+                SortOptions {
+                    temporary_directory: Some(directory.path()),
+                    threads: Some(4),
+                    source_index: Some(&idx_d),
+                    memory_budget_bytes: Some(2 * 1024 * 1024),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("delimiter-heavy sort cancelled");
+        };
+        assert_eq!(delim_summary.rows_sorted, 4);
+        assert_eq!(
+            fs::read_to_string(&dest_delim).unwrap(),
+            format!("k{commas}\n0{commas}\n1{commas}\n2{commas}\n3{commas}\n")
         );
     }
 }
