@@ -1,7 +1,8 @@
 # ADR 0005: Selected working folders and advisory capacity checks
 
-- Status: Accepted
+- Status: Accepted (amended 2026-11-22)
 - Date: 2026-09-05
+- Amended: 2026-11-22 (persisted scratch directory, adaptive 300 MB single-run memory budget, and `mmap` deferral)
 
 ## Context
 
@@ -73,3 +74,55 @@ original temporary-storage implementation. The later private-handoff change is
 covered separately by core regressions for abandonment, destination conflicts,
 source changes while awaiting handoff, cancellation, publication, and staging
 permissions. The earlier installed-app checks do not validate that later change.
+
+## Amendment (2026-11-22): Persisted scratch folder, adaptive 300 MB single-run budget, and `mmap` deferral
+
+### Persisted scratch folder with strict revalidation
+
+The desktop application now persists a user-selected custom temporary working folder
+across restarts in an owner-only preferences file (`storage-preferences`, `0600` on
+Unix). Selecting `"Use system temporary folder"` clears the persisted custom path back
+to the OS default.
+
+Every persisted custom scratch folder is revalidated on startup (non-blocking) and
+strictly before every operation that writes temporary or working-copy files:
+
+- Must be a non-empty absolute path to an existing real directory.
+- Must not traverse or target a symbolic link or Windows reparse point (allowing macOS's
+  OS-level `/var` and `/tmp` root links).
+- Must be owned by the current user (`uid == geteuid()` on Unix; on Windows, owner SID
+  matches `TokenUser`, or `TokenOwner` for elevated process tokens whose default new-object
+  owner is their administrative group).
+- Must support creating, writing, and removing a private temporary workspace with
+  owner-only permissions (`0700` and cleared inherited ACLs on macOS; protected owner-only
+  DACL on Windows workspaces and spill runs).
+
+If revalidation fails (for example, an external drive was disconnected, unmounted,
+replaced by a symlink, or no longer enforces private permissions), Quarry surfaces a
+warning notice and requires the user to choose another folder or explicitly return to
+the system temporary folder. Quarry **never** silently falls back to another volume.
+
+### Adaptive single-run memory budget (300 MB default)
+
+External sort uses a configurable tracked-payload single-run memory budget defaulting to
+**300,000,000 bytes** (300 MB decimal), capped at 25% of host physical RAM (floored at
+16 MiB) and drawn from the engine pool's shared out-of-core byte budget. The two-job
+write cap (`MAX_WRITE_JOBS`) is enforced by the desktop application for file-writing
+slots; `EnginePool` enforces the shared byte budget and worker thread cap across
+concurrent engine callers.
+
+Rather than maintaining a second in-RAM code path, run generation fills one contiguous
+tracked-payload arena per active worker, reserving budget capacity before admitting
+rows. If the input finishes within budget, Quarry sorts the in-memory arena(s) and
+streams directly to the guarded `ExportTarget` through the exact same comparator,
+`OutputVerifier`, and `StructuralIndex` builder with zero temporary spill files. If the
+input exceeds the budget or another concurrent job claims shared budget, workers spill
+seamlessly to a lazily created private `SpillWorkspace` and continue externally through
+bounded parallel intermediate merges and a serial verified final merge.
+
+### `mmap` deferral on Quarry-owned runs
+
+Memory-mapping (`mmap`) remains explicitly deferred even for Quarry-owned spill runs:
+an unplugged external scratch volume can raise unrecoverable `SIGBUS`, sequential
+positional reads (`pread`/`seek_read` with OS read-ahead hints) already saturate local
+storage without mapping risks, and file-backed page mappings distort RSS accounting.

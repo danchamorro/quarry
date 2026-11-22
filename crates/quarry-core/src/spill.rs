@@ -327,6 +327,7 @@ impl SpillWorkspace {
         for _ in 0..100 {
             let id = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!(".quarry-{namespace}-{}-{id}", std::process::id()));
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             builder.mode(0o700);
@@ -363,6 +364,42 @@ impl SpillWorkspace {
                         }
                         #[cfg(target_os = "macos")]
                         crate::storage::set_macos_acl(&directory.file, None)?;
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+                            use std::os::windows::io::AsRawHandle;
+                            use windows_sys::Win32::Storage::FileSystem::{
+                                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+                                FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+                                FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                            };
+                            const READ_CONTROL: u32 = 0x0002_0000;
+                            const WRITE_DAC: u32 = 0x0004_0000;
+                            let acl_handle = fs::OpenOptions::new()
+                                .access_mode(
+                                    FILE_LIST_DIRECTORY
+                                        | FILE_READ_ATTRIBUTES
+                                        | READ_CONTROL
+                                        | WRITE_DAC,
+                                )
+                                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                                .custom_flags(
+                                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                )
+                                .open(&path)?;
+                            let acl_meta = acl_handle.metadata()?;
+                            if !acl_meta.is_dir()
+                                || (acl_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                            {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "temporary workspace cannot be a reparse point",
+                                ));
+                            }
+                            crate::sidecar::set_windows_owner_only_dacl(
+                                acl_handle.as_raw_handle(),
+                            )?;
+                        }
                         Ok(())
                     })();
                     if let Err(error) = prepared {
@@ -422,7 +459,23 @@ impl SpillWorkspace {
             )
             .map_err(|error| storage_error(&self.path, error.into()))?,
         );
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            };
+            const WRITE_DAC: u32 = 0x0004_0000;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC)
+                .create_new(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(directory.current_path()?.join(run_name(id)))
+                .map_err(|error| storage_error(&self.path, error))?
+        };
+        #[cfg(not(any(unix, windows)))]
         let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -434,6 +487,15 @@ impl SpillWorkspace {
             drop(file);
             let _ = remove_owned(directory, id, &identity);
             return Err(storage_error(&self.path, error));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            if let Err(error) = crate::sidecar::set_windows_owner_only_dacl(file.as_raw_handle()) {
+                drop(file);
+                let _ = remove_owned(directory, id, &identity);
+                return Err(storage_error(&self.path, error));
+            }
         }
         state.files.insert(id, identity);
         Ok((

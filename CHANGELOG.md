@@ -8,6 +8,12 @@ Tagged beta releases are noted on the day they were published, with exact
 checksums and verification details under `docs/releases/`. Numbers in
 parentheses are GitHub pull requests.
 
+## [2026-11-22]
+
+### Added
+
+- Added checkpoint-striped parallel external sort, an adaptive 300 MB single-run memory budget, and a persisted scratch folder across `quarry-core`, `quarry-cli`, and `quarry-egui`: parallel run generation and disjoint intermediate merge passes (`crates/quarry-core/src/sort_parallel.rs`, `SortOptions`, `Session::start_create_sorted_working_copy_with_options`, `SortSummary::{effective_workers, in_memory_fast_path}`) run on `EnginePool` with positional reads, associative multiset fingerprints, deterministic earliest-error reporting, a shared `out_of_core_budget` + `LargeRecordGate` + `FdBudget` (staying safely beneath macOS's 256 soft FD limit), and immediate unlinking of completed merge-group inputs; a unified contiguous `RunArena` streams inputs that fit within the RAM-capped 300,000,000-byte default budget directly through `VerifiedOutputWriter` with zero spill files and spills seamlessly on overflow; `validate_scratch_directory` and `File > Temporary storage…` persist custom scratch folders in owner-only `storage-preferences` (`0600`) with strict per-use revalidation (no silent volume fallback); `sort-save-as` wires `--threads` and adds `--memory-budget` plus worker/fast-path telemetry; and ADR 0005 (`docs/adr/0005-temporary-storage.md`) and `docs/V1_CLAIM_LEDGER.md` (`T14`, `T6`, `C16`) document the persisted scratch policy, adaptive budget, and `mmap` deferral. (#173)
+
 ## [2026-11-21]
 
 ### Added

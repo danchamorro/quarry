@@ -287,7 +287,7 @@ pub(super) struct JoinDialog {
     acknowledge_expansion: bool,
     acknowledge_layout: bool,
     mode: JoinMode,
-    temporary: PathBuf,
+    pub(super) temporary: PathBuf,
     header_jobs: [Option<JoinJob<HeaderInfo>>; 2],
     retired_headers: Vec<RetiredHeader>,
     checking: Option<JoinJob<JoinPlan>>,
@@ -2248,7 +2248,10 @@ impl QuarryApp {
         if !self.write_slot_available() {
             return Err("Wait for an operation slot before analyzing.".into());
         }
-        self.join_files.as_mut().unwrap().start_analysis(working);
+        self.ensure_working_directory_available()?;
+        let dialog = self.join_files.as_mut().unwrap();
+        dialog.temporary = self.working_directory.clone();
+        dialog.start_analysis(working);
         Ok(())
     }
 
@@ -2385,6 +2388,11 @@ impl QuarryApp {
 
     /// Keep one join draft, using the configured private-storage location.
     pub(super) fn open_join_files(&mut self) {
+        if let Err(message) = self.ensure_working_directory_available() {
+            self.active.notice = Some(AppMessage::warning(message));
+            self.open_storage_settings();
+            return;
+        }
         if self.join_files.is_none() {
             self.join_files = Some(JoinDialog::new(self.working_directory.clone()));
             self.preselect_open_join_documents();
@@ -2708,8 +2716,8 @@ mod tests {
     fn prepare(app: &mut QuarryApp, dir: &Path) -> (PathBuf, PathBuf) {
         let a = fixture(dir, "main.csv", b"id,name\nb,Bob\na,Alice\nz,Last\n");
         let b = fixture(dir, "additional.csv", b"id,city\na,Seattle\nb,LA\n");
+        app.working_directory = dir.to_path_buf();
         app.open_join_files();
-        app.join_files.as_mut().unwrap().temporary = dir.to_path_buf();
         app.join_files.as_mut().unwrap().read_header(0, a.clone());
         finish(app);
         app.join_files.as_mut().unwrap().read_header(1, b.clone());

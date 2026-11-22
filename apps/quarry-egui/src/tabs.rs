@@ -599,6 +599,7 @@ impl QuarryApp {
             return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
         }
         document.working_directory = self.working_directory.clone();
+        document.custom_working_directory = self.custom_working_directory;
         document.index_cache_enabled = self.index_cache_enabled;
         document.working_cleanup = self.working_cleanup.clone();
         document.decompression_slots = self.decompression_slots.clone();

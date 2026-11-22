@@ -345,10 +345,13 @@ struct QuarryApp {
     decompression_slots: compressed::DecompressionSlots,
     document_cleanup: Option<tabs::DocumentCleanup>,
     whitespace_preferences: whitespace::Preferences,
+    storage_preferences: storage::StoragePreferences,
     about: about::About,
     combine_files: Option<combine_files::CombineDialog>,
     join_files: Option<join_files::JoinDialog>,
     working_directory: PathBuf,
+    custom_working_directory: bool,
+    scratch_validation_worker: Option<(PathBuf, std::thread::JoinHandle<Result<(), String>>)>,
     index_cache_enabled: bool,
     cache_clear_status: Option<Result<String, String>>,
     cache_clear_worker: Option<std::thread::JoinHandle<Result<String, String>>>,
@@ -791,6 +794,8 @@ impl QuarryApp {
     fn with_paths(paths: Vec<PathBuf>, started: Instant) -> Self {
         let mut app = Self::new(None, started);
         app.whitespace_preferences = whitespace::Preferences::application();
+        app.storage_preferences = storage::StoragePreferences::application();
+        app.apply_loaded_storage_preferences();
         app.handle_dropped_paths(paths.into_iter().map(Some).collect());
         app
     }
@@ -799,6 +804,7 @@ impl QuarryApp {
     fn new(initial_path: Option<PathBuf>, started: Instant) -> Self {
         let mut app = Self {
             whitespace_preferences: whitespace::Preferences::default(),
+            storage_preferences: storage::StoragePreferences::default(),
             about: about::About::new(),
             combine_files: None,
             join_files: None,
@@ -806,6 +812,8 @@ impl QuarryApp {
             decompression_slots: compressed::DecompressionSlots::default(),
             document_cleanup: None,
             working_directory: std::env::temp_dir(),
+            custom_working_directory: false,
+            scratch_validation_worker: None,
             index_cache_enabled: true,
             cache_clear_status: None,
             cache_clear_worker: None,
@@ -909,6 +917,7 @@ impl QuarryApp {
         encoding: Option<Encoding>,
     ) -> Result<(), AppMessage> {
         document.working_directory = self.working_directory.clone();
+        document.custom_working_directory = self.custom_working_directory;
         document.index_cache_enabled = self.index_cache_enabled;
         document.working_cleanup = self.working_cleanup.clone();
         document.decompression_slots = self.decompression_slots.clone();
@@ -920,6 +929,9 @@ impl QuarryApp {
                 .is_some_and(Document::decompression_running);
             if !self.write_slot_available_releasing(usize::from(outgoing)) {
                 return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
+            }
+            if let Err(message) = self.ensure_working_directory_available() {
+                return Err(AppMessage::warning(message));
             }
             if let Some(current) = self.active.document.as_mut() {
                 current.release_decompression();
@@ -1806,6 +1818,7 @@ impl QuarryApp {
         replacement.original_session = current.original_session.take();
         replacement.working_copy = current.working_copy.take();
         replacement.working_directory = self.working_directory.clone();
+        replacement.custom_working_directory = self.custom_working_directory;
         replacement.working_cleanup = self.working_cleanup.clone();
         replacement.selected_columns = ready.selected_columns;
         let first_selected = replacement.selected_columns.iter().next().copied();
@@ -2028,6 +2041,7 @@ impl QuarryApp {
         replacement.original_session = current.original_session.take();
         replacement.working_copy = Some(state);
         replacement.working_directory = self.working_directory.clone();
+        replacement.custom_working_directory = self.custom_working_directory;
         replacement.working_cleanup = self.working_cleanup.clone();
         current.shutdown();
         self.active.document = Some(replacement);
@@ -2354,6 +2368,7 @@ impl eframe::App for QuarryApp {
         self.poll_document_tabs(ctx);
         self.poll_inspections(ctx);
         self.poll_cache_clear_worker();
+        self.poll_scratch_validation_worker();
 
         if self.active.close_confirmation_open {
             self.about.open = false;
@@ -3023,7 +3038,10 @@ impl eframe::App for QuarryApp {
         {
             self.about.show(ctx);
         }
-        if self.document_tabs().any(DocumentTab::busy) || self.cache_clear_worker.is_some() {
+        if self.document_tabs().any(DocumentTab::busy)
+            || self.cache_clear_worker.is_some()
+            || self.scratch_validation_worker.is_some()
+        {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
         if self.combine_files.is_some() {
@@ -6449,6 +6467,7 @@ struct Document {
     pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
     pending_diagnostic_message: Option<String>,
     working_directory: PathBuf,
+    custom_working_directory: bool,
     index_cache_enabled: bool,
     working_cleanup: quarry_core::WorkingCopyCleanup,
     /// The app's decompression slots, which a compressed document's pass claims.
@@ -6643,6 +6662,7 @@ impl Document {
             pending_diagnostic: None,
             pending_diagnostic_message: None,
             working_directory: std::env::temp_dir(),
+            custom_working_directory: false,
             index_cache_enabled: true,
             working_cleanup: quarry_core::WorkingCopyCleanup::default(),
             decompression_slots: compressed::DecompressionSlots::default(),
@@ -7152,11 +7172,17 @@ impl Document {
             destination,
             renames,
         } = self.prepare_materialization()?;
-        let job = match self.session.start_create_sorted_working_copy(
+        let job = match self.session.start_create_sorted_working_copy_with_options(
             renames,
             self.owned_cell_edits(),
             plan.clone(),
             &destination,
+            quarry_core::SortOptions {
+                temporary_directory: Some(&self.working_directory),
+                source_index: self.index.as_ref(),
+                threads: None,
+                memory_budget_bytes: None,
+            },
         ) {
             Ok(job) => job,
             Err(QuarryError::SourceChanged) => {
@@ -7326,6 +7352,14 @@ impl Document {
                 Err(error) => return Err(AppMessage::core_error(error)),
             };
             self.original_session = Some(original);
+        }
+        if self.custom_working_directory {
+            quarry_core::validate_scratch_directory(&self.working_directory).map_err(|error| {
+                AppMessage::error(storage::format_unavailable_scratch_notice(
+                    &self.working_directory,
+                    &error.to_string(),
+                ))
+            })?;
         }
         if self.working_copy.is_none() {
             self.working_copy = Some(
