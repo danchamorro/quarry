@@ -452,7 +452,8 @@ where
     })
 }
 
-/// Run two independent inspection passes in parallel while preserving Main-before-Additional error priority.
+/// Run two independent inspection passes in parallel while preserving Main-before-Additional error
+/// priority and stopping Additional promptly via a side-local signal if Main fails.
 pub(super) fn inspect_pair(
     inputs: [JoinInput; 2],
     working: [Option<JoinWorkingSource>; 2],
@@ -463,12 +464,16 @@ pub(super) fn inspect_pair(
     let [left_input, right_input] = inputs;
     let [left_working, right_working] = working;
 
+    let main_failed = Arc::new(AtomicBool::new(false));
+    let right_state = Arc::new(Progress::with_parent(Arc::clone(state)));
     let left_result: Arc<Mutex<Option<JResult<Inspected>>>> = Arc::new(Mutex::new(None));
     let right_result: Arc<Mutex<Option<JResult<Inspected>>>> = Arc::new(Mutex::new(None));
 
     let left_slot = Arc::new(Mutex::new(Some((left_input, left_working))));
     let right_slot = Arc::new(Mutex::new(Some((right_input, right_working))));
     let state_arc = Arc::clone(state);
+    let right_state_worker = Arc::clone(&right_state);
+    let main_failed_worker = Arc::clone(&main_failed);
     let left_result_worker = Arc::clone(&left_result);
     let right_result_worker = Arc::clone(&right_result);
 
@@ -478,15 +483,26 @@ pub(super) fn inspect_pair(
                 return;
             };
             let res = inspect_inner(input, working, config, &state_arc);
+            if res.is_err() {
+                main_failed_worker.store(true, Ordering::Release);
+                right_state_worker.cancel.store(true, Ordering::Release);
+            }
             *left_result_worker.lock().unwrap() = Some(res);
         } else {
+            if main_failed_worker.load(Ordering::Acquire) {
+                return;
+            }
             let Some((input, working)) = right_slot.lock().unwrap().take() else {
                 return;
             };
-            let res = inspect_inner(input, working, config, &state_arc);
+            let res = inspect_inner(input, working, config, &right_state_worker);
             *right_result_worker.lock().unwrap() = Some(res);
         }
     })?;
+
+    state
+        .bytes
+        .fetch_add(right_state.bytes.load(Ordering::Acquire), Ordering::Release);
 
     let left = left_result
         .lock()
@@ -960,10 +976,12 @@ impl AnalysisTable {
     fn prepare_for_metas(&mut self, metas: [&PartitionMeta; 2], mem_cap: usize) {
         self.reset(mem_cap);
         let Ok(est_groups) = usize::try_from(metas[0].rows.saturating_add(metas[1].rows)) else {
+            self.reset(0);
             return;
         };
         let Ok(est_keys) = usize::try_from(metas[0].key_bytes.saturating_add(metas[1].key_bytes))
         else {
+            self.reset(0);
             return;
         };
         if est_groups == 0 {
@@ -976,8 +994,31 @@ impl AnalysisTable {
             .saturating_add(est_groups.saturating_mul(std::mem::size_of::<AnalysisGroup>()))
             .saturating_add(slot_len.saturating_mul(std::mem::size_of::<u32>()));
         if projected > mem_cap {
-            // High-duplicate partitions may still fit dynamically; grow on demand instead.
+            // High-duplicate partitions may still fit dynamically; drop any incompatible retained
+            // buffers from prior partitions so on-demand growth gets the full `mem_cap`.
+            self.reset(0);
             return;
+        }
+        // Account for retained buffers from prior partitions BEFORE reserving any growth so
+        // combined capacity never exceeds `mem_cap` even transiently.
+        let combined = self
+            .key_arena
+            .capacity()
+            .max(est_keys)
+            .saturating_add(
+                self.groups
+                    .capacity()
+                    .max(est_groups)
+                    .saturating_mul(std::mem::size_of::<AnalysisGroup>()),
+            )
+            .saturating_add(
+                self.slots
+                    .capacity()
+                    .max(slot_len)
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
+        if combined > mem_cap {
+            self.reset(0);
         }
         if self.key_arena.capacity() < est_keys
             && self.key_arena.try_reserve_exact(est_keys).is_err()
@@ -991,6 +1032,7 @@ impl AnalysisTable {
             return;
         }
         if self.slots.len() < slot_len {
+            self.slots = Vec::new();
             let mut new_slots = Vec::new();
             if new_slots.try_reserve_exact(slot_len).is_err() {
                 self.reset(0);
@@ -2332,6 +2374,38 @@ impl AnalysisAccumulator {
     }
 }
 
+fn fallback_sort_config(config: JoinConfig, hash_budget_total: usize) -> JoinConfig {
+    JoinConfig {
+        memory_bytes: config.memory_bytes.saturating_sub(hash_budget_total),
+        ..config
+    }
+}
+
+/// Extra bytes a fallback sort-merge must reserve from `JobByteBudget` when `max_key` is so large
+/// that even a 2-way merge exceeds the non-hash slice of `config.memory_bytes`.
+fn fallback_extra_budget_bytes(
+    config: JoinConfig,
+    hash_budget_total: usize,
+    max_key: usize,
+) -> usize {
+    let fallback_mem = config.memory_bytes.saturating_sub(hash_budget_total);
+    let reserved = config
+        .max_record_bytes
+        .saturating_mul(3)
+        .saturating_add(config.run_memory_bytes)
+        .saturating_add(config.group_memory_bytes)
+        .saturating_add(config.preview_bytes)
+        .saturating_add(GROUP_EXAMPLE_RESERVE)
+        .saturating_add(config.max_columns.saturating_mul(64))
+        .saturating_add(4 * 1024 * 1024);
+    let head = max_key.saturating_add(8192 + 64);
+    let min_two_way_need = head.saturating_mul(3);
+    let available = fallback_mem.saturating_sub(reserved);
+    min_two_way_need
+        .saturating_sub(available)
+        .min(hash_budget_total)
+}
+
 fn analyze_partitioned(
     inputs: &[PreparedInput; 2],
     sides: [PartitionedInput; 2],
@@ -2346,6 +2420,7 @@ fn analyze_partitioned(
     let columns = output.columns.len() as u64;
 
     let (hash_budget_total, per_partition_cap) = hash_budget_limits(config);
+    let fallback_config = fallback_sort_config(config, hash_budget_total);
     let max_part_est = (0..partition_count)
         .map(|p| estimate_analysis_ram(&sides[0].partitions[p], &sides[1].partitions[p]))
         .max()
@@ -2357,7 +2432,7 @@ fn analyze_partitioned(
         MAX_HASH_WORKERS
     };
     let budget = Arc::new(JobByteBudget::new(hash_budget_total));
-    let fallback_lock = Arc::new(Mutex::new(()));
+    let fallback_lock: Arc<Mutex<Option<Failure>>> = Arc::new(Mutex::new(None));
     let next_part = Arc::new(AtomicUsize::new(0));
     let accumulator = Arc::new(Mutex::new(AnalysisAccumulator::new(
         partition_count,
@@ -2473,11 +2548,38 @@ fn analyze_partitioned(
                 // Exceeded budget dynamically; release table and permit before sort-merge fallback.
                 table.reset(0);
                 held_permit = None;
-                let _fb = fb_arc.lock().unwrap();
-                let analyzed =
-                    analyze_partition_sort_merge(&in_arc, metas, columns, &ws, config, &st)?;
-                st.records.fetch_add(metas[0].rows, Ordering::AcqRel);
-                Ok(analyzed)
+                let mut fb_fatal = fb_arc.lock().unwrap();
+                if fb_fatal.is_some() {
+                    return Err(Failure::Cancelled);
+                }
+                let max_key = metas[0].max_key_bytes.max(metas[1].max_key_bytes).max(16);
+                let extra_budget = fallback_extra_budget_bytes(config, hash_budget_total, max_key);
+                let _fb_permit = if extra_budget > 0 {
+                    Some(b_arc.acquire(extra_budget, &st)?)
+                } else {
+                    None
+                };
+                match analyze_partition_sort_merge(
+                    &in_arc,
+                    metas,
+                    columns,
+                    &ws,
+                    fallback_config,
+                    &st,
+                ) {
+                    Ok(analyzed) => {
+                        st.records.fetch_add(metas[0].rows, Ordering::AcqRel);
+                        Ok(analyzed)
+                    }
+                    Err(Failure::Cancelled) => Err(Failure::Cancelled),
+                    Err(err) => {
+                        // Record the fatal fallback/cleanup failure before releasing `fallback_lock`
+                        // so no later worker can start another fallback beyond the single-fallback
+                        // disk allowance.
+                        *fb_fatal = Some(err);
+                        Err(Failure::Cancelled)
+                    }
+                }
             })();
             if out.is_err() {
                 table.reset(0);
@@ -2506,6 +2608,9 @@ fn analyze_partitioned(
             "Repeated key found, but Require unique key is enabled for this input.",
         )
         .into());
+    }
+    if let Some(err) = fallback_lock.lock().unwrap().take() {
+        return Err(err);
     }
     if let Some(err) = acc.first_error {
         return Err(err);
@@ -2836,7 +2941,35 @@ impl BuildTable {
             .saturating_add(est_rows.saturating_mul(std::mem::size_of::<BuildBucket>()))
             .saturating_add(slot_len.saturating_mul(std::mem::size_of::<u32>()));
         if projected > mem_cap {
+            self.reset(0);
             return Err(());
+        }
+        // Account for retained buffers from prior partitions BEFORE reserving any growth so
+        // combined capacity never exceeds `mem_cap` even transiently.
+        let combined = self
+            .key_arena
+            .capacity()
+            .max(est_keys)
+            .saturating_add(
+                self.rows
+                    .capacity()
+                    .max(est_rows)
+                    .saturating_mul(std::mem::size_of::<BuildRow>()),
+            )
+            .saturating_add(
+                self.buckets
+                    .capacity()
+                    .max(est_rows)
+                    .saturating_mul(std::mem::size_of::<BuildBucket>()),
+            )
+            .saturating_add(
+                self.slots
+                    .capacity()
+                    .max(slot_len)
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
+        if combined > mem_cap {
+            self.reset(0);
         }
         if self.key_arena.capacity() < est_keys {
             self.key_arena.try_reserve_exact(est_keys).map_err(|_| ())?;
@@ -2848,6 +2981,7 @@ impl BuildTable {
             self.buckets.try_reserve_exact(est_rows).map_err(|_| ())?;
         }
         if self.slots.len() < slot_len {
+            self.slots = Vec::new();
             let mut new_slots = Vec::new();
             new_slots.try_reserve_exact(slot_len).map_err(|_| ())?;
             new_slots.resize(slot_len, EMPTY_SLOT);
@@ -3670,6 +3804,7 @@ pub(super) fn write_partitioned(
     }
 
     let (hash_budget_total, per_partition_cap) = hash_budget_limits(config);
+    let fallback_config = fallback_sort_config(config, hash_budget_total);
     let max_build_est = (0..partition_count)
         .filter(|&p| !hash_plan.partition_plans[p].use_sort_merge)
         .map(|p| {
@@ -3685,7 +3820,7 @@ pub(super) fn write_partitioned(
         MAX_HASH_WORKERS
     };
     let budget = Arc::new(JobByteBudget::new(hash_budget_total));
-    let fallback_lock = Arc::new(Mutex::new(()));
+    let fallback_lock: Arc<Mutex<Option<Failure>>> = Arc::new(Mutex::new(None));
     let next_part = Arc::new(AtomicUsize::new(0));
     let results: Arc<Mutex<Vec<Option<JResult<PartitionCreateOut>>>>> =
         Arc::new(Mutex::new((0..partition_count).map(|_| None).collect()));
@@ -3858,10 +3993,31 @@ pub(super) fn write_partitioned(
                 }
                 table.reset(0);
                 held_permit = None;
-                let _fb = fb_arc.lock().unwrap();
-                let created = create_partition_sort_merge(&in_arc, metas, &ws, config, &st)?;
-                unlink_partition_pair(metas, &st)?;
-                Ok(created)
+                let mut fb_fatal = fb_arc.lock().unwrap();
+                if fb_fatal.is_some() {
+                    return Err(Failure::Cancelled);
+                }
+                let max_key = metas[0].max_key_bytes.max(metas[1].max_key_bytes).max(16);
+                let extra_budget = fallback_extra_budget_bytes(config, hash_budget_total, max_key);
+                let _fb_permit = if extra_budget > 0 {
+                    Some(b_arc.acquire(extra_budget, &st)?)
+                } else {
+                    None
+                };
+                match create_partition_sort_merge(&in_arc, metas, &ws, fallback_config, &st) {
+                    Ok(created) => {
+                        unlink_partition_pair(metas, &st)?;
+                        Ok(created)
+                    }
+                    Err(Failure::Cancelled) => Err(Failure::Cancelled),
+                    Err(err) => {
+                        // Record the fatal fallback/cleanup failure before releasing `fallback_lock`
+                        // so no later worker can start another fallback beyond the single-fallback
+                        // disk allowance.
+                        *fb_fatal = Some(err);
+                        Err(Failure::Cancelled)
+                    }
+                }
             })();
             if out.is_err() {
                 table.reset(0);
@@ -3874,6 +4030,9 @@ pub(super) fn write_partitioned(
     })?;
 
     state.check()?;
+    if let Some(err) = fallback_lock.lock().unwrap().take() {
+        return Err(err);
+    }
     let mut pair_runs: Vec<Run> = Vec::new();
     let part_results = std::mem::take(&mut *results.lock().unwrap());
     for slot in part_results {
@@ -4050,5 +4209,150 @@ pub(super) fn write_partitioned(
             primary.description()
         ))
         .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn job_byte_budget_waiter_observes_cancellation_while_permit_remains_held() {
+        let budget = Arc::new(JobByteBudget::new(1024));
+        let state = Arc::new(Progress::new());
+        let first_permit = budget.acquire(1024, &state).expect("first permit acquired");
+
+        let (wait_tx, wait_rx) = mpsc::channel();
+        let (res_tx, res_rx) = mpsc::channel();
+        let budget_worker = Arc::clone(&budget);
+        let state_worker = Arc::clone(&state);
+        let wait_signal = Arc::new(Mutex::new(Some(wait_tx)));
+        let waiter = std::thread::spawn(move || {
+            let _guard = storage_test::install(storage_test::Hook {
+                budget_wait_signal: Some(wait_signal),
+                ..storage_test::Hook::default()
+            });
+            let result = budget_worker
+                .acquire(512, &state_worker)
+                .map(|permit| permit.bytes);
+            let _ = res_tx.send(result);
+        });
+
+        wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter must enter JobByteBudget::acquire wait");
+        state.cancel.store(true, Ordering::Release);
+
+        // Keep `first_permit` held until the waiter reports `Failure::Cancelled`.
+        // On timeout, drop `first_permit` first so the waiter can be reaped cleanly.
+        let outcome = match res_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(err) => {
+                drop(first_permit);
+                let _ = waiter.join();
+                panic!("waiter did not observe cancellation while permit remained held: {err}");
+            }
+        };
+        assert!(
+            matches!(outcome, Err(Failure::Cancelled)),
+            "expected Failure::Cancelled while first permit is still held, got {outcome:?}"
+        );
+        drop(first_permit);
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn retained_tables_reset_incompatible_buffers_before_reserving_growth() {
+        let cap = 256 * 1024;
+        let mut analysis = AnalysisTable::new();
+        let long_key_meta = PartitionMeta {
+            rows: 10,
+            key_bytes: 200 * 1024,
+            ..PartitionMeta::default()
+        };
+        let empty_meta = PartitionMeta::default();
+        analysis.prepare_for_metas([&long_key_meta, &empty_meta], cap);
+        assert!(analysis.key_arena.capacity() >= 200 * 1024);
+        assert!(analysis.mem_bytes() <= cap);
+
+        // Next partition has tiny keys but many groups (~140 KiB groups+slots): combined with the
+        // old 200 KiB key arena would exceed 256 KiB, so `prepare_for_metas` must drop the old
+        // arena before reserving.
+        let many_groups_meta = PartitionMeta {
+            rows: 2_000,
+            key_bytes: 16 * 1024,
+            ..PartitionMeta::default()
+        };
+        analysis.prepare_for_metas([&many_groups_meta, &empty_meta], cap);
+        assert!(analysis.mem_bytes() <= cap);
+        assert!(analysis.groups.capacity() >= 2_000);
+
+        let mut build = BuildTable::new();
+        build.prepare_for_meta(&long_key_meta, cap).unwrap();
+        assert!(build.key_arena.capacity() >= 200 * 1024);
+        assert!(build.mem_bytes() <= cap);
+
+        let many_rows_meta = PartitionMeta {
+            rows: 2_500,
+            key_bytes: 16 * 1024,
+            ..PartitionMeta::default()
+        };
+        build.prepare_for_meta(&many_rows_meta, cap).unwrap();
+        assert!(build.mem_bytes() <= cap);
+        assert!(build.rows.capacity() >= 2_500);
+    }
+
+    #[test]
+    fn inspect_pair_main_failure_returns_main_error_without_scanning_additional() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_main = dir.path().join("empty-main.csv");
+        let missing_add = dir.path().join("never-opened-add.csv");
+        fs::write(&empty_main, b"").unwrap();
+        // Even with a single worker, Main failing must skip Additional and return Main's error
+        // rather than Additional's error or user cancellation.
+        let _guard = storage_test::install(storage_test::Hook {
+            force_single_pool_worker: true,
+            ..storage_test::Hook::default()
+        });
+        let state = Arc::new(Progress::new());
+        let err = inspect_pair(
+            [
+                JoinInput {
+                    path: empty_main.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: missing_add,
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ],
+            [None, None],
+            JoinConfig::default(),
+            &state,
+        )
+        .err()
+        .expect("empty main input must fail");
+        assert!(
+            matches!(
+                err,
+                Failure::Error(QuarryError::JoinFile {
+                    path: Some(ref p),
+                    ..
+                }) if *p == empty_main
+            ),
+            "expected Main JoinFile error, got {err:?}"
+        );
+        assert!(!state.is_cancelled());
     }
 }

@@ -223,7 +223,7 @@ struct HeaderReader<'a, R> {
 
 impl<R: Read> Read for HeaderReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.state.cancel.load(Ordering::Acquire) {
+        if self.state.is_cancelled() {
             return Err(io::Error::other("Header reading cancelled."));
         }
         let limit = buffer.len().min(READ_CHUNK);
@@ -235,7 +235,7 @@ impl<R: Read> Read for HeaderReader<'_, R> {
 
 impl<R: Seek> Seek for HeaderReader<'_, R> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        if self.state.cancel.load(Ordering::Acquire) {
+        if self.state.is_cancelled() {
             return Err(io::Error::other("Header reading cancelled."));
         }
         self.inner.seek(position)
@@ -642,6 +642,7 @@ struct Progress {
     peak: AtomicU64,
     group_peak: AtomicUsize,
     cancel: AtomicBool,
+    parent_cancel: Option<Arc<Progress>>,
     done: AtomicBool,
     discovered: Mutex<Option<[JoinHeader; 2]>>,
 }
@@ -656,14 +657,30 @@ impl Progress {
             peak: AtomicU64::new(0),
             group_peak: AtomicUsize::new(0),
             cancel: AtomicBool::new(false),
+            parent_cancel: None,
             done: AtomicBool::new(false),
             discovered: Mutex::new(None),
         }
     }
 
+    fn with_parent(parent: Arc<Progress>) -> Self {
+        Self {
+            parent_cancel: Some(parent),
+            ..Self::new()
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+            || self
+                .parent_cancel
+                .as_ref()
+                .is_some_and(|parent| parent.is_cancelled())
+    }
+
     /// Stop at bounded work checkpoints when cancellation is requested.
     fn check(&self) -> JResult<()> {
-        if self.cancel.load(Ordering::Acquire) {
+        if self.is_cancelled() {
             Err(Failure::Cancelled)
         } else {
             Ok(())
@@ -1153,7 +1170,7 @@ struct CancelRead<'a, R> {
 }
 impl<R: Read> Read for CancelRead<'_, R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if self.state.cancel.load(Ordering::Acquire) {
+        if self.state.is_cancelled() {
             return Err(io::Error::other("join cancelled"));
         }
         let length = bytes.len().min(READ_CHUNK);
@@ -1163,7 +1180,7 @@ impl<R: Read> Read for CancelRead<'_, R> {
 
 /// Preserve I/O failures while translating cancellation and malformed frames.
 fn frame_error(failure: FrameReadError, state: &Progress) -> Failure {
-    if state.cancel.load(Ordering::Acquire) {
+    if state.is_cancelled() {
         return Failure::Cancelled;
     }
     match failure {
@@ -1598,7 +1615,7 @@ fn scan(
         let mut start = 0;
         let mut failed = None;
         let scanned = scanner.scan_chunk(&chunk[..read], offset, |end| {
-            if failed.is_some() || state.cancel.load(Ordering::Acquire) {
+            if failed.is_some() || state.is_cancelled() {
                 return;
             }
             let local_end = (end - offset) as usize;
