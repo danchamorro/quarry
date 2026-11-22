@@ -506,15 +506,20 @@ impl IndexJob {
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
                 let result = (|| {
-                    if let Some(cached) = try_load_sidecar(
-                        &file,
-                        &path,
-                        file_size,
-                        delimiter,
-                        encoding,
-                        config,
-                        &cache_config,
-                    ) {
+                    if !worker_state.cancelled.load(Ordering::Acquire)
+                        && let Some(cached) = try_load_sidecar(
+                            &file,
+                            &path,
+                            file_size,
+                            delimiter,
+                            encoding,
+                            config,
+                            &cache_config,
+                        )
+                    {
+                        if worker_state.cancelled.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
                         if !source_matches_stamp(&file, &path, &source_stamp)? {
                             return Err(QuarryError::SourceChanged);
                         }
@@ -570,6 +575,7 @@ impl IndexJob {
                             file_size,
                             delimiter,
                             encoding,
+                            config.checkpoint_every,
                             &snapshot,
                             &cache_config,
                         );

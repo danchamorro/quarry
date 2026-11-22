@@ -3790,7 +3790,6 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
         },
         encoding,
     )?;
-    let job = session.start_indexing_with_options(IndexConfig::default(), threads, index_cache)?;
     let memory_at_first_rows = current_rss_bytes();
 
     println!("Quarry\n");
@@ -3847,16 +3846,11 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     }
 
     if !wait_for_index {
-        let cancel_started = Instant::now();
-        job.cancel();
-        let index = job.wait()?;
-        println!(
-            "\nIndexing cancelled after {} in {:.3} ms",
-            human_bytes(index.indexed_bytes()),
-            cancel_started.elapsed().as_secs_f64() * 1000.0
-        );
+        println!("\nIndexing skipped (--no-wait).");
         return Ok(());
     }
+
+    let job = session.start_indexing_with_options(IndexConfig::default(), threads, index_cache)?;
 
     println!("\nBackground indexing...");
     let mut last_report = Instant::now();
@@ -3899,14 +3893,26 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     let progress = job.progress();
     let index = job.wait()?;
 
-    println!("Bytes scanned: {}", human_bytes(progress.bytes_scanned));
-    println!("Rows parsed: {}", index.indexed_rows());
-    println!("Indexing time: {:.3} s", progress.elapsed.as_secs_f64());
-    println!(
-        "Indexing throughput: {}/s",
-        human_bytes(rate(progress.bytes_scanned, progress.elapsed))
-    );
     let telemetry = index.telemetry();
+    if telemetry.cache_hit {
+        println!(
+            "Indexed coverage: {} (loaded from sidecar cache)",
+            human_bytes(index.indexed_bytes())
+        );
+        println!("Rows indexed: {}", index.indexed_rows());
+        println!(
+            "Cache load time: {:.3} ms",
+            progress.elapsed.as_secs_f64() * 1000.0
+        );
+    } else {
+        println!("Bytes scanned: {}", human_bytes(progress.bytes_scanned));
+        println!("Rows parsed: {}", index.indexed_rows());
+        println!("Indexing time: {:.3} s", progress.elapsed.as_secs_f64());
+        println!(
+            "Indexing throughput: {}/s",
+            human_bytes(rate(progress.bytes_scanned, progress.elapsed))
+        );
+    }
     println!(
         "Index cache: {}",
         if telemetry.cache_hit { "hit" } else { "miss" }

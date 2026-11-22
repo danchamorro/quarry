@@ -170,6 +170,8 @@ pub(super) struct StorageReview {
     checked_path: PathBuf,
     result: Option<Result<(StorageSpace, u64), String>>,
     worker: Option<JoinHandle<Result<(StorageSpace, u64), String>>>,
+    index_cache_enabled: bool,
+    cache_clear_status: Option<Result<String, String>>,
 }
 
 impl StorageReview {
@@ -178,6 +180,7 @@ impl StorageReview {
         required_bytes: u64,
         retained_paths: Vec<PathBuf>,
         operation: Option<PendingStorageOperation>,
+        index_cache_enabled: bool,
     ) -> Self {
         let mut review = Self {
             operation,
@@ -187,6 +190,8 @@ impl StorageReview {
             checked_path: PathBuf::new(),
             result: None,
             worker: None,
+            index_cache_enabled,
+            cache_clear_status: None,
         };
         review.check();
         review
@@ -294,6 +299,7 @@ impl QuarryApp {
             operation.allowance(document),
             document.retained_storage_paths(),
             Some(operation),
+            self.index_cache_enabled,
         ));
         self.active.notice = None;
     }
@@ -309,6 +315,7 @@ impl QuarryApp {
                 .map(Document::retained_storage_paths)
                 .unwrap_or_default(),
             None,
+            self.index_cache_enabled,
         ));
     }
 
@@ -434,6 +441,44 @@ impl QuarryApp {
                             }
                             if ready && ui.button("Check again").clicked() { check = true; }
                             ui.small("Quarry checks again before writing. If a write fails, it removes unfinished output and preserves your current document and required Undo files.");
+                            if review.operation.is_none() {
+                                ui.separator();
+                                ui.label("Persistent index cache");
+                                ui.checkbox(
+                                    &mut review.index_cache_enabled,
+                                    "Reuse cached index for large local files",
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Clear index cache").clicked() {
+                                        review.cache_clear_status = Some(
+                                            quarry_core::clear_index_cache(None)
+                                                .map(|summary| {
+                                                    if summary.files_removed == 0 {
+                                                        "Index cache is already empty.".into()
+                                                    } else {
+                                                        format!(
+                                                            "Cleared {} cached index files ({}).",
+                                                            summary.files_removed,
+                                                            format_bytes(summary.bytes_reclaimed)
+                                                        )
+                                                    }
+                                                })
+                                                .map_err(|error| error.to_string()),
+                                        );
+                                    }
+                                });
+                                if let Some(status) = &review.cache_clear_status {
+                                    match status {
+                                        Ok(message) => {
+                                            ui.small(message);
+                                        }
+                                        Err(error) => {
+                                            ui.colored_label(ui.visuals().error_fg_color, error);
+                                        }
+                                    }
+                                }
+                                ui.small("Stores structural offsets only in a private folder (up to 256 MB). File names and cell contents are never written.");
+                            }
                         };
                         if review.operation.is_none() {
                             details(ui);
@@ -482,6 +527,14 @@ impl QuarryApp {
             return;
         }
         let review = self.active.storage_review.take().unwrap();
+        if review.operation.is_none() {
+            self.index_cache_enabled = review.index_cache_enabled;
+            for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
+                if let Some(document) = tab.document.as_mut() {
+                    document.index_cache_enabled = self.index_cache_enabled;
+                }
+            }
+        }
         if working {
             self.working_directory = PathBuf::from(review.path_input);
             for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
@@ -1155,6 +1208,8 @@ mod tests {
                 },
                 50,
             ))),
+            index_cache_enabled: true,
+            cache_clear_status: None,
         });
         let ctx = egui::Context::default();
         ctx.enable_accesskit();

@@ -39,8 +39,91 @@ const SPOT_CHECK_EXACT_SPAN_BYTES: u64 = 512 * 1024;
 const SPOT_CHECK_FALLBACK_PROBE_BYTES: u64 = 64 * 1024;
 const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
 const CACHE_KEY_FILENAME: &str = ".cache-key";
+const CACHE_LOCK_FILENAME: &str = ".cache.lock";
 const SIDECAR_EXT: &str = ".qidx";
 const TEMP_EXT: &str = ".qidx.tmp";
+
+fn is_quarry_sidecar_filename(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("idx-") else {
+        return false;
+    };
+    let Some(hex) = rest.strip_suffix(SIDECAR_EXT) else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_quarry_temp_filename(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".tmp-") else {
+        return false;
+    };
+    let Some(body) = rest.strip_suffix(TEMP_EXT) else {
+        return false;
+    };
+    let Some((pid, nonce)) = body.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_quarry_key_temp_filename(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".cache-key.") else {
+        return false;
+    };
+    let Some(body) = rest.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((pid, nonce)) = body.split_once('.') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), QuarryError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        ) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                // On macOS, `/var` and `/tmp` are OS-level root symlinks to `/private/*`.
+                #[cfg(target_os = "macos")]
+                if current == Path::new("/var") || current == Path::new("/tmp") {
+                    continue;
+                }
+                if meta.file_type().is_symlink() {
+                    return Err(QuarryError::InvalidOption(
+                        "index cache path must not traverse or target a symlink",
+                    ));
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+                    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                        return Err(QuarryError::InvalidOption(
+                            "index cache path must not traverse or target a reparse point",
+                        ));
+                    }
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            Err(err) => return Err(QuarryError::Io(err)),
+        }
+    }
+    Ok(())
+}
 
 const FLAG_BYTE_STRIDE: u32 = 1 << 0;
 const FLAG_HAS_BIRTHTIME: u32 = 1 << 1;
@@ -164,7 +247,7 @@ pub fn default_index_cache_dir() -> Option<PathBuf> {
     }
 }
 
-/// Removes all persisted sidecar index files, temporary staging files, and cache keys
+/// Removes all Quarry-managed sidecar index files, temporary staging files, and cache keys
 /// from the specified (or default) index cache directory.
 pub fn clear_index_cache(cache_dir: Option<&Path>) -> Result<CacheClearSummary, QuarryError> {
     let resolved = match cache_dir {
@@ -174,6 +257,8 @@ pub fn clear_index_cache(cache_dir: Option<&Path>) -> Result<CacheClearSummary, 
             None => return Ok(CacheClearSummary::default()),
         },
     };
+
+    reject_symlink_components(&resolved)?;
 
     let meta = match fs::symlink_metadata(&resolved) {
         Ok(meta) => meta,
@@ -188,6 +273,15 @@ pub fn clear_index_cache(cache_dir: Option<&Path>) -> Result<CacheClearSummary, 
         ));
     }
 
+    // Only clear a directory verified to belong to the current user and be private.
+    if !verify_existing_private_cache_dir(&resolved) {
+        return Err(QuarryError::InvalidOption(
+            "index cache path must be an owner-only private directory on a local filesystem",
+        ));
+    }
+
+    let _lock = acquire_cache_lock(&resolved);
+
     let mut summary = CacheClearSummary::default();
     let entries = match fs::read_dir(&resolved) {
         Ok(entries) => entries,
@@ -200,8 +294,10 @@ pub fn clear_index_cache(cache_dir: Option<&Path>) -> Result<CacheClearSummary, 
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let is_managed =
-            name.ends_with(SIDECAR_EXT) || name.ends_with(TEMP_EXT) || name == CACHE_KEY_FILENAME;
+        let is_managed = is_quarry_sidecar_filename(name)
+            || is_quarry_temp_filename(name)
+            || is_quarry_key_temp_filename(name)
+            || name == CACHE_KEY_FILENAME;
         if !is_managed {
             continue;
         }
@@ -1081,10 +1177,146 @@ fn preceded_by_lf(file: &File, offset: u64, encoding: Encoding) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_has_empty_acl(file: &File) -> bool {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd;
+
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+
+    unsafe extern "C" {
+        fn acl_get_fd(fd: libc::c_int) -> *mut c_void;
+        fn acl_get_entry(
+            acl: *mut c_void,
+            entry_id: libc::c_int,
+            entry_p: *mut *mut c_void,
+        ) -> libc::c_int;
+        fn acl_free(obj_p: *mut c_void) -> libc::c_int;
+    }
+
+    unsafe {
+        let acl = acl_get_fd(file.as_raw_fd());
+        if acl.is_null() {
+            let err = io::Error::last_os_error().raw_os_error();
+            return matches!(
+                err,
+                Some(libc::ENOENT) | Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP)
+            );
+        }
+        let mut entry: *mut c_void = std::ptr::null_mut();
+        let rc = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry);
+        acl_free(acl);
+        rc != 0
+    }
+}
+
+/// Verifies an existing directory is owner-only, non-symlink, and on a local filesystem
+/// without modifying its permissions or ACLs.
+fn verify_existing_private_cache_dir(dir: &Path) -> bool {
+    if reject_symlink_components(dir).is_err() {
+        return false;
+    }
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(fd) = rustix::fs::open(
+            dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let dir_file = File::from(fd);
+        let Ok(fmeta) = dir_file.metadata() else {
+            return false;
+        };
+        let uid = rustix::process::getuid().as_raw();
+        if !fmeta.is_dir()
+            || fmeta.uid() != uid
+            || (fmeta.mode() & 0o077) != 0
+            || !is_eligible_local_filesystem(&dir_file)
+        {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        if !macos_has_empty_acl(&dir_file) {
+            return false;
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        const READ_CONTROL: u32 = 0x0002_0000;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return false;
+        }
+        let Ok(dir_file) = fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir)
+        else {
+            return false;
+        };
+        let Ok(dir_meta) = dir_file.metadata() else {
+            return false;
+        };
+        dir_meta.is_dir()
+            && (dir_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+            && is_eligible_windows_filesystem(&dir_file)
+            && verify_windows_owner_only_dacl(dir_file.as_raw_handle())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
 fn resolve_and_harden_cache_dir(config: &IndexCacheConfig) -> Option<PathBuf> {
     let dir = config.cache_dir.clone().or_else(default_index_cache_dir)?;
 
-    if fs::create_dir_all(&dir).is_err() {
+    reject_symlink_components(&dir).ok()?;
+
+    let existed = fs::symlink_metadata(&dir).is_ok();
+    if existed && config.cache_dir.is_some() {
+        // Never mutate permissions/ACLs on an existing user-selected directory;
+        // require it to already be strictly owner-only on a local filesystem.
+        return verify_existing_private_cache_dir(&dir).then_some(dir);
+    }
+
+    if !existed && create_private_dir_all(&dir).is_err() {
         return None;
     }
 
@@ -1095,32 +1327,34 @@ fn resolve_and_harden_cache_dir(config: &IndexCacheConfig) -> Option<PathBuf> {
 
     #[cfg(unix)]
     {
+        use rustix::fs::{Mode, OFlags};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fd = rustix::fs::open(
+            &dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?;
+        let dir_file = File::from(fd);
+        let fmeta = dir_file.metadata().ok()?;
         let uid = rustix::process::getuid().as_raw();
-        if meta.uid() != uid {
+        if !fmeta.is_dir() || fmeta.uid() != uid || !is_eligible_local_filesystem(&dir_file) {
             return None;
         }
-        if (meta.mode() & 0o077) != 0 {
-            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-            let recheck = fs::symlink_metadata(&dir).ok()?;
-            if recheck.file_type().is_symlink()
-                || !recheck.is_dir()
-                || recheck.uid() != uid
-                || (recheck.mode() & 0o077) != 0
-            {
-                return None;
+        if (fmeta.mode() & 0o077) != 0 {
+            let _ = rustix::fs::fchmod(&dir_file, Mode::from_raw_mode(0o700));
+            let recheck = dir_file.metadata().ok()?;
+            if !recheck.is_dir() || recheck.uid() != uid || (recheck.mode() & 0o077) != 0 {
+                let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+                let recheck2 = dir_file.metadata().ok()?;
+                if !recheck2.is_dir() || recheck2.uid() != uid || (recheck2.mode() & 0o077) != 0 {
+                    return None;
+                }
             }
         }
         #[cfg(target_os = "macos")]
         {
-            use rustix::fs::{Mode, OFlags};
-            let fd = rustix::fs::open(
-                &dir,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .ok()?;
-            let dir_file = File::from(fd);
             // Clear any inherited ACL grants so cache files remain strictly owner-only.
             crate::storage::set_macos_acl(&dir_file, None).ok()?;
         }
@@ -1164,23 +1398,199 @@ fn resolve_and_harden_cache_dir(config: &IndexCacheConfig) -> Option<PathBuf> {
     Some(dir)
 }
 
+fn acquire_cache_lock(cache_dir: &Path) -> Option<File> {
+    let lock_path = cache_dir.join(CACHE_LOCK_FILENAME);
+
+    #[cfg(unix)]
+    {
+        use rustix::fs::{FlockOperation, Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+
+        let fd = rustix::fs::open(
+            &lock_path,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::from_raw_mode(0o600),
+        )
+        .ok()?;
+        let file = File::from(fd);
+        let meta = file.metadata().ok()?;
+        if !meta.is_file()
+            || meta.uid() != rustix::process::getuid().as_raw()
+            || (meta.mode() & 0o077) != 0
+        {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::storage::set_macos_acl(&file, None).ok()?;
+        }
+        rustix::fs::flock(&file, FlockOperation::LockExclusive).ok()?;
+        Some(file)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            h_event: *mut c_void,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LockFileEx(
+                file: *mut c_void,
+                flags: u32,
+                reserved: u32,
+                bytes_low: u32,
+                bytes_high: u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
+        }
+
+        let file = fs::OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .create(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&lock_path)
+            .ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file()
+            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || !verify_windows_owner_only_dacl(file.as_raw_handle())
+        {
+            return None;
+        }
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            h_event: std::ptr::null_mut(),
+        };
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some(file)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = lock_path;
+        None
+    }
+}
+
 fn load_or_create_cache_key(cache_dir: &Path) -> Option<[u8; 32]> {
     let key_path = cache_dir.join(CACHE_KEY_FILENAME);
     if let Some(key) = read_verified_key(&key_path) {
         return Some(key);
     }
 
-    let new_key = generate_random_key();
-    match create_private_exclusive_file(&key_path) {
-        Ok(mut file) => {
-            if file.write_all(&new_key).is_ok() && file.sync_all().is_ok() {
-                return Some(new_key);
+    let _lock = acquire_cache_lock(cache_dir)?;
+    if let Some(key) = read_verified_key(&key_path) {
+        return Some(key);
+    }
+
+    // Check if an existing entry at `.cache-key` is a recoverable owner-owned partial file.
+    let mut recover_partial = false;
+    match fs::symlink_metadata(&key_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return None;
             }
-            let _ = fs::remove_file(&key_path);
-            None
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.uid() != rustix::process::getuid().as_raw() || (meta.mode() & 0o077) != 0 {
+                    return None;
+                }
+            }
+            if meta.len() == 32 {
+                // Valid length failed `read_verified_key` (e.g. unreadable/ACL failure): do not clobber.
+                return None;
+            }
+            recover_partial = true;
         }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => read_verified_key(&key_path),
-        Err(_) => None,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+
+    let new_key = generate_random_key();
+    let mut tmp_path = None;
+    let mut tmp_file = None;
+    for _ in 0..8 {
+        let nonce = NEXT_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = cache_dir.join(format!(".cache-key.{}.{nonce}.tmp", std::process::id()));
+        match create_private_exclusive_file(&candidate) {
+            Ok(file) => {
+                tmp_path = Some(candidate);
+                tmp_file = Some(file);
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    let tmp_path = tmp_path?;
+    let mut tmp_file = tmp_file?;
+    let write_res = tmp_file
+        .write_all(&new_key)
+        .and_then(|()| tmp_file.sync_all());
+    drop(tmp_file);
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return None;
+    }
+
+    if recover_partial {
+        if fs::rename(&tmp_path, &key_path).is_err() {
+            let _ = fs::remove_file(&tmp_path);
+            return None;
+        }
+        return Some(new_key);
+    }
+
+    match fs::hard_link(&tmp_path, &key_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp_path);
+            Some(new_key)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp_path);
+            read_verified_key(&key_path)
+        }
+        Err(_) => {
+            // Fallback for filesystems without hard-link support (we hold `_lock` and verified NotFound).
+            let res = fs::rename(&tmp_path, &key_path);
+            if res.is_err() {
+                let _ = fs::remove_file(&tmp_path);
+                return None;
+            }
+            Some(new_key)
+        }
     }
 }
 
@@ -1245,6 +1655,7 @@ fn keyed_sidecar_filename(
     identity: &ExtendedIdentity,
     encoding: Encoding,
     dialect: ScannerDialect,
+    requested_checkpoint_every: u64,
 ) -> String {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let (delimiter, quote, escape_kind, escape_byte) = dialect_to_tags(dialect);
@@ -1266,6 +1677,7 @@ fn keyed_sidecar_filename(
     hasher.update(&identity.id_a.to_le_bytes());
     hasher.update(&identity.id_b.to_le_bytes());
     hasher.update(&identity.id_c.to_le_bytes());
+    hasher.update(&requested_checkpoint_every.to_le_bytes());
     let digest = hasher.finalize();
 
     let mut name = String::with_capacity(4 + 64 + SIDECAR_EXT.len());
@@ -1284,7 +1696,7 @@ fn open_private_readonly_nofollow(path: &Path) -> io::Result<File> {
         use rustix::fs::{Mode, OFlags};
         let fd = rustix::fs::open(
             path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         )?;
         Ok(File::from(fd))
@@ -1731,7 +2143,12 @@ pub(crate) fn try_load_sidecar(
 
     let dialect = ScannerDialect::rfc4180(delimiter);
     let sidecar_path = cache_dir.join(keyed_sidecar_filename(
-        &key, path, &identity, encoding, dialect,
+        &key,
+        path,
+        &identity,
+        encoding,
+        dialect,
+        index_config.checkpoint_every,
     ));
 
     let mut sidecar_file = open_private_readonly_nofollow(&sidecar_path).ok()?;
@@ -1811,16 +2228,17 @@ pub(crate) fn try_load_sidecar(
     )
     .ok()?;
 
-    // Best-effort LRU touch so recently used sidecars stay warm.
-    if let Ok(touch) = fs::OpenOptions::new().write(true).open(&sidecar_path) {
-        let _ = touch.set_modified(SystemTime::now());
+    // Best-effort LRU touch directly on the already-validated file handle (no second path lookup).
+    #[cfg(unix)]
+    {
+        let _ = sidecar_file.set_modified(SystemTime::now());
     }
 
     Some(index)
 }
 
 /// Persists a completed structural index to the sidecar cache using atomic temp-file
-/// write + `fsync` + rename, followed by concurrent-process-safe LRU eviction.
+/// write + `fsync` + rename, coordinated across processes with pre-write budget reservation.
 ///
 /// Failures are silently ignored so cache I/O problems never break indexing.
 #[allow(clippy::too_many_arguments)]
@@ -1831,6 +2249,7 @@ pub(crate) fn save_sidecar(
     file_size: u64,
     delimiter: u8,
     encoding: Encoding,
+    requested_checkpoint_every: u64,
     index: &StructuralIndex,
     cache_config: &IndexCacheConfig,
 ) {
@@ -1841,6 +2260,7 @@ pub(crate) fn save_sidecar(
         file_size,
         delimiter,
         encoding,
+        requested_checkpoint_every,
         index,
         cache_config,
     );
@@ -1854,6 +2274,7 @@ fn try_save_sidecar(
     file_size: u64,
     delimiter: u8,
     encoding: Encoding,
+    requested_checkpoint_every: u64,
     index: &StructuralIndex,
     cache_config: &IndexCacheConfig,
 ) -> Option<()> {
@@ -1892,7 +2313,8 @@ fn try_save_sidecar(
         index,
     )?;
     seal_sidecar_mac(&key, &mut encoded);
-    if (encoded.len() as u64) > cache_config.max_cache_bytes {
+    let encoded_len = encoded.len() as u64;
+    if encoded_len > cache_config.max_cache_bytes {
         return None;
     }
 
@@ -1902,8 +2324,21 @@ fn try_save_sidecar(
         return None;
     }
 
-    let final_name = keyed_sidecar_filename(&key, path, &identity, encoding, dialect);
+    let final_name = keyed_sidecar_filename(
+        &key,
+        path,
+        &identity,
+        encoding,
+        dialect,
+        requested_checkpoint_every,
+    );
     let final_path = cache_dir.join(&final_name);
+
+    // Coordinate across processes and reserve full staging capacity before creating a temp file.
+    let _lock = acquire_cache_lock(&cache_dir)?;
+    if !reserve_cache_budget(&cache_dir, cache_config.max_cache_bytes, encoded_len) {
+        return None;
+    }
 
     let mut tmp_path = None;
     let mut tmp_file = None;
@@ -1941,18 +2376,41 @@ fn try_save_sidecar(
     Some(())
 }
 
+/// Evicts oldest Quarry-owned `.qidx` entries so `needed_bytes` fits within `max_cache_bytes`
+/// alongside any active `.qidx.tmp` staging writers. Returns `true` if space is reserved.
+pub(crate) fn reserve_cache_budget(
+    cache_dir: &Path,
+    max_cache_bytes: u64,
+    needed_bytes: u64,
+) -> bool {
+    if needed_bytes > max_cache_bytes {
+        return false;
+    }
+    let budget_after_reserve = max_cache_bytes - needed_bytes;
+    let remaining = enforce_cache_budget_inner(cache_dir, budget_after_reserve, None);
+    remaining.saturating_add(needed_bytes) <= max_cache_bytes
+}
+
 /// Concurrent-process-safe LRU eviction across `cache_dir`.
 ///
-/// Counts BOTH published `.qidx` files AND active `.qidx.tmp` temp writers against
-/// `max_cache_bytes`. Stale temp writers older than `STALE_TEMP_AGE` are removed.
-/// Any `NotFound`/race errors from concurrent processes are ignored cleanly.
+/// Counts BOTH published Quarry `.qidx` files AND active Quarry `.qidx.tmp` temp writers against
+/// `max_cache_bytes`. Unrelated user files are never touched. Stale temp writers older than
+/// `STALE_TEMP_AGE` are removed.
 pub(crate) fn enforce_cache_budget(
     cache_dir: &Path,
     max_cache_bytes: u64,
     keep_name: Option<&str>,
 ) {
+    let _ = enforce_cache_budget_inner(cache_dir, max_cache_bytes, keep_name);
+}
+
+fn enforce_cache_budget_inner(
+    cache_dir: &Path,
+    max_cache_bytes: u64,
+    keep_name: Option<&str>,
+) -> u64 {
     let Ok(entries) = fs::read_dir(cache_dir) else {
-        return;
+        return u64::MAX;
     };
     let now = SystemTime::now();
     let mut published: Vec<(PathBuf, String, u64, SystemTime)> = Vec::new();
@@ -1972,7 +2430,7 @@ pub(crate) fn enforce_cache_budget(
         let len = meta.len();
         let modified = meta.modified().unwrap_or(UNIX_EPOCH);
 
-        if name.ends_with(TEMP_EXT) {
+        if is_quarry_temp_filename(&name) {
             let is_stale = now
                 .duration_since(modified)
                 .is_ok_and(|age| age >= STALE_TEMP_AGE);
@@ -1984,14 +2442,14 @@ pub(crate) fn enforce_cache_budget(
                 // Active concurrent temp writer: keep intact and count toward budget.
                 total_bytes = total_bytes.saturating_add(len);
             }
-        } else if name.ends_with(SIDECAR_EXT) {
+        } else if is_quarry_sidecar_filename(&name) {
             total_bytes = total_bytes.saturating_add(len);
             published.push((path, name, len, modified));
         }
     }
 
     if total_bytes <= max_cache_bytes {
-        return;
+        return total_bytes;
     }
 
     // Oldest modified first (deterministic tie-break by filename).
@@ -2014,6 +2472,7 @@ pub(crate) fn enforce_cache_budget(
             Err(_) => {}
         }
     }
+    total_bytes
 }
 
 /// Pure-Rust CRC32C (Castagnoli, polynomial `0x82F63B78`).
@@ -2249,7 +2708,7 @@ mod tests {
     use super::{
         CACHE_KEY_FILENAME, IndexCacheConfig, SIDECAR_EXT, SIDECAR_HEADER_LEN, Sha256, TEMP_EXT,
         clear_index_cache, crc32c, decode_sidecar_bytes, enforce_cache_budget,
-        is_allowed_linux_fs_magic, is_allowed_macos_fstype,
+        is_allowed_linux_fs_magic, is_allowed_macos_fstype, reserve_cache_budget,
     };
     use crate::{IndexConfig, OpenOptions, Session};
 
@@ -2436,15 +2895,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path();
 
-        let oldest = cache_dir.join(format!("idx-oldest{SIDECAR_EXT}"));
-        let middle = cache_dir.join(format!("idx-middle{SIDECAR_EXT}"));
-        let newest = cache_dir.join(format!("idx-newest{SIDECAR_EXT}"));
+        let oldest_name = format!("idx-{}{SIDECAR_EXT}", "a".repeat(64));
+        let middle_name = format!("idx-{}{SIDECAR_EXT}", "b".repeat(64));
+        let newest_name = format!("idx-{}{SIDECAR_EXT}", "c".repeat(64));
+        let oldest = cache_dir.join(&oldest_name);
+        let middle = cache_dir.join(&middle_name);
+        let newest = cache_dir.join(&newest_name);
         let active_tmp = cache_dir.join(format!(".tmp-999-1{TEMP_EXT}"));
+        let unrelated = cache_dir.join("analysis.qidx");
 
         fs::write(&oldest, vec![1u8; 400]).unwrap();
         fs::write(&middle, vec![2u8; 400]).unwrap();
         fs::write(&newest, vec![3u8; 400]).unwrap();
         fs::write(&active_tmp, vec![4u8; 400]).unwrap();
+        fs::write(&unrelated, vec![5u8; 400]).unwrap();
 
         let now = SystemTime::now();
         FsOpenOptions::new()
@@ -2466,9 +2930,10 @@ mod tests {
             .set_modified(now - Duration::from_secs(100))
             .unwrap();
 
-        // Total is 1600 bytes including active_tmp (400B). Cap at 900 bytes -> must keep
-        // active_tmp (400B) + newest (400B) = 800B, evicting oldest and middle!
-        enforce_cache_budget(cache_dir, 900, Some(&format!("idx-newest{SIDECAR_EXT}")));
+        // Total managed is 1600 bytes including active_tmp (400B). Cap at 900 bytes -> must keep
+        // active_tmp (400B) + newest (400B) = 800B, evicting oldest and middle, while leaving
+        // unrelated `analysis.qidx` untouched!
+        enforce_cache_budget(cache_dir, 900, Some(&newest_name));
 
         assert!(!oldest.exists(), "oldest sidecar should be evicted");
         assert!(
@@ -2480,6 +2945,21 @@ mod tests {
             active_tmp.exists(),
             "active temp writer must not be deleted"
         );
+        assert!(
+            unrelated.exists(),
+            "unrelated .qidx file must never be evicted"
+        );
+
+        // Pre-write reservation refuses to exceed cap when active temp writer leaves insufficient room.
+        assert!(
+            !reserve_cache_budget(cache_dir, 700, 400),
+            "400B active temp + 400B needed exceeds 700B cap even after evicting newest"
+        );
+        assert!(
+            !newest.exists(),
+            "reservation attempted eviction of evictable entries before declining"
+        );
+        assert!(unrelated.exists(), "unrelated file still untouched");
     }
 
     #[test]
@@ -2677,5 +3157,157 @@ mod tests {
             "forged sidecar with invalid keyed MAC must be rejected"
         );
         assert_eq!(second.maximum_width(), first.maximum_width());
+    }
+
+    #[test]
+    fn checkpoint_policy_separation_partial_key_recovery_and_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("policy_cache");
+        let csv_path = dir.path().join("sample.csv");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"a,b\n");
+        for i in 0..200_u32 {
+            payload.extend_from_slice(format!("{i},val\n").as_bytes());
+        }
+        fs::write(&csv_path, &payload).unwrap();
+
+        let cache_cfg = IndexCacheConfig {
+            enabled: true,
+            cache_dir: Some(cache_dir.clone()),
+            max_cache_bytes: 16 * 1024 * 1024,
+            min_file_bytes: 0,
+        };
+
+        // First open with sparse policy `checkpoint_every: u64::MAX`.
+        let session = Session::open(&csv_path, OpenOptions::default()).unwrap();
+        let sparse = session
+            .start_indexing_with_options(
+                IndexConfig {
+                    chunk_bytes: 1024,
+                    checkpoint_every: u64::MAX,
+                    memory_budget_bytes: 64 * 1024,
+                },
+                Some(1),
+                cache_cfg.clone(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!sparse.telemetry().cache_hit);
+        assert_eq!(sparse.checkpoints().len(), 1);
+
+        // Next open with dense policy `checkpoint_every: 16` must NOT reuse the sparse sidecar.
+        let dense = session
+            .start_indexing_with_options(
+                IndexConfig {
+                    chunk_bytes: 1024,
+                    checkpoint_every: 16,
+                    memory_budget_bytes: 64 * 1024,
+                },
+                Some(1),
+                cache_cfg.clone(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!dense.telemetry().cache_hit);
+        assert!(dense.checkpoints().len() > 1);
+
+        // Unrelated `.qidx` file in the cache directory is preserved by `clear_index_cache`.
+        let unrelated = cache_dir.join("analysis.qidx");
+        fs::write(&unrelated, b"user data").unwrap();
+        let cleared = clear_index_cache(Some(&cache_dir)).unwrap();
+        assert!(cleared.files_removed >= 3);
+        assert!(unrelated.exists(), "unrelated .qidx must not be deleted");
+
+        // Recover cleanly from a truncated partial `.cache-key` left by a crashed process.
+        fs::write(cache_dir.join(CACHE_KEY_FILENAME), b"partial").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                cache_dir.join(CACHE_KEY_FILENAME),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let recovered = session
+            .start_indexing_with_options(
+                IndexConfig {
+                    chunk_bytes: 1024,
+                    checkpoint_every: 16,
+                    memory_budget_bytes: 64 * 1024,
+                },
+                Some(1),
+                cache_cfg.clone(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!recovered.telemetry().cache_hit);
+        assert_eq!(
+            fs::metadata(cache_dir.join(CACHE_KEY_FILENAME))
+                .unwrap()
+                .len(),
+            32
+        );
+        let hit = session
+            .start_indexing_with_options(
+                IndexConfig {
+                    chunk_bytes: 1024,
+                    checkpoint_every: 16,
+                    memory_budget_bytes: 64 * 1024,
+                },
+                Some(1),
+                cache_cfg,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(hit.telemetry().cache_hit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_shared_user_cache_dir_is_rejected_without_changing_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared_dir");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let csv_path = dir.path().join("sample.csv");
+        fs::write(&csv_path, b"a,b\n1,2\n").unwrap();
+
+        let cache_cfg = IndexCacheConfig {
+            enabled: true,
+            cache_dir: Some(shared.clone()),
+            max_cache_bytes: 16 * 1024 * 1024,
+            min_file_bytes: 0,
+        };
+        let session = Session::open(&csv_path, OpenOptions::default()).unwrap();
+        let idx = session
+            .start_indexing_with_options(IndexConfig::default(), Some(1), cache_cfg)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!idx.telemetry().cache_hit);
+        let mode = fs::symlink_metadata(&shared).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "existing user-selected shared directory permissions must not be modified"
+        );
+        assert_eq!(
+            fs::read_dir(&shared).unwrap().count(),
+            0,
+            "no cache files should be written into an existing shared directory"
+        );
+
+        // Symlink ancestor must be rejected before creating or clearing.
+        let link = dir.path().join("link_parent");
+        symlink(&shared, &link).unwrap();
+        let nested = link.join("child");
+        assert!(clear_index_cache(Some(&nested)).is_err());
     }
 }
