@@ -4,15 +4,22 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::Encoding;
-use crate::encoding::RecordScanner;
+use memchr::memchr;
+use quarry_delimited::{
+    ByteEncodingClass, ParseError, ParseErrorKind, ScannerDialect, StructuralScanner,
+    active_simd_backend,
+};
 
+use crate::Encoding;
 use crate::case::ByteMatcher;
+use crate::encoding::RecordScanner;
 use crate::export::source_matches_stamp;
+use crate::pool::{JobExecutor, JobPriority, engine_pool, resolve_worker_count};
+use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
 use crate::sort::numeric_key;
 use crate::source_stamp::SourceStamp;
 use crate::{
@@ -56,6 +63,35 @@ impl FilterSource {
 
 const DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const MATCH_PUBLISH_BATCH: usize = 256;
+const PARALLEL_FILTER_MIN_BYTES: u64 = 4 * 1024 * 1024;
+const PARALLEL_FILTER_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const FILTER_ALIGNMENT_PROBE_BYTES: usize = 64 * 1024;
+const FILTER_MAX_ALIGNMENT_SEARCH: u64 = 256 * 1024;
+const FILTER_WORKER_CANCEL_SLICE: usize = 256 * 1024;
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+#[derive(Clone, Copy)]
+struct FilterParallelTuning {
+    requested_threads: usize,
+    min_parallel_bytes: u64,
+    chunk_bytes: usize,
+    max_alignment_search: u64,
+    #[cfg(test)]
+    delay_chunk_zero: Option<Duration>,
+}
+
+impl FilterParallelTuning {
+    fn for_production(requested_threads: usize) -> Self {
+        Self {
+            requested_threads,
+            min_parallel_bytes: PARALLEL_FILTER_MIN_BYTES,
+            chunk_bytes: PARALLEL_FILTER_CHUNK_BYTES,
+            max_alignment_search: FILTER_MAX_ALIGNMENT_SEARCH,
+            #[cfg(test)]
+            delay_chunk_zero: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct FilterScanConfig {
@@ -335,7 +371,7 @@ impl FilterJob {
         query: FilterQuery,
         config: FilterScanConfig,
     ) -> Result<Self, QuarryError> {
-        Self::start_with_edits(
+        Self::start_with_edits_and_tuning(
             path,
             file_size,
             delimiter,
@@ -345,9 +381,11 @@ impl FilterJob {
             Arc::default(),
             None,
             Encoding::Utf8,
+            FilterParallelTuning::for_production(1),
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn start_with_edits(
         path: PathBuf,
@@ -359,6 +397,33 @@ impl FilterJob {
         edits: FilterEdits,
         expected: Option<SourceStamp>,
         encoding: Encoding,
+    ) -> Result<Self, QuarryError> {
+        Self::start_with_edits_and_tuning(
+            path,
+            file_size,
+            delimiter,
+            data_start,
+            query,
+            config,
+            edits,
+            expected,
+            encoding,
+            FilterParallelTuning::for_production(1),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_edits_and_tuning(
+        path: PathBuf,
+        file_size: u64,
+        delimiter: u8,
+        data_start: u64,
+        query: FilterQuery,
+        config: FilterScanConfig,
+        edits: FilterEdits,
+        expected: Option<SourceStamp>,
+        encoding: Encoding,
+        tuning: FilterParallelTuning,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
@@ -386,15 +451,33 @@ impl FilterJob {
             .name("quarry-filter".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
-                let result = run_filter(
-                    file,
-                    delimiter,
-                    data_start,
-                    &query,
-                    config.chunk_bytes,
-                    config.max_record_bytes,
-                    &worker_state,
-                );
+                let result = if let Some(byte_class) = encoding.simd_byte_class()
+                    && tuning.requested_threads > 1
+                    && file_size >= tuning.min_parallel_bytes
+                {
+                    run_parallel_filter(
+                        Arc::new(file),
+                        file_size,
+                        delimiter,
+                        data_start,
+                        &query,
+                        config.max_record_bytes,
+                        encoding,
+                        byte_class,
+                        tuning,
+                        &worker_state,
+                    )
+                } else {
+                    run_filter(
+                        file,
+                        delimiter,
+                        data_start,
+                        &query,
+                        config.chunk_bytes,
+                        config.max_record_bytes,
+                        &worker_state,
+                    )
+                };
                 let result = result.and_then(|()| source.check_file(&guard_file));
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
@@ -630,8 +713,19 @@ impl Session {
         query: FilterQuery,
         edits: FilterEdits,
     ) -> Result<FilterJob, QuarryError> {
+        self.start_filter_with_edits_and_threads(query, edits, None)
+    }
+
+    /// Filters an immutable snapshot of working cell values with an explicit worker count.
+    pub fn start_filter_with_edits_and_threads(
+        &self,
+        query: FilterQuery,
+        edits: FilterEdits,
+        threads: Option<usize>,
+    ) -> Result<FilterJob, QuarryError> {
+        let requested_threads = resolve_worker_count(threads)?;
         self.ensure_source_unchanged()?;
-        FilterJob::start_with_edits(
+        FilterJob::start_with_edits_and_tuning(
             self.path.clone(),
             self.file_size,
             self.dialect.delimiter,
@@ -641,6 +735,7 @@ impl Session {
             edits,
             Some(self.source_stamp.clone()),
             self.encoding,
+            FilterParallelTuning::for_production(requested_threads),
         )
     }
 
@@ -779,6 +874,9 @@ impl PredicateMatcher<'_> {
                 _ => unreachable!("numeric operators compile to numeric matchers"),
             },
             Self::Numeric { lower, upper } => {
+                if field.is_empty() {
+                    return false;
+                }
                 // A column group can have several rules, but its field is parsed only once.
                 let Some(value) = numeric_value
                     .get_or_insert_with(|| numeric_key(field).ok().filter(|key| !key.is_empty()))
@@ -886,6 +984,105 @@ pub(crate) fn matching_fields_with_edits<'a>(
     Ok(matches.then_some(fields))
 }
 
+#[inline]
+fn strip_record_ending_fast(record: &[u8]) -> &[u8] {
+    if let Some(body) = record.strip_suffix(b"\r\n") {
+        body
+    } else if let Some(body) = record.strip_suffix(b"\n") {
+        body
+    } else {
+        record
+    }
+}
+
+/// Fast zero-allocation filter evaluation for unquoted UTF-8 records without edits on the row;
+/// falls back to `matching_fields_with_edits` for quoted, non-UTF-8, or edited records.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_matches_fast(
+    record: &[u8],
+    delimiter: u8,
+    physical_row: u64,
+    query: &FilterQuery,
+    matchers: &[PredicateMatcher<'_>],
+    groups: &[Vec<usize>],
+    max_column: usize,
+    edits: &FilterEdits,
+    encoding: Encoding,
+    field_ranges: &mut Vec<(usize, usize)>,
+) -> Result<bool, QuarryError> {
+    let row_has_edit = !edits.is_empty()
+        && edits
+            .range((physical_row, 0)..=(physical_row, usize::MAX))
+            .next()
+            .is_some();
+    if encoding != Encoding::Utf8 || row_has_edit || memchr(b'"', record).is_some() {
+        return Ok(matching_fields_with_edits(
+            record,
+            delimiter,
+            physical_row,
+            query,
+            matchers,
+            groups,
+            edits,
+            encoding,
+        )?
+        .is_some());
+    }
+
+    let body = if physical_row == 0 {
+        record.strip_prefix(UTF8_BOM).unwrap_or(record)
+    } else {
+        record
+    };
+    let body = strip_record_ending_fast(body);
+
+    field_ranges.clear();
+    let mut pos = 0usize;
+    let target_fields = max_column.saturating_add(1);
+    while field_ranges.len() < target_fields {
+        match memchr(delimiter, &body[pos..]) {
+            Some(rel) => {
+                let end = pos + rel;
+                field_ranges.push((pos, end));
+                pos = end + 1;
+            }
+            None => {
+                field_ranges.push((pos, body.len()));
+                break;
+            }
+        }
+    }
+
+    let matched = groups.iter().all(|group| {
+        let Some(&first) = group.first() else {
+            return true;
+        };
+        let col = query.predicates[first].column;
+        let Some(&(start, end)) = field_ranges.get(col) else {
+            return false;
+        };
+        let field = &body[start..end];
+        let mut has_inclusion = false;
+        let mut inclusion_matches = false;
+        let mut numeric_value = None;
+        for &index in group {
+            let operator = query.predicates[index].operator;
+            let m = matchers[index].matches(operator, field, &mut numeric_value);
+            if operator == FilterOperator::NotEquals {
+                if m {
+                    return false;
+                }
+            } else {
+                has_inclusion = true;
+                inclusion_matches |= m;
+            }
+        }
+        !has_inclusion || inclusion_matches
+    });
+
+    Ok(matched)
+}
+
 fn publish_matches(shared: &SharedState, matches: &mut Vec<(u64, u64)>) {
     if matches.is_empty() {
         return;
@@ -919,6 +1116,8 @@ fn run_filter(
     drop(index);
     let matchers = compile_matchers(query)?;
     let groups = predicate_groups(query);
+    let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
+    let mut field_ranges = Vec::with_capacity(max_column + 1);
     let mut scanner = RecordScanner::new(delimiter, encoding)?;
     let mut chunk = vec![0; encoding.chunk_size(chunk_bytes)];
     let mut absolute_start = 0_u64;
@@ -947,12 +1146,20 @@ fn run_filter(
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields_with_edits(
-                            &record, delimiter, row_number, query, &matchers, &groups, &edits,
+                        match record_matches_fast(
+                            &record,
+                            delimiter,
+                            row_number,
+                            query,
+                            &matchers,
+                            &groups,
+                            max_column,
+                            &edits,
                             encoding,
+                            &mut field_ranges,
                         ) {
-                            Ok(Some(_)) => pending_matches.push((row_number, record_start)),
-                            Ok(None) => {}
+                            Ok(true) => pending_matches.push((row_number, record_start)),
+                            Ok(false) => {}
                             Err(error) => deferred_error = Some(error),
                         }
                     }
@@ -998,24 +1205,63 @@ fn run_filter(
                 if shared.cancel_requested.load(Ordering::Acquire) {
                     cancelled = true;
                 } else if row_number >= data_start {
-                    record.extend_from_slice(&chunk[segment_start..local_end]);
-                    if record.len() > max_record_bytes {
-                        deferred_error = Some(QuarryError::RecordTooLarge {
-                            limit: max_record_bytes,
-                        });
-                    } else {
-                        match matching_fields_with_edits(
-                            &record, delimiter, row_number, query, &matchers, &groups, &edits,
-                            encoding,
-                        ) {
-                            Ok(Some(_)) => {
-                                pending_matches.push((row_number, record_start));
-                                if pending_matches.len() == MATCH_PUBLISH_BATCH {
-                                    publish_matches(shared, &mut pending_matches);
+                    if record.is_empty() {
+                        let rec = &chunk[segment_start..local_end];
+                        if rec.len() > max_record_bytes {
+                            deferred_error = Some(QuarryError::RecordTooLarge {
+                                limit: max_record_bytes,
+                            });
+                        } else {
+                            match record_matches_fast(
+                                rec,
+                                delimiter,
+                                row_number,
+                                query,
+                                &matchers,
+                                &groups,
+                                max_column,
+                                &edits,
+                                encoding,
+                                &mut field_ranges,
+                            ) {
+                                Ok(true) => {
+                                    pending_matches.push((row_number, record_start));
+                                    if pending_matches.len() == MATCH_PUBLISH_BATCH {
+                                        publish_matches(shared, &mut pending_matches);
+                                    }
                                 }
+                                Ok(false) => {}
+                                Err(error) => deferred_error = Some(error),
                             }
-                            Ok(None) => {}
-                            Err(error) => deferred_error = Some(error),
+                        }
+                    } else {
+                        record.extend_from_slice(&chunk[segment_start..local_end]);
+                        if record.len() > max_record_bytes {
+                            deferred_error = Some(QuarryError::RecordTooLarge {
+                                limit: max_record_bytes,
+                            });
+                        } else {
+                            match record_matches_fast(
+                                &record,
+                                delimiter,
+                                row_number,
+                                query,
+                                &matchers,
+                                &groups,
+                                max_column,
+                                &edits,
+                                encoding,
+                                &mut field_ranges,
+                            ) {
+                                Ok(true) => {
+                                    pending_matches.push((row_number, record_start));
+                                    if pending_matches.len() == MATCH_PUBLISH_BATCH {
+                                        publish_matches(shared, &mut pending_matches);
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => deferred_error = Some(error),
+                            }
                         }
                     }
                 }
@@ -1053,6 +1299,1109 @@ fn run_filter(
             }
         }
     }
+}
+
+struct FilterRangeOutcome {
+    matches: Vec<(u64, u64)>,
+    rows: u64,
+    end_in_quote: bool,
+    open_record_start: Option<u64>,
+    error: Option<QuarryError>,
+}
+
+struct FilterQuotedOutcome {
+    first_record_end: Option<u64>,
+    first_error: Option<QuarryError>,
+    tail: Option<FilterRangeOutcome>,
+}
+
+struct FilterChunkResult {
+    id: u64,
+    start: u64,
+    end: u64,
+    is_last: bool,
+    field_start: FilterRangeOutcome,
+    quoted: Option<FilterQuotedOutcome>,
+}
+
+fn find_filter_next_lf(
+    file: &File,
+    start: u64,
+    limit_end: u64,
+    cancelled: &AtomicBool,
+) -> Result<Option<u64>, QuarryError> {
+    let mut pos = start;
+    let mut probe = [0u8; FILTER_ALIGNMENT_PROBE_BYTES];
+    while pos < limit_end {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let want = (limit_end - pos).min(probe.len() as u64) as usize;
+        let read = read_at_exact_or_eof(file, pos, &mut probe[..want])?;
+        if read < want {
+            return Err(QuarryError::SourceChanged);
+        }
+        if let Some(rel) = memchr(b'\n', &probe[..read]) {
+            return Ok(Some(pos + rel as u64));
+        }
+        pos += read as u64;
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_filter_slice_from_field_start(
+    buf: &[u8],
+    slice_start: u64,
+    end: u64,
+    is_last: bool,
+    base_row: u64,
+    data_start: u64,
+    delimiter: u8,
+    dialect: ScannerDialect,
+    encoding: Encoding,
+    byte_class: ByteEncodingClass,
+    query: &FilterQuery,
+    matchers: &[PredicateMatcher<'_>],
+    groups: &[Vec<usize>],
+    max_column: usize,
+    edits: &FilterEdits,
+    max_record_bytes: usize,
+    stop_flag: &AtomicBool,
+) -> Option<FilterRangeOutcome> {
+    let mut scanner = if slice_start == 0 {
+        match StructuralScanner::<false>::with_dialect(dialect, 0, byte_class) {
+            Ok(scanner) => scanner,
+            Err(err) => {
+                return Some(FilterRangeOutcome {
+                    matches: Vec::new(),
+                    rows: 0,
+                    end_in_quote: false,
+                    open_record_start: None,
+                    error: Some(QuarryError::Parse(err)),
+                });
+            }
+        }
+    } else {
+        match StructuralScanner::<false>::with_dialect_without_bom(dialect, slice_start, byte_class)
+        {
+            Ok(scanner) => scanner,
+            Err(err) => {
+                return Some(FilterRangeOutcome {
+                    matches: Vec::new(),
+                    rows: 0,
+                    end_in_quote: false,
+                    open_record_start: None,
+                    error: Some(QuarryError::Parse(err)),
+                });
+            }
+        }
+    };
+
+    let mut matches = Vec::new();
+    let mut local_row = 0u64;
+    let mut record_start = slice_start;
+    let mut field_ranges = Vec::with_capacity(max_column + 1);
+    let mut deferred_error: Option<QuarryError> = None;
+
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        if stop_flag.load(Ordering::Acquire) {
+            return None;
+        }
+        let sub_end = (offset + FILTER_WORKER_CANCEL_SLICE).min(buf.len());
+        let scan_res = scanner.scan_chunk(
+            &buf[offset..sub_end],
+            slice_start + offset as u64,
+            |absolute_end| {
+                if deferred_error.is_none() {
+                    let row = base_row + local_row;
+                    if row >= data_start {
+                        let rec_len = (absolute_end - record_start) as usize;
+                        if rec_len > max_record_bytes {
+                            deferred_error = Some(QuarryError::RecordTooLarge {
+                                limit: max_record_bytes,
+                            });
+                        } else {
+                            let s = (record_start - slice_start) as usize;
+                            let e = (absolute_end - slice_start) as usize;
+                            match record_matches_fast(
+                                &buf[s..e],
+                                delimiter,
+                                row,
+                                query,
+                                matchers,
+                                groups,
+                                max_column,
+                                edits,
+                                encoding,
+                                &mut field_ranges,
+                            ) {
+                                Ok(true) => matches.push((local_row, record_start)),
+                                Ok(false) => {}
+                                Err(err) => deferred_error = Some(err),
+                            }
+                        }
+                    }
+                }
+                local_row += 1;
+                record_start = absolute_end;
+            },
+        );
+        if deferred_error.is_some() {
+            break;
+        }
+        if let Err(err) = scan_res {
+            deferred_error = Some(QuarryError::Parse(err));
+            break;
+        }
+        offset = sub_end;
+    }
+
+    if deferred_error.is_none() && is_last {
+        match scanner.finish(end, |_| {}) {
+            Ok(true) => {
+                let row = base_row + local_row;
+                if row >= data_start {
+                    let s = (record_start - slice_start) as usize;
+                    let rec = &buf[s..];
+                    if rec.len() > max_record_bytes {
+                        deferred_error = Some(QuarryError::RecordTooLarge {
+                            limit: max_record_bytes,
+                        });
+                    } else {
+                        match record_matches_fast(
+                            rec,
+                            delimiter,
+                            row,
+                            query,
+                            matchers,
+                            groups,
+                            max_column,
+                            edits,
+                            encoding,
+                            &mut field_ranges,
+                        ) {
+                            Ok(true) => matches.push((local_row, record_start)),
+                            Ok(false) => {}
+                            Err(err) => deferred_error = Some(err),
+                        }
+                    }
+                }
+                local_row += 1;
+                record_start = end;
+            }
+            Ok(false) => {}
+            Err(err) => deferred_error = Some(QuarryError::Parse(err)),
+        }
+    }
+
+    let end_in_quote = scanner.is_in_quote();
+    let open_record_start = end_in_quote.then_some(record_start);
+    Some(FilterRangeOutcome {
+        matches,
+        rows: local_row,
+        end_in_quote,
+        open_record_start,
+        error: deferred_error,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_filter_chunk_worker(
+    id: u64,
+    start: u64,
+    end: u64,
+    is_last: bool,
+    file: &File,
+    delimiter: u8,
+    data_start: u64,
+    dialect: ScannerDialect,
+    encoding: Encoding,
+    byte_class: ByteEncodingClass,
+    query: &FilterQuery,
+    max_record_bytes: usize,
+    stop_flag: &AtomicBool,
+    #[cfg(test)] delay_chunk_zero: Option<Duration>,
+) -> Option<Result<FilterChunkResult, QuarryError>> {
+    #[cfg(test)]
+    if id == 0
+        && let Some(delay) = delay_chunk_zero
+    {
+        thread::sleep(delay);
+    }
+
+    if stop_flag.load(Ordering::Acquire) {
+        return None;
+    }
+
+    let len = match usize::try_from(end - start) {
+        Ok(len) => len,
+        Err(_) => return Some(Err(QuarryError::InvalidOption("filter chunk overflow"))),
+    };
+    let mut buf = vec![0u8; len];
+    match read_at_exact_or_eof(file, start, &mut buf) {
+        Ok(read) if read == len => {}
+        Ok(_) => return Some(Err(QuarryError::SourceChanged)),
+        Err(error) => return Some(Err(QuarryError::Io(error))),
+    }
+    if stop_flag.load(Ordering::Acquire) {
+        return None;
+    }
+
+    let matchers = match compile_matchers(query) {
+        Ok(m) => m,
+        Err(err) => return Some(Err(err)),
+    };
+    let groups = predicate_groups(query);
+    let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
+    let empty_edits: FilterEdits = Arc::default();
+
+    // Non-initial chunks always contain data rows (>= data_start) because chunk 0 ends after
+    // at least one LF (covering row 0 when headered).
+    let fs_data_start = if start == 0 { data_start } else { 0 };
+    let field_start = eval_filter_slice_from_field_start(
+        &buf,
+        start,
+        end,
+        is_last,
+        0,
+        fs_data_start,
+        delimiter,
+        dialect,
+        encoding,
+        byte_class,
+        query,
+        &matchers,
+        &groups,
+        max_column,
+        &empty_edits,
+        max_record_bytes,
+        stop_flag,
+    )?;
+
+    let quoted = if start == 0 {
+        None
+    } else if dialect.quote.is_some_and(|q| memchr(q, &buf).is_some()) {
+        // Find the end of the incoming open quoted record, then evaluate the remaining slice
+        // in-worker so ordered merge only stitches that single boundary record.
+        let mut q_scanner = match StructuralScanner::<false>::at_offset_in_quote(
+            dialect,
+            start,
+            byte_class,
+            active_simd_backend(),
+        ) {
+            Ok(scanner) => scanner,
+            Err(err) => return Some(Err(QuarryError::Parse(err))),
+        };
+        let mut first_end: Option<u64> = None;
+        let mut first_error: Option<QuarryError> = None;
+        let mut pos = 0usize;
+        while pos < buf.len() && first_end.is_none() && first_error.is_none() {
+            if stop_flag.load(Ordering::Acquire) {
+                return None;
+            }
+            // Scan in small steps until the first record end so we stop immediately once closed.
+            let step_end = (pos + 4096).min(buf.len());
+            if let Err(err) = q_scanner.scan_chunk(&buf[pos..step_end], start + pos as u64, |re| {
+                if first_end.is_none() {
+                    first_end = Some(re);
+                }
+            }) {
+                first_error = Some(QuarryError::Parse(err));
+            }
+            pos = step_end;
+        }
+        if first_end.is_none() && first_error.is_none() && is_last {
+            match q_scanner.finish(end, |_| {}) {
+                Ok(true) => first_end = Some(end),
+                Ok(false) => {}
+                Err(err) => first_error = Some(QuarryError::Parse(err)),
+            }
+        }
+        let tail = if first_error.is_none()
+            && let Some(fe) = first_end
+            && fe < end
+        {
+            let tail_slice = &buf[(fe - start) as usize..];
+            Some(eval_filter_slice_from_field_start(
+                tail_slice,
+                fe,
+                end,
+                is_last,
+                0,
+                0,
+                delimiter,
+                dialect,
+                encoding,
+                byte_class,
+                query,
+                &matchers,
+                &groups,
+                max_column,
+                &empty_edits,
+                max_record_bytes,
+                stop_flag,
+            )?)
+        } else {
+            None
+        };
+        Some(FilterQuotedOutcome {
+            first_record_end: first_end,
+            first_error,
+            tail,
+        })
+    } else {
+        Some(FilterQuotedOutcome {
+            first_record_end: None,
+            first_error: is_last.then_some(QuarryError::Parse(ParseError {
+                offset: end,
+                kind: ParseErrorKind::UnterminatedQuote,
+            })),
+            tail: None,
+        })
+    };
+
+    Some(Ok(FilterChunkResult {
+        id,
+        start,
+        end,
+        is_last,
+        field_start,
+        quoted,
+    }))
+}
+
+fn adjust_worker_error(error: QuarryError, base_row: u64) -> QuarryError {
+    match error {
+        QuarryError::RecordEncoding { record, cause } => QuarryError::RecordEncoding {
+            record: base_row.saturating_add(record),
+            cause,
+        },
+        other => other,
+    }
+}
+
+struct FilterMergeState {
+    in_quote: bool,
+    open_record_start: u64,
+    rows_scanned: u64,
+    next_id: u64,
+    pending: BTreeMap<u64, Result<FilterChunkResult, QuarryError>>,
+}
+
+impl FilterMergeState {
+    fn new() -> Self {
+        Self {
+            in_quote: false,
+            open_record_start: 0,
+            rows_scanned: 0,
+            next_id: 0,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_ready(
+        &mut self,
+        file: &File,
+        delimiter: u8,
+        data_start: u64,
+        dialect: ScannerDialect,
+        encoding: Encoding,
+        byte_class: ByteEncodingClass,
+        query: &FilterQuery,
+        matchers: &[PredicateMatcher<'_>],
+        groups: &[Vec<usize>],
+        max_column: usize,
+        edits: &FilterEdits,
+        max_record_bytes: usize,
+        stop_flag: &AtomicBool,
+        shared: &SharedState,
+    ) -> Result<(), QuarryError> {
+        let mut publish_buf = Vec::new();
+        let mut field_ranges = Vec::with_capacity(max_column + 1);
+
+        while let Some(result) = self.pending.remove(&self.next_id) {
+            self.next_id += 1;
+            let chunk = result?;
+
+            if !self.in_quote {
+                let base_row = self.rows_scanned;
+                let has_edits_in_chunk = !edits.is_empty()
+                    && edits
+                        .range(
+                            (base_row, 0)
+                                ..=(base_row.saturating_add(chunk.field_start.rows), usize::MAX),
+                        )
+                        .next()
+                        .is_some();
+
+                if has_edits_in_chunk {
+                    let len = usize::try_from(chunk.end - chunk.start)
+                        .map_err(|_| QuarryError::InvalidOption("filter chunk overflow"))?;
+                    let mut buf = vec![0u8; len];
+                    if read_at_exact_or_eof(file, chunk.start, &mut buf)? != len {
+                        return Err(QuarryError::SourceChanged);
+                    }
+                    let Some(exact) = eval_filter_slice_from_field_start(
+                        &buf,
+                        chunk.start,
+                        chunk.end,
+                        chunk.is_last,
+                        base_row,
+                        data_start,
+                        delimiter,
+                        dialect,
+                        encoding,
+                        byte_class,
+                        query,
+                        matchers,
+                        groups,
+                        max_column,
+                        edits,
+                        max_record_bytes,
+                        stop_flag,
+                    ) else {
+                        return Ok(());
+                    };
+                    if let Some(err) = exact.error {
+                        return Err(err);
+                    }
+                    for (local_row, offset) in exact.matches {
+                        publish_buf.push((base_row + local_row, offset));
+                    }
+                    self.rows_scanned += exact.rows;
+                    self.in_quote = exact.end_in_quote;
+                    if let Some(open) = exact.open_record_start {
+                        self.open_record_start = open;
+                    }
+                } else {
+                    if let Some(err) = chunk.field_start.error {
+                        return Err(adjust_worker_error(err, base_row));
+                    }
+                    for (local_row, offset) in chunk.field_start.matches {
+                        publish_buf.push((base_row + local_row, offset));
+                    }
+                    self.rows_scanned += chunk.field_start.rows;
+                    self.in_quote = chunk.field_start.end_in_quote;
+                    if let Some(open) = chunk.field_start.open_record_start {
+                        self.open_record_start = open;
+                    }
+                }
+            } else {
+                let q = chunk
+                    .quoted
+                    .expect("non-initial LF-aligned filter chunk has quoted outcome");
+                if let Some(err) = q.first_error {
+                    return Err(adjust_worker_error(err, self.rows_scanned));
+                }
+                if let Some(first_end) = q.first_record_end {
+                    let stitched_len = first_end.saturating_sub(self.open_record_start);
+                    if stitched_len > max_record_bytes as u64 {
+                        return Err(QuarryError::RecordTooLarge {
+                            limit: max_record_bytes,
+                        });
+                    }
+                    let mut rec = vec![0u8; stitched_len as usize];
+                    if read_at_exact_or_eof(file, self.open_record_start, &mut rec)? != rec.len() {
+                        return Err(QuarryError::SourceChanged);
+                    }
+                    let row = self.rows_scanned;
+                    if row >= data_start
+                        && record_matches_fast(
+                            &rec,
+                            delimiter,
+                            row,
+                            query,
+                            matchers,
+                            groups,
+                            max_column,
+                            edits,
+                            encoding,
+                            &mut field_ranges,
+                        )?
+                    {
+                        publish_buf.push((row, self.open_record_start));
+                    }
+                    self.rows_scanned += 1;
+                    self.in_quote = false;
+
+                    if let Some(tail) = q.tail {
+                        let tail_base = self.rows_scanned;
+                        let has_edits_in_tail = !edits.is_empty()
+                            && edits
+                                .range(
+                                    (tail_base, 0)
+                                        ..=(tail_base.saturating_add(tail.rows), usize::MAX),
+                                )
+                                .next()
+                                .is_some();
+                        if has_edits_in_tail {
+                            let len = usize::try_from(chunk.end - first_end)
+                                .map_err(|_| QuarryError::InvalidOption("filter chunk overflow"))?;
+                            let mut buf = vec![0u8; len];
+                            if read_at_exact_or_eof(file, first_end, &mut buf)? != len {
+                                return Err(QuarryError::SourceChanged);
+                            }
+                            let Some(exact) = eval_filter_slice_from_field_start(
+                                &buf,
+                                first_end,
+                                chunk.end,
+                                chunk.is_last,
+                                tail_base,
+                                data_start,
+                                delimiter,
+                                dialect,
+                                encoding,
+                                byte_class,
+                                query,
+                                matchers,
+                                groups,
+                                max_column,
+                                edits,
+                                max_record_bytes,
+                                stop_flag,
+                            ) else {
+                                return Ok(());
+                            };
+                            if let Some(err) = exact.error {
+                                return Err(err);
+                            }
+                            for (local_row, offset) in exact.matches {
+                                publish_buf.push((tail_base + local_row, offset));
+                            }
+                            self.rows_scanned += exact.rows;
+                            self.in_quote = exact.end_in_quote;
+                            if let Some(open) = exact.open_record_start {
+                                self.open_record_start = open;
+                            }
+                        } else {
+                            if let Some(err) = tail.error {
+                                return Err(adjust_worker_error(err, tail_base));
+                            }
+                            for (local_row, offset) in tail.matches {
+                                publish_buf.push((tail_base + local_row, offset));
+                            }
+                            self.rows_scanned += tail.rows;
+                            self.in_quote = tail.end_in_quote;
+                            if let Some(open) = tail.open_record_start {
+                                self.open_record_start = open;
+                            }
+                        }
+                    }
+                }
+            }
+
+            publish_matches(shared, &mut publish_buf);
+            shared.bytes_scanned.store(chunk.end, Ordering::Release);
+            shared
+                .rows_scanned
+                .store(self.rows_scanned, Ordering::Release);
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_filter_giant_line_sequential(
+    file: &File,
+    start: u64,
+    min_stop: u64,
+    file_size: u64,
+    delimiter: u8,
+    data_start: u64,
+    dialect: ScannerDialect,
+    encoding: Encoding,
+    byte_class: ByteEncodingClass,
+    query: &FilterQuery,
+    matchers: &[PredicateMatcher<'_>],
+    groups: &[Vec<usize>],
+    max_column: usize,
+    edits: &FilterEdits,
+    max_record_bytes: usize,
+    read_chunk_bytes: usize,
+    merge: &mut FilterMergeState,
+    shared: &SharedState,
+) -> Result<u64, QuarryError> {
+    let mut scanner = if start == 0 {
+        StructuralScanner::<false>::with_dialect(dialect, 0, byte_class)?
+    } else if merge.in_quote {
+        StructuralScanner::<false>::at_offset_in_quote(
+            dialect,
+            start,
+            byte_class,
+            active_simd_backend(),
+        )?
+    } else {
+        StructuralScanner::<false>::with_dialect_without_bom(dialect, start, byte_class)?
+    };
+
+    let mut pos = start;
+    let mut record_start = if merge.in_quote {
+        merge.open_record_start
+    } else {
+        start
+    };
+    let mut buf = vec![0u8; read_chunk_bytes.clamp(64 * 1024, 1024 * 1024)];
+    let mut publish_buf = Vec::new();
+    let mut field_ranges = Vec::with_capacity(max_column + 1);
+
+    while pos < file_size {
+        if shared.cancel_requested.load(Ordering::Acquire) {
+            publish_matches(shared, &mut publish_buf);
+            shared.cancelled.store(true, Ordering::Release);
+            return Ok(pos);
+        }
+        let want = (file_size - pos).min(buf.len() as u64) as usize;
+        let read = read_at_exact_or_eof(file, pos, &mut buf[..want])?;
+        if read < want {
+            return Err(QuarryError::SourceChanged);
+        }
+
+        let mut slice_len = read;
+        let mut hit_lf_after_min = false;
+        if pos + read as u64 >= min_stop {
+            let search_from = min_stop.saturating_sub(pos) as usize;
+            if let Some(rel) = memchr(b'\n', &buf[search_from..read]) {
+                slice_len = search_from + rel + 1;
+                hit_lf_after_min = true;
+            }
+        }
+
+        let next_pos = pos + slice_len as u64;
+        let mut deferred_error: Option<QuarryError> = None;
+        let scan_res = scanner.scan_chunk(&buf[..slice_len], pos, |absolute_end| {
+            if deferred_error.is_none() {
+                let row = merge.rows_scanned;
+                if row >= data_start {
+                    let rec_len = absolute_end.saturating_sub(record_start);
+                    if rec_len > max_record_bytes as u64 {
+                        deferred_error = Some(QuarryError::RecordTooLarge {
+                            limit: max_record_bytes,
+                        });
+                    } else {
+                        let eval_res = if record_start >= pos {
+                            let s = (record_start - pos) as usize;
+                            let e = (absolute_end - pos) as usize;
+                            record_matches_fast(
+                                &buf[s..e],
+                                delimiter,
+                                row,
+                                query,
+                                matchers,
+                                groups,
+                                max_column,
+                                edits,
+                                encoding,
+                                &mut field_ranges,
+                            )
+                        } else {
+                            let mut stitched = vec![0u8; rec_len as usize];
+                            match read_at_exact_or_eof(file, record_start, &mut stitched) {
+                                Ok(n) if n == stitched.len() => record_matches_fast(
+                                    &stitched,
+                                    delimiter,
+                                    row,
+                                    query,
+                                    matchers,
+                                    groups,
+                                    max_column,
+                                    edits,
+                                    encoding,
+                                    &mut field_ranges,
+                                ),
+                                Ok(_) => Err(QuarryError::SourceChanged),
+                                Err(err) => Err(QuarryError::Io(err)),
+                            }
+                        };
+                        match eval_res {
+                            Ok(true) => publish_buf.push((row, record_start)),
+                            Ok(false) => {}
+                            Err(err) => deferred_error = Some(err),
+                        }
+                    }
+                }
+            }
+            merge.rows_scanned += 1;
+            record_start = absolute_end;
+        });
+        if let Some(err) = deferred_error {
+            return Err(err);
+        }
+        scan_res?;
+        if next_pos == file_size && scanner.finish(file_size, |_| {})? {
+            let row = merge.rows_scanned;
+            if row >= data_start {
+                let rec_len = file_size.saturating_sub(record_start);
+                if rec_len > max_record_bytes as u64 {
+                    return Err(QuarryError::RecordTooLarge {
+                        limit: max_record_bytes,
+                    });
+                }
+                let mut stitched = vec![0u8; rec_len as usize];
+                if read_at_exact_or_eof(file, record_start, &mut stitched)? != stitched.len() {
+                    return Err(QuarryError::SourceChanged);
+                }
+                if record_matches_fast(
+                    &stitched,
+                    delimiter,
+                    row,
+                    query,
+                    matchers,
+                    groups,
+                    max_column,
+                    edits,
+                    encoding,
+                    &mut field_ranges,
+                )? {
+                    publish_buf.push((row, record_start));
+                }
+            }
+            merge.rows_scanned += 1;
+            record_start = file_size;
+        }
+
+        publish_matches(shared, &mut publish_buf);
+        pos = next_pos;
+        shared.bytes_scanned.store(pos, Ordering::Release);
+        shared
+            .rows_scanned
+            .store(merge.rows_scanned, Ordering::Release);
+        if hit_lf_after_min {
+            break;
+        }
+    }
+
+    merge.in_quote = scanner.is_in_quote();
+    merge.open_record_start = record_start;
+    Ok(pos)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_parallel_filter(
+    file: Arc<File>,
+    file_size: u64,
+    delimiter: u8,
+    data_start: u64,
+    query: &FilterQuery,
+    max_record_bytes: usize,
+    encoding: Encoding,
+    byte_class: ByteEncodingClass,
+    tuning: FilterParallelTuning,
+    shared: &SharedState,
+) -> Result<(), QuarryError> {
+    let edits = shared.index.read().unwrap().edits.clone();
+    let dialect = ScannerDialect::rfc4180(delimiter);
+    dialect.validate(byte_class)?;
+    let matchers = compile_matchers(query)?;
+    let groups = predicate_groups(query);
+    let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
+
+    let chunk_size = tuning.chunk_bytes.max(64);
+    let estimated_chunks = file_size.div_ceil(chunk_size as u64).max(1) as usize;
+    let effective_workers = tuning.requested_threads.min(estimated_chunks).max(1);
+    let pool = engine_pool();
+    let executor = JobExecutor::new(pool, JobPriority::Foreground, effective_workers)?;
+    let effective_workers = executor.effective_workers();
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<Result<FilterChunkResult, QuarryError>>();
+    let max_window = (effective_workers * 2).clamp(2, 16);
+    let query_arc = Arc::new(query.clone());
+
+    let mut merge = FilterMergeState::new();
+    let mut cursor = 0u64;
+    let mut next_chunk_id = 0u64;
+
+    let run_result: Result<(), QuarryError> = (|| {
+        while cursor < file_size {
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                stop_flag.store(true, Ordering::Release);
+                shared.cancelled.store(true, Ordering::Release);
+                return Ok(());
+            }
+
+            while let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(chunk) => {
+                        merge.pending.insert(chunk.id, Ok(chunk));
+                    }
+                    Err(err) => {
+                        stop_flag.store(true, Ordering::Release);
+                        return Err(err);
+                    }
+                }
+                if let Err(err) = merge.apply_ready(
+                    &file,
+                    delimiter,
+                    data_start,
+                    dialect,
+                    encoding,
+                    byte_class,
+                    query,
+                    &matchers,
+                    &groups,
+                    max_column,
+                    &edits,
+                    max_record_bytes,
+                    &stop_flag,
+                    shared,
+                ) {
+                    stop_flag.store(true, Ordering::Release);
+                    return Err(err);
+                }
+            }
+
+            while (next_chunk_id - merge.next_id) as usize >= max_window {
+                if shared.cancel_requested.load(Ordering::Acquire) {
+                    stop_flag.store(true, Ordering::Release);
+                    shared.cancelled.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                match rx.recv_timeout(Duration::from_millis(2)) {
+                    Ok(result) => {
+                        match result {
+                            Ok(chunk) => {
+                                merge.pending.insert(chunk.id, Ok(chunk));
+                            }
+                            Err(err) => {
+                                stop_flag.store(true, Ordering::Release);
+                                return Err(err);
+                            }
+                        }
+                        if let Err(err) = merge.apply_ready(
+                            &file,
+                            delimiter,
+                            data_start,
+                            dialect,
+                            encoding,
+                            byte_class,
+                            query,
+                            &matchers,
+                            &groups,
+                            max_column,
+                            &edits,
+                            max_record_bytes,
+                            &stop_flag,
+                            shared,
+                        ) {
+                            stop_flag.store(true, Ordering::Release);
+                            return Err(err);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            let nominal_end = cursor.saturating_add(chunk_size as u64).min(file_size);
+            let chunk_end = if nominal_end == file_size {
+                file_size
+            } else {
+                let search_limit = nominal_end
+                    .saturating_add(tuning.max_alignment_search)
+                    .min(file_size);
+                match find_filter_next_lf(
+                    &file,
+                    nominal_end,
+                    search_limit,
+                    &shared.cancel_requested,
+                )? {
+                    Some(lf_pos) => lf_pos + 1,
+                    None if shared.cancel_requested.load(Ordering::Acquire) => {
+                        stop_flag.store(true, Ordering::Release);
+                        shared.cancelled.store(true, Ordering::Release);
+                        return Ok(());
+                    }
+                    None => {
+                        // Drain prior parallel chunks before streaming the giant line sequentially.
+                        while merge.next_id < next_chunk_id {
+                            if shared.cancel_requested.load(Ordering::Acquire) {
+                                stop_flag.store(true, Ordering::Release);
+                                shared.cancelled.store(true, Ordering::Release);
+                                return Ok(());
+                            }
+                            match rx.recv_timeout(Duration::from_millis(2)) {
+                                Ok(result) => {
+                                    match result {
+                                        Ok(chunk) => {
+                                            merge.pending.insert(chunk.id, Ok(chunk));
+                                        }
+                                        Err(err) => {
+                                            stop_flag.store(true, Ordering::Release);
+                                            return Err(err);
+                                        }
+                                    }
+                                    if let Err(err) = merge.apply_ready(
+                                        &file,
+                                        delimiter,
+                                        data_start,
+                                        dialect,
+                                        encoding,
+                                        byte_class,
+                                        query,
+                                        &matchers,
+                                        &groups,
+                                        max_column,
+                                        &edits,
+                                        max_record_bytes,
+                                        &stop_flag,
+                                        shared,
+                                    ) {
+                                        stop_flag.store(true, Ordering::Release);
+                                        return Err(err);
+                                    }
+                                }
+                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        cursor = scan_filter_giant_line_sequential(
+                            &file,
+                            cursor,
+                            search_limit,
+                            file_size,
+                            delimiter,
+                            data_start,
+                            dialect,
+                            encoding,
+                            byte_class,
+                            query,
+                            &matchers,
+                            &groups,
+                            max_column,
+                            &edits,
+                            max_record_bytes,
+                            chunk_size,
+                            &mut merge,
+                            shared,
+                        )?;
+                        continue;
+                    }
+                }
+            };
+
+            let start = cursor;
+            let end = chunk_end;
+            let is_last = end == file_size;
+            let id = next_chunk_id;
+            next_chunk_id += 1;
+            cursor = end;
+
+            let chunk_len = usize::try_from(end - start)
+                .map_err(|_| QuarryError::InvalidOption("filter chunk overflow"))?;
+            let Some(budget_guard) = pool
+                .byte_budget()
+                .acquire(chunk_len.max(1), &shared.cancel_requested)
+            else {
+                stop_flag.store(true, Ordering::Release);
+                shared.cancelled.store(true, Ordering::Release);
+                return Ok(());
+            };
+            advise_readahead(&file, start, end - start);
+
+            let worker_file = Arc::clone(&file);
+            let worker_query = Arc::clone(&query_arc);
+            let worker_stop = Arc::clone(&stop_flag);
+            let worker_tx = tx.clone();
+            #[cfg(test)]
+            let delay_zero = tuning.delay_chunk_zero;
+
+            if !executor.spawn(&shared.cancel_requested, move || {
+                let _budget = budget_guard;
+                let res = scan_filter_chunk_worker(
+                    id,
+                    start,
+                    end,
+                    is_last,
+                    &worker_file,
+                    delimiter,
+                    data_start,
+                    dialect,
+                    encoding,
+                    byte_class,
+                    &worker_query,
+                    max_record_bytes,
+                    &worker_stop,
+                    #[cfg(test)]
+                    delay_zero,
+                );
+                drop(_budget);
+                if let Some(res) = res {
+                    let _ = worker_tx.send(res);
+                }
+            }) {
+                stop_flag.store(true, Ordering::Release);
+                shared.cancelled.store(true, Ordering::Release);
+                return Ok(());
+            }
+        }
+
+        // Drain all remaining dispatched chunks in strict order.
+        while merge.next_id < next_chunk_id {
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                stop_flag.store(true, Ordering::Release);
+                shared.cancelled.store(true, Ordering::Release);
+                return Ok(());
+            }
+            match rx.recv_timeout(Duration::from_millis(2)) {
+                Ok(result) => {
+                    match result {
+                        Ok(chunk) => {
+                            merge.pending.insert(chunk.id, Ok(chunk));
+                        }
+                        Err(err) => {
+                            stop_flag.store(true, Ordering::Release);
+                            return Err(err);
+                        }
+                    }
+                    if let Err(err) = merge.apply_ready(
+                        &file,
+                        delimiter,
+                        data_start,
+                        dialect,
+                        encoding,
+                        byte_class,
+                        query,
+                        &matchers,
+                        &groups,
+                        max_column,
+                        &edits,
+                        max_record_bytes,
+                        &stop_flag,
+                        shared,
+                    ) {
+                        stop_flag.store(true, Ordering::Release);
+                        return Err(err);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        if edits
+            .keys()
+            .next_back()
+            .is_some_and(|(row, _)| *row >= merge.rows_scanned)
+        {
+            return Err(QuarryError::InvalidOption(
+                "cell edit points beyond the source rows",
+            ));
+        }
+
+        Ok(())
+    })();
+
+    if run_result.is_err() || shared.cancel_requested.load(Ordering::Acquire) {
+        stop_flag.store(true, Ordering::Release);
+    }
+    drop(tx);
+    let drain_res = executor.drain();
+    run_result?;
+    drain_res?;
+    Ok(())
 }
 
 fn read_filtered_rows(
@@ -1293,6 +2642,7 @@ fn run_filtered_read(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs::{self, File};
     use std::io::Write;
     use std::sync::Arc;
@@ -1301,10 +2651,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES, FilterIndex, FilterJob, FilterOperator,
-        FilterPredicate, FilterQuery, FilterReadCompletion, FilterReadConfig, FilterReadJob,
-        FilterReadOutcome, FilterReadSharedState, FilterScanConfig, SharedState, WorkerCompletion,
-        prepare_filtered_read,
+        DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES, DEFAULT_FILTER_SCAN_CONFIG, FilterEdits,
+        FilterIndex, FilterJob, FilterOperator, FilterPredicate, FilterQuery, FilterReadCompletion,
+        FilterReadConfig, FilterReadJob, FilterReadOutcome, FilterReadSharedState,
+        FilterScanConfig, SharedState, WorkerCompletion, prepare_filtered_read,
     };
     use crate::{CaseSensitivity, HeaderMode, OpenOptions, QuarryError, Session};
 
@@ -2344,5 +3694,144 @@ mod tests {
             thread::yield_now();
         }
         assert!(shared.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn parallel_filter_matches_sequential_across_multiline_quotes_edits_and_slow_first_chunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("parallel-filter.csv");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\xEF\xBB\xBFid,score,notes\n");
+        for i in 1..=300_u32 {
+            if i % 9 == 0 {
+                data.extend_from_slice(
+                    format!("{i},{},\"multi\nline\n\"\"quoted\"\"\n{i}\"\r\n", i % 50).as_bytes(),
+                );
+            } else {
+                data.extend_from_slice(format!("{i},{},plain_{i}\n", i % 50).as_bytes());
+            }
+        }
+        data.extend_from_slice(b"301,45,\"trailing\nwithout_lf\"");
+        fs::write(&path, &data).unwrap();
+
+        let session = Session::open(&path, OpenOptions::default()).unwrap();
+        let query = FilterQuery {
+            predicates: vec![
+                FilterPredicate {
+                    column: 1,
+                    operator: FilterOperator::GreaterThan,
+                    value: b"35".to_vec(),
+                    upper_bound: None,
+                },
+                FilterPredicate {
+                    column: 2,
+                    operator: FilterOperator::Contains,
+                    value: b"0".to_vec(),
+                    upper_bound: None,
+                },
+            ],
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        let mut edit_map = BTreeMap::new();
+        edit_map.insert((5_u64, 1usize), Arc::new(b"49".to_vec()));
+        edit_map.insert((5_u64, 2usize), Arc::new(b"forced_0_hit".to_vec()));
+        edit_map.insert((40_u64, 1usize), Arc::new(b"1".to_vec()));
+        let edits: FilterEdits = Arc::new(edit_map);
+
+        let sequential = session
+            .start_filter_with_edits_and_threads(query.clone(), Arc::clone(&edits), Some(1))
+            .unwrap()
+            .wait()
+            .unwrap();
+        let seq_rows = session
+            .read_filtered_rows(&sequential, 0, sequential.matches_found() as usize)
+            .unwrap();
+
+        let parallel = FilterJob::start_with_edits_and_tuning(
+            session.path().to_path_buf(),
+            session.file_size,
+            session.dialect.delimiter,
+            u64::from(session.dialect.has_header),
+            query,
+            DEFAULT_FILTER_SCAN_CONFIG,
+            edits,
+            Some(session.source_stamp.clone()),
+            session.encoding,
+            super::FilterParallelTuning {
+                requested_threads: 4,
+                min_parallel_bytes: 64,
+                chunk_bytes: 256,
+                max_alignment_search: 256,
+                delay_chunk_zero: Some(Duration::from_millis(25)),
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        let par_rows = session
+            .read_filtered_rows(&parallel, 0, parallel.matches_found() as usize)
+            .unwrap();
+
+        assert_eq!(parallel.matches_found(), sequential.matches_found());
+        assert_eq!(par_rows, seq_rows);
+    }
+
+    #[test]
+    fn parallel_filter_preceding_parse_error_wins_over_later_matches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("filter-malformed.csv");
+        let mut data = Vec::with_capacity(1_300_000);
+        data.extend_from_slice(b"id,val\n");
+        for i in 1..=65_000_u32 {
+            data.extend_from_slice(format!("{i},ok_row_{i:05}\n").as_bytes());
+        }
+        data.extend_from_slice(b"65001,\"bad\"after\n");
+        for i in 65_002..=66_000_u32 {
+            data.extend_from_slice(format!("{i},target_hit_{i}\n").as_bytes());
+        }
+        fs::write(&path, &data).unwrap();
+
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                rows: 5,
+                delimiter: Some(b','),
+                sample_bytes: 256,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let query = FilterQuery::single(1, FilterOperator::Contains, b"target_hit".to_vec());
+        let seq_err = session
+            .start_filter_with_edits_and_threads(query.clone(), Arc::default(), Some(1))
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        let par_err = FilterJob::start_with_edits_and_tuning(
+            session.path().to_path_buf(),
+            session.file_size,
+            session.dialect.delimiter,
+            u64::from(session.dialect.has_header),
+            query,
+            DEFAULT_FILTER_SCAN_CONFIG,
+            Arc::default(),
+            Some(session.source_stamp.clone()),
+            session.encoding,
+            super::FilterParallelTuning {
+                requested_threads: 4,
+                min_parallel_bytes: 64,
+                chunk_bytes: 64 * 1024,
+                max_alignment_search: 8 * 1024,
+                delay_chunk_zero: Some(Duration::from_millis(15)),
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap_err();
+
+        match (seq_err, par_err) {
+            (QuarryError::Parse(a), QuarryError::Parse(b)) => assert_eq!(a, b),
+            (a, b) => panic!("expected matching Parse errors, got seq={a:?} par={b:?}"),
+        }
     }
 }

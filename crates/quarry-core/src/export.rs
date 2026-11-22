@@ -1,3 +1,6 @@
+#[path = "export_parallel.rs"]
+mod parallel;
+
 use crate::ColumnCleanup;
 #[cfg(target_os = "macos")]
 use crate::storage::set_macos_acl;
@@ -757,7 +760,7 @@ impl FilterExportJob {
         destination: PathBuf,
         config: ExportConfig,
     ) -> Result<Self, QuarryError> {
-        Self::start_with_edits(
+        Self::start_with_edits_and_tuning(
             source_path,
             file_size,
             delimiter,
@@ -767,11 +770,12 @@ impl FilterExportJob {
             config,
             FilteredEdits::default(),
             None,
+            parallel::ExportParallelTuning::for_production(1),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_with_edits(
+    fn start_with_edits_and_tuning(
         source_path: PathBuf,
         file_size: u64,
         delimiter: u8,
@@ -781,6 +785,7 @@ impl FilterExportJob {
         config: ExportConfig,
         edits: FilteredEdits,
         expected: Option<SourceStamp>,
+        tuning: parallel::ExportParallelTuning,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
@@ -816,6 +821,7 @@ impl FilterExportJob {
                     &query,
                     &edits,
                     config,
+                    tuning,
                     &worker_state,
                 );
                 match &result {
@@ -1727,9 +1733,22 @@ impl Session {
         headers: BTreeMap<usize, Vec<u8>>,
         destination: impl AsRef<Path>,
     ) -> Result<FilterExportJob, QuarryError> {
+        self.start_filtered_export_with_edits_and_threads(query, cells, headers, destination, None)
+    }
+
+    /// Exports matching working values and renamed headers using an explicit worker count.
+    pub fn start_filtered_export_with_edits_and_threads(
+        &self,
+        query: FilterQuery,
+        cells: FilterEdits,
+        headers: BTreeMap<usize, Vec<u8>>,
+        destination: impl AsRef<Path>,
+        threads: Option<usize>,
+    ) -> Result<FilterExportJob, QuarryError> {
+        let requested_threads = crate::pool::resolve_worker_count(threads)?;
         self.check_uncompressed_destination(destination.as_ref())?;
         self.ensure_source_unchanged()?;
-        FilterExportJob::start_with_edits(
+        FilterExportJob::start_with_edits_and_tuning(
             self.path.clone(),
             self.file_size,
             self.dialect.delimiter,
@@ -1739,6 +1758,7 @@ impl Session {
             self.export_config(),
             FilteredEdits { cells, headers },
             Some(self.source_stamp.clone()),
+            parallel::ExportParallelTuning::for_production(requested_threads),
         )
         .map(|job| job.retaining(self.compressed.clone()))
     }
@@ -3187,6 +3207,7 @@ enum ScanOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_export(
     mut source: File,
     mut output: ExportTarget,
@@ -3195,6 +3216,7 @@ fn run_export(
     query: &FilterQuery,
     edits: &FilteredEdits,
     config: ExportConfig,
+    tuning: parallel::ExportParallelTuning,
     shared: &SharedState,
 ) -> Result<FilterExportOutcome, QuarryError> {
     if shared.cancel_requested.load(Ordering::Acquire) {
@@ -3222,16 +3244,35 @@ fn run_export(
             3
         }),
     )?;
-    match scan_export(
-        &mut source,
-        &mut output,
-        delimiter,
-        data_start,
-        query,
-        edits,
-        config,
-        shared,
-    ) {
+    let scan_outcome = if let Some(byte_class) = config.source_encoding.simd_byte_class()
+        && tuning.requested_threads > 1
+        && shared.total_bytes >= tuning.min_parallel_bytes
+    {
+        parallel::scan_export_parallel(
+            &mut source,
+            &mut output,
+            delimiter,
+            data_start,
+            query,
+            edits,
+            config,
+            byte_class,
+            tuning,
+            shared,
+        )
+    } else {
+        scan_export(
+            &mut source,
+            &mut output,
+            delimiter,
+            data_start,
+            query,
+            edits,
+            config,
+            shared,
+        )
+    };
+    match scan_outcome {
         Ok(ScanOutcome::Complete {
             rows_written,
             bytes_written,

@@ -1,20 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::Encoding;
-use crate::encoding::RecordScanner;
-
 use crate::case::ByteMatcher;
+use crate::encoding::RecordScanner;
+use crate::pool::{JobExecutor, JobPriority, engine_pool, resolve_worker_count};
+use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
 use crate::{
     CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError,
     Session, StructuralIndex, parse_encoded_record,
 };
+
+const DEFAULT_SEARCH_STRIPE_BYTES: u64 = 2 * 1024 * 1024;
+const WORKER_CANCEL_SLICE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchPosition {
@@ -46,6 +50,24 @@ pub struct SearchProgress {
     pub cancelled: bool,
 }
 
+/// Telemetry reported by literal search jobs (including bounded speculative work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchTelemetry {
+    pub effective_workers: usize,
+    pub wasted_work_bound_bytes: u64,
+    pub stripes_scanned: u64,
+}
+
+impl Default for SearchTelemetry {
+    fn default() -> Self {
+        Self {
+            effective_workers: 1,
+            wasted_work_bound_bytes: 0,
+            stripes_scanned: 0,
+        }
+    }
+}
+
 struct SharedState {
     bytes_scanned: AtomicU64,
     rows_scanned: AtomicU64,
@@ -53,6 +75,7 @@ struct SharedState {
     done: AtomicBool,
     cancelled: AtomicBool,
     error: Mutex<Option<String>>,
+    telemetry: Mutex<SearchTelemetry>,
     started: Instant,
     total_bytes: u64,
 }
@@ -66,6 +89,7 @@ impl SharedState {
             done: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             error: Mutex::new(None),
+            telemetry: Mutex::new(SearchTelemetry::default()),
             started: Instant::now(),
             total_bytes,
         }
@@ -84,12 +108,41 @@ impl Drop for WorkerCompletion<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SearchStripe {
+    id: u64,
+    start_row: u64,
+    start_offset: u64,
+    end_offset: u64,
+    is_eof: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchTuning {
+    requested_threads: usize,
+    stripe_target_bytes: u64,
+    #[cfg(test)]
+    delay_stripe_zero: Option<Duration>,
+}
+
+impl SearchTuning {
+    fn for_production(requested_threads: usize) -> Self {
+        Self {
+            requested_threads,
+            stripe_target_bytes: DEFAULT_SEARCH_STRIPE_BYTES,
+            #[cfg(test)]
+            delay_stripe_zero: None,
+        }
+    }
+}
+
 pub struct SearchJob {
     shared: Arc<SharedState>,
     handle: Option<JoinHandle<Result<SearchOutcome, QuarryError>>>,
 }
 
 impl SearchJob {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn start(
         path: PathBuf,
@@ -103,6 +156,48 @@ impl SearchJob {
         max_record_bytes: usize,
         encoding: Encoding,
     ) -> Result<Self, QuarryError> {
+        let stripes = vec![SearchStripe {
+            id: 0,
+            start_row: checkpoint.row,
+            start_offset: checkpoint.offset,
+            end_offset: file_size,
+            is_eof: true,
+        }];
+        Self::start_plan(
+            path,
+            file_size,
+            file_size,
+            0,
+            delimiter,
+            needle,
+            case_sensitivity,
+            start,
+            checkpoint,
+            stripes,
+            cell_edits,
+            max_record_bytes,
+            encoding,
+            SearchTuning::for_production(1),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_plan(
+        path: PathBuf,
+        file_size: u64,
+        indexed_frontier: u64,
+        indexed_rows: u64,
+        delimiter: u8,
+        needle: Vec<u8>,
+        case_sensitivity: CaseSensitivity,
+        start: SearchPosition,
+        checkpoint: Checkpoint,
+        stripes: Vec<SearchStripe>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        max_record_bytes: usize,
+        encoding: Encoding,
+        tuning: SearchTuning,
+    ) -> Result<Self, QuarryError> {
         if cell_edits
             .values()
             .any(|value| value.len() > max_record_bytes)
@@ -113,26 +208,48 @@ impl SearchJob {
         }
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(checkpoint.offset))?;
-        let shared = Arc::new(SharedState::new(
-            file_size.saturating_sub(checkpoint.offset),
-        ));
+        let total_bytes = indexed_frontier.saturating_sub(checkpoint.offset);
+        let shared = Arc::new(SharedState::new(total_bytes));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("quarry-search".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
-                let result = run_search(
-                    file,
-                    delimiter,
-                    &needle,
-                    case_sensitivity,
-                    start,
-                    checkpoint,
-                    &cell_edits,
-                    max_record_bytes,
-                    encoding,
-                    &worker_state,
-                );
+                let result =
+                    if !encoding.is_utf16() && tuning.requested_threads > 1 && stripes.len() > 1 {
+                        run_parallel_search(
+                            Arc::new(file),
+                            file_size,
+                            indexed_frontier,
+                            indexed_rows,
+                            delimiter,
+                            &needle,
+                            case_sensitivity,
+                            start,
+                            &stripes,
+                            &cell_edits,
+                            max_record_bytes,
+                            encoding,
+                            tuning,
+                            &worker_state,
+                        )
+                    } else {
+                        run_search_bounded(
+                            file,
+                            file_size,
+                            indexed_frontier,
+                            indexed_rows,
+                            delimiter,
+                            &needle,
+                            case_sensitivity,
+                            start,
+                            checkpoint,
+                            &cell_edits,
+                            max_record_bytes,
+                            encoding,
+                            &worker_state,
+                        )
+                    };
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
                 }
@@ -161,6 +278,10 @@ impl SearchJob {
         }
     }
 
+    pub fn telemetry(&self) -> SearchTelemetry {
+        *self.shared.telemetry.lock().unwrap()
+    }
+
     pub fn error(&self) -> Option<String> {
         self.shared.error.lock().unwrap().clone()
     }
@@ -187,6 +308,48 @@ impl Drop for SearchJob {
     }
 }
 
+fn build_search_stripes(
+    index: &StructuralIndex,
+    start_cp: Checkpoint,
+    indexed_frontier: u64,
+    file_size: u64,
+    stripe_target_bytes: u64,
+) -> Vec<SearchStripe> {
+    let mut stripes = Vec::new();
+    let target = stripe_target_bytes.max(1);
+    let mut cur = start_cp;
+    let mut id = 0u64;
+
+    for &cp in index.checkpoints() {
+        if cp.offset <= cur.offset || cp.offset > indexed_frontier {
+            continue;
+        }
+        if cp.offset - cur.offset >= target {
+            stripes.push(SearchStripe {
+                id,
+                start_row: cur.row,
+                start_offset: cur.offset,
+                end_offset: cp.offset,
+                is_eof: cp.offset == file_size,
+            });
+            id += 1;
+            cur = cp;
+        }
+    }
+
+    if cur.offset < indexed_frontier || (cur.offset == indexed_frontier && stripes.is_empty()) {
+        stripes.push(SearchStripe {
+            id,
+            start_row: cur.row,
+            start_offset: cur.offset,
+            end_offset: indexed_frontier,
+            is_eof: indexed_frontier == file_size,
+        });
+    }
+
+    stripes
+}
+
 impl Session {
     pub fn start_search(
         &self,
@@ -194,12 +357,13 @@ impl Session {
         needle: Vec<u8>,
         start: SearchPosition,
     ) -> Result<SearchJob, QuarryError> {
-        self.start_search_with_cell_edits_and_case(
+        self.start_search_with_options(
             index,
             needle,
             start,
             BTreeMap::new(),
             CaseSensitivity::Sensitive,
+            None,
         )
     }
 
@@ -210,12 +374,13 @@ impl Session {
         start: SearchPosition,
         case_sensitivity: CaseSensitivity,
     ) -> Result<SearchJob, QuarryError> {
-        self.start_search_with_cell_edits_and_case(
+        self.start_search_with_options(
             index,
             needle,
             start,
             BTreeMap::new(),
             case_sensitivity,
+            None,
         )
     }
 
@@ -226,12 +391,13 @@ impl Session {
         start: SearchPosition,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
     ) -> Result<SearchJob, QuarryError> {
-        self.start_search_with_cell_edits_and_case(
+        self.start_search_with_options(
             index,
             needle,
             start,
             cell_edits,
             CaseSensitivity::Sensitive,
+            None,
         )
     }
 
@@ -240,8 +406,40 @@ impl Session {
         index: &StructuralIndex,
         needle: Vec<u8>,
         start: SearchPosition,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<SearchJob, QuarryError> {
+        self.start_search_with_options(index, needle, start, cell_edits, case_sensitivity, None)
+    }
+
+    pub fn start_search_with_options(
+        &self,
+        index: &StructuralIndex,
+        needle: Vec<u8>,
+        start: SearchPosition,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        case_sensitivity: CaseSensitivity,
+        threads: Option<usize>,
+    ) -> Result<SearchJob, QuarryError> {
+        let requested_threads = resolve_worker_count(threads)?;
+        self.start_search_with_tuning(
+            index,
+            needle,
+            start,
+            cell_edits,
+            case_sensitivity,
+            SearchTuning::for_production(requested_threads),
+        )
+    }
+
+    fn start_search_with_tuning(
+        &self,
+        index: &StructuralIndex,
+        needle: Vec<u8>,
+        start: SearchPosition,
         mut cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
         case_sensitivity: CaseSensitivity,
+        tuning: SearchTuning,
     ) -> Result<SearchJob, QuarryError> {
         if needle.is_empty() {
             return Err(QuarryError::InvalidOption("search query must not be empty"));
@@ -256,25 +454,516 @@ impl Session {
         } else {
             start
         };
+        let indexed_frontier = index.indexed_bytes().min(self.file_size);
         let checkpoint = index.nearest_checkpoint(start.row);
-        SearchJob::start(
+        let stripes = build_search_stripes(
+            index,
+            checkpoint,
+            indexed_frontier,
+            self.file_size,
+            tuning.stripe_target_bytes,
+        );
+        SearchJob::start_plan(
             self.path.clone(),
             self.file_size,
+            indexed_frontier,
+            index.indexed_rows(),
             self.dialect.delimiter,
             needle,
             case_sensitivity,
             start,
             checkpoint,
+            stripes,
             cell_edits,
             DEFAULT_MAX_RECORD_BYTES,
             self.encoding,
+            tuning,
         )
     }
 }
 
+struct StripeResult {
+    id: u64,
+    bytes: u64,
+    rows: u64,
+    outcome: Result<Option<SearchMatch>, QuarryError>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_search_stripe(
+    stripe: SearchStripe,
+    file: &File,
+    delimiter: u8,
+    needle: &[u8],
+    case_sensitivity: CaseSensitivity,
+    start: SearchPosition,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    edited_rows: &BTreeSet<u64>,
+    max_record_bytes: usize,
+    encoding: Encoding,
+    stop_flag: &AtomicBool,
+    earliest_hit_stripe: &AtomicU64,
+    #[cfg(test)] delay_stripe_zero: Option<Duration>,
+) -> Option<StripeResult> {
+    #[cfg(test)]
+    if stripe.id == 0
+        && let Some(delay) = delay_stripe_zero
+    {
+        thread::sleep(delay);
+    }
+
+    if stop_flag.load(Ordering::Acquire) || stripe.id > earliest_hit_stripe.load(Ordering::Acquire)
+    {
+        return None;
+    }
+
+    let span = stripe.end_offset.saturating_sub(stripe.start_offset);
+    if span == 0 {
+        return Some(StripeResult {
+            id: stripe.id,
+            bytes: 0,
+            rows: 0,
+            outcome: Ok(None),
+        });
+    }
+
+    let len = match usize::try_from(span) {
+        Ok(len) => len,
+        Err(_) => {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: 0,
+                rows: 0,
+                outcome: Err(QuarryError::InvalidOption("search stripe overflow")),
+            });
+        }
+    };
+
+    let mut buf = vec![0u8; len];
+    match read_at_exact_or_eof(file, stripe.start_offset, &mut buf) {
+        Ok(read) if read == len => {}
+        Ok(_) => {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: 0,
+                rows: 0,
+                outcome: Err(QuarryError::SourceChanged),
+            });
+        }
+        Err(error) => {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: 0,
+                rows: 0,
+                outcome: Err(QuarryError::Io(error)),
+            });
+        }
+    }
+
+    let matcher = ByteMatcher::new(needle, case_sensitivity);
+    let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
+    let raw_stripe_has_hit = !can_prefilter || matcher.find(&buf).is_some();
+
+    let mut scanner = match RecordScanner::at_offset(delimiter, stripe.start_offset, encoding) {
+        Ok(scanner) => scanner,
+        Err(error) => {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: 0,
+                rows: 0,
+                outcome: Err(error),
+            });
+        }
+    };
+
+    let mut row_number = stripe.start_row;
+    let mut record_start = stripe.start_offset;
+    let mut rows_scanned = 0u64;
+    let mut found: Option<SearchMatch> = None;
+    let mut deferred_error: Option<QuarryError> = None;
+
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        if stop_flag.load(Ordering::Acquire)
+            || stripe.id > earliest_hit_stripe.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let slice_end = (offset + WORKER_CANCEL_SLICE_BYTES).min(buf.len());
+        let slice_abs = stripe.start_offset + offset as u64;
+        let scan_res = scanner.scan_chunk(&buf[offset..slice_end], slice_abs, |absolute_end| {
+            if found.is_none() && deferred_error.is_none() {
+                let rec_len = (absolute_end - record_start) as usize;
+                if row_number >= start.row {
+                    if rec_len > max_record_bytes {
+                        deferred_error = Some(QuarryError::RecordTooLarge {
+                            limit: max_record_bytes,
+                        });
+                    } else {
+                        let rec_local_start = (record_start - stripe.start_offset) as usize;
+                        let rec_local_end = (absolute_end - stripe.start_offset) as usize;
+                        let rec_bytes = &buf[rec_local_start..rec_local_end];
+                        let row_has_edit =
+                            !edited_rows.is_empty() && edited_rows.contains(&row_number);
+                        let should_parse = row_has_edit
+                            || (raw_stripe_has_hit
+                                && (!can_prefilter || matcher.find(rec_bytes).is_some()));
+                        if should_parse {
+                            match find_record(
+                                &matcher,
+                                rec_bytes,
+                                delimiter,
+                                row_number,
+                                record_start,
+                                start,
+                                cell_edits,
+                                encoding,
+                            ) {
+                                Ok(result) => found = result,
+                                Err(error) => deferred_error = Some(error),
+                            }
+                        }
+                    }
+                }
+            }
+            row_number += 1;
+            record_start = absolute_end;
+            rows_scanned += 1;
+        });
+
+        if let Some(error) = deferred_error {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: (slice_end as u64),
+                rows: rows_scanned,
+                outcome: Err(error),
+            });
+        }
+        if let Some(hit) = found {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: (slice_end as u64),
+                rows: rows_scanned,
+                outcome: Ok(Some(hit)),
+            });
+        }
+        if let Err(error) = scan_res {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: (slice_end as u64),
+                rows: rows_scanned,
+                outcome: Err(error),
+            });
+        }
+
+        offset = slice_end;
+    }
+
+    if stripe.is_eof {
+        match scanner.finish(stripe.end_offset, |_| {}) {
+            Ok(true) => {
+                rows_scanned += 1;
+                if row_number >= start.row {
+                    let rec_local_start = (record_start - stripe.start_offset) as usize;
+                    let rec_bytes = &buf[rec_local_start..];
+                    if rec_bytes.len() > max_record_bytes {
+                        earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                        return Some(StripeResult {
+                            id: stripe.id,
+                            bytes: len as u64,
+                            rows: rows_scanned,
+                            outcome: Err(QuarryError::RecordTooLarge {
+                                limit: max_record_bytes,
+                            }),
+                        });
+                    }
+                    let row_has_edit = !edited_rows.is_empty() && edited_rows.contains(&row_number);
+                    let should_parse = row_has_edit
+                        || (raw_stripe_has_hit
+                            && (!can_prefilter || matcher.find(rec_bytes).is_some()));
+                    if should_parse {
+                        match find_record(
+                            &matcher,
+                            rec_bytes,
+                            delimiter,
+                            row_number,
+                            record_start,
+                            start,
+                            cell_edits,
+                            encoding,
+                        ) {
+                            Ok(Some(hit)) => {
+                                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                                return Some(StripeResult {
+                                    id: stripe.id,
+                                    bytes: len as u64,
+                                    rows: rows_scanned,
+                                    outcome: Ok(Some(hit)),
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                                return Some(StripeResult {
+                                    id: stripe.id,
+                                    bytes: len as u64,
+                                    rows: rows_scanned,
+                                    outcome: Err(error),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                return Some(StripeResult {
+                    id: stripe.id,
+                    bytes: len as u64,
+                    rows: rows_scanned,
+                    outcome: Err(error),
+                });
+            }
+        }
+    }
+
+    Some(StripeResult {
+        id: stripe.id,
+        bytes: len as u64,
+        rows: rows_scanned,
+        outcome: Ok(None),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_parallel_search(
+    file: Arc<File>,
+    file_size: u64,
+    indexed_frontier: u64,
+    indexed_rows: u64,
+    delimiter: u8,
+    needle: &[u8],
+    case_sensitivity: CaseSensitivity,
+    start: SearchPosition,
+    stripes: &[SearchStripe],
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    max_record_bytes: usize,
+    encoding: Encoding,
+    tuning: SearchTuning,
+    shared: &SharedState,
+) -> Result<SearchOutcome, QuarryError> {
+    let effective_workers = tuning.requested_threads.min(stripes.len()).max(1);
+    let pool = engine_pool();
+    let executor = JobExecutor::new(pool, JobPriority::Foreground, effective_workers)?;
+    let effective_workers = executor.effective_workers();
+    let max_stripe_bytes = stripes
+        .iter()
+        .map(|s| s.end_offset.saturating_sub(s.start_offset))
+        .max()
+        .unwrap_or(0);
+    let window = effective_workers.clamp(1, 16);
+    {
+        let mut t = shared.telemetry.lock().unwrap();
+        t.effective_workers = effective_workers;
+        t.wasted_work_bound_bytes = (window as u64).saturating_mul(max_stripe_bytes);
+    }
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let earliest_hit_stripe = Arc::new(AtomicU64::new(u64::MAX));
+    let (tx, rx) = mpsc::channel::<StripeResult>();
+
+    let needle_arc = Arc::new(needle.to_vec());
+    let edits_arc = Arc::new(cell_edits.clone());
+    let edited_rows_arc: Arc<BTreeSet<u64>> =
+        Arc::new(cell_edits.keys().map(|(row, _)| *row).collect());
+
+    let mut pending: BTreeMap<u64, StripeResult> = BTreeMap::new();
+    let mut next_merge_id = 0u64;
+    let mut next_dispatch_idx = 0usize;
+    let mut bytes_done = 0u64;
+    let mut rows_done = 0u64;
+    let mut stripes_done = 0u64;
+
+    let mut final_outcome: Option<Result<SearchOutcome, QuarryError>> = None;
+
+    while final_outcome.is_none() {
+        if shared.cancelled.load(Ordering::Acquire) {
+            stop_flag.store(true, Ordering::Release);
+            final_outcome = Some(Ok(SearchOutcome::Cancelled));
+            break;
+        }
+
+        // Dispatch up to `window` in-flight stripes, never dispatching past `earliest_hit_stripe`.
+        while next_dispatch_idx < stripes.len()
+            && (next_dispatch_idx as u64 - next_merge_id) < window as u64
+            && (next_dispatch_idx as u64) < earliest_hit_stripe.load(Ordering::Acquire)
+        {
+            if shared.cancelled.load(Ordering::Acquire) {
+                stop_flag.store(true, Ordering::Release);
+                final_outcome = Some(Ok(SearchOutcome::Cancelled));
+                break;
+            }
+            let stripe = stripes[next_dispatch_idx];
+            next_dispatch_idx += 1;
+            let stripe_bytes = stripe.end_offset.saturating_sub(stripe.start_offset) as usize;
+            let Some(budget_guard) = pool
+                .byte_budget()
+                .acquire(stripe_bytes.max(1), &shared.cancelled)
+            else {
+                stop_flag.store(true, Ordering::Release);
+                final_outcome = Some(Ok(SearchOutcome::Cancelled));
+                break;
+            };
+            advise_readahead(&file, stripe.start_offset, stripe_bytes as u64);
+
+            let worker_file = Arc::clone(&file);
+            let worker_needle = Arc::clone(&needle_arc);
+            let worker_edits = Arc::clone(&edits_arc);
+            let worker_edited_rows = Arc::clone(&edited_rows_arc);
+            let worker_stop = Arc::clone(&stop_flag);
+            let worker_earliest = Arc::clone(&earliest_hit_stripe);
+            let worker_tx = tx.clone();
+            #[cfg(test)]
+            let delay_zero = tuning.delay_stripe_zero;
+
+            if !executor.spawn(&shared.cancelled, move || {
+                let _budget = budget_guard;
+                let res = scan_search_stripe(
+                    stripe,
+                    &worker_file,
+                    delimiter,
+                    &worker_needle,
+                    case_sensitivity,
+                    start,
+                    &worker_edits,
+                    &worker_edited_rows,
+                    max_record_bytes,
+                    encoding,
+                    &worker_stop,
+                    &worker_earliest,
+                    #[cfg(test)]
+                    delay_zero,
+                );
+                drop(_budget);
+                if let Some(res) = res {
+                    let _ = worker_tx.send(res);
+                }
+            }) {
+                stop_flag.store(true, Ordering::Release);
+                final_outcome = Some(Ok(SearchOutcome::Cancelled));
+                break;
+            }
+        }
+
+        if final_outcome.is_some() {
+            break;
+        }
+
+        // Check if all stripes have been merged cleanly.
+        if next_merge_id == stripes.len() as u64 {
+            final_outcome = Some(if indexed_frontier == file_size {
+                Ok(SearchOutcome::NotFound)
+            } else {
+                Err(QuarryError::RowNotIndexed {
+                    requested: indexed_rows,
+                    indexed_rows,
+                })
+            });
+            break;
+        }
+
+        // Receive completed stripes and merge in strict stripe order `0, 1, 2, ...`.
+        match rx.recv_timeout(Duration::from_millis(2)) {
+            Ok(result) => {
+                pending.insert(result.id, result);
+                while let Ok(more) = rx.try_recv() {
+                    pending.insert(more.id, more);
+                }
+                while let Some(res) = pending.remove(&next_merge_id) {
+                    next_merge_id += 1;
+                    stripes_done += 1;
+                    bytes_done = bytes_done.saturating_add(res.bytes);
+                    rows_done = rows_done.saturating_add(res.rows);
+                    shared.bytes_scanned.store(bytes_done, Ordering::Release);
+                    shared.rows_scanned.store(rows_done, Ordering::Release);
+                    match res.outcome {
+                        Ok(Some(hit)) => {
+                            stop_flag.store(true, Ordering::Release);
+                            final_outcome = Some(Ok(SearchOutcome::Match(hit)));
+                            break;
+                        }
+                        Err(error) => {
+                            stop_flag.store(true, Ordering::Release);
+                            final_outcome = Some(Err(error));
+                            break;
+                        }
+                        Ok(None) => {}
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                final_outcome = Some(Ok(SearchOutcome::Cancelled));
+                break;
+            }
+        }
+    }
+
+    stop_flag.store(true, Ordering::Release);
+    drop(tx);
+    let drain_res = executor.drain();
+    shared.telemetry.lock().unwrap().stripes_scanned = stripes_done;
+    let outcome = final_outcome.expect("search loop terminates with outcome");
+    drain_res?;
+    outcome
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_search(
+    file: File,
+    delimiter: u8,
+    needle: &[u8],
+    case_sensitivity: CaseSensitivity,
+    start: SearchPosition,
+    checkpoint: Checkpoint,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    max_record_bytes: usize,
+    encoding: Encoding,
+    shared: &SharedState,
+) -> Result<SearchOutcome, QuarryError> {
+    let file_size = file.metadata()?.len();
+    run_search_bounded(
+        file,
+        file_size,
+        file_size,
+        0,
+        delimiter,
+        needle,
+        case_sensitivity,
+        start,
+        checkpoint,
+        cell_edits,
+        max_record_bytes,
+        encoding,
+        shared,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_search_bounded(
     mut file: File,
+    file_size: u64,
+    indexed_frontier: u64,
+    indexed_rows: u64,
     delimiter: u8,
     needle: &[u8],
     case_sensitivity: CaseSensitivity,
@@ -286,6 +975,8 @@ fn run_search(
     shared: &SharedState,
 ) -> Result<SearchOutcome, QuarryError> {
     let matcher = ByteMatcher::new(needle, case_sensitivity);
+    let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
+    let edited_rows: BTreeSet<u64> = cell_edits.keys().map(|(row, _)| *row).collect();
     let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset, encoding)?;
     let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut absolute_start = checkpoint.offset;
@@ -298,40 +989,56 @@ fn run_search(
         if shared.cancelled.load(Ordering::Acquire) {
             return Ok(SearchOutcome::Cancelled);
         }
-        let read = encoding.read_chunk(&mut file, &mut chunk)?;
+        let remaining = indexed_frontier.saturating_sub(absolute_start);
+        let read = if remaining == 0 {
+            0
+        } else {
+            let cap = encoding.chunk_size((remaining as usize).min(chunk.len()));
+            encoding.read_chunk(&mut file, &mut chunk[..cap])?
+        };
         if read == 0 {
-            let has_final_record = scanner.finish(absolute_start, |_| {})?;
-            if has_final_record {
-                records_scanned += 1;
-                shared
-                    .rows_scanned
-                    .store(records_scanned, Ordering::Release);
-                if row_number >= start.row {
-                    if record.len() > max_record_bytes {
-                        return Err(QuarryError::RecordTooLarge {
-                            limit: max_record_bytes,
-                        });
-                    }
-                    if let Some(found) = find_record(
-                        &matcher,
-                        &record,
-                        delimiter,
-                        row_number,
-                        record_start,
-                        start,
-                        cell_edits,
-                        encoding,
-                    )? {
-                        return Ok(SearchOutcome::Match(found));
+            if indexed_frontier == file_size {
+                let has_final_record = scanner.finish(absolute_start, |_| {})?;
+                if has_final_record {
+                    records_scanned += 1;
+                    shared
+                        .rows_scanned
+                        .store(records_scanned, Ordering::Release);
+                    if row_number >= start.row {
+                        if record.len() > max_record_bytes {
+                            return Err(QuarryError::RecordTooLarge {
+                                limit: max_record_bytes,
+                            });
+                        }
+                        if let Some(found) = find_record(
+                            &matcher,
+                            &record,
+                            delimiter,
+                            row_number,
+                            record_start,
+                            start,
+                            cell_edits,
+                            encoding,
+                        )? {
+                            return Ok(SearchOutcome::Match(found));
+                        }
                     }
                 }
+                shared
+                    .bytes_scanned
+                    .store(absolute_start - checkpoint.offset, Ordering::Release);
+                return Ok(SearchOutcome::NotFound);
             }
             shared
                 .bytes_scanned
                 .store(absolute_start - checkpoint.offset, Ordering::Release);
-            return Ok(SearchOutcome::NotFound);
+            return Err(QuarryError::RowNotIndexed {
+                requested: indexed_rows,
+                indexed_rows,
+            });
         }
 
+        let chunk_has_raw_hit = !can_prefilter || matcher.find(&chunk[..read]).is_some();
         let mut segment_start = 0;
         let mut found = None;
         let mut deferred_error = None;
@@ -342,24 +1049,52 @@ fn run_search(
                 if shared.cancelled.load(Ordering::Acquire) {
                     cancelled = true;
                 } else if row_number >= start.row {
-                    record.extend_from_slice(&chunk[segment_start..local_end]);
-                    if record.len() > max_record_bytes {
-                        deferred_error = Some(QuarryError::RecordTooLarge {
-                            limit: max_record_bytes,
-                        });
+                    let row_has_edit = !edited_rows.is_empty() && edited_rows.contains(&row_number);
+                    if record.is_empty() {
+                        let rec_bytes = &chunk[segment_start..local_end];
+                        if rec_bytes.len() > max_record_bytes {
+                            deferred_error = Some(QuarryError::RecordTooLarge {
+                                limit: max_record_bytes,
+                            });
+                        } else if row_has_edit
+                            || (chunk_has_raw_hit
+                                && (!can_prefilter || matcher.find(rec_bytes).is_some()))
+                        {
+                            match find_record(
+                                &matcher,
+                                rec_bytes,
+                                delimiter,
+                                row_number,
+                                record_start,
+                                start,
+                                cell_edits,
+                                encoding,
+                            ) {
+                                Ok(result) => found = result,
+                                Err(error) => deferred_error = Some(error),
+                            }
+                        }
                     } else {
-                        match find_record(
-                            &matcher,
-                            &record,
-                            delimiter,
-                            row_number,
-                            record_start,
-                            start,
-                            cell_edits,
-                            encoding,
-                        ) {
-                            Ok(result) => found = result,
-                            Err(error) => deferred_error = Some(error),
+                        record.extend_from_slice(&chunk[segment_start..local_end]);
+                        if record.len() > max_record_bytes {
+                            deferred_error = Some(QuarryError::RecordTooLarge {
+                                limit: max_record_bytes,
+                            });
+                        } else if row_has_edit || !can_prefilter || matcher.find(&record).is_some()
+                        {
+                            match find_record(
+                                &matcher,
+                                &record,
+                                delimiter,
+                                row_number,
+                                record_start,
+                                start,
+                                cell_edits,
+                                encoding,
+                            ) {
+                                Ok(result) => found = result,
+                                Err(error) => deferred_error = Some(error),
+                            }
                         }
                     }
                 }
@@ -441,7 +1176,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SearchJob, SearchOutcome, SearchPosition, SharedState, WorkerCompletion, run_search,
+        SearchJob, SearchOutcome, SearchPosition, SearchTuning, SharedState, WorkerCompletion,
+        run_search,
     };
     use crate::{
         CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, HeaderMode,
@@ -676,6 +1412,170 @@ mod tests {
     }
 
     #[test]
+    fn finds_literal_matches_inside_quoted_and_multiline_fields_only() {
+        let path = fixture(
+            b"id,note\n1,\"alpha,beta\"\n2,\"he said \"\"target\"\"\nnow\"\n3,target_end\n",
+        );
+        let (session, index) = session_and_index(&path, true);
+
+        let comma = session
+            .start_search(&index, b",".to_vec(), SearchPosition { row: 1, column: 0 })
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            comma,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 1,
+                column: 1,
+                record_offset: 8,
+            })
+        );
+
+        let quoted = session
+            .start_search(
+                &index,
+                b"\"target\"\nnow".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            quoted,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 2,
+                column: 1,
+                record_offset: 23,
+            })
+        );
+
+        let insensitive = session
+            .start_search_with_case(
+                &index,
+                b"TARGET".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                CaseSensitivity::Insensitive,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            insensitive,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 2,
+                column: 1,
+                record_offset: 23,
+            })
+        );
+
+        let next = session
+            .start_search(
+                &index,
+                b"target".to_vec(),
+                SearchPosition { row: 2, column: 2 },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            next,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 3,
+                column: 1,
+                record_offset: 50,
+            })
+        );
+
+        let header = session
+            .start_search(
+                &index,
+                b"note".to_vec(),
+                SearchPosition { row: 0, column: 0 },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(header, SearchOutcome::NotFound);
+
+        let missing = session
+            .start_search(
+                &index,
+                b"absent".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(missing, SearchOutcome::NotFound);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn search_respects_sparse_cell_edits_without_matching_replaced_text() {
+        let path = fixture(b"id,note\n1,old_value\n2,plain\n");
+        let (session, index) = session_and_index(&path, true);
+        let edits = BTreeMap::from([
+            ((0, 1), b"header_ignored".to_vec()),
+            ((1, 1), b"new_value".to_vec()),
+            ((2, 1), b"patched".to_vec()),
+        ]);
+
+        let replaced = session
+            .start_search_with_cell_edits(
+                &index,
+                b"old_value".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                edits.clone(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(replaced, SearchOutcome::NotFound);
+
+        let inserted = session
+            .start_search_with_cell_edits(
+                &index,
+                b"new_value".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                edits.clone(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            inserted,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 1,
+                column: 1,
+                record_offset: 8,
+            })
+        );
+
+        let later = session
+            .start_search_with_cell_edits(
+                &index,
+                b"patched".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                edits,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            later,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 2,
+                column: 1,
+                record_offset: 20,
+            })
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn searches_unterminated_final_record_from_a_checkpoint() {
         let path = fixture(b"a,b\r\nc,target");
         let session = Session::open(
@@ -717,6 +1617,225 @@ mod tests {
                 record_offset: 5,
             })
         );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parallel_search_slow_first_stripe_beats_faster_competing_later_hit() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"id,text\n");
+        for i in 1..=200_u32 {
+            if i == 25 || i == 150 {
+                data.extend_from_slice(format!("{i},needle_hit_{i}\n").as_bytes());
+            } else {
+                data.extend_from_slice(format!("{i},ordinary_row_{i:04}\n").as_bytes());
+            }
+        }
+        let path = fixture(&data);
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let index = session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 64,
+                checkpoint_every: 20,
+                memory_budget_bytes: 64 * 1024,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let job = session
+            .start_search_with_tuning(
+                &index,
+                b"needle_hit".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                SearchTuning {
+                    requested_threads: 4,
+                    stripe_target_bytes: 256,
+                    delay_stripe_zero: Some(Duration::from_millis(30)),
+                },
+            )
+            .unwrap();
+        let outcome = job.wait().unwrap();
+        match outcome {
+            SearchOutcome::Match(found) => assert_eq!(found.row, 25),
+            other => panic!("expected earliest hit on row 25, got {other:?}"),
+        }
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parallel_search_preceding_parse_error_beats_later_stripe_hit() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"id,text\n");
+        for i in 1..=200_u32 {
+            if i == 25 {
+                data.extend_from_slice(b"25,\"bad\"trailing\n");
+            } else if i == 150 {
+                data.extend_from_slice(b"150,needle_hit\n");
+            } else {
+                data.extend_from_slice(format!("{i},ordinary_row_{i:04}\n").as_bytes());
+            }
+        }
+        let path = fixture(&data);
+        // Open with a clean copy first so bootstrap succeeds, then build checkpoints matching rows.
+        let mut clean = Vec::new();
+        clean.extend_from_slice(b"id,text\n");
+        for i in 1..=200_u32 {
+            if i == 25 {
+                clean.extend_from_slice(b"25,good_trailing\n");
+            } else if i == 150 {
+                clean.extend_from_slice(b"150,needle_hit\n");
+            } else {
+                clean.extend_from_slice(format!("{i},ordinary_row_{i:04}\n").as_bytes());
+            }
+        }
+        assert_eq!(clean.len(), data.len());
+        fs::write(&path, &clean).unwrap();
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let index = session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 64,
+                checkpoint_every: 20,
+                memory_budget_bytes: 64 * 1024,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        // Overwrite with same-length malformed row 25 to verify stripe 0's parse error beats stripe > 0's hit.
+        fs::write(&path, &data).unwrap();
+
+        let err = session
+            .start_search_with_tuning(
+                &index,
+                b"needle_hit".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                SearchTuning {
+                    requested_threads: 4,
+                    stripe_target_bytes: 256,
+                    delay_stripe_zero: Some(Duration::from_millis(25)),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert!(
+            matches!(err, QuarryError::Parse(_)),
+            "preceding parse error must win over later stripe hit, got {err:?}"
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parallel_search_respects_live_index_frontier_and_never_reports_false_not_found() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"id,text\n");
+        for i in 1..=20_000_u32 {
+            if i == 19_999 {
+                data.extend_from_slice(b"19999,tail_only_needle\n");
+            } else {
+                data.extend_from_slice(format!("{i},row_{i:05}\n").as_bytes());
+            }
+        }
+        let path = fixture(&data);
+        let session = Session::open(&path, OpenOptions::default()).unwrap();
+        let index_job = session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 16,
+                checkpoint_every: 50,
+                memory_budget_bytes: 64 * 1024,
+            })
+            .unwrap();
+        let partial = loop {
+            let snap = index_job.snapshot();
+            if snap.indexed_rows() >= 200 || index_job.progress().done {
+                index_job.cancel();
+                break snap;
+            }
+            thread::yield_now();
+        };
+        drop(index_job);
+        assert!(
+            partial.indexed_bytes() < session.file_size,
+            "partial snapshot must stop before EOF"
+        );
+
+        let search = session
+            .start_search_with_tuning(
+                &partial,
+                b"tail_only_needle".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                SearchTuning {
+                    requested_threads: 4,
+                    stripe_target_bytes: 256,
+                    delay_stripe_zero: None,
+                },
+            )
+            .unwrap();
+        let err = search.wait().unwrap_err();
+        assert!(
+            matches!(err, QuarryError::RowNotIndexed { .. }),
+            "partial frontier without match must not report NotFound, got {err:?}"
+        );
+
+        // Once full index reaches verified EOF, absent needle returns NotFound and tail needle is found.
+        let full = session
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            session
+                .start_search_with_options(
+                    &full,
+                    b"definitely_absent".to_vec(),
+                    SearchPosition { row: 1, column: 0 },
+                    BTreeMap::new(),
+                    CaseSensitivity::Sensitive,
+                    Some(4),
+                )
+                .unwrap()
+                .wait()
+                .unwrap(),
+            SearchOutcome::NotFound
+        );
+        assert!(matches!(
+            session
+                .start_search_with_options(
+                    &full,
+                    b"tail_only_needle".to_vec(),
+                    SearchPosition { row: 1, column: 0 },
+                    BTreeMap::new(),
+                    CaseSensitivity::Sensitive,
+                    Some(4),
+                )
+                .unwrap()
+                .wait()
+                .unwrap(),
+            SearchOutcome::Match(m) if m.row == 19_999
+        ));
 
         fs::remove_file(path).unwrap();
     }

@@ -37,7 +37,6 @@ pub(crate) fn resolve_worker_count(requested: Option<usize>) -> Result<usize, cr
 /// Scheduling priority for engine worker tasks. Foreground work runs ahead of background jobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobPriority {
-    #[allow(dead_code)]
     Foreground,
     Background,
 }
