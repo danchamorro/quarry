@@ -152,13 +152,18 @@ impl RunArena {
     pub(super) fn clear_for_reuse(&mut self, retain_bytes_cap: usize) {
         self.entries.clear();
         self.bytes.clear();
-        let max_keep_bytes = retain_bytes_cap.max(LARGE_RECORD_GATE_BYTES);
-        if self.bytes.capacity() > max_keep_bytes {
+        if retain_bytes_cap == 0 {
             self.bytes.shrink_to(0);
-        }
-        let max_keep_entries = (max_keep_bytes / ARENA_ENTRY_BYTES).max(65_536);
-        if self.entries.capacity() > max_keep_entries {
             self.entries.shrink_to(0);
+        } else {
+            let max_keep_bytes = retain_bytes_cap.max(LARGE_RECORD_GATE_BYTES);
+            if self.bytes.capacity() > max_keep_bytes {
+                self.bytes.shrink_to(0);
+            }
+            let max_keep_entries = (max_keep_bytes / ARENA_ENTRY_BYTES).max(65_536);
+            if self.entries.capacity() > max_keep_entries {
+                self.entries.shrink_to(0);
+            }
         }
         self.tracked_bytes = 0;
         self.sorted = false;
@@ -288,6 +293,24 @@ impl JobMemoryBudget {
         self.spilled.store(true, Ordering::Release);
     }
 
+    /// Non-blocking reservation attempt for an empty worker arena. Returns `None` when
+    /// another worker/job currently holds budget so the caller can spill completed arenas first.
+    pub(super) fn try_acquire_empty(self: &Arc<Self>, bytes: usize) -> Option<JobBudgetGuard> {
+        let needed = bytes.max(1);
+        let mut used = self.used.lock().unwrap();
+        if *used != 0 && used.saturating_add(needed) > self.limit {
+            return None;
+        }
+        let shared_guard = self.shared.try_acquire(needed)?;
+        *used = used.saturating_add(needed);
+        Some(JobBudgetGuard {
+            job: Arc::clone(self),
+            shared_guard: Some(shared_guard),
+            reserved: needed,
+            used: needed,
+        })
+    }
+
     /// Blocking reservation used when a worker's arena is empty so even an oversized row
     /// makes forward progress once other workers flush.
     pub(super) fn acquire_empty(
@@ -295,28 +318,56 @@ impl JobMemoryBudget {
         bytes: usize,
         cancelled: &AtomicBool,
     ) -> Option<JobBudgetGuard> {
+        self.acquire_empty_with_spill(bytes, cancelled, || Ok(true))
+            .ok()
+            .flatten()
+    }
+
+    /// Blocking reservation for an empty worker arena that invokes `on_wait` before sleeping
+    /// (allowing parallel workers to drain and spill any retained `completed_arenas`).
+    pub(super) fn acquire_empty_with_spill(
+        self: &Arc<Self>,
+        bytes: usize,
+        cancelled: &AtomicBool,
+        mut on_wait: impl FnMut() -> Result<bool, QuarryError>,
+    ) -> Result<Option<JobBudgetGuard>, QuarryError> {
         let needed = bytes.max(1);
-        let shared_guard = self.shared.acquire(needed, cancelled)?;
-        let mut used = self.used.lock().unwrap();
         loop {
             if cancelled.load(Ordering::Acquire) {
-                drop(shared_guard);
-                return None;
+                return Ok(None);
             }
+            if let Some(guard) = self.try_acquire_empty(needed) {
+                return Ok(Some(guard));
+            }
+            if !on_wait()? {
+                return Ok(None);
+            }
+            if let Some(guard) = self.try_acquire_empty(needed) {
+                return Ok(Some(guard));
+            }
+            // Wait briefly for shared or job budget to free up, then recheck `on_wait` so any
+            // concurrently completed arena is also spilled rather than deadlocking.
+            let shared_guard = match self.shared.acquire(needed, cancelled) {
+                Some(g) => g,
+                None => return Ok(None),
+            };
+            let mut used = self.used.lock().unwrap();
             if *used == 0 || used.saturating_add(needed) <= self.limit {
                 *used = used.saturating_add(needed);
-                return Some(JobBudgetGuard {
+                return Ok(Some(JobBudgetGuard {
                     job: Arc::clone(self),
                     shared_guard: Some(shared_guard),
                     reserved: needed,
                     used: needed,
-                });
+                }));
             }
-            let (next, _) = self
+            drop(used);
+            drop(shared_guard);
+            let used = self.used.lock().unwrap();
+            let _ = self
                 .available
                 .wait_timeout(used, std::time::Duration::from_millis(2))
                 .unwrap();
-            used = next;
         }
     }
 }
@@ -804,6 +855,13 @@ impl ParallelCollector {
     }
 }
 
+fn clear_record_buffer(record: &mut Vec<u8>) {
+    record.clear();
+    if record.capacity() > LARGE_RECORD_GATE_BYTES {
+        record.shrink_to(0);
+    }
+}
+
 fn spill_collected_arenas(
     collector: &Mutex<ParallelCollector>,
     direction: SortDirection,
@@ -1053,16 +1111,12 @@ fn create_initial_runs_serial(
                     && (job_budget.is_spilled() || footprint > job_budget.limit())
                 {
                     job_budget.mark_spilled();
-                    let Some(run) =
-                        arena.flush_to_workspace(direction, workspace, shared, serial_spill_cap)?
+                    let Some(run) = arena.flush_to_workspace(direction, workspace, shared, 0)?
                     else {
                         return Ok(false);
                     };
                     runs.push(run);
                     budget_guard.take();
-                    large_guard.take();
-                } else if large_guard.is_some() {
-                    large_guard.take();
                 }
             }
         }
@@ -1094,10 +1148,12 @@ fn create_initial_runs_serial(
                         Err(error) => deferred_error = Some(error),
                     }
                 }
-                record.clear();
+                clear_record_buffer(&mut record);
                 large_guard.take();
                 physical_row = physical_row.saturating_add(1);
             });
+            clear_record_buffer(&mut record);
+            large_guard.take();
             shared
                 .bytes_scanned
                 .store(absolute_start, Ordering::Release);
@@ -1143,7 +1199,7 @@ fn create_initial_runs_serial(
                     }
                 }
             }
-            record.clear();
+            clear_record_buffer(&mut record);
             large_guard.take();
             physical_row = physical_row.saturating_add(1);
             segment_start = local_end;
@@ -1349,7 +1405,7 @@ fn create_initial_runs_parallel(
                         break 'worker;
                     }
                 };
-                record.clear();
+                clear_record_buffer(&mut record);
                 let mut pos = stripe.start_offset;
                 let mut physical_row = stripe.start_row;
 
@@ -1424,8 +1480,16 @@ fn create_initial_runs_parallel(
                                 }
                             }
                             if arena.is_empty() {
-                                let Some(guard) =
-                                    job_budget.acquire_empty(footprint, &shared.cancel_requested)
+                                let Some(guard) = job_budget.acquire_empty_with_spill(
+                                    footprint,
+                                    &shared.cancel_requested,
+                                    || {
+                                        job_budget.mark_spilled();
+                                        spill_collected_arenas(
+                                            &collector, direction, &workspace, &shared,
+                                        )
+                                    },
+                                )?
                                 else {
                                     return Ok(false);
                                 };
@@ -1442,12 +1506,21 @@ fn create_initial_runs_parallel(
                             if large_guard.is_some()
                                 && (job_budget.is_spilled() || footprint > job_budget.limit())
                             {
-                                if !flush_arena_and_collected(arena, budget_guard, local_runs)? {
+                                job_budget.mark_spilled();
+                                if !arena.is_empty() {
+                                    let Some(run) = arena
+                                        .flush_to_workspace(direction, &workspace, &shared, 0)?
+                                    else {
+                                        return Ok(false);
+                                    };
+                                    local_runs.push(run);
+                                    budget_guard.take();
+                                }
+                                if !spill_collected_arenas(
+                                    &collector, direction, &workspace, &shared,
+                                )? {
                                     return Ok(false);
                                 }
-                                large_guard.take();
-                            } else if large_guard.is_some() {
-                                large_guard.take();
                             }
                         }
                     }
@@ -1513,7 +1586,7 @@ fn create_initial_runs_parallel(
                                 }
                             }
                         }
-                        record.clear();
+                        clear_record_buffer(&mut record);
                         large_guard.take();
                         physical_row = physical_row.saturating_add(1);
                         segment_start = local_end;
@@ -1609,10 +1682,12 @@ fn create_initial_runs_parallel(
                                 Err(err) => deferred_error = Some((physical_row, err)),
                             }
                         }
-                        record.clear();
+                        clear_record_buffer(&mut record);
                         large_guard.take();
                         physical_row = physical_row.saturating_add(1);
                     });
+                    clear_record_buffer(&mut record);
+                    large_guard.take();
                     let row_delta = local_rows.saturating_sub(rows_before_eof);
                     if row_delta > 0 {
                         shared.rows_sorted.fetch_add(row_delta, Ordering::Relaxed);
@@ -1649,8 +1724,10 @@ fn create_initial_runs_parallel(
                 }
             }
 
-            // Finish worker: sort in-memory arena in parallel, then either retain (zero-spill path)
+            // Finish worker: release any oversized scratch buffer before releasing the gate,
+            // sort in-memory arena in parallel, then either retain (zero-spill path)
             // or flush to disk if any worker has spilled.
+            clear_record_buffer(&mut record);
             large_guard.take();
             if !shared.cancel_requested.load(Ordering::Acquire)
                 && earliest_error_row.load(Ordering::Acquire) == u64::MAX

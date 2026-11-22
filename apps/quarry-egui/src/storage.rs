@@ -116,6 +116,7 @@ fn encode_scratch_directory_pref(path: &Path) -> std::io::Result<String> {
         && !text.contains('\n')
         && !text.contains('\r')
         && !text.contains('\0')
+        && text.trim() == text
     {
         return Ok(format!("scratch_directory={text}\n"));
     }
@@ -134,6 +135,13 @@ fn encode_scratch_directory_pref(path: &Path) -> std::io::Result<String> {
     }
     #[cfg(not(unix))]
     {
+        if let Some(text) = path.to_str()
+            && !text.contains('\n')
+            && !text.contains('\r')
+            && !text.contains('\0')
+        {
+            return Ok(format!("scratch_directory={text}\n"));
+        }
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Temporary folder path contains unsupported characters.",
@@ -143,8 +151,8 @@ fn encode_scratch_directory_pref(path: &Path) -> std::io::Result<String> {
 
 fn parse_scratch_directory_pref(content: &str) -> Option<PathBuf> {
     for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("scratch_directory=") {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(rest) = line.strip_prefix("scratch_directory=") {
             if !rest.is_empty() && !rest.contains('\0') {
                 let candidate = PathBuf::from(rest);
                 if candidate.is_absolute() {
@@ -153,8 +161,9 @@ fn parse_scratch_directory_pref(content: &str) -> Option<PathBuf> {
             }
         }
         #[cfg(unix)]
-        if let Some(hex) = trimmed.strip_prefix("scratch_directory_hex=") {
+        if let Some(hex) = line.strip_prefix("scratch_directory_hex=") {
             use std::os::unix::ffi::OsStringExt;
+            let hex = hex.trim();
             if !hex.is_empty() && hex.len() % 2 == 0 {
                 let mut bytes = Vec::with_capacity(hex.len() / 2);
                 let mut valid = true;
@@ -2002,8 +2011,20 @@ mod tests {
         // Clearing back to system temporary folder clears the persisted setting.
         prefs.set_scratch_directory(None).unwrap();
         assert_eq!(
-            StoragePreferences::load(Some(pref_path)).scratch_directory,
+            StoragePreferences::load(Some(pref_path.clone())).scratch_directory,
             None
         );
+
+        // Paths with trailing spaces must round-trip losslessly without trimming.
+        #[cfg(unix)]
+        {
+            let spaced_dir = dir.path().join("scratch with trailing space ");
+            std::fs::create_dir(&spaced_dir).unwrap();
+            prefs.set_scratch_directory(Some(&spaced_dir)).unwrap();
+            assert_eq!(
+                StoragePreferences::load(Some(pref_path)).scratch_directory,
+                Some(spaced_dir)
+            );
+        }
     }
 }

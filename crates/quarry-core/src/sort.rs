@@ -4661,4 +4661,64 @@ mod tests {
         assert!(!d3.exists());
         assert!(sort_artifacts(directory.path()).is_empty());
     }
+
+    #[test]
+    fn parallel_sort_spills_completed_arenas_when_empty_worker_exceeds_remaining_budget() {
+        // Reproduces the exact case where one worker finishes and retains a ~100 KiB arena
+        // in `completed_arenas` while another empty worker tries to admit a ~100 KiB row
+        // under a 150,000-byte budget. Must spill cleanly without deadlocking.
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("two-large-rows.csv");
+        let payload_b = "x".repeat(100_000);
+        let payload_a = "y".repeat(100_000);
+        let content = format!("k,v\n2,{payload_b}\n1,{payload_a}\n");
+        fs::write(&source, content.as_bytes()).unwrap();
+        let s = session(&source, HeaderMode::FirstRow);
+        let idx = s
+            .start_indexing(IndexConfig {
+                checkpoint_every: 1,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let dest = directory.path().join("sorted.csv");
+        let job = SortJob::start_with_options_internal(
+            s.path.clone(),
+            s.file_size,
+            s.dialect.delimiter,
+            s.dialect.has_header,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            SortSpec {
+                column: 0,
+                mode: SortMode::Number,
+                direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
+            dest.clone(),
+            s.source_stamp.clone(),
+            SortConfig {
+                run_memory_bytes: 150_000,
+                merge_fan_in: 4,
+                ..DEFAULT_SORT_CONFIG
+            },
+            Some(directory.path().to_path_buf()),
+            Some(idx.indexed_rows()),
+            Some(idx),
+            Some(2),
+            1,
+        )
+        .unwrap();
+        wait_done(&job);
+        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("sort cancelled");
+        };
+        assert!(!summary.in_memory_fast_path);
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            format!("k,v\n1,{payload_a}\n2,{payload_b}\n").as_bytes()
+        );
+        assert!(sort_artifacts(directory.path()).is_empty());
+    }
 }
