@@ -2509,7 +2509,9 @@ impl Document {
                     return Err(SOURCE_CHANGED_NOTICE.into());
                 }
                 let message = self.diagnostic_error(error);
-                if desired.is_some_and(|window| window != active.window) {
+                if !self.filter_waiting_for_page()
+                    && desired.is_some_and(|window| window != active.window)
+                {
                     self.pending_filter_read = desired;
                     let _ = self.schedule_filter_buffer(self.filter_viewport_start);
                 } else {
@@ -2519,6 +2521,9 @@ impl Document {
             }
         }
 
+        if self.filter_waiting_for_page() {
+            return Ok(());
+        }
         self.schedule_filter_buffer(self.filter_viewport_start)
     }
 
@@ -3779,11 +3784,14 @@ impl Document {
 
     pub fn filter_buffer_covers(&self, viewport_start: u64) -> bool {
         let available = self.available_filter_rows();
-        if available == 0 {
+        if available == 0 || viewport_start >= available {
             return false;
         }
-        let visible_end = viewport_start
-            .saturating_add((available - viewport_start).min(self.visible_rows as u64));
+        let visible_end = viewport_start.saturating_add(
+            available
+                .saturating_sub(viewport_start)
+                .min(self.visible_rows as u64),
+        );
         let loaded_end = self
             .filter_buffer_start
             .saturating_add(self.filtered_rows.len() as u64);
