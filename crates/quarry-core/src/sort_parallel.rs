@@ -261,7 +261,9 @@ impl RunArena {
             return;
         }
         let bytes = &self.bytes;
-        self.entries.sort_by(|left, right| {
+        // `compare_key_ordinal` breaks all ties with unique source ordinals, so the order is
+        // strict and `sort_unstable_by` matches `sort_by` identically with O(1) stack scratch.
+        self.entries.sort_unstable_by(|left, right| {
             let l_key = &bytes[left.key_offset..left.key_offset + left.key_len];
             let r_key = &bytes[right.key_offset..right.key_offset + right.key_len];
             compare_key_ordinal(l_key, left.ordinal, r_key, right.ordinal, direction)
@@ -456,6 +458,15 @@ impl JobMemoryBudget {
         }
     }
 
+    /// Shrink the coordinator's shared reservation down to `target` (never below live `used`)
+    /// when transitioning into a smaller post-scan phase such as survivor-run creation.
+    pub(super) fn shrink_shared_reservation_to(&self, target: usize) {
+        let current_used = *self.used.lock().unwrap();
+        if let Some(guard) = self.shared_guard.lock().unwrap().as_mut() {
+            guard.shrink_to(current_used.max(target.max(1)));
+        }
+    }
+
     /// Release the coordinator's shared budget reservation once arenas are no longer in memory.
     pub(super) fn release_shared_reservation(&self) {
         self.shared_guard.lock().unwrap().take();
@@ -512,37 +523,47 @@ impl JobMemoryBudget {
         bytes: usize,
         cancelled: &AtomicBool,
     ) -> Option<JobBudgetGuard> {
-        self.acquire_empty_with_spill(bytes, cancelled, || Ok(true))
+        self.acquire_empty_with_spill(|_| bytes, cancelled, || Ok(true))
             .ok()
             .flatten()
+            .map(|(guard, _)| guard)
     }
 
     /// Reservation for an empty worker arena that invokes `on_wait` before waiting on this
     /// job's active workers (allowing parallel workers to drain and spill `completed_arenas`).
+    /// Recomputes `compute_bytes(is_spilled)` on every retry so a waiting worker immediately
+    /// switches from the pre-spill plan to the smaller spill-cap plan after a spill transition.
+    /// Returns `(guard, spilled_used)` so the caller appends with the exact plan that was reserved.
     /// Never blocks on cross-job `EnginePool` budgets.
     pub(super) fn acquire_empty_with_spill(
         self: &Arc<Self>,
-        bytes: usize,
+        mut compute_bytes: impl FnMut(bool) -> usize,
         cancelled: &AtomicBool,
         mut on_wait: impl FnMut() -> Result<bool, QuarryError>,
-    ) -> Result<Option<JobBudgetGuard>, QuarryError> {
-        let needed = bytes.max(1);
+    ) -> Result<Option<(JobBudgetGuard, bool)>, QuarryError> {
         loop {
             if cancelled.load(Ordering::Acquire) {
                 return Ok(None);
             }
+            let spilled = self.is_spilled();
+            let needed = compute_bytes(spilled).max(1);
             if let Some(guard) = self.try_acquire_empty(needed) {
-                return Ok(Some(guard));
+                return Ok(Some((guard, spilled)));
             }
             if !on_wait()? {
                 return Ok(None);
             }
+            let spilled = self.is_spilled();
+            let needed = compute_bytes(spilled).max(1);
             if let Some(guard) = self.try_acquire_empty(needed) {
-                return Ok(Some(guard));
+                return Ok(Some((guard, spilled)));
             }
             let used = self.used.lock().unwrap();
             let effective_limit = self.effective_limit();
-            if *used == 0 || used.saturating_add(needed) <= effective_limit {
+            if *used == 0
+                || used.saturating_add(needed) <= effective_limit
+                || self.is_spilled() != spilled
+            {
                 continue;
             }
             let _ = self
@@ -1891,9 +1912,14 @@ fn create_initial_runs_parallel(
                                     *large_guard = Some(g);
                                 }
                             }
+                            let mut admission_cap = if job_budget.is_spilled() {
+                                worker_spill_cap
+                            } else {
+                                job_budget.limit()
+                            };
                             if !arena.is_empty() {
                                 let spilled = job_budget.is_spilled();
-                                let active_cap = if spilled {
+                                admission_cap = if spilled {
                                     worker_spill_cap
                                 } else {
                                     job_budget.limit()
@@ -1901,11 +1927,11 @@ fn create_initial_runs_parallel(
                                 let planned = arena.planned_capacity_bytes(
                                     key.len(),
                                     effective_record.len(),
-                                    Some(active_cap),
+                                    Some(admission_cap),
                                 );
                                 let current = budget_guard.as_ref().map_or(0, JobBudgetGuard::used);
                                 let delta = planned.saturating_sub(current);
-                                let fits = planned <= active_cap
+                                let fits = planned <= admission_cap
                                     && budget_guard.as_mut().is_some_and(|g| {
                                         g.try_reserve_additional(
                                             delta,
@@ -1925,7 +1951,7 @@ fn create_initial_runs_parallel(
                             }
                             if arena.is_empty() {
                                 let spilled = job_budget.is_spilled();
-                                let active_cap = if spilled {
+                                admission_cap = if spilled {
                                     worker_spill_cap
                                 } else {
                                     job_budget.limit()
@@ -1934,10 +1960,10 @@ fn create_initial_runs_parallel(
                                     let planned = arena.planned_capacity_bytes(
                                         key.len(),
                                         effective_record.len(),
-                                        Some(active_cap),
+                                        Some(admission_cap),
                                     );
                                     let delta = planned.saturating_sub(guard.used());
-                                    if planned > active_cap
+                                    if planned > admission_cap
                                         || !guard.try_reserve_additional(
                                             delta,
                                             spilled.then_some(worker_spill_cap),
@@ -1948,39 +1974,51 @@ fn create_initial_runs_parallel(
                                     }
                                 }
                                 if budget_guard.is_none() {
-                                    let planned = arena.planned_capacity_bytes(
-                                        key.len(),
-                                        effective_record.len(),
-                                        Some(active_cap),
-                                    );
-                                    let Some(guard) = job_budget.acquire_empty_with_spill(
-                                        planned,
-                                        &shared.cancel_requested,
-                                        || {
-                                            job_budget.mark_spilled();
-                                            spill_collected_arenas(
-                                                &collector,
-                                                direction,
-                                                dedup,
-                                                early_duplicates.as_deref(),
-                                                &workspace,
-                                                &shared,
-                                            )
-                                        },
-                                    )?
+                                    let Some((guard, admitted_spilled)) = job_budget
+                                        .acquire_empty_with_spill(
+                                            |is_spilled| {
+                                                let cap = if is_spilled {
+                                                    worker_spill_cap
+                                                } else {
+                                                    job_budget.limit()
+                                                };
+                                                arena.planned_capacity_bytes(
+                                                    key.len(),
+                                                    effective_record.len(),
+                                                    Some(cap),
+                                                )
+                                            },
+                                            &shared.cancel_requested,
+                                            || {
+                                                job_budget.mark_spilled();
+                                                spill_collected_arenas(
+                                                    &collector,
+                                                    direction,
+                                                    dedup,
+                                                    early_duplicates.as_deref(),
+                                                    &workspace,
+                                                    &shared,
+                                                )
+                                            },
+                                        )?
                                     else {
                                         return Ok(false);
+                                    };
+                                    admission_cap = if admitted_spilled {
+                                        worker_spill_cap
+                                    } else {
+                                        job_budget.limit()
                                     };
                                     *budget_guard = Some(guard);
                                 }
                             }
                             local_records.observe(&effective_record);
-                            let cap_hint = if job_budget.is_spilled() {
-                                Some(worker_spill_cap)
-                            } else {
-                                Some(job_budget.limit())
-                            };
-                            arena.push_bounded(&key, &effective_record, ordinal, cap_hint);
+                            arena.push_bounded(
+                                &key,
+                                &effective_record,
+                                ordinal,
+                                Some(admission_cap),
+                            );
                             *local_rows = local_rows.saturating_add(1);
                             let needs_immediate_flush = (large_guard.is_some()
                                 && (job_budget.is_spilled()

@@ -686,7 +686,11 @@ fn run_duplicates_inner(
             header_width.max(data_max_width),
         )
     } else {
-        job_budget.release_shared_reservation();
+        const SURVIVOR_RUN_CAP_BYTES: usize = 32 * 1024 * 1024;
+        let survivor_cap = job_budget.limit().clamp(1, SURVIVOR_RUN_CAP_BYTES);
+        // Shrink the coordinator's shared out-of-core reservation to the exact survivor arena cap
+        // and keep it held through `retain_first_runs` so the survivor arena is always budgeted.
+        job_budget.shrink_shared_reservation_to(survivor_cap);
         if !parallel::reduce_runs_parallel_with_dedup(
             &mut scan.runs,
             SortDirection::Ascending,
@@ -706,8 +710,17 @@ fn run_duplicates_inner(
         else {
             return Ok(None);
         };
-        let retained_result = retain_first_runs(&scan.runs, delimiter, config, workspace, state);
+        let retained_result = retain_first_runs(
+            &scan.runs,
+            delimiter,
+            config,
+            workspace,
+            state,
+            &job_budget,
+            survivor_cap,
+        );
         drop(fd_guard);
+        job_budget.release_shared_reservation();
         let Some((mut survivors, records, data_max_width)) = retained_result? else {
             return Ok(None);
         };
@@ -791,8 +804,15 @@ fn retain_first_runs(
     config: SortConfig,
     workspace: &parallel::LazyRunWorkspace,
     state: &DuplicateState,
+    job_budget: &Arc<parallel::JobMemoryBudget>,
+    survivor_cap: usize,
 ) -> Result<Option<(Vec<SpillFile>, RecordMultisetFingerprint, usize)>, QuarryError> {
     let shared = &state.sort;
+    let Some(_survivor_budget_guard) =
+        job_budget.acquire_empty(survivor_cap, &shared.cancel_requested)
+    else {
+        return Ok(None);
+    };
     let mut readers = open_run_readers(paths)?;
     let Some(mut heap) = seed_heap(
         &mut readers,
@@ -803,8 +823,6 @@ fn retain_first_runs(
     else {
         return Ok(None);
     };
-    const SURVIVOR_RUN_CAP_BYTES: usize = 32 * 1024 * 1024;
-    let survivor_cap = config.run_memory_bytes.clamp(1, SURVIVOR_RUN_CAP_BYTES);
     let mut previous_key: Option<Vec<u8>> = None;
     let mut arena = parallel::RunArena::new();
     let mut runs = Vec::new();

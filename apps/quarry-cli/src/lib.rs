@@ -1695,7 +1695,7 @@ fn wait_for_duplicates(
     let progress = job.progress();
     if cancel_after_bytes.is_some() && cancellation.is_none() {
         job.cancel();
-        let _ = job.wait();
+        let _ = job.wait()?;
         return Err("duplicate analysis finished before cancellation threshold".into());
     }
     let outcome = job.wait()?;
@@ -3088,7 +3088,7 @@ fn wait_for_replace_all(
     let progress = job.progress();
     if cancel_after_bytes.is_some() && cancellation.is_none() {
         job.cancel();
-        let _ = job.wait();
+        let _ = job.wait()?;
         return Err("Replace All finished before cancellation threshold".into());
     }
     let outcome = job.wait()?;

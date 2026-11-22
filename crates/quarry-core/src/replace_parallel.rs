@@ -41,6 +41,8 @@ pub(super) struct ReplaceParallelTuning {
     #[cfg(test)]
     pub(super) delay_stripe_zero: Option<Duration>,
     #[cfg(test)]
+    pub(super) wait_stripe_zero_until: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
     pub(super) max_chunk_bytes_seen: Option<Arc<AtomicUsize>>,
     #[cfg(test)]
     pub(super) on_reorder_wait: Option<Arc<AtomicBool>>,
@@ -60,6 +62,8 @@ impl ReplaceParallelTuning {
             max_head_in_flight: DEFAULT_MAX_HEAD_IN_FLIGHT,
             #[cfg(test)]
             delay_stripe_zero: None,
+            #[cfg(test)]
+            wait_stripe_zero_until: None,
             #[cfg(test)]
             max_chunk_bytes_seen: None,
             #[cfg(test)]
@@ -593,25 +597,19 @@ fn estimate_replace_memory(
     } else {
         0
     };
+    let field_count = memchr::memchr_iter(delimiter, rec)
+        .count()
+        .saturating_add(1);
     let est_output_bytes = rec
         .len()
         .saturating_add(edit_bytes)
         .saturating_mul(expansion_ratio)
         .saturating_mul(2)
+        // Account for up to two enclosing quotes per field when quoting is added.
+        .saturating_add(field_count.saturating_mul(2))
         .saturating_add(16)
         .min(max_record_bytes);
-    let max_possible_descriptors = rec
-        .len()
-        .saturating_add(1)
-        .saturating_mul(FIELD_DESCRIPTOR_BYTES);
-    let field_descriptor_bytes = if max_possible_descriptors > LARGE_RECORD_GATE_BYTES {
-        memchr::memchr_iter(delimiter, rec)
-            .count()
-            .saturating_add(1)
-            .saturating_mul(FIELD_DESCRIPTOR_BYTES)
-    } else {
-        max_possible_descriptors
-    };
+    let field_descriptor_bytes = field_count.saturating_mul(FIELD_DESCRIPTOR_BYTES);
     let est_working_bytes = rec
         .len()
         .saturating_add(est_output_bytes)
@@ -679,6 +677,8 @@ pub(super) fn copy_with_replaced_records_parallel(
     #[cfg(test)]
     let delay_stripe_zero = tuning.delay_stripe_zero;
     #[cfg(test)]
+    let wait_stripe_zero_until = tuning.wait_stripe_zero_until.clone();
+    #[cfg(test)]
     let max_chunk_bytes_seen = tuning.max_chunk_bytes_seen.clone();
     #[cfg(test)]
     let max_non_head_output_bytes_seen = tuning.max_non_head_output_bytes_seen.clone();
@@ -707,6 +707,8 @@ pub(super) fn copy_with_replaced_records_parallel(
         let tx = tx.clone();
         #[cfg(test)]
         let max_chunk_bytes_seen = max_chunk_bytes_seen.clone();
+        #[cfg(test)]
+        let wait_stripe_zero_until = wait_stripe_zero_until.clone();
         #[cfg(test)]
         let max_non_head_output_bytes_seen = max_non_head_output_bytes_seen.clone();
         #[cfg(test)]
@@ -752,10 +754,20 @@ pub(super) fn copy_with_replaced_records_parallel(
                 }
 
                 #[cfg(test)]
-                if stripe.id == 0
-                    && let Some(delay) = delay_stripe_zero
-                {
-                    std::thread::sleep(delay);
+                if stripe.id == 0 {
+                    if let Some(signal) = &wait_stripe_zero_until {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        while !signal.load(Ordering::Acquire)
+                            && !stop_flag.load(Ordering::Acquire)
+                            && !shared.cancel_requested.load(Ordering::Acquire)
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    if let Some(delay) = delay_stripe_zero {
+                        std::thread::sleep(delay);
+                    }
                 }
 
                 advise_readahead(
@@ -853,29 +865,41 @@ pub(super) fn copy_with_replaced_records_parallel(
                         relative_ends.clear();
                         return true;
                     }
-                    let bytes = std::mem::take(chunk_bytes);
+                    let mut bytes = std::mem::take(chunk_bytes);
                     #[cfg(test)]
                     if let Some(tracker) = &max_chunk_bytes_seen {
                         tracker.fetch_max(bytes.len(), Ordering::AcqRel);
                     }
-                    let ends = std::mem::take(relative_ends);
+                    let mut ends = std::mem::take(relative_ends);
                     let replacements = std::mem::take(chunk_replacements);
                     let physical_rows = std::mem::take(chunk_rows);
-                    let footprint = bytes
-                        .len()
-                        .saturating_add(ends.len().saturating_mul(std::mem::size_of::<u64>()))
-                        .max(1);
+                    let allocated_footprint = |bytes: &Vec<u8>, ends: &Vec<u64>| {
+                        bytes
+                            .capacity()
+                            .saturating_add(
+                                ends.capacity().saturating_mul(std::mem::size_of::<u64>()),
+                            )
+                            .max(1)
+                    };
 
                     let credit = match pre_credit {
                         Some(mut credit) => {
                             if let EmitCredit::Reorder(ref mut guard) = credit {
-                                guard.shrink_to(footprint);
+                                if allocated_footprint(&bytes, &ends) > guard.bytes()
+                                    || bytes.capacity().saturating_sub(bytes.len()) > 64 * 1024
+                                {
+                                    bytes.shrink_to_fit();
+                                    ends.shrink_to_fit();
+                                }
+                                guard.shrink_to(allocated_footprint(&bytes, &ends));
                             }
                             credit
                         }
                         None => {
                             debug_assert!(bytes.is_empty() && ends.is_empty());
-                            let Some(credit) = acquire_emit_credit(footprint) else {
+                            let Some(credit) =
+                                acquire_emit_credit(allocated_footprint(&bytes, &ends))
+                            else {
                                 return false;
                             };
                             credit
@@ -1047,7 +1071,6 @@ pub(super) fn copy_with_replaced_records_parallel(
                         needle_contains_quote,
                         config.max_record_bytes,
                     );
-                    large_guard.take();
 
                     let count = match appended {
                         Ok(count) => count,
