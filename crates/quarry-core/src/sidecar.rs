@@ -264,9 +264,13 @@ impl ExtendedIdentity {
         {
             use std::os::unix::fs::MetadataExt;
             #[cfg(target_os = "macos")]
-            let data_gen = crate::source_stamp::data_generation(file);
+            let (data_generation, has_data_generation) =
+                match crate::source_stamp::data_generation(file) {
+                    Some(gen_val) => (gen_val, true),
+                    None => (0, false),
+                };
             #[cfg(not(target_os = "macos"))]
-            let data_gen: Option<u32> = None;
+            let (data_generation, has_data_generation) = (0u32, false);
 
             Ok(Self {
                 platform_tag: 1,
@@ -281,8 +285,8 @@ impl ExtendedIdentity {
                 birthtime_secs,
                 birthtime_nanos,
                 has_birthtime,
-                data_generation: data_gen.unwrap_or(0),
-                has_data_generation: data_gen.is_some(),
+                data_generation,
+                has_data_generation,
             })
         }
 
