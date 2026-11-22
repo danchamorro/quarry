@@ -228,7 +228,7 @@ fn format_export_slice_from_field_start(
                     if !reserve_for_capacity(delta) {
                         return Ok(false);
                     }
-                    output_bytes.reserve_exact(delta);
+                    output_bytes.reserve_exact(next_cap - output_bytes.len());
                     let actual_extra = output_bytes.capacity().saturating_sub(next_cap);
                     if !reserve_for_capacity(actual_extra) {
                         return Ok(false);
@@ -687,44 +687,11 @@ impl ExportMergeState {
         shared: &SharedState,
     ) -> Result<(), QuarryError> {
         while let Some(result) = self.pending.remove(&self.next_id) {
-            self.next_id += 1;
-            self.next_merge_id.store(self.next_id, Ordering::Release);
-            self.reorder_budget.notify_all();
-            let chunk = result?;
+            let chunk_end = {
+                let chunk = result?;
+                let chunk_end = chunk.end;
 
-            if chunk.start == 0 {
-                self.write_range_sequential(
-                    file,
-                    chunk.start,
-                    chunk.end,
-                    chunk.is_last,
-                    delimiter,
-                    data_start,
-                    dialect,
-                    byte_class,
-                    query,
-                    edits,
-                    matchers,
-                    groups,
-                    config,
-                    source_had_bom,
-                    output,
-                )?;
-            } else if !self.in_quote {
-                let base_row = self.rows_scanned;
-                let has_edits_in_chunk = !edits.cells.is_empty()
-                    && edits
-                        .cells
-                        .range(
-                            (base_row, 0)
-                                ..=(
-                                    base_row.saturating_add(chunk.field_start.rows_scanned),
-                                    usize::MAX,
-                                ),
-                        )
-                        .next()
-                        .is_some();
-                if has_edits_in_chunk {
+                if chunk.start == 0 {
                     self.write_range_sequential(
                         file,
                         chunk.start,
@@ -742,99 +709,140 @@ impl ExportMergeState {
                         source_had_bom,
                         output,
                     )?;
+                } else if !self.in_quote {
+                    let base_row = self.rows_scanned;
+                    let has_edits_in_chunk = !edits.cells.is_empty()
+                        && edits
+                            .cells
+                            .range(
+                                (base_row, 0)
+                                    ..=(
+                                        base_row.saturating_add(chunk.field_start.rows_scanned),
+                                        usize::MAX,
+                                    ),
+                            )
+                            .next()
+                            .is_some();
+                    if has_edits_in_chunk {
+                        self.write_range_sequential(
+                            file,
+                            chunk.start,
+                            chunk.end,
+                            chunk.is_last,
+                            delimiter,
+                            data_start,
+                            dialect,
+                            byte_class,
+                            query,
+                            edits,
+                            matchers,
+                            groups,
+                            config,
+                            source_had_bom,
+                            output,
+                        )?;
+                    } else {
+                        self.write_preformatted_outcome(
+                            chunk.field_start,
+                            base_row,
+                            source_had_bom,
+                            config,
+                            output,
+                        )?;
+                    }
                 } else {
-                    self.write_preformatted_outcome(
-                        chunk.field_start,
-                        base_row,
-                        source_had_bom,
-                        config,
-                        output,
-                    )?;
-                }
-            } else {
-                let q = chunk
-                    .quoted
-                    .expect("non-initial LF-aligned export chunk has quoted outcome");
-                if let Some(err) = q.first_error {
-                    return Err(adjust_export_worker_error(err, self.rows_scanned));
-                }
-                if let Some(first_end) = q.first_record_end {
-                    let stitched_len = first_end.saturating_sub(self.open_record_start);
-                    if stitched_len > config.max_record_bytes as u64 {
-                        return Err(QuarryError::RecordTooLarge {
-                            limit: config.max_record_bytes,
-                        });
+                    let q = chunk
+                        .quoted
+                        .expect("non-initial LF-aligned export chunk has quoted outcome");
+                    if let Some(err) = q.first_error {
+                        return Err(adjust_export_worker_error(err, self.rows_scanned));
                     }
-                    let mut rec = vec![0u8; stitched_len as usize];
-                    if read_at_exact_or_eof(file, self.open_record_start, &mut rec)? != rec.len() {
-                        return Err(QuarryError::SourceChanged);
-                    }
-                    process_record(
-                        &rec,
-                        self.rows_scanned,
-                        data_start,
-                        delimiter,
-                        query,
-                        edits,
-                        matchers,
-                        groups,
-                        config.max_record_bytes,
-                        source_had_bom,
-                        output,
-                        &mut self.rows_written,
-                        &mut self.bytes_written,
-                    )?;
-                    self.rows_scanned += 1;
-                    self.in_quote = false;
+                    if let Some(first_end) = q.first_record_end {
+                        let stitched_len = first_end.saturating_sub(self.open_record_start);
+                        if stitched_len > config.max_record_bytes as u64 {
+                            return Err(QuarryError::RecordTooLarge {
+                                limit: config.max_record_bytes,
+                            });
+                        }
+                        let mut rec = vec![0u8; stitched_len as usize];
+                        if read_at_exact_or_eof(file, self.open_record_start, &mut rec)?
+                            != rec.len()
+                        {
+                            return Err(QuarryError::SourceChanged);
+                        }
+                        process_record(
+                            &rec,
+                            self.rows_scanned,
+                            data_start,
+                            delimiter,
+                            query,
+                            edits,
+                            matchers,
+                            groups,
+                            config.max_record_bytes,
+                            source_had_bom,
+                            output,
+                            &mut self.rows_written,
+                            &mut self.bytes_written,
+                        )?;
+                        self.rows_scanned += 1;
+                        self.in_quote = false;
 
-                    if let Some(tail) = q.tail {
-                        let tail_base = self.rows_scanned;
-                        let has_edits_in_tail = !edits.cells.is_empty()
-                            && edits
-                                .cells
-                                .range(
-                                    (tail_base, 0)
-                                        ..=(
-                                            tail_base.saturating_add(tail.rows_scanned),
-                                            usize::MAX,
-                                        ),
-                                )
-                                .next()
-                                .is_some();
-                        if has_edits_in_tail {
-                            self.write_range_sequential(
-                                file,
-                                first_end,
-                                chunk.end,
-                                chunk.is_last,
-                                delimiter,
-                                data_start,
-                                dialect,
-                                byte_class,
-                                query,
-                                edits,
-                                matchers,
-                                groups,
-                                config,
-                                source_had_bom,
-                                output,
-                            )?;
-                        } else {
-                            self.write_preformatted_outcome(
-                                tail,
-                                tail_base,
-                                source_had_bom,
-                                config,
-                                output,
-                            )?;
+                        if let Some(tail) = q.tail {
+                            let tail_base = self.rows_scanned;
+                            let has_edits_in_tail = !edits.cells.is_empty()
+                                && edits
+                                    .cells
+                                    .range(
+                                        (tail_base, 0)
+                                            ..=(
+                                                tail_base.saturating_add(tail.rows_scanned),
+                                                usize::MAX,
+                                            ),
+                                    )
+                                    .next()
+                                    .is_some();
+                            if has_edits_in_tail {
+                                self.write_range_sequential(
+                                    file,
+                                    first_end,
+                                    chunk.end,
+                                    chunk.is_last,
+                                    delimiter,
+                                    data_start,
+                                    dialect,
+                                    byte_class,
+                                    query,
+                                    edits,
+                                    matchers,
+                                    groups,
+                                    config,
+                                    source_had_bom,
+                                    output,
+                                )?;
+                            } else {
+                                self.write_preformatted_outcome(
+                                    tail,
+                                    tail_base,
+                                    source_had_bom,
+                                    config,
+                                    output,
+                                )?;
+                            }
                         }
                     }
                 }
-            }
+                chunk_end
+            };
+            // `chunk` and all of its reorder budget guards are now dropped; advance the merge
+            // cursor and wake any head-of-line waiter only after those bytes are released.
+            self.next_id += 1;
+            self.next_merge_id.store(self.next_id, Ordering::Release);
+            self.reorder_budget.notify_all();
 
             publish_progress(
                 shared,
-                chunk.end,
+                chunk_end,
                 self.rows_scanned,
                 self.rows_written,
                 self.bytes_written,

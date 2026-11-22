@@ -216,41 +216,49 @@ impl SearchJob {
             .name("quarry-search".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
-                let result =
-                    if !encoding.is_utf16() && tuning.requested_threads > 1 && stripes.len() > 1 {
-                        run_parallel_search(
-                            Arc::new(file),
-                            file_size,
-                            indexed_frontier,
-                            indexed_rows,
-                            delimiter,
-                            &needle,
-                            case_sensitivity,
-                            start,
-                            &stripes,
-                            &cell_edits,
-                            max_record_bytes,
-                            encoding,
-                            tuning,
-                            &worker_state,
-                        )
-                    } else {
-                        run_search_bounded(
-                            file,
-                            file_size,
-                            indexed_frontier,
-                            indexed_rows,
-                            delimiter,
-                            &needle,
-                            case_sensitivity,
-                            start,
-                            checkpoint,
-                            &cell_edits,
-                            max_record_bytes,
-                            encoding,
-                            &worker_state,
-                        )
-                    };
+                let budget_cap = engine_pool().byte_budget().limit() as u64;
+                let stripes_fit_input_budget = stripes.iter().all(|s| {
+                    let span = s.end_offset.saturating_sub(s.start_offset);
+                    search_stripe_memory_bound(span, max_record_bytes) <= budget_cap
+                });
+                let result = if !encoding.is_utf16()
+                    && tuning.requested_threads > 1
+                    && stripes.len() > 1
+                    && stripes_fit_input_budget
+                {
+                    run_parallel_search(
+                        Arc::new(file),
+                        file_size,
+                        indexed_frontier,
+                        indexed_rows,
+                        delimiter,
+                        &needle,
+                        case_sensitivity,
+                        start,
+                        &stripes,
+                        &cell_edits,
+                        max_record_bytes,
+                        encoding,
+                        tuning,
+                        &worker_state,
+                    )
+                } else {
+                    run_search_bounded(
+                        file,
+                        file_size,
+                        indexed_frontier,
+                        indexed_rows,
+                        delimiter,
+                        &needle,
+                        case_sensitivity,
+                        start,
+                        checkpoint,
+                        &cell_edits,
+                        max_record_bytes,
+                        encoding,
+                        &worker_state,
+                    )
+                };
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
                 }
@@ -1015,6 +1023,23 @@ fn scan_search_stripe_streaming(
     })
 }
 
+/// Conservative peak live memory bound for scanning a search stripe.
+///
+/// Single-read stripes buffer the entire stripe (`<= MAX_SINGLE_READ_STRIPE_BYTES`).
+/// Streaming stripes read in `WORKER_CANCEL_SLICE_BYTES` pieces while retaining at most
+/// one active record up to `max_record_bytes`.
+fn search_stripe_memory_bound(stripe_span: u64, max_record_bytes: usize) -> u64 {
+    if stripe_span > MAX_SINGLE_READ_STRIPE_BYTES
+        || stripe_span > (max_record_bytes as u64).saturating_mul(2)
+    {
+        stripe_span
+            .min((max_record_bytes as u64).saturating_add(WORKER_CANCEL_SLICE_BYTES as u64))
+            .max(1)
+    } else {
+        stripe_span.max(1)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_parallel_search(
     file: Arc<File>,
@@ -1086,14 +1111,7 @@ fn run_parallel_search(
             let stripe = stripes[next_dispatch_idx];
             next_dispatch_idx += 1;
             let stripe_span = stripe.end_offset.saturating_sub(stripe.start_offset);
-            let budget_request = stripe_span
-                .min(MAX_SINGLE_READ_STRIPE_BYTES)
-                .min(
-                    (max_record_bytes as u64)
-                        .saturating_mul(2)
-                        .max(WORKER_CANCEL_SLICE_BYTES as u64),
-                )
-                .max(1) as usize;
+            let budget_request = search_stripe_memory_bound(stripe_span, max_record_bytes) as usize;
             let Some(budget_guard) = pool
                 .byte_budget()
                 .acquire(budget_request, &shared.cancelled)

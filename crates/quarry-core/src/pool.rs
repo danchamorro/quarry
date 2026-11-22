@@ -182,6 +182,10 @@ impl ByteBudget {
         }
     }
 
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
     #[cfg(test)]
     pub(crate) fn with_wait_signal(limit: usize, wait_signal: Option<Arc<AtomicBool>>) -> Self {
         Self {
