@@ -76,21 +76,38 @@ impl EnginePool {
         &self.byte_budget
     }
 
-    /// Ensure at least `target_workers` threads exist in the shared pool (capped at `MAX_POOL_WORKERS`).
-    pub(crate) fn ensure_workers(&'static self, target_workers: usize) {
+    /// Ensure at least one worker thread exists (targeting `target_workers`, capped at `MAX_POOL_WORKERS`).
+    ///
+    /// Returns the number of live worker threads available for this job (up to `target_workers`),
+    /// or an I/O error if zero worker threads could be spawned.
+    pub(crate) fn ensure_workers(
+        &'static self,
+        target_workers: usize,
+    ) -> Result<usize, crate::QuarryError> {
         let desired = target_workers.clamp(1, MAX_POOL_WORKERS);
         let mut guard = self.queue.lock().unwrap();
+        let mut last_error = None;
         while guard.spawned_workers < desired {
             let worker_id = guard.spawned_workers;
             guard.spawned_workers += 1;
-            let spawn_result = thread::Builder::new()
+            match thread::Builder::new()
                 .name(format!("quarry-worker-{worker_id}"))
-                .spawn(move || self.worker_loop());
-            if spawn_result.is_err() {
-                guard.spawned_workers -= 1;
-                break;
+                .spawn(move || self.worker_loop())
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    guard.spawned_workers -= 1;
+                    last_error = Some(error);
+                    break;
+                }
             }
         }
+        if guard.spawned_workers == 0 {
+            return Err(crate::QuarryError::Io(last_error.unwrap_or_else(|| {
+                std::io::Error::other("failed to start engine worker pool thread")
+            })));
+        }
+        Ok(guard.spawned_workers.min(desired))
     }
 
     /// Submit one task with the given priority.
@@ -215,17 +232,21 @@ impl JobExecutor {
         pool: &'static EnginePool,
         priority: JobPriority,
         max_workers: usize,
-    ) -> Self {
-        let max_workers = max_workers.clamp(1, MAX_POOL_WORKERS);
-        pool.ensure_workers(max_workers);
-        Self {
+    ) -> Result<Self, crate::QuarryError> {
+        let available = pool.ensure_workers(max_workers)?;
+        let max_workers = max_workers.clamp(1, available);
+        Ok(Self {
             pool,
             priority,
             max_workers,
             in_flight: Arc::new((Mutex::new(0), Condvar::new())),
             panicked: Arc::new(AtomicBool::new(false)),
             active_count: Arc::new(AtomicUsize::new(0)),
-        }
+        })
+    }
+
+    pub(crate) fn effective_workers(&self) -> usize {
+        self.max_workers
     }
 
     /// Wait for a per-job worker slot (bounded by `max_workers`), then submit `work` to the pool.
@@ -344,7 +365,7 @@ mod tests {
 
     #[test]
     fn job_executor_bounds_concurrency_and_drains_cleanly() {
-        let executor = JobExecutor::new(engine_pool(), JobPriority::Foreground, 3);
+        let executor = JobExecutor::new(engine_pool(), JobPriority::Foreground, 3).unwrap();
         let cancelled = AtomicBool::new(false);
         let current = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));

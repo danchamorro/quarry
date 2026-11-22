@@ -174,29 +174,32 @@ impl StructuralIndex {
             let current_stride = self.checkpoint_byte_stride.unwrap();
             let new_stride = current_stride.saturating_mul(2);
             if new_stride == current_stride {
-                let mut compacted = Vec::with_capacity(self.checkpoints.len() / 2 + 1);
-                for (i, &cp) in self.checkpoints.iter().enumerate() {
-                    if i % 2 == 0 {
-                        compacted.push(cp);
+                // Compact in-place so capacity stays bounded by `max_checkpoints` (a power of 2).
+                let mut write = 0usize;
+                for read in 0..self.checkpoints.len() {
+                    if read % 2 == 0 {
+                        self.checkpoints[write] = self.checkpoints[read];
+                        write += 1;
                     }
                 }
-                compacted.shrink_to_fit();
-                self.checkpoints = compacted;
+                self.checkpoints.truncate(write);
                 break;
             }
             self.checkpoint_byte_stride = Some(new_stride);
-            let mut compacted = Vec::with_capacity(self.checkpoints.len() / 2 + 2);
-            compacted.push(self.checkpoints[0]);
+            // Compact in-place without calling `shrink_to_fit()` so subsequent pushes never
+            // reallocate past the power-of-two `max_checkpoints` capacity ceiling.
+            let mut write = 1usize;
             let mut prev_bucket = 0u64;
-            for &cp in &self.checkpoints[1..] {
+            for read in 1..self.checkpoints.len() {
+                let cp = self.checkpoints[read];
                 let b = cp.offset / new_stride;
                 if b > prev_bucket {
-                    compacted.push(cp);
+                    self.checkpoints[write] = cp;
+                    write += 1;
                     prev_bucket = b;
                 }
             }
-            compacted.shrink_to_fit();
-            self.checkpoints = compacted;
+            self.checkpoints.truncate(write);
         }
         let active_stride = self.checkpoint_byte_stride.unwrap();
         let active_bucket = offset / active_stride;
@@ -1160,7 +1163,9 @@ fn run_parallel_indexer(
     }
 
     let pool = engine_pool();
-    let executor = JobExecutor::new(pool, JobPriority::Background, effective_workers);
+    let executor = JobExecutor::new(pool, JobPriority::Background, effective_workers)?;
+    let effective_workers = executor.effective_workers();
+    shared.index.write().unwrap().telemetry.effective_workers = effective_workers;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Result<ChunkResult, QuarryError>>();
     let max_window = (effective_workers * 2).clamp(2, 16);
@@ -1369,6 +1374,27 @@ mod tests {
         }
         assert_eq!(index.nearest_checkpoint(0).row, 0);
         assert!(index.nearest_checkpoint(10_000).row <= 10_000);
+
+        // Non-halving compaction: 8 slots with sparse buckets 0,1,2,4,6,8,10,12 keep 7 entries
+        // after doubling; subsequent pushes must never grow capacity past `memory_budget_bytes`.
+        let mut sparse = StructuralIndex::new(IndexConfig {
+            chunk_bytes: 1024,
+            checkpoint_every: 4096,
+            memory_budget_bytes: budget,
+        })
+        .unwrap();
+        sparse.enable_byte_stride_checkpoints(100);
+        for (i, bucket) in [1_u64, 2, 4, 6, 8, 10, 12, 14, 16, 18]
+            .into_iter()
+            .enumerate()
+        {
+            sparse.record_byte_stride_checkpoint(i as u64 + 1, bucket * 100);
+            assert!(
+                sparse.memory_bytes() <= budget,
+                "capacity {} bytes exceeded budget {budget}",
+                sparse.memory_bytes()
+            );
+        }
     }
 
     #[test]

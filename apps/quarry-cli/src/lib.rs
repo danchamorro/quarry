@@ -853,6 +853,7 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
     let mut requested_edits = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut threads = None;
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -887,7 +888,7 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
                 }
             }
             "--threads" => {
-                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             "--temp-dir" | "--max-decompressed-bytes" if utf8 => {
                 compressed.parse(&args, &mut cursor)?
@@ -967,7 +968,7 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
             {
                 return Err("published output does not match Save As progress".into());
             }
-            let validation_elapsed = validate_saved_edits(
+            let validation_elapsed = validate_saved_edits_with_threads(
                 &summary.destination,
                 &cell_edits,
                 session.dialect,
@@ -976,6 +977,7 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
                 } else {
                     session.encoding()
                 },
+                threads,
             )?;
             (
                 "complete",
@@ -1606,6 +1608,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut header_mode = HeaderMode::Auto;
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut threads = None;
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -1665,7 +1668,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
                 }
             }
             "--threads" => {
-                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -1724,7 +1727,9 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be less than file size".into());
     }
     let source_index_started = Instant::now();
-    let source_index = session.start_indexing(IndexConfig::default())?.wait()?;
+    let source_index = session
+        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .wait()?;
     println!(
         "Source indexing time: {:.3} s (before sort)",
         source_index_started.elapsed().as_secs_f64()
@@ -1800,12 +1805,13 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             {
                 return Err("published output does not match sort progress".into());
             }
-            let validation = validate_sorted_output(
+            let validation = validate_sorted_output_with_threads(
                 &session,
                 &source_index,
                 &summary.destination,
                 spec,
                 summary.output_index.clone(),
+                threads,
             )?;
             if validation.data_rows != summary.rows_sorted
                 || summary.header_rows != u64::from(session.dialect.has_header)
@@ -2095,12 +2101,31 @@ fn sort_artifact_permissions(path: Option<&Path>) -> CliResult<String> {
     }
 }
 
+#[cfg(test)]
 fn validate_sorted_output(
     source: &Session,
     source_index: &StructuralIndex,
     destination: &Path,
     spec: SortSpec,
     completed_index: Option<CompletedIndex>,
+) -> CliResult<SortValidation> {
+    validate_sorted_output_with_threads(
+        source,
+        source_index,
+        destination,
+        spec,
+        completed_index,
+        None,
+    )
+}
+
+fn validate_sorted_output_with_threads(
+    source: &Session,
+    source_index: &StructuralIndex,
+    destination: &Path,
+    spec: SortSpec,
+    completed_index: Option<CompletedIndex>,
+    threads: Option<usize>,
 ) -> CliResult<SortValidation> {
     const VALIDATION_ROWS: usize = 1_000;
 
@@ -2124,7 +2149,9 @@ fn validate_sorted_output(
         .transpose()?;
     let index_handoff_elapsed = adopted_index.as_ref().map(|_| handoff_started.elapsed());
     let started = Instant::now();
-    let output_index = output.start_indexing(IndexConfig::default())?.wait()?;
+    let output_index = output
+        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .wait()?;
     if output_index.indexed_rows() != source_index.indexed_rows() {
         return Err("sorted output record count changed".into());
     }
@@ -2297,6 +2324,7 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut output_headers = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut threads = None;
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -2394,7 +2422,7 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
                 }
             }
             "--threads" => {
-                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -2517,7 +2545,12 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
                 return Err("published output does not match Save As progress".into());
             }
             let (sample_rows, total_data_rows, validation_elapsed) =
-                validate_saved_transformation(&session, &summary.destination, &transformation)?;
+                validate_saved_transformation_with_threads(
+                    &session,
+                    &summary.destination,
+                    &transformation,
+                    threads,
+                )?;
             (
                 "complete",
                 Some(output_size),
@@ -2747,10 +2780,20 @@ fn wait_for_split_analysis(
     Ok((job.wait()?, progress))
 }
 
+#[cfg(test)]
 fn validate_saved_transformation(
     source: &Session,
     destination: &Path,
     transformation: &ColumnTransformation,
+) -> CliResult<(usize, u64, Duration)> {
+    validate_saved_transformation_with_threads(source, destination, transformation, None)
+}
+
+fn validate_saved_transformation_with_threads(
+    source: &Session,
+    destination: &Path,
+    transformation: &ColumnTransformation,
+    threads: Option<usize>,
 ) -> CliResult<(usize, u64, Duration)> {
     let started = Instant::now();
     let output = Session::open_with_encoding(
@@ -2767,8 +2810,12 @@ fn validate_saved_transformation(
         },
         Some(source.encoding()),
     )?;
-    let source_index = source.start_indexing(IndexConfig::default())?.wait()?;
-    let output_index = output.start_indexing(IndexConfig::default())?.wait()?;
+    let source_index = source
+        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .wait()?;
+    let output_index = output
+        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .wait()?;
     if output_index.indexed_rows() != source_index.indexed_rows() {
         return Err("transformed output record count changed".into());
     }
@@ -2898,11 +2945,12 @@ fn wait_for_replace_all(
     Ok((outcome, progress, cancellation))
 }
 
-fn validate_saved_edits(
+fn validate_saved_edits_with_threads(
     destination: &Path,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     dialect: Dialect,
     encoding: Encoding,
+    threads: Option<usize>,
 ) -> CliResult<Duration> {
     let started = Instant::now();
     let session = Session::open_with_encoding(
@@ -2918,7 +2966,9 @@ fn validate_saved_edits(
         },
         Some(encoding),
     )?;
-    let index = session.start_indexing(IndexConfig::default())?.wait()?;
+    let index = session
+        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .wait()?;
     let mut current_row = None;
     let mut row = None;
     for (&(record_row, column), expected) in cell_edits {
