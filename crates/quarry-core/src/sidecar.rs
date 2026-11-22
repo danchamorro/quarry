@@ -280,7 +280,7 @@ pub fn clear_index_cache(cache_dir: Option<&Path>) -> Result<CacheClearSummary, 
         ));
     }
 
-    let _lock = acquire_cache_lock(&resolved);
+    let _lock = acquire_cache_lock(&resolved, true);
 
     let mut summary = CacheClearSummary::default();
     let entries = match fs::read_dir(&resolved) {
@@ -1401,7 +1401,7 @@ fn resolve_and_harden_cache_dir(config: &IndexCacheConfig) -> Option<PathBuf> {
     Some(dir)
 }
 
-fn acquire_cache_lock(cache_dir: &Path) -> Option<File> {
+fn acquire_cache_lock(cache_dir: &Path, blocking: bool) -> Option<File> {
     let lock_path = cache_dir.join(CACHE_LOCK_FILENAME);
 
     #[cfg(unix)]
@@ -1427,7 +1427,12 @@ fn acquire_cache_lock(cache_dir: &Path) -> Option<File> {
         {
             crate::storage::set_macos_acl(&file, None).ok()?;
         }
-        rustix::fs::flock(&file, FlockOperation::LockExclusive).ok()?;
+        let op = if blocking {
+            FlockOperation::LockExclusive
+        } else {
+            FlockOperation::NonBlockingLockExclusive
+        };
+        rustix::fs::flock(&file, op).ok()?;
         Some(file)
     }
 
@@ -1441,6 +1446,7 @@ fn acquire_cache_lock(cache_dir: &Path) -> Option<File> {
             FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
+        const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
         const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
         #[repr(C)]
         struct Overlapped {
@@ -1483,10 +1489,15 @@ fn acquire_cache_lock(cache_dir: &Path) -> Option<File> {
             offset_high: 0,
             h_event: std::ptr::null_mut(),
         };
+        let flags = if blocking {
+            LOCKFILE_EXCLUSIVE_LOCK
+        } else {
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
+        };
         let ok = unsafe {
             LockFileEx(
                 file.as_raw_handle(),
-                LOCKFILE_EXCLUSIVE_LOCK,
+                flags,
                 0,
                 u32::MAX,
                 u32::MAX,
@@ -1512,7 +1523,7 @@ fn load_or_create_cache_key(cache_dir: &Path) -> Option<[u8; 32]> {
         return Some(key);
     }
 
-    let _lock = acquire_cache_lock(cache_dir)?;
+    let _lock = acquire_cache_lock(cache_dir, false)?;
     if let Some(key) = read_verified_key(&key_path) {
         return Some(key);
     }
@@ -2345,7 +2356,8 @@ fn try_save_sidecar(
     let final_path = cache_dir.join(&final_name);
 
     // Coordinate across processes and reserve full staging capacity before creating a temp file.
-    let _lock = acquire_cache_lock(&cache_dir)?;
+    // Non-blocking lock ensures optional cache writes never stall indexing or cancellation.
+    let _lock = acquire_cache_lock(&cache_dir, false)?;
     if !reserve_cache_budget(&cache_dir, cache_config.max_cache_bytes, encoded_len) {
         return None;
     }
