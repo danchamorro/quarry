@@ -1,0 +1,86 @@
+{
+  "weather/export": {
+    "output_equality": "raw-byte",
+    "output_sha256": "4cc7682452d1e221c56d4bdefa7255b2b99b67bea9bd53c702338dc6f98acb6a",
+    "output_bytes": 2238131,
+    "output_rows": 26506
+  },
+  "weather/edit-save-as": {
+    "output_equality": "decoded-record",
+    "output_sha256": "1dda7240efc1192b9b6551d384c2701298b74bd78d50fdb4f8c9a33fb338aa09",
+    "output_bytes": 9770967599,
+    "output_rows": 131985330
+  },
+  "weather/replace-all": {
+    "output_equality": "decoded-record",
+    "output_sha256": "99df9f38bb93fecec9f4c42e859bef8933072de16df6d6e086454c0fdc14a586",
+    "output_bytes": 9770967575,
+    "output_rows": 131985330
+  },
+  "weather/split-auto": {
+    "output_equality": "decoded-record",
+    "output_sha256": "a3473c044b340e49506dd811ecc08801897655d2a536735ed115ec2238b373da",
+    "output_bytes": 9775630595,
+    "output_rows": 131985330
+  },
+  "weather/combine": {
+    "output_equality": "decoded-record",
+    "output_sha256": "c5f57f5d7431720fb52d4bb07e274d317baab592f99035c6ce1f10e9da1551b0",
+    "output_bytes": 9770967561,
+    "output_rows": 131985330
+  },
+  "weather/sort-number": {
+    "output_equality": "raw-byte",
+    "output_sha256": "4be7c66945d56ececb1564c08ab94f470b992db8cbdedd49f4e18ceeb216d58b",
+    "output_bytes": 9770967575,
+    "output_rows": 131985330
+  },
+  "weather/duplicates-remove": {
+    "output_equality": "raw-byte",
+    "output_sha256": "10e09e36fbd11a1b5742aa3938fcfff71066b45cf2bae7d461a17bba5e921100",
+    "output_bytes": 9477642738,
+    "output_rows": 127261910
+  },
+  "hacker-news/export": {
+    "output_equality": "raw-byte",
+    "output_sha256": "1ebb146861f71c371f13c48f757647f9175fe21af94ba6bb1e9a9b8a8c7d3c16",
+    "output_bytes": 54128598,
+    "output_rows": 128223
+  },
+  "hacker-news/edit-save-as": {
+    "output_equality": "decoded-record",
+    "output_sha256": "e84956182bc15e1c5f9350f8405b55a63387f7da7a72ec2743f09f64cbb8ac10",
+    "output_bytes": 12718039455,
+    "output_rows": 28737558
+  },
+  "hacker-news/replace-all": {
+    "output_equality": "decoded-record",
+    "output_sha256": "d4e78f74e1e6024a00c96f45f2ed316dc494654ba28c1cdf0dbed19d96da7181",
+    "output_bytes": 12718030503,
+    "output_rows": 28737558
+  },
+  "hacker-news/split-auto": {
+    "output_equality": "decoded-record",
+    "output_sha256": "47e1d39560aa4059f5ca9bd4244ef15960efa988ffae9984e680415f7c3b4ac9",
+    "output_bytes": 12303294624,
+    "output_rows": 28737558
+  },
+  "hacker-news/combine": {
+    "output_equality": "decoded-record",
+    "output_sha256": "62555d7ecc8bef65717b6f6036d39d4aec780727d427100552f0de435865b077",
+    "output_bytes": 12303294624,
+    "output_rows": 28737558
+  },
+  "hacker-news/sort-number": {
+    "output_equality": "raw-byte",
+    "output_sha256": "b7462bd362f26ae1fbf433e7c7001370bafcc9f505163a44ef70c6f0aec9fd47",
+    "output_bytes": 12718039463,
+    "output_rows": 28737558
+  },
+  "hacker-news/duplicates-remove": {
+    "output_equality": "raw-byte",
+    "output_sha256": "165d9336b6266519da4e99d0348576537f80337e40d1794aefb00258a49a0373",
+    "output_bytes": 12718039463,
+    "output_rows": 28737558
+  }
+}
