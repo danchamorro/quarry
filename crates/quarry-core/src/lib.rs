@@ -13,6 +13,8 @@ mod inspection;
 mod join;
 #[cfg(test)]
 mod join_faults;
+mod pool;
+mod positional_io;
 
 mod search;
 mod sort;
@@ -63,7 +65,8 @@ pub use filter::{
     FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
 };
 pub use index::{
-    Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, StructuralIndex,
+    Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, IndexTelemetry,
+    StructuralIndex,
 };
 pub use inspection::{
     Diagnostic, DiagnosticKind, InspectionEdits, InspectionJob, InspectionOptions,
@@ -83,6 +86,7 @@ pub use join::{
     JoinOutputColumn, JoinOutputOptions, JoinSource, analyze_join_with_output, read_join_header,
     read_join_header_with_format,
 };
+pub use pool::default_worker_threads;
 pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
 };
@@ -592,7 +596,15 @@ impl Session {
     }
 
     pub fn start_indexing(&self, config: IndexConfig) -> Result<IndexJob, QuarryError> {
-        IndexJob::start(self, config)
+        IndexJob::start(self, config, None)
+    }
+
+    pub fn start_indexing_with_threads(
+        &self,
+        config: IndexConfig,
+        threads: Option<usize>,
+    ) -> Result<IndexJob, QuarryError> {
+        IndexJob::start(self, config, threads)
     }
 
     fn completed_record_count(&self) -> Option<u64> {

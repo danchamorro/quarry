@@ -266,6 +266,7 @@ fn print_help() {
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]\n\n\
          Commands that read an input file accept --encoding auto|utf8|utf16le|utf16be|windows1252|latin1; generate does not.\n\
+         Parallel engine commands accept --threads N (default: available_parallelism - 1).\n\
          Auto detects Unicode BOMs and otherwise uses UTF-8; no legacy guessing.\n\n\
          Compressed input: inspect, open, viewport, search, filter, export, and convert-utf8 read gzip (.gz) files.\n\
          Quarry decompresses the file once into a private temporary copy and indexes it in the same pass.\n\
@@ -285,6 +286,14 @@ fn print_help() {
          Date sorting requires --date-format; no locale or timezone guessing.\n\
          Shuffle and reverse reorder all data rows; --seed repeats a shuffle within the same build."
     );
+}
+
+fn parse_threads(raw: &str) -> CliResult<usize> {
+    let threads = raw.parse::<usize>()?;
+    if threads == 0 {
+        return Err("--threads must be at least 1".into());
+    }
+    Ok(threads)
 }
 
 fn parse_filter_operator(value: &str, option: &str) -> CliResult<FilterOperator> {
@@ -383,6 +392,9 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
                 if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
+            }
+            "--threads" => {
+                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -618,6 +630,9 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
                 if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
+            }
+            "--threads" => {
+                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -871,6 +886,9 @@ fn save_copy_command(args: Vec<String>, utf8: bool) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--threads" => {
+                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+            }
             "--temp-dir" | "--max-decompressed-bytes" if utf8 => {
                 compressed.parse(&args, &mut cursor)?
             }
@@ -1102,6 +1120,9 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--threads" => {
+                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+            }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
             }
@@ -1315,6 +1336,9 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
                 if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
+            }
+            "--threads" => {
+                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -1639,6 +1663,9 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
                 if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
+            }
+            "--threads" => {
+                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -2366,6 +2393,9 @@ fn transform_save_as_command(args: Vec<String>) -> CliResult<()> {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
             }
+            "--threads" => {
+                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+            }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
             }
@@ -2989,6 +3019,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     let mut start_column = 1_usize;
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut threads = None;
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -3009,6 +3040,9 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
                 if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
+            }
+            "--threads" => {
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -3042,7 +3076,9 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     let index_started = Instant::now();
     let index = match prepared_index {
         Some(index) => index,
-        None => session.start_indexing(IndexConfig::default())?.wait()?,
+        None => session
+            .start_indexing_with_threads(IndexConfig::default(), threads)?
+            .wait()?,
     };
     let index_elapsed = index_started.elapsed();
     let search_bytes = session
@@ -3076,6 +3112,9 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     println!("Start: data row {start_row}, column {start_column}");
     println!("Rows indexed: {}", index.indexed_rows());
     println!("Indexing time: {:.3} s", index_elapsed.as_secs_f64());
+    let telemetry = index.telemetry();
+    println!("Engine workers: {}", telemetry.effective_workers);
+    println!("SIMD backend: {}", telemetry.simd_backend);
     let time_label = if matches!(&outcome, SearchOutcome::Match(_)) {
         "Time to first match"
     } else {
@@ -3199,6 +3238,7 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     let mut live = false;
     let mut interval_ms = 16_u64;
     let mut chunk_bytes = IndexConfig::default().chunk_bytes;
+    let mut threads = None;
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -3216,6 +3256,9 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
                 if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
+            }
+            "--threads" => {
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -3258,10 +3301,13 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     let index = match prepared_index {
         Some(index) => index,
         None => {
-            let job = session.start_indexing(IndexConfig {
-                chunk_bytes,
-                ..IndexConfig::default()
-            })?;
+            let job = session.start_indexing_with_threads(
+                IndexConfig {
+                    chunk_bytes,
+                    ..IndexConfig::default()
+                },
+                threads,
+            )?;
             if live {
                 return benchmark_live_viewports(
                     session,
@@ -3313,6 +3359,9 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     println!("File size: {}", human_bytes(session.file_size));
     println!("Rows indexed: {}", index.indexed_rows());
     println!("Indexing time: {:.3} s", index_elapsed.as_secs_f64());
+    let telemetry = index.telemetry();
+    println!("Engine workers: {}", telemetry.effective_workers);
+    println!("SIMD backend: {}", telemetry.simd_backend);
     println!("Cache state: {cache_state}");
     println!("Iterations: {iterations} per pattern, {rows} rows per viewport");
     println!("Seed: {seed}\n");
@@ -3539,6 +3588,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     let mut cache_state = "unknown".to_owned();
     let mut wait_for_index = true;
     let mut metrics_only = false;
+    let mut threads = None;
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -3556,6 +3606,9 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
                 if !matches!(cache_state.as_str(), "unknown" | "cold" | "warm") {
                     return Err("--cache-state must be unknown, cold, or warm".into());
                 }
+            }
+            "--threads" => {
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             "--metrics-only" => metrics_only = true,
             "--no-wait" => wait_for_index = false,
@@ -3598,7 +3651,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
         },
         encoding,
     )?;
-    let job = session.start_indexing(IndexConfig::default())?;
+    let job = session.start_indexing_with_threads(IndexConfig::default(), threads)?;
     let memory_at_first_rows = current_rss_bytes();
 
     println!("Quarry\n");
@@ -3714,12 +3767,31 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
         "Indexing throughput: {}/s",
         human_bytes(rate(progress.bytes_scanned, progress.elapsed))
     );
+    let telemetry = index.telemetry();
+    println!("Engine workers: {}", telemetry.effective_workers);
+    println!("SIMD backend: {}", telemetry.simd_backend);
     println!(
-        "Index: {} checkpoints, every {} rows, {} memory",
-        index.checkpoints().len(),
-        index.checkpoint_every(),
-        human_bytes(index.memory_bytes() as u64)
+        "Parallel chunks: {} ({} dual-scan, {} quoted-entry, {} rescanned)",
+        telemetry.chunks_processed,
+        telemetry.dual_scan_chunks,
+        telemetry.quoted_entry_chunks,
+        human_bytes(telemetry.rescanned_bytes)
     );
+    if let Some(stride) = index.checkpoint_byte_stride() {
+        println!(
+            "Index: {} checkpoints, every {} bytes, {} memory",
+            index.checkpoints().len(),
+            human_bytes(stride),
+            human_bytes(index.memory_bytes() as u64)
+        );
+    } else {
+        println!(
+            "Index: {} checkpoints, every {} rows, {} memory",
+            index.checkpoints().len(),
+            index.checkpoint_every(),
+            human_bytes(index.memory_bytes() as u64)
+        );
+    }
 
     if let Some(start) = pending_jump {
         print_jump(&session, &index, start, jump_count, None, !metrics_only)?;
