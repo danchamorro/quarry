@@ -1,5 +1,7 @@
 //! Bounded, source-preserving joins with explicit source formats and output layouts.
 use crate::source_stamp::open_regular_file;
+#[path = "join_hash.rs"]
+mod hash;
 #[path = "join_working.rs"]
 mod working;
 pub use working::{
@@ -46,13 +48,25 @@ const MAX_COALESCE_SPAN_BYTES: u64 = 256 * 1024;
 #[cfg(test)]
 mod storage_test {
     use std::cell::RefCell;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
 
     #[derive(Clone, Default)]
     pub(super) struct Hook {
         pub(super) force_spooled: bool,
+        pub(super) force_sort_merge: bool,
+        pub(super) force_hash_join: bool,
+        pub(super) force_hash_partition_fallback_bytes: Option<usize>,
+        pub(super) force_hash_budget_limits: Option<(usize, usize)>,
+        pub(super) force_hash_workers: Option<usize>,
+        pub(super) force_single_pool_worker: bool,
+        pub(super) force_hash_collision: bool,
         pub(super) pread_calls: Option<Arc<AtomicU64>>,
+        pub(super) hash_fallback_partitions: Option<Arc<AtomicUsize>>,
+        pub(super) hash_partitions_processed: Option<Arc<AtomicUsize>>,
+        pub(super) budget_wait_signal: Option<Arc<Mutex<Option<mpsc::Sender<()>>>>>,
+        pub(super) pause_first_hash_worker_until_cancel: Option<Arc<AtomicBool>>,
     }
 
     thread_local! {
@@ -80,12 +94,80 @@ mod storage_test {
         ACTIVE.with(|slot| slot.borrow().force_spooled)
     }
 
+    pub(super) fn force_sort_merge() -> bool {
+        ACTIVE.with(|slot| slot.borrow().force_sort_merge)
+    }
+
+    pub(super) fn force_hash_join() -> bool {
+        ACTIVE.with(|slot| slot.borrow().force_hash_join)
+    }
+
+    pub(super) fn force_hash_partition_fallback_bytes() -> Option<usize> {
+        ACTIVE.with(|slot| slot.borrow().force_hash_partition_fallback_bytes)
+    }
+
+    pub(super) fn force_hash_budget_limits() -> Option<(usize, usize)> {
+        ACTIVE.with(|slot| slot.borrow().force_hash_budget_limits)
+    }
+
+    pub(super) fn force_hash_workers() -> Option<usize> {
+        ACTIVE.with(|slot| slot.borrow().force_hash_workers)
+    }
+
+    pub(super) fn force_single_pool_worker() -> bool {
+        ACTIVE.with(|slot| slot.borrow().force_single_pool_worker)
+    }
+
+    pub(super) fn force_hash_collision() -> bool {
+        ACTIVE.with(|slot| slot.borrow().force_hash_collision)
+    }
+
     pub(super) fn record_pread() {
         ACTIVE.with(|slot| {
             if let Some(counter) = slot.borrow().pread_calls.as_ref() {
                 counter.fetch_add(1, Ordering::AcqRel);
             }
         });
+    }
+
+    pub(super) fn record_hash_fallback() {
+        ACTIVE.with(|slot| {
+            if let Some(counter) = slot.borrow().hash_fallback_partitions.as_ref() {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+    }
+
+    pub(super) fn record_hash_partition() {
+        ACTIVE.with(|slot| {
+            if let Some(counter) = slot.borrow().hash_partitions_processed.as_ref() {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+    }
+
+    pub(super) fn notify_budget_wait() {
+        ACTIVE.with(|slot| {
+            if let Some(signal) = slot.borrow().budget_wait_signal.as_ref()
+                && let Ok(mut guard) = signal.lock()
+                && let Some(sender) = guard.take()
+            {
+                let _ = sender.send(());
+            }
+        });
+    }
+
+    pub(super) fn maybe_pause_first_hash_worker(cancel: &AtomicBool) {
+        let gate = ACTIVE.with(|slot| slot.borrow().pause_first_hash_worker_until_cancel.clone());
+        if let Some(flag) = gate
+            && flag
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
 }
 
@@ -141,7 +223,7 @@ struct HeaderReader<'a, R> {
 
 impl<R: Read> Read for HeaderReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.state.cancel.load(Ordering::Acquire) {
+        if self.state.is_cancelled() {
             return Err(io::Error::other("Header reading cancelled."));
         }
         let limit = buffer.len().min(READ_CHUNK);
@@ -153,7 +235,7 @@ impl<R: Read> Read for HeaderReader<'_, R> {
 
 impl<R: Seek> Seek for HeaderReader<'_, R> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        if self.state.cancel.load(Ordering::Acquire) {
+        if self.state.is_cancelled() {
             return Err(io::Error::other("Header reading cancelled."));
         }
         self.inner.seek(position)
@@ -486,7 +568,7 @@ pub struct JoinDuplicateExample {
 }
 
 /// One bounded comparison-key example, including rows omitted by the join mode.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct JoinUnmatchedExample {
     /// One-based data-row number, excluding a possible header.
     pub data_row: u64,
@@ -494,12 +576,18 @@ pub struct JoinUnmatchedExample {
     pub key: Option<String>,
 }
 
-/// Immutable analysis owns its private sorted inputs until creation or release.
+enum PlanExecution {
+    SortMerge,
+    PartitionedHash(Box<hash::HashJoinPlan>),
+}
+
+/// Immutable analysis owns its private sorted or partitioned inputs until creation or release.
 pub struct JoinPlan {
     inputs: [PreparedInput; 2],
     analysis: JoinAnalysis,
     output: OutputLayout,
-    workspace: Option<SpillWorkspace>,
+    workspace: Option<Arc<SpillWorkspace>>,
+    execution: PlanExecution,
     config: JoinConfig,
 }
 
@@ -554,6 +642,7 @@ struct Progress {
     peak: AtomicU64,
     group_peak: AtomicUsize,
     cancel: AtomicBool,
+    parent_cancel: Option<Arc<Progress>>,
     done: AtomicBool,
     discovered: Mutex<Option<[JoinHeader; 2]>>,
 }
@@ -568,14 +657,30 @@ impl Progress {
             peak: AtomicU64::new(0),
             group_peak: AtomicUsize::new(0),
             cancel: AtomicBool::new(false),
+            parent_cancel: None,
             done: AtomicBool::new(false),
             discovered: Mutex::new(None),
         }
     }
 
+    fn with_parent(parent: Arc<Progress>) -> Self {
+        Self {
+            parent_cancel: Some(parent),
+            ..Self::new()
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+            || self
+                .parent_cancel
+                .as_ref()
+                .is_some_and(|parent| parent.is_cancelled())
+    }
+
     /// Stop at bounded work checkpoints when cancellation is requested.
     fn check(&self) -> JResult<()> {
-        if self.cancel.load(Ordering::Acquire) {
+        if self.is_cancelled() {
             Err(Failure::Cancelled)
         } else {
             Ok(())
@@ -590,13 +695,44 @@ impl Progress {
         crate::join_faults::observe(crate::join_faults::Event::Phase(phase));
     }
 
-    /// Track logical spill and staging bytes with checked arithmetic.
+    /// Track logical spill and staging bytes with thread-safe checked arithmetic.
     fn add_disk(&self, bytes: u64) -> JResult<()> {
-        let current = self.temporary.load(Ordering::Acquire);
-        let next = add(current, bytes)?;
-        self.temporary.store(next, Ordering::Release);
-        self.peak.fetch_max(next, Ordering::AcqRel);
-        Ok(())
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut overflow = false;
+        let updated = self
+            .temporary
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| match current
+                .checked_add(bytes)
+            {
+                Some(next) => Some(next),
+                None => {
+                    overflow = true;
+                    None
+                }
+            });
+        match updated {
+            Ok(prev) => {
+                self.peak.fetch_max(prev + bytes, Ordering::AcqRel);
+                Ok(())
+            }
+            Err(_) => {
+                debug_assert!(overflow);
+                Err(error("Join size or row count exceeds the supported range.").into())
+            }
+        }
+    }
+
+    fn sub_disk(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self
+            .temporary
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(bytes))
+            });
     }
 }
 
@@ -609,7 +745,7 @@ pub struct JoinJob<T> {
 impl<T: Send + 'static> JoinJob<T> {
     /// Mark completion even during unwinding so UI polling cannot wait forever.
     fn spawn(
-        work: impl FnOnce(&Progress) -> JResult<T> + Send + 'static,
+        work: impl FnOnce(&Arc<Progress>) -> JResult<T> + Send + 'static,
     ) -> Result<Self, QuarryError> {
         #[cfg(test)]
         let instrumentation = crate::join_faults::capture();
@@ -891,6 +1027,11 @@ impl LocatorFingerprint {
         self.xor_a ^= a.finish();
         self.sum_b = self.sum_b.wrapping_add(b.finish());
     }
+
+    fn combine(&mut self, other: Self) {
+        self.xor_a ^= other.xor_a;
+        self.sum_b = self.sum_b.wrapping_add(other.sum_b);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -958,7 +1099,7 @@ struct PreparedInput {
     require_unique: bool,
     output_delimiter: u8,
     projection: Vec<(usize, bool)>,
-    sorted: SpillFile,
+    sorted: Option<SpillFile>,
     frame_bytes: u64,
 }
 
@@ -1029,7 +1170,7 @@ struct CancelRead<'a, R> {
 }
 impl<R: Read> Read for CancelRead<'_, R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if self.state.cancel.load(Ordering::Acquire) {
+        if self.state.is_cancelled() {
             return Err(io::Error::other("join cancelled"));
         }
         let length = bytes.len().min(READ_CHUNK);
@@ -1039,7 +1180,7 @@ impl<R: Read> Read for CancelRead<'_, R> {
 
 /// Preserve I/O failures while translating cancellation and malformed frames.
 fn frame_error(failure: FrameReadError, state: &Progress) -> Failure {
-    if state.cancel.load(Ordering::Acquire) {
+    if state.is_cancelled() {
         return Failure::Cancelled;
     }
     match failure {
@@ -1252,6 +1393,10 @@ impl<'a> Runs<'a> {
     /// Keep one key per input stream and one payload live during a merge.
     fn merge(&self, runs: Vec<Run>) -> JResult<Run> {
         self.state.check()?;
+        let _fd_guard = crate::pool::engine_pool()
+            .fd_budget()
+            .acquire(runs.len().saturating_add(1), &self.state.cancel)
+            .ok_or(Failure::Cancelled)?;
         let mut readers: Vec<_> = runs
             .iter()
             .map(|run| {
@@ -1305,6 +1450,7 @@ impl<'a> Runs<'a> {
         self.flush_writer(&mut writer)?;
         drop(writer);
         drop(readers);
+        drop(_fd_guard);
         for run in runs {
             run.path.remove()?;
             self.state.temporary.fetch_sub(run.bytes, Ordering::AcqRel);
@@ -1469,7 +1615,7 @@ fn scan(
         let mut start = 0;
         let mut failed = None;
         let scanned = scanner.scan_chunk(&chunk[..read], offset, |end| {
-            if failed.is_some() || state.cancel.load(Ordering::Acquire) {
+            if failed.is_some() || state.is_cancelled() {
                 return;
             }
             let local_end = (end - offset) as usize;
@@ -1709,13 +1855,12 @@ struct Inspected {
 }
 
 /// Scan the complete source to validate text and size its private frames.
-fn inspect(
+fn inspect_inner(
     input: JoinInput,
     mut working: Option<JoinWorkingSource>,
     config: JoinConfig,
     state: &Progress,
 ) -> JResult<Inspected> {
-    state.phase(JoinPhase::Inspecting);
     if let Some(source) = &mut working {
         source.accepts(&input)?;
         source.pin_private_directory()?;
@@ -2020,7 +2165,7 @@ fn prepare(
         require_unique: input.require_unique,
         output_delimiter: input.output_delimiter,
         projection,
-        sorted: run.path,
+        sorted: Some(run.path),
         frame_bytes: run.bytes,
     })
 }
@@ -2654,7 +2799,10 @@ impl<'a> Groups<'a> {
         Ok(Self {
             input,
             side,
-            reader: BufReader::with_capacity(READ_CHUNK, input.sorted.open()?),
+            reader: BufReader::with_capacity(
+                READ_CHUNK,
+                input.sorted.as_ref().expect("sorted join stream").open()?,
+            ),
             config,
             state,
             rows: 0,
@@ -2862,7 +3010,10 @@ impl<'a> RangeRows<'a> {
     ) -> JResult<Self> {
         let reader = match reader_slot {
             Some(reader) => reader,
-            None => reader_slot.insert(BufReader::with_capacity(READ_CHUNK, input.sorted.open()?)),
+            None => reader_slot.insert(BufReader::with_capacity(
+                READ_CHUNK,
+                input.sorted.as_ref().expect("sorted join stream").open()?,
+            )),
         };
         reader.seek(SeekFrom::Start(range.start))?;
 
@@ -3494,8 +3645,12 @@ fn analyze_prepared(
 }
 
 /// Keep the original failure visible when private-file cleanup also fails.
-fn cleanup_failure(workspace: SpillWorkspace, failure: Failure) -> Failure {
-    match workspace.cleanup() {
+fn cleanup_failure(workspace: Arc<SpillWorkspace>, failure: Failure) -> Failure {
+    match Arc::try_unwrap(workspace)
+        .ok()
+        .expect("join workers must finish before workspace cleanup")
+        .cleanup()
+    {
         Ok(()) => failure,
         Err(cleanup) => {
             let cause = failure.description();
@@ -3549,10 +3704,7 @@ pub fn analyze_join_with_working(
         ));
     }
     JoinJob::spawn(move |state| {
-        let [left, right] = inputs;
-        let [left_working, right_working] = working;
-        let left = inspect(left, left_working, config, state)?;
-        let mut right = inspect(right, right_working, config, state)?;
+        let [left, mut right] = hash::inspect_pair(inputs, working, config, state)?;
         right.output_delimiter = left.info.delimiter;
         if same_input(&left, &right)? {
             return Err(
@@ -3573,28 +3725,47 @@ pub fn analyze_join_with_working(
             &temporary,
             state,
         )?;
-        let initial = mul(add(left.frame_bytes, right.frame_bytes)?, 2)?;
+        let use_hash = hash::should_use_hash_join(&[&left, &right], config);
+        let initial_factor = if use_hash { 3 } else { 2 };
+        let initial = mul(add(left.frame_bytes, right.frame_bytes)?, initial_factor)?;
         check_storage(&temporary, initial)?;
         state.check()?;
         let mut projections: [Vec<(usize, bool)>; 2] = [Vec::new(), Vec::new()];
         for (position, column) in output.columns.iter().enumerate() {
             projections[column.source.index()].push((column.column, position == 0));
         }
-        let [left_projection, right_projection] = projections;
-        let workspace = SpillWorkspace::create_in(&temporary, "join")?;
+        let workspace = Arc::new(SpillWorkspace::create_in(&temporary, "join")?);
         let prepared = (|| {
-            let left = prepare(left, left_projection, &workspace, config, state)?;
-            let right = prepare(right, right_projection, &workspace, config, state)?;
-            let inputs = [left, right];
-            let analysis = analyze_prepared(&inputs, &output, config, state)?;
-            Ok((inputs, analysis))
+            if use_hash {
+                let (inputs, hash_plan, analysis) = hash::prepare_and_analyze_hash(
+                    [left, right],
+                    projections,
+                    &output,
+                    &workspace,
+                    config,
+                    state,
+                )?;
+                Ok((
+                    inputs,
+                    analysis,
+                    PlanExecution::PartitionedHash(Box::new(hash_plan)),
+                ))
+            } else {
+                let [left_projection, right_projection] = projections;
+                let left = prepare(left, left_projection, &workspace, config, state)?;
+                let right = prepare(right, right_projection, &workspace, config, state)?;
+                let inputs = [left, right];
+                let analysis = analyze_prepared(&inputs, &output, config, state)?;
+                Ok((inputs, analysis, PlanExecution::SortMerge))
+            }
         })();
         match prepared {
-            Ok((inputs, analysis)) => Ok(JoinPlan {
+            Ok((inputs, analysis, execution)) => Ok(JoinPlan {
                 inputs,
                 analysis,
                 output,
                 workspace: Some(workspace),
+                execution,
                 config,
             }),
             Err(failure) => Err(cleanup_failure(workspace, failure)),
@@ -3738,7 +3909,10 @@ impl JoinPlan {
 
     /// Release an idle preview explicitly, reporting filesystem cleanup failures.
     pub fn release(mut self) -> Result<(), QuarryError> {
-        self.workspace.take().expect("join workspace").cleanup()
+        Arc::try_unwrap(self.workspace.take().expect("join workspace"))
+            .ok()
+            .expect("join workers must finish before workspace release")
+            .cleanup()
     }
 
     /// Create a result when no many-to-many acknowledgement is required.
@@ -3782,7 +3956,11 @@ impl JoinPlan {
             let result = self.write_inner(&workspace, &destination, state);
             match result {
                 Ok(mut summary) => {
-                    if let Err(error) = workspace.cleanup() {
+                    if let Err(error) = Arc::try_unwrap(workspace)
+                        .ok()
+                        .expect("join workers must finish before workspace cleanup")
+                        .cleanup()
+                    {
                         summary.cleanup_warning = Some(match summary.cleanup_warning.take() {
                             Some(previous) => format!("{previous}; {error}"),
                             None => error.to_string(),
@@ -3840,9 +4018,9 @@ impl JoinPlan {
     /// Validate count, shape and byte size before guarded atomic publication.
     fn write_inner(
         &self,
-        workspace: &SpillWorkspace,
+        workspace: &Arc<SpillWorkspace>,
         destination: &Path,
-        state: &Progress,
+        state: &Arc<Progress>,
     ) -> JResult<JoinSummary> {
         state.phase(JoinPhase::Creating);
         state.check()?;
@@ -3875,7 +4053,11 @@ impl JoinPlan {
                 mul(self.analysis.output_rows, 40)?,
             )?
         };
-        let spill_bytes = mul(frame_bytes, 2)?;
+        let fallback_extra = match &self.execution {
+            PlanExecution::SortMerge => 0,
+            PlanExecution::PartitionedHash(hash_plan) => hash_plan.max_fallback_extra_bytes,
+        };
+        let spill_bytes = add(mul(frame_bytes, 2)?, fallback_extra)?;
         workspace.with_directory(|temporary| {
             Ok(check_creation_space(
                 temporary,
@@ -3904,169 +4086,190 @@ impl JoinPlan {
                 .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
             state.add_disk(header.len() as u64)?;
             drop(header);
-            let mut runs = Runs::new(workspace, self.config, state, 16);
-            let mut count = 0;
-            let mut bytes = 0;
-            let mut range_readers: [Option<BufReader<File>>; 2] = [None, None];
-            if all_seekable {
-                let mut expected_pair_fingerprint = LocatorFingerprint::default();
-                walk_groups(&self.inputs, self.config, state, |left, right| {
-                    enumerate_pairs(
-                        &self.inputs,
-                        left.map(Group::into_data),
-                        right.map(Group::into_data),
-                        &mut range_readers,
-                        self.config,
-                        state,
-                        None,
-                        |left, right| {
-                            let main_ref = left.map(|item| match item {
-                                GroupItem::Ref(row) => *row,
-                                GroupItem::Owned(_) => unreachable!("seekable input stores RowRef"),
-                            });
-                            let additional_ref = right.map(|item| match item {
-                                GroupItem::Ref(row) => *row,
-                                GroupItem::Owned(_) => unreachable!("seekable input stores RowRef"),
-                            });
-                            count = add(count, 1)?;
-                            let order = pair_order(
-                                self.config.mode,
-                                main_ref.map(|r| r.ordinal),
-                                additional_ref.map(|r| r.ordinal),
-                            );
-                            let locator = PairLocator {
-                                main_offset: main_ref.map_or(0, |r| r.source_offset),
-                                main_len: main_ref.map_or(0, |r| r.record_len),
-                                additional_offset: additional_ref.map_or(0, |r| r.source_offset),
-                                additional_len: additional_ref.map_or(0, |r| r.record_len),
-                            };
-                            expected_pair_fingerprint.observe_pair(order.0, order.1, locator);
-                            let pair_key_bytes = pair_key(order);
-                            runs.push(
-                                &pair_key_bytes,
-                                EntryPayload::Pair(locator.to_le_bytes()),
-                                order.0,
-                            )?;
-                            state.records.store(count, Ordering::Release);
-                            Ok(())
-                        },
-                    )?;
-                    Ok(())
-                })?;
-                drop(range_readers);
-                #[cfg(test)]
-                crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
-                let ordered = runs.finish()?;
-                if count != self.analysis.output_rows || ordered.bytes != frame_bytes {
-                    return Err(error(
-                        "Join output differs from the analyzed plan. Analyze again.",
-                    )
-                    .into());
-                }
-                self.materialize_seekable_ordered(
-                    &ordered,
-                    expected_pair_fingerprint,
+            if let PlanExecution::PartitionedHash(hash_plan) = &self.execution {
+                hash::write_partitioned(
+                    self,
+                    hash_plan,
+                    workspace,
                     &source_files,
                     &mut output,
                     state,
                 )?;
             } else {
-                walk_groups(&self.inputs, self.config, state, |left, right| {
-                    enumerate_pairs(
-                        &self.inputs,
-                        left.map(Group::into_data),
-                        right.map(Group::into_data),
-                        &mut range_readers,
-                        self.config,
-                        state,
-                        None,
-                        |left, right| {
-                            let left_rec = left.map(|item| match item {
-                                GroupItem::Owned(row) => row.record.as_slice(),
-                                GroupItem::Ref(_) => unreachable!("spooled path stores OwnedRow"),
-                            });
-                            let right_rec = right.map(|item| match item {
-                                GroupItem::Owned(row) => row.record.as_slice(),
-                                GroupItem::Ref(_) => unreachable!("spooled path stores OwnedRow"),
-                            });
-                            let row = output_record(
-                                &self.inputs,
-                                left_rec,
-                                right_rec,
-                                &self.output,
-                                self.config,
-                            )?;
-                            count = add(count, 1)?;
-                            bytes = add(bytes, row.len() as u64)?;
-                            let order = pair_order(
-                                self.config.mode,
-                                left.map(GroupItem::ordinal),
-                                right.map(GroupItem::ordinal),
-                            );
-                            let pair_key_bytes = pair_key(order);
-                            runs.push(&pair_key_bytes, EntryPayload::Inline(row), order.0)?;
-                            state.records.store(count, Ordering::Release);
-                            Ok(())
-                        },
-                    )?;
-                    Ok(())
-                })?;
-                drop(range_readers);
-                #[cfg(test)]
-                crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
-                let ordered = runs.finish()?;
-                if count != self.analysis.output_rows
-                    || add(bytes, output.bytes_written())? != self.analysis.output_bytes
-                    || ordered.bytes != frame_bytes
-                {
-                    return Err(error(
-                        "Join output differs from the analyzed plan. Analyze again.",
-                    )
-                    .into());
-                }
-                let mut reader = BufReader::with_capacity(READ_CHUNK, ordered.path.open()?);
-                let mut ordinal = 0;
-                let mut previous_order: Option<Vec<u8>> = None;
-                while let Some(head) = read_head(&mut reader, self.config, state)? {
-                    if !valid_pair_order(
-                        &head.key,
-                        head.ordinal,
-                        self.config.mode,
-                        [self.inputs[0].info.data_rows, self.inputs[1].info.data_rows],
-                    ) || previous_order
-                        .as_ref()
-                        .is_some_and(|previous| previous >= &head.key)
-                    {
-                        return Err(error("Joined row pairs are not in source order.").into());
-                    }
-                    previous_order = Some(head.key);
-                    let record = read_record(&mut reader, head.record_len, self.config, state)?;
-                    let parsed = fields(
-                        &record,
-                        self.inputs[0].info.delimiter,
-                        false,
-                        destination,
-                        ordinal,
-                        self.config,
-                    )?;
-                    if parsed.len() != self.output.columns.len() {
-                        return Err(error("Joined row has the wrong number of columns.").into());
-                    }
-                    drop(parsed);
+                let mut runs = Runs::new(workspace, self.config, state, 16);
+                let mut count = 0;
+                let mut bytes = 0;
+                let mut range_readers: [Option<BufReader<File>>; 2] = [None, None];
+                if all_seekable {
+                    let mut expected_pair_fingerprint = LocatorFingerprint::default();
+                    walk_groups(&self.inputs, self.config, state, |left, right| {
+                        enumerate_pairs(
+                            &self.inputs,
+                            left.map(Group::into_data),
+                            right.map(Group::into_data),
+                            &mut range_readers,
+                            self.config,
+                            state,
+                            None,
+                            |left, right| {
+                                let main_ref = left.map(|item| match item {
+                                    GroupItem::Ref(row) => *row,
+                                    GroupItem::Owned(_) => {
+                                        unreachable!("seekable input stores RowRef")
+                                    }
+                                });
+                                let additional_ref = right.map(|item| match item {
+                                    GroupItem::Ref(row) => *row,
+                                    GroupItem::Owned(_) => {
+                                        unreachable!("seekable input stores RowRef")
+                                    }
+                                });
+                                count = add(count, 1)?;
+                                let order = pair_order(
+                                    self.config.mode,
+                                    main_ref.map(|r| r.ordinal),
+                                    additional_ref.map(|r| r.ordinal),
+                                );
+                                let locator = PairLocator {
+                                    main_offset: main_ref.map_or(0, |r| r.source_offset),
+                                    main_len: main_ref.map_or(0, |r| r.record_len),
+                                    additional_offset: additional_ref
+                                        .map_or(0, |r| r.source_offset),
+                                    additional_len: additional_ref.map_or(0, |r| r.record_len),
+                                };
+                                expected_pair_fingerprint.observe_pair(order.0, order.1, locator);
+                                let pair_key_bytes = pair_key(order);
+                                runs.push(
+                                    &pair_key_bytes,
+                                    EntryPayload::Pair(locator.to_le_bytes()),
+                                    order.0,
+                                )?;
+                                state.records.store(count, Ordering::Release);
+                                Ok(())
+                            },
+                        )?;
+                        Ok(())
+                    })?;
+                    drop(range_readers);
                     #[cfg(test)]
-                    crate::join_faults::observe(crate::join_faults::Event::WritingRow);
-                    output
-                        .write_all(&record)
-                        .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
-                    state.add_disk(record.len() as u64)?;
-                    ordinal = add(ordinal, 1)?;
-                }
-                if ordinal != self.analysis.output_rows
-                    || output.bytes_written() != self.analysis.output_bytes
-                {
-                    return Err(
-                        error("Joined output count or size changed before publication.").into(),
-                    );
+                    crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
+                    let ordered = runs.finish()?;
+                    if count != self.analysis.output_rows || ordered.bytes != frame_bytes {
+                        return Err(error(
+                            "Join output differs from the analyzed plan. Analyze again.",
+                        )
+                        .into());
+                    }
+                    self.materialize_seekable_ordered(
+                        &ordered,
+                        expected_pair_fingerprint,
+                        &source_files,
+                        &mut output,
+                        state,
+                    )?;
+                } else {
+                    walk_groups(&self.inputs, self.config, state, |left, right| {
+                        enumerate_pairs(
+                            &self.inputs,
+                            left.map(Group::into_data),
+                            right.map(Group::into_data),
+                            &mut range_readers,
+                            self.config,
+                            state,
+                            None,
+                            |left, right| {
+                                let left_rec = left.map(|item| match item {
+                                    GroupItem::Owned(row) => row.record.as_slice(),
+                                    GroupItem::Ref(_) => {
+                                        unreachable!("spooled path stores OwnedRow")
+                                    }
+                                });
+                                let right_rec = right.map(|item| match item {
+                                    GroupItem::Owned(row) => row.record.as_slice(),
+                                    GroupItem::Ref(_) => {
+                                        unreachable!("spooled path stores OwnedRow")
+                                    }
+                                });
+                                let row = output_record(
+                                    &self.inputs,
+                                    left_rec,
+                                    right_rec,
+                                    &self.output,
+                                    self.config,
+                                )?;
+                                count = add(count, 1)?;
+                                bytes = add(bytes, row.len() as u64)?;
+                                let order = pair_order(
+                                    self.config.mode,
+                                    left.map(GroupItem::ordinal),
+                                    right.map(GroupItem::ordinal),
+                                );
+                                let pair_key_bytes = pair_key(order);
+                                runs.push(&pair_key_bytes, EntryPayload::Inline(row), order.0)?;
+                                state.records.store(count, Ordering::Release);
+                                Ok(())
+                            },
+                        )?;
+                        Ok(())
+                    })?;
+                    drop(range_readers);
+                    #[cfg(test)]
+                    crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
+                    let ordered = runs.finish()?;
+                    if count != self.analysis.output_rows
+                        || add(bytes, output.bytes_written())? != self.analysis.output_bytes
+                        || ordered.bytes != frame_bytes
+                    {
+                        return Err(error(
+                            "Join output differs from the analyzed plan. Analyze again.",
+                        )
+                        .into());
+                    }
+                    let mut reader = BufReader::with_capacity(READ_CHUNK, ordered.path.open()?);
+                    let mut ordinal = 0;
+                    let mut previous_order: Option<Vec<u8>> = None;
+                    while let Some(head) = read_head(&mut reader, self.config, state)? {
+                        if !valid_pair_order(
+                            &head.key,
+                            head.ordinal,
+                            self.config.mode,
+                            [self.inputs[0].info.data_rows, self.inputs[1].info.data_rows],
+                        ) || previous_order
+                            .as_ref()
+                            .is_some_and(|previous| previous >= &head.key)
+                        {
+                            return Err(error("Joined row pairs are not in source order.").into());
+                        }
+                        previous_order = Some(head.key);
+                        let record = read_record(&mut reader, head.record_len, self.config, state)?;
+                        let parsed = fields(
+                            &record,
+                            self.inputs[0].info.delimiter,
+                            false,
+                            destination,
+                            ordinal,
+                            self.config,
+                        )?;
+                        if parsed.len() != self.output.columns.len() {
+                            return Err(error("Joined row has the wrong number of columns.").into());
+                        }
+                        drop(parsed);
+                        #[cfg(test)]
+                        crate::join_faults::observe(crate::join_faults::Event::WritingRow);
+                        output
+                            .write_all(&record)
+                            .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
+                        state.add_disk(record.len() as u64)?;
+                        ordinal = add(ordinal, 1)?;
+                    }
+                    if ordinal != self.analysis.output_rows
+                        || output.bytes_written() != self.analysis.output_bytes
+                    {
+                        return Err(error(
+                            "Joined output count or size changed before publication.",
+                        )
+                        .into());
+                    }
                 }
             }
             for (role, input) in [JoinSource::Main, JoinSource::Additional]
@@ -4127,8 +4330,83 @@ impl JoinPlan {
         state: &Progress,
     ) -> JResult<()> {
         let mut reader = BufReader::with_capacity(READ_CHUNK, ordered.path.open()?);
-        let mut ordinal = 0_u64;
         let mut previous_order: Option<[u8; 16]> = None;
+        let right_drives = self.config.mode == JoinMode::Right;
+        self.materialize_seekable_pairs(
+            || {
+                let Some(head) = read_head(&mut reader, self.config, state)? else {
+                    return Ok(None);
+                };
+                if !valid_pair_order(
+                    &head.key,
+                    head.ordinal,
+                    self.config.mode,
+                    [self.inputs[0].info.data_rows, self.inputs[1].info.data_rows],
+                ) {
+                    return Err(error("Joined row pairs are not in source order.").into());
+                }
+                let key_bytes: [u8; 16] = head.key.try_into().unwrap();
+                if previous_order.is_some_and(|previous| previous >= key_bytes) {
+                    return Err(error("Joined row pairs are not in source order.").into());
+                }
+                previous_order = Some(key_bytes);
+                let first = u64::from_be_bytes(key_bytes[0..8].try_into().unwrap());
+                let second = u64::from_be_bytes(key_bytes[8..16].try_into().unwrap());
+                let (main_ord, additional_ord) = if right_drives {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
+                let main_ordinal = (main_ord != u64::MAX).then_some(main_ord);
+                let additional_ordinal = (additional_ord != u64::MAX).then_some(additional_ord);
+                let raw_locator =
+                    read_exact_fixed::<PAIR_LOCATOR_BYTES>(&mut reader, head.record_len, state)?;
+                let locator = PairLocator::from_le_bytes(&raw_locator);
+                if main_ordinal.is_none() && (locator.main_offset != 0 || locator.main_len != 0)
+                    || additional_ordinal.is_none()
+                        && (locator.additional_offset != 0 || locator.additional_len != 0)
+                {
+                    return Err(error("Invalid private join pair locator.").into());
+                }
+                if main_ordinal.is_some()
+                    && (add(locator.main_offset, locator.main_len)?
+                        > self.inputs[0].stamp.file_size()
+                        || locator.main_len > self.config.max_record_bytes as u64)
+                {
+                    return Err(error("Invalid private join row locator.").into());
+                }
+                if additional_ordinal.is_some()
+                    && (add(locator.additional_offset, locator.additional_len)?
+                        > self.inputs[1].stamp.file_size()
+                        || locator.additional_len > self.config.max_record_bytes as u64)
+                {
+                    return Err(error("Invalid private join row locator.").into());
+                }
+                Ok(Some((
+                    key_bytes,
+                    OrderedPair {
+                        main_ordinal,
+                        additional_ordinal,
+                        locator,
+                    },
+                )))
+            },
+            expected_pair_fingerprint,
+            source_files,
+            output,
+            state,
+        )
+    }
+
+    fn materialize_seekable_pairs(
+        &self,
+        mut read_next_pair: impl FnMut() -> JResult<Option<([u8; 16], OrderedPair)>>,
+        expected_pair_fingerprint: LocatorFingerprint,
+        source_files: &[File; 2],
+        output: &mut ExportTarget,
+        state: &Progress,
+    ) -> JResult<()> {
+        let mut ordinal = 0_u64;
         let mut observed_pair_fingerprint = LocatorFingerprint::default();
         let batch_byte_budget = (self.config.group_memory_bytes / 2).min(2 * 1024 * 1024);
         let right_drives = self.config.mode == JoinMode::Right;
@@ -4147,65 +4425,6 @@ impl JoinPlan {
         let mut batch_count = 0_u64;
         let mut next_pair: Option<OrderedPair> = None;
 
-        let read_next_pair = |reader: &mut BufReader<File>,
-                              previous_order: &mut Option<[u8; 16]>,
-                              observed_pair_fingerprint: &mut LocatorFingerprint|
-         -> JResult<Option<OrderedPair>> {
-            let Some(head) = read_head(reader, self.config, state)? else {
-                return Ok(None);
-            };
-            if !valid_pair_order(
-                &head.key,
-                head.ordinal,
-                self.config.mode,
-                [self.inputs[0].info.data_rows, self.inputs[1].info.data_rows],
-            ) {
-                return Err(error("Joined row pairs are not in source order.").into());
-            }
-            let key_bytes: [u8; 16] = head.key.try_into().unwrap();
-            if previous_order.is_some_and(|previous| previous >= key_bytes) {
-                return Err(error("Joined row pairs are not in source order.").into());
-            }
-            *previous_order = Some(key_bytes);
-            let first = u64::from_be_bytes(key_bytes[0..8].try_into().unwrap());
-            let second = u64::from_be_bytes(key_bytes[8..16].try_into().unwrap());
-            let (main_ord, additional_ord) = if right_drives {
-                (second, first)
-            } else {
-                (first, second)
-            };
-            let main_ordinal = (main_ord != u64::MAX).then_some(main_ord);
-            let additional_ordinal = (additional_ord != u64::MAX).then_some(additional_ord);
-            let raw_locator =
-                read_exact_fixed::<PAIR_LOCATOR_BYTES>(reader, head.record_len, state)?;
-            let locator = PairLocator::from_le_bytes(&raw_locator);
-            if main_ordinal.is_none() && (locator.main_offset != 0 || locator.main_len != 0)
-                || additional_ordinal.is_none()
-                    && (locator.additional_offset != 0 || locator.additional_len != 0)
-            {
-                return Err(error("Invalid private join pair locator.").into());
-            }
-            if main_ordinal.is_some()
-                && (add(locator.main_offset, locator.main_len)? > self.inputs[0].stamp.file_size()
-                    || locator.main_len > self.config.max_record_bytes as u64)
-            {
-                return Err(error("Invalid private join row locator.").into());
-            }
-            if additional_ordinal.is_some()
-                && (add(locator.additional_offset, locator.additional_len)?
-                    > self.inputs[1].stamp.file_size()
-                    || locator.additional_len > self.config.max_record_bytes as u64)
-            {
-                return Err(error("Invalid private join row locator.").into());
-            }
-            observed_pair_fingerprint.observe_pair(first, second, locator);
-            Ok(Some(OrderedPair {
-                main_ordinal,
-                additional_ordinal,
-                locator,
-            }))
-        };
-
         loop {
             state.check()?;
             batch.clear();
@@ -4217,11 +4436,12 @@ impl JoinPlan {
             while batch.len() < MAX_MATERIALIZE_BATCH_PAIRS {
                 let pair = match next_pair.take() {
                     Some(pair) => Some(pair),
-                    None => read_next_pair(
-                        &mut reader,
-                        &mut previous_order,
-                        &mut observed_pair_fingerprint,
-                    )?,
+                    None => read_next_pair()?.map(|(key_bytes, pair)| {
+                        let first = u64::from_be_bytes(key_bytes[0..8].try_into().unwrap());
+                        let second = u64::from_be_bytes(key_bytes[8..16].try_into().unwrap());
+                        observed_pair_fingerprint.observe_pair(first, second, pair.locator);
+                        pair
+                    }),
                 };
                 let Some(pair) = pair else {
                     break;
@@ -4991,7 +5211,7 @@ mod tests {
         assert!(p.start_write(output.clone()).unwrap().wait().is_err());
         assert_eq!(fs::read(&output).unwrap(), b"keep");
         let p = plan(dir.path(), b"id\nx\n", b"id\nx\n");
-        fs::write(&p.inputs[0].sorted, [0_u8; 24]).unwrap();
+        fs::write(p.inputs[0].sorted.as_ref().unwrap(), [0_u8; 24]).unwrap();
         let output = dir.path().join("corrupt.csv");
         assert!(p.start_write(output.clone()).unwrap().wait().is_err());
         assert!(!output.exists());
@@ -7087,6 +7307,7 @@ mod tests {
             let _guard = storage_test::install(storage_test::Hook {
                 force_spooled: false,
                 pread_calls: Some(Arc::clone(&pread_calls)),
+                ..storage_test::Hook::default()
             });
             let sources = [
                 JoinInput {
@@ -7211,6 +7432,7 @@ mod tests {
                 let _guard = storage_test::install(storage_test::Hook {
                     force_spooled: false,
                     pread_calls: Some(Arc::clone(&seekable_preads)),
+                    ..storage_test::Hook::default()
                 });
                 let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
                     .unwrap()
@@ -7243,6 +7465,7 @@ mod tests {
                 let _guard = storage_test::install(storage_test::Hook {
                     force_spooled: true,
                     pread_calls: Some(Arc::clone(&spooled_preads)),
+                    ..storage_test::Hook::default()
                 });
                 let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
                     .unwrap()
@@ -7341,12 +7564,12 @@ mod tests {
             .wait()
             .unwrap()
             .unwrap();
-        let mut bytes = fs::read(&plan.inputs[1].sorted).unwrap();
+        let mut bytes = fs::read(plan.inputs[1].sorted.as_ref().unwrap()).unwrap();
         // Flip the final locator bytes so record_len/value_bytes become invalid.
         for byte in bytes.iter_mut().rev().take(16) {
             *byte = 0xff;
         }
-        fs::write(&plan.inputs[1].sorted, bytes).unwrap();
+        fs::write(plan.inputs[1].sorted.as_ref().unwrap(), bytes).unwrap();
         let out2 = dir.path().join("corrupt-locator.csv");
         assert!(plan.start_write(out2.clone()).unwrap().wait().is_err());
         assert!(!out2.exists());
@@ -7382,7 +7605,7 @@ mod tests {
             .wait()
             .unwrap()
             .unwrap();
-        let mut sorted = fs::read(&plan.inputs[0].sorted).unwrap();
+        let mut sorted = fs::read(plan.inputs[0].sorted.as_ref().unwrap()).unwrap();
         // Two equal-length frames (`24 header + 10 key + 24 locator = 58` bytes each); swap their
         // 8-byte `source_offset` fields so row `a` points to row `b` and vice versa.
         assert_eq!(sorted.len(), 116);
@@ -7390,7 +7613,7 @@ mod tests {
         let offset_b: [u8; 8] = sorted[92..100].try_into().unwrap();
         sorted[34..42].copy_from_slice(&offset_b);
         sorted[92..100].copy_from_slice(&offset_a);
-        fs::write(&plan.inputs[0].sorted, sorted).unwrap();
+        fs::write(plan.inputs[0].sorted.as_ref().unwrap(), sorted).unwrap();
         let out3 = dir.path().join("swapped-unmatched.csv");
         assert!(plan.start_write(out3.clone()).unwrap().wait().is_err());
         assert!(!out3.exists());
@@ -7551,6 +7774,7 @@ mod tests {
         let _guard = storage_test::install(storage_test::Hook {
             force_spooled: false,
             pread_calls: Some(Arc::clone(&pread_calls)),
+            ..storage_test::Hook::default()
         });
         let cfg = JoinConfig {
             mode: JoinMode::Left,
@@ -7657,6 +7881,7 @@ mod tests {
         let _guard = storage_test::install(storage_test::Hook {
             force_spooled: false,
             pread_calls: Some(Arc::clone(&pread_calls)),
+            ..storage_test::Hook::default()
         });
         let cfg = JoinConfig {
             mode: JoinMode::Inner,
@@ -7719,6 +7944,1003 @@ mod tests {
         for (i, line) in lines.iter().skip(1).enumerate() {
             assert_eq!(*line, format!("k{i},{expected_e},k{i},a"));
         }
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    fn hash_config(mode: JoinMode, case: JoinCase) -> JoinConfig {
+        JoinConfig {
+            mode,
+            case,
+            memory_bytes: 16 * 1024 * 1024,
+            run_memory_bytes: 256 * 1024,
+            group_memory_bytes: 128 * 1024,
+            max_record_bytes: 64 * 1024,
+            max_columns: 64,
+            max_merge_fan_in: 16,
+            preview_rows: 6,
+            preview_bytes: 4096,
+        }
+    }
+
+    fn assert_analyses_equal(a: &JoinAnalysis, b: &JoinAnalysis, context: &str) {
+        assert_eq!(a.input_rows, b.input_rows, "{context}: input_rows");
+        assert_eq!(a.matching_rows, b.matching_rows, "{context}: matching_rows");
+        assert_eq!(
+            a.matching_pairs, b.matching_pairs,
+            "{context}: matching_pairs"
+        );
+        assert_eq!(
+            a.unmatched_rows, b.unmatched_rows,
+            "{context}: unmatched_rows"
+        );
+        assert_eq!(
+            a.empty_key_rows, b.empty_key_rows,
+            "{context}: empty_key_rows"
+        );
+        assert_eq!(
+            a.duplicate_groups, b.duplicate_groups,
+            "{context}: duplicate_groups"
+        );
+        assert_eq!(
+            a.many_to_many_groups, b.many_to_many_groups,
+            "{context}: many_to_many_groups"
+        );
+        assert_eq!(
+            a.many_to_many_pairs, b.many_to_many_pairs,
+            "{context}: many_to_many_pairs"
+        );
+        assert_eq!(a.output_rows, b.output_rows, "{context}: output_rows");
+        assert_eq!(a.output_bytes, b.output_bytes, "{context}: output_bytes");
+        assert_eq!(a.preview, b.preview, "{context}: preview");
+        assert_eq!(
+            a.duplicate_samples
+                .iter()
+                .map(|s| (&s.key, s.main_rows, s.additional_rows))
+                .collect::<Vec<_>>(),
+            b.duplicate_samples
+                .iter()
+                .map(|s| (&s.key, s.main_rows, s.additional_rows))
+                .collect::<Vec<_>>(),
+            "{context}: duplicate_samples"
+        );
+        for side in 0..2 {
+            assert_eq!(
+                a.unmatched_samples[side]
+                    .iter()
+                    .map(|s| (s.data_row, &s.key))
+                    .collect::<Vec<_>>(),
+                b.unmatched_samples[side]
+                    .iter()
+                    .map(|s| (s.data_row, &s.key))
+                    .collect::<Vec<_>>(),
+                "{context}: unmatched_samples[{side}]"
+            );
+        }
+    }
+
+    #[test]
+    fn partitioned_hash_join_matches_sort_merge_byte_for_byte_across_all_modes_and_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("hash-main.csv");
+        let add_path = dir.path().join("hash-add.tsv");
+        let mut main_csv = String::from("k1,k2,val\n");
+        let mut add_tsv = String::from("k1\tk2\tnote\n");
+        // Mix of unique matches, 1-to-many, many-to-1, many-to-many, case variants, empty keys,
+        // unmatched keys on both sides, quoted multiline payloads, and >100 rows across partitions.
+        main_csv.push_str(",r0,empty-main-0\n");
+        main_csv.push_str("alpha,r1,\"m-alpha-1, quoted\nline2\"\n");
+        main_csv.push_str("ALPHA,r1,m-ALPHA-2\n");
+        main_csv.push_str("dup,r2,m-dup-1\n");
+        main_csv.push_str("dup,r2,m-dup-2\n");
+        main_csv.push_str("only-m,r3,m-unmatched-1\n");
+        main_csv.push_str("only-m,r3,m-unmatched-2\n");
+        main_csv.push_str("k-missing,,empty-main-1\n");
+        for i in 0..120 {
+            main_csv.push_str(&format!("k{i:03},reg{},main-{i}\n", i % 5));
+        }
+
+        add_tsv.push_str("\tr0\tempty-add-0\n");
+        add_tsv.push_str("alpha\tr1\ta-alpha-1\n");
+        add_tsv.push_str("alpha\tr1\ta-alpha-2\n");
+        add_tsv.push_str("dup\tr2\ta-dup-1\n");
+        add_tsv.push_str("dup\tr2\ta-dup-2\n");
+        add_tsv.push_str("dup\tr2\ta-dup-3\n");
+        add_tsv.push_str("only-a\tr9\ta-unmatched-1\n");
+        add_tsv.push_str("only-a\tr9\ta-unmatched-2\n");
+        add_tsv.push_str("a-empty\t\tempty-add-1\n");
+        for i in (0..120).rev() {
+            if i % 3 != 0 {
+                add_tsv.push_str(&format!("k{i:03}\treg{}\tadd-{i}\n", i % 5));
+            }
+        }
+        fs::write(&main_path, main_csv.as_bytes()).unwrap();
+        fs::write(&add_path, add_tsv.as_bytes()).unwrap();
+
+        let make_inputs = || {
+            [
+                JoinInput {
+                    path: main_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0, 1],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: add_path.clone(),
+                    delimiter: Some(b'\t'),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0, 1],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ]
+        };
+
+        for case in [JoinCase::Sensitive, JoinCase::AsciiInsensitive] {
+            for mode in [
+                JoinMode::Left,
+                JoinMode::Inner,
+                JoinMode::Right,
+                JoinMode::Full,
+            ] {
+                let cfg = hash_config(mode, case);
+                let hash_parts = Arc::new(AtomicUsize::new(0));
+                let hash_fallbacks = Arc::new(AtomicUsize::new(0));
+                let hash_out = dir.path().join(format!("hash-{mode:?}-{case:?}.csv"));
+                let (hash_analysis, hash_summary, hash_frame_total) = {
+                    let _guard = storage_test::install(storage_test::Hook {
+                        hash_partitions_processed: Some(Arc::clone(&hash_parts)),
+                        hash_fallback_partitions: Some(Arc::clone(&hash_fallbacks)),
+                        ..storage_test::Hook::default()
+                    });
+                    let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .unwrap();
+                    assert!(matches!(plan.execution, PlanExecution::PartitionedHash(_)));
+                    let frame_total: u64 = plan.inputs.iter().map(|i| i.frame_bytes).sum();
+                    let analysis_snapshot = JoinAnalysis {
+                        input_rows: plan.analysis.input_rows,
+                        matching_rows: plan.analysis.matching_rows,
+                        matching_pairs: plan.analysis.matching_pairs,
+                        duplicate_groups: plan.analysis.duplicate_groups,
+                        many_to_many_groups: plan.analysis.many_to_many_groups,
+                        many_to_many_pairs: plan.analysis.many_to_many_pairs,
+                        duplicate_samples: plan
+                            .analysis
+                            .duplicate_samples
+                            .iter()
+                            .map(|s| JoinDuplicateExample {
+                                key: s.key.clone(),
+                                main_rows: s.main_rows,
+                                additional_rows: s.additional_rows,
+                            })
+                            .collect(),
+                        unmatched_rows: plan.analysis.unmatched_rows,
+                        unmatched_samples: plan.analysis.unmatched_samples.clone(),
+                        empty_key_rows: plan.analysis.empty_key_rows,
+                        output_rows: plan.analysis.output_rows,
+                        output_bytes: plan.analysis.output_bytes,
+                        additional_temporary_bytes: plan.analysis.additional_temporary_bytes,
+                        preview: plan.analysis.preview.clone(),
+                        output_headers: Arc::clone(&plan.analysis.output_headers),
+                        include_header: plan.analysis.include_header,
+                        duplicate_headers: plan.analysis.duplicate_headers,
+                        new_columns: plan.analysis.new_columns,
+                    };
+                    let summary = plan
+                        .start_write_acknowledged(hash_out.clone(), true)
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .unwrap();
+                    (analysis_snapshot, summary, frame_total)
+                };
+                assert!(hash_parts.load(Ordering::Acquire) > 0);
+                assert_eq!(hash_fallbacks.load(Ordering::Acquire), 0);
+                assert!(
+                    hash_summary.peak_temporary_bytes
+                        <= hash_analysis.additional_temporary_bytes + hash_frame_total,
+                    "{mode:?}/{case:?}: peak {} > allowance {}",
+                    hash_summary.peak_temporary_bytes,
+                    hash_analysis.additional_temporary_bytes + hash_frame_total
+                );
+
+                let sort_out = dir.path().join(format!("sort-{mode:?}-{case:?}.csv"));
+                let sort_analysis = {
+                    let _guard = storage_test::install(storage_test::Hook {
+                        force_sort_merge: true,
+                        ..storage_test::Hook::default()
+                    });
+                    let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .unwrap();
+                    assert!(matches!(plan.execution, PlanExecution::SortMerge));
+                    let analysis_snapshot = JoinAnalysis {
+                        input_rows: plan.analysis.input_rows,
+                        matching_rows: plan.analysis.matching_rows,
+                        matching_pairs: plan.analysis.matching_pairs,
+                        duplicate_groups: plan.analysis.duplicate_groups,
+                        many_to_many_groups: plan.analysis.many_to_many_groups,
+                        many_to_many_pairs: plan.analysis.many_to_many_pairs,
+                        duplicate_samples: plan
+                            .analysis
+                            .duplicate_samples
+                            .iter()
+                            .map(|s| JoinDuplicateExample {
+                                key: s.key.clone(),
+                                main_rows: s.main_rows,
+                                additional_rows: s.additional_rows,
+                            })
+                            .collect(),
+                        unmatched_rows: plan.analysis.unmatched_rows,
+                        unmatched_samples: plan.analysis.unmatched_samples.clone(),
+                        empty_key_rows: plan.analysis.empty_key_rows,
+                        output_rows: plan.analysis.output_rows,
+                        output_bytes: plan.analysis.output_bytes,
+                        additional_temporary_bytes: plan.analysis.additional_temporary_bytes,
+                        preview: plan.analysis.preview.clone(),
+                        output_headers: Arc::clone(&plan.analysis.output_headers),
+                        include_header: plan.analysis.include_header,
+                        duplicate_headers: plan.analysis.duplicate_headers,
+                        new_columns: plan.analysis.new_columns,
+                    };
+                    plan.start_write_acknowledged(sort_out.clone(), true)
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .unwrap();
+                    analysis_snapshot
+                };
+
+                assert_analyses_equal(
+                    &hash_analysis,
+                    &sort_analysis,
+                    &format!("{mode:?}/{case:?}"),
+                );
+                assert_eq!(
+                    fs::read(&hash_out).unwrap(),
+                    fs::read(&sort_out).unwrap(),
+                    "{mode:?}/{case:?}: hash output differs from sort-merge oracle"
+                );
+            }
+        }
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn partitioned_hash_join_forced_skew_and_collision_fallback_matches_sort_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("fb-main.csv");
+        let add_path = dir.path().join("fb-add.csv");
+        let mut m = String::from("k,v\n,empty-m\n");
+        let mut a = String::from("k,w\n,empty-a\n");
+        for i in 0..80 {
+            m.push_str(&format!("key-{:02},m-{i}\n", i % 25));
+        }
+        for i in (0..90).rev() {
+            a.push_str(&format!("key-{:02},a-{i}\n", i % 30));
+        }
+        fs::write(&main_path, m.as_bytes()).unwrap();
+        fs::write(&add_path, a.as_bytes()).unwrap();
+
+        let make_inputs = || {
+            [
+                JoinInput {
+                    path: main_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: add_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ]
+        };
+
+        for mode in [
+            JoinMode::Left,
+            JoinMode::Inner,
+            JoinMode::Right,
+            JoinMode::Full,
+        ] {
+            let cfg = hash_config(mode, JoinCase::Sensitive);
+            // Reference sort-merge oracle.
+            let ref_out = dir.path().join(format!("ref-{mode:?}.csv"));
+            {
+                let _guard = storage_test::install(storage_test::Hook {
+                    force_sort_merge: true,
+                    ..storage_test::Hook::default()
+                });
+                let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                plan.start_write_acknowledged(ref_out.clone(), true)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+            }
+            let expected = fs::read(&ref_out).unwrap();
+
+            // 1. Forced memory-cap fallback to sort-merge.
+            let fb_count = Arc::new(AtomicUsize::new(0));
+            let fb_out = dir.path().join(format!("fb-mem-{mode:?}.csv"));
+            {
+                let _guard = storage_test::install(storage_test::Hook {
+                    force_hash_join: true,
+                    force_hash_partition_fallback_bytes: Some(256),
+                    hash_fallback_partitions: Some(Arc::clone(&fb_count)),
+                    ..storage_test::Hook::default()
+                });
+                let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                let allowance = plan.analysis().additional_temporary_bytes
+                    + plan.inputs.iter().map(|i| i.frame_bytes).sum::<u64>();
+                let summary = plan
+                    .start_write_acknowledged(fb_out.clone(), true)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert!(summary.peak_temporary_bytes <= allowance);
+            }
+            assert!(
+                fb_count.load(Ordering::Acquire) > 0,
+                "{mode:?}: expected forced fallback"
+            );
+            assert_eq!(
+                fs::read(&fb_out).unwrap(),
+                expected,
+                "{mode:?} mem fallback"
+            );
+
+            // 2. Forced 100% hash collision (all matchable keys hash to 0 -> partition 0, slot 0).
+            let coll_out = dir.path().join(format!("fb-coll-{mode:?}.csv"));
+            {
+                let _guard = storage_test::install(storage_test::Hook {
+                    force_hash_join: true,
+                    force_hash_collision: true,
+                    ..storage_test::Hook::default()
+                });
+                let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                let allowance = plan.analysis().additional_temporary_bytes
+                    + plan.inputs.iter().map(|i| i.frame_bytes).sum::<u64>();
+                let summary = plan
+                    .start_write_acknowledged(coll_out.clone(), true)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert!(summary.peak_temporary_bytes <= allowance);
+            }
+            assert_eq!(
+                fs::read(&coll_out).unwrap(),
+                expected,
+                "{mode:?} hash collision"
+            );
+        }
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn partitioned_hash_join_handles_tiny_inputs_with_explosive_many_to_many_skew() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("skew-main.csv");
+        let add_path = dir.path().join("skew-add.csv");
+        // 300 x 300 = 90,000 pairs (> 65,536 skew fallback threshold) plus normal keys.
+        let mut m = String::from("k,v\nnormal,m0\n,empty-m\n");
+        let mut a = String::from("k,w\nnormal,a0\n,empty-a\n");
+        for i in 0..300 {
+            m.push_str(&format!("hot,m{i}\n"));
+            a.push_str(&format!("hot,a{i}\n"));
+        }
+        fs::write(&main_path, m.as_bytes()).unwrap();
+        fs::write(&add_path, a.as_bytes()).unwrap();
+
+        let cfg = JoinConfig {
+            mode: JoinMode::Full,
+            group_memory_bytes: 64 * 1024,
+            ..hash_config(JoinMode::Full, JoinCase::Sensitive)
+        };
+        let make_inputs = || {
+            [
+                JoinInput {
+                    path: main_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: add_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ]
+        };
+
+        let fb_count = Arc::new(AtomicUsize::new(0));
+        let hash_out = dir.path().join("skew-hash.csv");
+        {
+            let _guard = storage_test::install(storage_test::Hook {
+                hash_fallback_partitions: Some(Arc::clone(&fb_count)),
+                ..storage_test::Hook::default()
+            });
+            let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.analysis().matching_pairs, 90_001);
+            assert_eq!(plan.analysis().output_rows, 90_003);
+            let allowance = plan.analysis().additional_temporary_bytes
+                + plan.inputs.iter().map(|i| i.frame_bytes).sum::<u64>();
+            let summary = plan
+                .start_write_acknowledged(hash_out.clone(), true)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert_eq!(summary.data_rows, 90_003);
+            assert!(summary.peak_group_buffer_bytes <= cfg.group_memory_bytes);
+            assert!(summary.peak_temporary_bytes <= allowance);
+        }
+        assert!(
+            fb_count.load(Ordering::Acquire) >= 1,
+            "hot 90,000-pair partition must automatically fall back to sort-merge"
+        );
+
+        let sort_out = dir.path().join("skew-sort.csv");
+        {
+            let _guard = storage_test::install(storage_test::Hook {
+                force_sort_merge: true,
+                ..storage_test::Hook::default()
+            });
+            let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            plan.start_write_acknowledged(sort_out.clone(), true)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(fs::read(&hash_out).unwrap(), fs::read(&sort_out).unwrap());
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn partitioned_hash_join_handles_edited_additional_rows_uniqueness_and_tamper() {
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("edit-main.csv");
+        let add_path = dir.path().join("edit-add.csv");
+        fs::write(&main_path, b"id,label\nk1,M1\nk2,M2\nk3,M3\nk4,Main-only\n").unwrap();
+        fs::write(
+            &add_path,
+            b"id,note\nk1,\xff\nk2,short\nk3,longer-original-value\nk5,Add-only\n",
+        )
+        .unwrap();
+        let add_session = Arc::new(
+            crate::Session::open_with_encoding(
+                &add_path,
+                crate::OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: crate::HeaderMode::FirstRow,
+                    ..crate::OpenOptions::default()
+                },
+                Some(Encoding::Utf8),
+            )
+            .unwrap(),
+        );
+        let add_edits = Arc::new(BTreeMap::from([
+            ((1, 1), Arc::new("repaired-utf8-é".as_bytes().to_vec())),
+            ((2, 1), Arc::new(b"expanded, \"quoted\"\nline2".to_vec())),
+            ((3, 1), Arc::new(b"s".to_vec())),
+        ]));
+        let add_working = JoinWorkingSource::capture(
+            Arc::clone(&add_session),
+            &add_session,
+            Arc::new(BTreeMap::new()),
+            add_edits,
+            Arc::new(()),
+        );
+
+        let make_inputs = || {
+            [
+                JoinInput {
+                    path: main_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: add_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ]
+        };
+
+        for mode in [
+            JoinMode::Left,
+            JoinMode::Inner,
+            JoinMode::Right,
+            JoinMode::Full,
+        ] {
+            let cfg = hash_config(mode, JoinCase::Sensitive);
+            let hash_out = dir.path().join(format!("edited-hash-{mode:?}.csv"));
+            let sort_out = dir.path().join(format!("edited-sort-{mode:?}.csv"));
+            let plan = analyze_join_with_working(
+                make_inputs(),
+                [None, Some(add_working.clone())],
+                dir.path().to_owned(),
+                cfg,
+                JoinOutputOptions::default(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+            assert!(matches!(plan.execution, PlanExecution::PartitionedHash(_)));
+            plan.start_write(hash_out.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+
+            let _guard = storage_test::install(storage_test::Hook {
+                force_sort_merge: true,
+                ..storage_test::Hook::default()
+            });
+            let sort_plan = analyze_join_with_working(
+                make_inputs(),
+                [None, Some(add_working.clone())],
+                dir.path().to_owned(),
+                cfg,
+                JoinOutputOptions::default(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+            sort_plan
+                .start_write(sort_out.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert_eq!(fs::read(&hash_out).unwrap(), fs::read(&sort_out).unwrap());
+        }
+
+        // Uniqueness enforcement on hash path reports exact physical record number.
+        let dup_main = dir.path().join("dup-main.csv");
+        let dup_add = dir.path().join("dup-add.csv");
+        fs::write(&dup_main, b"id,v\na,1\nb,2\na,3\n").unwrap();
+        fs::write(&dup_add, b"id,v\na,1\n").unwrap();
+        let err = analyze_join(
+            [
+                JoinInput {
+                    path: dup_main.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: true,
+                },
+                JoinInput {
+                    path: dup_add.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ],
+            dir.path().to_owned(),
+            hash_config(JoinMode::Left, JoinCase::Sensitive),
+        )
+        .unwrap()
+        .wait()
+        .err()
+        .expect("duplicate key must fail uniqueness");
+        assert!(matches!(
+            err,
+            QuarryError::JoinFile {
+                path: Some(ref p),
+                record: Some(4),
+                ..
+            } if *p == dup_main
+        ));
+
+        // Tampering with a retained hash partition file must be rejected before publication.
+        let plan = analyze_join(
+            [
+                JoinInput {
+                    path: main_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: dup_add,
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ],
+            dir.path().to_owned(),
+            hash_config(JoinMode::Left, JoinCase::Sensitive),
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        if let PlanExecution::PartitionedHash(ref hp) = plan.execution {
+            let part_file = hp.sides[0]
+                .partitions
+                .iter()
+                .find_map(|m| m.file.as_ref())
+                .expect("at least one populated partition");
+            let mut bytes = fs::read(part_file).unwrap();
+            for b in bytes.iter_mut().rev().take(8) {
+                *b ^= 0xff;
+            }
+            fs::write(part_file, bytes).unwrap();
+        } else {
+            panic!("expected PartitionedHash plan");
+        }
+        let tamper_out = dir.path().join("tampered-hash.csv");
+        assert!(
+            plan.start_write(tamper_out.clone())
+                .unwrap()
+                .wait()
+                .is_err()
+        );
+        assert!(!tamper_out.exists());
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn partitioned_hash_join_supports_concurrent_jobs_and_cancellation_under_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("conc-main.csv");
+        let add_path = dir.path().join("conc-add.csv");
+        let mut m = String::from("k,v\n");
+        let mut a = String::from("k,w\n");
+        for i in 0..400 {
+            m.push_str(&format!("k{i:04},mv-{i}\n"));
+            a.push_str(&format!("k{:04},av-{i}\n", (i * 7) % 400));
+        }
+        fs::write(&main_path, m.as_bytes()).unwrap();
+        fs::write(&add_path, a.as_bytes()).unwrap();
+
+        // 1. Four concurrent hash-join jobs across all four modes.
+        let modes = [
+            JoinMode::Left,
+            JoinMode::Inner,
+            JoinMode::Right,
+            JoinMode::Full,
+        ];
+        let handles: Vec<_> = modes
+            .into_iter()
+            .enumerate()
+            .map(|(idx, mode)| {
+                let main_p = main_path.clone();
+                let add_p = add_path.clone();
+                let tmp = dir.path().to_owned();
+                let out = dir.path().join(format!("conc-{idx}.csv"));
+                thread::spawn(move || {
+                    let plan = analyze_join(
+                        [
+                            JoinInput {
+                                path: main_p,
+                                delimiter: Some(b','),
+                                has_header: true,
+                                encoding: Some(Encoding::Utf8),
+                                key_columns: vec![0],
+                                expected_version: None,
+                                require_unique: false,
+                            },
+                            JoinInput {
+                                path: add_p,
+                                delimiter: Some(b','),
+                                has_header: true,
+                                encoding: Some(Encoding::Utf8),
+                                key_columns: vec![0],
+                                expected_version: None,
+                                require_unique: false,
+                            },
+                        ],
+                        tmp,
+                        hash_config(mode, JoinCase::Sensitive),
+                    )
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                    let summary = plan
+                        .start_write(out.clone())
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(summary.data_rows, 400);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 2. Deterministic cancellation while a worker is actively blocked in `JobByteBudget::acquire`.
+        let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+        let wait_signal = Arc::new(Mutex::new(Some(wait_tx)));
+        let pause_first = Arc::new(AtomicBool::new(false));
+        let _guard = storage_test::install(storage_test::Hook {
+            force_hash_join: true,
+            force_hash_budget_limits: Some((8 * 1024, 8 * 1024)),
+            force_hash_workers: Some(2),
+            budget_wait_signal: Some(Arc::clone(&wait_signal)),
+            pause_first_hash_worker_until_cancel: Some(Arc::clone(&pause_first)),
+            ..storage_test::Hook::default()
+        });
+        let cancel_job = analyze_join(
+            [
+                JoinInput {
+                    path: main_path,
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: add_path,
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ],
+            dir.path().to_owned(),
+            JoinConfig {
+                memory_bytes: 4 * 1024 * 1024,
+                max_merge_fan_in: 8,
+                ..hash_config(JoinMode::Inner, JoinCase::Sensitive)
+            },
+        )
+        .unwrap();
+        wait_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second worker must enter JobByteBudget backpressure wait");
+        cancel_job.cancel();
+        let outcome = cancel_job.wait().unwrap();
+        assert!(
+            outcome.is_none(),
+            "job cancelled while waiting on JobByteBudget must return Cancelled (None)"
+        );
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn partitioned_hash_join_single_worker_long_keys_and_tight_fan_in_parity() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Single-worker pool fallback must inspect, partition, analyze, and write both sides.
+        let m1 = dir.path().join("sw-main.csv");
+        let a1 = dir.path().join("sw-add.csv");
+        fs::write(&m1, b"k,v\na,1\nb,2\n,3\nc,4\n").unwrap();
+        fs::write(&a1, b"k,w\nb,20\nc,30\n,40\nd,50\n").unwrap();
+        let make_inputs = |mp: &Path, ap: &Path| {
+            [
+                JoinInput {
+                    path: mp.to_path_buf(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: ap.to_path_buf(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ]
+        };
+        let cfg_full = hash_config(JoinMode::Full, JoinCase::Sensitive);
+        let sw_out = dir.path().join("sw-hash.csv");
+        let sm_out = dir.path().join("sw-sort.csv");
+        {
+            let _guard = storage_test::install(storage_test::Hook {
+                force_hash_join: true,
+                force_single_pool_worker: true,
+                ..storage_test::Hook::default()
+            });
+            let plan = analyze_join(make_inputs(&m1, &a1), dir.path().to_owned(), cfg_full)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(plan.execution, PlanExecution::PartitionedHash(_)));
+            plan.start_write(sw_out.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+        }
+        {
+            let _guard = storage_test::install(storage_test::Hook {
+                force_sort_merge: true,
+                ..storage_test::Hook::default()
+            });
+            let plan = analyze_join(make_inputs(&m1, &a1), dir.path().to_owned(), cfg_full)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            plan.start_write(sm_out.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(fs::read(&sw_out).unwrap(), fs::read(&sm_out).unwrap());
+
+        // 2. Full join with empty keys on both sides under `max_merge_fan_in = 2` must respect fan_in.
+        let tight_cfg = JoinConfig {
+            max_merge_fan_in: 2,
+            ..cfg_full
+        };
+        let tight_out = dir.path().join("tight-fanin.csv");
+        {
+            let _guard = storage_test::install(storage_test::Hook {
+                force_hash_join: true,
+                ..storage_test::Hook::default()
+            });
+            let plan = analyze_join(make_inputs(&m1, &a1), dir.path().to_owned(), tight_cfg)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(plan.execution, PlanExecution::PartitionedHash(_)));
+            plan.start_write(tight_out.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(fs::read(&tight_out).unwrap(), fs::read(&sm_out).unwrap());
+
+        // 3. Long multi-KiB keys across duplicates, unmatched rows, and previews match sort-merge.
+        let m_long = dir.path().join("long-main.csv");
+        let a_long = dir.path().join("long-add.csv");
+        let mut lm = String::from("k,v\n");
+        let mut la = String::from("k,w\n");
+        let pad = "X".repeat(16 * 1024);
+        for i in 0..24 {
+            let key = format!("k{i:03}-{pad}");
+            lm.push_str(&format!("{key},m{i}\n"));
+            if i < 6 {
+                lm.push_str(&format!("{key},m{i}-dup\n"));
+            }
+            if i % 2 == 0 {
+                la.push_str(&format!("{key},a{i}\n"));
+            }
+        }
+        for i in 24..36 {
+            let key = format!("u{i:03}-{pad}");
+            la.push_str(&format!("{key},a{i}\n"));
+        }
+        fs::write(&m_long, lm.as_bytes()).unwrap();
+        fs::write(&a_long, la.as_bytes()).unwrap();
+
+        let long_hash_out = dir.path().join("long-hash.csv");
+        let long_sort_out = dir.path().join("long-sort.csv");
+        let hash_plan = analyze_join(
+            make_inputs(&m_long, &a_long),
+            dir.path().to_owned(),
+            cfg_full,
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            hash_plan.execution,
+            PlanExecution::PartitionedHash(_)
+        ));
+        let hash_preview = hash_plan.analysis().preview.clone();
+        let hash_dup_len = hash_plan.analysis().duplicate_samples.len();
+        hash_plan
+            .start_write(long_hash_out.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+
+        let _sm = storage_test::install(storage_test::Hook {
+            force_sort_merge: true,
+            ..storage_test::Hook::default()
+        });
+        let sort_plan = analyze_join(
+            make_inputs(&m_long, &a_long),
+            dir.path().to_owned(),
+            cfg_full,
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert_eq!(hash_preview, sort_plan.analysis().preview);
+        assert_eq!(hash_dup_len, sort_plan.analysis().duplicate_samples.len());
+        sort_plan
+            .start_write(long_sort_out.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(&long_hash_out).unwrap(),
+            fs::read(&long_sort_out).unwrap()
+        );
         assert!(workspaces(dir.path()).is_empty());
     }
 }
