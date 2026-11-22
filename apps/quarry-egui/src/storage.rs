@@ -1,7 +1,7 @@
 use super::*;
 use quarry_core::{
-    StorageSpace, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes_from_values,
-    inspect_storage, validate_scratch_directory,
+    StorageSpace, estimate_duplicate_target_temporary_bytes,
+    estimate_edited_output_bytes_from_values, inspect_storage, validate_scratch_directory,
 };
 use std::io::{Read, Write};
 use std::thread::{self, JoinHandle};
@@ -350,14 +350,14 @@ impl PendingStorageOperation {
                     // Read-only analysis determines the actual padded width before its review.
                     StructuralRequest::Split => 0,
                     StructuralRequest::Sort => document
-                        .sort_plan_disk_estimate(dialog.sort_plan(false).keys.len())
+                        .sort_plan_disk_estimate(&dialog.sort_plan(false))
                         .unwrap_or(u64::MAX),
-                    StructuralRequest::Duplicates => estimate_duplicate_temporary_bytes(
+                    StructuralRequest::Duplicates => estimate_duplicate_target_temporary_bytes(
                         document.reordered_storage_estimate(),
                         document
                             .storage_record_count()
                             .saturating_sub(document.data_start),
-                        dialog.columns.len(),
+                        &dialog.duplicate_target(),
                     ),
                     StructuralRequest::Combine => document.materialization_storage_estimate(
                         Some(&ColumnTransformation::Join {

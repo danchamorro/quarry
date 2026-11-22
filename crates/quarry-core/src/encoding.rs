@@ -1258,10 +1258,7 @@ mod tests {
                 .start_find_duplicates(
                     BTreeMap::new(),
                     BTreeMap::new(),
-                    crate::DuplicateSpec {
-                        columns: vec![0],
-                        case_sensitivity: crate::CaseSensitivity::Sensitive,
-                    },
+                    crate::DuplicateSpec::columns(vec![0], crate::CaseSensitivity::Sensitive),
                     &output,
                 )
                 .unwrap()

@@ -37,9 +37,10 @@ use crate::{
 mod duplicate;
 #[path = "sort_parallel.rs"]
 mod parallel;
+use duplicate::{ALL_FIELDS_KEY_BYTES, DedupComparator};
 pub use duplicate::{
     DuplicateJob, DuplicateOptions, DuplicateOutcome, DuplicateProgress, DuplicateSpec,
-    DuplicateSummary,
+    DuplicateSummary, DuplicateTarget,
 };
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -62,6 +63,7 @@ pub enum SortDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
     Text,
+    Natural,
     Number,
     DateTime { format: DateTimeFormat },
     CharacterCount,
@@ -110,6 +112,7 @@ impl SortSpec {
                 }
                 Ok(key)
             }
+            SortMode::Natural => natural_key(value, self.case_sensitivity),
             SortMode::Number => numeric_key(value),
             SortMode::DateTime { format } => date_time_key(value, format),
             SortMode::CharacterCount | SortMode::WordCount => {
@@ -248,13 +251,73 @@ impl SortPlan {
     }
 }
 
-/// Upper bound for encoded tuples: each distinct field appears once, and NUL
-/// escaping can double it. Numeric metadata and tuple terminators are bounded.
+/// Upper bound for encoded tuples: each distinct field appears once; Natural
+/// keys expand up to `2 * field_len + 1` (single-level) and NUL-escaped Natural
+/// components expand up to `3 * field_len` (multi-level). Numeric metadata and
+/// tuple terminators are bounded per level.
 fn maximum_sort_key_bytes(max_record_bytes: usize) -> usize {
     max_record_bytes
-        .saturating_add(MAX_SORT_KEYS * NUMERIC_KEY_OVERHEAD)
-        .saturating_mul(2)
-        .saturating_add(MAX_SORT_KEYS * 2)
+        .saturating_mul(3)
+        .saturating_add(MAX_SORT_KEYS * (2 * NUMERIC_KEY_OVERHEAD + 2))
+}
+
+/// Encode a natural-sort key where contiguous ASCII digit runs (`0`–`9`) compare
+/// by integer magnitude (`v1.9 < v1.10`) without parsing signs, decimals, or
+/// Unicode digits. Whitespace is exact; `CaseSensitivity::Insensitive` folds ASCII
+/// letters only; leading zeros compare equal (`02 == 2`) so ascending source
+/// ordinals break ties stably.
+///
+/// Prefix-orderable wire format:
+/// - Non-digit byte (never in `0x30..=0x39`): emitted verbatim (ASCII-lowercased if insensitive).
+/// - Digit run: tag `0x30` (`b'0'`) followed by compact significant-digit length:
+///   - `0x00` for an all-zero run (0 significant digits)
+///   - `0x01..=0xFE` followed by `len` significant ASCII digits
+///   - `0xFF` + `u32` big-endian length followed by `len` significant ASCII digits
+///
+/// Output length is strictly `<= 2 * value.len() + 1` (and `<= 3 * value.len()`
+/// after multi-level NUL escaping).
+pub(crate) fn natural_key(
+    value: &[u8],
+    case_sensitivity: CaseSensitivity,
+) -> Result<Vec<u8>, QuarryError> {
+    let mut key = Vec::with_capacity(value.len().saturating_add(8));
+    let mut index = 0_usize;
+    while index < value.len() {
+        let byte = value[index];
+        if byte.is_ascii_digit() {
+            let start = index;
+            index += 1;
+            while index < value.len() && value[index].is_ascii_digit() {
+                index += 1;
+            }
+            let run = &value[start..index];
+            let first_nonzero = run.iter().position(|&b| b != b'0');
+            key.push(b'0');
+            match first_nonzero {
+                None => key.push(0x00),
+                Some(offset) => {
+                    let sig = &run[offset..];
+                    if sig.len() <= 254 {
+                        key.push(sig.len() as u8);
+                    } else {
+                        let len = u32::try_from(sig.len())
+                            .map_err(|_| invalid_sort_output("natural sort digit run too long"))?;
+                        key.push(0xFF);
+                        key.extend_from_slice(&len.to_be_bytes());
+                    }
+                    key.extend_from_slice(sig);
+                }
+            }
+        } else {
+            key.push(if case_sensitivity == CaseSensitivity::Insensitive {
+                byte.to_ascii_lowercase()
+            } else {
+                byte
+            });
+            index += 1;
+        }
+    }
+    Ok(key)
 }
 
 pub(crate) fn numeric_key(value: &[u8]) -> Result<Vec<u8>, QuarryError> {
@@ -417,6 +480,36 @@ pub const fn estimate_multi_sort_temporary_bytes(
         .saturating_add(data_rows.saturating_mul(48_u64.saturating_add(
             (key_count as u64).saturating_mul(4 * NUMERIC_KEY_OVERHEAD as u64 + 4),
         )))
+}
+
+/// Conservative disk allowance for a concrete `SortPlan`, accounting for `SortMode::Natural`
+/// key expansion (up to `2 * field_len + 1` single-level and `3 * field_len` multi-level).
+pub fn estimate_sort_plan_temporary_bytes(
+    effective_bytes_upper_bound: u64,
+    data_rows: u64,
+    plan: &SortPlan,
+) -> u64 {
+    let has_natural = plan.keys.iter().any(|key| key.mode == SortMode::Natural);
+    if !has_natural {
+        return estimate_multi_sort_temporary_bytes(
+            effective_bytes_upper_bound,
+            data_rows,
+            plan.keys.len(),
+        );
+    }
+    if plan.keys.len() <= 1 {
+        // Two generations of (record + natural key <= 2 * record + 1) + frame headers.
+        effective_bytes_upper_bound
+            .saturating_mul(6)
+            .saturating_add(data_rows.saturating_mul(52))
+    } else {
+        // Two generations of (record + NUL-escaped multi-level key <= 3 * record) + per-level headroom.
+        effective_bytes_upper_bound
+            .saturating_mul(8)
+            .saturating_add(data_rows.saturating_mul(48_u64.saturating_add(
+                (plan.keys.len() as u64).saturating_mul(4 * NUMERIC_KEY_OVERHEAD as u64 + 4),
+            )))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1346,7 +1439,9 @@ impl<'a> InitialRunBuilder<'a> {
             }
         }
         let key = match self.order {
-            RunOrder::Duplicates(spec) => spec.key(value_at, self.config.max_record_bytes)?,
+            RunOrder::Duplicates(spec) => {
+                spec.key(fields.len(), value_at, self.config.max_record_bytes)?
+            }
             RunOrder::Sort(spec) => SortPlan::from(spec).key(value_at, self.rows)?,
             RunOrder::MultiSort(spec) => spec.key(value_at, self.rows)?,
         };
@@ -1635,10 +1730,10 @@ fn run_sort(
     check_operation_storage(
         temporary_directory,
         &destination,
-        estimate_multi_sort_temporary_bytes(
+        estimate_sort_plan_temporary_bytes(
             output_bytes,
             records.saturating_sub(u64::from(has_header)),
-            spec.keys.len(),
+            &spec,
         ),
         output_bytes,
     )?;
@@ -1955,6 +2050,7 @@ fn merge_runs_to_run_with_dedup(
     max_record_bytes: usize,
     shared: &SharedState,
     dedup_counter: Option<&AtomicU64>,
+    comparator: DedupComparator,
 ) -> Result<bool, QuarryError> {
     debug_assert!(dedup_counter.is_none() || direction == SortDirection::Ascending);
     let mut readers = open_run_readers(paths)?;
@@ -1962,17 +2058,66 @@ fn merge_runs_to_run_with_dedup(
         return Ok(false);
     };
     let mut previous_key: Option<Vec<u8>> = None;
+    let mut bucket_survivors: Vec<Vec<u8>> = Vec::new();
     while let Some(item) = heap.pop() {
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(false);
         }
         let run_index = item.run_index;
+        let same_key = previous_key.as_deref() == Some(item.head.key.as_slice());
         if let Some(counter) = dedup_counter
-            && previous_key.as_deref() == Some(item.head.key.as_slice())
+            && same_key
         {
-            readers[run_index].seek_relative(item.head.record_len as i64)?;
-            counter.fetch_add(1, Ordering::AcqRel);
+            match comparator {
+                DedupComparator::KeyOnly => {
+                    readers[run_index].seek_relative(item.head.record_len as i64)?;
+                    counter.fetch_add(1, Ordering::AcqRel);
+                }
+                DedupComparator::AllFields {
+                    delimiter,
+                    case_sensitivity,
+                } => {
+                    let record = read_record(
+                        &mut readers[run_index],
+                        item.head.record_len,
+                        max_record_bytes,
+                    )?;
+                    if shared.cancel_requested.load(Ordering::Acquire) {
+                        return Ok(false);
+                    }
+                    let mut is_dup = false;
+                    for prev in &bucket_survivors {
+                        if duplicate::records_equal_all_fields(
+                            prev,
+                            &record,
+                            delimiter,
+                            case_sensitivity,
+                        )? {
+                            is_dup = true;
+                            break;
+                        }
+                    }
+                    if is_dup {
+                        counter.fetch_add(1, Ordering::AcqRel);
+                    } else {
+                        let bytes = write_entry_parts(
+                            &mut writer,
+                            &item.head.key,
+                            &record,
+                            item.head.ordinal,
+                        )?;
+                        shared.add_temporary_bytes(bytes);
+                        bucket_survivors.push(record);
+                    }
+                }
+            }
         } else {
+            // Release any prior bucket's retained records before reading the next record so
+            // peak memory never holds two max-size records simultaneously.
+            if !bucket_survivors.is_empty() {
+                bucket_survivors.clear();
+                bucket_survivors.shrink_to(0);
+            }
             let record = read_record(
                 &mut readers[run_index],
                 item.head.record_len,
@@ -1983,9 +2128,11 @@ fn merge_runs_to_run_with_dedup(
             }
             let bytes = write_entry_parts(&mut writer, &item.head.key, &record, item.head.ordinal)?;
             shared.add_temporary_bytes(bytes);
-            drop(record);
             if dedup_counter.is_some() {
                 previous_key = Some(item.head.key);
+                if matches!(comparator, DedupComparator::AllFields { .. }) {
+                    bucket_survivors.push(record);
+                }
             }
         }
         if let Some(head) = read_head(&mut readers[run_index], max_record_bytes)? {
@@ -3951,7 +4098,9 @@ mod tests {
         let widest = maximum_sort_key_bytes(DEFAULT_SORT_CONFIG.max_record_bytes);
         let fan_in = effective_merge_fan_in(DEFAULT_SORT_CONFIG, widest);
         assert_eq!(fan_in, 2);
-        assert!((fan_in + 1) * widest + DEFAULT_SORT_CONFIG.max_record_bytes < 449 * 1024 * 1024);
+        // ADR 0010 amendment: with Natural key expansion (3x multi-level NUL-escaped bound),
+        // 3 widest keys + 1 64 MiB record stays strictly below 641 MiB.
+        assert!((fan_in + 1) * widest + DEFAULT_SORT_CONFIG.max_record_bytes < 641 * 1024 * 1024);
         assert_eq!(
             estimate_multi_sort_temporary_bytes(123, 7, 1),
             estimate_sort_temporary_bytes(123, 7)
@@ -4743,7 +4892,7 @@ mod tests {
             b',',
             2 * 1024 * 1024,
             Encoding::Utf8,
-            false,
+            1,
         );
         assert!(
             bound > crate::pool::LARGE_RECORD_GATE_BYTES,
@@ -4752,7 +4901,7 @@ mod tests {
         // A 1.5 MiB UTF-8 row in a multi-column composite sort can expand up to ~3x due to NUL escaping.
         let nul_row = vec![0_u8; 1_500_000];
         let composite_bound =
-            parallel::conservative_record_expansion_bound(&nul_row, b',', 0, Encoding::Utf8, true);
+            parallel::conservative_record_expansion_bound(&nul_row, b',', 0, Encoding::Utf8, 2);
         assert!(
             composite_bound > crate::pool::LARGE_RECORD_GATE_BYTES,
             "expected composite pre-evaluation bound ({composite_bound}) to exceed LARGE_RECORD_GATE_BYTES"
@@ -4761,13 +4910,8 @@ mod tests {
         // descriptors in `parse_record` and must take the large-record admission path, while a
         // 200 KiB two-column row stays below the gate.
         let comma_row = vec![b','; 200 * 1024];
-        let delimiter_bound = parallel::conservative_record_expansion_bound(
-            &comma_row,
-            b',',
-            0,
-            Encoding::Utf8,
-            false,
-        );
+        let delimiter_bound =
+            parallel::conservative_record_expansion_bound(&comma_row, b',', 0, Encoding::Utf8, 1);
         assert!(
             delimiter_bound > crate::pool::LARGE_RECORD_GATE_BYTES,
             "expected delimiter-heavy bound ({delimiter_bound}) to exceed LARGE_RECORD_GATE_BYTES"
@@ -4778,7 +4922,7 @@ mod tests {
             b',',
             0,
             Encoding::Utf8,
-            false,
+            1,
         );
         assert!(
             wide_bound < crate::pool::LARGE_RECORD_GATE_BYTES,
@@ -5192,6 +5336,342 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&dest_delim).unwrap(),
             format!("k\n0{commas}\n1{commas}\n2{commas}\n3{commas}\n")
+        );
+    }
+
+    fn oracle_compare_natural(
+        left: &[u8],
+        right: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> CmpOrdering {
+        let fold = |b: u8| {
+            if case_sensitivity == CaseSensitivity::Insensitive {
+                b.to_ascii_lowercase()
+            } else {
+                b
+            }
+        };
+        let mut i = 0;
+        let mut j = 0;
+        while i < left.len() && j < right.len() {
+            let l_digit = left[i].is_ascii_digit();
+            let r_digit = right[j].is_ascii_digit();
+            if l_digit && r_digit {
+                let l_start = i;
+                while i < left.len() && left[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let r_start = j;
+                while j < right.len() && right[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let l_run = &left[l_start..i];
+                let r_run = &right[r_start..j];
+                let l_sig = l_run
+                    .iter()
+                    .position(|&b| b != b'0')
+                    .map_or(&[][..], |pos| &l_run[pos..]);
+                let r_sig = r_run
+                    .iter()
+                    .position(|&b| b != b'0')
+                    .map_or(&[][..], |pos| &r_run[pos..]);
+                let ord = l_sig.len().cmp(&r_sig.len()).then_with(|| l_sig.cmp(r_sig));
+                if ord != CmpOrdering::Equal {
+                    return ord;
+                }
+            } else if l_digit {
+                let ord = b'0'.cmp(&fold(right[j]));
+                if ord != CmpOrdering::Equal {
+                    return ord;
+                }
+                unreachable!("non-digit byte cannot equal b'0'");
+            } else if r_digit {
+                let ord = fold(left[i]).cmp(&b'0');
+                if ord != CmpOrdering::Equal {
+                    return ord;
+                }
+                unreachable!("non-digit byte cannot equal b'0'");
+            } else {
+                let ord = fold(left[i]).cmp(&fold(right[j]));
+                if ord != CmpOrdering::Equal {
+                    return ord;
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+        left.len()
+            .saturating_sub(i)
+            .cmp(&right.len().saturating_sub(j))
+    }
+
+    #[test]
+    fn natural_sort_keys_match_reference_oracle_and_expansion_bounds() {
+        let long_254 = format!("n{}", "9".repeat(254));
+        let long_255 = format!("n1{}", "0".repeat(254));
+        let long_255_padded = format!("n0001{}", "0".repeat(254));
+        let long_256 = format!("n1{}", "0".repeat(255));
+        let alt_digits = "1a1a1a1a1a1";
+        let alt_zero_nul = b"0\x000\x000\x000";
+        let corpus: Vec<&[u8]> = vec![
+            b"",
+            b" ",
+            b"!",
+            b"0",
+            b"00",
+            b"000",
+            b"01",
+            b"1",
+            b"02",
+            b"2",
+            b"9",
+            b"10",
+            b"010",
+            b"100",
+            b"-2",
+            b"-10",
+            b"+2",
+            b"+10",
+            b"1.2",
+            b"1.02",
+            b"1.9",
+            b"1.10",
+            b"v1",
+            b"v1 ",
+            b"v1.",
+            b"v1:",
+            b"v1a",
+            b"v1.9",
+            b"v1.09",
+            b"v1.10",
+            b"V1.9",
+            b"V1.10",
+            b"a01b",
+            b"a1b",
+            b"a1c",
+            b"a\x000",
+            b"a\x001",
+            b"a\x0010",
+            "item2".as_bytes(),
+            "item10".as_bytes(),
+            "item٢".as_bytes(),
+            "item２".as_bytes(),
+            long_254.as_bytes(),
+            long_255.as_bytes(),
+            long_255_padded.as_bytes(),
+            long_256.as_bytes(),
+            alt_digits.as_bytes(),
+            alt_zero_nul.as_slice(),
+        ];
+
+        for case in [CaseSensitivity::Sensitive, CaseSensitivity::Insensitive] {
+            for &a in &corpus {
+                let ka = natural_key(a, case).unwrap();
+                assert!(
+                    ka.len() <= a.len().saturating_mul(2).saturating_add(1),
+                    "single-level natural key exceeded 2*len+1 for {a:?}: {} > {}",
+                    ka.len(),
+                    2 * a.len() + 1
+                );
+                // Verify multi-level composite NUL-escaped bound too.
+                let plan = SortPlan {
+                    keys: vec![
+                        SortSpec {
+                            column: 0,
+                            mode: SortMode::Natural,
+                            direction: SortDirection::Ascending,
+                            case_sensitivity: case,
+                        },
+                        SortSpec {
+                            column: 1,
+                            mode: SortMode::Text,
+                            direction: SortDirection::Ascending,
+                            case_sensitivity: case,
+                        },
+                    ],
+                };
+                let comp = plan.key(|col| if col == 0 { a } else { b"" }, 0).unwrap();
+                assert!(
+                    comp.len() <= a.len().saturating_mul(3).saturating_add(4),
+                    "multi-level natural key exceeded 3*len+4 for {a:?}: {}",
+                    comp.len()
+                );
+
+                for &b in &corpus {
+                    let kb = natural_key(b, case).unwrap();
+                    let expected = oracle_compare_natural(a, b, case);
+                    assert_eq!(
+                        ka.cmp(&kb),
+                        expected,
+                        "asc mismatch for {a:?} vs {b:?} ({case:?})"
+                    );
+
+                    // Single-level descending vs multi-level descending equivalence.
+                    let single_desc = kb.cmp(&ka);
+                    let multi_desc_plan = SortPlan {
+                        keys: vec![
+                            SortSpec {
+                                column: 0,
+                                mode: SortMode::Natural,
+                                direction: SortDirection::Descending,
+                                case_sensitivity: case,
+                            },
+                            SortSpec {
+                                column: 1,
+                                mode: SortMode::Natural,
+                                direction: SortDirection::Ascending,
+                                case_sensitivity: case,
+                            },
+                        ],
+                    };
+                    let m_a = multi_desc_plan
+                        .key(|col| if col == 0 { a } else { b"x" }, 0)
+                        .unwrap();
+                    let m_b = multi_desc_plan
+                        .key(|col| if col == 0 { b } else { b"x" }, 1)
+                        .unwrap();
+                    assert_eq!(
+                        m_a.cmp(&m_b),
+                        single_desc,
+                        "multi-level desc mismatch for {a:?} vs {b:?} ({case:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn natural_sort_end_to_end_single_and_multi_level_parallel_and_spilled() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("versions.csv");
+        let rows = [
+            "v1.10,r2\n",
+            "v1.09,r1\n",
+            "V1.2,r3\n",
+            "v1.9,r4\n",
+            "v1.10,r10\n",
+            "v1.10,r1\n",
+            "v1.2,r0\n",
+        ];
+        let mut bytes = b"ver,rev\n".to_vec();
+        for r in &rows {
+            bytes.extend_from_slice(r.as_bytes());
+        }
+        fs::write(&source, &bytes).unwrap();
+        let session = Session::open(
+            &source,
+            crate::OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                delimiter: Some(b','),
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let index = session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 1,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        // Single-level insensitive ascending: V1.2 == v1.2 (stable order), v1.09 == v1.9 (stable order), v1.10 last.
+        let single_asc = SortPlan::from(SortSpec {
+            column: 0,
+            mode: SortMode::Natural,
+            direction: SortDirection::Ascending,
+            case_sensitivity: CaseSensitivity::Insensitive,
+        });
+        let dest_single = directory.path().join("single-asc.csv");
+        let SortOutcome::Complete(summary) = session
+            .start_create_sorted_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                single_asc.clone(),
+                &dest_single,
+                SortOptions {
+                    temporary_directory: Some(directory.path()),
+                    source_index: Some(&index),
+                    threads: Some(4),
+                    memory_budget_bytes: Some(128),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("cancelled");
+        };
+        assert_eq!(
+            fs::read_to_string(&dest_single).unwrap(),
+            "ver,rev\nV1.2,r3\nv1.2,r0\nv1.09,r1\nv1.9,r4\nv1.10,r2\nv1.10,r10\nv1.10,r1\n"
+        );
+        assert!(
+            summary.peak_temporary_bytes
+                <= estimate_sort_plan_temporary_bytes(
+                    bytes.len() as u64 * 4,
+                    rows.len() as u64,
+                    &single_asc
+                )
+        );
+
+        // Multi-level: col 0 Natural Desc (insensitive), col 1 Natural Asc (sensitive).
+        let multi = SortPlan {
+            keys: vec![
+                SortSpec {
+                    column: 0,
+                    mode: SortMode::Natural,
+                    direction: SortDirection::Descending,
+                    case_sensitivity: CaseSensitivity::Insensitive,
+                },
+                SortSpec {
+                    column: 1,
+                    mode: SortMode::Natural,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+            ],
+        };
+        let dest_multi = directory.path().join("multi.csv");
+        let SortOutcome::Complete(multi_summary) = session
+            .start_create_sorted_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                multi.clone(),
+                &dest_multi,
+                SortOptions {
+                    temporary_directory: Some(directory.path()),
+                    source_index: Some(&index),
+                    threads: Some(4),
+                    memory_budget_bytes: Some(128),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("cancelled");
+        };
+        assert_eq!(
+            fs::read_to_string(&dest_multi).unwrap(),
+            "ver,rev\nv1.10,r1\nv1.10,r2\nv1.10,r10\nv1.09,r1\nv1.9,r4\nv1.2,r0\nV1.2,r3\n"
+        );
+        assert!(
+            multi_summary.peak_temporary_bytes
+                <= estimate_sort_plan_temporary_bytes(
+                    bytes.len() as u64 * 4,
+                    rows.len() as u64,
+                    &multi
+                )
+        );
+        assert!(
+            estimate_sort_plan_temporary_bytes(10_000, 100, &single_asc)
+                > estimate_sort_temporary_bytes(10_000, 100)
+        );
+        assert!(
+            estimate_sort_plan_temporary_bytes(10_000, 100, &multi)
+                > estimate_multi_sort_temporary_bytes(10_000, 100, 2)
         );
     }
 }

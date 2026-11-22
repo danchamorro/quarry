@@ -11,17 +11,18 @@ use std::time::{Duration, Instant};
 use quarry_core::{
     CaseSensitivity, ColumnTransformation, CompletedIndex, CompressedBootstrap,
     CompressedDecompressJob, CompressedOpenConfig, CompressedOpenOutcome, CompressedProgress,
-    CompressedRawDecompressJob, CompressionFormat, DateTimeFormat, DecompressedCopy, Dialect,
-    DuplicateJob, DuplicateOutcome, DuplicateSpec, Encoding, FilterExportJob, FilterExportOutcome,
-    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
-    FilterProgress, FilterQuery, HeaderMode, IndexCacheConfig, IndexConfig, IndexJob,
-    IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob,
-    ReplaceAllOutcome, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome,
-    SearchPosition, SearchProgress, SearchTelemetry, Session, SortDirection, SortJob, SortMode,
-    SortOutcome, SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
-    SplitAnalysisProgress, StructuralIndex, WorkingCopyCleanup, check_storage, clear_index_cache,
-    detect_compression, estimate_edited_output_bytes, estimate_sort_temporary_bytes,
-    inspect_storage, is_compressed_destination,
+    CompressedRawDecompressJob, CompressionFormat, DateFormatSuggestionConfig, DateTimeFormat,
+    DecompressedCopy, Dialect, DuplicateJob, DuplicateOutcome, DuplicateSpec, DuplicateTarget,
+    Encoding, FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
+    FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, HeaderMode,
+    IndexCacheConfig, IndexConfig, IndexJob, IndexProgress, LiteralReplacement,
+    MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob,
+    SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
+    SearchTelemetry, Session, SortDirection, SortJob, SortMode, SortOutcome, SortPlan,
+    SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress,
+    StructuralIndex, WorkingCopyCleanup, check_storage, clear_index_cache, detect_compression,
+    estimate_edited_output_bytes, estimate_sort_plan_temporary_bytes, inspect_storage,
+    is_compressed_destination,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -60,6 +61,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("replace-all-save-as") => replace_all_save_as_command(args.collect()),
         Some("transform-save-as") => transform_save_as_command(args.collect()),
         Some("sort-save-as") => sort_save_as_command(args.collect()),
+        Some("suggest-date-format") => suggest_date_format_command(args.collect()),
         Some("duplicates") => duplicates_command(args.collect()),
         Some("clear-index-cache") => clear_index_cache_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
@@ -260,12 +262,15 @@ fn print_help() {
          [--output-header NAME]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
            quarry sort-save-as <SOURCE> <DESTINATION> [--column N] \
-         [--order asc|desc] [--mode text|number|date|characters|words|shuffle|reverse] \
-         [--date-format ymd|mdy|dmy|datetime|rfc3339] \
+         [--order asc|desc] [--mode text|natural|number|date|characters|words|shuffle|reverse] \
+         [--ignore-case] [--date-format ymd|mdy|dmy|datetime|rfc3339] \
          [--seed N] [--delimiter ,] [--header auto|first-row|none] \
          [--temp-dir DIRECTORY] [--threads N] [--memory-budget BYTES] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
-           quarry duplicates <FILE> --columns 1,2 [--match-case] [--output FILE] \
+           quarry suggest-date-format <FILE> --column N [--max-rows N] [--max-bytes N] \
+         [--delimiter ,] [--header auto|first-row|none] \
+         [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
+           quarry duplicates <FILE> (--columns 1,2 | --all-fields) [--match-case] [--output FILE] \
          [--temp-dir DIRECTORY] \
          [--delimiter ,] [--header auto|first-row|none] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
@@ -287,13 +292,14 @@ fn print_help() {
          and duplicates reject them; convert-utf8 writes an uncompressed copy to use instead.\n\
          Outputs are always uncompressed and must not end in .gz. Zstandard, bzip2, XZ, ZIP, and tar are not supported.\n\n\
          Duplicates: count only by default; --output explicitly removes extra occurrences.\n\
+         Use --columns 1,2 for selected columns or --all-fields for whole-row matching.\n\
          The first row is kept. Matching ignores ASCII case unless --match-case is set.\n\
          Blank and missing selected fields match; whitespace is significant.\n\
          Temporary runs use --temp-dir when set; final output staging stays beside its destination.\n\
          Filters: between includes both bounds and requires --upper-bound (or UPPER after --and).\n\
          Numeric values accept signed decimals and scientific notation; blank or invalid cells do not match.\n\
-         Sort: --column and --order are required for text, number, date, characters, and words.\n\
-         Date sorting requires --date-format; no locale or timezone guessing.\n\
+         Sort: --column and --order are required for text, natural, number, date, characters, and words.\n\
+         Date sorting requires --date-format; suggest-date-format samples bounded rows/bytes without auto-selecting.\n\
          Shuffle and reverse reorder all data rows; --seed repeats a shuffle within the same build."
     );
 }
@@ -1377,6 +1383,7 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     let mut case_sensitivity = CaseSensitivity::Insensitive;
     let mut delimiter = None;
     let mut header_mode = HeaderMode::Auto;
+    let mut all_fields = false;
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
     let mut threads = None;
@@ -1398,6 +1405,7 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
                 }
                 columns = Some(selected.into_iter().map(|column| column - 1).collect());
             }
+            "--all-fields" => all_fields = true,
             "--match-case" => case_sensitivity = CaseSensitivity::Sensitive,
             "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
             "--temp-dir" => {
@@ -1436,7 +1444,14 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
         cursor += 1;
     }
     let source = source.ok_or("duplicates requires a file path")?;
-    let columns = columns.ok_or("duplicates requires --columns")?;
+    let target = match (all_fields, columns) {
+        (true, Some(_)) => {
+            return Err("duplicates accepts either --columns or --all-fields, not both".into());
+        }
+        (true, None) => DuplicateTarget::AllFields,
+        (false, Some(columns)) => DuplicateTarget::Columns(columns),
+        (false, None) => return Err("duplicates requires --columns or --all-fields".into()),
+    };
     if cancel_after_bytes == Some(0) {
         return Err("cancel-after-bytes must be non-zero".into());
     }
@@ -1502,7 +1517,7 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     });
     let result = (|| -> CliResult<()> {
         let spec = DuplicateSpec {
-            columns,
+            target,
             case_sensitivity,
         };
         println!(
@@ -1562,14 +1577,21 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
             human_bytes(session.file_size),
             session.file_size
         );
-        println!(
-            "Columns: {}",
-            spec.columns
-                .iter()
-                .map(|column| (column + 1).to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        match &spec.target {
+            DuplicateTarget::Columns(columns) => {
+                println!(
+                    "Columns: {}",
+                    columns
+                        .iter()
+                        .map(|column| (column + 1).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+            DuplicateTarget::AllFields => {
+                println!("Target: all fields (whole row)");
+            }
+        }
         println!(
             "Match case: {}",
             if case_sensitivity == CaseSensitivity::Sensitive {
@@ -1578,7 +1600,16 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
                 "no (ASCII)"
             }
         );
-        println!("Blank and missing selected fields match; whitespace is significant.");
+        match &spec.target {
+            DuplicateTarget::Columns(_) => {
+                println!("Blank and missing selected fields match; whitespace is significant.");
+            }
+            DuplicateTarget::AllFields => {
+                println!(
+                    "Every decoded field and exact field count match; quoted and unquoted forms match; whitespace is significant."
+                );
+            }
+        }
         println!("First occurrence in source row order is kept.");
         println!("Cache state: {cache_state}");
         println!(
@@ -1709,6 +1740,97 @@ fn wait_for_duplicates(
     Ok((outcome, progress, cancellation))
 }
 
+fn suggest_date_format_command(args: Vec<String>) -> CliResult<()> {
+    let mut encoding = None;
+    let mut path = None;
+    let mut column = None;
+    let mut delimiter = None;
+    let mut header_mode = HeaderMode::Auto;
+    let mut config = DateFormatSuggestionConfig::default();
+    let mut compressed = CompressedArgs::default();
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
+            "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
+            "--max-rows" => {
+                config.max_rows = value(&args, &mut cursor, "--max-rows")?.parse::<usize>()?;
+            }
+            "--max-bytes" => {
+                config.max_bytes = value(&args, &mut cursor, "--max-bytes")?.parse::<usize>()?;
+            }
+            "--delimiter" => {
+                delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
+            }
+            "--header" => header_mode = parse_header_mode(value(&args, &mut cursor, "--header")?)?,
+            "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            argument if path.is_none() => path = Some(PathBuf::from(argument)),
+            argument => return Err(format!("unexpected argument {argument:?}").into()),
+        }
+        cursor += 1;
+    }
+
+    let path = path.ok_or("suggest-date-format requires a file path")?;
+    let column = column.ok_or("suggest-date-format requires --column")?;
+    if column == 0 {
+        return Err("column must be at least 1".into());
+    }
+    let input = open_input(
+        &path,
+        OpenOptions {
+            delimiter,
+            header_mode,
+            ..OpenOptions::default()
+        },
+        encoding,
+        &compressed,
+    )?;
+    let suggestion =
+        input
+            .session
+            .suggest_date_time_formats(column - 1, &BTreeMap::new(), config)?;
+    println!("Quarry bounded date/time format suggestion\n");
+    input.print_source("Source");
+    println!("Column: {column}");
+    println!("Sampled rows: {}", suggestion.sampled_rows);
+    println!(
+        "Sampled nonblank values: {}",
+        suggestion.sampled_nonblank_values
+    );
+    println!("Sampled bytes: {}", suggestion.sampled_bytes);
+    println!(
+        "Sample truncated: {}",
+        if suggestion.truncated { "yes" } else { "no" }
+    );
+    println!(
+        "Ambiguous: {}",
+        if suggestion.is_ambiguous() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if suggestion.matching_formats.is_empty() {
+        println!("Matching formats: none");
+    } else {
+        let names = suggestion
+            .matching_formats
+            .iter()
+            .map(|format| format!("{} ({})", format.cli_name(), format.label()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Matching formats: {names}");
+    }
+    println!(
+        "Advisory only: Quarry never auto-selects a date/time format; choose explicitly and full validation runs when sorting."
+    );
+    Ok(())
+}
+
 fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut encoding = None;
     let mut source = None;
@@ -1717,6 +1839,8 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut column = None;
     let mut direction = None;
     let mut mode = SortMode::Text;
+    let mut case_sensitivity = CaseSensitivity::Sensitive;
+    let mut ignore_case_requested = false;
     let mut date_format = None;
     let mut shuffle_seed = None;
     let mut delimiter = None;
@@ -1737,6 +1861,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             "--mode" => {
                 mode = match value(&args, &mut cursor, "--mode")? {
                     "text" => SortMode::Text,
+                    "natural" => SortMode::Natural,
                     "number" => SortMode::Number,
                     "date" => SortMode::DateTime {
                         format: DateTimeFormat::YearMonthDay,
@@ -1746,10 +1871,14 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
                     "shuffle" => SortMode::Shuffle { seed: 0 },
                     "reverse" => SortMode::Reverse,
                     _ => return Err(
-                        "--mode must be text, number, date, characters, words, shuffle, or reverse"
+                        "--mode must be text, natural, number, date, characters, words, shuffle, or reverse"
                             .into(),
                     ),
                 };
+            }
+            "--ignore-case" => {
+                case_sensitivity = CaseSensitivity::Insensitive;
+                ignore_case_requested = true;
             }
             "--date-format" => {
                 date_format = Some(match value(&args, &mut cursor, "--date-format")? {
@@ -1831,6 +1960,9 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     } else if shuffle_seed.is_some() {
         return Err("--seed is only supported with --mode shuffle".into());
     }
+    if ignore_case_requested && !matches!(mode, SortMode::Text | SortMode::Natural) {
+        return Err("--ignore-case is only supported with --mode text or --mode natural".into());
+    }
     if cancel_after_bytes == Some(0) {
         return Err("cancel-after-bytes must be non-zero".into());
     }
@@ -1865,13 +1997,13 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         column: column - 1,
         direction,
         mode,
-        case_sensitivity: CaseSensitivity::Sensitive,
+        case_sensitivity,
     };
     let source_size_before = session.file_size;
     let data_rows = source_index
         .indexed_rows()
         .saturating_sub(u64::from(session.dialect.has_header));
-    let estimated_temporary_bytes = estimate_sort_temporary_bytes(
+    let estimated_temporary_bytes = estimate_sort_plan_temporary_bytes(
         estimate_edited_output_bytes(
             source_size_before,
             source_index.indexed_rows(),
@@ -1881,6 +2013,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             None,
         ),
         data_rows,
+        &SortPlan::from(spec),
     );
     let temporary_directory = temporary_directory.unwrap_or_else(|| {
         destination
@@ -2002,6 +2135,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         "Sort mode: {}",
         match mode {
             SortMode::Text => "text",
+            SortMode::Natural => "natural",
             SortMode::Number => "number",
             SortMode::DateTime { .. } => "date",
             SortMode::CharacterCount => "characters",
@@ -4878,7 +5012,10 @@ mod tests {
     fn duplicates_command_counts_and_keeps_exact_first_rows_without_clobbering() {
         for (args, message) in [
             (vec![], "duplicates requires a file path"),
-            (vec!["missing.csv"], "duplicates requires --columns"),
+            (
+                vec!["missing.csv"],
+                "duplicates requires --columns or --all-fields",
+            ),
             (
                 vec!["missing.csv", "--columns", "0"],
                 "duplicate columns must be at least 1",
@@ -6054,7 +6191,7 @@ mod tests {
             (vec![], "sort-save-as requires a source file path"),
             (
                 vec!["source.csv", "sorted.csv", "--mode", "numeric"],
-                "--mode must be text, number, date, characters, words, shuffle, or reverse",
+                "--mode must be text, natural, number, date, characters, words, shuffle, or reverse",
             ),
             (
                 vec!["source.csv"],
@@ -6912,5 +7049,110 @@ mod tests {
             std::path::PathBuf::from("./--no-index-cache")
         );
         assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn cli_natural_sort_whole_row_duplicates_and_suggest_date_format() {
+        let dir = std::env::temp_dir().join(format!(
+            "quarry-cli-phase3b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let src = dir.join("items.csv");
+        std::fs::write(
+            &src,
+            b"ver,when\nv1.10,01/02/2020\nv1.2,03/04/2026\nV1.9,01/02/2020\n\"v1.2\",03/04/2026\nv1.2,03/04/2026,\n",
+        )
+        .unwrap();
+
+        // Natural sort (insensitive ascending).
+        let sorted = dir.join("sorted.csv");
+        super::run(vec![
+            "sort-save-as".into(),
+            src.display().to_string(),
+            sorted.display().to_string(),
+            "--column".into(),
+            "1".into(),
+            "--order".into(),
+            "asc".into(),
+            "--mode".into(),
+            "natural".into(),
+            "--ignore-case".into(),
+            "--header".into(),
+            "first-row".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&sorted).unwrap(),
+            "ver,when\nv1.2,03/04/2026\n\"v1.2\",03/04/2026\nv1.2,03/04/2026,\nV1.9,01/02/2020\nv1.10,01/02/2020\n"
+        );
+
+        // --ignore-case rejected for numeric sort.
+        assert!(
+            super::run(vec![
+                "sort-save-as".into(),
+                src.display().to_string(),
+                dir.join("bad.csv").display().to_string(),
+                "--column".into(),
+                "1".into(),
+                "--order".into(),
+                "asc".into(),
+                "--mode".into(),
+                "number".into(),
+                "--ignore-case".into(),
+            ])
+            .is_err()
+        );
+
+        // Whole-row duplicates: `"v1.2",03/04/2026` deduplicates with `v1.2,03/04/2026`,
+        // while `v1.2,03/04/2026,` (3 fields) stays distinct.
+        let deduped = dir.join("deduped.csv");
+        super::run(vec![
+            "duplicates".into(),
+            src.display().to_string(),
+            "--all-fields".into(),
+            "--output".into(),
+            deduped.display().to_string(),
+            "--header".into(),
+            "first-row".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&deduped).unwrap(),
+            "ver,when\nv1.10,01/02/2020\nv1.2,03/04/2026\nV1.9,01/02/2020\nv1.2,03/04/2026,\n"
+        );
+
+        // Reject --columns together with --all-fields, or neither.
+        assert!(
+            super::run(vec![
+                "duplicates".into(),
+                src.display().to_string(),
+                "--columns".into(),
+                "1".into(),
+                "--all-fields".into(),
+            ])
+            .is_err()
+        );
+        assert!(super::run(vec!["duplicates".into(), src.display().to_string()]).is_err());
+
+        // Bounded date-format suggestion CLI command.
+        super::run(vec![
+            "suggest-date-format".into(),
+            src.display().to_string(),
+            "--column".into(),
+            "2".into(),
+            "--max-rows".into(),
+            "10".into(),
+            "--max-bytes".into(),
+            "4096".into(),
+            "--header".into(),
+            "first-row".into(),
+        ])
+        .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -50,7 +50,11 @@ pub use compressed::{
     CompressedProgress, CompressedRawDecompressJob, CompressedSourceGuard, CompressionFormat,
     DecompressedCopy, detect_compression, is_compressed_destination, reject_compressed_destination,
 };
-pub use date_time_sort::DateTimeFormat;
+pub use date_time_sort::{
+    DEFAULT_DATE_FORMAT_SUGGESTION_MAX_BYTES, DEFAULT_DATE_FORMAT_SUGGESTION_MAX_ROWS,
+    DateFormatSuggestion, DateFormatSuggestionConfig, DateTimeFormat,
+    suggest_date_time_formats_from_values,
+};
 pub use encoding::Encoding;
 use encoding::RecordScanner;
 pub use export::{
@@ -103,12 +107,14 @@ pub use sidecar::{
 };
 pub use sort::{
     DuplicateJob, DuplicateOptions, DuplicateOutcome, DuplicateProgress, DuplicateSpec,
-    DuplicateSummary, MAX_SORT_KEYS, SortDirection, SortJob, SortMode, SortOptions, SortOutcome,
-    SortPlan, SortProgress, SortSpec, SortSummary, estimate_multi_sort_temporary_bytes,
+    DuplicateSummary, DuplicateTarget, MAX_SORT_KEYS, SortDirection, SortJob, SortMode,
+    SortOptions, SortOutcome, SortPlan, SortProgress, SortSpec, SortSummary,
+    estimate_multi_sort_temporary_bytes, estimate_sort_plan_temporary_bytes,
     estimate_sort_temporary_bytes,
 };
 pub use storage::{
-    StorageSpace, check_storage, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
+    StorageSpace, check_storage, estimate_duplicate_target_temporary_bytes,
+    estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
     estimate_edited_output_bytes_from_values, inspect_storage, restrict_private_file,
     validate_scratch_directory,
 };
