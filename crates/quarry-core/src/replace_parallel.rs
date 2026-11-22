@@ -281,8 +281,10 @@ struct ReplaceOutputChunk {
     max_width: usize,
     physical_rows: u64,
     is_head_credit: bool,
-    _reorder_guard: Option<BudgetGuard>,
+    // Drop `_non_head_tracker` (and `bytes`) BEFORE `_reorder_guard` releases budget credit
+    // so waiting workers cannot allocate against the freed credit before the old chunk drops.
     _non_head_tracker: Option<NonHeadOutputTracker>,
+    _reorder_guard: Option<BudgetGuard>,
 }
 
 enum StripeMessage {
@@ -1052,8 +1054,8 @@ pub(super) fn copy_with_replaced_records_parallel(
                         Err(err) => {
                             chunk_bytes.clear();
                             relative_ends.clear();
-                            chunk_credit.take();
                             chunk_tracker.take();
+                            chunk_credit.take();
                             return Err(err);
                         }
                     };
@@ -1152,8 +1154,8 @@ pub(super) fn copy_with_replaced_records_parallel(
                         }
                         large_guard.take();
                         if chunk_bytes.is_empty() {
-                            chunk_credit.take();
                             chunk_tracker.take();
+                            chunk_credit.take();
                         }
                         physical_row = physical_row.saturating_add(1);
                         segment_start = local_end;
@@ -1292,8 +1294,8 @@ pub(super) fn copy_with_replaced_records_parallel(
                         clear_record_buffer(&mut record);
                         large_guard.take();
                         if chunk_bytes.is_empty() {
-                            chunk_credit.take();
                             chunk_tracker.take();
+                            chunk_credit.take();
                         }
                         physical_row = physical_row.saturating_add(1);
                     });
@@ -1311,8 +1313,8 @@ pub(super) fn copy_with_replaced_records_parallel(
                         break 'worker;
                     }
                 } else if !record.is_empty() || physical_row != stripe.end_row {
-                    chunk_credit.take();
                     chunk_tracker.take();
+                    chunk_credit.take();
                     record_error(physical_row, QuarryError::SourceChanged);
                     break 'worker;
                 }
