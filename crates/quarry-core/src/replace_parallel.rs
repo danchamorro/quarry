@@ -227,28 +227,48 @@ enum EmitCredit {
 #[cfg(test)]
 struct NonHeadOutputTracker {
     live: Arc<AtomicUsize>,
+    max_seen: Arc<AtomicUsize>,
     bytes: usize,
 }
 
 #[cfg(test)]
 impl NonHeadOutputTracker {
-    fn new(live: &Arc<AtomicUsize>, max_seen: &Arc<AtomicUsize>, bytes: usize) -> Self {
-        let now = live
-            .fetch_add(bytes, Ordering::AcqRel)
-            .saturating_add(bytes);
-        max_seen.fetch_max(now, Ordering::AcqRel);
+    fn new(live: &Arc<AtomicUsize>, max_seen: &Arc<AtomicUsize>) -> Self {
         Self {
             live: Arc::clone(live),
-            bytes,
+            max_seen: Arc::clone(max_seen),
+            bytes: 0,
         }
+    }
+
+    fn record_bytes(&mut self, delta: usize) {
+        if delta == 0 {
+            return;
+        }
+        let now = self
+            .live
+            .fetch_add(delta, Ordering::AcqRel)
+            .saturating_add(delta);
+        self.max_seen.fetch_max(now, Ordering::AcqRel);
+        self.bytes = self.bytes.saturating_add(delta);
     }
 }
 
 #[cfg(test)]
 impl Drop for NonHeadOutputTracker {
     fn drop(&mut self) {
-        self.live.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.bytes > 0 {
+            self.live.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
     }
+}
+
+#[cfg(not(test))]
+struct NonHeadOutputTracker;
+
+#[cfg(not(test))]
+impl NonHeadOutputTracker {
+    fn record_bytes(&mut self, _delta: usize) {}
 }
 
 struct ReplaceOutputChunk {
@@ -262,7 +282,6 @@ struct ReplaceOutputChunk {
     physical_rows: u64,
     is_head_credit: bool,
     _reorder_guard: Option<BudgetGuard>,
-    #[cfg(test)]
     _non_head_tracker: Option<NonHeadOutputTracker>,
 }
 
@@ -810,6 +829,7 @@ pub(super) fn copy_with_replaced_records_parallel(
 
                 let emit_chunk_with_credit = |is_last: bool,
                                               pre_credit: Option<EmitCredit>,
+                                              pre_tracker: Option<NonHeadOutputTracker>,
                                               chunk_bytes: &mut Vec<u8>,
                                               relative_ends: &mut Vec<u64>,
                                               chunk_replacements: &mut u64,
@@ -852,6 +872,7 @@ pub(super) fn copy_with_replaced_records_parallel(
                             credit
                         }
                         None => {
+                            debug_assert!(bytes.is_empty() && ends.is_empty());
                             let Some(credit) = acquire_emit_credit(footprint) else {
                                 return false;
                             };
@@ -867,19 +888,6 @@ pub(super) fn copy_with_replaced_records_parallel(
                         EmitCredit::Reorder(guard) => (false, Some(guard)),
                     };
 
-                    #[cfg(test)]
-                    let non_head_tracker = if !is_head_credit
-                        && let Some(max_seen) = &max_non_head_output_bytes_seen
-                    {
-                        Some(NonHeadOutputTracker::new(
-                            &live_non_head_output_bytes,
-                            max_seen,
-                            bytes.len(),
-                        ))
-                    } else {
-                        None
-                    };
-
                     let current_seq = *seq;
                     *seq = seq.saturating_add(1);
                     let msg = StripeMessage::Chunk(ReplaceOutputChunk {
@@ -893,8 +901,7 @@ pub(super) fn copy_with_replaced_records_parallel(
                         physical_rows,
                         is_head_credit,
                         _reorder_guard: reorder_guard,
-                        #[cfg(test)]
-                        _non_head_tracker: non_head_tracker,
+                        _non_head_tracker: pre_tracker,
                     });
                     if tx.send(msg).is_err() {
                         if is_head_credit {
@@ -905,7 +912,8 @@ pub(super) fn copy_with_replaced_records_parallel(
                     true
                 };
 
-                let mut pre_credit: Option<EmitCredit> = None;
+                let mut chunk_credit: Option<EmitCredit> = None;
+                let mut chunk_tracker: Option<NonHeadOutputTracker> = None;
 
                 let process_record = |rec: &[u8],
                                       row_num: u64,
@@ -915,7 +923,8 @@ pub(super) fn copy_with_replaced_records_parallel(
                                       chunk_rows: &mut u64,
                                       seq: &mut u64,
                                       large_guard: &mut Option<LargeRecordGuard>,
-                                      pre_credit: &mut Option<EmitCredit>|
+                                      chunk_credit: &mut Option<EmitCredit>,
+                                      chunk_tracker: &mut Option<NonHeadOutputTracker>|
                  -> Result<bool, QuarryError> {
                     let (est_output_bytes, est_working_bytes) = estimate_replace_memory(
                         rec,
@@ -929,56 +938,84 @@ pub(super) fn copy_with_replaced_records_parallel(
                         expansion_ratio,
                         config.max_record_bytes,
                     );
-                    let needs_pre_credit = est_output_bytes >= flush_chunk_bytes
-                        || est_output_bytes > LARGE_RECORD_GATE_BYTES
-                        || rec.len() > LARGE_RECORD_GATE_BYTES;
                     let needs_large_gate = rec.len() > LARGE_RECORD_GATE_BYTES
                         || est_output_bytes > LARGE_RECORD_GATE_BYTES
                         || est_working_bytes > LARGE_RECORD_GATE_BYTES;
+                    let row_footprint = est_output_bytes
+                        .saturating_add(std::mem::size_of::<u64>())
+                        .max(1);
 
-                    // Lock ordering: acquire `reorder_budget`/`head_flow` BEFORE `large_record_gate`
-                    // and BEFORE allocating expanded output so oversized output is charged against
-                    // the 64 MiB reorder bound while retained, and a non-head worker never holds
-                    // `large_record_gate` while waiting on `reorder_budget`.
-                    if needs_pre_credit && pre_credit.is_none() {
-                        debug_assert!(large_guard.is_none());
-                        if !chunk_bytes.is_empty()
-                            && !emit_chunk_with_credit(
-                                false,
-                                None,
-                                chunk_bytes,
-                                relative_ends,
-                                chunk_replacements,
-                                chunk_rows,
-                                seq,
-                                0,
-                            )
-                        {
+                    // Flush any buffered output BEFORE acquiring fresh credit or `large_record_gate`
+                    // whenever this row would exceed our pre-acquired `chunk_credit` (or when we
+                    // need `large_record_gate`). Because `chunk_credit` is already held, flushing
+                    // is non-blocking and leaves `chunk_bytes` empty before any potential wait.
+                    let would_exceed_credit = match chunk_credit.as_ref() {
+                        Some(EmitCredit::Reorder(guard)) => {
+                            let projected = chunk_bytes
+                                .len()
+                                .saturating_add(est_output_bytes)
+                                .saturating_add(
+                                    relative_ends
+                                        .len()
+                                        .saturating_add(1)
+                                        .saturating_mul(std::mem::size_of::<u64>()),
+                                );
+                            projected > guard.bytes()
+                        }
+                        Some(EmitCredit::Head(_)) => {
+                            !chunk_bytes.is_empty()
+                                && chunk_bytes.len().saturating_add(est_output_bytes)
+                                    > flush_chunk_bytes
+                        }
+                        None => false,
+                    };
+                    if !chunk_bytes.is_empty() && (would_exceed_credit || needs_large_gate) {
+                        let credit = chunk_credit.take();
+                        let tracker = chunk_tracker.take();
+                        if !emit_chunk_with_credit(
+                            false,
+                            credit,
+                            tracker,
+                            chunk_bytes,
+                            relative_ends,
+                            chunk_replacements,
+                            chunk_rows,
+                            seq,
+                            0,
+                        ) {
                             return Ok(false);
                         }
-                        let reserve = est_output_bytes
-                            .saturating_add(std::mem::size_of::<u64>())
-                            .max(1);
+                    }
+
+                    // Lock ordering: always acquire `reorder_budget` / `head_flow` BEFORE
+                    // `large_record_gate` and BEFORE writing any output bytes into `chunk_bytes`.
+                    // A worker waiting on `reorder_budget` therefore holds 0 retained output bytes
+                    // and never holds `large_record_gate`.
+                    if chunk_credit.is_none() {
+                        debug_assert!(chunk_bytes.is_empty());
+                        debug_assert!(large_guard.is_none());
+                        let reserve = if row_footprint >= flush_chunk_bytes {
+                            row_footprint
+                        } else {
+                            flush_chunk_bytes
+                                .min(reorder_budget.limit())
+                                .max(row_footprint)
+                        };
                         let Some(credit) = acquire_emit_credit(reserve) else {
                             return Ok(false);
                         };
-                        *pre_credit = Some(credit);
+                        #[cfg(test)]
+                        if matches!(credit, EmitCredit::Reorder(_))
+                            && let Some(max_seen) = &max_non_head_output_bytes_seen
+                        {
+                            *chunk_tracker = Some(NonHeadOutputTracker::new(
+                                &live_non_head_output_bytes,
+                                max_seen,
+                            ));
+                        }
+                        *chunk_credit = Some(credit);
                     }
                     if needs_large_gate && large_guard.is_none() {
-                        if !chunk_bytes.is_empty()
-                            && !emit_chunk_with_credit(
-                                false,
-                                None,
-                                chunk_bytes,
-                                relative_ends,
-                                chunk_replacements,
-                                chunk_rows,
-                                seq,
-                                0,
-                            )
-                        {
-                            return Ok(false);
-                        }
                         let guard = if let Some(g) = large_record_gate.try_acquire() {
                             g
                         } else if let Some(g) = large_record_gate.acquire(&shared.cancel_requested)
@@ -994,6 +1031,7 @@ pub(super) fn copy_with_replaced_records_parallel(
                         *large_guard = Some(guard);
                     }
 
+                    let before_len = chunk_bytes.len();
                     let appended = append_replaced_record(
                         chunk_bytes,
                         rec,
@@ -1012,19 +1050,28 @@ pub(super) fn copy_with_replaced_records_parallel(
                     let count = match appended {
                         Ok(count) => count,
                         Err(err) => {
-                            pre_credit.take();
+                            chunk_bytes.clear();
+                            relative_ends.clear();
+                            chunk_credit.take();
+                            chunk_tracker.take();
                             return Err(err);
                         }
                     };
+                    if let Some(tracker) = chunk_tracker.as_mut() {
+                        tracker.record_bytes(chunk_bytes.len().saturating_sub(before_len));
+                    }
                     *chunk_replacements = chunk_replacements.saturating_add(count);
                     *chunk_rows = chunk_rows.saturating_add(1);
                     relative_ends.push(chunk_bytes.len() as u64);
 
-                    if pre_credit.is_some() || chunk_bytes.len() >= flush_chunk_bytes {
-                        let credit = pre_credit.take();
+                    if chunk_bytes.len() >= flush_chunk_bytes || row_footprint >= flush_chunk_bytes
+                    {
+                        let credit = chunk_credit.take();
+                        let tracker = chunk_tracker.take();
                         if !emit_chunk_with_credit(
                             false,
                             credit,
+                            tracker,
                             chunk_bytes,
                             relative_ends,
                             chunk_replacements,
@@ -1090,7 +1137,8 @@ pub(super) fn copy_with_replaced_records_parallel(
                                         &mut chunk_rows,
                                         &mut seq,
                                         &mut large_guard,
-                                        &mut pre_credit,
+                                        &mut chunk_credit,
+                                        &mut chunk_tracker,
                                     ) {
                                         Ok(true) => {}
                                         Ok(false) => stopped = true,
@@ -1103,7 +1151,10 @@ pub(super) fn copy_with_replaced_records_parallel(
                             clear_record_buffer(&mut record);
                         }
                         large_guard.take();
-                        pre_credit.take();
+                        if chunk_bytes.is_empty() {
+                            chunk_credit.take();
+                            chunk_tracker.take();
+                        }
                         physical_row = physical_row.saturating_add(1);
                         segment_start = local_end;
                     });
@@ -1125,19 +1176,22 @@ pub(super) fn copy_with_replaced_records_parallel(
                         break 'worker;
                     }
 
-                    if chunk_bytes.len() >= flush_chunk_bytes
-                        && !emit_chunk_with_credit(
+                    if chunk_bytes.len() >= flush_chunk_bytes {
+                        let credit = chunk_credit.take();
+                        let tracker = chunk_tracker.take();
+                        if !emit_chunk_with_credit(
                             false,
-                            None,
+                            credit,
+                            tracker,
                             &mut chunk_bytes,
                             &mut relative_ends,
                             &mut chunk_replacements,
                             &mut chunk_rows,
                             &mut seq,
                             scanner.maximum_width(),
-                        )
-                    {
-                        break 'worker;
+                        ) {
+                            break 'worker;
+                        }
                     }
 
                     let remainder = &read_buf[segment_start..read];
@@ -1154,21 +1208,24 @@ pub(super) fn copy_with_replaced_records_parallel(
                         if record.len().saturating_add(remainder.len()) > LARGE_RECORD_GATE_BYTES
                             && large_guard.is_none()
                         {
-                            if !chunk_bytes.is_empty()
-                                && !emit_chunk_with_credit(
+                            if !chunk_bytes.is_empty() {
+                                let credit = chunk_credit.take();
+                                let tracker = chunk_tracker.take();
+                                if !emit_chunk_with_credit(
                                     false,
-                                    None,
+                                    credit,
+                                    tracker,
                                     &mut chunk_bytes,
                                     &mut relative_ends,
                                     &mut chunk_replacements,
                                     &mut chunk_rows,
                                     &mut seq,
                                     scanner.maximum_width(),
-                                )
-                            {
-                                break 'worker;
+                                ) {
+                                    break 'worker;
+                                }
                             }
-                            if pre_credit.is_none() {
+                            if chunk_credit.is_none() {
                                 let reserve = config
                                     .max_record_bytes
                                     .saturating_add(std::mem::size_of::<u64>())
@@ -1176,7 +1233,16 @@ pub(super) fn copy_with_replaced_records_parallel(
                                 let Some(credit) = acquire_emit_credit(reserve) else {
                                     break 'worker;
                                 };
-                                pre_credit = Some(credit);
+                                #[cfg(test)]
+                                if matches!(credit, EmitCredit::Reorder(_))
+                                    && let Some(max_seen) = &max_non_head_output_bytes_seen
+                                {
+                                    chunk_tracker = Some(NonHeadOutputTracker::new(
+                                        &live_non_head_output_bytes,
+                                        max_seen,
+                                    ));
+                                }
+                                chunk_credit = Some(credit);
                             }
                             let guard = if let Some(g) = large_record_gate.try_acquire() {
                                 g
@@ -1214,7 +1280,8 @@ pub(super) fn copy_with_replaced_records_parallel(
                                     &mut chunk_rows,
                                     &mut seq,
                                     &mut large_guard,
-                                    &mut pre_credit,
+                                    &mut chunk_credit,
+                                    &mut chunk_tracker,
                                 ) {
                                     Ok(true) => {}
                                     Ok(false) => stopped = true,
@@ -1224,12 +1291,14 @@ pub(super) fn copy_with_replaced_records_parallel(
                         }
                         clear_record_buffer(&mut record);
                         large_guard.take();
-                        pre_credit.take();
+                        if chunk_bytes.is_empty() {
+                            chunk_credit.take();
+                            chunk_tracker.take();
+                        }
                         physical_row = physical_row.saturating_add(1);
                     });
                     clear_record_buffer(&mut record);
                     large_guard.take();
-                    pre_credit.take();
                     if let Some((err_row, err)) = deferred_error {
                         record_error(err_row, err);
                         break 'worker;
@@ -1242,14 +1311,18 @@ pub(super) fn copy_with_replaced_records_parallel(
                         break 'worker;
                     }
                 } else if !record.is_empty() || physical_row != stripe.end_row {
-                    pre_credit.take();
+                    chunk_credit.take();
+                    chunk_tracker.take();
                     record_error(physical_row, QuarryError::SourceChanged);
                     break 'worker;
                 }
 
+                let final_credit = chunk_credit.take();
+                let final_tracker = chunk_tracker.take();
                 if !emit_chunk_with_credit(
                     true,
-                    None,
+                    final_credit,
+                    final_tracker,
                     &mut chunk_bytes,
                     &mut relative_ends,
                     &mut chunk_replacements,

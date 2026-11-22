@@ -10510,6 +10510,8 @@ mod tests {
         };
 
         let max_chunk_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_small_non_head_retained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let small_waited = Arc::new(AtomicBool::new(false));
         let parallel_dest = dir.path().join("parallel.csv");
         let inner = SaveAsJob::start_worker_with_options(
             session.path.clone(),
@@ -10536,8 +10538,8 @@ mod tests {
                 max_head_in_flight: 2,
                 delay_stripe_zero: Some(Duration::from_millis(40)),
                 max_chunk_bytes_seen: Some(Arc::clone(&max_chunk_seen)),
-                on_reorder_wait: None,
-                max_non_head_output_bytes_seen: None,
+                on_reorder_wait: Some(Arc::clone(&small_waited)),
+                max_non_head_output_bytes_seen: Some(Arc::clone(&max_small_non_head_retained)),
                 large_gate_acquisitions: None,
             }),
         )
@@ -10558,6 +10560,18 @@ mod tests {
             max_chunk_seen.load(Ordering::Acquire) <= 4 * 1024 + 512,
             "expanded chunk grew past record-boundary flush cap: {}",
             max_chunk_seen.load(Ordering::Acquire)
+        );
+        // Non-head workers pre-acquire reorder credit before buffering small records too, so
+        // even while workers wait on the 2 KiB reorder budget, retained non-head output bytes
+        // stay strictly within the 2 KiB reorder budget!
+        assert!(
+            small_waited.load(Ordering::Acquire),
+            "expected non-head workers to wait on the 2 KiB reorder budget"
+        );
+        assert!(
+            max_small_non_head_retained.load(Ordering::Acquire) <= 2 * 1024,
+            "non-head retained small-chunk output exceeded 2 KiB reorder budget: {}",
+            max_small_non_head_retained.load(Ordering::Acquire)
         );
 
         // Cancel under tight reorder backpressure with delayed stripe 0 must finish cleanly.
