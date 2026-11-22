@@ -312,24 +312,20 @@ pub(crate) struct BudgetGuard {
 }
 
 impl BudgetGuard {
-    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// Attempt to expand this reservation by `extra_bytes` without blocking.
-    pub(crate) fn try_grow(&mut self, extra_bytes: usize) -> bool {
-        if extra_bytes == 0 {
-            return true;
+    /// Release unused reservation bytes immediately and wake waiting jobs.
+    pub(crate) fn shrink_to(&mut self, new_bytes: usize) {
+        if new_bytes >= self.bytes {
+            return;
         }
+        let release = self.bytes - new_bytes;
         let mut used = self.budget.used.lock().unwrap();
-        if used.saturating_add(extra_bytes) <= self.budget.limit {
-            *used = used.saturating_add(extra_bytes);
-            self.bytes = self.bytes.saturating_add(extra_bytes);
-            true
-        } else {
-            false
-        }
+        *used = used.saturating_sub(release);
+        self.bytes = new_bytes;
+        self.budget.available.notify_all();
     }
 }
 
@@ -416,18 +412,46 @@ impl ByteBudget {
         }
     }
 
-    /// Attempt a non-blocking reservation if `bytes` fit within `self.limit`.
-    pub(crate) fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BudgetGuard> {
-        let requested = bytes.max(1);
+    /// Reserve between `min_bytes` and `preferred_bytes` from the shared budget, waiting until
+    /// at least `min_bytes` fit (or the budget is idle for a single large request) or `cancelled` fires.
+    pub(crate) fn acquire_up_to(
+        self: &Arc<Self>,
+        min_bytes: usize,
+        preferred_bytes: usize,
+        cancelled: &AtomicBool,
+    ) -> Option<BudgetGuard> {
+        let min_req = min_bytes.max(1);
+        let pref_req = preferred_bytes.max(min_req);
         let mut used = self.used.lock().unwrap();
-        if used.saturating_add(requested) <= self.limit {
-            *used = used.saturating_add(requested);
-            Some(BudgetGuard {
-                budget: Arc::clone(self),
-                bytes: requested,
-            })
-        } else {
-            None
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return None;
+            }
+            if *used == 0 {
+                *used = pref_req;
+                return Some(BudgetGuard {
+                    budget: Arc::clone(self),
+                    bytes: pref_req,
+                });
+            }
+            let free = self.limit.saturating_sub(*used);
+            if free >= min_req {
+                let granted = free.min(pref_req);
+                *used = used.saturating_add(granted);
+                return Some(BudgetGuard {
+                    budget: Arc::clone(self),
+                    bytes: granted,
+                });
+            }
+            #[cfg(test)]
+            if let Some(signal) = &self.wait_signal {
+                signal.store(true, Ordering::Release);
+            }
+            let (next_guard, _) = self
+                .available
+                .wait_timeout(used, std::time::Duration::from_millis(2))
+                .unwrap();
+            used = next_guard;
         }
     }
 
@@ -805,17 +829,25 @@ mod tests {
     }
 
     #[test]
-    fn budget_guard_try_grow_and_try_acquire_respect_limit() {
+    fn acquire_up_to_and_shrink_to_share_and_release_budget_cleanly() {
         let budget = Arc::new(ByteBudget::new(1000));
-        let mut g1 = budget.try_acquire(400).expect("fits");
-        assert_eq!(g1.bytes(), 400);
-        assert!(g1.try_grow(500));
-        assert_eq!(g1.bytes(), 900);
-        assert!(!g1.try_grow(200));
-        assert!(budget.try_acquire(200).is_none());
-        let g2 = budget.try_acquire(100).expect("fits remainder");
+        let cancelled = AtomicBool::new(false);
+        let mut g1 = budget.acquire_up_to(200, 1000, &cancelled).expect("idle");
+        assert_eq!(g1.bytes(), 1000);
         assert_eq!(budget.used(), 1000);
-        drop(g2);
+
+        let b2 = Arc::clone(&budget);
+        let c2 = Arc::new(AtomicBool::new(false));
+        let c2_wait = Arc::clone(&c2);
+        let waiter = thread::spawn(move || {
+            b2.acquire_up_to(300, 800, &c2_wait)
+                .map(|guard| guard.bytes())
+        });
+        thread::sleep(Duration::from_millis(10));
+        // Shrinking g1 from 1000 -> 400 frees 600 bytes (>= min 300), waking waiter for 600.
+        g1.shrink_to(400);
+        assert_eq!(g1.bytes(), 400);
+        assert_eq!(waiter.join().unwrap(), Some(600));
         drop(g1);
         assert_eq!(budget.used(), 0);
     }

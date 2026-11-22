@@ -242,11 +242,13 @@ impl LazyRunWorkspace {
     }
 }
 
-/// Shared payload budget coordinating both the per-job limit and the engine pool's shared
-/// out-of-core byte budget across concurrent engine callers.
+/// Job-level payload budget backed by an up-front reservation from the engine pool's shared
+/// `out_of_core_budget`. Because the reservation is acquired on the coordinator thread before
+/// spawning workers onto `EnginePool`, worker threads never block on cross-job budget waits
+/// and cannot starve queued tasks belonging to other jobs.
 pub(super) struct JobMemoryBudget {
     limit: usize,
-    shared: Arc<ByteBudget>,
+    shared_guard: Mutex<Option<BudgetGuard>>,
     used: Mutex<usize>,
     available: Condvar,
     spilled: AtomicBool,
@@ -254,14 +256,12 @@ pub(super) struct JobMemoryBudget {
 
 pub(super) struct JobBudgetGuard {
     job: Arc<JobMemoryBudget>,
-    shared_guard: Option<BudgetGuard>,
     reserved: usize,
     used: usize,
 }
 
 impl Drop for JobBudgetGuard {
     fn drop(&mut self) {
-        self.shared_guard.take();
         if self.reserved > 0 {
             let mut used = self.job.used.lock().unwrap();
             *used = used.saturating_sub(self.reserved);
@@ -271,14 +271,24 @@ impl Drop for JobBudgetGuard {
 }
 
 impl JobMemoryBudget {
-    pub(super) fn new(limit: usize, shared: Arc<ByteBudget>) -> Self {
-        Self {
-            limit: limit.max(1),
-            shared,
+    /// Reserve a job-scoped slice of `shared` on the coordinator thread before spawning workers.
+    /// Returns `None` if `cancelled` fires while waiting for shared budget admission.
+    pub(super) fn acquire_for_job(
+        requested_limit: usize,
+        shared: &Arc<ByteBudget>,
+        cancelled: &AtomicBool,
+    ) -> Option<Arc<Self>> {
+        let preferred = requested_limit.max(1);
+        let min_bytes = preferred.clamp(1, EXTERNAL_SPILL_TOTAL_BYTES / 8);
+        let shared_guard = shared.acquire_up_to(min_bytes, preferred, cancelled)?;
+        let granted_limit = shared_guard.bytes().min(preferred).max(1);
+        Some(Arc::new(Self {
+            limit: granted_limit,
+            shared_guard: Mutex::new(Some(shared_guard)),
             used: Mutex::new(0),
             available: Condvar::new(),
             spilled: AtomicBool::new(false),
-        }
+        }))
     }
 
     pub(super) fn limit(&self) -> usize {
@@ -290,29 +300,39 @@ impl JobMemoryBudget {
     }
 
     pub(super) fn mark_spilled(&self) {
-        self.spilled.store(true, Ordering::Release);
+        if !self.spilled.swap(true, Ordering::AcqRel)
+            && let Some(guard) = self.shared_guard.lock().unwrap().as_mut()
+        {
+            // Once spilling, steady-state worker arenas are capped at `EXTERNAL_SPILL_TOTAL_BYTES`,
+            // so release any excess reservation immediately for concurrent engine jobs.
+            let target = self.limit.clamp(1, EXTERNAL_SPILL_TOTAL_BYTES);
+            guard.shrink_to(target);
+        }
+    }
+
+    /// Release the coordinator's shared budget reservation once arenas are no longer in memory.
+    pub(super) fn release_shared_reservation(&self) {
+        self.shared_guard.lock().unwrap().take();
     }
 
     /// Non-blocking reservation attempt for an empty worker arena. Returns `None` when
-    /// another worker/job currently holds budget so the caller can spill completed arenas first.
+    /// another worker of this job currently holds budget so the caller can spill completed arenas first.
     pub(super) fn try_acquire_empty(self: &Arc<Self>, bytes: usize) -> Option<JobBudgetGuard> {
         let needed = bytes.max(1);
         let mut used = self.used.lock().unwrap();
         if *used != 0 && used.saturating_add(needed) > self.limit {
             return None;
         }
-        let shared_guard = self.shared.try_acquire(needed)?;
         *used = used.saturating_add(needed);
         Some(JobBudgetGuard {
             job: Arc::clone(self),
-            shared_guard: Some(shared_guard),
             reserved: needed,
             used: needed,
         })
     }
 
     /// Blocking reservation used when a worker's arena is empty so even an oversized row
-    /// makes forward progress once other workers flush.
+    /// makes forward progress once other active workers of this same job flush.
     pub(super) fn acquire_empty(
         self: &Arc<Self>,
         bytes: usize,
@@ -323,8 +343,9 @@ impl JobMemoryBudget {
             .flatten()
     }
 
-    /// Blocking reservation for an empty worker arena that invokes `on_wait` before sleeping
-    /// (allowing parallel workers to drain and spill any retained `completed_arenas`).
+    /// Reservation for an empty worker arena that invokes `on_wait` before waiting on this
+    /// job's active workers (allowing parallel workers to drain and spill `completed_arenas`).
+    /// Never blocks on cross-job `EnginePool` budgets.
     pub(super) fn acquire_empty_with_spill(
         self: &Arc<Self>,
         bytes: usize,
@@ -345,25 +366,10 @@ impl JobMemoryBudget {
             if let Some(guard) = self.try_acquire_empty(needed) {
                 return Ok(Some(guard));
             }
-            // Wait briefly for shared or job budget to free up, then recheck `on_wait` so any
-            // concurrently completed arena is also spilled rather than deadlocking.
-            let shared_guard = match self.shared.acquire(needed, cancelled) {
-                Some(g) => g,
-                None => return Ok(None),
-            };
-            let mut used = self.used.lock().unwrap();
-            if *used == 0 || used.saturating_add(needed) <= self.limit {
-                *used = used.saturating_add(needed);
-                return Ok(Some(JobBudgetGuard {
-                    job: Arc::clone(self),
-                    shared_guard: Some(shared_guard),
-                    reserved: needed,
-                    used: needed,
-                }));
-            }
-            drop(used);
-            drop(shared_guard);
             let used = self.used.lock().unwrap();
+            if *used == 0 || used.saturating_add(needed) <= self.limit {
+                continue;
+            }
             let _ = self
                 .available
                 .wait_timeout(used, std::time::Duration::from_millis(2))
@@ -374,7 +380,7 @@ impl JobMemoryBudget {
 
 impl JobBudgetGuard {
     /// Non-blocking reservation for adding another row to a non-empty arena.
-    /// Never blocks so concurrent jobs/workers cannot deadlock; returns `false` to trigger spill.
+    /// Never blocks so concurrent workers cannot deadlock; returns `false` to trigger spill.
     pub(super) fn try_reserve_additional(
         &mut self,
         extra: usize,
@@ -417,20 +423,6 @@ impl JobBudgetGuard {
         }
         let mut used = self.job.used.lock().unwrap();
         if used.saturating_add(delta) > self.job.limit {
-            return false;
-        }
-        let shared_ok = match self.shared_guard.as_mut() {
-            Some(guard) => guard.try_grow(delta),
-            None => {
-                if let Some(guard) = self.job.shared.try_acquire(delta) {
-                    self.shared_guard = Some(guard);
-                    true
-                } else {
-                    false
-                }
-            }
-        };
-        if !shared_ok {
             return false;
         }
         *used = used.saturating_add(delta);
@@ -862,9 +854,37 @@ fn clear_record_buffer(record: &mut Vec<u8>) {
     }
 }
 
+/// Sum the byte length of any unsaved edits targeting `physical_row` (O(1) when unedited).
+fn row_edit_bytes(
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    header_renames: &BTreeMap<usize, Vec<u8>>,
+    has_header: bool,
+    physical_row: u64,
+) -> usize {
+    if has_header && physical_row == 0 {
+        if header_renames.is_empty() {
+            return 0;
+        }
+        return header_renames
+            .values()
+            .fold(0_usize, |acc, v| acc.saturating_add(v.len()));
+    }
+    if cell_edits.is_empty() {
+        return 0;
+    }
+    cell_edits
+        .range((physical_row, 0)..=(physical_row, usize::MAX))
+        .fold(0_usize, |acc, (_, v)| acc.saturating_add(v.len()))
+}
+
 /// Conservative upper bound on decoded record + key memory before `evaluate_record` allocates,
-/// so multi-byte Windows-1252 / Latin-1 expansions acquire `LargeRecordGate` prior to allocation.
-fn conservative_record_expansion_bound(raw_len: usize, encoding: Encoding) -> usize {
+/// accounting for multi-byte Windows-1252 / Latin-1 expansions and large cell edits so
+/// workers acquire `LargeRecordGate` prior to allocation.
+pub(super) fn conservative_record_expansion_bound(
+    raw_len: usize,
+    edit_bytes: usize,
+    encoding: Encoding,
+) -> usize {
     let multiplier = match encoding {
         Encoding::Windows1252 => 6,
         Encoding::Latin1 => 4,
@@ -872,6 +892,7 @@ fn conservative_record_expansion_bound(raw_len: usize, encoding: Encoding) -> us
     };
     raw_len
         .saturating_mul(multiplier)
+        .saturating_add(edit_bytes.saturating_mul(4))
         .saturating_add(ARENA_ENTRY_BYTES)
 }
 
@@ -1031,7 +1052,11 @@ fn create_initial_runs_serial(
                              budget_guard: &mut Option<JobBudgetGuard>,
                              large_guard: &mut Option<LargeRecordGuard>|
      -> Result<bool, QuarryError> {
-        let pre_bound = conservative_record_expansion_bound(raw_record.len(), config.encoding);
+        let pre_bound = conservative_record_expansion_bound(
+            raw_record.len(),
+            row_edit_bytes(cell_edits, header_renames, has_header, row_num),
+            config.encoding,
+        );
         if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
             && large_guard.is_none()
         {
@@ -1458,8 +1483,11 @@ fn create_initial_runs_parallel(
                     {
                         return Ok(false);
                     }
-                    let pre_bound =
-                        conservative_record_expansion_bound(raw_record.len(), config.encoding);
+                    let pre_bound = conservative_record_expansion_bound(
+                        raw_record.len(),
+                        row_edit_bytes(&cell_edits, &header_renames, has_header, row_num),
+                        config.encoding,
+                    );
                     if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
                         && large_guard.is_none()
                     {
@@ -2141,23 +2169,25 @@ pub(super) fn reduce_runs_parallel(
             if shared.cancel_requested.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
                 break;
             }
+            // Acquire FD reservation on the coordinator thread BEFORE spawning onto `EnginePool`
+            // so merge worker threads never block waiting on cross-job `FdBudget`.
+            let Some(fd_guard) =
+                fd_budget.acquire(group.len().saturating_add(1), &shared.cancel_requested)
+            else {
+                break;
+            };
             let workspace = Arc::clone(workspace);
             let shared_worker = Arc::clone(shared);
-            let fd_budget = Arc::clone(fd_budget);
             let outputs = Arc::clone(&outputs);
             let first_error = Arc::clone(&first_error);
             let stop = Arc::clone(&stop);
 
             let spawned = executor.spawn(&shared.cancel_requested, move || {
+                let _fd_guard = fd_guard;
                 let shared = shared_worker;
                 if shared.cancel_requested.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
                     return;
                 }
-                let Some(fd_guard) =
-                    fd_budget.acquire(group.len().saturating_add(1), &shared.cancel_requested)
-                else {
-                    return;
-                };
                 let outcome = (|| -> Result<Option<SpillFile>, QuarryError> {
                     let (path, writer) = workspace.create_run()?;
                     let merged = merge_runs_to_run(
@@ -2180,7 +2210,7 @@ pub(super) fn reduce_runs_parallel(
                     shared.runs_created.fetch_add(1, Ordering::AcqRel);
                     Ok(Some(path))
                 })();
-                drop(fd_guard);
+                drop(_fd_guard);
                 match outcome {
                     Ok(Some(path)) => {
                         outputs.lock().unwrap()[group_index] = Some(path);

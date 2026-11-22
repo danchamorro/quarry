@@ -87,7 +87,7 @@ This ledger keeps three concepts explicitly distinct:
 | **T3** | Lifting Light-only appearance policy for Dark, custom, and Omarchy themes | Pending owner sign-off | Phase 4B-2, Phase 6 |
 | **T4** | Cross-platform Linux / Wayland / Hyprland / Omarchy desktop scope | Pending owner sign-off | Phase 4B, Phase 9B |
 | **T5** | `pread` vs guarded `mmap` & SIMD/parallel I/O strategy (ADR 0001) | **Decided (`2026-11-21`):** Approved parallel positional reads (`pread`/`FileExt::read_at` + read-ahead on Unix, `seek_read` on Windows) instead of `mmap` on user source files; ADR 0001 amended and `C02` kept `rephrase`. | Phase 2 |
-| **T6** | Partitioned hash-join with sort-merge skew fallback (ADR 0011) | **Decided (`2026-11-22`):** Approved profiling Join first (`3C-1`), shipping key-only frames + late materialization (`3C-2`), and amending ADR 0011 for partitioned hash-join with sort-merge skew fallback (`3C-3`) if warranted by evidence. | Phase 3 |
+| **T6** | Partitioned hash-join with sort-merge skew fallback (ADR 0011) | Pending Phase 3 design gate | Phase 3 |
 | **T7** | `.csv.zst` support & decoder crate selection (ADR 0012) | Pending Phase 7 ADR amendment | Phase 7 |
 | **T8** | Opt-in Combine Files column alignment & `_source_file` (ADR 0006) | Pending Phase 7 ADR amendment | Phase 7 |
 | **T9** | 200-document dormant-tab lifecycle & multi-window scheduler (ADR 0007) | Pending Phase 4A/4B ADR amendment | Phase 4A, Phase 4B |

@@ -1717,10 +1717,13 @@ fn run_sort_inner(
     min_parallel_stripe_bytes: u64,
 ) -> Result<Option<BuiltSortOutput>, QuarryError> {
     let pool = engine_pool();
-    let job_budget = Arc::new(parallel::JobMemoryBudget::new(
+    let Some(job_budget) = parallel::JobMemoryBudget::acquire_for_job(
         config.run_memory_bytes,
-        Arc::clone(pool.out_of_core_budget()),
-    ));
+        pool.out_of_core_budget(),
+        &shared.cancel_requested,
+    ) else {
+        return Ok(None);
+    };
     let parallel::AdaptiveScanOutcome::Complete(mut scan) = parallel::create_initial_runs_adaptive(
         Arc::clone(&source),
         shared.total_bytes,
@@ -1736,7 +1739,7 @@ fn run_sort_inner(
         source_index,
         requested_workers,
         min_parallel_stripe_bytes,
-        job_budget,
+        Arc::clone(&job_budget),
         Arc::clone(pool.large_record_gate()),
     )?
     else {
@@ -1753,6 +1756,11 @@ fn run_sort_inner(
     }
 
     let in_memory_fast_path = scan.runs.is_empty();
+    if !in_memory_fast_path {
+        // All arenas have been flushed to spill files; release the shared out-of-core budget
+        // reservation before entering the merge phase so concurrent jobs can make progress.
+        job_budget.release_shared_reservation();
+    }
     if !in_memory_fast_path
         && !parallel::reduce_runs_parallel(
             &mut scan.runs,
@@ -1794,6 +1802,8 @@ fn run_sort_inner(
         else {
             return Ok(None);
         };
+        drop(scan.in_memory_runs);
+        job_budget.release_shared_reservation();
         result
     } else {
         let Some(result) = merge_runs_to_output(
@@ -4723,6 +4733,153 @@ mod tests {
             fs::read(&dest).unwrap(),
             format!("k,v\n1,{payload_a}\n2,{payload_b}\n").as_bytes()
         );
+        assert!(sort_artifacts(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn pre_evaluation_bound_includes_row_cell_edits() {
+        // A tiny raw row with a multi-megabyte cell edit must trigger LargeRecordGate pre-evaluation.
+        let bound =
+            parallel::conservative_record_expansion_bound(12, 2 * 1024 * 1024, Encoding::Utf8);
+        assert!(
+            bound > crate::pool::LARGE_RECORD_GATE_BYTES,
+            "expected pre-evaluation bound ({bound}) to exceed LARGE_RECORD_GATE_BYTES"
+        );
+
+        // Verify an indexed parallel sort with short source rows and large cell edits succeeds
+        // with exact sorted output.
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("short-rows.csv");
+        let mut content = String::from("k,v\n");
+        for i in (0..64).rev() {
+            content.push_str(&format!("{i:04},s\n"));
+        }
+        fs::write(&source, content.as_bytes()).unwrap();
+        let s = session(&source, HeaderMode::FirstRow);
+        let idx = s
+            .start_indexing(IndexConfig {
+                checkpoint_every: 8,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let big_a = vec![b'a'; 128 * 1024];
+        let big_b = vec![b'b'; 128 * 1024];
+        let mut edits = BTreeMap::new();
+        edits.insert((1_u64, 1_usize), big_b.clone());
+        edits.insert((64_u64, 1_usize), big_a.clone());
+        let dest = directory.path().join("sorted-edited.csv");
+        let job = SortJob::start_with_options_internal(
+            s.path.clone(),
+            s.file_size,
+            s.dialect.delimiter,
+            s.dialect.has_header,
+            BTreeMap::new(),
+            edits,
+            SortSpec {
+                column: 0,
+                mode: SortMode::Number,
+                direction: SortDirection::Ascending,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
+            dest.clone(),
+            s.source_stamp.clone(),
+            SortConfig {
+                run_memory_bytes: 64 * 1024,
+                merge_fan_in: 4,
+                ..DEFAULT_SORT_CONFIG
+            },
+            Some(directory.path().to_path_buf()),
+            Some(idx.indexed_rows()),
+            Some(idx),
+            Some(4),
+            1,
+        )
+        .unwrap();
+        wait_done(&job);
+        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("sort cancelled");
+        };
+        assert_eq!(summary.rows_sorted, 64);
+        let out = fs::read_to_string(&dest).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "k,v");
+        assert_eq!(lines[1], format!("0000,{}", "a".repeat(128 * 1024)));
+        assert_eq!(lines[64], format!("0063,{}", "b".repeat(128 * 1024)));
+        assert!(sort_artifacts(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn concurrent_parallel_sorts_never_starve_engine_pool_on_shared_budget() {
+        // Launch 3 concurrent parallel sorts each requesting the full default 300 MB budget
+        // on the shared `engine_pool()`. Coordinator-side admission guarantees workers never
+        // occupy shared pool threads waiting on cross-job budget.
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("concurrent.csv");
+        let mut content = String::from("k,v\n");
+        for i in (0..400).rev() {
+            content.push_str(&format!("{i},payload-{i:04}-abcdef0123456789\n"));
+        }
+        fs::write(&source, content.as_bytes()).unwrap();
+        let s = session(&source, HeaderMode::FirstRow);
+        let idx = s
+            .start_indexing(IndexConfig {
+                checkpoint_every: 20,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let full_budget = crate::pool::default_single_run_memory_budget_bytes();
+        let mut jobs = Vec::new();
+        let mut dests = Vec::new();
+        for n in 0..3 {
+            let dest = directory.path().join(format!("out-{n}.csv"));
+            let job = SortJob::start_with_options_internal(
+                s.path.clone(),
+                s.file_size,
+                s.dialect.delimiter,
+                s.dialect.has_header,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SortSpec {
+                    column: 0,
+                    mode: SortMode::Number,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                dest.clone(),
+                s.source_stamp.clone(),
+                SortConfig {
+                    run_memory_bytes: full_budget,
+                    merge_fan_in: 4,
+                    ..DEFAULT_SORT_CONFIG
+                },
+                Some(directory.path().to_path_buf()),
+                Some(idx.indexed_rows()),
+                Some(idx.clone()),
+                Some(4),
+                1,
+            )
+            .unwrap();
+            jobs.push(job);
+            dests.push(dest);
+        }
+        for job in &jobs {
+            wait_done(job);
+        }
+        let mut outputs = Vec::new();
+        for (job, dest) in jobs.into_iter().zip(dests.iter()) {
+            let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("sort cancelled");
+            };
+            assert_eq!(summary.rows_sorted, 400);
+            outputs.push(fs::read(dest).unwrap());
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[1], outputs[2]);
         assert!(sort_artifacts(directory.path()).is_empty());
     }
 }

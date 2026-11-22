@@ -45,16 +45,33 @@ impl StoragePreferences {
         if let Some(pref_path) = path.as_ref() {
             match std::fs::File::open(pref_path) {
                 Ok(file) => {
-                    let mut content = String::new();
+                    let mut raw = Vec::new();
                     match file
-                        .take(MAX_STORAGE_PREFERENCES_BYTES)
-                        .read_to_string(&mut content)
+                        .take(MAX_STORAGE_PREFERENCES_BYTES + 1)
+                        .read_to_end(&mut raw)
                     {
                         Ok(_) => {
-                            if !content.trim().is_empty() {
-                                match parse_scratch_directory_pref(&content) {
-                                    Some(dir) => scratch_directory = Some(dir),
-                                    None => {
+                            if raw.len() as u64 > MAX_STORAGE_PREFERENCES_BYTES {
+                                load_error = Some(format!(
+                                    "Saved temporary folder preference ({}) exceeds the maximum supported size. Open File > Temporary storage… to choose your temporary folder again.",
+                                    pref_path.display()
+                                ));
+                            } else {
+                                match String::from_utf8(raw) {
+                                    Ok(content) => {
+                                        if !content.trim().is_empty() {
+                                            match parse_scratch_directory_pref(&content) {
+                                                Some(dir) => scratch_directory = Some(dir),
+                                                None => {
+                                                    load_error = Some(format!(
+                                                        "Saved temporary folder preference ({}) could not be parsed. Open File > Temporary storage… to choose your temporary folder again.",
+                                                        pref_path.display()
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
                                         load_error = Some(format!(
                                             "Saved temporary folder preference ({}) could not be parsed. Open File > Temporary storage… to choose your temporary folder again.",
                                             pref_path.display()
@@ -157,41 +174,51 @@ impl StoragePreferences {
 }
 
 fn encode_scratch_directory_pref(path: &Path) -> std::io::Result<String> {
-    if let Some(text) = path.to_str()
+    let encoded = if let Some(text) = path.to_str()
         && !text.contains('\n')
         && !text.contains('\r')
         && !text.contains('\0')
         && text.trim() == text
     {
-        return Ok(format!("scratch_directory={text}\n"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = path.as_os_str().as_bytes();
-        let mut hex = String::with_capacity("scratch_directory_hex=".len() + bytes.len() * 2 + 1);
-        hex.push_str("scratch_directory_hex=");
-        for byte in bytes {
-            use std::fmt::Write as _;
-            let _ = write!(hex, "{byte:02x}");
-        }
-        hex.push('\n');
-        Ok(hex)
-    }
-    #[cfg(not(unix))]
-    {
-        if let Some(text) = path.to_str()
-            && !text.contains('\n')
-            && !text.contains('\r')
-            && !text.contains('\0')
+        format!("scratch_directory={text}\n")
+    } else {
+        #[cfg(unix)]
         {
-            return Ok(format!("scratch_directory={text}\n"));
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = path.as_os_str().as_bytes();
+            let mut hex =
+                String::with_capacity("scratch_directory_hex=".len() + bytes.len() * 2 + 1);
+            hex.push_str("scratch_directory_hex=");
+            for byte in bytes {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+            }
+            hex.push('\n');
+            hex
         }
-        Err(std::io::Error::new(
+        #[cfg(not(unix))]
+        {
+            if let Some(text) = path.to_str()
+                && !text.contains('\n')
+                && !text.contains('\r')
+                && !text.contains('\0')
+            {
+                format!("scratch_directory={text}\n")
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Temporary folder path contains unsupported characters.",
+                ));
+            }
+        }
+    };
+    if encoded.len() as u64 > MAX_STORAGE_PREFERENCES_BYTES {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Temporary folder path contains unsupported characters.",
-        ))
+            "Temporary folder path is too long to save across restarts.",
+        ));
     }
+    Ok(encoded)
 }
 
 fn parse_scratch_directory_pref(content: &str) -> Option<PathBuf> {
@@ -2079,8 +2106,34 @@ mod tests {
             std::fs::create_dir(&spaced_dir).unwrap();
             prefs.set_scratch_directory(Some(&spaced_dir)).unwrap();
             assert_eq!(
-                StoragePreferences::load(Some(pref_path)).scratch_directory,
-                Some(spaced_dir)
+                StoragePreferences::load(Some(pref_path.clone())).scratch_directory,
+                Some(spaced_dir.clone())
+            );
+
+            // An oversized encoded path (> MAX_STORAGE_PREFERENCES_BYTES) must be rejected before
+            // saving rather than truncated on reload into a shorter valid parent path.
+            let huge_name = format!("{} ", "a".repeat(4_090));
+            let huge_path = PathBuf::from("/").join(huge_name);
+            assert!(prefs.set_scratch_directory(Some(&huge_path)).is_err());
+            assert_eq!(prefs.scratch_directory, Some(spaced_dir));
+
+            // An oversized preference file on disk must fail to load with an explicit error
+            // rather than parsing a truncated prefix.
+            let oversized_content = format!(
+                "scratch_directory_hex={}\n",
+                "2f".repeat((MAX_STORAGE_PREFERENCES_BYTES as usize) / 2 + 32)
+            );
+            assert!(oversized_content.len() as u64 > MAX_STORAGE_PREFERENCES_BYTES);
+            std::fs::write(&pref_path, oversized_content).unwrap();
+            let loaded = StoragePreferences::load(Some(pref_path));
+            assert_eq!(loaded.scratch_directory, None);
+            assert!(
+                loaded
+                    .load_error
+                    .as_deref()
+                    .is_some_and(|msg| msg.contains("maximum supported size")),
+                "expected oversized preference error, got {:?}",
+                loaded.load_error
             );
         }
     }
