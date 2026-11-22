@@ -1483,6 +1483,8 @@ fn acquire_cache_lock(cache_dir: &Path, blocking: bool) -> Option<File> {
         }
 
         let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
             .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .create(true)
@@ -1798,6 +1800,8 @@ fn create_private_exclusive_file(path: &Path) -> io::Result<File> {
         };
         const WRITE_DAC: u32 = 0x0004_0000;
         let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
             .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC)
             .create_new(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -1969,6 +1973,7 @@ fn verify_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> bool {
 
     const TOKEN_QUERY: u32 = 0x0008;
     const TOKEN_USER_CLASS: u32 = 1;
+    const TOKEN_OWNER_CLASS: u32 = 4;
     const SE_FILE_OBJECT: u32 = 1;
     const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
@@ -2063,11 +2068,39 @@ fn verify_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> bool {
             needed,
             &mut needed,
         );
-        CloseHandle(token);
         if ok == 0 {
+            CloseHandle(token);
             return false;
         }
         let user_sid = (*buf.as_ptr().cast::<SidAndAttributes>()).sid;
+
+        let mut owner_needed: u32 = 0;
+        let _ = GetTokenInformation(
+            token,
+            TOKEN_OWNER_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut owner_needed,
+        );
+        let mut owner_buf = if owner_needed > 0 {
+            vec![0u8; owner_needed as usize]
+        } else {
+            Vec::new()
+        };
+        let token_owner_sid = if owner_needed > 0
+            && GetTokenInformation(
+                token,
+                TOKEN_OWNER_CLASS,
+                owner_buf.as_mut_ptr().cast(),
+                owner_needed,
+                &mut owner_needed,
+            ) != 0
+        {
+            *owner_buf.as_ptr().cast::<*mut c_void>()
+        } else {
+            std::ptr::null_mut()
+        };
+        CloseHandle(token);
 
         let system_sid_wide: Vec<u16> = "S-1-5-18\0".encode_utf16().collect();
         let mut system_sid: *mut c_void = std::ptr::null_mut();
@@ -2095,8 +2128,10 @@ fn verify_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> bool {
             return false;
         }
 
-        let mut allowed =
-            !owner_sid.is_null() && EqualSid(owner_sid, user_sid) != 0 && !dacl.is_null();
+        let owner_matches = !owner_sid.is_null()
+            && (EqualSid(owner_sid, user_sid) != 0
+                || (!token_owner_sid.is_null() && EqualSid(owner_sid, token_owner_sid) != 0));
+        let mut allowed = owner_matches && !dacl.is_null();
         if allowed {
             let mut size_info = AclSizeInformation {
                 ace_count: 0,
