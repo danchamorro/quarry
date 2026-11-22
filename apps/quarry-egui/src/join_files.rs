@@ -9,8 +9,8 @@ use quarry_core::{
 };
 use std::thread::{self, JoinHandle};
 
-pub(super) const INPUT_RESERVED: &str =
-    "This document is being used by Join Files. Reset or close the join before changing it.";
+pub(super) use quarry_workbench::JOIN_INPUT_RESERVED as INPUT_RESERVED;
+use quarry_workbench::{CapturedDocument, DocumentProbe};
 
 /// Maximum unfinished superseded header probes kept off-thread at once.
 const MAX_RETIRED_HEADER_JOBS: usize = 2;
@@ -41,181 +41,10 @@ impl RetiredHeader {
     }
 }
 
-struct DocumentLease {
-    counter: Arc<std::sync::atomic::AtomicUsize>,
-    generation: Option<Arc<quarry_core::WorkingCopyStorage>>,
-}
-impl Drop for DocumentLease {
-    fn drop(&mut self) {
-        // Release generation ownership before allowing another document action.
-        drop(self.generation.take());
-        self.counter
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
-type CellEditMap = BTreeMap<(u64, usize), Arc<Vec<u8>>>;
-
-/// Weak metadata signatures detect changed drafts without retaining idle input data.
-struct DocumentProbe {
-    tab_id: u64,
-    session: std::sync::Weak<Session>,
-    headers: std::sync::Weak<BTreeMap<usize, Arc<String>>>,
-    cells: std::sync::Weak<CellEditMap>,
-    header_cells: bool,
-}
-impl DocumentProbe {
-    fn capture(tab_id: u64, document: &Document) -> Self {
-        Self {
-            tab_id,
-            session: Arc::downgrade(&document.session),
-            headers: Arc::downgrade(&document.header_renames),
-            cells: Arc::downgrade(&document.cell_edits),
-            header_cells: Self::has_header_cells(document),
-        }
-    }
-    fn has_header_cells(document: &Document) -> bool {
-        document.session.dialect.has_header
-            && document
-                .cell_edits
-                .first_key_value()
-                .is_some_and(|((row, _), _)| *row == 0)
-    }
-
-    fn matches(&self, tab_id: u64, document: &Document) -> bool {
-        self.tab_id == tab_id
-            && !document.source_changed
-            && self.session.ptr_eq(&Arc::downgrade(&document.session))
-            && self
-                .headers
-                .ptr_eq(&Arc::downgrade(&document.header_renames))
-            && (self.cells.ptr_eq(&Arc::downgrade(&document.cell_edits))
-                || !self.header_cells && !Self::has_header_cells(document))
-    }
-}
-
-struct CapturedDocument {
-    path: PathBuf,
-    source: JoinWorkingSource,
-    probe: DocumentProbe,
-    columns: usize,
-}
-
 struct OpenDocumentChoice {
     tab_id: u64,
     label: String,
     path: PathBuf,
-}
-
-impl Document {
-    pub(super) fn join_reserved(&self) -> bool {
-        self.join_reservations
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-    }
-
-    fn join_capture_disabled_reason(&self) -> Option<&'static str> {
-        if let Some(reason) = self.compressed_join_reason() {
-            return Some(reason);
-        }
-        if self.join_reserved() {
-            return Some(INPUT_RESERVED);
-        }
-        if self.filter_active() || self.filter_refresh_pending {
-            return Some("Clear this document's filters before using it in a join.");
-        }
-        if self.source_changed {
-            return Some("Reopen this changed document before using it in a join.");
-        }
-        if self.job.is_some()
-            || self.pending_materialization.is_some()
-            || self.save_job.is_some()
-            || self.export_job.is_some()
-            || self.structural_job.is_some()
-            || self.search_job.is_some()
-            || self.filter_job.is_some()
-        {
-            return Some("Wait for this document's active operation to finish before joining.");
-        }
-        None
-    }
-
-    fn commit_join_drafts(&mut self) -> Result<(), String> {
-        if let Some(reason) = self.join_capture_disabled_reason() {
-            return Err(reason.into());
-        }
-        let limit = JoinConfig::default().max_record_bytes;
-        if self
-            .header_edit
-            .as_ref()
-            .is_some_and(|edit| edit.draft.len() > limit)
-            || self
-                .cell_edit
-                .as_ref()
-                .is_some_and(|edit| edit.draft.len() > limit)
-        {
-            return Err(
-                "An editor draft exceeds the record limit. Shorten it before joining.".into(),
-            );
-        }
-        if self
-            .header_edit
-            .as_ref()
-            .is_some_and(|edit| !self.header_is_editable(edit.column))
-        {
-            return Err("Finish or cancel the invalid header draft before joining.".into());
-        }
-        if let Some(edit) = &self.cell_edit
-            && self.cell_edit_disabled_reason(Some(&edit.source)).is_some()
-        {
-            return Err("Finish or cancel the invalid cell draft before joining.".into());
-        }
-        self.commit_edits();
-        Ok(())
-    }
-
-    fn capture_join_document(&mut self, tab_id: u64) -> Result<CapturedDocument, String> {
-        self.commit_join_drafts()?;
-        if self.has_structural_edits() && self.original_session.is_none() {
-            return Err("The original source cannot be identified. Save a copy and reopen it before joining.".into());
-        }
-        let generation =
-            if self.has_structural_edits() {
-                let name = self
-                    .session
-                    .path()
-                    .file_name()
-                    .ok_or("Missing private generation name.")?;
-                Some(self.working_copy.as_ref()
-                .and_then(|state| std::iter::once(&state.directory)
-                    .chain(state.previous_directories.iter())
-                    .find(|directory| directory.has_generation_name(name)))
-                .cloned()
-                .ok_or("The current working generation is no longer owned. Reopen this document.")?)
-            } else {
-                None
-            };
-        let probe = DocumentProbe::capture(tab_id, self);
-        self.join_reservations
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let owner = Arc::new(DocumentLease {
-            counter: Arc::clone(&self.join_reservations),
-            generation,
-        });
-        let source = JoinWorkingSource::capture(
-            Arc::clone(&self.session),
-            self.original_session.as_ref().unwrap_or(&self.session),
-            Arc::clone(&self.header_renames),
-            Arc::clone(&self.cell_edits),
-            owner,
-        );
-        Ok(CapturedDocument {
-            path: self.logical_path.clone(),
-            source,
-            probe,
-            columns: self.total_columns,
-        })
-    }
 }
 
 struct OutputColumnDraft {

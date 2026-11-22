@@ -5,6 +5,7 @@ members = [
     "apps/quarry-egui",
     "crates/quarry-core",
     "crates/quarry-delimited",
+    "crates/quarry-workbench",
 ]
 resolver = "2"
 

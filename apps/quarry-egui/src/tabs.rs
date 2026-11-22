@@ -1404,7 +1404,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .selected_rows
-            .select(100, egui::Modifiers::NONE);
+            .select(100, quarry_workbench::SelectionModifiers::NONE);
         app.open_new_path(b.clone()).unwrap();
         let b_id = app.active.id;
         assert!(!app.active.document.as_ref().unwrap().is_dirty());

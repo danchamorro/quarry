@@ -41,9 +41,9 @@ jobs:
         run: |
           uname -sm
           rustc -vV
-      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli --all-targets --locked -- -D warnings
-      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
-      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
+      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-targets --all-features --locked -- -D warnings
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --locked
+      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --release --locked
 
   linux-arm64-core-cli:
     runs-on: ubuntu-24.04-arm
@@ -60,9 +60,9 @@ jobs:
         run: |
           uname -sm
           rustc -vV
-      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli --all-targets --locked -- -D warnings
-      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
-      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
+      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-targets --all-features --locked -- -D warnings
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --locked
+      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --release --locked
 
   macos-intel-core-cli:
     runs-on: macos-15-intel
@@ -79,9 +79,9 @@ jobs:
         run: |
           uname -sm
           rustc -vV
-      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli --all-targets --locked -- -D warnings
-      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli --locked
-      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli --release --locked
+      - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-targets --all-features --locked -- -D warnings
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --locked
+      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --release --locked
 
   windows-core:
     runs-on: windows-latest
@@ -108,4 +108,5 @@ jobs:
       - run: cargo test -p quarry-core --locked working_storage::tests
       - run: cargo test -p quarry-core --locked sidecar::tests
       - run: "cargo test -p quarry-core --locked join_faults::"
-      - run: cargo build -p quarry-core -p quarry-delimited --release --locked
+      - run: cargo test -p quarry-workbench --locked
+      - run: cargo build -p quarry-core -p quarry-delimited -p quarry-workbench --release --locked
