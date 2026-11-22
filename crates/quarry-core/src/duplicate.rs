@@ -840,40 +840,41 @@ fn retain_first_runs(
             let record = read_record(reader, item.head.record_len, config.max_record_bytes)?;
             retained_max_width =
                 retained_max_width.max(parallel::count_record_fields(&record, delimiter)?);
-            let planned = arena.planned_capacity_bytes(8, record.len(), Some(survivor_cap));
-            if !arena.is_empty() && planned > survivor_cap {
-                let Some((run, _)) = arena.flush_to_workspace_mode(
-                    SortDirection::Ascending,
-                    false,
-                    workspace,
-                    shared,
-                    survivor_cap,
-                )?
-                else {
-                    return Ok(None);
-                };
-                runs.push(run);
-            }
-            if arena.is_empty()
-                && arena.planned_capacity_bytes(8, record.len(), Some(survivor_cap)) > survivor_cap
-            {
-                arena.clear_for_reuse(0);
-            }
-            records.observe(&record);
             let ordinal_key = item.head.ordinal.to_be_bytes();
-            arena.push_bounded(&ordinal_key, &record, item.head.ordinal, Some(survivor_cap));
-            if arena.capacity_bytes() > survivor_cap {
-                let Some((run, _)) = arena.flush_to_workspace_mode(
-                    SortDirection::Ascending,
-                    false,
-                    workspace,
-                    shared,
-                    0,
-                )?
-                else {
-                    return Ok(None);
-                };
-                runs.push(run);
+            if parallel::RunArena::entry_footprint(ordinal_key.len(), record.len()) > survivor_cap {
+                // Stream oversized survivors directly to their own spill run without staging a
+                // second full copy inside the bounded survivor arena.
+                let (path, mut writer) = workspace.create_run()?;
+                let bytes =
+                    write_entry_parts(&mut writer, &ordinal_key, &record, item.head.ordinal)?;
+                writer.flush()?;
+                shared.add_temporary_bytes(bytes);
+                shared.runs_created.fetch_add(1, Ordering::AcqRel);
+                runs.push(path);
+                records.observe(&record);
+            } else {
+                let planned = arena.planned_capacity_bytes(8, record.len(), Some(survivor_cap));
+                if !arena.is_empty() && planned > survivor_cap {
+                    let Some((run, _)) = arena.flush_to_workspace_mode(
+                        SortDirection::Ascending,
+                        false,
+                        workspace,
+                        shared,
+                        survivor_cap,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    runs.push(run);
+                }
+                if arena.is_empty()
+                    && arena.planned_capacity_bytes(8, record.len(), Some(survivor_cap))
+                        > survivor_cap
+                {
+                    arena.clear_for_reuse(0);
+                }
+                records.observe(&record);
+                arena.push_bounded(&ordinal_key, &record, item.head.ordinal, Some(survivor_cap));
             }
             previous_key = Some(item.head.key);
             state.retained_rows.fetch_add(1, Ordering::AcqRel);

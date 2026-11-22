@@ -10576,8 +10576,10 @@ mod tests {
             max_small_non_head_retained.load(Ordering::Acquire)
         );
 
-        // Cancel under tight reorder backpressure with delayed stripe 0 must finish cleanly.
+        // Cancel under tight reorder backpressure with stripe 0 deterministically held until
+        // cancellation is requested must finish cleanly and clean up all staging artifacts.
         let waited_on_reorder = Arc::new(AtomicBool::new(false));
+        let release_stripe_zero = Arc::new(AtomicBool::new(false));
         let cancel_dest = dir.path().join("cancelled.csv");
         let cancel_inner = SaveAsJob::start_worker_with_options(
             session.path.clone(),
@@ -10602,8 +10604,8 @@ mod tests {
                 flush_chunk_bytes: 1024,
                 reorder_budget_bytes: 1024,
                 max_head_in_flight: 1,
-                delay_stripe_zero: Some(Duration::from_millis(500)),
-                wait_stripe_zero_until: None,
+                delay_stripe_zero: None,
+                wait_stripe_zero_until: Some(Arc::clone(&release_stripe_zero)),
                 max_chunk_bytes_seen: None,
                 on_reorder_wait: Some(Arc::clone(&waited_on_reorder)),
                 max_non_head_output_bytes_seen: None,
@@ -10622,7 +10624,12 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(
+            !cancel_job.progress().done,
+            "stripe 0 must remain held so backpressure is active when cancellation is requested"
+        );
         cancel_job.cancel();
+        release_stripe_zero.store(true, Ordering::Release);
         assert_eq!(cancel_job.wait().unwrap(), ReplaceAllOutcome::Cancelled);
         assert!(!cancel_dest.exists());
         assert!(temporary_exports(&cancel_dest).is_empty());

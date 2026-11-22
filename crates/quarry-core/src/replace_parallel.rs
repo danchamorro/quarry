@@ -971,22 +971,60 @@ pub(super) fn copy_with_replaced_records_parallel(
                         .saturating_add(std::mem::size_of::<u64>())
                         .max(1);
 
+                    // Plan exact `chunk_bytes` and `relative_ends` capacities inside a reorder
+                    // guard's reserved bytes so neither `append_replaced_record` nor `push` can
+                    // trigger unbudgeted Vec growth past `guard.bytes()`.
+                    let plan_chunk_capacities = |chunk_bytes: &Vec<u8>,
+                                                 relative_ends: &Vec<u64>,
+                                                 budget: usize|
+                     -> Option<(usize, usize)> {
+                        let need_bytes = chunk_bytes.len().saturating_add(est_output_bytes);
+                        let need_ends = relative_ends.len().saturating_add(1);
+                        let cur_bytes_cap = chunk_bytes.capacity();
+                        let cur_ends_cap = relative_ends.capacity();
+                        let next_ends_cap = if need_ends <= cur_ends_cap {
+                            cur_ends_cap
+                        } else {
+                            let min_bytes_cap = cur_bytes_cap.max(need_bytes);
+                            let max_ends =
+                                budget.saturating_sub(min_bytes_cap) / std::mem::size_of::<u64>();
+                            if need_ends > max_ends {
+                                return None;
+                            }
+                            cur_ends_cap
+                                .saturating_mul(2)
+                                .max(16)
+                                .min(max_ends)
+                                .max(need_ends)
+                        };
+                        let ends_cap_bytes =
+                            next_ends_cap.saturating_mul(std::mem::size_of::<u64>());
+                        let max_bytes = budget.saturating_sub(ends_cap_bytes);
+                        let next_bytes_cap = if need_bytes <= cur_bytes_cap {
+                            if cur_bytes_cap > max_bytes {
+                                return None;
+                            }
+                            cur_bytes_cap
+                        } else {
+                            if need_bytes > max_bytes {
+                                return None;
+                            }
+                            cur_bytes_cap
+                                .saturating_mul(2)
+                                .max(need_bytes)
+                                .min(max_bytes)
+                        };
+                        Some((next_bytes_cap, next_ends_cap))
+                    };
+
                     // Flush any buffered output BEFORE acquiring fresh credit or `large_record_gate`
-                    // whenever this row would exceed our pre-acquired `chunk_credit` (or when we
-                    // need `large_record_gate`). Because `chunk_credit` is already held, flushing
-                    // is non-blocking and leaves `chunk_bytes` empty before any potential wait.
+                    // whenever this row's capacity plan would exceed our pre-acquired `chunk_credit`
+                    // (or when we need `large_record_gate`). Because `chunk_credit` is already held,
+                    // flushing is non-blocking and leaves `chunk_bytes` empty before any potential wait.
                     let would_exceed_credit = match chunk_credit.as_ref() {
                         Some(EmitCredit::Reorder(guard)) => {
-                            let projected = chunk_bytes
-                                .len()
-                                .saturating_add(est_output_bytes)
-                                .saturating_add(
-                                    relative_ends
-                                        .len()
-                                        .saturating_add(1)
-                                        .saturating_mul(std::mem::size_of::<u64>()),
-                                );
-                            projected > guard.bytes()
+                            plan_chunk_capacities(chunk_bytes, relative_ends, guard.bytes())
+                                .is_none()
                         }
                         Some(EmitCredit::Head(_)) => {
                             !chunk_bytes.is_empty()
@@ -1040,6 +1078,17 @@ pub(super) fn copy_with_replaced_records_parallel(
                             ));
                         }
                         *chunk_credit = Some(credit);
+                    }
+                    if let Some(EmitCredit::Reorder(guard)) = chunk_credit.as_ref()
+                        && let Some((next_bytes_cap, next_ends_cap)) =
+                            plan_chunk_capacities(chunk_bytes, relative_ends, guard.bytes())
+                    {
+                        if next_bytes_cap > chunk_bytes.capacity() {
+                            chunk_bytes.reserve_exact(next_bytes_cap - chunk_bytes.len());
+                        }
+                        if next_ends_cap > relative_ends.capacity() {
+                            relative_ends.reserve_exact(next_ends_cap - relative_ends.len());
+                        }
                     }
                     if needs_large_gate && large_guard.is_none() {
                         let guard = if let Some(g) = large_record_gate.try_acquire() {
