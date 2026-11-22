@@ -4739,11 +4739,22 @@ mod tests {
     #[test]
     fn pre_evaluation_bound_includes_row_cell_edits() {
         // A tiny raw row with a multi-megabyte cell edit must trigger LargeRecordGate pre-evaluation.
-        let bound =
-            parallel::conservative_record_expansion_bound(12, 2 * 1024 * 1024, Encoding::Utf8);
+        let bound = parallel::conservative_record_expansion_bound(
+            12,
+            2 * 1024 * 1024,
+            Encoding::Utf8,
+            false,
+        );
         assert!(
             bound > crate::pool::LARGE_RECORD_GATE_BYTES,
             "expected pre-evaluation bound ({bound}) to exceed LARGE_RECORD_GATE_BYTES"
+        );
+        // A 1.5 MiB UTF-8 row in a multi-column composite sort can expand up to ~3x due to NUL escaping.
+        let composite_bound =
+            parallel::conservative_record_expansion_bound(1_500_000, 0, Encoding::Utf8, true);
+        assert!(
+            composite_bound > crate::pool::LARGE_RECORD_GATE_BYTES,
+            "expected composite pre-evaluation bound ({composite_bound}) to exceed LARGE_RECORD_GATE_BYTES"
         );
 
         // Verify an indexed parallel sort with short source rows and large cell edits succeeds

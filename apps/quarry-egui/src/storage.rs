@@ -2103,16 +2103,39 @@ mod tests {
             None
         );
 
-        // Paths with trailing spaces must round-trip losslessly without trimming.
+        // Paths with trailing spaces must round-trip losslessly without trimming (both hex-encoded
+        // and legacy plain `scratch_directory=` entries when trimmed and untrimmed siblings coexist).
         #[cfg(unix)]
         {
+            let trimmed_dir = dir.path().join("scratch with trailing space");
             let spaced_dir = dir.path().join("scratch with trailing space ");
+            std::fs::create_dir(&trimmed_dir).unwrap();
             std::fs::create_dir(&spaced_dir).unwrap();
             prefs.set_scratch_directory(Some(&spaced_dir)).unwrap();
             assert_eq!(
                 StoragePreferences::load(Some(pref_path.clone())).scratch_directory,
                 Some(spaced_dir.clone())
             );
+
+            // Legacy plain entry with trailing space must select the exact trailing-space folder on startup.
+            std::fs::write(
+                &pref_path,
+                format!("scratch_directory={}\n", spaced_dir.display()),
+            )
+            .unwrap();
+            let mut plain_app = QuarryApp::new(Some(source.clone()), Instant::now());
+            finish(&mut plain_app);
+            plain_app.storage_preferences = StoragePreferences::load(Some(pref_path.clone()));
+            plain_app.apply_loaded_storage_preferences();
+            assert_eq!(plain_app.working_directory, spaced_dir);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while plain_app.scratch_validation_worker.is_some() {
+                plain_app.poll_scratch_validation_worker();
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert!(plain_app.active.notice.is_none());
+            assert_eq!(plain_app.working_directory, spaced_dir);
 
             // An oversized encoded path (> MAX_STORAGE_PREFERENCES_BYTES) must be rejected before
             // saving rather than truncated on reload into a shorter valid parent path.

@@ -898,22 +898,39 @@ fn row_edit_bytes(
         .fold(0_usize, |acc, (_, v)| acc.saturating_add(v.len()))
 }
 
-/// Conservative upper bound on decoded record + key memory before `evaluate_record` allocates,
-/// accounting for multi-byte Windows-1252 / Latin-1 expansions and large cell edits so
-/// workers acquire `LargeRecordGate` prior to allocation.
+/// Conservative upper bound on decoded record + effective record + sort-key memory before
+/// `evaluate_record` allocates, accounting for encoding expansion (Windows-1252, Latin-1, UTF-16),
+/// cell edits (with CSV quote doubling), and multi-column composite-key escaping (`0x00`/`0xFF`
+/// byte doubling) so workers acquire `LargeRecordGate` prior to allocation.
 pub(super) fn conservative_record_expansion_bound(
     raw_len: usize,
     edit_bytes: usize,
     encoding: Encoding,
+    composite_key: bool,
 ) -> usize {
-    let multiplier = match encoding {
-        Encoding::Windows1252 => 6,
-        Encoding::Latin1 => 4,
-        Encoding::Utf8 | Encoding::Utf16Le | Encoding::Utf16Be => 2,
+    let decode_multiplier = match encoding {
+        Encoding::Windows1252 => 3,
+        Encoding::Latin1 | Encoding::Utf16Le | Encoding::Utf16Be => 2,
+        Encoding::Utf8 => 1,
     };
-    raw_len
-        .saturating_mul(multiplier)
-        .saturating_add(edit_bytes.saturating_mul(4))
+    let decoded_bound = raw_len.saturating_mul(decode_multiplier);
+    let temp_decode_buffer = if encoding == Encoding::Utf8 {
+        0
+    } else {
+        decoded_bound
+    };
+    let effective_record_bound = if edit_bytes > 0 {
+        decoded_bound.saturating_add(edit_bytes).saturating_mul(2)
+    } else {
+        decoded_bound
+    };
+    let key_multiplier = if composite_key { 2 } else { 1 };
+    let key_bound = decoded_bound
+        .saturating_add(edit_bytes)
+        .saturating_mul(key_multiplier);
+    temp_decode_buffer
+        .saturating_add(effective_record_bound)
+        .saturating_add(key_bound)
         .saturating_add(ARENA_ENTRY_BYTES)
 }
 
@@ -1077,6 +1094,7 @@ fn create_initial_runs_serial(
             raw_record.len(),
             row_edit_bytes(cell_edits, header_renames, has_header, row_num),
             config.encoding,
+            spec.keys.len() > 1,
         );
         if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
             && large_guard.is_none()
@@ -1508,6 +1526,7 @@ fn create_initial_runs_parallel(
                         raw_record.len(),
                         row_edit_bytes(&cell_edits, &header_renames, has_header, row_num),
                         config.encoding,
+                        spec.keys.len() > 1,
                     );
                     if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
                         && large_guard.is_none()
