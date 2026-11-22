@@ -229,3 +229,19 @@ HTML (SHA-256
 affected inputs are the lockfile's dependency lists, the core, CLI, and egui
 manifests, and this audit record. The regenerated manifest hash records this
 bounded review; it is not a change of license terms or release approval.
+
+## 2026-11-22 frontend-neutral quarry-workbench extraction
+
+Extracting Quarry's UI-independent document model from `apps/quarry-egui` into
+the new first-party workspace crate `crates/quarry-workbench` (`MIT OR
+Apache-2.0`) adds zero third-party crates to `Cargo.lock`: `quarry-workbench`
+depends only on internal `quarry-core` and already-locked `tempfile@3.27.0`
+(with already-locked `flate2@1.1.9` as a dev-dependency only). Regeneration
+with the checksum-verified cargo-about 0.9.2 ARM64 tool updated only the locked
+package count (142 to 143) and added the single `quarry-workbench@0.1.0`
+(`MIT OR Apache-2.0`) row in `THIRD_PARTY_NOTICES.html`. Selected third-party
+notice terms, supplemental text/font hashes, and Rust runtime resources are
+unchanged. The affected inputs are `Cargo.toml`, `Cargo.lock`,
+`apps/quarry-egui/Cargo.toml`, `crates/quarry-workbench/Cargo.toml`, and this
+audit record. The regenerated manifest hash records this bounded review; it is
+not a change of license terms or release approval.

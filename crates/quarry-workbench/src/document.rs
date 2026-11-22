@@ -25,9 +25,11 @@ use quarry_core::{
     IndexJob, IndexProgress, JoinConfig, JoinWorkingSource, LiteralReplacement,
     MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row,
     RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchMatch, SearchOutcome,
-    SearchPosition, SearchProgress, Session, SortDirection, SortJob, SortMode, SortOutcome,
-    SortPlan, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    SearchPosition, Session, SortDirection, SortJob, SortMode, SortOutcome, SortPlan,
+    SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
 };
+#[cfg(any(test, feature = "test-hooks"))]
+use quarry_core::{SearchProgress, SortSpec};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -1499,6 +1501,11 @@ impl Document {
                 source_column,
                 separator,
             } => match job.wait() {
+                Ok(SplitAnalysisOutcome::Complete(_)) if cancel_requested => {
+                    self.structural_status =
+                        Some("Split cancelled. The document was not changed.".into());
+                    Ok(None)
+                }
                 Ok(SplitAnalysisOutcome::Complete(summary)) if summary.max_pieces >= 2 => {
                     let source_header = self.session.dialect.has_header.then(|| {
                         self.current_header_fields()
@@ -2501,8 +2508,14 @@ impl Document {
                     self.invalidate_changed_source();
                     return Err(SOURCE_CHANGED_NOTICE.into());
                 }
-                self.pending_filter_read = None;
-                return Err(self.diagnostic_error(error));
+                let message = self.diagnostic_error(error);
+                if desired.is_some_and(|window| window != active.window) {
+                    self.pending_filter_read = desired;
+                    let _ = self.schedule_filter_buffer(self.filter_viewport_start);
+                } else {
+                    self.pending_filter_read = None;
+                }
+                return Err(message);
             }
         }
 
@@ -2697,6 +2710,11 @@ impl Document {
         if self.export_job.is_some() {
             return Err(AppMessage::warning(
                 "Cancel the active export before saving.",
+            ));
+        }
+        if utf8 && destination.is_none() {
+            return Err(AppMessage::warning(
+                "Choose a destination file to save a UTF-8 copy.",
             ));
         }
         if let Some(warning) = destination
@@ -3686,8 +3704,19 @@ impl Document {
 
     pub fn load_buffer(&mut self, viewport_start: u64) -> Result<(), String> {
         let available = self.available_rows();
-        let visible_end = viewport_start
-            .saturating_add((available - viewport_start).min(self.visible_rows as u64));
+        if available <= self.data_start || viewport_start >= available {
+            self.buffer_start = self.data_start;
+            if !self.buffered_rows.is_empty() {
+                self.whitespace.invalidate_rows();
+                self.buffered_rows.clear();
+            }
+            return Ok(());
+        }
+        let visible_end = viewport_start.saturating_add(
+            available
+                .saturating_sub(viewport_start)
+                .min(self.visible_rows as u64),
+        );
         let loaded_end = self
             .buffer_start
             .saturating_add(self.buffered_rows.len() as u64);
@@ -3704,7 +3733,7 @@ impl Document {
             .saturating_sub(OVERSCAN_ROWS as u64)
             .max(self.data_start)
             .min(last_start);
-        let count = (available - start).min(capacity) as usize;
+        let count = available.saturating_sub(start).min(capacity) as usize;
         let end = start.saturating_add(count as u64);
         let began = Instant::now();
         let rows = if end <= self.session.first_rows.len() as u64 {
@@ -3854,12 +3883,15 @@ impl Document {
     }
 
     pub fn visible_filter_rows(&self) -> &[Arc<FilterMatch>] {
-        let offset = usize::try_from(
-            self.filter_viewport_start
-                .saturating_sub(self.filter_buffer_start),
-        )
-        .unwrap_or(self.filtered_rows.len())
-        .min(self.filtered_rows.len());
+        let Some(relative) = self
+            .filter_viewport_start
+            .checked_sub(self.filter_buffer_start)
+        else {
+            return &[];
+        };
+        let offset = usize::try_from(relative)
+            .unwrap_or(self.filtered_rows.len())
+            .min(self.filtered_rows.len());
         let end = offset
             .saturating_add(self.visible_rows)
             .min(self.filtered_rows.len());
@@ -5995,5 +6027,73 @@ mod tests {
         assert_eq!(document.cell_edits[&(1, 1)].as_slice(), b"pending");
         assert!(document.can_undo());
         assert_eq!(fs::read(source).unwrap(), b"name,value\nrow,original\n");
+    }
+
+    #[test]
+    fn empty_file_with_first_row_header_polls_without_underflow() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.csv");
+        fs::write(&path, b"").unwrap();
+        let mut document = Document::open(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(document.data_start, 1);
+        assert_eq!(document.viewport_start, 1);
+        finish_index(&mut document);
+        assert!(document.progress.done);
+        assert_eq!(document.available_rows(), 0);
+        assert_eq!(document.available_data_rows(), 0);
+        assert!(document.visible_rows().is_empty());
+        document.load_buffer(1).unwrap();
+        assert!(document.visible_rows().is_empty());
+    }
+
+    #[test]
+    fn visible_filter_rows_returns_empty_when_viewport_precedes_buffer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("filter-backward.csv");
+        fs::write(&path, b"name\na\nb\nc\n").unwrap();
+        let mut document = Document::open(&path, OpenOptions::default()).unwrap();
+        finish_index(&mut document);
+        document.filter_buffer_start = 84;
+        document.filter_viewport_start = 0;
+        document.filtered_rows = vec![Arc::new(FilterMatch {
+            match_ordinal: 84,
+            row: 85,
+            record_offset: 0,
+            fields: vec![b"stale".to_vec()],
+        })];
+        assert!(document.visible_filter_rows().is_empty());
+        document.filter_viewport_start = 84;
+        assert_eq!(document.visible_filter_rows().len(), 1);
+    }
+
+    #[test]
+    fn start_save_utf8_requires_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("latin1.csv");
+        fs::write(&path, b"name\ncaf\xe9\n").unwrap();
+        let mut document = Document::prepare_with_encoding(
+            &path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+            Some(Encoding::Latin1),
+        )
+        .unwrap();
+        document.start_indexing().unwrap();
+        finish_index(&mut document);
+        let err = document
+            .start_save_operation_format(None, true)
+            .expect_err("UTF-8 save without destination must be rejected");
+        assert!(err.text.contains("destination"));
+        assert!(document.save_job.is_none());
+        assert!(document.save_output_encoding.is_none());
     }
 }

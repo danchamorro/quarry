@@ -205,7 +205,7 @@ pub fn decompression_status(document: &Document) -> Option<DecompressionStatus> 
 
 impl Document {
     /// Shows the bootstrap rows at once; `start_indexing` then starts decompression.
-    pub fn prepare_compressed(
+    pub(crate) fn prepare_compressed(
         path: &Path,
         options: OpenOptions,
         encoding: Option<Encoding>,

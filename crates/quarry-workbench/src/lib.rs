@@ -423,6 +423,9 @@ pub fn field_preview(field: &[u8], max_chars: usize) -> String {
         .flatten();
     let mut rendered: String = characters.by_ref().take(max_chars).collect();
     if characters.next().is_some() {
+        if max_chars < 3 {
+            return ".".repeat(max_chars);
+        }
         let end = rendered.char_indices().nth(max_chars - 3).unwrap().0;
         rendered.truncate(end);
         rendered.push_str("...");
@@ -698,5 +701,21 @@ pub fn sort_direction_label(mode: SortMode, direction: SortDirection) -> &'stati
         (SortMode::WordCount, SortDirection::Descending) => "Most first",
         (_, SortDirection::Ascending) => "Ascending",
         (_, SortDirection::Descending) => "Descending",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::field_preview;
+
+    #[test]
+    fn field_preview_handles_short_limits_without_underflow() {
+        assert_eq!(field_preview(b"abcd", 0), "");
+        assert_eq!(field_preview(b"abcd", 1), ".");
+        assert_eq!(field_preview(b"abcd", 2), "..");
+        assert_eq!(field_preview(b"abcd", 3), "...");
+        assert_eq!(field_preview(b"abcd", 4), "abcd");
+        assert_eq!(field_preview(b"abcde", 4), "a...");
+        assert_eq!(field_preview(b"ab", 2), "ab");
     }
 }

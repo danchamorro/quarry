@@ -69,7 +69,8 @@ impl WorkingCopyState {
     }
 
     pub fn use_directory(&mut self, parent: &Path) -> Result<(), String> {
-        if self.directory.path().parent() != Some(parent) {
+        let live_parent = self.directory.current_path().ok();
+        if live_parent.as_deref().and_then(Path::parent) != Some(parent) {
             let replacement = Self::new_in_with_cleanup(parent, self.cleanup.clone())?;
             self.previous_directories.push(std::mem::replace(
                 &mut self.directory,
