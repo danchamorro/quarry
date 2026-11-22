@@ -327,6 +327,7 @@ impl SpillWorkspace {
         for _ in 0..100 {
             let id = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!(".quarry-{namespace}-{}-{id}", std::process::id()));
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             builder.mode(0o700);
@@ -369,20 +370,26 @@ impl SpillWorkspace {
                             use std::os::windows::io::AsRawHandle;
                             use windows_sys::Win32::Storage::FileSystem::{
                                 FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-                                FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-                                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                                FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+                                FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
                             };
+                            const READ_CONTROL: u32 = 0x0002_0000;
                             const WRITE_DAC: u32 = 0x0004_0000;
                             let acl_handle = fs::OpenOptions::new()
-                                .access_mode(FILE_READ_ATTRIBUTES | WRITE_DAC)
-                                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                                .access_mode(
+                                    FILE_LIST_DIRECTORY
+                                        | FILE_READ_ATTRIBUTES
+                                        | READ_CONTROL
+                                        | WRITE_DAC,
+                                )
+                                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                                 .custom_flags(
                                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                                 )
                                 .open(&path)?;
-                            if (acl_handle.metadata()?.file_attributes()
-                                & FILE_ATTRIBUTE_REPARSE_POINT)
-                                != 0
+                            let acl_meta = acl_handle.metadata()?;
+                            if !acl_meta.is_dir()
+                                || (acl_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
                             {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,

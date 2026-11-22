@@ -137,7 +137,8 @@ pub fn validate_scratch_directory(directory: &Path) -> Result<StorageSpace, Quar
             use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::Storage::FileSystem::{
                 FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE,
             };
             const READ_CONTROL: u32 = 0x0002_0000;
             if (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
@@ -147,10 +148,19 @@ pub fn validate_scratch_directory(directory: &Path) -> Result<StorageSpace, Quar
                 ));
             }
             let dir_handle = OpenOptions::new()
-                .access_mode(READ_CONTROL)
+                .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(directory)?;
+            let dir_meta = dir_handle.metadata()?;
+            if !dir_meta.is_dir()
+                || (dir_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "temporary folder cannot be a reparse point or symlink",
+                ));
+            }
             if !crate::sidecar::verify_windows_handle_owned_by_current_user(
                 dir_handle.as_raw_handle(),
             ) {
