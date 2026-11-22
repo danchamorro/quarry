@@ -145,6 +145,9 @@ impl RunArena {
         let cur_entries_cap = self.entries.capacity();
         let target_entries_len = self.entries.len().saturating_add(1);
 
+        let avg_payload = target_bytes_len.div_ceil(target_entries_len).max(1);
+        let bytes_per_entry = ARENA_ENTRY_BYTES.saturating_add(avg_payload);
+
         let next_bytes_cap = if target_bytes_len <= cur_bytes_cap {
             cur_bytes_cap
         } else if let Some(cap) = combined_cap_hint {
@@ -153,10 +156,18 @@ impl RunArena {
                 .saturating_mul(ARENA_ENTRY_BYTES);
             let bytes_ceiling = cap.saturating_sub(min_entries_bytes);
             if target_bytes_len <= bytes_ceiling {
+                let balanced_entries = (cap / bytes_per_entry).max(target_entries_len);
+                let balanced_entries_bytes = balanced_entries
+                    .max(cur_entries_cap)
+                    .saturating_mul(ARENA_ENTRY_BYTES);
+                let balanced_bytes_ceiling = cap
+                    .saturating_sub(balanced_entries_bytes)
+                    .max(target_bytes_len)
+                    .min(bytes_ceiling);
                 cur_bytes_cap
                     .saturating_mul(2)
                     .max(target_bytes_len)
-                    .min(bytes_ceiling)
+                    .min(balanced_bytes_ceiling)
             } else {
                 target_bytes_len
             }
@@ -168,7 +179,9 @@ impl RunArena {
             cur_entries_cap
         } else if let Some(cap) = combined_cap_hint {
             let remaining_bytes = cap.saturating_sub(next_bytes_cap);
-            let max_entries = remaining_bytes / ARENA_ENTRY_BYTES;
+            let max_entries_by_space = remaining_bytes / ARENA_ENTRY_BYTES;
+            let balanced_max_entries = (cap / bytes_per_entry).max(target_entries_len);
+            let max_entries = max_entries_by_space.min(balanced_max_entries);
             if target_entries_len <= max_entries {
                 cur_entries_cap
                     .saturating_mul(2)

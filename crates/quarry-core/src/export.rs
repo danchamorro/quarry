@@ -10608,6 +10608,7 @@ mod tests {
         cancel_job.cancel();
         assert_eq!(cancel_job.wait().unwrap(), ReplaceAllOutcome::Cancelled);
         assert!(!cancel_dest.exists());
+        assert!(temporary_exports(&cancel_dest).is_empty());
 
         // Regression test for lock-ordering between `LargeRecordGate` and `reorder_budget`:
         // 4 workers, delayed stripe 0, tight reorder budget, and records on every stripe

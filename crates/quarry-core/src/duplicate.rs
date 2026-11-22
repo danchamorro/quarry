@@ -1729,6 +1729,38 @@ mod tests {
 
     #[test]
     fn run_arena_combined_capacity_stays_within_cap_and_reuses_cleanly() {
+        // On a 64-bit target with 24-byte payloads (8-byte key + 16-byte record) and a 1,024-byte
+        // budget, `plan_growth` must leave room for payloads so multiple rows fit before a spill
+        // (and after reuse) instead of reserving all budget for `entries` and producing 1-row runs.
+        let small_cap = 1024_usize;
+        let mut small_arena = parallel::RunArena::new();
+        let mut run_lengths = Vec::new();
+        let mut current_run_rows = 0_usize;
+        for ordinal in 0_u64..64 {
+            let key = format!("k{ordinal:07}");
+            let rec = format!("r{ordinal:014}\n");
+            assert_eq!(key.len() + rec.len(), 24);
+            let planned = small_arena.planned_capacity_bytes(key.len(), rec.len(), Some(small_cap));
+            if !small_arena.is_empty() && planned > small_cap {
+                assert!(small_arena.capacity_bytes() <= small_cap);
+                run_lengths.push(current_run_rows);
+                small_arena.clear_for_reuse(small_cap);
+                assert!(small_arena.capacity_bytes() <= small_cap);
+                current_run_rows = 0;
+            }
+            small_arena.push_bounded(key.as_bytes(), rec.as_bytes(), ordinal, Some(small_cap));
+            current_run_rows += 1;
+            assert!(
+                small_arena.capacity_bytes() <= small_cap,
+                "combined arena capacity {} exceeded small_cap {small_cap}",
+                small_arena.capacity_bytes()
+            );
+        }
+        assert!(
+            !run_lengths.is_empty() && run_lengths.iter().all(|&rows| rows >= 12),
+            "expected balanced multi-row runs before spilling under 1024B cap, got {run_lengths:?}"
+        );
+
         let cap = 4096_usize;
         let mut arena = parallel::RunArena::new();
         for ordinal in 0_u64..1000 {
