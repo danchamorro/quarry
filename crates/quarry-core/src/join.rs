@@ -8,7 +8,7 @@ pub use working::{
 
 use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,58 @@ const MAX_GROUP_EXAMPLES: usize = 8;
 // capacities, vector storage and row metadata, independent of source length.
 const GROUP_EXAMPLE_RESERVE: usize = 16 * 1024;
 const KEY_FRAME_OVERHEAD: usize = 1 + 8 * MAX_KEY_PAIRS;
+const ROW_LOCATOR_BYTES: usize = 24;
+const PAIR_LOCATOR_BYTES: usize = 32;
+const PAIR_LOCATOR_FRAME_BYTES: u64 = 24 + 16 + PAIR_LOCATOR_BYTES as u64;
+const MAX_MATERIALIZE_BATCH_PAIRS: usize = 512;
+const MAX_COALESCE_GAP_BYTES: u64 = 4 * 1024;
+const MAX_COALESCE_SPAN_BYTES: u64 = 256 * 1024;
+
+#[cfg(test)]
+mod storage_test {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone, Default)]
+    pub(super) struct Hook {
+        pub(super) force_spooled: bool,
+        pub(super) pread_calls: Option<Arc<AtomicU64>>,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Hook> = RefCell::new(Hook::default());
+    }
+
+    pub(super) struct Guard(Hook);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let previous = std::mem::take(&mut self.0);
+            ACTIVE.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+
+    pub(super) fn capture() -> Hook {
+        ACTIVE.with(|slot| slot.borrow().clone())
+    }
+
+    pub(super) fn install(hook: Hook) -> Guard {
+        let previous = ACTIVE.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), hook));
+        Guard(previous)
+    }
+
+    pub(super) fn force_spooled() -> bool {
+        ACTIVE.with(|slot| slot.borrow().force_spooled)
+    }
+
+    pub(super) fn record_pread() {
+        ACTIVE.with(|slot| {
+            if let Some(counter) = slot.borrow().pread_calls.as_ref() {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+    }
+}
 
 /// Interpretation and key selection for one input. Working sources inherit their format.
 #[derive(Clone, Debug)]
@@ -559,6 +611,8 @@ impl<T: Send + 'static> JoinJob<T> {
     ) -> Result<Self, QuarryError> {
         #[cfg(test)]
         let instrumentation = crate::join_faults::capture();
+        #[cfg(test)]
+        let storage_hook = storage_test::capture();
         let state = Arc::new(Progress::new());
         let worker = Arc::clone(&state);
         let handle = thread::Builder::new()
@@ -566,6 +620,8 @@ impl<T: Send + 'static> JoinJob<T> {
             .spawn(move || {
                 #[cfg(test)]
                 let _instrumentation = crate::join_faults::install(instrumentation);
+                #[cfg(test)]
+                let _storage_guard = storage_test::install(storage_hook);
                 struct Done<'a>(&'a AtomicBool);
                 impl Drop for Done<'_> {
                     fn drop(&mut self) {
@@ -773,12 +829,77 @@ impl JoinConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameStorage {
+    /// Seekable uncompressed source (saved file or working generation): sorted runs store
+    /// 24-byte `RowLocator` frames and materialize payloads on demand via positional `pread`
+    /// plus the retained immutable edit overlay.
+    Seekable,
+    /// Non-seekable fallback: sorted runs store full decoded effective record payloads inline
+    /// and never issue positional `pread` against the source handle.
+    SpooledPayload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowLocator {
+    source_offset: u64,
+    record_len: u64,
+    value_bytes: u64,
+}
+
+impl RowLocator {
+    fn to_le_bytes(self) -> [u8; ROW_LOCATOR_BYTES] {
+        let mut bytes = [0_u8; ROW_LOCATOR_BYTES];
+        bytes[0..8].copy_from_slice(&self.source_offset.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.record_len.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.value_bytes.to_le_bytes());
+        bytes
+    }
+
+    fn from_le_bytes(bytes: &[u8; ROW_LOCATOR_BYTES]) -> Self {
+        Self {
+            source_offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            record_len: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            value_bytes: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PairLocator {
+    main_offset: u64,
+    main_len: u64,
+    additional_offset: u64,
+    additional_len: u64,
+}
+
+impl PairLocator {
+    fn to_le_bytes(self) -> [u8; PAIR_LOCATOR_BYTES] {
+        let mut bytes = [0_u8; PAIR_LOCATOR_BYTES];
+        bytes[0..8].copy_from_slice(&self.main_offset.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.main_len.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.additional_offset.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.additional_len.to_le_bytes());
+        bytes
+    }
+
+    fn from_le_bytes(bytes: &[u8; PAIR_LOCATOR_BYTES]) -> Self {
+        Self {
+            main_offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            main_len: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            additional_offset: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            additional_len: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PreparedInput {
     info: JoinInputInfo,
     physical_path: PathBuf,
     working: Option<JoinWorkingSource>,
     stamp: SourceStamp,
+    storage: FrameStorage,
     key_columns: Vec<usize>,
     require_unique: bool,
     output_delimiter: u8,
@@ -787,9 +908,33 @@ struct PreparedInput {
     frame_bytes: u64,
 }
 
+enum EntryPayload {
+    Locator([u8; ROW_LOCATOR_BYTES]),
+    Pair([u8; PAIR_LOCATOR_BYTES]),
+    Inline(Vec<u8>),
+}
+
+impl EntryPayload {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Locator(bytes) => bytes,
+            Self::Pair(bytes) => bytes,
+            Self::Inline(bytes) => bytes,
+        }
+    }
+
+    fn heap_capacity(&self) -> usize {
+        match self {
+            Self::Locator(_) | Self::Pair(_) => 0,
+            Self::Inline(bytes) => bytes.capacity(),
+        }
+    }
+}
+
 struct Entry {
-    key: Vec<u8>,
-    record: Vec<u8>,
+    key_start: usize,
+    key_len: usize,
+    payload: EntryPayload,
     ordinal: u64,
 }
 struct Run {
@@ -874,6 +1019,22 @@ fn read_record(
     .map_err(|error| frame_error(error, state))
 }
 
+fn read_exact_fixed<const N: usize>(
+    reader: &mut impl Read,
+    length: usize,
+    state: &Progress,
+) -> JResult<[u8; N]> {
+    if length != N {
+        return Err(error("Invalid private join record length.").into());
+    }
+    let mut buf = [0_u8; N];
+    let mut cancel_reader = CancelRead { reader, state };
+    cancel_reader
+        .read_exact(&mut buf)
+        .map_err(|cause| frame_error(FrameReadError::Io(cause), state))?;
+    Ok(buf)
+}
+
 /// Leveled compaction caps the number of retained run paths independently of
 /// source length, instead of collecting one path per small initial run forever.
 struct Runs<'a> {
@@ -882,6 +1043,7 @@ struct Runs<'a> {
     state: &'a Progress,
     fan_in: usize,
     levels: Vec<Vec<Run>>,
+    key_arena: Vec<u8>,
     buffer: Vec<Entry>,
     buffer_bytes: usize,
 }
@@ -899,6 +1061,7 @@ impl<'a> Runs<'a> {
             state,
             fan_in: config.fan_in(max_key),
             levels: vec![],
+            key_arena: vec![],
             buffer: vec![],
             buffer_bytes: 0,
         }
@@ -946,20 +1109,26 @@ impl<'a> Runs<'a> {
     }
 
     /// Flush accumulated rows before admitting another record beyond the run target.
-    fn push(&mut self, entry: Entry) -> JResult<()> {
+    fn push(&mut self, key: &[u8], payload: EntryPayload, ordinal: u64) -> JResult<()> {
         self.state.check()?;
-        let size = entry
-            .key
-            .capacity()
-            .saturating_add(entry.record.capacity())
+        let size = key
+            .len()
+            .saturating_add(payload.heap_capacity())
             .saturating_add(std::mem::size_of::<Entry>());
         if !self.buffer.is_empty()
             && self.buffer_bytes.saturating_add(size) > self.config.run_memory_bytes
         {
             self.flush()?;
         }
+        let key_start = self.key_arena.len();
+        self.key_arena.extend_from_slice(key);
         self.buffer_bytes = self.buffer_bytes.saturating_add(size);
-        self.buffer.push(entry);
+        self.buffer.push(Entry {
+            key_start,
+            key_len: key.len(),
+            payload,
+            ordinal,
+        });
         Ok(())
     }
 
@@ -969,16 +1138,35 @@ impl<'a> Runs<'a> {
             return Ok(());
         }
         self.state.check()?;
-        let mut entries = std::mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
-        entries.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| a.ordinal.cmp(&b.ordinal)));
+        let arena = &self.key_arena;
+        self.buffer.sort_unstable_by(|a, b| {
+            arena[a.key_start..a.key_start + a.key_len]
+                .cmp(&arena[b.key_start..b.key_start + b.key_len])
+                .then_with(|| a.ordinal.cmp(&b.ordinal))
+        });
         let (path, mut writer) = self.workspace.create_run()?;
         let mut bytes = 0;
-        for entry in entries {
+        for index in 0..self.buffer.len() {
             self.state.check()?;
-            let count = self.write_frame(&mut writer, &entry.key, &entry.record, entry.ordinal)?;
+            let entry = &self.buffer[index];
+            let key = &self.key_arena[entry.key_start..entry.key_start + entry.key_len];
+            let count =
+                self.write_frame(&mut writer, key, entry.payload.as_slice(), entry.ordinal)?;
             bytes = add(bytes, count)?;
             self.state.add_disk(count)?;
+        }
+        self.buffer.clear();
+        self.key_arena.clear();
+        if self
+            .buffer
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Entry>())
+            .saturating_add(self.key_arena.capacity())
+            > self.config.run_memory_bytes.saturating_mul(2)
+        {
+            self.buffer = Vec::new();
+            self.key_arena = Vec::new();
         }
         self.flush_writer(&mut writer)?;
         drop(writer);
@@ -1012,7 +1200,11 @@ impl<'a> Runs<'a> {
         self.state.check()?;
         let mut readers: Vec<_> = runs
             .iter()
-            .map(|run| run.path.open().map(BufReader::new))
+            .map(|run| {
+                run.path
+                    .open()
+                    .map(|file| BufReader::with_capacity(READ_CHUNK, file))
+            })
             .collect::<Result<_, _>>()?;
         let mut heap = BinaryHeap::new();
         for (stream, reader) in readers.iter_mut().enumerate() {
@@ -1022,19 +1214,35 @@ impl<'a> Runs<'a> {
         }
         let (path, mut writer) = self.workspace.create_run()?;
         let mut bytes = 0;
+        let mut small_buf = [0_u8; PAIR_LOCATOR_BYTES];
         while let Some(entry) = heap.pop() {
-            let record = read_record(
-                &mut readers[entry.stream],
-                entry.head.record_len,
-                self.config,
-                self.state,
-            )?;
-            let count =
-                self.write_frame(&mut writer, &entry.head.key, &record, entry.head.ordinal)?;
+            let count = if entry.head.record_len <= small_buf.len() {
+                let len = entry.head.record_len;
+                let mut cancel_reader = CancelRead {
+                    reader: &mut readers[entry.stream],
+                    state: self.state,
+                };
+                cancel_reader
+                    .read_exact(&mut small_buf[..len])
+                    .map_err(|cause| frame_error(FrameReadError::Io(cause), self.state))?;
+                self.write_frame(
+                    &mut writer,
+                    &entry.head.key,
+                    &small_buf[..len],
+                    entry.head.ordinal,
+                )?
+            } else {
+                let record = read_record(
+                    &mut readers[entry.stream],
+                    entry.head.record_len,
+                    self.config,
+                    self.state,
+                )?;
+                self.write_frame(&mut writer, &entry.head.key, &record, entry.head.ordinal)?
+            };
             bytes = add(bytes, count)?;
             self.state.add_disk(count)?;
             let stream = entry.stream;
-            drop(record);
             drop(entry);
             if let Some(head) = read_head(&mut readers[stream], self.config, self.state)? {
                 heap.push(HeapEntry { head, stream });
@@ -1053,6 +1261,8 @@ impl<'a> Runs<'a> {
     /// Collapse all retained levels into a single ordered private stream.
     fn finish(mut self) -> JResult<Run> {
         self.flush()?;
+        self.buffer = Vec::new();
+        self.key_arena = Vec::new();
         let mut runs: Vec<_> = self.levels.drain(..).flatten().collect();
         if runs.is_empty() {
             let (path, writer) = self.workspace.create_run()?;
@@ -1127,7 +1337,7 @@ fn scan(
     encoding: Encoding,
     config: JoinConfig,
     state: &Progress,
-    mut visit: impl FnMut(&[u8], u64) -> JResult<()>,
+    mut visit: impl FnMut(&[u8], u64, u64, u64) -> JResult<()>,
 ) -> JResult<()> {
     let path = source.path;
     let stamp = source.stamp;
@@ -1150,22 +1360,24 @@ fn scan(
     let mut chunk = vec![0; chunk_size];
     let mut record = Vec::new();
     let mut offset = 0_u64;
+    let mut record_start = 0_u64;
     let mut row = 0_u64;
-    let mut decoded_visit = |record: &[u8], row: u64| -> JResult<()> {
-        let native = if row == 0 {
-            encoding.strip_bom(record).1
-        } else {
-            record
+    let mut decoded_visit =
+        |record: &[u8], row: u64, source_offset: u64, raw_len: u64| -> JResult<()> {
+            let native = if row == 0 {
+                encoding.strip_bom(record).1
+            } else {
+                record
+            };
+            let decoded = encoding
+                .decode(native, config.max_record_bytes)
+                .map_err(|e| input_error(display_path, Some(row + 1), e))?;
+            let effective = match source.working {
+                Some(working) => working.record(&decoded, row, config, state)?,
+                None => Cow::Borrowed(decoded.as_ref()),
+            };
+            visit(&effective, row, source_offset, raw_len)
         };
-        let decoded = encoding
-            .decode(native, config.max_record_bytes)
-            .map_err(|e| input_error(display_path, Some(row + 1), e))?;
-        let effective = match source.working {
-            Some(working) => working.record(&decoded, row, config, state)?,
-            None => Cow::Borrowed(decoded.as_ref()),
-        };
-        visit(&effective, row)
-    };
     loop {
         state.check()?;
         let mut native_read = 0;
@@ -1180,19 +1392,20 @@ fn scan(
         let incomplete_unit = encoding.is_utf16() && native_read % 2 != 0;
         let read = native_read - usize::from(incomplete_unit);
         if native_read == 0 {
-            let mut last = false;
+            let mut last_end = None;
             scanner
-                .finish(offset, |_| last = true)
+                .finish(offset, |end| last_end = Some(end))
                 .map_err(|e| input_error(display_path, Some(row + 1), e))?;
-            if last {
-                decoded_visit(&record, row)?;
+            if let Some(end) = last_end {
+                let raw_len = end - record_start;
+                decoded_visit(&record, row, record_start, raw_len)?;
             }
             if !source_matches_stamp(&file, path, stamp)? {
                 return Err(QuarryError::SourceChanged.into());
             }
             if let Some(working) = source.working {
                 working.validate()?;
-                working.check_rows(row + u64::from(last))?;
+                working.check_rows(row + u64::from(last_end.is_some()))?;
             }
             return Ok(());
         }
@@ -1205,8 +1418,8 @@ fn scan(
             if failed.is_some() || state.cancel.load(Ordering::Acquire) {
                 return;
             }
-            let end = (end - offset) as usize;
-            if record.len().saturating_add(end - start) > config.max_record_bytes {
+            let local_end = (end - offset) as usize;
+            if record.len().saturating_add(local_end - start) > config.max_record_bytes {
                 failed = Some(
                     input_error(
                         display_path,
@@ -1217,13 +1430,15 @@ fn scan(
                 );
                 return;
             }
-            record.extend_from_slice(&chunk[start..end]);
-            if let Err(error) = decoded_visit(&record, row) {
+            record.extend_from_slice(&chunk[start..local_end]);
+            let raw_len = end - record_start;
+            if let Err(error) = decoded_visit(&record, row, record_start, raw_len) {
                 failed = Some(error);
             }
             record.clear();
+            record_start = end;
             row += 1;
-            start = end;
+            start = local_end;
         });
         if let Some(error) = failed {
             return Err(error);
@@ -1431,6 +1646,7 @@ struct Inspected {
     physical_path: PathBuf,
     working: Option<JoinWorkingSource>,
     stamp: SourceStamp,
+    storage: FrameStorage,
     key_columns: Vec<usize>,
     require_unique: bool,
     output_delimiter: u8,
@@ -1525,6 +1741,17 @@ fn inspect(
         )
         .map_err(|e| input_error(&path, None, e))?,
     };
+    let seekable = file.seek(SeekFrom::Start(0)).is_ok()
+        && working
+            .as_ref()
+            .is_none_or(|source| !source.session.is_compressed());
+    #[cfg(test)]
+    let seekable = seekable && !storage_test::force_spooled();
+    let storage = if seekable {
+        FrameStorage::Seekable
+    } else {
+        FrameStorage::SpooledPayload
+    };
     drop(file);
     let mut columns = None;
     let mut data_rows = 0;
@@ -1541,7 +1768,7 @@ fn inspect(
         encoding,
         config,
         state,
-        |record, row| {
+        |record, row, _source_offset, _raw_len| {
             let parsed = fields(record, delimiter, false, &path, row, config)?;
             if row == 0 {
                 columns = Some(if input.has_header {
@@ -1573,10 +1800,11 @@ fn inspect(
                 empty_key_rows = add(empty_key_rows, 1)?;
             }
             max_key_bytes = max_key_bytes.max(key.len());
-            frame_bytes = add(
-                frame_bytes,
-                add(24, add(key.len() as u64, record.len() as u64)?)?,
-            )?;
+            let payload_len = match storage {
+                FrameStorage::Seekable => ROW_LOCATOR_BYTES as u64,
+                FrameStorage::SpooledPayload => record.len() as u64,
+            };
+            frame_bytes = add(frame_bytes, add(24, add(key.len() as u64, payload_len)?)?)?;
             data_rows = add(data_rows, 1)?;
             state.records.store(data_rows, Ordering::Release);
             Ok(())
@@ -1616,6 +1844,7 @@ fn inspect(
         physical_path,
         working,
         stamp,
+        storage,
         key_columns: input.key_columns,
         require_unique: input.require_unique,
         output_delimiter: delimiter,
@@ -1664,6 +1893,7 @@ fn same_input(left: &Inspected, right: &Inspected) -> JResult<bool> {
 /// Recheck the inspected source while producing its ordered private stream.
 fn prepare(
     input: Inspected,
+    projection: Vec<(usize, bool)>,
     workspace: &SpillWorkspace,
     config: JoinConfig,
     state: &Progress,
@@ -1681,7 +1911,7 @@ fn prepare(
         input.info.encoding,
         config,
         state,
-        |record, row| {
+        |record, row, source_offset, raw_len| {
             if input.info.has_header && row == 0 {
                 return Ok(());
             }
@@ -1694,12 +1924,24 @@ fn prepare(
                 config,
             )?;
             let comparison = key(&parsed, &input.key_columns, rows, config)?;
+            let payload = match input.storage {
+                FrameStorage::Seekable => {
+                    if parsed.len() > input.info.columns.len() {
+                        return Err(error("Prepared row exceeds the analyzed schema.").into());
+                    }
+                    let value_bytes =
+                        row_value_bytes_from_fields(&projection, input.output_delimiter, &parsed)?;
+                    let locator = RowLocator {
+                        source_offset,
+                        record_len: raw_len,
+                        value_bytes: value_bytes as u64,
+                    };
+                    EntryPayload::Locator(locator.to_le_bytes())
+                }
+                FrameStorage::SpooledPayload => EntryPayload::Inline(record.to_vec()),
+            };
             drop(parsed);
-            runs.push(Entry {
-                key: comparison,
-                record: record.to_vec(),
-                ordinal: rows,
-            })?;
+            runs.push(&comparison, payload, rows)?;
             rows = add(rows, 1)?;
             Ok(())
         },
@@ -1716,22 +1958,24 @@ fn prepare(
         physical_path: input.physical_path,
         working: input.working,
         stamp: input.stamp,
+        storage: input.storage,
         key_columns: input.key_columns,
         require_unique: input.require_unique,
         output_delimiter: input.output_delimiter,
-        projection: Vec::new(),
+        projection,
         sorted: run.path,
         frame_bytes: run.bytes,
     })
 }
 
 /// Serialize decoded fields with exact value preservation and a hard record cap.
-fn encode<'a>(
+fn encode_into<'a>(
     fields: impl IntoIterator<Item = &'a [u8]>,
     delimiter: u8,
     limit: usize,
-) -> JResult<Vec<u8>> {
-    let mut output = Vec::new();
+    output: &mut Vec<u8>,
+) -> JResult<()> {
+    output.clear();
     for (column, field) in fields.into_iter().enumerate() {
         let quoted = field
             .iter()
@@ -1769,6 +2013,16 @@ fn encode<'a>(
         }
     }
     output.push(b'\n');
+    Ok(())
+}
+
+fn encode<'a>(
+    fields: impl IntoIterator<Item = &'a [u8]>,
+    delimiter: u8,
+    limit: usize,
+) -> JResult<Vec<u8>> {
+    let mut output = Vec::new();
+    encode_into(fields, delimiter, limit, &mut output)?;
     Ok(output)
 }
 
@@ -1945,13 +2199,14 @@ fn output_header(layout: &OutputLayout, delimiter: u8, config: JoinConfig) -> JR
 }
 
 /// Pad absent fields and serialize values without changing their contents.
-fn output_record(
+fn output_record_into(
     inputs: &[PreparedInput; 2],
     left: Option<&[u8]>,
     right: Option<&[u8]>,
     output: &OutputLayout,
     config: JoinConfig,
-) -> JResult<Vec<u8>> {
+    buffer: &mut Vec<u8>,
+) -> JResult<()> {
     let a = left
         .map(|record| {
             fields(
@@ -1990,7 +2245,50 @@ fn output_record(
         row.get(column.column)
             .map_or(b"".as_slice(), |value| value.as_ref())
     });
-    encode(values, inputs[0].info.delimiter, config.max_record_bytes)
+    encode_into(
+        values,
+        inputs[0].info.delimiter,
+        config.max_record_bytes,
+        buffer,
+    )
+}
+
+fn output_record(
+    inputs: &[PreparedInput; 2],
+    left: Option<&[u8]>,
+    right: Option<&[u8]>,
+    output: &OutputLayout,
+    config: JoinConfig,
+) -> JResult<Vec<u8>> {
+    let mut buffer = Vec::new();
+    output_record_into(inputs, left, right, output, config, &mut buffer)?;
+    Ok(buffer)
+}
+
+fn fields_keys_match(
+    left: &[Cow<'_, [u8]>],
+    left_columns: &[usize],
+    right: &[Cow<'_, [u8]>],
+    right_columns: &[usize],
+    case: JoinCase,
+) -> bool {
+    left_columns
+        .iter()
+        .zip(right_columns.iter())
+        .all(|(&lc, &rc)| {
+            let Some(lv) = left.get(lc) else {
+                return false;
+            };
+            let Some(rv) = right.get(rc) else {
+                return false;
+            };
+            !lv.is_empty()
+                && lv.len() == rv.len()
+                && lv
+                    .iter()
+                    .zip(rv.iter())
+                    .all(|(&a, &b)| case.byte(a) == case.byte(b))
+        })
 }
 
 /// A duplicate group is a byte range in an immutable private sorted run.
@@ -2004,23 +2302,62 @@ struct GroupRange {
     max_value_bytes: usize,
 }
 
-struct Group {
-    key: Vec<u8>,
-    range: GroupRange,
-    first_ordinal: u64,
-}
-
-impl Group {
-    fn into_range(self) -> GroupRange {
-        let Self { key, range, .. } = self;
-        drop(key);
-        range
-    }
+#[derive(Clone, Copy, Debug)]
+struct RowRef {
+    ordinal: u64,
+    source_offset: u64,
+    record_len: u64,
 }
 
 struct OwnedRow {
     record: Vec<u8>,
     ordinal: u64,
+}
+
+enum GroupItem {
+    Ref(RowRef),
+    Owned(OwnedRow),
+}
+
+impl GroupItem {
+    fn ordinal(&self) -> u64 {
+        match self {
+            Self::Ref(row) => row.ordinal,
+            Self::Owned(row) => row.ordinal,
+        }
+    }
+
+    fn mem_bytes(&self) -> usize {
+        match self {
+            Self::Ref(_) => std::mem::size_of::<RowRef>(),
+            Self::Owned(row) => row
+                .record
+                .capacity()
+                .saturating_add(std::mem::size_of::<OwnedRow>()),
+        }
+    }
+}
+
+struct GroupData {
+    range: GroupRange,
+    inline: Option<Vec<GroupItem>>,
+}
+
+struct Group {
+    key: Vec<u8>,
+    range: GroupRange,
+    first_ordinal: u64,
+    inline: Option<Vec<GroupItem>>,
+}
+
+impl Group {
+    fn into_data(self) -> GroupData {
+        let Self {
+            key, range, inline, ..
+        } = self;
+        drop(key);
+        GroupData { range, inline }
+    }
 }
 
 /// Compute exactly the escaping contribution of one value in its output position.
@@ -2037,6 +2374,23 @@ fn encoded_value_bytes(value: &[u8], delimiter: u8, first: bool) -> JResult<usiz
             0
         })
         .ok_or_else(|| error("Joined value length overflow.").into())
+}
+
+fn row_value_bytes_from_fields(
+    projection: &[(usize, bool)],
+    output_delimiter: u8,
+    values: &[Cow<'_, [u8]>],
+) -> JResult<usize> {
+    let mut size = 0_usize;
+    for &(column, first) in projection {
+        let value = values
+            .get(column)
+            .map_or(b"".as_slice(), |value| value.as_ref());
+        size = size
+            .checked_add(encoded_value_bytes(value, output_delimiter, first)?)
+            .ok_or_else(|| error("Joined row length overflow."))?;
+    }
+    Ok(size)
 }
 
 /// Separate value bytes from the fixed per-row delimiter and LF contribution.
@@ -2057,16 +2411,107 @@ fn row_value_bytes(
     if values.len() > input.info.columns.len() {
         return Err(error("Prepared row exceeds the analyzed schema.").into());
     }
-    let mut size = 0_usize;
-    for &(column, first) in &input.projection {
-        let value = values
-            .get(column)
-            .map_or(b"".as_slice(), |value| value.as_ref());
-        size = size
-            .checked_add(encoded_value_bytes(value, input.output_delimiter, first)?)
-            .ok_or_else(|| error("Joined row length overflow."))?;
+    row_value_bytes_from_fields(&input.projection, input.output_delimiter, &values)
+}
+
+fn read_at_exact_checked(
+    file: &File,
+    input: &PreparedInput,
+    role: JoinSource,
+    phase: JoinPhase,
+    offset: u64,
+    buf: &mut [u8],
+    state: &Progress,
+) -> JResult<()> {
+    let mut filled = 0_usize;
+    while filled < buf.len() {
+        state.check()?;
+        let step = (buf.len() - filled).min(READ_CHUNK);
+        let pos = add(offset, filled as u64)?;
+        #[cfg(test)]
+        storage_test::record_pread();
+        let read =
+            crate::positional_io::read_at_exact_or_eof(file, pos, &mut buf[filled..filled + step])?;
+        if read < step {
+            if !source_matches_stamp(file, &input.physical_path, &input.stamp)? {
+                return Err(input_error(
+                    &input.info.path,
+                    None,
+                    format!(
+                        "{} input during {}: File changed. Analyze the inputs again.",
+                        role.label(),
+                        phase.label()
+                    ),
+                )
+                .into());
+            }
+            return Err(error("Private join row locator overran the source file.").into());
+        }
+        filled += read;
     }
-    Ok(size)
+    Ok(())
+}
+
+fn decode_seekable_raw(
+    raw: &[u8],
+    input: &PreparedInput,
+    ordinal: u64,
+    config: JoinConfig,
+    state: &Progress,
+) -> JResult<Vec<u8>> {
+    let physical_row = add(ordinal, u64::from(input.info.has_header))?;
+    let native = if physical_row == 0 {
+        input.info.encoding.strip_bom(raw).1
+    } else {
+        raw
+    };
+    let decoded = input
+        .info
+        .encoding
+        .decode(native, config.max_record_bytes)
+        .map_err(|e| input_error(&input.info.path, Some(physical_row + 1), e))?;
+    let effective = match &input.working {
+        Some(working) => working.record(&decoded, physical_row, config, state)?,
+        None => Cow::Borrowed(decoded.as_ref()),
+    };
+    Ok(effective.into_owned())
+}
+
+fn materialize_seekable_record(
+    file: &File,
+    input: &PreparedInput,
+    role: JoinSource,
+    phase: JoinPhase,
+    row: RowRef,
+    config: JoinConfig,
+    state: &Progress,
+) -> JResult<Vec<u8>> {
+    let end = add(row.source_offset, row.record_len)?;
+    if end > input.stamp.file_size() || row.record_len > config.max_record_bytes as u64 {
+        return Err(error("Invalid private join row locator.").into());
+    }
+    let mut raw = vec![0_u8; row.record_len as usize];
+    read_at_exact_checked(file, input, role, phase, row.source_offset, &mut raw, state)?;
+    decode_seekable_raw(&raw, input, row.ordinal, config, state)
+}
+
+fn validate_row_locator(
+    locator: RowLocator,
+    input: &PreparedInput,
+    ordinal: u64,
+    config: JoinConfig,
+) -> JResult<()> {
+    if ordinal >= input.info.data_rows {
+        return Err(error("Invalid private source ordinal.").into());
+    }
+    let end = add(locator.source_offset, locator.record_len)?;
+    if end > input.stamp.file_size()
+        || locator.record_len > config.max_record_bytes as u64
+        || locator.value_bytes > config.max_record_bytes as u64
+    {
+        return Err(error("Invalid private join row locator.").into());
+    }
+    Ok(())
 }
 
 /// Verify the stored comparison key against the decoded record before using it.
@@ -2099,6 +2544,37 @@ fn read_row(
     Ok(OwnedRow { record, ordinal })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn read_group_item(
+    reader: &mut impl Read,
+    input: &PreparedInput,
+    side: usize,
+    key: &[u8],
+    record_len: usize,
+    ordinal: u64,
+    config: JoinConfig,
+    state: &Progress,
+) -> JResult<(GroupItem, usize)> {
+    match input.storage {
+        FrameStorage::Seekable => {
+            let bytes = read_exact_fixed::<ROW_LOCATOR_BYTES>(reader, record_len, state)?;
+            let locator = RowLocator::from_le_bytes(&bytes);
+            validate_row_locator(locator, input, ordinal, config)?;
+            let item = GroupItem::Ref(RowRef {
+                ordinal,
+                source_offset: locator.source_offset,
+                record_len: locator.record_len,
+            });
+            Ok((item, locator.value_bytes as usize))
+        }
+        FrameStorage::SpooledPayload => {
+            let row = read_row(reader, input, key, record_len, ordinal, config, state)?;
+            let size = row_value_bytes(input, side, &row, config)?;
+            Ok((GroupItem::Owned(row), size))
+        }
+    }
+}
+
 struct Groups<'a> {
     input: &'a PreparedInput,
     side: usize,
@@ -2106,6 +2582,8 @@ struct Groups<'a> {
     config: JoinConfig,
     state: &'a Progress,
     rows: u64,
+    position: u64,
+    peeked: Option<FrameHead>,
 }
 
 impl<'a> Groups<'a> {
@@ -2118,18 +2596,23 @@ impl<'a> Groups<'a> {
         Ok(Self {
             input,
             side,
-            reader: BufReader::new(input.sorted.open()?),
+            reader: BufReader::with_capacity(READ_CHUNK, input.sorted.open()?),
             config,
             state,
             rows: 0,
+            position: 0,
+            peeked: None,
         })
     }
 
-    /// Scan each group once for counts and exact byte-size contributions.
+    /// Scan each group once for counts and exact byte-size contributions without per-group seeks.
     fn next(&mut self) -> JResult<Option<Group>> {
         self.state.check()?;
-        let start = self.reader.stream_position()?;
-        let Some(first) = read_head(&mut self.reader, self.config, self.state)? else {
+        let start = self.position;
+        let Some(first) = (match self.peeked.take() {
+            Some(head) => Some(head),
+            None => read_head(&mut self.reader, self.config, self.state)?,
+        }) else {
             if self.rows != self.input.info.data_rows {
                 return Err(error("Prepared join row count changed.").into());
             }
@@ -2143,32 +2626,45 @@ impl<'a> Groups<'a> {
             record_len,
             ordinal,
         } = first;
+        self.position = add(self.position, add(24, key.len() as u64)?)?;
         let mut head = (record_len, ordinal);
         let mut rows = 0;
         let mut value_bytes = 0;
         let mut max_value_bytes = 0;
         let mut last_ordinal = None;
+        let inline_cap = self.config.group_memory_bytes.min(64 * 1024);
+        let mut inline: Option<Vec<GroupItem>> = Some(Vec::new());
+        let mut inline_bytes = 0_usize;
         let end;
         loop {
             self.state.check()?;
             if last_ordinal.is_some_and(|last| head.1 <= last) {
                 return Err(error("Private join ordinals are out of order.").into());
             }
-            let row = read_row(
+            let (item, size) = read_group_item(
                 &mut self.reader,
                 self.input,
+                self.side,
                 &key,
                 head.0,
                 head.1,
                 self.config,
                 self.state,
             )?;
-            let size = row_value_bytes(self.input, self.side, &row, self.config)?;
+            self.position = add(self.position, head.0 as u64)?;
             value_bytes = add(value_bytes, size as u64)?;
             max_value_bytes = max_value_bytes.max(size);
             rows = add(rows, 1)?;
             last_ordinal = Some(head.1);
-            drop(row);
+            if let Some(items) = inline.as_mut() {
+                let item_bytes = item.mem_bytes();
+                if items.is_empty() || inline_bytes.saturating_add(item_bytes) <= inline_cap {
+                    inline_bytes = inline_bytes.saturating_add(item_bytes);
+                    items.push(item);
+                } else {
+                    inline = None;
+                }
+            }
             if rows > 1 && key[0] == 1 && self.input.require_unique {
                 return Err(input_error(
                     &self.input.info.path,
@@ -2177,7 +2673,7 @@ impl<'a> Groups<'a> {
                 )
                 .into());
             }
-            let next_position = self.reader.stream_position()?;
+            let next_position = self.position;
             let Some(next) = read_head(&mut self.reader, self.config, self.state)? else {
                 end = next_position;
                 break;
@@ -2186,16 +2682,18 @@ impl<'a> Groups<'a> {
                 if next.key < key {
                     return Err(error("Private join groups are out of order.").into());
                 }
-                self.reader.seek(SeekFrom::Start(next_position))?;
+                self.peeked = Some(next);
                 end = next_position;
                 break;
             }
+            self.position = add(self.position, add(24, next.key.len() as u64)?)?;
             head = (next.record_len, next.ordinal);
         }
         self.rows = add(self.rows, rows)?;
         Ok(Some(Group {
             key,
             first_ordinal: ordinal,
+            inline,
             range: GroupRange {
                 start,
                 end,
@@ -2207,7 +2705,7 @@ impl<'a> Groups<'a> {
     }
 }
 
-/// Merge only group metadata; the potentially enormous groups remain on disk.
+/// Merge only group metadata; oversized groups remain on disk.
 fn walk_groups(
     inputs: &[PreparedInput; 2],
     config: JoinConfig,
@@ -2249,8 +2747,11 @@ fn walk_groups(
 
 struct RangeRows<'a> {
     input: &'a PreparedInput,
+    side: usize,
     range: GroupRange,
-    reader: BufReader<File>,
+    reader: &'a mut BufReader<File>,
+    position: u64,
+    peeked: Option<FrameHead>,
     consumed: u64,
     config: JoinConfig,
     state: &'a Progress,
@@ -2259,74 +2760,91 @@ struct RangeRows<'a> {
 impl<'a> RangeRows<'a> {
     fn new(
         input: &'a PreparedInput,
+        side: usize,
+        reader_slot: &'a mut Option<BufReader<File>>,
         range: GroupRange,
         config: JoinConfig,
         state: &'a Progress,
     ) -> JResult<Self> {
-        let mut reader = BufReader::new(input.sorted.open()?);
+        let reader = match reader_slot {
+            Some(reader) => reader,
+            None => reader_slot.insert(BufReader::with_capacity(READ_CHUNK, input.sorted.open()?)),
+        };
         reader.seek(SeekFrom::Start(range.start))?;
 
         Ok(Self {
             input,
+            side,
             range,
             reader,
+            position: range.start,
+            peeked: None,
             consumed: 0,
             config,
             state,
         })
     }
 
-    fn next(&mut self) -> JResult<Option<OwnedRow>> {
+    fn next(&mut self) -> JResult<Option<GroupItem>> {
         self.state.check()?;
-        let position = self.reader.stream_position()?;
-        if position == self.range.end {
+        if self.peeked.is_none() && self.position == self.range.end {
             if self.consumed != self.range.rows {
                 return Err(error("Private duplicate group changed.").into());
             }
             return Ok(None);
         }
-        if position > self.range.end || self.consumed >= self.range.rows {
+        if self.position > self.range.end || self.consumed >= self.range.rows {
             return Err(error("Invalid private duplicate-group range.").into());
         }
-        let head = read_head(&mut self.reader, self.config, self.state)?
-            .ok_or_else(|| error("Truncated duplicate group."))?;
-        let row = read_row(
-            &mut self.reader,
+        let head = match self.peeked.take() {
+            Some(head) => head,
+            None => read_head(self.reader, self.config, self.state)?
+                .ok_or_else(|| error("Truncated duplicate group."))?,
+        };
+        self.position = add(self.position, add(24, head.key.len() as u64)?)?;
+        let (item, _) = read_group_item(
+            self.reader,
             self.input,
+            self.side,
             &head.key,
             head.record_len,
             head.ordinal,
             self.config,
             self.state,
         )?;
+        self.position = add(self.position, head.record_len as u64)?;
         self.consumed += 1;
-        if self.reader.stream_position()? > self.range.end {
+        if self.position > self.range.end {
             return Err(error("Private duplicate group overran its range.").into());
         }
-        Ok(Some(row))
+        Ok(Some(item))
     }
 
-    /// Peek only the next frame length, rewinding before holding any row block.
+    /// Peek only the next frame head into `self.peeked` without rewinding the reader.
     fn next_size(&mut self) -> JResult<Option<usize>> {
-        let position = self.reader.stream_position()?;
-        if position == self.range.end {
-            if self.consumed != self.range.rows {
-                return Err(error("Private duplicate group changed.").into());
+        if self.peeked.is_none() {
+            if self.position == self.range.end {
+                if self.consumed != self.range.rows {
+                    return Err(error("Private duplicate group changed.").into());
+                }
+                return Ok(None);
             }
-            return Ok(None);
+            let head = read_head(self.reader, self.config, self.state)?
+                .ok_or_else(|| error("Truncated duplicate group."))?;
+            self.peeked = Some(head);
         }
-        let head = read_head(&mut self.reader, self.config, self.state)?
-            .ok_or_else(|| error("Truncated duplicate group."))?;
-        let bytes = head
-            .record_len
-            .saturating_add(std::mem::size_of::<OwnedRow>());
-        drop(head);
-        self.reader.seek(SeekFrom::Start(position))?;
+        let head = self.peeked.as_ref().unwrap();
+        let bytes = match self.input.storage {
+            FrameStorage::Seekable => std::mem::size_of::<RowRef>(),
+            FrameStorage::SpooledPayload => head
+                .record_len
+                .saturating_add(std::mem::size_of::<OwnedRow>()),
+        };
         Ok(Some(bytes))
     }
 
     /// A single oversized record is allowed, within the validated record budget.
-    fn block(&mut self) -> JResult<Vec<OwnedRow>> {
+    fn block(&mut self) -> JResult<Vec<GroupItem>> {
         let mut rows = Vec::new();
         let mut bytes = 0_usize;
         while let Some(size) = self.next_size()? {
@@ -2338,9 +2856,7 @@ impl<'a> RangeRows<'a> {
                 .ok_or_else(|| error("Duplicate group ended unexpectedly."))?;
             rows.try_reserve_exact(1)
                 .map_err(|_| error("Cannot allocate the bounded duplicate block."))?;
-            bytes = bytes
-                .saturating_add(row.record.capacity())
-                .saturating_add(std::mem::size_of::<OwnedRow>());
+            bytes = bytes.saturating_add(row.mem_bytes());
             rows.push(row);
         }
         self.state.group_peak.fetch_max(bytes, Ordering::AcqRel);
@@ -2349,14 +2865,16 @@ impl<'a> RangeRows<'a> {
 }
 
 /// Stream retained pairs using bounded blocks of the side that drives public order.
+#[allow(clippy::too_many_arguments)]
 fn enumerate_pairs(
     inputs: &[PreparedInput; 2],
-    left: Option<GroupRange>,
-    right: Option<GroupRange>,
+    left: Option<GroupData>,
+    right: Option<GroupData>,
+    range_readers: &mut [Option<BufReader<File>>; 2],
     config: JoinConfig,
     state: &Progress,
     limit: Option<usize>,
-    mut emit: impl FnMut(Option<&OwnedRow>, Option<&OwnedRow>) -> JResult<()>,
+    mut emit: impl FnMut(Option<&GroupItem>, Option<&GroupItem>) -> JResult<()>,
 ) -> JResult<()> {
     if !config.mode.retains(left.is_some(), right.is_some()) {
         return Ok(());
@@ -2366,10 +2884,15 @@ fn enumerate_pairs(
         config.group_memory_bytes = 1;
     }
     let primary = usize::from(left.is_none() || config.mode == JoinMode::Right);
-    let ranges = [left, right];
-    let mut a = RangeRows::new(&inputs[primary], ranges[primary].unwrap(), config, state)?;
+    let secondary = 1 - primary;
+    let [left_group, right_group] = [left, right];
+    let (primary_group, other_group) = if primary == 0 {
+        (left_group.unwrap(), right_group)
+    } else {
+        (right_group.unwrap(), left_group)
+    };
     let mut emitted = 0_usize;
-    let mut visit = |first: &OwnedRow, second: Option<&OwnedRow>| -> JResult<bool> {
+    let mut visit = |first: &GroupItem, second: Option<&GroupItem>| -> JResult<bool> {
         #[cfg(test)]
         crate::join_faults::observe(crate::join_faults::Event::ExpandingPairs);
         state.check()?;
@@ -2381,25 +2904,130 @@ fn enumerate_pairs(
         emitted = emitted.saturating_add(1);
         Ok(limit.is_some_and(|limit| emitted >= limit))
     };
-    if let Some(other) = ranges[1 - primary] {
-        loop {
-            let block = a.block()?;
-            if block.is_empty() {
-                break;
+
+    // Fast path: both sides already fit within the bounded inline group cap.
+    match (primary_group.inline, other_group) {
+        (Some(primary_items), None) => {
+            for row in &primary_items {
+                if visit(row, None)? {
+                    return Ok(());
+                }
             }
-            let mut b = RangeRows::new(&inputs[1 - primary], other, config, state)?;
-            while let Some(row) = b.next()? {
-                for first in &block {
-                    if visit(first, Some(&row))? {
+            return Ok(());
+        }
+        (Some(primary_items), Some(other)) if other.inline.is_some() => {
+            let other_items = other.inline.unwrap();
+            let block_bytes = if limit.is_some() {
+                primary_items.first().map_or(0, GroupItem::mem_bytes)
+            } else {
+                primary_items
+                    .iter()
+                    .fold(0_usize, |acc, item| acc.saturating_add(item.mem_bytes()))
+            };
+            state.group_peak.fetch_max(block_bytes, Ordering::AcqRel);
+            for first in &primary_items {
+                for second in &other_items {
+                    if visit(first, Some(second))? {
                         return Ok(());
                     }
                 }
             }
+            return Ok(());
         }
-    } else {
-        while let Some(row) = a.next()? {
-            if visit(&row, None)? {
-                return Ok(());
+        (primary_inline, other_opt) => {
+            let [reader_left, reader_right] = range_readers;
+            let (primary_reader, other_reader) = if primary == 0 {
+                (reader_left, reader_right)
+            } else {
+                (reader_right, reader_left)
+            };
+            if let Some(other) = other_opt {
+                if let Some(primary_items) = primary_inline {
+                    let block_bytes = if limit.is_some() {
+                        primary_items.first().map_or(0, GroupItem::mem_bytes)
+                    } else {
+                        primary_items
+                            .iter()
+                            .fold(0_usize, |acc, item| acc.saturating_add(item.mem_bytes()))
+                    };
+                    state.group_peak.fetch_max(block_bytes, Ordering::AcqRel);
+                    let chunk_len = if limit.is_some() {
+                        1
+                    } else {
+                        primary_items.len().max(1)
+                    };
+                    for block in primary_items.chunks(chunk_len) {
+                        let mut b = RangeRows::new(
+                            &inputs[secondary],
+                            secondary,
+                            other_reader,
+                            other.range,
+                            config,
+                            state,
+                        )?;
+                        while let Some(row) = b.next()? {
+                            for first in block {
+                                if visit(first, Some(&row))? {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let mut a = RangeRows::new(
+                        &inputs[primary],
+                        primary,
+                        primary_reader,
+                        primary_group.range,
+                        config,
+                        state,
+                    )?;
+                    loop {
+                        let block = a.block()?;
+                        if block.is_empty() {
+                            break;
+                        }
+                        if let Some(other_items) = other.inline.as_ref() {
+                            for row in other_items {
+                                for first in &block {
+                                    if visit(first, Some(row))? {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut b = RangeRows::new(
+                                &inputs[secondary],
+                                secondary,
+                                other_reader,
+                                other.range,
+                                config,
+                                state,
+                            )?;
+                            while let Some(row) = b.next()? {
+                                for first in &block {
+                                    if visit(first, Some(&row))? {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                let mut a = RangeRows::new(
+                    &inputs[primary],
+                    primary,
+                    primary_reader,
+                    primary_group.range,
+                    config,
+                    state,
+                )?;
+                while let Some(row) = a.next()? {
+                    if visit(&row, None)? {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -2416,10 +3044,10 @@ fn pair_order(mode: JoinMode, main: Option<u64>, additional: Option<u64>) -> (u6
     }
 }
 
-fn pair_key(order: (u64, u64)) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16);
-    key.extend_from_slice(&order.0.to_be_bytes());
-    key.extend_from_slice(&order.1.to_be_bytes());
+fn pair_key(order: (u64, u64)) -> [u8; 16] {
+    let mut key = [0_u8; 16];
+    key[0..8].copy_from_slice(&order.0.to_be_bytes());
+    key[8..16].copy_from_slice(&order.1.to_be_bytes());
     key
 }
 
@@ -2520,6 +3148,9 @@ fn analyze_prepared(
     let mut output_rows = 0;
     let mut output_bytes = header_bytes;
     let mut preview = std::collections::BTreeMap::new();
+    let mut range_readers: [Option<BufReader<File>>; 2] = [None, None];
+    let mut preview_files: [Option<File>; 2] = [None, None];
+    let mut preview_buf = Vec::new();
     walk_groups(inputs, config, state, |left, right| {
         for (side, group) in [left.as_ref(), right.as_ref()].into_iter().enumerate() {
             if group.is_some_and(|group| group.key[0] == 1 && group.range.rows > 1) {
@@ -2555,9 +3186,29 @@ fn analyze_prepared(
             }
             _ => {}
         }
-        let left = left.map(Group::into_range);
-        let right = right.map(Group::into_range);
-        match (left, right) {
+        let min_order = pair_order(
+            config.mode,
+            left.as_ref().map(|g| g.first_ordinal),
+            right.as_ref().map(|g| g.first_ordinal),
+        );
+        let may_improve_preview = config.preview_rows > 0
+            && config.mode.retains(left.is_some(), right.is_some())
+            && (preview.len() < config.preview_rows
+                || preview
+                    .last_key_value()
+                    .is_some_and(|(&last, _)| min_order < last));
+        let left_key = may_improve_preview
+            .then(|| left.as_ref().map(|g| g.key.clone()))
+            .flatten();
+        let right_key = may_improve_preview
+            .then(|| right.as_ref().map(|g| g.key.clone()))
+            .flatten();
+        let left = left.map(Group::into_data);
+        let right = right.map(Group::into_data);
+        match (
+            left.as_ref().map(|g| g.range),
+            right.as_ref().map(|g| g.range),
+        ) {
             (Some(a), Some(b)) => {
                 let (count, bytes) = matched_group_output(a, b, columns, config.max_record_bytes)?;
                 matching[0] = add(matching[0], a.rows)?;
@@ -2593,40 +3244,107 @@ fn analyze_prepared(
                 }
             }
         }
-        if config.preview_rows > 0 {
+        if may_improve_preview {
             enumerate_pairs(
                 inputs,
                 left,
                 right,
+                &mut range_readers,
                 config,
                 state,
                 Some(config.preview_rows),
                 |a, b| {
-                    let row = output_record(
+                    let key = pair_order(
+                        config.mode,
+                        a.map(GroupItem::ordinal),
+                        b.map(GroupItem::ordinal),
+                    );
+                    if preview.len() >= config.preview_rows
+                        && preview
+                            .last_key_value()
+                            .is_none_or(|(&last, _)| key >= last)
+                    {
+                        return Ok(());
+                    }
+                    let mut load_item = |side: usize,
+                                         item: Option<&GroupItem>,
+                                         expected_key: Option<&[u8]>|
+                     -> JResult<Option<Vec<u8>>> {
+                        let Some(item) = item else {
+                            return Ok(None);
+                        };
+                        match item {
+                            GroupItem::Owned(row) => Ok(Some(row.record.clone())),
+                            GroupItem::Ref(row) => {
+                                let role = if side == 0 {
+                                    JoinSource::Main
+                                } else {
+                                    JoinSource::Additional
+                                };
+                                let file = match &preview_files[side] {
+                                    Some(file) => file,
+                                    None => preview_files[side].insert(check_source(
+                                        &inputs[side],
+                                        role,
+                                        JoinPhase::Analyzing,
+                                    )?),
+                                };
+                                let record = materialize_seekable_record(
+                                    file,
+                                    &inputs[side],
+                                    role,
+                                    JoinPhase::Analyzing,
+                                    *row,
+                                    config,
+                                    state,
+                                )?;
+                                if let Some(expected_key) = expected_key {
+                                    let parsed = fields(
+                                        &record,
+                                        inputs[side].info.delimiter,
+                                        false,
+                                        &inputs[side].info.path,
+                                        row.ordinal + 1,
+                                        config,
+                                    )?;
+                                    if !key_matches(
+                                        expected_key,
+                                        &parsed,
+                                        &inputs[side].key_columns,
+                                        row.ordinal,
+                                        config.case,
+                                    ) {
+                                        return Err(error(
+                                            "Private join key differs from its record.",
+                                        )
+                                        .into());
+                                    }
+                                }
+                                Ok(Some(record))
+                            }
+                        }
+                    };
+                    let a_record = load_item(0, a, left_key.as_deref())?;
+                    let b_record = load_item(1, b, right_key.as_deref())?;
+                    output_record_into(
                         inputs,
-                        a.map(|a| a.record.as_slice()),
-                        b.map(|b| b.record.as_slice()),
+                        a_record.as_deref(),
+                        b_record.as_deref(),
                         output,
                         config,
+                        &mut preview_buf,
                     )?;
-                    let key = pair_order(config.mode, a.map(|a| a.ordinal), b.map(|b| b.ordinal));
-                    if preview.len() < config.preview_rows
-                        || preview
-                            .last_key_value()
-                            .is_some_and(|(&last, _)| key < last)
-                    {
-                        preview.insert(
-                            key,
-                            preview_row(
-                                &row,
-                                inputs[0].info.delimiter,
-                                config.preview_bytes / config.preview_rows,
-                                config,
-                            )?,
-                        );
-                        if preview.len() > config.preview_rows {
-                            preview.pop_last();
-                        }
+                    preview.insert(
+                        key,
+                        preview_row(
+                            &preview_buf,
+                            inputs[0].info.delimiter,
+                            config.preview_bytes / config.preview_rows,
+                            config,
+                        )?,
+                    );
+                    if preview.len() > config.preview_rows {
+                        preview.pop_last();
                     }
                     Ok(())
                 },
@@ -2637,7 +3355,14 @@ fn analyze_prepared(
             .store(add(matching[0], unmatched[0])?, Ordering::Release);
         Ok(())
     })?;
-    let frames = add(output_bytes - header_bytes, mul(output_rows, 40)?)?;
+    let all_seekable = inputs
+        .iter()
+        .all(|input| input.storage == FrameStorage::Seekable);
+    let frames = if all_seekable {
+        mul(output_rows, PAIR_LOCATOR_FRAME_BYTES)?
+    } else {
+        add(output_bytes - header_bytes, mul(output_rows, 40)?)?
+    };
     let temporary = add(mul(frames, 2)?, output_bytes)?;
     for (role, input) in [JoinSource::Main, JoinSource::Additional]
         .into_iter()
@@ -2750,16 +3475,16 @@ pub fn analyze_join_with_working(
         let initial = mul(add(left.frame_bytes, right.frame_bytes)?, 2)?;
         check_storage(&temporary, initial)?;
         state.check()?;
+        let mut projections: [Vec<(usize, bool)>; 2] = [Vec::new(), Vec::new()];
+        for (position, column) in output.columns.iter().enumerate() {
+            projections[column.source.index()].push((column.column, position == 0));
+        }
+        let [left_projection, right_projection] = projections;
         let workspace = SpillWorkspace::create_in(&temporary, "join")?;
         let prepared = (|| {
-            let left = prepare(left, &workspace, config, state)?;
-            let right = prepare(right, &workspace, config, state)?;
-            let mut inputs = [left, right];
-            for (position, column) in output.columns.iter().enumerate() {
-                inputs[column.source.index()]
-                    .projection
-                    .push((column.column, position == 0));
-            }
+            let left = prepare(left, left_projection, &workspace, config, state)?;
+            let right = prepare(right, right_projection, &workspace, config, state)?;
+            let inputs = [left, right];
             let analysis = analyze_prepared(&inputs, &output, config, state)?;
             Ok((inputs, analysis))
         })();
@@ -2796,6 +3521,84 @@ fn check_creation_space(
     };
     temporary_space.require(temporary_required)?;
     output_space.require(output_required)?;
+    Ok(())
+}
+
+struct OrderedPair {
+    main_ordinal: Option<u64>,
+    additional_ordinal: Option<u64>,
+    locator: PairLocator,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_seekable_batch(
+    file: &File,
+    input: &PreparedInput,
+    role: JoinSource,
+    requests: &[(u64, u64, u64)],
+    scratch: &mut Vec<u8>,
+    records: &mut HashMap<u64, Vec<u8>>,
+    config: JoinConfig,
+    state: &Progress,
+) -> JResult<()> {
+    records.clear();
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let mut sorted: Vec<(u64, u64, u64)> = requests.to_vec();
+    sorted.sort_unstable_by_key(|&(offset, _, ordinal)| (offset, ordinal));
+    sorted.dedup_by_key(|item| item.2);
+
+    let mut index = 0_usize;
+    while index < sorted.len() {
+        state.check()?;
+        let span_start = sorted[index].0;
+        let mut span_end = add(span_start, sorted[index].1)?;
+        let mut group_end = index + 1;
+        while group_end < sorted.len() {
+            let (next_offset, next_len, _) = sorted[group_end];
+            if next_offset < span_end {
+                break;
+            }
+            let gap = next_offset - span_end;
+            let next_end = add(next_offset, next_len)?;
+            let span_len = next_end - span_start;
+            if gap > MAX_COALESCE_GAP_BYTES || span_len > MAX_COALESCE_SPAN_BYTES {
+                break;
+            }
+            span_end = next_end;
+            group_end += 1;
+        }
+        let span_len = usize::try_from(span_end - span_start)
+            .map_err(|_| error("Join read span length overflow."))?;
+        if group_end < sorted.len() {
+            let next_start = sorted[group_end].0;
+            let next_len = sorted[group_end].1.min(MAX_COALESCE_SPAN_BYTES);
+            crate::positional_io::advise_readahead(file, next_start, next_len);
+        }
+        scratch.resize(span_len, 0);
+        read_at_exact_checked(
+            file,
+            input,
+            role,
+            JoinPhase::Creating,
+            span_start,
+            scratch,
+            state,
+        )?;
+        for &(offset, len, ordinal) in &sorted[index..group_end] {
+            let rel_start = (offset - span_start) as usize;
+            let rel_end = rel_start + len as usize;
+            let decoded =
+                decode_seekable_raw(&scratch[rel_start..rel_end], input, ordinal, config, state)?;
+            records.insert(ordinal, decoded);
+        }
+        index = group_end;
+    }
+    if scratch.capacity() > MAX_COALESCE_SPAN_BYTES as usize {
+        scratch.clear();
+        scratch.shrink_to(0);
+    }
     Ok(())
 }
 
@@ -2931,17 +3734,23 @@ impl JoinPlan {
         crate::join_faults::observe(crate::join_faults::Event::DestinationPinned);
         let retained = add(self.inputs[0].frame_bytes, self.inputs[1].frame_bytes)?;
         state.add_disk(retained)?;
-        for (role, input) in [JoinSource::Main, JoinSource::Additional]
-            .into_iter()
-            .zip(&self.inputs)
-        {
-            check_source(input, role, JoinPhase::Creating)?;
-        }
+        let source_files = [
+            check_source(&self.inputs[0], JoinSource::Main, JoinPhase::Creating)?,
+            check_source(&self.inputs[1], JoinSource::Additional, JoinPhase::Creating)?,
+        ];
         let header = output_header(&self.output, self.inputs[0].info.delimiter, self.config)?;
-        let frame_bytes = add(
-            self.analysis.output_bytes - header.len() as u64,
-            mul(self.analysis.output_rows, 40)?,
-        )?;
+        let all_seekable = self
+            .inputs
+            .iter()
+            .all(|input| input.storage == FrameStorage::Seekable);
+        let frame_bytes = if all_seekable {
+            mul(self.analysis.output_rows, PAIR_LOCATOR_FRAME_BYTES)?
+        } else {
+            add(
+                self.analysis.output_bytes - header.len() as u64,
+                mul(self.analysis.output_rows, 40)?,
+            )?
+        };
         let spill_bytes = mul(frame_bytes, 2)?;
         workspace.with_directory(|temporary| {
             Ok(check_creation_space(
@@ -2974,94 +3783,159 @@ impl JoinPlan {
             let mut runs = Runs::new(workspace, self.config, state, 16);
             let mut count = 0;
             let mut bytes = 0;
-            walk_groups(&self.inputs, self.config, state, |left, right| {
-                enumerate_pairs(
-                    &self.inputs,
-                    left.map(Group::into_range),
-                    right.map(Group::into_range),
-                    self.config,
-                    state,
-                    None,
-                    |left, right| {
-                        let row = output_record(
-                            &self.inputs,
-                            left.map(|r| r.record.as_slice()),
-                            right.map(|r| r.record.as_slice()),
-                            &self.output,
-                            self.config,
-                        )?;
-                        count = add(count, 1)?;
-                        bytes = add(bytes, row.len() as u64)?;
-                        let order = pair_order(
-                            self.config.mode,
-                            left.map(|r| r.ordinal),
-                            right.map(|r| r.ordinal),
-                        );
-                        runs.push(Entry {
-                            key: pair_key(order),
-                            record: row,
-                            ordinal: order.0,
-                        })?;
-                        state.records.store(count, Ordering::Release);
-                        Ok(())
-                    },
-                )?;
-                Ok(())
-            })?;
-            #[cfg(test)]
-            crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
-            let ordered = runs.finish()?;
-            if count != self.analysis.output_rows
-                || add(bytes, output.bytes_written())? != self.analysis.output_bytes
-                || ordered.bytes != frame_bytes
-            {
-                return Err(
-                    error("Join output differs from the analyzed plan. Analyze again.").into(),
-                );
-            }
-            let mut reader = BufReader::new(ordered.path.open()?);
-            let mut ordinal = 0;
-            let mut previous_order: Option<Vec<u8>> = None;
-            while let Some(head) = read_head(&mut reader, self.config, state)? {
-                if !valid_pair_order(
-                    &head.key,
-                    head.ordinal,
-                    self.config.mode,
-                    [self.inputs[0].info.data_rows, self.inputs[1].info.data_rows],
-                ) || previous_order
-                    .as_ref()
-                    .is_some_and(|previous| previous >= &head.key)
-                {
-                    return Err(error("Joined row pairs are not in source order.").into());
-                }
-                previous_order = Some(head.key);
-                let record = read_record(&mut reader, head.record_len, self.config, state)?;
-                let parsed = fields(
-                    &record,
-                    self.inputs[0].info.delimiter,
-                    false,
-                    destination,
-                    ordinal,
-                    self.config,
-                )?;
-                if parsed.len() != self.output.columns.len() {
-                    return Err(error("Joined row has the wrong number of columns.").into());
-                }
-                drop(parsed);
+            let mut range_readers: [Option<BufReader<File>>; 2] = [None, None];
+            if all_seekable {
+                walk_groups(&self.inputs, self.config, state, |left, right| {
+                    enumerate_pairs(
+                        &self.inputs,
+                        left.map(Group::into_data),
+                        right.map(Group::into_data),
+                        &mut range_readers,
+                        self.config,
+                        state,
+                        None,
+                        |left, right| {
+                            let main_ref = left.map(|item| match item {
+                                GroupItem::Ref(row) => *row,
+                                GroupItem::Owned(_) => unreachable!("seekable input stores RowRef"),
+                            });
+                            let additional_ref = right.map(|item| match item {
+                                GroupItem::Ref(row) => *row,
+                                GroupItem::Owned(_) => unreachable!("seekable input stores RowRef"),
+                            });
+                            count = add(count, 1)?;
+                            let order = pair_order(
+                                self.config.mode,
+                                main_ref.map(|r| r.ordinal),
+                                additional_ref.map(|r| r.ordinal),
+                            );
+                            let locator = PairLocator {
+                                main_offset: main_ref.map_or(0, |r| r.source_offset),
+                                main_len: main_ref.map_or(0, |r| r.record_len),
+                                additional_offset: additional_ref.map_or(0, |r| r.source_offset),
+                                additional_len: additional_ref.map_or(0, |r| r.record_len),
+                            };
+                            let pair_key_bytes = pair_key(order);
+                            runs.push(
+                                &pair_key_bytes,
+                                EntryPayload::Pair(locator.to_le_bytes()),
+                                order.0,
+                            )?;
+                            state.records.store(count, Ordering::Release);
+                            Ok(())
+                        },
+                    )?;
+                    Ok(())
+                })?;
+                drop(range_readers);
                 #[cfg(test)]
-                crate::join_faults::observe(crate::join_faults::Event::WritingRow);
-                output
-                    .write_all(&record)
-                    .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
-                state.add_disk(record.len() as u64)?;
-                ordinal = add(ordinal, 1)?;
-            }
-            if ordinal != self.analysis.output_rows
-                || output.bytes_written() != self.analysis.output_bytes
-            {
-                return Err(
-                    error("Joined output count or size changed before publication.").into(),
-                );
+                crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
+                let ordered = runs.finish()?;
+                if count != self.analysis.output_rows || ordered.bytes != frame_bytes {
+                    return Err(error(
+                        "Join output differs from the analyzed plan. Analyze again.",
+                    )
+                    .into());
+                }
+                self.materialize_seekable_ordered(&ordered, &source_files, &mut output, state)?;
+            } else {
+                walk_groups(&self.inputs, self.config, state, |left, right| {
+                    enumerate_pairs(
+                        &self.inputs,
+                        left.map(Group::into_data),
+                        right.map(Group::into_data),
+                        &mut range_readers,
+                        self.config,
+                        state,
+                        None,
+                        |left, right| {
+                            let left_rec = left.map(|item| match item {
+                                GroupItem::Owned(row) => row.record.as_slice(),
+                                GroupItem::Ref(_) => unreachable!("spooled path stores OwnedRow"),
+                            });
+                            let right_rec = right.map(|item| match item {
+                                GroupItem::Owned(row) => row.record.as_slice(),
+                                GroupItem::Ref(_) => unreachable!("spooled path stores OwnedRow"),
+                            });
+                            let row = output_record(
+                                &self.inputs,
+                                left_rec,
+                                right_rec,
+                                &self.output,
+                                self.config,
+                            )?;
+                            count = add(count, 1)?;
+                            bytes = add(bytes, row.len() as u64)?;
+                            let order = pair_order(
+                                self.config.mode,
+                                left.map(GroupItem::ordinal),
+                                right.map(GroupItem::ordinal),
+                            );
+                            let pair_key_bytes = pair_key(order);
+                            runs.push(&pair_key_bytes, EntryPayload::Inline(row), order.0)?;
+                            state.records.store(count, Ordering::Release);
+                            Ok(())
+                        },
+                    )?;
+                    Ok(())
+                })?;
+                drop(range_readers);
+                #[cfg(test)]
+                crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
+                let ordered = runs.finish()?;
+                if count != self.analysis.output_rows
+                    || add(bytes, output.bytes_written())? != self.analysis.output_bytes
+                    || ordered.bytes != frame_bytes
+                {
+                    return Err(error(
+                        "Join output differs from the analyzed plan. Analyze again.",
+                    )
+                    .into());
+                }
+                let mut reader = BufReader::with_capacity(READ_CHUNK, ordered.path.open()?);
+                let mut ordinal = 0;
+                let mut previous_order: Option<Vec<u8>> = None;
+                while let Some(head) = read_head(&mut reader, self.config, state)? {
+                    if !valid_pair_order(
+                        &head.key,
+                        head.ordinal,
+                        self.config.mode,
+                        [self.inputs[0].info.data_rows, self.inputs[1].info.data_rows],
+                    ) || previous_order
+                        .as_ref()
+                        .is_some_and(|previous| previous >= &head.key)
+                    {
+                        return Err(error("Joined row pairs are not in source order.").into());
+                    }
+                    previous_order = Some(head.key);
+                    let record = read_record(&mut reader, head.record_len, self.config, state)?;
+                    let parsed = fields(
+                        &record,
+                        self.inputs[0].info.delimiter,
+                        false,
+                        destination,
+                        ordinal,
+                        self.config,
+                    )?;
+                    if parsed.len() != self.output.columns.len() {
+                        return Err(error("Joined row has the wrong number of columns.").into());
+                    }
+                    drop(parsed);
+                    #[cfg(test)]
+                    crate::join_faults::observe(crate::join_faults::Event::WritingRow);
+                    output
+                        .write_all(&record)
+                        .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
+                    state.add_disk(record.len() as u64)?;
+                    ordinal = add(ordinal, 1)?;
+                }
+                if ordinal != self.analysis.output_rows
+                    || output.bytes_written() != self.analysis.output_bytes
+                {
+                    return Err(
+                        error("Joined output count or size changed before publication.").into(),
+                    );
+                }
             }
             for (role, input) in [JoinSource::Main, JoinSource::Additional]
                 .into_iter()
@@ -3110,6 +3984,240 @@ impl JoinPlan {
                 cleanup_warning,
             }),
         }
+    }
+
+    fn materialize_seekable_ordered(
+        &self,
+        ordered: &Run,
+        source_files: &[File; 2],
+        output: &mut ExportTarget,
+        state: &Progress,
+    ) -> JResult<()> {
+        let mut reader = BufReader::with_capacity(READ_CHUNK, ordered.path.open()?);
+        let mut ordinal = 0_u64;
+        let mut previous_order: Option<[u8; 16]> = None;
+        let batch_byte_budget = (self.config.group_memory_bytes / 2).min(2 * 1024 * 1024);
+        let mut batch: Vec<OrderedPair> = Vec::new();
+        let mut main_requests: Vec<(u64, u64, u64)> = Vec::new();
+        let mut additional_requests: Vec<(u64, u64, u64)> = Vec::new();
+        let mut scratch = Vec::new();
+        let mut main_records: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut additional_records: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut out_buf = Vec::new();
+        let mut batch_count = 0_u64;
+        let mut next_pair: Option<OrderedPair> = None;
+
+        let read_next_pair = |reader: &mut BufReader<File>,
+                              previous_order: &mut Option<[u8; 16]>|
+         -> JResult<Option<OrderedPair>> {
+            let Some(head) = read_head(reader, self.config, state)? else {
+                return Ok(None);
+            };
+            if !valid_pair_order(
+                &head.key,
+                head.ordinal,
+                self.config.mode,
+                [self.inputs[0].info.data_rows, self.inputs[1].info.data_rows],
+            ) {
+                return Err(error("Joined row pairs are not in source order.").into());
+            }
+            let key_bytes: [u8; 16] = head.key.try_into().unwrap();
+            if previous_order.is_some_and(|previous| previous >= key_bytes) {
+                return Err(error("Joined row pairs are not in source order.").into());
+            }
+            *previous_order = Some(key_bytes);
+            let first = u64::from_be_bytes(key_bytes[0..8].try_into().unwrap());
+            let second = u64::from_be_bytes(key_bytes[8..16].try_into().unwrap());
+            let (main_ord, additional_ord) = if self.config.mode == JoinMode::Right {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            let main_ordinal = (main_ord != u64::MAX).then_some(main_ord);
+            let additional_ordinal = (additional_ord != u64::MAX).then_some(additional_ord);
+            let raw_locator =
+                read_exact_fixed::<PAIR_LOCATOR_BYTES>(reader, head.record_len, state)?;
+            let locator = PairLocator::from_le_bytes(&raw_locator);
+            if main_ordinal.is_none() && (locator.main_offset != 0 || locator.main_len != 0)
+                || additional_ordinal.is_none()
+                    && (locator.additional_offset != 0 || locator.additional_len != 0)
+            {
+                return Err(error("Invalid private join pair locator.").into());
+            }
+            if main_ordinal.is_some()
+                && (add(locator.main_offset, locator.main_len)? > self.inputs[0].stamp.file_size()
+                    || locator.main_len > self.config.max_record_bytes as u64)
+            {
+                return Err(error("Invalid private join row locator.").into());
+            }
+            if additional_ordinal.is_some()
+                && (add(locator.additional_offset, locator.additional_len)?
+                    > self.inputs[1].stamp.file_size()
+                    || locator.additional_len > self.config.max_record_bytes as u64)
+            {
+                return Err(error("Invalid private join row locator.").into());
+            }
+            Ok(Some(OrderedPair {
+                main_ordinal,
+                additional_ordinal,
+                locator,
+            }))
+        };
+
+        loop {
+            state.check()?;
+            batch.clear();
+            main_requests.clear();
+            additional_requests.clear();
+            let mut batch_bytes = 0_usize;
+            while batch.len() < MAX_MATERIALIZE_BATCH_PAIRS {
+                let pair = match next_pair.take() {
+                    Some(pair) => Some(pair),
+                    None => read_next_pair(&mut reader, &mut previous_order)?,
+                };
+                let Some(pair) = pair else {
+                    break;
+                };
+                let pair_bytes = (pair.locator.main_len as usize)
+                    .saturating_add(pair.locator.additional_len as usize);
+                if !batch.is_empty() && batch_bytes.saturating_add(pair_bytes) > batch_byte_budget {
+                    next_pair = Some(pair);
+                    break;
+                }
+                batch_bytes = batch_bytes.saturating_add(pair_bytes);
+                if let Some(main_ord) = pair.main_ordinal {
+                    main_requests.push((pair.locator.main_offset, pair.locator.main_len, main_ord));
+                }
+                if let Some(add_ord) = pair.additional_ordinal {
+                    additional_requests.push((
+                        pair.locator.additional_offset,
+                        pair.locator.additional_len,
+                        add_ord,
+                    ));
+                }
+                batch.push(pair);
+            }
+            if batch.is_empty() {
+                break;
+            }
+            if batch_count > 0 && batch_count.is_multiple_of(1024) {
+                for (role, input) in [JoinSource::Main, JoinSource::Additional]
+                    .into_iter()
+                    .zip(&self.inputs)
+                {
+                    check_source(input, role, JoinPhase::Creating)?;
+                }
+            }
+            read_seekable_batch(
+                &source_files[0],
+                &self.inputs[0],
+                JoinSource::Main,
+                &main_requests,
+                &mut scratch,
+                &mut main_records,
+                self.config,
+                state,
+            )?;
+            read_seekable_batch(
+                &source_files[1],
+                &self.inputs[1],
+                JoinSource::Additional,
+                &additional_requests,
+                &mut scratch,
+                &mut additional_records,
+                self.config,
+                state,
+            )?;
+            for pair in &batch {
+                state.check()?;
+                let main_fields = pair
+                    .main_ordinal
+                    .map(|ord| -> JResult<_> {
+                        let rec = main_records
+                            .get(&ord)
+                            .ok_or_else(|| error("Missing materialized Main row."))?;
+                        let parsed = fields(
+                            rec,
+                            self.inputs[0].info.delimiter,
+                            false,
+                            &self.inputs[0].info.path,
+                            ord + 1,
+                            self.config,
+                        )?;
+                        if parsed.len() > self.inputs[0].info.columns.len() {
+                            return Err(
+                                error("Prepared join row exceeds the analyzed schema.").into()
+                            );
+                        }
+                        Ok(parsed)
+                    })
+                    .transpose()?;
+                let additional_fields = pair
+                    .additional_ordinal
+                    .map(|ord| -> JResult<_> {
+                        let rec = additional_records
+                            .get(&ord)
+                            .ok_or_else(|| error("Missing materialized Additional row."))?;
+                        let parsed = fields(
+                            rec,
+                            self.inputs[1].info.delimiter,
+                            false,
+                            &self.inputs[1].info.path,
+                            ord + 1,
+                            self.config,
+                        )?;
+                        if parsed.len() > self.inputs[1].info.columns.len() {
+                            return Err(
+                                error("Prepared join row exceeds the analyzed schema.").into()
+                            );
+                        }
+                        Ok(parsed)
+                    })
+                    .transpose()?;
+                if let (Some(left_f), Some(right_f)) = (&main_fields, &additional_fields)
+                    && !fields_keys_match(
+                        left_f,
+                        &self.inputs[0].key_columns,
+                        right_f,
+                        &self.inputs[1].key_columns,
+                        self.config.case,
+                    )
+                {
+                    return Err(error("Private join key differs from its record.").into());
+                }
+                let values = self.output.columns.iter().map(|column| {
+                    let row = if column.source == JoinSource::Main {
+                        main_fields.as_deref()
+                    } else {
+                        additional_fields.as_deref()
+                    };
+                    row.and_then(|fields| fields.get(column.column))
+                        .map_or(b"".as_slice(), |value| value.as_ref())
+                });
+                encode_into(
+                    values,
+                    self.inputs[0].info.delimiter,
+                    self.config.max_record_bytes,
+                    &mut out_buf,
+                )?;
+                #[cfg(test)]
+                crate::join_faults::observe(crate::join_faults::Event::WritingRow);
+                output
+                    .write_all(&out_buf)
+                    .map_err(|error| self.publication_error(error, JoinPhase::Creating))?;
+                state.add_disk(out_buf.len() as u64)?;
+                ordinal = add(ordinal, 1)?;
+            }
+            main_records.clear();
+            additional_records.clear();
+            batch_count += 1;
+        }
+        if ordinal != self.analysis.output_rows
+            || output.bytes_written() != self.analysis.output_bytes
+        {
+            return Err(error("Joined output count or size changed before publication.").into());
+        }
+        Ok(())
     }
 }
 
@@ -5623,5 +6731,366 @@ mod tests {
         for (side, input) in args.iter().enumerate() {
             assert_eq!(fs::read(&input.path).unwrap(), bytes[side]);
         }
+    }
+
+    #[test]
+    fn seekable_late_materialization_handles_length_changing_and_utf8_repair_edits_on_additional_row()
+     {
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.csv");
+        let add_path = dir.path().join("additional.csv");
+        let main_bytes = b"id,label\nk1,Main-1\nk2,Main-2\nk3,Main-3\nk4,Main-only\n";
+        // Row 1 has invalid UTF-8 (0xff) repaired by a working edit;
+        // Row 2 has a short value expanded by a much longer multiline quoted edit;
+        // Row 3 has a longer value shrunk by an edit;
+        // Row 4 is Additional-only.
+        let add_bytes =
+            b"id,note\nk1,\xff\nk2,ok\nk3,very-long-original-value-to-shrink\nk5,Add-only\n";
+        fs::write(&main_path, main_bytes).unwrap();
+        fs::write(&add_path, add_bytes).unwrap();
+
+        let add_session = Arc::new(
+            crate::Session::open_with_encoding(
+                &add_path,
+                crate::OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: crate::HeaderMode::FirstRow,
+                    ..crate::OpenOptions::default()
+                },
+                Some(Encoding::Utf8),
+            )
+            .unwrap(),
+        );
+        let add_edits = Arc::new(BTreeMap::from([
+            ((1, 1), Arc::new("repaired-utf8-é".as_bytes().to_vec())),
+            (
+                (2, 1),
+                Arc::new(b"expanded, \"quoted\"\nline-two-with-extra-payload".to_vec()),
+            ),
+            ((3, 1), Arc::new(b"s".to_vec())),
+        ]));
+        let add_working = JoinWorkingSource::capture(
+            Arc::clone(&add_session),
+            &add_session,
+            Arc::new(BTreeMap::new()),
+            add_edits,
+            Arc::new(()),
+        );
+
+        let expected_by_mode: [(JoinMode, &[u8]); 4] = [
+            (
+                JoinMode::Left,
+                concat!(
+                    "id (Main),label,id (Additional),note\n",
+                    "k1,Main-1,k1,repaired-utf8-é\n",
+                    "k2,Main-2,k2,\"expanded, \"\"quoted\"\"\nline-two-with-extra-payload\"\n",
+                    "k3,Main-3,k3,s\n",
+                    "k4,Main-only,,\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                JoinMode::Inner,
+                concat!(
+                    "id (Main),label,id (Additional),note\n",
+                    "k1,Main-1,k1,repaired-utf8-é\n",
+                    "k2,Main-2,k2,\"expanded, \"\"quoted\"\"\nline-two-with-extra-payload\"\n",
+                    "k3,Main-3,k3,s\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                JoinMode::Right,
+                concat!(
+                    "id (Main),label,id (Additional),note\n",
+                    "k1,Main-1,k1,repaired-utf8-é\n",
+                    "k2,Main-2,k2,\"expanded, \"\"quoted\"\"\nline-two-with-extra-payload\"\n",
+                    "k3,Main-3,k3,s\n",
+                    ",,k5,Add-only\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                JoinMode::Full,
+                concat!(
+                    "id (Main),label,id (Additional),note\n",
+                    "k1,Main-1,k1,repaired-utf8-é\n",
+                    "k2,Main-2,k2,\"expanded, \"\"quoted\"\"\nline-two-with-extra-payload\"\n",
+                    "k3,Main-3,k3,s\n",
+                    "k4,Main-only,,\n",
+                    ",,k5,Add-only\n",
+                )
+                .as_bytes(),
+            ),
+        ];
+
+        for (index, (mode, expected)) in expected_by_mode.into_iter().enumerate() {
+            let pread_calls = Arc::new(AtomicU64::new(0));
+            let _guard = storage_test::install(storage_test::Hook {
+                force_spooled: false,
+                pread_calls: Some(Arc::clone(&pread_calls)),
+            });
+            let sources = [
+                JoinInput {
+                    path: main_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: add_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ];
+            let plan = analyze_join_with_working(
+                sources,
+                [None, Some(add_working.clone())],
+                dir.path().to_owned(),
+                JoinConfig { mode, ..config() },
+                JoinOutputOptions::default(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+            assert_eq!(plan.inputs[0].storage, FrameStorage::Seekable);
+            assert_eq!(plan.inputs[1].storage, FrameStorage::Seekable);
+            assert_eq!(
+                plan.analysis().output_bytes,
+                expected.len() as u64,
+                "{mode:?}"
+            );
+            let output = dir.path().join(format!("edited-{index}.csv"));
+            let summary = plan
+                .start_write(output.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert_eq!(summary.bytes_written, expected.len() as u64, "{mode:?}");
+            assert_eq!(fs::read(&output).unwrap(), expected, "{mode:?}");
+            assert!(
+                pread_calls.load(Ordering::Acquire) > 0,
+                "{mode:?}: seekable late materialization must use positional reads"
+            );
+        }
+        assert_eq!(fs::read(&main_path).unwrap(), main_bytes);
+        assert_eq!(fs::read(&add_path).unwrap(), add_bytes);
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn spooled_payload_fallback_matches_seekable_byte_for_byte_without_pread() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_bytes = source_bytes(
+            &format!(
+                "id,grp,val\nA,1,\"Main-1, {}\"\na,1,\"Main-2-{}\"\nB,2,\"Main-B-{}\"\n,1,\"Empty-key-{}\"\nC,3,\"Unmatched-M-{}\"\n",
+                "a".repeat(128),
+                "b".repeat(128),
+                "c".repeat(128),
+                "d".repeat(128),
+                "e".repeat(128),
+            ),
+            Encoding::Utf16Le,
+        );
+        let add_bytes =
+            b"id;grp;city\na;1;S\xe3o Paulo\nA;1;Montr\xe9al\nb;2;Lisbon\nD;4;Unmatched-A\n";
+        let main_path = dir.path().join("main-u16.csv");
+        let add_path = dir.path().join("add-1252.csv");
+        fs::write(&main_path, &main_bytes).unwrap();
+        fs::write(&add_path, add_bytes).unwrap();
+
+        let make_inputs = || {
+            [
+                JoinInput {
+                    path: main_path.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: None,
+                    key_columns: vec![0, 1],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: add_path.clone(),
+                    delimiter: Some(b';'),
+                    has_header: true,
+                    encoding: Some(Encoding::Windows1252),
+                    key_columns: vec![0, 1],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ]
+        };
+
+        for (idx, mode) in [
+            JoinMode::Left,
+            JoinMode::Inner,
+            JoinMode::Right,
+            JoinMode::Full,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cfg = JoinConfig {
+                mode,
+                case: JoinCase::AsciiInsensitive,
+                group_memory_bytes: 32,
+                ..config()
+            };
+
+            let seekable_preads = Arc::new(AtomicU64::new(0));
+            let (seekable_bytes, seekable_preview, seekable_temp, seekable_frames) = {
+                let _guard = storage_test::install(storage_test::Hook {
+                    force_spooled: false,
+                    pread_calls: Some(Arc::clone(&seekable_preads)),
+                });
+                let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(plan.inputs[0].storage, FrameStorage::Seekable);
+                assert_eq!(plan.inputs[1].storage, FrameStorage::Seekable);
+                let preview = plan.analysis().preview.clone();
+                let add_temp = plan.analysis().additional_temporary_bytes;
+                let frame_total: u64 = plan.inputs.iter().map(|i| i.frame_bytes).sum();
+                let output = dir.path().join(format!("seekable-{idx}.csv"));
+                let summary = plan
+                    .start_write_acknowledged(output.clone(), true)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert!(summary.peak_temporary_bytes <= add_temp + frame_total);
+                (fs::read(&output).unwrap(), preview, add_temp, frame_total)
+            };
+            assert!(
+                seekable_preads.load(Ordering::Acquire) > 0,
+                "{mode:?}: seekable path must use pread"
+            );
+
+            let spooled_preads = Arc::new(AtomicU64::new(0));
+            let (spooled_bytes, spooled_preview, spooled_temp, spooled_frames) = {
+                let _guard = storage_test::install(storage_test::Hook {
+                    force_spooled: true,
+                    pread_calls: Some(Arc::clone(&spooled_preads)),
+                });
+                let plan = analyze_join(make_inputs(), dir.path().to_owned(), cfg)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(plan.inputs[0].storage, FrameStorage::SpooledPayload);
+                assert_eq!(plan.inputs[1].storage, FrameStorage::SpooledPayload);
+                let preview = plan.analysis().preview.clone();
+                let add_temp = plan.analysis().additional_temporary_bytes;
+                let frame_total: u64 = plan.inputs.iter().map(|i| i.frame_bytes).sum();
+                let output = dir.path().join(format!("spooled-{idx}.csv"));
+                let summary = plan
+                    .start_write_acknowledged(output.clone(), true)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap();
+                assert!(summary.peak_temporary_bytes <= add_temp + frame_total);
+                (fs::read(&output).unwrap(), preview, add_temp, frame_total)
+            };
+            assert_eq!(
+                spooled_preads.load(Ordering::Acquire),
+                0,
+                "{mode:?}: non-seekable fallback must never issue pread"
+            );
+            assert_eq!(seekable_bytes, spooled_bytes, "{mode:?} output parity");
+            assert_eq!(seekable_preview, spooled_preview, "{mode:?} preview parity");
+            // With long payloads in Main, seekable compact frames use less disk than spooled payloads.
+            assert!(
+                seekable_frames < spooled_frames,
+                "{mode:?}: seekable frames ({seekable_frames}) should be smaller than spooled ({spooled_frames})"
+            );
+            assert!(
+                seekable_temp < spooled_temp,
+                "{mode:?}: seekable additional_temporary_bytes ({seekable_temp}) should be smaller than spooled ({spooled_temp})"
+            );
+        }
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn seekable_late_materialization_rejects_external_truncation_and_corrupted_locators() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.csv");
+        let add = dir.path().join("additional.csv");
+        fs::write(&main, b"id,val\na,Main-A\nb,Main-B\n").unwrap();
+        fs::write(
+            &add,
+            b"id,note\na,Additional-A-long-payload\nb,Additional-B\n",
+        )
+        .unwrap();
+        let make_inputs = || {
+            [
+                JoinInput {
+                    path: main.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: add.clone(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ]
+        };
+
+        // External truncation of Additional after analysis blocks publication cleanly.
+        let plan = analyze_join(make_inputs(), dir.path().to_owned(), config())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        fs::write(&add, b"id,note\n").unwrap();
+        let out = dir.path().join("truncated.csv");
+        assert!(plan.start_write(out.clone()).unwrap().wait().is_err());
+        assert!(!out.exists());
+        assert!(workspaces(dir.path()).is_empty());
+
+        // Restore Additional and corrupt a private locator frame in `sorted`.
+        fs::write(
+            &add,
+            b"id,note\na,Additional-A-long-payload\nb,Additional-B\n",
+        )
+        .unwrap();
+        let plan = analyze_join(make_inputs(), dir.path().to_owned(), config())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        let mut bytes = fs::read(&plan.inputs[1].sorted).unwrap();
+        // Flip the final locator bytes so record_len/value_bytes become invalid.
+        for byte in bytes.iter_mut().rev().take(16) {
+            *byte = 0xff;
+        }
+        fs::write(&plan.inputs[1].sorted, bytes).unwrap();
+        let out2 = dir.path().join("corrupt-locator.csv");
+        assert!(plan.start_write(out2.clone()).unwrap().wait().is_err());
+        assert!(!out2.exists());
+        assert!(workspaces(dir.path()).is_empty());
     }
 }

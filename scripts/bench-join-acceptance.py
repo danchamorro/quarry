@@ -62,6 +62,14 @@ def generate(args, root, ram):
         ]
         output_header = record(headings[0] + headings[1], b"\t")
         size = None
+    elif args.case == "narrow":
+        rows = 1000 if smoke else 10_000_000
+        counts = [rows, rows]
+        columns, keys = 2, 1
+        delimiters = [b",", b","]
+        headings = [[b"key", b"payload"], [b"key", b"payload"]]
+        output_header = b"key (Main),payload (Main),key (Additional),payload (Additional)\n"
+        size = 6
     else:
         counts = [rows, rows] if args.case == "large" else ([8, 9] if smoke else [1024, 1536])
         columns, keys = 2, 1
@@ -84,45 +92,76 @@ def generate(args, root, ram):
             destination.write(header)
             digest.update(header)
             written += len(header)
-            for row in range(counts[side]):
-                if args.case == "wide":
-                    fields = wide_fields("main" if side == 0 else "additional", row, columns, keys)
-                else:
-                    key = b"k" if args.case == "skew" else (
-                        ("shared" if row % 1000 == 0 else ("main" if side == 0 else "additional"))
-                        + "-%08d" % row
-                    ).encode()
-                    fields = [key, payload("M" if side == 0 else "A", row, size)]
-                data = record(fields, delimiters[side])
-                destination.write(data)
-                digest.update(data)
-                written += len(data)
-                if side == 0:
+            if args.case == "narrow":
+                side_prefix = b"M" if side == 0 else b"A"
+                other_prefix = b"A"
+                chunk_size = 50_000
+                for start in range(0, counts[side], chunk_size):
+                    end = min(start + chunk_size, counts[side])
+                    buf = bytearray()
+                    exp_buf = bytearray() if side == 0 else None
+                    for row in range(start, end):
+                        if row % 10 == 0:
+                            key = f"s{row:08d}".encode()
+                        else:
+                            key = (f"m{row:08d}" if side == 0 else f"a{row:08d}").encode()
+                        val = f"{side_prefix.decode()}{row:08d}".encode()
+                        line = key + b"," + val + b"\n"
+                        buf += line
+                        if exp_buf is not None:
+                            if row % 10 == 0:
+                                exp_buf += key + b"," + val + b"," + key + b"," + f"{other_prefix.decode()}{row:08d}".encode() + b"\n"
+                            else:
+                                exp_buf += key + b"," + val + b",,\n"
+                    destination.write(buf)
+                    digest.update(buf)
+                    written += len(buf)
+                    if exp_buf is not None:
+                        expected.update(exp_buf)
+                        expected_bytes += len(exp_buf)
+                    if time.monotonic() - last >= 10:
+                        print("generating_side=%d bytes=%d" % (side, written), flush=True)
+                        last = time.monotonic()
+            else:
+                for row in range(counts[side]):
                     if args.case == "wide":
-                        additional = wide_fields("additional", row, columns, keys) if row % 4 == 0 else [b""] * columns
-                        expected_data = record(fields + additional, b"\t")
-                        expected.update(expected_data)
-                        expected_bytes += len(expected_data)
-                    elif args.case == "large":
-                        additional = [fields[0], payload("A", row, size)] if row % 1000 == 0 else [b"", b""]
-                        expected_data = record(fields + additional, b",")
-                        expected.update(expected_data)
-                        expected_bytes += len(expected_data)
+                        fields = wide_fields("main" if side == 0 else "additional", row, columns, keys)
                     else:
-                        for additional_row in range(counts[1]):
-                            expected_data = record(fields + [b"k", payload("A", additional_row, size)], b",")
+                        key = b"k" if args.case == "skew" else (
+                            ("shared" if row % 1000 == 0 else ("main" if side == 0 else "additional"))
+                            + "-%08d" % row
+                        ).encode()
+                        fields = [key, payload("M" if side == 0 else "A", row, size)]
+                    data = record(fields, delimiters[side])
+                    destination.write(data)
+                    digest.update(data)
+                    written += len(data)
+                    if side == 0:
+                        if args.case == "wide":
+                            additional = wide_fields("additional", row, columns, keys) if row % 4 == 0 else [b""] * columns
+                            expected_data = record(fields + additional, b"\t")
                             expected.update(expected_data)
                             expected_bytes += len(expected_data)
-                if time.monotonic() - last >= 10:
-                    print("generating_side=%d bytes=%d" % (side, written), flush=True)
-                    last = time.monotonic()
+                        elif args.case == "large":
+                            additional = [fields[0], payload("A", row, size)] if row % 1000 == 0 else [b"", b""]
+                            expected_data = record(fields + additional, b",")
+                            expected.update(expected_data)
+                            expected_bytes += len(expected_data)
+                        else:
+                            for additional_row in range(counts[1]):
+                                expected_data = record(fields + [b"k", payload("A", additional_row, size)], b",")
+                                expected.update(expected_data)
+                                expected_bytes += len(expected_data)
+                    if time.monotonic() - last >= 10:
+                        print("generating_side=%d bytes=%d" % (side, written), flush=True)
+                        last = time.monotonic()
             destination.flush()
             os.fsync(destination.fileno())
         input_hashes.append(digest.hexdigest())
         input_bytes.append(written)
         print("generated_side=%d bytes=%d" % (side, written), flush=True)
-    if args.case == "large" and not smoke:
-        assert sum(input_bytes) > ram, "the complete large fixture must exceed actual VM RAM"
+    if args.case == "large" and not smoke and not args.allow_below_ram:
+        assert sum(input_bytes) > ram, "the complete large fixture must exceed actual VM RAM (pass --allow-below-ram for host profiling)"
     manifest = {
         "schema": 1, "fixture_id": str(uuid.uuid4()), "case": args.case,
         "smoke": smoke, "rows": counts, "columns_per_side": columns, "keys": keys,
@@ -148,9 +187,11 @@ def parse_metrics(content):
             parsed = float(value) if "." in value else int(value)
         except ValueError:
             parsed = value
-        # The probe reports one observed peak for each separate job.
+        # The probe reports one observed peak and per-phase seconds for each separate job.
         if key == "observed_peak_temporary_bytes":
             result[key] = max(result.get(key, 0), parsed)
+        elif key.startswith("phase_seconds_"):
+            result[key] = result.get(key, 0.0) + float(parsed)
         else:
             result[key] = parsed
     return result
@@ -293,10 +334,12 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", required=True, choices=["large", "skew", "wide"])
+    parser.add_argument("--case", required=True, choices=["large", "skew", "wide", "narrow"])
     parser.add_argument("--root", required=True)
     parser.add_argument("--binary", help="Optional copy; must match the probe built from the clean checkout")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--reuse", action="store_true")
+    parser.add_argument("--allow-below-ram", action="store_true",
+                        help="Allow --case large on hosts with RAM larger than 18 GiB (for profiling)")
     parser.add_argument("--cancel-after-rows", type=int)
     run(parser.parse_args())
