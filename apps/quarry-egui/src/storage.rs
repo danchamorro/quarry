@@ -298,8 +298,68 @@ impl QuarryApp {
         self.active.notice = None;
     }
 
+    /// Applies the persistent index cache setting immediately across the app and open tabs.
+    pub(super) fn set_index_cache_enabled(&mut self, enabled: bool) {
+        self.index_cache_enabled = enabled;
+        for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
+            if let Some(document) = tab.document.as_mut() {
+                document.index_cache_enabled = enabled;
+            }
+        }
+    }
+
+    /// Starts clearing the persistent index cache on a background worker owned by `QuarryApp`.
+    pub(super) fn start_clear_index_cache(&mut self) {
+        if self.cache_clear_worker.is_some() {
+            return;
+        }
+        self.cache_clear_status = None;
+        self.cache_clear_worker = Some(thread::spawn(|| {
+            quarry_core::clear_index_cache(None)
+                .map(|summary| {
+                    if summary.files_removed == 0 {
+                        "Index cache is already empty.".into()
+                    } else {
+                        format!(
+                            "Cleared {} cached index files ({}).",
+                            summary.files_removed,
+                            format_bytes(summary.bytes_reclaimed)
+                        )
+                    }
+                })
+                .map_err(|error| error.to_string())
+        }));
+    }
+
+    /// Collects a finished cache-clear worker even after the settings dialog has closed.
+    pub(super) fn poll_cache_clear_worker(&mut self) {
+        if self
+            .cache_clear_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            let outcome = self
+                .cache_clear_worker
+                .take()
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| Err("Failed to clear index cache.".into()));
+            if self.active.storage_review.is_none() {
+                self.active.notice = Some(match &outcome {
+                    Ok(message) => AppMessage::status(message.clone()),
+                    Err(error) => AppMessage::error(error.clone()),
+                });
+            }
+            self.cache_clear_status = Some(outcome);
+        }
+    }
+
     /// Opens working-folder settings without reserving a document operation.
     pub(super) fn open_storage_settings(&mut self) {
+        self.poll_cache_clear_worker();
+        if self.cache_clear_worker.is_none() {
+            self.cache_clear_status = None;
+        }
         self.active.storage_review = Some(StorageReview::new(
             self.working_directory.clone(),
             0,
@@ -314,7 +374,11 @@ impl QuarryApp {
 
     /// Reviews this tab's storage and propagates an accepted working folder to all tabs.
     pub(super) fn show_storage_review(&mut self, ctx: &egui::Context) {
+        self.poll_cache_clear_worker();
         let write_slot_available = self.write_slot_available();
+        let mut cache_enabled = self.index_cache_enabled;
+        let clearing_cache = self.cache_clear_worker.is_some();
+        let cache_clear_status = self.cache_clear_status.clone();
         let Some(review) = self.active.storage_review.as_mut() else {
             return;
         };
@@ -329,6 +393,7 @@ impl QuarryApp {
         let mut accept = false;
         let mut cancel = false;
         let mut check = false;
+        let mut clear_cache = false;
         let modal = egui::Modal::new(egui::Id::new("quarry-storage-review"))
             .frame(compact_tool_frame(ctx))
             .backdrop_color(Color32::from_black_alpha(40))
@@ -394,7 +459,7 @@ impl QuarryApp {
                 }
                 egui::ScrollArea::vertical()
                     .id_salt("quarry-storage-details-scroll")
-                    .max_height((ctx.content_rect().height() - 260.0).clamp(80.0, 360.0))
+                    .max_height((ctx.content_rect().height() - 220.0).clamp(80.0, 440.0))
                     .show(ui, |ui| {
                         let mut details = |ui: &mut egui::Ui| {
                             if review.operation.is_some() {
@@ -434,6 +499,37 @@ impl QuarryApp {
                             }
                             if ready && ui.button("Check again").clicked() { check = true; }
                             ui.small("Quarry checks again before writing. If a write fails, it removes unfinished output and preserves your current document and required Undo files.");
+                            if review.operation.is_none() {
+                                ui.separator();
+                                ui.label("Persistent index cache");
+                                ui.checkbox(
+                                    &mut cache_enabled,
+                                    "Reuse cached index for large local files",
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .add_enabled(!clearing_cache, egui::Button::new("Clear index cache"))
+                                        .clicked()
+                                    {
+                                        clear_cache = true;
+                                    }
+                                    if clearing_cache {
+                                        ui.spinner();
+                                        ui.small("Clearing index cache…");
+                                    }
+                                });
+                                if let Some(status) = &cache_clear_status {
+                                    match status {
+                                        Ok(message) => {
+                                            ui.small(message);
+                                        }
+                                        Err(error) => {
+                                            ui.colored_label(ui.visuals().error_fg_color, error);
+                                        }
+                                    }
+                                }
+                                ui.small("Stores structural offsets only in a private folder (up to 256 MB); never file names or cell data.");
+                            }
                         };
                         if review.operation.is_none() {
                             details(ui);
@@ -456,6 +552,12 @@ impl QuarryApp {
         cancel |= modal.should_close();
         if check {
             review.check();
+        }
+        if cache_enabled != self.index_cache_enabled {
+            self.set_index_cache_enabled(cache_enabled);
+        }
+        if clear_cache {
+            self.start_clear_index_cache();
         }
         if cancel {
             self.active.storage_review = None;
@@ -1501,5 +1603,63 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), foreign);
         assert_eq!(std::fs::read(&source).unwrap(), original);
         assert!(!document.working_cleanup.take_errors().is_empty());
+    }
+
+    #[test]
+    fn persistent_index_cache_toggle_and_clear_worker_survive_unwritable_folder_and_dialog_close() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("source.csv");
+        std::fs::write(&source, b"a,b\n1,2\n").unwrap();
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        finish(&mut app);
+
+        let missing_dir = parent.path().join("disconnected-drive");
+        app.active.storage_review = Some(StorageReview {
+            operation: None,
+            path_input: missing_dir.display().to_string(),
+            checked_path: missing_dir,
+            required_bytes: 0,
+            retained_paths: Vec::new(),
+            worker: None,
+            result: Some(Err("Volume disconnected".into())),
+        });
+        assert!(!app.active.storage_review.as_ref().unwrap().ready());
+
+        // Toggling index cache applies immediately even though the working folder check failed.
+        app.set_index_cache_enabled(false);
+        assert!(!app.index_cache_enabled);
+        assert!(!app.active.document.as_ref().unwrap().index_cache_enabled);
+
+        // An in-flight cache clear owned by QuarryApp survives closing and reopening settings,
+        // prevents duplicate starts, and reports completion in `active.notice` when closed.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        app.cache_clear_worker = Some(std::thread::spawn(move || {
+            let _ = rx.recv();
+            Ok("Cleared 1 cached index files (4.0 KiB).".into())
+        }));
+        app.active.storage_review = None;
+        app.open_storage_settings();
+        assert!(app.cache_clear_worker.is_some());
+        // Attempting to start a second clear while one is active must be a no-op.
+        app.start_clear_index_cache();
+        assert!(app.cache_clear_worker.is_some());
+
+        // Closing settings before completion must still retain the worker and report its result.
+        app.active.storage_review = None;
+        tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.cache_clear_worker.is_some() {
+            app.poll_cache_clear_worker();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(
+            app.active
+                .notice
+                .as_ref()
+                .is_some_and(|msg| msg.text.contains("Cleared 1 cached index files")),
+            "expected completion notice after settings closed, got: {:?}",
+            app.active.notice.as_ref().map(|m| &m.text)
+        );
     }
 }

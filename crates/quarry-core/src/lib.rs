@@ -15,8 +15,8 @@ mod join;
 mod join_faults;
 mod pool;
 mod positional_io;
-
 mod search;
+mod sidecar;
 mod sort;
 mod source_stamp;
 mod spill;
@@ -93,6 +93,10 @@ pub use quarry_delimited::{
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{
     SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress, SearchTelemetry,
+};
+pub use sidecar::{
+    CacheClearSummary, DEFAULT_INDEX_CACHE_MAX_BYTES, DEFAULT_INDEX_CACHE_MIN_FILE_BYTES,
+    IndexCacheConfig, clear_index_cache, default_index_cache_dir,
 };
 pub use sort::{
     DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
@@ -607,6 +611,15 @@ impl Session {
         threads: Option<usize>,
     ) -> Result<IndexJob, QuarryError> {
         IndexJob::start(self, config, threads)
+    }
+
+    pub fn start_indexing_with_options(
+        &self,
+        config: IndexConfig,
+        threads: Option<usize>,
+        cache_config: IndexCacheConfig,
+    ) -> Result<IndexJob, QuarryError> {
+        IndexJob::start_with_options(self, config, threads, cache_config)
     }
 
     fn completed_record_count(&self) -> Option<u64> {

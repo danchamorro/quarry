@@ -349,6 +349,9 @@ struct QuarryApp {
     combine_files: Option<combine_files::CombineDialog>,
     join_files: Option<join_files::JoinDialog>,
     working_directory: PathBuf,
+    index_cache_enabled: bool,
+    cache_clear_status: Option<Result<String, String>>,
+    cache_clear_worker: Option<std::thread::JoinHandle<Result<String, String>>>,
     active: DocumentTab,
     tabs: Vec<DocumentTab>,
     next_tab_id: u64,
@@ -803,6 +806,9 @@ impl QuarryApp {
             decompression_slots: compressed::DecompressionSlots::default(),
             document_cleanup: None,
             working_directory: std::env::temp_dir(),
+            index_cache_enabled: true,
+            cache_clear_status: None,
+            cache_clear_worker: None,
             active: DocumentTab::new(1),
             tabs: Vec::new(),
             next_tab_id: 2,
@@ -903,6 +909,7 @@ impl QuarryApp {
         encoding: Option<Encoding>,
     ) -> Result<(), AppMessage> {
         document.working_directory = self.working_directory.clone();
+        document.index_cache_enabled = self.index_cache_enabled;
         document.working_cleanup = self.working_cleanup.clone();
         document.decompression_slots = self.decompression_slots.clone();
         if document.awaiting_decompression() {
@@ -1777,6 +1784,7 @@ impl QuarryApp {
             replacement.index = Some(index);
             replacement.load_buffer(replacement.viewport_start)?;
         } else {
+            replacement.index_cache_enabled = self.index_cache_enabled;
             replacement.start_indexing()?;
         }
         self.install_prepared_working_copy(replacement, ready);
@@ -1831,6 +1839,7 @@ impl QuarryApp {
             Some(document.session.encoding()),
         )
         .map_err(AppMessage::error)?;
+        replacement.index_cache_enabled = self.index_cache_enabled;
         replacement.start_indexing().map_err(AppMessage::error)?;
         let document = self
             .active
@@ -1996,6 +2005,7 @@ impl QuarryApp {
         replacement.cell_edits = Arc::new(target.overlay.cell_edits.clone());
         replacement.edit_history = target.edit_history;
         replacement.refresh_column_headers();
+        replacement.index_cache_enabled = self.index_cache_enabled;
         replacement.start_indexing().map_err(AppMessage::error)?;
 
         let current = self
@@ -2343,6 +2353,7 @@ impl eframe::App for QuarryApp {
         self.reset_tab_focus(ctx);
         self.poll_document_tabs(ctx);
         self.poll_inspections(ctx);
+        self.poll_cache_clear_worker();
 
         if self.active.close_confirmation_open {
             self.about.open = false;
@@ -3012,7 +3023,7 @@ impl eframe::App for QuarryApp {
         {
             self.about.show(ctx);
         }
-        if self.document_tabs().any(DocumentTab::busy) {
+        if self.document_tabs().any(DocumentTab::busy) || self.cache_clear_worker.is_some() {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
         if self.combine_files.is_some() {
@@ -6438,6 +6449,7 @@ struct Document {
     pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
     pending_diagnostic_message: Option<String>,
     working_directory: PathBuf,
+    index_cache_enabled: bool,
     working_cleanup: quarry_core::WorkingCopyCleanup,
     /// The app's decompression slots, which a compressed document's pass claims.
     decompression_slots: compressed::DecompressionSlots,
@@ -6631,6 +6643,7 @@ impl Document {
             pending_diagnostic: None,
             pending_diagnostic_message: None,
             working_directory: std::env::temp_dir(),
+            index_cache_enabled: true,
             working_cleanup: quarry_core::WorkingCopyCleanup::default(),
             decompression_slots: compressed::DecompressionSlots::default(),
             join_reservations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -8128,9 +8141,14 @@ impl Document {
         if self.start_decompression()? {
             return Ok(());
         }
+        let cache_config = if self.index_cache_enabled {
+            quarry_core::IndexCacheConfig::default()
+        } else {
+            quarry_core::IndexCacheConfig::disabled()
+        };
         let job = self
             .session
-            .start_indexing(IndexConfig::default())
+            .start_indexing_with_options(IndexConfig::default(), None, cache_config)
             .map_err(|error| self.diagnostic_error(error))?;
         self.progress = job.progress();
         self.job = Some(job);
