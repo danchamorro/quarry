@@ -9,6 +9,7 @@ rust-version.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
 quarry-core = { path = "../../crates/quarry-core" }
+quarry-workbench = { path = "../../crates/quarry-workbench" }
 rfd = { version = "0.17.2", default-features = false }
 tempfile = "3.27.0"
 
@@ -21,3 +22,4 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
 [dev-dependencies]
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+quarry-workbench = { path = "../../crates/quarry-workbench", features = ["test-hooks"] }

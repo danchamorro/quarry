@@ -1,7 +1,7 @@
 use super::*;
 use quarry_core::{
-    StorageSpace, estimate_duplicate_target_temporary_bytes,
-    estimate_edited_output_bytes_from_values, inspect_storage, validate_scratch_directory,
+    StorageSpace, estimate_duplicate_target_temporary_bytes, inspect_storage,
+    validate_scratch_directory,
 };
 use std::io::{Read, Write};
 use std::thread::{self, JoinHandle};
@@ -257,15 +257,7 @@ fn parse_scratch_directory_pref(content: &str) -> Option<PathBuf> {
     None
 }
 
-pub(super) fn format_unavailable_scratch_notice(directory: &Path, error: &str) -> String {
-    format!(
-        "Saved temporary folder {} is unavailable ({error}). Open File > Temporary storage… to choose another folder or switch back to the system temporary folder.",
-        directory.display()
-    )
-}
-
-// Small operations still receive the engine's space check, without another dialog.
-pub(super) const STORAGE_REVIEW_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) use quarry_workbench::{STORAGE_REVIEW_BYTES, format_unavailable_scratch_notice};
 
 #[derive(Clone)]
 pub(super) enum PendingStorageOperation {
@@ -1032,135 +1024,6 @@ impl QuarryApp {
             }
         }
         ctx.request_repaint();
-    }
-}
-
-impl Document {
-    pub(super) fn storage_record_count(&self) -> u64 {
-        self.index.as_ref().map_or(
-            self.session.file_size.saturating_add(1),
-            StructuralIndex::indexed_rows,
-        )
-    }
-
-    pub(super) fn materialization_storage_estimate(
-        &self,
-        transformation: Option<&ColumnTransformation>,
-        replacement: Option<&LiteralReplacement>,
-    ) -> u64 {
-        self.materialization_storage_estimate_for_records(
-            transformation,
-            replacement,
-            if transformation.is_some() || replacement.is_some() {
-                self.storage_record_count()
-            } else {
-                0
-            },
-        )
-    }
-
-    pub(super) fn materialization_storage_estimate_for_records(
-        &self,
-        transformation: Option<&ColumnTransformation>,
-        replacement: Option<&LiteralReplacement>,
-        records: u64,
-    ) -> u64 {
-        estimate_edited_output_bytes_from_values(
-            self.session.file_size,
-            records,
-            self.header_renames
-                .iter()
-                .map(|(column, value)| (*column, value.as_bytes())),
-            self.cell_edits
-                .iter()
-                .map(|(key, value)| (*key, value.as_slice())),
-            transformation,
-            replacement,
-        )
-        .saturating_mul(if self.session.encoding() == Encoding::Utf8 {
-            1
-        } else {
-            3
-        })
-    }
-
-    fn reordered_storage_estimate(&self) -> u64 {
-        estimate_edited_output_bytes_from_values(
-            self.session.file_size,
-            self.storage_record_count(),
-            self.header_renames
-                .iter()
-                .map(|(column, value)| (*column, value.as_bytes())),
-            self.cell_edits
-                .iter()
-                .map(|(key, value)| (*key, value.as_slice())),
-            None,
-            None,
-        )
-        .saturating_mul(if self.session.encoding() == Encoding::Utf8 {
-            1
-        } else {
-            3
-        })
-    }
-
-    fn retained_storage_paths(&self) -> Vec<PathBuf> {
-        let Some(state) = self.working_copy.as_ref() else {
-            return Vec::new();
-        };
-        std::iter::once(self.session.path())
-            .chain(
-                state
-                    .undo
-                    .iter()
-                    .chain(state.redo.iter())
-                    .map(|snapshot| snapshot.path.as_path()),
-            )
-            .filter(|path| state.owns(path))
-            .map(Path::to_path_buf)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-}
-
-impl WorkingCopyState {
-    pub(super) fn use_directory(&mut self, parent: &Path) -> Result<(), String> {
-        if self.directory.path().parent() != Some(parent) {
-            let replacement = Self::new_in_with_cleanup(parent, self.cleanup.clone())?;
-            self.previous_directories.push(std::mem::replace(
-                &mut self.directory,
-                replacement.directory,
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) fn prune_directories(&mut self, current: &Path) {
-        self.previous_directories.retain(|directory| {
-            directory.contains(current)
-                || self
-                    .undo
-                    .iter()
-                    .chain(self.redo.iter())
-                    .any(|snapshot| directory.contains(&snapshot.path))
-        });
-    }
-
-    pub(super) fn remove(&self, path: &Path) -> std::io::Result<()> {
-        let directory = std::iter::once(&self.directory)
-            .chain(self.previous_directories.iter())
-            .find(|directory| directory.contains(path))
-            .ok_or_else(|| std::io::Error::other("No private working owner for this file."))?;
-        directory.remove(path)
-    }
-
-    pub(super) fn owns(&self, path: &Path) -> bool {
-        self.directory.contains(path)
-            || self
-                .previous_directories
-                .iter()
-                .any(|directory| directory.contains(path))
     }
 }
 

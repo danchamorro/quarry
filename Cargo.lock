@@ -2105,9 +2105,19 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "quarry-core",
+ "quarry-workbench",
  "rfd",
  "tempfile",
  "winit",
+]
+
+[[package]]
+name = "quarry-workbench"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "quarry-core",
+ "tempfile",
 ]
 
 [[package]]
