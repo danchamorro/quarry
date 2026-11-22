@@ -758,35 +758,33 @@ pub(super) fn copy_with_replaced_records_parallel(
                                     let needs_large_gate = rec.len() > LARGE_RECORD_GATE_BYTES
                                         || est_output_bytes > LARGE_RECORD_GATE_BYTES;
                                     if needs_large_gate && large_guard.is_none() {
-                                        if let Some(g) = large_record_gate.try_acquire() {
-                                            large_guard = Some(g);
-                                        } else {
-                                            if !chunk_bytes.is_empty()
-                                                && !emit_chunk(
-                                                    false,
-                                                    &mut chunk_bytes,
-                                                    &mut relative_ends,
-                                                    &mut chunk_replacements,
-                                                    &mut chunk_rows,
-                                                    &mut seq,
-                                                    0,
-                                                )
+                                        if !chunk_bytes.is_empty()
+                                            && !emit_chunk(
+                                                false,
+                                                &mut chunk_bytes,
+                                                &mut relative_ends,
+                                                &mut chunk_replacements,
+                                                &mut chunk_rows,
+                                                &mut seq,
+                                                0,
+                                            )
+                                        {
+                                            stopped = true;
+                                        }
+                                        if !stopped {
+                                            if let Some(g) = large_record_gate.try_acquire() {
+                                                large_guard = Some(g);
+                                            } else if let Some(g) =
+                                                large_record_gate.acquire(&shared.cancel_requested)
                                             {
+                                                large_guard = Some(g);
+                                            } else {
                                                 stopped = true;
-                                            }
-                                            if !stopped {
-                                                if let Some(g) = large_record_gate
-                                                    .acquire(&shared.cancel_requested)
-                                                {
-                                                    large_guard = Some(g);
-                                                } else {
-                                                    stopped = true;
-                                                }
                                             }
                                         }
                                     }
                                     if !stopped {
-                                        match append_replaced_record(
+                                        let appended = append_replaced_record(
                                             &mut chunk_bytes,
                                             rec,
                                             physical_row,
@@ -798,7 +796,15 @@ pub(super) fn copy_with_replaced_records_parallel(
                                             &replacement,
                                             needle_contains_quote,
                                             config.max_record_bytes,
-                                        ) {
+                                        );
+                                        if !record.is_empty() {
+                                            clear_record_buffer(&mut record);
+                                        }
+                                        // Release the global large-record gate BEFORE calling
+                                        // `emit_chunk`, which may block on `reorder_budget` for a
+                                        // non-head stripe while the head stripe needs the gate.
+                                        large_guard.take();
+                                        match appended {
                                             Ok(count) => {
                                                 chunk_replacements =
                                                     chunk_replacements.saturating_add(count);

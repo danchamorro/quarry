@@ -10584,6 +10584,75 @@ mod tests {
         cancel_job.cancel();
         assert_eq!(cancel_job.wait().unwrap(), ReplaceAllOutcome::Cancelled);
         assert!(!cancel_dest.exists());
+
+        // Regression test for lock-ordering between `LargeRecordGate` and `reorder_budget`:
+        // 4 workers, delayed stripe 0, tight reorder budget, and records on every stripe
+        // expanding past `LARGE_RECORD_GATE_BYTES` (~5 MiB) must complete without deadlocking.
+        let large_source = dir.path().join("large-expand.csv");
+        let mut large_raw = String::from("id,val\n");
+        let seed_cell = "a".repeat(2_500);
+        for i in 0..8_u64 {
+            large_raw.push_str(&format!("{i:02},{seed_cell}\n"));
+        }
+        fs::write(&large_source, large_raw.as_bytes()).unwrap();
+        let large_session = Session::open(
+            &large_source,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let large_index = large_session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 2,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        // Each row has 2,500 `a`s -> 2,500 * 2,048 = ~5.12 MiB (> 4 MiB LargeRecordGate).
+        let large_replacement = LiteralReplacement {
+            needle: b"a".to_vec(),
+            replacement: vec![b'X'; 2_048],
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        let large_dest = dir.path().join("large-expand-out.csv");
+        let large_inner = SaveAsJob::start_worker_with_options(
+            large_session.path.clone(),
+            large_session.file_size,
+            large_session.dialect.delimiter,
+            large_session.dialect.has_header,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            Some(large_replacement),
+            Vec::new(),
+            None,
+            SaveTarget::WorkingCopy(large_dest.clone(), large_session.source_stamp.clone()),
+            large_session.export_config(),
+            Some(large_index.indexed_rows()),
+            Some(large_index),
+            Some(replace_parallel::ReplaceParallelTuning {
+                requested_workers: 4,
+                min_stripe_bytes: 1,
+                flush_chunk_bytes: 1024 * 1024,
+                reorder_budget_bytes: 64 * 1024,
+                max_head_in_flight: 2,
+                delay_stripe_zero: Some(Duration::from_millis(50)),
+                max_chunk_bytes_seen: None,
+            }),
+        )
+        .unwrap();
+        let large_job = ReplaceAllJob { inner: large_inner };
+        let ReplaceAllOutcome::Complete(large_summary) = large_job.wait().unwrap() else {
+            panic!("large expanding parallel replace did not complete");
+        };
+        assert!(large_summary.effective_workers >= 2);
+        assert_eq!(large_summary.replacements, 8 * 2_500);
     }
 
     #[test]
