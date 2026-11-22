@@ -8,7 +8,7 @@
 
 ## 1. Phase 3C-1 Baseline Profiling (`6bc42a9`)
 
-Profiling the pre-optimization join engine on both the 18 GiB acceptance workload (`large`) and the new 10M-row/side short-row workload (`narrow`) exposed three primary bottlenecks:
+Baseline per-phase durations for `6bc42a9` were collected as polling estimates by sampling `JoinJob::progress().phase` at a 10 ms interval around the release `join_acceptance` binary on the same host Mac and fixtures before applying Phase 3C-2 changes (`total_seconds`, `peak_temporary_bytes`, `max_rss_macos_time_bytes`, and SHA-256 parity came directly from `join_acceptance` and `/usr/bin/time -l`). Profiling both the 18 GiB acceptance workload (`large`) and the 10M-row/side short-row workload (`narrow`) exposed three primary bottlenecks:
 
 1. **Payload duplication in `large` (18 GiB):** Copying full 128 KiB records into both inputs' sorted runs and again into the output ordinal-ordering runs inflated peak temporary disk to **38.69 GB** (4.0× the 9.67 GB output) and spent 91.97 s across `Sorting keys` (24.83 s), `Analyzing matches` (27.58 s), and `Creating joined rows` (39.56 s).
 2. **Per-group seek and file-open storm in `narrow` (10M rows/side):** `Groups::next()` called `BufReader::stream_position()` + `seek()` on every group boundary (flushing the read buffer 20M+ times), `analyze_prepared()` called `enumerate_pairs()` on all 10M groups even after the 20-row preview was finalized, and `RangeRows::new()` reopened the spill file per group during `Creating joined rows`. Together `Analyzing matches` (203.38 s) and `Creating joined rows` (207.92 s) consumed **97.3%** of the 422.57 s wall time.
@@ -63,6 +63,6 @@ All runs verified `all_checks_passed: true` against the independent streaming SH
 
 With Phase 3C-2 complete:
 - `large` (18 GiB) is now near the single-pass I/O floor (`9.69 GB` peak temporary disk vs `9.67 GB` final output; `Analyzing matches` dropped to `0.017 s`).
-- `narrow` (10M rows/side) dropped from `422.57 s` / `638.55 MiB` RSS to `20–47 s` / `41.47 MiB` RSS, and **>90% of its remaining wall time** is now spent in single-threaded external sorting (`Sorting keys` + sorting the 10M output `PairLocator` frames in `Creating joined rows`).
+- `narrow` (10M rows/side) dropped from `422.57 s` / `638.55 MiB` RSS to `20–47 s` / `41.47 MiB` RSS, and **>90% of its remaining wall time** is now spent in the combined `Sorting keys` (`23.80 s` / `9.30 s` uncontended) and `Creating joined rows` (`20.14 s` / `7.61 s` uncontended) phases — covering single-threaded external key sorting on both inputs plus pair enumeration, ordinal-ordering sort, positional reads, decoding, serialization, and staging writes.
 
 This empirical profile directly justifies proceeding to **Phase 3C-3 (`#171`)**: partitioned multi-threaded hash-join inside `analyze_join` -> `JoinPlan` with automatic ADR 0011 external sort-merge fallback for skewed/overflowing partitions, eliminating input sorting and parallelizing partition build/probe across `EnginePool` workers while preserving the exact ADR 0011 512 MiB memory ceiling and byte-identical output contract.

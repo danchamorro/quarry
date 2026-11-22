@@ -69,7 +69,7 @@ def generate(args, root, ram):
         delimiters = [b",", b","]
         headings = [[b"key", b"payload"], [b"key", b"payload"]]
         output_header = b"key (Main),payload (Main),key (Additional),payload (Additional)\n"
-        size = 6
+        size = 9
     else:
         counts = [rows, rows] if args.case == "large" else ([8, 9] if smoke else [1024, 1536])
         columns, keys = 2, 1
@@ -253,6 +253,11 @@ def run(args):
     else:
         root.mkdir(mode=0o700, parents=False, exist_ok=False)
         manifest = generate(args, root, ram)
+    if args.case == "large" and not args.smoke and not args.allow_below_ram:
+        assert sum(manifest["input_bytes"]) > ram, (
+            "the complete large fixture must exceed actual VM RAM "
+            "(pass --allow-below-ram for host profiling)"
+        )
     label = "cancel" if args.cancel_after_rows is not None else "complete"
     output = root / (label + ".csv")
     if output.exists():
@@ -294,6 +299,7 @@ def run(args):
     verify_measured_build(repo, source_revision, binary, binary_digest)
     report = {
         "case": args.case, "smoke": args.smoke, "label": label,
+        "allow_below_ram": bool(args.allow_below_ram),
         "fixture_id": manifest["fixture_id"], "command": command, "exit_code": exit_code,
         "input_bytes": manifest["input_bytes"], "ram_bytes": ram,
         "elapsed_seconds": time.monotonic() - measurement_start,
