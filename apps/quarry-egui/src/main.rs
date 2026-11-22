@@ -4660,10 +4660,20 @@ fn sort_mode_label(mode: SortMode) -> &'static str {
 
 /// Format a bounded date/time sample hint without ever auto-selecting a format.
 fn format_date_suggestion_hint(suggestion: &DateFormatSuggestion) -> String {
-    let scope = if suggestion.truncated {
-        format!("first {} sampled rows", suggestion.sampled_rows)
+    let row_noun = if suggestion.sampled_rows == 1 {
+        "row"
     } else {
-        format!("{} sampled rows", suggestion.sampled_rows)
+        "rows"
+    };
+    let value_noun = if suggestion.sampled_nonblank_values == 1 {
+        "value"
+    } else {
+        "values"
+    };
+    let scope = if suggestion.truncated {
+        format!("first {} sampled {row_noun}", suggestion.sampled_rows)
+    } else {
+        format!("{} sampled {row_noun}", suggestion.sampled_rows)
     };
     if suggestion.sampled_nonblank_values == 0 {
         return format!(
@@ -4672,7 +4682,7 @@ fn format_date_suggestion_hint(suggestion: &DateFormatSuggestion) -> String {
     }
     if let Some(format) = suggestion.unambiguous_format() {
         return format!(
-            "Sample hint ({} values in {scope}): matches {}. Choose explicitly; full file is checked when sorting.",
+            "Sample hint ({} {value_noun} in {scope}): matches {}. Choose explicitly; full file is checked when sorting.",
             suggestion.sampled_nonblank_values,
             format.label()
         );
@@ -4685,12 +4695,12 @@ fn format_date_suggestion_hint(suggestion: &DateFormatSuggestion) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         return format!(
-            "Sample hint ({} values in {scope}): ambiguous — matches {labels}. Choose explicitly; full file is checked when sorting.",
+            "Sample hint ({} {value_noun} in {scope}): ambiguous — matches {labels}. Choose explicitly; full file is checked when sorting.",
             suggestion.sampled_nonblank_values
         );
     }
     format!(
-        "Sample hint ({} values in {scope}): no single date/time format matched all sampled values.",
+        "Sample hint ({} {value_noun} in {scope}): no single date/time format matched all sampled values.",
         suggestion.sampled_nonblank_values
     )
 }
