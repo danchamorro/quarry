@@ -2263,6 +2263,20 @@ pub(super) fn write_in_memory_runs_to_output(
     Ok(Some(writer.finish()?))
 }
 
+/// Count the exact RFC 4180 field width of one UTF-8 delimited record using SIMD `memchr`
+/// when unquoted and `StructuralScanner<true>` when quotes are present.
+pub(super) fn count_record_fields(record: &[u8], delimiter: u8) -> Result<usize, QuarryError> {
+    if memchr::memchr(b'"', record).is_none() {
+        return Ok(memchr::memchr_iter(delimiter, record)
+            .count()
+            .saturating_add(1));
+    }
+    let mut scanner = quarry_delimited::StructuralScanner::<true>::new(delimiter)?;
+    scanner.scan_chunk(record, 0, |_| {})?;
+    scanner.finish(record.len() as u64, |_| {})?;
+    Ok(scanner.maximum_width())
+}
+
 /// Deduplicate one or more already-sorted in-memory arenas (ascending by `(key, ordinal)`)
 /// keeping only the lowest-ordinal occurrence of each key, restore original source order
 /// via compact `(ordinal, run_index, entry_index)` triples (zero record-byte copying), and
@@ -2270,6 +2284,7 @@ pub(super) fn write_in_memory_runs_to_output(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn deduplicate_in_memory_runs_to_output(
     runs: &[InMemoryRun],
+    delimiter: u8,
     duplicate_rows_counter: &AtomicU64,
     retained_rows_counter: &AtomicU64,
     output: &mut ExportTarget,
@@ -2279,12 +2294,13 @@ pub(super) fn deduplicate_in_memory_runs_to_output(
     first_record_prefix_bytes: u64,
     shared: &SharedState,
     output_index: Option<&mut StructuralIndex>,
-) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
+) -> Result<Option<(u64, u64, usize, SortVerification)>, QuarryError> {
     let total_entries: usize = runs.iter().map(|run| run.arena.len()).sum();
     let mut survivors: Vec<(u64, usize, usize)> = Vec::with_capacity(total_entries);
     let mut expected_records = RecordMultisetFingerprint::default();
     let mut duplicates = 0_u64;
     let mut retained = 0_u64;
+    let mut retained_max_width = 0_usize;
 
     if runs.len() == 1 {
         let arena = &runs[0].arena;
@@ -2298,7 +2314,9 @@ pub(super) fn deduplicate_in_memory_runs_to_output(
                 duplicates = duplicates.saturating_add(1);
             } else {
                 prev_idx = Some(idx);
-                expected_records.observe(arena.record_at(idx));
+                let rec = arena.record_at(idx);
+                expected_records.observe(rec);
+                retained_max_width = retained_max_width.max(count_record_fields(rec, delimiter)?);
                 survivors.push((arena.ordinal_at(idx), 0, idx));
                 retained = retained.saturating_add(1);
             }
@@ -2359,7 +2377,9 @@ pub(super) fn deduplicate_in_memory_runs_to_output(
                 duplicates = duplicates.saturating_add(1);
             } else {
                 prev = Some((item.run_index, item.entry_index));
-                expected_records.observe(arena.record_at(item.entry_index));
+                let rec = arena.record_at(item.entry_index);
+                expected_records.observe(rec);
+                retained_max_width = retained_max_width.max(count_record_fields(rec, delimiter)?);
                 survivors.push((item.ordinal, item.run_index, item.entry_index));
                 retained = retained.saturating_add(1);
             }
@@ -2400,7 +2420,13 @@ pub(super) fn deduplicate_in_memory_runs_to_output(
         writer.set_pending(key_bytes.to_vec(), record, ordinal);
     }
 
-    Ok(Some(writer.finish()?))
+    let (rows_written, bytes_written, verification) = writer.finish()?;
+    Ok(Some((
+        rows_written,
+        bytes_written,
+        retained_max_width,
+        verification,
+    )))
 }
 
 /// Compute the safe concurrent merge group count that splits `MERGE_MEMORY_BUDGET_BYTES`

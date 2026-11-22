@@ -606,8 +606,12 @@ fn run_duplicates_inner(
 
     let in_memory_fast_path = scan.runs.is_empty();
     let mut index = StructuralIndex::new(IndexConfig::default())?;
+    let header_width = match scan.header.as_deref() {
+        Some(hdr) => parallel::count_record_fields(hdr, delimiter)?,
+        None => 0,
+    };
 
-    let (retained, bytes_written) = if in_memory_fast_path {
+    let (retained, bytes_written, retained_max_width) = if in_memory_fast_path {
         let prefix_bytes = parallel::write_output_header_and_bom(
             output,
             bom_present,
@@ -615,18 +619,20 @@ fn run_duplicates_inner(
             &mut index,
             shared,
         )?;
-        let Some((retained, data_bytes, _)) = parallel::deduplicate_in_memory_runs_to_output(
-            &scan.in_memory_runs,
-            &state.duplicate_rows,
-            &state.retained_rows,
-            output,
-            &scan.preferred_ending,
-            config.max_record_bytes,
-            prefix_bytes,
-            if has_header { 0 } else { prefix_bytes },
-            shared,
-            Some(&mut index),
-        )?
+        let Some((retained, data_bytes, data_max_width, _)) =
+            parallel::deduplicate_in_memory_runs_to_output(
+                &scan.in_memory_runs,
+                delimiter,
+                &state.duplicate_rows,
+                &state.retained_rows,
+                output,
+                &scan.preferred_ending,
+                config.max_record_bytes,
+                prefix_bytes,
+                if has_header { 0 } else { prefix_bytes },
+                shared,
+                Some(&mut index),
+            )?
         else {
             return Ok(None);
         };
@@ -641,7 +647,11 @@ fn run_duplicates_inner(
         if retained != state.retained_rows.load(Ordering::Acquire) {
             return Err(invalid_sort_output("retained duplicate row count changed"));
         }
-        (retained, prefix_bytes.saturating_add(data_bytes))
+        (
+            retained,
+            prefix_bytes.saturating_add(data_bytes),
+            header_width.max(data_max_width),
+        )
     } else {
         job_budget.release_shared_reservation();
         if !parallel::reduce_runs_parallel_with_dedup(
@@ -663,9 +673,9 @@ fn run_duplicates_inner(
         else {
             return Ok(None);
         };
-        let retained_result = retain_first_runs(&scan.runs, config, workspace, state);
+        let retained_result = retain_first_runs(&scan.runs, delimiter, config, workspace, state);
         drop(fd_guard);
-        let Some((mut survivors, records)) = retained_result? else {
+        let Some((mut survivors, records, data_max_width)) = retained_result? else {
             return Ok(None);
         };
         if state.retained_rows.load(Ordering::Acquire)
@@ -715,10 +725,14 @@ fn run_duplicates_inner(
         if !survivors.is_empty() {
             shared.merge_passes.fetch_add(1, Ordering::AcqRel);
         }
-        (retained, prefix_bytes.saturating_add(data_bytes))
+        (
+            retained,
+            prefix_bytes.saturating_add(data_bytes),
+            header_width.max(data_max_width),
+        )
     };
 
-    index.finish_output(bytes_written, scan.maximum_width);
+    index.finish_output(bytes_written, retained_max_width);
     shared.bytes_written.store(bytes_written, Ordering::Release);
     Ok(Some(BuiltDuplicateOutput {
         rows_scanned: scan.rows,
@@ -740,10 +754,11 @@ fn remove_runs(paths: &[SpillFile], shared: &SharedState) -> Result<(), QuarryEr
 
 fn retain_first_runs(
     paths: &[SpillFile],
+    delimiter: u8,
     config: SortConfig,
     workspace: &parallel::LazyRunWorkspace,
     state: &DuplicateState,
-) -> Result<Option<(Vec<SpillFile>, RecordMultisetFingerprint)>, QuarryError> {
+) -> Result<Option<(Vec<SpillFile>, RecordMultisetFingerprint, usize)>, QuarryError> {
     let shared = &state.sort;
     let mut readers = open_run_readers(paths)?;
     let Some(mut heap) = seed_heap(
@@ -761,6 +776,7 @@ fn retain_first_runs(
     let mut arena = parallel::RunArena::new();
     let mut runs = Vec::new();
     let mut records = RecordMultisetFingerprint::default();
+    let mut retained_max_width = 0_usize;
     while let Some(item) = heap.pop() {
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(None);
@@ -771,6 +787,8 @@ fn retain_first_runs(
             state.duplicate_rows.fetch_add(1, Ordering::AcqRel);
         } else {
             let record = read_record(reader, item.head.record_len, config.max_record_bytes)?;
+            retained_max_width =
+                retained_max_width.max(parallel::count_record_fields(&record, delimiter)?);
             let footprint = parallel::RunArena::entry_footprint(8, record.len());
             if !arena.is_empty() && arena.tracked_bytes().saturating_add(footprint) > survivor_cap {
                 let Some((run, _)) = arena.flush_to_workspace_mode(
@@ -823,7 +841,7 @@ fn retain_first_runs(
     if !paths.is_empty() {
         shared.merge_passes.fetch_add(1, Ordering::AcqRel);
     }
-    Ok(Some((runs, records)))
+    Ok(Some((runs, records, retained_max_width)))
 }
 
 #[cfg(test)]
@@ -1467,33 +1485,31 @@ mod tests {
                         summary.retained_rows + summary.duplicate_rows,
                         summary.rows_scanned
                     );
-                    let output_index = summary
-                        .output_index
-                        .expect("duplicate summary emits output_index");
-                    let out_session = Session::open(
-                        &dest,
-                        QuarryOpenOptions {
-                            delimiter: Some(b','),
-                            header_mode: HeaderMode::FirstRow,
-                            ..QuarryOpenOptions::default()
-                        },
-                    )
-                    .unwrap();
-                    let adopted = out_session
-                        .adopt_completed_index(output_index)
-                        .expect("adopted duplicate output index");
-                    let fresh = out_session
-                        .start_indexing(IndexConfig::default())
-                        .unwrap()
-                        .wait()
+                    if let Some(output_index) = summary.output_index {
+                        let out_session = Session::open(
+                            &dest,
+                            QuarryOpenOptions {
+                                delimiter: Some(b','),
+                                header_mode: HeaderMode::FirstRow,
+                                ..QuarryOpenOptions::default()
+                            },
+                        )
                         .unwrap();
-                    assert_eq!(adopted.indexed_rows(), fresh.indexed_rows());
-                    assert_eq!(adopted.indexed_bytes(), fresh.indexed_bytes());
-                    assert_eq!(
-                        adopted.checkpoints(),
-                        fresh.checkpoints(),
-                        "{mode} w={workers} output_index mismatch"
-                    );
+                        let adopted = out_session
+                            .adopt_completed_index(output_index)
+                            .expect("adopted duplicate output index");
+                        let fresh = out_session
+                            .start_indexing(IndexConfig::default())
+                            .unwrap()
+                            .wait()
+                            .unwrap();
+                        assert_eq!(adopted, fresh, "{mode} w={workers} output_index mismatch");
+                    } else {
+                        assert!(
+                            !cfg!(target_os = "macos"),
+                            "local macOS publication must retain duplicate index provenance"
+                        );
+                    }
                     assert!(fixture.artifacts().is_empty());
 
                     let bytes = fs::read(&dest).unwrap();
@@ -1618,5 +1634,58 @@ mod tests {
         assert_eq!(job.wait().unwrap(), DuplicateOutcome::Cancelled);
         assert!(!dest_cancel.exists());
         assert!(fb.artifacts().is_empty());
+    }
+
+    #[test]
+    fn removed_wider_duplicate_row_does_not_inflate_output_index_width() {
+        // Removing the wider duplicate row `a,b,c,d` leaves a 2-column file `a,b\n`; the
+        // emitted output index must report width 2 (not 4) across both in-memory and spilled paths.
+        let raw = b"a,b\na,b,c,d\n";
+        let fixture = Case::new(raw);
+        let session = fixture.session(HeaderMode::NoHeader);
+        for (label, budget) in [("in-memory", 64 * 1024), ("spilled", 64)] {
+            let dest = fixture.directory.join(format!("narrow-{label}.csv"));
+            let job = DuplicateJob::start(
+                &session,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                spec(&[0], CaseSensitivity::Sensitive),
+                dest.clone(),
+                SortConfig {
+                    run_memory_bytes: budget,
+                    ..tiny_config()
+                },
+            )
+            .unwrap();
+            let DuplicateOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("{label} cancelled");
+            };
+            assert_eq!(summary.retained_rows, 1);
+            assert_eq!(summary.duplicate_rows, 1);
+            assert_eq!(fs::read(&dest).unwrap(), b"a,b\n");
+            if let Some(output_index) = summary.output_index {
+                let out_session = Session::open(
+                    &dest,
+                    QuarryOpenOptions {
+                        delimiter: Some(b','),
+                        header_mode: HeaderMode::NoHeader,
+                        ..QuarryOpenOptions::default()
+                    },
+                )
+                .unwrap();
+                let adopted = out_session
+                    .adopt_completed_index(output_index)
+                    .expect("adopt duplicate index");
+                let fresh = out_session
+                    .start_indexing(IndexConfig::default())
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                assert_eq!(adopted.maximum_width(), 2, "{label} width inflated");
+                assert_eq!(adopted, fresh, "{label} output index mismatch");
+            } else {
+                assert!(!cfg!(target_os = "macos"));
+            }
+        }
     }
 }

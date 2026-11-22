@@ -40,6 +40,8 @@ pub(super) struct ReplaceParallelTuning {
     pub(super) max_head_in_flight: usize,
     #[cfg(test)]
     pub(super) delay_stripe_zero: Option<Duration>,
+    #[cfg(test)]
+    pub(super) max_chunk_bytes_seen: Option<Arc<AtomicUsize>>,
 }
 
 impl ReplaceParallelTuning {
@@ -52,6 +54,8 @@ impl ReplaceParallelTuning {
             max_head_in_flight: DEFAULT_MAX_HEAD_IN_FLIGHT,
             #[cfg(test)]
             delay_stripe_zero: None,
+            #[cfg(test)]
+            max_chunk_bytes_seen: None,
         }
     }
 }
@@ -493,12 +497,19 @@ pub(super) fn copy_with_replaced_records_parallel(
     let cell_edits = Arc::new(edits.cells.clone());
     let replacement = Arc::new(replacement.clone());
     let needle_contains_quote = replacement.needle.contains(&b'"');
+    let expansion_ratio = replacement
+        .replacement
+        .len()
+        .div_ceil(replacement.needle.len().max(1))
+        .max(1);
     let flush_chunk_bytes = tuning.flush_chunk_bytes.max(1);
     let large_record_gate = Arc::clone(engine_pool().large_record_gate());
     let dialect = ScannerDialect::rfc4180(delimiter);
     let simd_backend = active_simd_backend();
     #[cfg(test)]
     let delay_stripe_zero = tuning.delay_stripe_zero;
+    #[cfg(test)]
+    let max_chunk_bytes_seen = tuning.max_chunk_bytes_seen.clone();
 
     let (tx, rx) = mpsc::channel::<StripeMessage>();
 
@@ -518,6 +529,8 @@ pub(super) fn copy_with_replaced_records_parallel(
         let large_record_gate = Arc::clone(&large_record_gate);
         let shared_worker = Arc::clone(shared);
         let tx = tx.clone();
+        #[cfg(test)]
+        let max_chunk_bytes_seen = max_chunk_bytes_seen.clone();
 
         let spawned = executor.spawn(&shared.cancel_requested, move || {
             let shared = shared_worker;
@@ -627,6 +640,10 @@ pub(super) fn copy_with_replaced_records_parallel(
                         return true;
                     }
                     let bytes = std::mem::take(chunk_bytes);
+                    #[cfg(test)]
+                    if let Some(tracker) = &max_chunk_bytes_seen {
+                        tracker.fetch_max(bytes.len(), Ordering::AcqRel);
+                    }
                     let ends = std::mem::take(relative_ends);
                     let replacements = std::mem::take(chunk_replacements);
                     let physical_rows = std::mem::take(chunk_rows);
@@ -734,16 +751,38 @@ pub(super) fn copy_with_replaced_records_parallel(
                                         record.extend_from_slice(slice);
                                         &record
                                     };
-                                    if rec.len() > LARGE_RECORD_GATE_BYTES && large_guard.is_none()
-                                    {
+                                    let est_output_bytes = rec
+                                        .len()
+                                        .saturating_mul(expansion_ratio)
+                                        .min(config.max_record_bytes);
+                                    let needs_large_gate = rec.len() > LARGE_RECORD_GATE_BYTES
+                                        || est_output_bytes > LARGE_RECORD_GATE_BYTES;
+                                    if needs_large_gate && large_guard.is_none() {
                                         if let Some(g) = large_record_gate.try_acquire() {
                                             large_guard = Some(g);
-                                        } else if let Some(g) =
-                                            large_record_gate.acquire(&shared.cancel_requested)
-                                        {
-                                            large_guard = Some(g);
                                         } else {
-                                            stopped = true;
+                                            if !chunk_bytes.is_empty()
+                                                && !emit_chunk(
+                                                    false,
+                                                    &mut chunk_bytes,
+                                                    &mut relative_ends,
+                                                    &mut chunk_replacements,
+                                                    &mut chunk_rows,
+                                                    &mut seq,
+                                                    0,
+                                                )
+                                            {
+                                                stopped = true;
+                                            }
+                                            if !stopped {
+                                                if let Some(g) = large_record_gate
+                                                    .acquire(&shared.cancel_requested)
+                                                {
+                                                    large_guard = Some(g);
+                                                } else {
+                                                    stopped = true;
+                                                }
+                                            }
                                         }
                                     }
                                     if !stopped {
@@ -765,6 +804,23 @@ pub(super) fn copy_with_replaced_records_parallel(
                                                     chunk_replacements.saturating_add(count);
                                                 chunk_rows = chunk_rows.saturating_add(1);
                                                 relative_ends.push(chunk_bytes.len() as u64);
+                                                // Flush at record boundaries as soon as the output
+                                                // threshold is reached so expanding replacements on
+                                                // short rows cannot grow unboundedly inside a
+                                                // single input read chunk.
+                                                if chunk_bytes.len() >= flush_chunk_bytes
+                                                    && !emit_chunk(
+                                                        false,
+                                                        &mut chunk_bytes,
+                                                        &mut relative_ends,
+                                                        &mut chunk_replacements,
+                                                        &mut chunk_rows,
+                                                        &mut seq,
+                                                        0,
+                                                    )
+                                                {
+                                                    stopped = true;
+                                                }
                                             }
                                             Err(err) => {
                                                 deferred_error = Some((physical_row, err));

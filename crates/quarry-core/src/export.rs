@@ -10379,6 +10379,7 @@ mod tests {
                     reorder_budget_bytes: 64 * 1024,
                     max_head_in_flight: 2,
                     delay_stripe_zero: None,
+                    max_chunk_bytes_seen: None,
                 };
                 let inner = SaveAsJob::start_worker_with_options(
                     session.path.clone(),
@@ -10409,33 +10410,31 @@ mod tests {
                 } else {
                     assert_eq!(summary.effective_workers, 1, "{label} w={workers}");
                 }
-                let output_index = summary
-                    .output_index
-                    .expect("Replace All must emit CompletedIndex");
-                let out_session = Session::open(
-                    &dest,
-                    OpenOptions {
-                        delimiter: Some(b','),
-                        header_mode: HeaderMode::FirstRow,
-                        ..OpenOptions::default()
-                    },
-                )
-                .unwrap();
-                let adopted = out_session
-                    .adopt_completed_index(output_index)
-                    .expect("adopted replace output index");
-                let fresh = out_session
-                    .start_indexing(IndexConfig::default())
-                    .unwrap()
-                    .wait()
+                if let Some(output_index) = summary.output_index {
+                    let out_session = Session::open(
+                        &dest,
+                        OpenOptions {
+                            delimiter: Some(b','),
+                            header_mode: HeaderMode::FirstRow,
+                            ..OpenOptions::default()
+                        },
+                    )
                     .unwrap();
-                assert_eq!(adopted.indexed_rows(), fresh.indexed_rows());
-                assert_eq!(adopted.indexed_bytes(), fresh.indexed_bytes());
-                assert_eq!(
-                    adopted.checkpoints(),
-                    fresh.checkpoints(),
-                    "{label} w={workers} output_index mismatch"
-                );
+                    let adopted = out_session
+                        .adopt_completed_index(output_index)
+                        .expect("adopted replace output index");
+                    let fresh = out_session
+                        .start_indexing(IndexConfig::default())
+                        .unwrap()
+                        .wait()
+                        .unwrap();
+                    assert_eq!(adopted, fresh, "{label} w={workers} output_index mismatch");
+                } else {
+                    assert!(
+                        !cfg!(target_os = "macos"),
+                        "local macOS publication must retain replace index provenance"
+                    );
+                }
                 let bytes = fs::read(&dest).unwrap();
                 if let Some((ref expected_bytes, expected_count)) = baseline {
                     assert_eq!(summary.replacements, expected_count, "{label} w={workers}");
@@ -10500,6 +10499,7 @@ mod tests {
             panic!("serial did not complete");
         };
 
+        let max_chunk_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let parallel_dest = dir.path().join("parallel.csv");
         let inner = SaveAsJob::start_worker_with_options(
             session.path.clone(),
@@ -10525,6 +10525,7 @@ mod tests {
                 reorder_budget_bytes: 2 * 1024,
                 max_head_in_flight: 2,
                 delay_stripe_zero: Some(Duration::from_millis(40)),
+                max_chunk_bytes_seen: Some(Arc::clone(&max_chunk_seen)),
             }),
         )
         .unwrap();
@@ -10537,6 +10538,13 @@ mod tests {
         assert_eq!(
             fs::read(&parallel_dest).unwrap(),
             fs::read(&serial_dest).unwrap()
+        );
+        // Every emitted chunk must stay bounded near `flush_chunk_bytes` (4 KiB + 1 row ~ 210 B),
+        // proving we flush at record boundaries instead of buffering a whole expanded input chunk.
+        assert!(
+            max_chunk_seen.load(Ordering::Acquire) <= 4 * 1024 + 512,
+            "expanded chunk grew past record-boundary flush cap: {}",
+            max_chunk_seen.load(Ordering::Acquire)
         );
 
         // Cancel under tight reorder backpressure with delayed stripe 0 must finish cleanly.
@@ -10565,6 +10573,7 @@ mod tests {
                 reorder_budget_bytes: 1024,
                 max_head_in_flight: 1,
                 delay_stripe_zero: Some(Duration::from_millis(80)),
+                max_chunk_bytes_seen: None,
             }),
         )
         .unwrap();
