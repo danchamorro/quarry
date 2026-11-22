@@ -242,8 +242,8 @@ impl LazyRunWorkspace {
     }
 }
 
-/// Shared payload budget coordinating both the per-job limit and the engine-wide shared budget
-/// across concurrent jobs under the two-job cap.
+/// Shared payload budget coordinating both the per-job limit and the engine pool's shared
+/// out-of-core byte budget across concurrent engine callers.
 pub(super) struct JobMemoryBudget {
     limit: usize,
     shared: Arc<ByteBudget>,
@@ -862,6 +862,19 @@ fn clear_record_buffer(record: &mut Vec<u8>) {
     }
 }
 
+/// Conservative upper bound on decoded record + key memory before `evaluate_record` allocates,
+/// so multi-byte Windows-1252 / Latin-1 expansions acquire `LargeRecordGate` prior to allocation.
+fn conservative_record_expansion_bound(raw_len: usize, encoding: Encoding) -> usize {
+    let multiplier = match encoding {
+        Encoding::Windows1252 => 6,
+        Encoding::Latin1 => 4,
+        Encoding::Utf8 | Encoding::Utf16Le | Encoding::Utf16Be => 2,
+    };
+    raw_len
+        .saturating_mul(multiplier)
+        .saturating_add(ARENA_ENTRY_BYTES)
+}
+
 fn spill_collected_arenas(
     collector: &Mutex<ParallelCollector>,
     direction: SortDirection,
@@ -1018,6 +1031,29 @@ fn create_initial_runs_serial(
                              budget_guard: &mut Option<JobBudgetGuard>,
                              large_guard: &mut Option<LargeRecordGuard>|
      -> Result<bool, QuarryError> {
+        let pre_bound = conservative_record_expansion_bound(raw_record.len(), config.encoding);
+        if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
+            && large_guard.is_none()
+        {
+            if let Some(g) = large_record_gate.try_acquire() {
+                *large_guard = Some(g);
+            } else {
+                if !arena.is_empty() {
+                    job_budget.mark_spilled();
+                    let Some(run) =
+                        arena.flush_to_workspace(direction, workspace, shared, serial_spill_cap)?
+                    else {
+                        return Ok(false);
+                    };
+                    runs.push(run);
+                    budget_guard.take();
+                }
+                let Some(g) = large_record_gate.acquire(&shared.cancel_requested) else {
+                    return Ok(false);
+                };
+                *large_guard = Some(g);
+            }
+        }
         let evaluated = evaluate_record(
             raw_record,
             row_num,
@@ -1421,6 +1457,24 @@ fn create_initial_runs_parallel(
                         || shared.cancel_requested.load(Ordering::Acquire)
                     {
                         return Ok(false);
+                    }
+                    let pre_bound =
+                        conservative_record_expansion_bound(raw_record.len(), config.encoding);
+                    if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
+                        && large_guard.is_none()
+                    {
+                        if let Some(g) = large_record_gate.try_acquire() {
+                            *large_guard = Some(g);
+                        } else {
+                            if !flush_arena_and_collected(arena, budget_guard, local_runs)? {
+                                return Ok(false);
+                            }
+                            let Some(g) = large_record_gate.acquire(&shared.cancel_requested)
+                            else {
+                                return Ok(false);
+                            };
+                            *large_guard = Some(g);
+                        }
                     }
                     let evaluated = evaluate_record(
                         raw_record,

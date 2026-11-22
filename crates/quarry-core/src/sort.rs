@@ -833,12 +833,16 @@ impl Session {
             Some(bytes) => bytes,
             None => default_single_run_memory_budget_bytes(),
         };
-        let completed_records = self.completed_record_count().or_else(|| {
-            options
-                .source_index
-                .filter(|index| index.indexed_bytes() == self.file_size)
-                .map(StructuralIndex::indexed_rows)
-        });
+        // Only trust a caller-supplied index when it matches this session's validated
+        // completed-index record count (bound to source_stamp, delimiter, encoding, and file_size).
+        let completed_records = self.completed_record_count();
+        let validated_index = options
+            .source_index
+            .filter(|index| {
+                index.indexed_bytes() == self.file_size
+                    && completed_records == Some(index.indexed_rows())
+            })
+            .cloned();
         SortJob::start_with_options_internal(
             self.path.clone(),
             self.file_size,
@@ -856,7 +860,7 @@ impl Session {
             },
             options.temporary_directory.map(Path::to_path_buf),
             completed_records,
-            options.source_index.cloned(),
+            validated_index,
             options.threads,
             parallel::DEFAULT_MIN_PARALLEL_STRIPE_BYTES,
         )
@@ -1757,7 +1761,7 @@ fn run_sort_inner(
             config,
             workspace,
             shared,
-            requested_workers,
+            scan.effective_workers,
             pool.fd_budget(),
         )?
     {

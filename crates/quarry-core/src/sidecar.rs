@@ -1825,7 +1825,7 @@ fn create_private_exclusive_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn set_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> io::Result<()> {
+pub(crate) fn set_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> io::Result<()> {
     use std::ffi::c_void;
 
     const TOKEN_QUERY: u32 = 0x0008;
@@ -1967,6 +1967,9 @@ fn set_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> io::Result<()> 
     }
 }
 
+/// Checks that a Windows filesystem handle is owned by the current process token's `TokenUser`,
+/// or `TokenOwner` (which equals `TokenUser` for standard tokens and matches the elevated default
+/// owner, such as `BUILTIN\Administrators`, for directories created by elevated processes).
 #[cfg(windows)]
 pub(crate) fn verify_windows_handle_owned_by_current_user(handle: *mut std::ffi::c_void) -> bool {
     use std::ffi::c_void;
@@ -2034,12 +2037,14 @@ pub(crate) fn verify_windows_handle_owned_by_current_user(handle: *mut std::ffi:
             CloseHandle(token);
             return false;
         }
-        let mut buf = vec![0u8; needed as usize];
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0usize; words];
+        let buf_len = (words * std::mem::size_of::<usize>()) as u32;
         if GetTokenInformation(
             token,
             TOKEN_USER_CLASS,
             buf.as_mut_ptr().cast(),
-            needed,
+            buf_len,
             &mut needed,
         ) == 0
         {
@@ -2056,17 +2061,15 @@ pub(crate) fn verify_windows_handle_owned_by_current_user(handle: *mut std::ffi:
             0,
             &mut owner_needed,
         );
-        let mut owner_buf = if owner_needed > 0 {
-            vec![0u8; owner_needed as usize]
-        } else {
-            Vec::new()
-        };
+        let owner_words = (owner_needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut owner_buf = vec![0usize; owner_words];
+        let owner_buf_len = (owner_words * std::mem::size_of::<usize>()) as u32;
         let token_owner_sid = if owner_needed > 0
             && GetTokenInformation(
                 token,
                 TOKEN_OWNER_CLASS,
                 owner_buf.as_mut_ptr().cast(),
-                owner_needed,
+                owner_buf_len,
                 &mut owner_needed,
             ) != 0
         {
@@ -2192,12 +2195,14 @@ fn verify_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> bool {
             CloseHandle(token);
             return false;
         }
-        let mut buf = vec![0u8; needed as usize];
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0usize; words];
+        let buf_len = (words * std::mem::size_of::<usize>()) as u32;
         let ok = GetTokenInformation(
             token,
             TOKEN_USER_CLASS,
             buf.as_mut_ptr().cast(),
-            needed,
+            buf_len,
             &mut needed,
         );
         if ok == 0 {
@@ -2214,17 +2219,15 @@ fn verify_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> bool {
             0,
             &mut owner_needed,
         );
-        let mut owner_buf = if owner_needed > 0 {
-            vec![0u8; owner_needed as usize]
-        } else {
-            Vec::new()
-        };
+        let owner_words = (owner_needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut owner_buf = vec![0usize; owner_words];
+        let owner_buf_len = (owner_words * std::mem::size_of::<usize>()) as u32;
         let token_owner_sid = if owner_needed > 0
             && GetTokenInformation(
                 token,
                 TOKEN_OWNER_CLASS,
                 owner_buf.as_mut_ptr().cast(),
-                owner_needed,
+                owner_buf_len,
                 &mut owner_needed,
             ) != 0
         {

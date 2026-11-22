@@ -95,7 +95,7 @@ This ledger keeps three concepts explicitly distinct:
 | **T11** | Arbitrary-offset line-boundary snapping & uncertain-boundary safety | Pending Phase 5 design gate | Phase 5 |
 | **T12** | Opt-in append-only Live Watch Mode vs source-modification guard | Pending Phase 5B design gate | Phase 5B |
 | **T13** | Section splice-save streaming/reflink contract vs atomic staging (ADR 0005) | Pending Phase 5 design gate | Phase 5 |
-| **T14** | Configurable 300 MB in-RAM fast path retaining bounded out-of-core fallback | **Decided (`2026-11-22`):** Approved adaptive 300 MB single-run budget (RAM-capped, shared across two-job cap), persisted scratch folder with strict per-use revalidation (no silent fallback), and continued `mmap` deferral (ADR 0005 amended). | Phase 3 |
+| **T14** | Configurable 300 MB in-RAM fast path retaining bounded out-of-core fallback | **Decided (`2026-11-22`):** Approved adaptive 300 MB single-run budget (RAM-capped, drawn from `EnginePool`'s shared out-of-core byte budget alongside the desktop two-job write limit), persisted scratch folder with strict per-use revalidation (no silent fallback), and continued `mmap` deferral (ADR 0005 amended). | Phase 3 |
 | **T15** | Aligning feature names and scale claims with Quarry's verified identity | Active governance rule | Phase 5, Phase 8, Phase 9 |
 | **T16** | Release publication timing (no premature launch-date commitments) | Active governance rule | Phase 9 |
 | **T17** | Official repository identity, package names, and distribution channels | Pending per-channel owner approval | Phase 9 |

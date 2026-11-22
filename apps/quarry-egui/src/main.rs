@@ -351,7 +351,7 @@ struct QuarryApp {
     join_files: Option<join_files::JoinDialog>,
     working_directory: PathBuf,
     custom_working_directory: bool,
-    scratch_validation_worker: Option<std::thread::JoinHandle<Result<(), String>>>,
+    scratch_validation_worker: Option<(PathBuf, std::thread::JoinHandle<Result<(), String>>)>,
     index_cache_enabled: bool,
     cache_clear_status: Option<Result<String, String>>,
     cache_clear_worker: Option<std::thread::JoinHandle<Result<String, String>>>,
@@ -929,6 +929,9 @@ impl QuarryApp {
                 .is_some_and(Document::decompression_running);
             if !self.write_slot_available_releasing(usize::from(outgoing)) {
                 return Err(AppMessage::warning(compressed::WRITE_SLOTS_FULL));
+            }
+            if let Err(message) = self.ensure_working_directory_available() {
+                return Err(AppMessage::warning(message));
             }
             if let Some(current) = self.active.document.as_mut() {
                 current.release_decompression();
@@ -3035,7 +3038,10 @@ impl eframe::App for QuarryApp {
         {
             self.about.show(ctx);
         }
-        if self.document_tabs().any(DocumentTab::busy) || self.cache_clear_worker.is_some() {
+        if self.document_tabs().any(DocumentTab::busy)
+            || self.cache_clear_worker.is_some()
+            || self.scratch_validation_worker.is_some()
+        {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
         if self.combine_files.is_some() {

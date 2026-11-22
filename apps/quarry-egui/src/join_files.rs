@@ -2248,7 +2248,12 @@ impl QuarryApp {
         if !self.write_slot_available() {
             return Err("Wait for an operation slot before analyzing.".into());
         }
-        self.join_files.as_mut().unwrap().start_analysis(working);
+        self.ensure_working_directory_available()?;
+        let dialog = self.join_files.as_mut().unwrap();
+        if self.custom_working_directory {
+            dialog.temporary = self.working_directory.clone();
+        }
+        dialog.start_analysis(working);
         Ok(())
     }
 

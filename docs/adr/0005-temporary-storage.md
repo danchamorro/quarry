@@ -90,10 +90,12 @@ strictly before every operation that writes temporary or working-copy files:
 - Must be a non-empty absolute path to an existing real directory.
 - Must not traverse or target a symbolic link or Windows reparse point (allowing macOS's
   OS-level `/var` and `/tmp` root links).
-- Must be owned by the current user (`uid == geteuid()` on Unix; owner SID match on
-  Windows).
+- Must be owned by the current user (`uid == geteuid()` on Unix; on Windows, owner SID
+  matches `TokenUser`, or `TokenOwner` for elevated process tokens whose default new-object
+  owner is their administrative group).
 - Must support creating, writing, and removing a private temporary workspace with
-  owner-only permissions (`0700` and cleared inherited ACLs on macOS).
+  owner-only permissions (`0700` and cleared inherited ACLs on macOS; protected owner-only
+  DACL on Windows workspaces and spill runs).
 
 If revalidation fails (for example, an external drive was disconnected, unmounted,
 replaced by a symlink, or no longer enforces private permissions), Quarry surfaces a
@@ -104,8 +106,10 @@ the system temporary folder. Quarry **never** silently falls back to another vol
 
 External sort uses a configurable tracked-payload single-run memory budget defaulting to
 **300,000,000 bytes** (300 MB decimal), capped at 25% of host physical RAM (floored at
-16 MiB) and drawn from the engine pool's shared out-of-core byte budget across the
-two-job cap.
+16 MiB) and drawn from the engine pool's shared out-of-core byte budget. The two-job
+write cap (`MAX_WRITE_JOBS`) is enforced by the desktop application for file-writing
+slots; `EnginePool` enforces the shared byte budget and worker thread cap across
+concurrent engine callers.
 
 Rather than maintaining a second in-RAM code path, run generation fills one contiguous
 tracked-payload arena per active worker, reserving budget capacity before admitting

@@ -107,6 +107,7 @@ pub(super) struct InspectionUi {
     decompression: Option<RawDecompression>,
     /// Where that copy is written, and where its cleanup failures are reported.
     working_directory: PathBuf,
+    custom_working_directory: bool,
     working_cleanup: WorkingCopyCleanup,
     /// The app's decompression slots, which the raw pass claims.
     decompression_slots: compressed::DecompressionSlots,
@@ -139,6 +140,7 @@ impl Default for InspectionUi {
             confirm_destination: None,
             decompression: None,
             working_directory: std::env::temp_dir(),
+            custom_working_directory: false,
             working_cleanup: WorkingCopyCleanup::default(),
             decompression_slots: compressed::DecompressionSlots::default(),
             private_copy: None,
@@ -294,6 +296,14 @@ impl InspectionUi {
     }
     /// Replaces any old private copy; inspection starts when the new copy is verified.
     fn start_decompression(&mut self, path: &Path) -> Result<(), String> {
+        if self.custom_working_directory
+            && let Err(error) = quarry_core::validate_scratch_directory(&self.working_directory)
+        {
+            return Err(storage::format_unavailable_scratch_notice(
+                &self.working_directory,
+                &error.to_string(),
+            ));
+        }
         self.private_copy = None;
         let slot = self.decompression_slots.claim();
         let job = CompressedRawDecompressJob::start(
@@ -524,6 +534,7 @@ impl QuarryApp {
         let write_slot_available = self.write_slot_available();
         let state = &mut self.active.inspection;
         state.working_directory = self.working_directory.clone();
+        state.custom_working_directory = self.custom_working_directory;
         state.working_cleanup = self.working_cleanup.clone();
         state.decompression_slots = self.decompression_slots.clone();
         if let Err(e) = state.start(write_slot_available) {

@@ -28,24 +28,63 @@ fn unix_storage_preferences_path(
 #[derive(Default)]
 pub(super) struct StoragePreferences {
     pub scratch_directory: Option<PathBuf>,
+    pub load_error: Option<String>,
     path: Option<PathBuf>,
+    persist_enabled: bool,
 }
 
 impl StoragePreferences {
+    #[cfg(test)]
     pub(super) fn load(path: Option<PathBuf>) -> Self {
-        let scratch_directory = path
-            .as_ref()
-            .and_then(|p| std::fs::File::open(p).ok())
-            .and_then(|file| {
-                let mut content = String::new();
-                file.take(MAX_STORAGE_PREFERENCES_BYTES)
-                    .read_to_string(&mut content)
-                    .ok()?;
-                parse_scratch_directory_pref(&content)
-            });
+        Self::load_with_persistence(path, false)
+    }
+
+    fn load_with_persistence(path: Option<PathBuf>, persist_enabled: bool) -> Self {
+        let mut scratch_directory = None;
+        let mut load_error = None;
+        if let Some(pref_path) = path.as_ref() {
+            match std::fs::File::open(pref_path) {
+                Ok(file) => {
+                    let mut content = String::new();
+                    match file
+                        .take(MAX_STORAGE_PREFERENCES_BYTES)
+                        .read_to_string(&mut content)
+                    {
+                        Ok(_) => {
+                            if !content.trim().is_empty() {
+                                match parse_scratch_directory_pref(&content) {
+                                    Some(dir) => scratch_directory = Some(dir),
+                                    None => {
+                                        load_error = Some(format!(
+                                            "Saved temporary folder preference ({}) could not be parsed. Open File > Temporary storage… to choose your temporary folder again.",
+                                            pref_path.display()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            load_error = Some(format!(
+                                "Could not read saved temporary folder preference ({}): {error}. Open File > Temporary storage… to choose your temporary folder again.",
+                                pref_path.display()
+                            ));
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    load_error = Some(format!(
+                        "Could not read saved temporary folder preference ({}): {error}. Open File > Temporary storage… to choose your temporary folder again.",
+                        pref_path.display()
+                    ));
+                }
+            }
+        }
         Self {
             scratch_directory,
+            load_error,
             path,
+            persist_enabled,
         }
     }
 
@@ -66,7 +105,7 @@ impl StoragePreferences {
                 std::env::var_os("HOME").map(PathBuf::from),
             )
         };
-        Self::load(path)
+        Self::load_with_persistence(path, true)
     }
 
     pub(super) fn set_scratch_directory(
@@ -90,7 +129,13 @@ impl StoragePreferences {
                 String::new()
             }
         };
+        self.load_error = None;
         let Some(path) = &self.path else {
+            if self.persist_enabled {
+                return Err(std::io::Error::other(
+                    "no writable configuration directory is available for saving preferences across restarts",
+                ));
+            }
             return Ok(());
         };
         let parent = path
@@ -438,6 +483,10 @@ impl QuarryApp {
     /// Applies persisted storage preferences and kicks off a non-blocking startup revalidation
     /// of any saved custom temporary folder without silently falling back to another volume.
     pub(super) fn apply_loaded_storage_preferences(&mut self) {
+        if let Some(error) = self.storage_preferences.load_error.clone() {
+            self.active.notice = Some(AppMessage::warning(error));
+            return;
+        }
         let Some(saved) = self.storage_preferences.scratch_directory.clone() else {
             return;
         };
@@ -449,33 +498,35 @@ impl QuarryApp {
                 document.custom_working_directory = true;
             }
         }
-        self.scratch_validation_worker = Some(thread::spawn(move || {
-            validate_scratch_directory(&saved)
-                .map(|_| ())
-                .map_err(|error| format_unavailable_scratch_notice(&saved, &error.to_string()))
-        }));
+        let checked = saved.clone();
+        self.scratch_validation_worker = Some((
+            checked,
+            thread::spawn(move || {
+                validate_scratch_directory(&saved)
+                    .map(|_| ())
+                    .map_err(|error| format_unavailable_scratch_notice(&saved, &error.to_string()))
+            }),
+        ));
     }
 
-    /// Collects the non-blocking startup scratch validation result and surfaces a notice on failure.
+    /// Collects the non-blocking startup scratch validation result and surfaces a notice
+    /// only if the checked folder is still the active custom working folder.
     pub(super) fn poll_scratch_validation_worker(&mut self) {
         if self
             .scratch_validation_worker
             .as_ref()
-            .is_some_and(|worker| worker.is_finished())
+            .is_some_and(|(_, worker)| worker.is_finished())
         {
-            let outcome = self
-                .scratch_validation_worker
-                .take()
-                .unwrap()
-                .join()
-                .unwrap_or_else(|_| {
-                    Err(format_unavailable_scratch_notice(
-                        &self.working_directory,
-                        "validation worker failed",
-                    ))
-                });
+            let (checked, worker) = self.scratch_validation_worker.take().unwrap();
+            let outcome = worker.join().unwrap_or_else(|_| {
+                Err(format_unavailable_scratch_notice(
+                    &checked,
+                    "validation worker failed",
+                ))
+            });
             if let Err(message) = outcome
                 && self.custom_working_directory
+                && self.working_directory == checked
             {
                 self.active.notice = Some(AppMessage::warning(message));
             }
@@ -859,10 +910,16 @@ impl QuarryApp {
         {
             return;
         }
-        let review = self.active.storage_review.take().unwrap();
+        let mut review = self.active.storage_review.take().unwrap();
         if working {
-            let chosen = PathBuf::from(review.path_input);
+            let chosen = PathBuf::from(&review.path_input);
             let is_custom = chosen != std::env::temp_dir();
+            if is_custom && let Err(error) = validate_scratch_directory(&chosen) {
+                review.checked_path = chosen;
+                review.result = Some(Err(error.to_string()));
+                self.active.storage_review = Some(review);
+                return;
+            }
             self.working_directory = chosen.clone();
             self.custom_working_directory = is_custom;
             if let Err(error) = self
