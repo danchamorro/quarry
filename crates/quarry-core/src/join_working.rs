@@ -179,6 +179,19 @@ impl JoinWorkingSource {
         Ok(())
     }
 
+    /// Conservative upper bound on serialized bytes added by cell edits on `physical_row`.
+    pub(super) fn row_edit_bytes(&self, physical_row: u64) -> usize {
+        if self.cells.is_empty() {
+            return 0;
+        }
+        self.cells
+            .range((physical_row, 0)..=(physical_row, usize::MAX))
+            .fold(0_usize, |acc, (_, value)| {
+                // Worst-case RFC 4180 quote doubling plus enclosing quotes.
+                acc.saturating_add(value.len().saturating_mul(2).saturating_add(2))
+            })
+    }
+
     /// Overlay only the current row. Edited values borrow existing immutable data;
     /// encoding allocates at most one capped record and never a file-sized copy.
     pub(super) fn record<'a>(

@@ -68,17 +68,34 @@ fn options() -> Result<Options, Box<dyn std::error::Error>> {
     }
     Ok(options)
 }
+fn phase_slug(phase: JoinPhase) -> &'static str {
+    match phase {
+        JoinPhase::Inspecting => "inspecting",
+        JoinPhase::Sorting => "sorting",
+        JoinPhase::Analyzing => "analyzing",
+        JoinPhase::Creating => "creating",
+        JoinPhase::Publishing => "publishing",
+    }
+}
+
 fn finish<T: Send + 'static>(
     job: JoinJob<T>,
     cancel_rows: Option<u64>,
 ) -> Result<Option<T>, Box<dyn std::error::Error>> {
     let mut previous = None;
+    let mut phase_started = Instant::now();
+    let mut phase_durations: [Duration; 5] = [Duration::ZERO; 5];
     let mut requested = None;
     let mut observed_peak = 0;
     loop {
         let progress = job.progress();
         observed_peak = observed_peak.max(progress.temporary_bytes);
         if previous != Some(progress.phase) {
+            let now = Instant::now();
+            if let Some(prev) = previous {
+                phase_durations[prev as usize] += now.duration_since(phase_started);
+            }
+            phase_started = now;
             eprintln!("phase={}", progress.phase.label());
             previous = Some(progress.phase);
         }
@@ -92,12 +109,27 @@ fn finish<T: Send + 'static>(
             eprintln!("cancel_requested_after_rows={}", progress.records);
         }
         if progress.done {
+            if let Some(prev) = previous {
+                phase_durations[prev as usize] += phase_started.elapsed();
+            }
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     let result = job.wait()?;
     println!("observed_peak_temporary_bytes={observed_peak}");
+    for phase in [
+        JoinPhase::Inspecting,
+        JoinPhase::Sorting,
+        JoinPhase::Analyzing,
+        JoinPhase::Creating,
+        JoinPhase::Publishing,
+    ] {
+        let secs = phase_durations[phase as usize].as_secs_f64();
+        if secs > 0.0 {
+            println!("phase_seconds_{}={:.9}", phase_slug(phase), secs);
+        }
+    }
     if let Some(requested) = requested {
         println!(
             "cancel_latency_seconds={:.9}",
