@@ -1786,6 +1786,8 @@ fn create_initial_runs_parallel(
     let collector = Arc::new(Mutex::new(ParallelCollector::new()));
     let worker_spill_cap =
         (job_budget.limit().min(EXTERNAL_SPILL_TOTAL_BYTES) / actual_workers).max(1);
+    #[cfg(test)]
+    let forced_collision = super::duplicate::collision_test::capture();
 
     for _ in 0..actual_workers {
         let source = Arc::clone(&source);
@@ -1801,8 +1803,12 @@ fn create_initial_runs_parallel(
         let job_budget = Arc::clone(&job_budget);
         let large_record_gate = Arc::clone(&large_record_gate);
         let early_duplicates = early_duplicates.clone();
+        #[cfg(test)]
+        let forced_collision = forced_collision.clone();
 
         let spawned = executor.spawn(&shared.cancel_requested, move || {
+            #[cfg(test)]
+            let _collision_guard = super::duplicate::collision_test::install(forced_collision);
             let shared = shared_worker;
             let direction = order.direction();
             let dedup = order.dedup_on_flush();

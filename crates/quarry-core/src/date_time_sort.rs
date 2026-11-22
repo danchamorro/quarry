@@ -432,6 +432,7 @@ impl Session {
         let mut offset = 0_u64;
         let mut physical_row = 0_u64;
         let mut source_bytes_read = 0_usize;
+        let mut consumed_source_bytes = 0_usize;
         let mut edit_bytes_read = 0_usize;
         let mut sampler = FormatSampler::new();
         let mut truncated = false;
@@ -441,12 +442,14 @@ impl Session {
         let mut process_record = |rec: &[u8],
                                   row_num: u64,
                                   sampler: &mut FormatSampler,
+                                  consumed_source_bytes: &mut usize,
                                   edit_bytes_read: &mut usize,
-                                  source_bytes_read: usize,
                                   truncated: &mut bool,
                                   stop: &mut bool|
          -> Result<(), QuarryError> {
+            let record_source_bytes = rec.len();
             if has_header && row_num == 0 {
+                *consumed_source_bytes = consumed_source_bytes.saturating_add(record_source_bytes);
                 return Ok(());
             }
             if sampler.sampled_rows >= config.max_rows {
@@ -455,7 +458,8 @@ impl Session {
                 return Ok(());
             }
             if let Some(edited) = edit_lookup(row_num, column) {
-                let next_total = source_bytes_read
+                let next_total = consumed_source_bytes
+                    .saturating_add(record_source_bytes)
                     .saturating_add(*edit_bytes_read)
                     .saturating_add(edited.len());
                 if next_total > config.max_bytes {
@@ -463,9 +467,19 @@ impl Session {
                     *stop = true;
                     return Ok(());
                 }
+                *consumed_source_bytes = consumed_source_bytes.saturating_add(record_source_bytes);
                 *edit_bytes_read = edit_bytes_read.saturating_add(edited.len());
                 sampler.observe(edited);
             } else {
+                let next_total = consumed_source_bytes
+                    .saturating_add(record_source_bytes)
+                    .saturating_add(*edit_bytes_read);
+                if next_total > config.max_bytes {
+                    *truncated = true;
+                    *stop = true;
+                    return Ok(());
+                }
+                *consumed_source_bytes = consumed_source_bytes.saturating_add(record_source_bytes);
                 let fields = parse_encoded_record(rec, delimiter, row_num, encoding)?;
                 let value = fields.get(column).map_or(&[][..], |field| field.as_ref());
                 sampler.observe(value);
@@ -508,8 +522,8 @@ impl Session {
                         &record,
                         physical_row,
                         &mut sampler,
+                        &mut consumed_source_bytes,
                         &mut edit_bytes_read,
-                        source_bytes_read,
                         &mut truncated,
                         &mut stop,
                     ) {
@@ -543,8 +557,8 @@ impl Session {
                         &record,
                         physical_row,
                         &mut sampler,
+                        &mut consumed_source_bytes,
                         &mut edit_bytes_read,
-                        source_bytes_read,
                         &mut truncated,
                         &mut stop,
                     )
@@ -562,7 +576,10 @@ impl Session {
             truncated = true;
         }
 
-        Ok(sampler.finish(source_bytes_read.saturating_add(edit_bytes_read), truncated))
+        Ok(sampler.finish(
+            consumed_source_bytes.saturating_add(edit_bytes_read),
+            truncated,
+        ))
     }
 }
 
@@ -883,6 +900,42 @@ mod tests {
         assert!(tiny_bytes.sampled_bytes <= 24);
         assert!(tiny_bytes.truncated);
         assert!(tiny_bytes.is_ambiguous());
+
+        // Read-ahead in a file larger than max_bytes must not crowd out a short edit on row 1.
+        let large_path = dir.path().join("large-edited.csv");
+        let mut large_csv = String::from("id,when\n1,not-a-date\n");
+        for row in 2..=400 {
+            large_csv.push_str(&format!("{row},2026-03-04\n"));
+        }
+        assert!(large_csv.len() > 4096);
+        std::fs::write(&large_path, large_csv.as_bytes()).unwrap();
+        let large_session = Session::open(
+            &large_path,
+            crate::OpenOptions {
+                header_mode: crate::HeaderMode::FirstRow,
+                delimiter: Some(b','),
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let row1_edit = BTreeMap::from([((1, 1), b"2026-03-01".to_vec())]);
+        let large_sugg = large_session
+            .suggest_date_time_formats(
+                1,
+                &row1_edit,
+                DateFormatSuggestionConfig {
+                    max_rows: 1000,
+                    max_bytes: 4096,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            large_sugg.unambiguous_format(),
+            Some(DateTimeFormat::YearMonthDay)
+        );
+        assert!(large_sugg.sampled_rows > 100);
+        assert!(large_sugg.sampled_bytes <= 4096);
+        assert!(large_sugg.truncated);
 
         // UTF-16LE with BOM.
         let utf16_path = dir.path().join("dates-utf16.csv");

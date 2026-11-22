@@ -10,8 +10,45 @@ const ALL_FIELDS_HASH_DOMAIN_A: u64 = 0x7175_6172_7279_6431;
 const ALL_FIELDS_HASH_DOMAIN_B: u64 = 0x7175_6172_7279_6432;
 
 #[cfg(test)]
-std::thread_local! {
-    static FORCE_ALL_FIELDS_HASH_COLLISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+pub(crate) mod collision_test {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    std::thread_local! {
+        static FORCED_COLLISION_HITS: RefCell<Option<Arc<AtomicU64>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard(Option<Arc<AtomicU64>>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCED_COLLISION_HITS.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+
+    pub(crate) fn capture() -> Option<Arc<AtomicU64>> {
+        FORCED_COLLISION_HITS.with(|slot| slot.borrow().clone())
+    }
+
+    pub(crate) fn install(hits: Option<Arc<AtomicU64>>) -> Guard {
+        let previous =
+            FORCED_COLLISION_HITS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), hits));
+        Guard(previous)
+    }
+
+    pub(super) fn record_if_active() -> bool {
+        FORCED_COLLISION_HITS.with(|slot| {
+            if let Some(hits) = slot.borrow().as_ref() {
+                hits.fetch_add(1, Ordering::AcqRel);
+                true
+            } else {
+                false
+            }
+        })
+    }
 }
 
 /// Which decoded fields participate in duplicate matching.
@@ -139,7 +176,7 @@ impl DuplicateSpec {
                 let mut key = Vec::with_capacity(ALL_FIELDS_KEY_BYTES);
                 key.extend_from_slice(&(field_count as u64).to_be_bytes());
                 #[cfg(test)]
-                if FORCE_ALL_FIELDS_HASH_COLLISION.with(std::cell::Cell::get) {
+                if collision_test::record_if_active() {
                     key.extend_from_slice(&[0_u8; 16]);
                     return Ok(key);
                 }
@@ -363,9 +400,13 @@ impl DuplicateJob {
             retained_rows: AtomicU64::new(0),
         });
         let worker_state = Arc::clone(&shared);
+        #[cfg(test)]
+        let forced_collision = collision_test::capture();
         let handle = thread::Builder::new()
             .name("quarry-duplicates".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _collision_guard = collision_test::install(forced_collision);
                 let mut completion = WorkerCompletion::new(&worker_state.sort);
                 let mut result = run_duplicates(
                     source,
@@ -2295,27 +2336,37 @@ mod tests {
             .unwrap();
 
         let expected = b"k,v\na,1\nb,2\nc,3\na,1,\nd,4\n";
+        let collision_spec = DuplicateSpec::all_fields(CaseSensitivity::Insensitive);
+        {
+            let probe = Arc::new(AtomicU64::new(0));
+            let _guard = collision_test::install(Some(Arc::clone(&probe)));
+            let key_a = collision_spec
+                .key(2, |c| if c == 0 { b"a" } else { b"1" }, 4096)
+                .unwrap();
+            let key_b = collision_spec
+                .key(2, |c| if c == 0 { b"b" } else { b"2" }, 4096)
+                .unwrap();
+            assert_eq!(
+                key_a, key_b,
+                "forced collision must map distinct same-width rows to identical keys"
+            );
+            assert_eq!(probe.load(Ordering::Acquire), 2);
+        }
         for (name, workers, budget) in [
             ("serial-in-memory", 1usize, 4 * 1024 * 1024),
             ("parallel-in-memory", 4usize, 4 * 1024 * 1024),
             ("serial-spilled", 1usize, 128),
             ("parallel-spilled", 4usize, 128),
         ] {
-            struct CollisionGuard;
-            impl Drop for CollisionGuard {
-                fn drop(&mut self) {
-                    FORCE_ALL_FIELDS_HASH_COLLISION.with(|flag| flag.set(false));
-                }
-            }
-            FORCE_ALL_FIELDS_HASH_COLLISION.with(|flag| flag.set(true));
-            let _guard = CollisionGuard;
+            let hits = Arc::new(AtomicU64::new(0));
+            let _guard = collision_test::install(Some(Arc::clone(&hits)));
 
             let dest = col_case.directory.join(format!("{name}.csv"));
             let DuplicateOutcome::Complete(sum) = DuplicateJob::start_with_options_internal(
                 &col_session,
                 BTreeMap::new(),
                 BTreeMap::new(),
-                DuplicateSpec::all_fields(CaseSensitivity::Insensitive),
+                collision_spec.clone(),
                 dest.clone(),
                 SortConfig {
                     run_memory_bytes: budget,
@@ -2332,6 +2383,11 @@ mod tests {
             .unwrap() else {
                 panic!("{name} cancelled");
             };
+            assert_eq!(
+                hits.load(Ordering::Acquire),
+                (16 * pattern.len()) as u64,
+                "{name}: forced hash collision must execute on every data row"
+            );
             assert_eq!(sum.retained_rows, 5, "{name}");
             assert_eq!(
                 sum.duplicate_rows,
