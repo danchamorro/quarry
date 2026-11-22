@@ -3644,7 +3644,7 @@ fn run_save_as(
 struct EncodedSaveState<'a> {
     output: &'a mut ExportTarget,
     edits: &'a PreparedSaveEdits,
-    replacement_matcher: Option<&'a ByteMatcher<'a>>,
+    replacement_matcher: Option<&'a (ByteMatcher<'a>, bool)>,
     config: ExportConfig,
     shared: &'a SharedState,
     delimiter: u8,
@@ -3873,10 +3873,12 @@ fn copy_encoded_records(
 ) -> Result<Option<SaveCopySummary>, QuarryError> {
     let source_had_bom = source_starts_with_bom(source, config.source_encoding)?;
     let mut scanner = crate::encoding::RecordScanner::new(delimiter, config.source_encoding)?;
-    let replacement_matcher = edits
-        .replacement
-        .as_ref()
-        .map(|r| ByteMatcher::new(&r.needle, r.case_sensitivity));
+    let replacement_matcher = edits.replacement.as_ref().map(|r| {
+        (
+            ByteMatcher::new(&r.needle, r.case_sensitivity),
+            r.needle.contains(&b'"'),
+        )
+    });
     let output_index = if edits.replacement.is_some() {
         Some(StructuralIndex::new(IndexConfig::default())?)
     } else {
@@ -4512,10 +4514,12 @@ fn copy_with_rewritten_records(
     shared: &SharedState,
 ) -> Result<Option<SaveCopySummary>, QuarryError> {
     let mut scanner = quarry_delimited::StructuralScanner::<true>::new(delimiter)?;
-    let replacement_matcher = edits
-        .replacement
-        .as_ref()
-        .map(|r| ByteMatcher::new(&r.needle, r.case_sensitivity));
+    let replacement_matcher = edits.replacement.as_ref().map(|r| {
+        (
+            ByteMatcher::new(&r.needle, r.case_sensitivity),
+            r.needle.contains(&b'"'),
+        )
+    });
     let mut output_index = if edits.replacement.is_some() {
         Some(StructuralIndex::new(IndexConfig::default())?)
     } else {
@@ -4822,7 +4826,7 @@ fn write_saved_record(
     delimiter: u8,
     has_header: bool,
     edits: &PreparedSaveEdits,
-    replacement_matcher: Option<&ByteMatcher<'_>>,
+    replacement_matcher: Option<&(ByteMatcher<'_>, bool)>,
     max_record_bytes: usize,
 ) -> Result<SaveCopySummary, QuarryError> {
     if record.len() > max_record_bytes {
@@ -4894,7 +4898,8 @@ fn write_saved_record(
                 effective_workers: 1,
             });
         }
-        let matcher = replacement_matcher.expect("replacement matcher prepared");
+        let (matcher, needle_contains_quote) =
+            replacement_matcher.expect("replacement matcher prepared");
         return write_replaced_data_record(
             output,
             record,
@@ -4903,6 +4908,7 @@ fn write_saved_record(
             &edits.cells,
             replacement,
             matcher,
+            *needle_contains_quote,
             max_record_bytes,
         );
     }
@@ -5023,6 +5029,7 @@ fn write_replaced_data_record(
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     replacement: &LiteralReplacement,
     matcher: &ByteMatcher,
+    needle_contains_quote: bool,
     max_record_bytes: usize,
 ) -> Result<SaveCopySummary, QuarryError> {
     if record.len() > max_record_bytes {
@@ -5040,7 +5047,7 @@ fn write_replaced_data_record(
     };
     let row_edits = cell_edits.range((row_number, 0)..=(row_number, usize::MAX));
     let has_cell_edits = row_edits.clone().next().is_some();
-    if !has_cell_edits && !replacement.needle.contains(&b'"') && matcher.find(record).is_none() {
+    if !has_cell_edits && !needle_contains_quote && matcher.find(record).is_none() {
         output.write_all(original)?;
         return Ok(SaveCopySummary {
             bytes_written: original.len() as u64,
@@ -10380,6 +10387,7 @@ mod tests {
                     max_head_in_flight: 2,
                     delay_stripe_zero: None,
                     max_chunk_bytes_seen: None,
+                    on_reorder_wait: None,
                 };
                 let inner = SaveAsJob::start_worker_with_options(
                     session.path.clone(),
@@ -10526,6 +10534,7 @@ mod tests {
                 max_head_in_flight: 2,
                 delay_stripe_zero: Some(Duration::from_millis(40)),
                 max_chunk_bytes_seen: Some(Arc::clone(&max_chunk_seen)),
+                on_reorder_wait: None,
             }),
         )
         .unwrap();
@@ -10548,6 +10557,7 @@ mod tests {
         );
 
         // Cancel under tight reorder backpressure with delayed stripe 0 must finish cleanly.
+        let waited_on_reorder = Arc::new(AtomicBool::new(false));
         let cancel_dest = dir.path().join("cancelled.csv");
         let cancel_inner = SaveAsJob::start_worker_with_options(
             session.path.clone(),
@@ -10572,15 +10582,23 @@ mod tests {
                 flush_chunk_bytes: 1024,
                 reorder_budget_bytes: 1024,
                 max_head_in_flight: 1,
-                delay_stripe_zero: Some(Duration::from_millis(80)),
+                delay_stripe_zero: Some(Duration::from_millis(500)),
                 max_chunk_bytes_seen: None,
+                on_reorder_wait: Some(Arc::clone(&waited_on_reorder)),
             }),
         )
         .unwrap();
         let cancel_job = ReplaceAllJob {
             inner: cancel_inner,
         };
-        std::thread::sleep(Duration::from_millis(15));
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while !waited_on_reorder.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < wait_deadline,
+                "expected at least one parallel replace worker to hit reorder backpressure"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         cancel_job.cancel();
         assert_eq!(cancel_job.wait().unwrap(), ReplaceAllOutcome::Cancelled);
         assert!(!cancel_dest.exists());
@@ -10644,6 +10662,7 @@ mod tests {
                 max_head_in_flight: 2,
                 delay_stripe_zero: Some(Duration::from_millis(50)),
                 max_chunk_bytes_seen: None,
+                on_reorder_wait: None,
             }),
         )
         .unwrap();

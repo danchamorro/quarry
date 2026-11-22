@@ -1770,20 +1770,15 @@ impl QuarryApp {
         }
     }
 
-    fn install_materialized_working_copy(
-        &mut self,
-        mut ready: MaterializedWorkingCopy,
-    ) -> Result<(), String> {
-        let Some(current) = self.active.document.as_ref() else {
-            return Err("The document closed before the change finished.".into());
-        };
-        let options = current.current_open_options();
-        let mut replacement = Document::prepare_with_encoding(
-            &ready.path,
-            options,
-            Some(current.session.encoding()),
-        )?;
-        if let Some(index) = ready.output_index.take() {
+    fn prepare_materialized_document(
+        &self,
+        path: &Path,
+        options: OpenOptions,
+        encoding: Encoding,
+        output_index: Option<CompletedIndex>,
+    ) -> Result<Document, String> {
+        let mut replacement = Document::prepare_with_encoding(path, options, Some(encoding))?;
+        if let Some(index) = output_index {
             let index = replacement
                 .session
                 .adopt_completed_index(index)
@@ -1799,6 +1794,22 @@ impl QuarryApp {
             replacement.index_cache_enabled = self.index_cache_enabled;
             replacement.start_indexing()?;
         }
+        Ok(replacement)
+    }
+
+    fn install_materialized_working_copy(
+        &mut self,
+        mut ready: MaterializedWorkingCopy,
+    ) -> Result<(), String> {
+        let Some(current) = self.active.document.as_ref() else {
+            return Err("The document closed before the change finished.".into());
+        };
+        let replacement = self.prepare_materialized_document(
+            &ready.path,
+            current.current_open_options(),
+            current.session.encoding(),
+            ready.output_index.take(),
+        )?;
         self.install_prepared_working_copy(replacement, ready);
         Ok(())
     }
@@ -1839,36 +1850,48 @@ impl QuarryApp {
     }
 
     fn confirm_duplicate_removal(&mut self) -> Result<(), AppMessage> {
-        let Some(document) = self.active.document.as_ref() else {
-            return Ok(());
+        let (destination, options, encoding, output_index) = {
+            let Some(document) = self.active.document.as_ref() else {
+                return Ok(());
+            };
+            let Some(StructuralJob::DuplicatePreview { summary, .. }) = &document.structural_job
+            else {
+                return Ok(());
+            };
+            (
+                summary.destination.clone(),
+                document.current_open_options(),
+                document.session.encoding(),
+                summary.output_index.clone(),
+            )
         };
-        let Some(StructuralJob::DuplicatePreview { summary, .. }) = &document.structural_job else {
-            return Ok(());
-        };
-        // Prepare the candidate before consuming history so a reopen failure is harmless.
-        let mut replacement = Document::prepare_with_encoding(
-            &summary.destination,
-            document.current_open_options(),
-            Some(document.session.encoding()),
-        )
-        .map_err(AppMessage::error)?;
-        replacement.index_cache_enabled = self.index_cache_enabled;
-        replacement.start_indexing().map_err(AppMessage::error)?;
+        {
+            let document = self
+                .active
+                .document
+                .as_mut()
+                .expect("the preview document is open");
+            if document.session.ensure_source_unchanged().is_err()
+                || document
+                    .original_session
+                    .as_ref()
+                    .is_some_and(|source| source.ensure_source_unchanged().is_err())
+            {
+                document.cancel_structural_edit();
+                document.invalidate_changed_source();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+        }
+        // Prepare the candidate (adopting its completed index when present) before consuming
+        // the preview or history so a reopen/adoption failure leaves the open document intact.
+        let replacement = self
+            .prepare_materialized_document(&destination, options, encoding, output_index)
+            .map_err(AppMessage::error)?;
         let document = self
             .active
             .document
             .as_mut()
             .expect("the preview document is open");
-        if document.session.ensure_source_unchanged().is_err()
-            || document
-                .original_session
-                .as_ref()
-                .is_some_and(|source| source.ensure_source_unchanged().is_err())
-        {
-            document.cancel_structural_edit();
-            document.invalidate_changed_source();
-            return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
-        }
         let Some(StructuralJob::DuplicatePreview {
             summary,
             selected_columns,
@@ -1881,7 +1904,7 @@ impl QuarryApp {
             replacement,
             MaterializedWorkingCopy {
                 path: summary.destination,
-                output_index: summary.output_index,
+                output_index: None,
                 undo,
                 selected_columns,
                 notice: format!(
@@ -14231,8 +14254,15 @@ mod tests {
     }
 
     fn finish_index(document: &mut Document) {
-        await_index_worker(document);
-        document.poll().unwrap();
+        if document.job.is_some() {
+            await_index_worker(document);
+            document.poll().unwrap();
+        } else {
+            assert!(
+                document.index.is_some() && document.progress.done,
+                "document must either have an active index job or an adopted completed index"
+            );
+        }
     }
 
     fn finish_structural_edit(app: &mut QuarryApp) {
@@ -19583,6 +19613,67 @@ mod tests {
         assert!(!document.working_cleanup.take_errors().is_empty());
         assert!(document.source_changed);
         assert_eq!(fs::read(source).unwrap(), b"key,value\nexternal,changed\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_confirmation_adopts_completed_index_without_rescanning() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("dedup-adopt.csv");
+        let original = b"key,value\na,first\nb,keep\na,dup\nc,last\n";
+        fs::write(&source, original).unwrap();
+        let mut app = individual_edit_app(&source);
+        app.active
+            .document
+            .as_mut()
+            .unwrap()
+            .start_find_duplicates(vec![0], CaseSensitivity::Insensitive)
+            .unwrap();
+        finish_duplicate_search(&mut app);
+        let candidate = {
+            let document = app.active.document.as_ref().unwrap();
+            let Some(super::StructuralJob::DuplicatePreview { summary, .. }) =
+                &document.structural_job
+            else {
+                panic!("expected duplicate preview");
+            };
+            assert!(
+                summary.output_index.is_some(),
+                "macOS duplicate output should emit a completed index"
+            );
+            summary.destination.clone()
+        };
+
+        // Tampering with the published candidate before confirming must fail adoption without
+        // consuming the preview or mutating undo history.
+        let original_candidate = fs::read(&candidate).unwrap();
+        let backup = directory.path().join("candidate-backup.csv");
+        fs::rename(&candidate, &backup).unwrap();
+        fs::write(&candidate, b"key,value\ntampered,1\n").unwrap();
+        assert!(app.confirm_duplicate_removal().is_err());
+        assert!(matches!(
+            app.active.document.as_ref().unwrap().structural_job,
+            Some(super::StructuralJob::DuplicatePreview { .. })
+        ));
+        assert_eq!(app.active.document.as_ref().unwrap().session.path(), source);
+
+        // Restoring the exact published file identity lets confirmation adopt the index
+        // immediately with zero background re-indexing job.
+        fs::remove_file(&candidate).unwrap();
+        fs::rename(&backup, &candidate).unwrap();
+        app.confirm_duplicate_removal().unwrap();
+        let document = app.active.document.as_ref().unwrap();
+        assert!(
+            document.job.is_none(),
+            "confirming duplicate removal must adopt output_index without starting another index scan"
+        );
+        assert!(document.progress.done);
+        assert_eq!(document.progress.bytes_scanned, document.session.file_size);
+        assert_eq!(document.progress.rows_scanned, 4);
+        assert_eq!(
+            fs::read(document.session.path()).unwrap(),
+            original_candidate
+        );
     }
 
     #[test]

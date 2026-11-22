@@ -42,6 +42,8 @@ pub(super) struct ReplaceParallelTuning {
     pub(super) delay_stripe_zero: Option<Duration>,
     #[cfg(test)]
     pub(super) max_chunk_bytes_seen: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    pub(super) on_reorder_wait: Option<Arc<AtomicBool>>,
 }
 
 impl ReplaceParallelTuning {
@@ -56,6 +58,8 @@ impl ReplaceParallelTuning {
             delay_stripe_zero: None,
             #[cfg(test)]
             max_chunk_bytes_seen: None,
+            #[cfg(test)]
+            on_reorder_wait: None,
         }
     }
 }
@@ -488,6 +492,12 @@ pub(super) fn copy_with_replaced_records_parallel(
     let stripes = Arc::new(stripes);
     let next_stripe = Arc::new(AtomicUsize::new(0));
     let head_stripe_id = Arc::new(AtomicUsize::new(0));
+    #[cfg(test)]
+    let reorder_budget = Arc::new(ByteBudget::with_wait_signal(
+        tuning.reorder_budget_bytes.max(1),
+        tuning.on_reorder_wait.clone(),
+    ));
+    #[cfg(not(test))]
     let reorder_budget = Arc::new(ByteBudget::new(tuning.reorder_budget_bytes.max(1)));
     let head_flow = Arc::new(HeadFlowControl::new(tuning.max_head_in_flight));
     let stop_flag = Arc::new(AtomicBool::new(false));

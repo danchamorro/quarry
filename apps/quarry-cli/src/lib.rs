@@ -1693,10 +1693,12 @@ fn wait_for_duplicates(
         thread::sleep(Duration::from_millis(1));
     }
     let progress = job.progress();
-    let outcome = job.wait()?;
     if cancel_after_bytes.is_some() && cancellation.is_none() {
+        job.cancel();
+        let _ = job.wait();
         return Err("duplicate analysis finished before cancellation threshold".into());
     }
+    let outcome = job.wait()?;
     if cancel_after_bytes.is_some()
         && (!matches!(outcome, DuplicateOutcome::Cancelled)
             || !progress.cancelled
@@ -3084,11 +3086,13 @@ fn wait_for_replace_all(
     }
 
     let progress = job.progress();
-    let outcome = job.wait()?;
-    let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
     if cancel_after_bytes.is_some() && cancellation.is_none() {
+        job.cancel();
+        let _ = job.wait();
         return Err("Replace All finished before cancellation threshold".into());
     }
+    let outcome = job.wait()?;
+    let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
     if cancel_after_bytes.is_some() && !matches!(&outcome, ReplaceAllOutcome::Cancelled) {
         return Err("Replace All completed before cancellation took effect".into());
     }

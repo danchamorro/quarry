@@ -94,7 +94,6 @@ pub(super) struct ArenaEntry {
 pub(super) struct RunArena {
     bytes: Vec<u8>,
     entries: Vec<ArenaEntry>,
-    tracked_bytes: usize,
     sorted: bool,
 }
 
@@ -103,7 +102,6 @@ impl RunArena {
         Self {
             bytes: Vec::new(),
             entries: Vec::new(),
-            tracked_bytes: 0,
             sorted: false,
         }
     }
@@ -116,8 +114,10 @@ impl RunArena {
         self.entries.len()
     }
 
-    pub(super) fn tracked_bytes(&self) -> usize {
-        self.tracked_bytes
+    pub(super) fn capacity_bytes(&self) -> usize {
+        self.bytes
+            .capacity()
+            .saturating_add(self.entries.capacity().saturating_mul(ARENA_ENTRY_BYTES))
     }
 
     pub(super) const fn entry_footprint(key_len: usize, record_len: usize) -> usize {
@@ -126,48 +126,98 @@ impl RunArena {
             .saturating_add(ARENA_ENTRY_BYTES)
     }
 
+    /// Compute `(next_bytes_cap, next_entries_cap)` that `push_bounded` will allocate for
+    /// appending `(key_len, record_len)` given an optional combined byte cap.
+    ///
+    /// Whenever the resulting lengths fit inside `combined_cap_hint`, the returned combined
+    /// capacity `next_bytes_cap + next_entries_cap * ARENA_ENTRY_BYTES` stays `<= combined_cap_hint`.
+    /// For a single oversized entry that exceeds `combined_cap_hint`, returns the exact minimum
+    /// capacities needed (`target_bytes_len`, `target_entries_len`).
+    pub(super) fn plan_growth(
+        &self,
+        key_len: usize,
+        record_len: usize,
+        combined_cap_hint: Option<usize>,
+    ) -> (usize, usize) {
+        let needed_bytes = key_len.saturating_add(record_len);
+        let target_bytes_len = self.bytes.len().saturating_add(needed_bytes);
+        let cur_bytes_cap = self.bytes.capacity();
+        let cur_entries_cap = self.entries.capacity();
+        let target_entries_len = self.entries.len().saturating_add(1);
+
+        let next_bytes_cap = if target_bytes_len <= cur_bytes_cap {
+            cur_bytes_cap
+        } else if let Some(cap) = combined_cap_hint {
+            let min_entries_bytes = target_entries_len
+                .max(cur_entries_cap)
+                .saturating_mul(ARENA_ENTRY_BYTES);
+            let bytes_ceiling = cap.saturating_sub(min_entries_bytes);
+            if target_bytes_len <= bytes_ceiling {
+                cur_bytes_cap
+                    .saturating_mul(2)
+                    .max(target_bytes_len)
+                    .min(bytes_ceiling)
+            } else {
+                target_bytes_len
+            }
+        } else {
+            cur_bytes_cap.saturating_mul(2).max(target_bytes_len)
+        };
+
+        let next_entries_cap = if target_entries_len <= cur_entries_cap {
+            cur_entries_cap
+        } else if let Some(cap) = combined_cap_hint {
+            let remaining_bytes = cap.saturating_sub(next_bytes_cap);
+            let max_entries = remaining_bytes / ARENA_ENTRY_BYTES;
+            if target_entries_len <= max_entries {
+                cur_entries_cap
+                    .saturating_mul(2)
+                    .max(64)
+                    .min(max_entries)
+                    .max(target_entries_len)
+            } else {
+                target_entries_len
+            }
+        } else {
+            cur_entries_cap
+                .saturating_mul(2)
+                .max(64)
+                .max(target_entries_len)
+        };
+
+        (next_bytes_cap, next_entries_cap)
+    }
+
+    pub(super) fn planned_capacity_bytes(
+        &self,
+        key_len: usize,
+        record_len: usize,
+        combined_cap_hint: Option<usize>,
+    ) -> usize {
+        let (next_bytes_cap, next_entries_cap) =
+            self.plan_growth(key_len, record_len, combined_cap_hint);
+        next_bytes_cap.saturating_add(next_entries_cap.saturating_mul(ARENA_ENTRY_BYTES))
+    }
+
     pub(super) fn push_bounded(
         &mut self,
         key: &[u8],
         record: &[u8],
         ordinal: u64,
-        bytes_cap_hint: Option<usize>,
+        combined_cap_hint: Option<usize>,
     ) {
-        let needed = key.len().saturating_add(record.len());
-        let target_len = self.bytes.len().saturating_add(needed);
-        if target_len > self.bytes.capacity() {
-            if let Some(cap) = bytes_cap_hint
-                && target_len <= cap
-            {
-                // Avoid Vec power-of-2 doubling past the worker's run cap.
-                let next_cap = self
-                    .bytes
-                    .capacity()
-                    .saturating_mul(2)
-                    .max(target_len)
-                    .min(cap);
-                self.bytes.reserve_exact(next_cap - self.bytes.len());
-            } else {
-                self.bytes.reserve(needed);
-            }
+        let (next_bytes_cap, next_entries_cap) =
+            self.plan_growth(key.len(), record.len(), combined_cap_hint);
+        if next_bytes_cap > self.bytes.capacity() {
+            self.bytes.reserve_exact(next_bytes_cap - self.bytes.len());
         }
         let key_offset = self.bytes.len();
         self.bytes.extend_from_slice(key);
         let record_offset = self.bytes.len();
         self.bytes.extend_from_slice(record);
-        if self.entries.len() == self.entries.capacity() {
-            if let Some(cap) = bytes_cap_hint {
-                let max_entries = (cap / ARENA_ENTRY_BYTES).max(1);
-                let next_cap = self
-                    .entries
-                    .capacity()
-                    .saturating_mul(2)
-                    .max(64)
-                    .min(max_entries.max(self.entries.len().saturating_add(1)));
-                self.entries.reserve_exact(next_cap - self.entries.len());
-            } else {
-                self.entries.reserve(1);
-            }
+        if next_entries_cap > self.entries.capacity() {
+            self.entries
+                .reserve_exact(next_entries_cap - self.entries.len());
         }
         self.entries.push(ArenaEntry {
             key_offset,
@@ -176,9 +226,6 @@ impl RunArena {
             record_len: record.len(),
             ordinal,
         });
-        self.tracked_bytes = self
-            .tracked_bytes
-            .saturating_add(Self::entry_footprint(key.len(), record.len()));
         self.sorted = false;
     }
 
@@ -209,25 +256,21 @@ impl RunArena {
         self.sorted = true;
     }
 
-    /// Clear arena contents while reusing steady-state buffers up to `retain_bytes_cap`
-    /// so repeated spill flushes do not thrash large-region allocator caches across workers.
+    /// Clear arena contents while reusing steady-state buffers whose combined capacity stays
+    /// within `retain_bytes_cap` so repeated spill flushes avoid allocator thrashing without
+    /// exceeding the worker's budgeted capacity.
     pub(super) fn clear_for_reuse(&mut self, retain_bytes_cap: usize) {
+        let prev_bytes_len = self.bytes.len();
         self.entries.clear();
         self.bytes.clear();
-        if retain_bytes_cap == 0 {
+        if retain_bytes_cap == 0
+            || self.capacity_bytes() > retain_bytes_cap
+            || (prev_bytes_len < self.bytes.capacity() / 4
+                && self.bytes.capacity() > retain_bytes_cap / 2)
+        {
             self.bytes.shrink_to(0);
             self.entries.shrink_to(0);
-        } else {
-            let max_keep_bytes = retain_bytes_cap.max(LARGE_RECORD_GATE_BYTES);
-            if self.bytes.capacity() > max_keep_bytes {
-                self.bytes.shrink_to(0);
-            }
-            let max_keep_entries = (max_keep_bytes / ARENA_ENTRY_BYTES).max(65_536);
-            if self.entries.capacity() > max_keep_entries {
-                self.entries.shrink_to(0);
-            }
         }
-        self.tracked_bytes = 0;
         self.sorted = false;
     }
 
@@ -405,6 +448,33 @@ impl JobMemoryBudget {
         self.shared_guard.lock().unwrap().take();
     }
 
+    /// Non-blocking reservation that succeeds only when `used + bytes <= effective_limit`
+    /// (never admitting above-budget allocations). Used for optional fast-path auxiliary
+    /// allocations such as the multi-arena duplicate survivor vector.
+    pub(super) fn try_acquire_within_limit(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<JobBudgetGuard> {
+        if bytes == 0 {
+            return Some(JobBudgetGuard {
+                job: Arc::clone(self),
+                reserved: 0,
+                used: 0,
+            });
+        }
+        let mut used = self.used.lock().unwrap();
+        let effective_limit = self.effective_limit();
+        if used.saturating_add(bytes) > effective_limit {
+            return None;
+        }
+        *used = used.saturating_add(bytes);
+        Some(JobBudgetGuard {
+            job: Arc::clone(self),
+            reserved: bytes,
+            used: bytes,
+        })
+    }
+
     /// Non-blocking reservation attempt for an empty worker arena. Returns `None` when
     /// another worker of this job currently holds budget so the caller can spill completed arenas first.
     pub(super) fn try_acquire_empty(self: &Arc<Self>, bytes: usize) -> Option<JobBudgetGuard> {
@@ -471,6 +541,26 @@ impl JobMemoryBudget {
 }
 
 impl JobBudgetGuard {
+    pub(super) fn used(&self) -> usize {
+        self.used
+    }
+
+    /// Shrink this guard's tracked and reserved budget down to `new_used`, releasing excess
+    /// bytes back to the job budget immediately.
+    pub(super) fn shrink_used_to(&mut self, new_used: usize) {
+        self.used = new_used;
+        if self.reserved > new_used {
+            let release = self.reserved - new_used;
+            self.reserved = new_used;
+            let mut used = self.job.used.lock().unwrap();
+            *used = used.saturating_sub(release);
+            if self.job.spilled.load(Ordering::Acquire) {
+                self.job.shrink_shared_reservation_locked(*used);
+            }
+            self.job.available.notify_all();
+        }
+    }
+
     /// Non-blocking reservation for adding another row to a non-empty arena.
     /// Never blocks so concurrent workers cannot deadlock; returns `false` to trigger spill.
     pub(super) fn try_reserve_additional(
@@ -1031,6 +1121,29 @@ pub(super) fn conservative_record_expansion_bound(
         .saturating_add(ARENA_ENTRY_BYTES)
 }
 
+fn record_flushed_run(
+    run: SpillFile,
+    dropped: u64,
+    early_duplicates: Option<&AtomicU64>,
+    runs: &mut Vec<SpillFile>,
+) {
+    if dropped > 0
+        && let Some(counter) = early_duplicates
+    {
+        counter.fetch_add(dropped, Ordering::AcqRel);
+    }
+    runs.push(run);
+}
+
+fn sync_budget_after_flush(arena: &RunArena, budget_guard: &mut Option<JobBudgetGuard>) {
+    let retained_cap = arena.capacity_bytes();
+    if retained_cap == 0 {
+        budget_guard.take();
+    } else if let Some(guard) = budget_guard.as_mut() {
+        guard.shrink_used_to(retained_cap);
+    }
+}
+
 fn spill_collected_arenas(
     collector: &Mutex<ParallelCollector>,
     direction: SortDirection,
@@ -1052,12 +1165,7 @@ fn spill_collected_arenas(
             .arena
             .flush_to_workspace_mode(direction, dedup, workspace, shared, 0)?
         {
-            if dropped > 0
-                && let Some(counter) = early_duplicates
-            {
-                counter.fetch_add(dropped, Ordering::AcqRel);
-            }
-            new_runs.push(run);
+            record_flushed_run(run, dropped, early_duplicates, &mut new_runs);
         }
         drop(item);
     }
@@ -1195,6 +1303,7 @@ fn create_initial_runs_serial(
 
     let flush_serial = |arena: &mut RunArena,
                         runs: &mut Vec<SpillFile>,
+                        budget_guard: &mut Option<JobBudgetGuard>,
                         retain_bytes_cap: usize|
      -> Result<bool, QuarryError> {
         let Some((run, dropped)) =
@@ -1202,12 +1311,8 @@ fn create_initial_runs_serial(
         else {
             return Ok(false);
         };
-        if dropped > 0
-            && let Some(counter) = early_duplicates
-        {
-            counter.fetch_add(dropped, Ordering::AcqRel);
-        }
-        runs.push(run);
+        record_flushed_run(run, dropped, early_duplicates, runs);
+        sync_budget_after_flush(arena, budget_guard);
         Ok(true)
     };
 
@@ -1235,9 +1340,11 @@ fn create_initial_runs_serial(
             } else {
                 if !arena.is_empty() {
                     job_budget.mark_spilled();
-                    if !flush_serial(arena, runs, serial_spill_cap)? {
+                    if !flush_serial(arena, runs, budget_guard, 0)? {
                         return Ok(false);
                     }
+                } else {
+                    arena.clear_for_reuse(0);
                     budget_guard.take();
                 }
                 let Some(g) = large_record_gate.acquire(&shared.cancel_requested) else {
@@ -1281,9 +1388,11 @@ fn create_initial_runs_serial(
                     } else {
                         if !arena.is_empty() {
                             job_budget.mark_spilled();
-                            if !flush_serial(arena, runs, serial_spill_cap)? {
+                            if !flush_serial(arena, runs, budget_guard, 0)? {
                                 return Ok(false);
                             }
+                        } else {
+                            arena.clear_for_reuse(0);
                             budget_guard.take();
                         }
                         let Some(g) = large_record_gate.acquire(&shared.cancel_requested) else {
@@ -1293,24 +1402,65 @@ fn create_initial_runs_serial(
                     }
                 }
                 if !arena.is_empty() {
-                    let cap = job_budget.is_spilled().then_some(serial_spill_cap);
-                    let fits = budget_guard
-                        .as_mut()
-                        .is_some_and(|g| g.try_reserve_additional(footprint, cap));
+                    let spilled = job_budget.is_spilled();
+                    let active_cap = if spilled {
+                        serial_spill_cap
+                    } else {
+                        job_budget.limit()
+                    };
+                    let planned = arena.planned_capacity_bytes(
+                        key.len(),
+                        effective_record.len(),
+                        Some(active_cap),
+                    );
+                    let current = budget_guard.as_ref().map_or(0, JobBudgetGuard::used);
+                    let delta = planned.saturating_sub(current);
+                    let fits = planned <= active_cap
+                        && budget_guard.as_mut().is_some_and(|g| {
+                            g.try_reserve_additional(delta, spilled.then_some(serial_spill_cap))
+                        });
                     if !fits {
                         job_budget.mark_spilled();
-                        if !flush_serial(arena, runs, serial_spill_cap)? {
+                        if !flush_serial(arena, runs, budget_guard, serial_spill_cap)? {
                             return Ok(false);
                         }
-                        budget_guard.take();
                     }
                 }
                 if arena.is_empty() {
-                    let Some(guard) = job_budget.acquire_empty(footprint, &shared.cancel_requested)
-                    else {
-                        return Ok(false);
+                    let spilled = job_budget.is_spilled();
+                    let active_cap = if spilled {
+                        serial_spill_cap
+                    } else {
+                        job_budget.limit()
                     };
-                    *budget_guard = Some(guard);
+                    if let Some(guard) = budget_guard.as_mut() {
+                        let planned = arena.planned_capacity_bytes(
+                            key.len(),
+                            effective_record.len(),
+                            Some(active_cap),
+                        );
+                        let delta = planned.saturating_sub(guard.used());
+                        if planned > active_cap
+                            || !guard
+                                .try_reserve_additional(delta, spilled.then_some(serial_spill_cap))
+                        {
+                            arena.clear_for_reuse(0);
+                            budget_guard.take();
+                        }
+                    }
+                    if budget_guard.is_none() {
+                        let planned = arena.planned_capacity_bytes(
+                            key.len(),
+                            effective_record.len(),
+                            Some(active_cap),
+                        );
+                        let Some(guard) =
+                            job_budget.acquire_empty(planned, &shared.cancel_requested)
+                        else {
+                            return Ok(false);
+                        };
+                        *budget_guard = Some(guard);
+                    }
                 }
                 records.observe(&effective_record);
                 let cap_hint = if job_budget.is_spilled() {
@@ -1321,14 +1471,14 @@ fn create_initial_runs_serial(
                 arena.push_bounded(&key, &effective_record, ordinal, cap_hint);
                 rows = rows.saturating_add(1);
                 shared.rows_sorted.store(rows, Ordering::Release);
-                if large_guard.is_some()
-                    && (job_budget.is_spilled() || footprint > job_budget.limit())
+                if (large_guard.is_some()
+                    && (job_budget.is_spilled() || arena.capacity_bytes() > job_budget.limit()))
+                    || (job_budget.is_spilled() && arena.capacity_bytes() > serial_spill_cap)
                 {
                     job_budget.mark_spilled();
-                    if !flush_serial(arena, runs, 0)? {
+                    if !flush_serial(arena, runs, budget_guard, 0)? {
                         return Ok(false);
                     }
-                    budget_guard.take();
                 }
             }
         }
@@ -1442,9 +1592,11 @@ fn create_initial_runs_serial(
             } else {
                 if !arena.is_empty() {
                     job_budget.mark_spilled();
-                    if !flush_serial(&mut arena, &mut runs, serial_spill_cap)? {
+                    if !flush_serial(&mut arena, &mut runs, &mut budget_guard, 0)? {
                         return Ok(AdaptiveScanOutcome::Cancelled);
                     }
+                } else {
+                    arena.clear_for_reuse(0);
                     budget_guard.take();
                 }
                 let Some(g) = large_record_gate.acquire(&shared.cancel_requested) else {
@@ -1471,17 +1623,22 @@ fn create_initial_runs_serial(
     let mut in_memory_runs = Vec::new();
     if !arena.is_empty() {
         if !runs.is_empty() || job_budget.is_spilled() {
-            if !flush_serial(&mut arena, &mut runs, 0)? {
+            if !flush_serial(&mut arena, &mut runs, &mut budget_guard, 0)? {
                 return Ok(AdaptiveScanOutcome::Cancelled);
             }
-            budget_guard.take();
         } else {
             arena.sort(direction);
+            if let Some(guard) = budget_guard.as_mut() {
+                guard.shrink_used_to(arena.capacity_bytes());
+            }
             in_memory_runs.push(InMemoryRun {
                 arena,
                 _budget_guard: budget_guard,
             });
         }
+    } else {
+        arena.clear_for_reuse(0);
+        budget_guard.take();
     }
 
     Ok(AdaptiveScanOutcome::Complete(AdaptiveScanSummary {
@@ -1567,7 +1724,8 @@ fn create_initial_runs_parallel(
 
             let flush_arena_and_collected = |arena: &mut RunArena,
                                              budget_guard: &mut Option<JobBudgetGuard>,
-                                             local_runs: &mut Vec<SpillFile>|
+                                             local_runs: &mut Vec<SpillFile>,
+                                             retain_bytes_cap: usize|
              -> Result<bool, QuarryError> {
                 job_budget.mark_spilled();
                 if !arena.is_empty() {
@@ -1576,17 +1734,15 @@ fn create_initial_runs_parallel(
                         dedup,
                         &workspace,
                         &shared,
-                        worker_spill_cap,
+                        retain_bytes_cap,
                     )?
                     else {
                         return Ok(false);
                     };
-                    if dropped > 0
-                        && let Some(counter) = early_duplicates.as_deref()
-                    {
-                        counter.fetch_add(dropped, Ordering::AcqRel);
-                    }
-                    local_runs.push(run);
+                    record_flushed_run(run, dropped, early_duplicates.as_deref(), local_runs);
+                    sync_budget_after_flush(arena, budget_guard);
+                } else if retain_bytes_cap == 0 {
+                    arena.clear_for_reuse(0);
                     budget_guard.take();
                 }
                 if !spill_collected_arenas(
@@ -1662,7 +1818,7 @@ fn create_initial_runs_parallel(
                         if let Some(g) = large_record_gate.try_acquire() {
                             *large_guard = Some(g);
                         } else {
-                            if !flush_arena_and_collected(arena, budget_guard, local_runs)? {
+                            if !flush_arena_and_collected(arena, budget_guard, local_runs, 0)? {
                                 return Ok(false);
                             }
                             let Some(g) = large_record_gate.acquire(&shared.cancel_requested)
@@ -1706,8 +1862,12 @@ fn create_initial_runs_parallel(
                                 if let Some(g) = large_record_gate.try_acquire() {
                                     *large_guard = Some(g);
                                 } else {
-                                    if !flush_arena_and_collected(arena, budget_guard, local_runs)?
-                                    {
+                                    if !flush_arena_and_collected(
+                                        arena,
+                                        budget_guard,
+                                        local_runs,
+                                        0,
+                                    )? {
                                         return Ok(false);
                                     }
                                     let Some(g) =
@@ -1719,36 +1879,87 @@ fn create_initial_runs_parallel(
                                 }
                             }
                             if !arena.is_empty() {
-                                let cap = job_budget.is_spilled().then_some(worker_spill_cap);
-                                let fits = budget_guard
-                                    .as_mut()
-                                    .is_some_and(|g| g.try_reserve_additional(footprint, cap));
+                                let spilled = job_budget.is_spilled();
+                                let active_cap = if spilled {
+                                    worker_spill_cap
+                                } else {
+                                    job_budget.limit()
+                                };
+                                let planned = arena.planned_capacity_bytes(
+                                    key.len(),
+                                    effective_record.len(),
+                                    Some(active_cap),
+                                );
+                                let current = budget_guard.as_ref().map_or(0, JobBudgetGuard::used);
+                                let delta = planned.saturating_sub(current);
+                                let fits = planned <= active_cap
+                                    && budget_guard.as_mut().is_some_and(|g| {
+                                        g.try_reserve_additional(
+                                            delta,
+                                            spilled.then_some(worker_spill_cap),
+                                        )
+                                    });
                                 if !fits
-                                    && !flush_arena_and_collected(arena, budget_guard, local_runs)?
+                                    && !flush_arena_and_collected(
+                                        arena,
+                                        budget_guard,
+                                        local_runs,
+                                        worker_spill_cap,
+                                    )?
                                 {
                                     return Ok(false);
                                 }
                             }
                             if arena.is_empty() {
-                                let Some(guard) = job_budget.acquire_empty_with_spill(
-                                    footprint,
-                                    &shared.cancel_requested,
-                                    || {
-                                        job_budget.mark_spilled();
-                                        spill_collected_arenas(
-                                            &collector,
-                                            direction,
-                                            dedup,
-                                            early_duplicates.as_deref(),
-                                            &workspace,
-                                            &shared,
-                                        )
-                                    },
-                                )?
-                                else {
-                                    return Ok(false);
+                                let spilled = job_budget.is_spilled();
+                                let active_cap = if spilled {
+                                    worker_spill_cap
+                                } else {
+                                    job_budget.limit()
                                 };
-                                *budget_guard = Some(guard);
+                                if let Some(guard) = budget_guard.as_mut() {
+                                    let planned = arena.planned_capacity_bytes(
+                                        key.len(),
+                                        effective_record.len(),
+                                        Some(active_cap),
+                                    );
+                                    let delta = planned.saturating_sub(guard.used());
+                                    if planned > active_cap
+                                        || !guard.try_reserve_additional(
+                                            delta,
+                                            spilled.then_some(worker_spill_cap),
+                                        )
+                                    {
+                                        arena.clear_for_reuse(0);
+                                        budget_guard.take();
+                                    }
+                                }
+                                if budget_guard.is_none() {
+                                    let planned = arena.planned_capacity_bytes(
+                                        key.len(),
+                                        effective_record.len(),
+                                        Some(active_cap),
+                                    );
+                                    let Some(guard) = job_budget.acquire_empty_with_spill(
+                                        planned,
+                                        &shared.cancel_requested,
+                                        || {
+                                            job_budget.mark_spilled();
+                                            spill_collected_arenas(
+                                                &collector,
+                                                direction,
+                                                dedup,
+                                                early_duplicates.as_deref(),
+                                                &workspace,
+                                                &shared,
+                                            )
+                                        },
+                                    )?
+                                    else {
+                                        return Ok(false);
+                                    };
+                                    *budget_guard = Some(guard);
+                                }
                             }
                             local_records.observe(&effective_record);
                             let cap_hint = if job_budget.is_spilled() {
@@ -1758,35 +1969,15 @@ fn create_initial_runs_parallel(
                             };
                             arena.push_bounded(&key, &effective_record, ordinal, cap_hint);
                             *local_rows = local_rows.saturating_add(1);
-                            if large_guard.is_some()
-                                && (job_budget.is_spilled() || footprint > job_budget.limit())
+                            let needs_immediate_flush = (large_guard.is_some()
+                                && (job_budget.is_spilled()
+                                    || arena.capacity_bytes() > job_budget.limit()))
+                                || (job_budget.is_spilled()
+                                    && arena.capacity_bytes() > worker_spill_cap);
+                            if needs_immediate_flush
+                                && !flush_arena_and_collected(arena, budget_guard, local_runs, 0)?
                             {
-                                job_budget.mark_spilled();
-                                if !arena.is_empty() {
-                                    let Some((run, dropped)) = arena.flush_to_workspace_mode(
-                                        direction, dedup, &workspace, &shared, 0,
-                                    )?
-                                    else {
-                                        return Ok(false);
-                                    };
-                                    if dropped > 0
-                                        && let Some(counter) = early_duplicates.as_deref()
-                                    {
-                                        counter.fetch_add(dropped, Ordering::AcqRel);
-                                    }
-                                    local_runs.push(run);
-                                    budget_guard.take();
-                                }
-                                if !spill_collected_arenas(
-                                    &collector,
-                                    direction,
-                                    dedup,
-                                    early_duplicates.as_deref(),
-                                    &workspace,
-                                    &shared,
-                                )? {
-                                    return Ok(false);
-                                }
+                                return Ok(false);
                             }
                         }
                     }
@@ -1906,6 +2097,7 @@ fn create_initial_runs_parallel(
                                 &mut arena,
                                 &mut budget_guard,
                                 &mut local_runs,
+                                0,
                             ) {
                                 Ok(true) => {}
                                 Ok(false) => break 'worker,
@@ -2000,40 +2192,20 @@ fn create_initial_runs_parallel(
                 && !arena.is_empty()
             {
                 arena.sort(direction);
-                if job_budget.is_spilled() {
-                    match arena.flush_to_workspace_mode(direction, dedup, &workspace, &shared, 0) {
-                        Ok(Some((run, dropped))) => {
-                            if dropped > 0
-                                && let Some(counter) = early_duplicates.as_deref()
-                            {
-                                counter.fetch_add(dropped, Ordering::AcqRel);
-                            }
-                            local_runs.push(run);
-                        }
-                        Ok(None) => {}
-                        Err(err) => {
-                            collector.lock().unwrap().record_error(
-                                u64::MAX - 1,
-                                err,
-                                &earliest_error_row,
-                            );
-                        }
-                    }
-                    budget_guard.take();
-                } else {
-                    let mut guard = collector.lock().unwrap();
-                    if job_budget.is_spilled() {
-                        drop(guard);
+                let flush_final =
+                    |arena: &mut RunArena,
+                     budget_guard: &mut Option<JobBudgetGuard>,
+                     local_runs: &mut Vec<SpillFile>| {
                         match arena
                             .flush_to_workspace_mode(direction, dedup, &workspace, &shared, 0)
                         {
                             Ok(Some((run, dropped))) => {
-                                if dropped > 0
-                                    && let Some(counter) = early_duplicates.as_deref()
-                                {
-                                    counter.fetch_add(dropped, Ordering::AcqRel);
-                                }
-                                local_runs.push(run);
+                                record_flushed_run(
+                                    run,
+                                    dropped,
+                                    early_duplicates.as_deref(),
+                                    local_runs,
+                                );
                             }
                             Ok(None) => {}
                             Err(err) => {
@@ -2045,7 +2217,18 @@ fn create_initial_runs_parallel(
                             }
                         }
                         budget_guard.take();
+                    };
+                if job_budget.is_spilled() {
+                    flush_final(&mut arena, &mut budget_guard, &mut local_runs);
+                } else {
+                    let mut guard = collector.lock().unwrap();
+                    if job_budget.is_spilled() {
+                        drop(guard);
+                        flush_final(&mut arena, &mut budget_guard, &mut local_runs);
                     } else {
+                        if let Some(bg) = budget_guard.as_mut() {
+                            bg.shrink_used_to(arena.capacity_bytes());
+                        }
                         guard.completed_arenas.push(InMemoryRun {
                             arena,
                             _budget_guard: budget_guard.take(),
@@ -2053,6 +2236,7 @@ fn create_initial_runs_parallel(
                     }
                 }
             } else {
+                arena.clear_for_reuse(0);
                 budget_guard.take();
             }
 
@@ -2119,12 +2303,12 @@ fn create_initial_runs_parallel(
                 .arena
                 .flush_to_workspace_mode(direction, dedup, &workspace, &shared, 0)?
             {
-                if dropped > 0
-                    && let Some(counter) = early_duplicates.as_deref()
-                {
-                    counter.fetch_add(dropped, Ordering::AcqRel);
-                }
-                collected.spilled_runs.push(run);
+                record_flushed_run(
+                    run,
+                    dropped,
+                    early_duplicates.as_deref(),
+                    &mut collected.spilled_runs,
+                );
             }
             drop(item);
         }
@@ -2279,11 +2463,12 @@ pub(super) fn count_record_fields(record: &[u8], delimiter: u8) -> Result<usize,
 
 /// Deduplicate one or more already-sorted in-memory arenas (ascending by `(key, ordinal)`)
 /// keeping only the lowest-ordinal occurrence of each key, restore original source order
-/// via compact `(ordinal, run_index, entry_index)` triples (zero record-byte copying), and
-/// stream directly through `VerifiedOutputWriter` with zero temporary spill files.
+/// (in-place inside `arena.entries` for a single arena with zero extra allocation, or via
+/// budgeted `(ordinal, run_index, entry_index)` triples across multiple arenas), and stream
+/// directly through `VerifiedOutputWriter` with zero temporary spill files.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn deduplicate_in_memory_runs_to_output(
-    runs: &[InMemoryRun],
+    runs: &mut [InMemoryRun],
     delimiter: u8,
     duplicate_rows_counter: &AtomicU64,
     retained_rows_counter: &AtomicU64,
@@ -2295,33 +2480,75 @@ pub(super) fn deduplicate_in_memory_runs_to_output(
     shared: &SharedState,
     output_index: Option<&mut StructuralIndex>,
 ) -> Result<Option<(u64, u64, usize, SortVerification)>, QuarryError> {
-    let total_entries: usize = runs.iter().map(|run| run.arena.len()).sum();
-    let mut survivors: Vec<(u64, usize, usize)> = Vec::with_capacity(total_entries);
     let mut expected_records = RecordMultisetFingerprint::default();
     let mut duplicates = 0_u64;
     let mut retained = 0_u64;
     let mut retained_max_width = 0_usize;
 
     if runs.len() == 1 {
-        let arena = &runs[0].arena;
-        let mut prev_idx: Option<usize> = None;
-        for idx in 0..arena.len() {
-            if (idx & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
+        let arena = &mut runs[0].arena;
+        let mut write_idx = 0_usize;
+        let mut prev_key: Option<(usize, usize)> = None;
+        for read_idx in 0..arena.entries.len() {
+            if (read_idx & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            let key = arena.key_at(idx);
-            if prev_idx.is_some_and(|prev| arena.key_at(prev) == key) {
+            let entry = arena.entries[read_idx];
+            let key = &arena.bytes[entry.key_offset..entry.key_offset + entry.key_len];
+            if prev_key.is_some_and(|(off, len)| &arena.bytes[off..off + len] == key) {
                 duplicates = duplicates.saturating_add(1);
             } else {
-                prev_idx = Some(idx);
-                let rec = arena.record_at(idx);
+                prev_key = Some((entry.key_offset, entry.key_len));
+                let rec = &arena.bytes[entry.record_offset..entry.record_offset + entry.record_len];
                 expected_records.observe(rec);
                 retained_max_width = retained_max_width.max(count_record_fields(rec, delimiter)?);
-                survivors.push((arena.ordinal_at(idx), 0, idx));
+                arena.entries[write_idx] = entry;
+                write_idx += 1;
                 retained = retained.saturating_add(1);
             }
         }
-    } else if runs.len() > 1 {
+        arena.entries.truncate(write_idx);
+        arena.sorted = false;
+
+        duplicate_rows_counter.fetch_add(duplicates, Ordering::AcqRel);
+        retained_rows_counter.fetch_add(retained, Ordering::AcqRel);
+
+        arena.entries.sort_unstable_by_key(|entry| entry.ordinal);
+
+        let mut writer = VerifiedOutputWriter::new(
+            output,
+            preferred_ending,
+            expected_records,
+            max_record_bytes,
+            prior_bytes_written,
+            first_record_prefix_bytes,
+            shared,
+            output_index,
+        );
+        for (idx, entry) in arena.entries.iter().enumerate() {
+            if (idx & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let key_bytes = entry.ordinal.to_be_bytes();
+            writer.flush_previous_before(&key_bytes, entry.ordinal)?;
+            let record =
+                arena.bytes[entry.record_offset..entry.record_offset + entry.record_len].to_vec();
+            writer.set_pending(key_bytes.to_vec(), record, entry.ordinal);
+        }
+
+        let (rows_written, bytes_written, verification) = writer.finish()?;
+        return Ok(Some((
+            rows_written,
+            bytes_written,
+            retained_max_width,
+            verification,
+        )));
+    }
+
+    let total_entries: usize = runs.iter().map(|run| run.arena.len()).sum();
+    let mut survivors: Vec<(u64, usize, usize)> = Vec::with_capacity(total_entries);
+
+    if runs.len() > 1 {
         struct DedupHeapItem<'a> {
             run_index: usize,
             entry_index: usize,

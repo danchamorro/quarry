@@ -604,7 +604,39 @@ fn run_duplicates_inner(
         return Ok(None);
     }
 
-    let in_memory_fast_path = scan.runs.is_empty();
+    let mut survivor_guard = None;
+    let mut in_memory_fast_path = scan.runs.is_empty();
+    if in_memory_fast_path && scan.in_memory_runs.len() > 1 {
+        let total_entries: usize = scan.in_memory_runs.iter().map(|run| run.arena.len()).sum();
+        let survivor_bytes =
+            total_entries.saturating_mul(std::mem::size_of::<(u64, usize, usize)>());
+        if let Some(guard) = job_budget.try_acquire_within_limit(survivor_bytes) {
+            survivor_guard = Some(guard);
+        } else {
+            // The survivor reference vector plus live worker arenas would exceed the job budget;
+            // flush the sorted in-memory arenas to disk and run the bounded spill path instead.
+            job_budget.mark_spilled();
+            for mut item in scan.in_memory_runs.drain(..) {
+                if shared.cancel_requested.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                if let Some((run, dropped)) = item.arena.flush_to_workspace_mode(
+                    SortDirection::Ascending,
+                    true,
+                    workspace,
+                    shared,
+                    0,
+                )? {
+                    if dropped > 0 {
+                        state.duplicate_rows.fetch_add(dropped, Ordering::AcqRel);
+                    }
+                    scan.runs.push(run);
+                }
+                drop(item);
+            }
+            in_memory_fast_path = false;
+        }
+    }
     let mut index = StructuralIndex::new(IndexConfig::default())?;
     let header_width = match scan.header.as_deref() {
         Some(hdr) => parallel::count_record_fields(hdr, delimiter)?,
@@ -621,7 +653,7 @@ fn run_duplicates_inner(
         )?;
         let Some((retained, data_bytes, data_max_width, _)) =
             parallel::deduplicate_in_memory_runs_to_output(
-                &scan.in_memory_runs,
+                &mut scan.in_memory_runs,
                 delimiter,
                 &state.duplicate_rows,
                 &state.retained_rows,
@@ -636,6 +668,7 @@ fn run_duplicates_inner(
         else {
             return Ok(None);
         };
+        drop(survivor_guard);
         drop(scan.in_memory_runs);
         job_budget.release_shared_reservation();
         if state.retained_rows.load(Ordering::Acquire)
@@ -789,8 +822,8 @@ fn retain_first_runs(
             let record = read_record(reader, item.head.record_len, config.max_record_bytes)?;
             retained_max_width =
                 retained_max_width.max(parallel::count_record_fields(&record, delimiter)?);
-            let footprint = parallel::RunArena::entry_footprint(8, record.len());
-            if !arena.is_empty() && arena.tracked_bytes().saturating_add(footprint) > survivor_cap {
+            let planned = arena.planned_capacity_bytes(8, record.len(), Some(survivor_cap));
+            if !arena.is_empty() && planned > survivor_cap {
                 let Some((run, _)) = arena.flush_to_workspace_mode(
                     SortDirection::Ascending,
                     false,
@@ -803,10 +836,15 @@ fn retain_first_runs(
                 };
                 runs.push(run);
             }
+            if arena.is_empty()
+                && arena.planned_capacity_bytes(8, record.len(), Some(survivor_cap)) > survivor_cap
+            {
+                arena.clear_for_reuse(0);
+            }
             records.observe(&record);
             let ordinal_key = item.head.ordinal.to_be_bytes();
             arena.push_bounded(&ordinal_key, &record, item.head.ordinal, Some(survivor_cap));
-            if footprint > survivor_cap {
+            if arena.capacity_bytes() > survivor_cap {
                 let Some((run, _)) = arena.flush_to_workspace_mode(
                     SortDirection::Ascending,
                     false,
@@ -1687,5 +1725,121 @@ mod tests {
                 assert!(!cfg!(target_os = "macos"));
             }
         }
+    }
+
+    #[test]
+    fn run_arena_combined_capacity_stays_within_cap_and_reuses_cleanly() {
+        let cap = 4096_usize;
+        let mut arena = parallel::RunArena::new();
+        for ordinal in 0_u64..1000 {
+            let key = format!("k{ordinal:04}");
+            let rec = format!("k{ordinal:04},v\n");
+            let planned = arena.planned_capacity_bytes(key.len(), rec.len(), Some(cap));
+            if !arena.is_empty() && planned > cap {
+                assert!(arena.capacity_bytes() <= cap);
+                arena.clear_for_reuse(cap);
+                assert!(arena.capacity_bytes() <= cap);
+                continue;
+            }
+            arena.push_bounded(key.as_bytes(), rec.as_bytes(), ordinal, Some(cap));
+            assert!(
+                arena.capacity_bytes() <= cap,
+                "combined arena capacity {} exceeded cap {cap}",
+                arena.capacity_bytes()
+            );
+        }
+        // Single oversized entry is admitted on an empty arena with exact minimum capacity.
+        arena.clear_for_reuse(0);
+        assert_eq!(arena.capacity_bytes(), 0);
+        let big = vec![b'x'; cap + 512];
+        arena.push_bounded(b"k", &big, 0, Some(cap));
+        assert!(arena.capacity_bytes() > big.len());
+        arena.clear_for_reuse(cap);
+        assert_eq!(
+            arena.capacity_bytes(),
+            0,
+            "oversized arena must not be retained past retain_bytes_cap"
+        );
+    }
+
+    #[test]
+    fn parallel_duplicates_spills_when_survivor_vector_exceeds_budget() {
+        // Short unique rows have a high survivor-vector overhead (24 B/row) relative to payload,
+        // so a tight budget that fits the live worker arenas still cannot fit `arenas + survivors`
+        // and must spill cleanly while matching the spacious in-memory output byte-for-byte.
+        let mut raw = String::from("k\n");
+        for i in 0..4_000_u64 {
+            raw.push_str(&format!("{i:04}\n"));
+        }
+        let fixture = Case::new(raw.as_bytes());
+        let session = fixture.session(HeaderMode::FirstRow);
+        let index = session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 256,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let spacious_dest = fixture.directory.join("spacious.csv");
+        let DuplicateOutcome::Complete(spacious) = DuplicateJob::start_with_options_internal(
+            &session,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            spec(&[0], CaseSensitivity::Sensitive),
+            spacious_dest.clone(),
+            SortConfig {
+                run_memory_bytes: 8 * 1024 * 1024,
+                ..tiny_config()
+            },
+            None,
+            Some(index.indexed_rows()),
+            Some(index.clone()),
+            Some(4),
+            1,
+        )
+        .unwrap()
+        .wait()
+        .unwrap() else {
+            panic!("spacious cancelled");
+        };
+        assert!(spacious.in_memory_fast_path);
+
+        // ~4000 rows * (~50 B arena footprint) ~= 200 KiB; survivors alone add 96 KiB.
+        // Choose a budget around 256 KiB where arenas fit (~200-230 KiB) or barely fit,
+        // and adding 96 KiB for `survivors` exceeds the budget so it must spill cleanly.
+        let tight_dest = fixture.directory.join("tight.csv");
+        let DuplicateOutcome::Complete(tight) = DuplicateJob::start_with_options_internal(
+            &session,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            spec(&[0], CaseSensitivity::Sensitive),
+            tight_dest.clone(),
+            SortConfig {
+                run_memory_bytes: 256 * 1024,
+                ..tiny_config()
+            },
+            None,
+            Some(index.indexed_rows()),
+            Some(index),
+            Some(4),
+            1,
+        )
+        .unwrap()
+        .wait()
+        .unwrap() else {
+            panic!("tight cancelled");
+        };
+        assert!(
+            !tight.in_memory_fast_path,
+            "tight budget must spill instead of allocating unbudgeted survivor vector"
+        );
+        assert_eq!(tight.retained_rows, spacious.retained_rows);
+        assert_eq!(tight.duplicate_rows, spacious.duplicate_rows);
+        assert_eq!(
+            fs::read(&tight_dest).unwrap(),
+            fs::read(&spacious_dest).unwrap()
+        );
     }
 }
