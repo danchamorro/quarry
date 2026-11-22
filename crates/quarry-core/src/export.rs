@@ -1,5 +1,7 @@
 #[path = "export_parallel.rs"]
 mod parallel;
+#[path = "replace_parallel.rs"]
+mod replace_parallel;
 
 use crate::ColumnCleanup;
 #[cfg(target_os = "macos")]
@@ -29,8 +31,8 @@ use crate::filter::{
 };
 use crate::storage::{check_storage, output_parent, storage_error};
 use crate::{
-    CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
-    SourceStamp,
+    CaseSensitivity, CompletedIndex, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, IndexConfig,
+    QuarryError, Session, SourceStamp, StructuralIndex,
 };
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -112,11 +114,20 @@ pub struct LiteralReplacement {
     pub case_sensitivity: CaseSensitivity,
 }
 
+/// Execution options for Replace All, including parallel striping over a validated source index.
+#[derive(Debug, Clone, Default)]
+pub struct ReplaceAllOptions<'a> {
+    pub source_index: Option<&'a StructuralIndex>,
+    pub threads: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaceAllSummary {
     pub destination: PathBuf,
+    pub output_index: Option<CompletedIndex>,
     pub bytes_written: u64,
     pub replacements: u64,
+    pub effective_workers: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1041,6 +1052,8 @@ enum SaveWorkerOutcome {
     Complete {
         summary: SaveAsSummary,
         replacements: u64,
+        output_index: Option<CompletedIndex>,
+        effective_workers: usize,
     },
     NoMatch,
     Cancelled,
@@ -1330,6 +1343,7 @@ impl SaveAsJob {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn start_worker(
         source_path: PathBuf,
@@ -1392,6 +1406,39 @@ impl SaveAsJob {
         inserted_rows: Option<RowInsertion>,
         target: SaveTarget,
         config: ExportConfig,
+    ) -> Result<Self, QuarryError> {
+        Self::start_worker_with_options(
+            source_path,
+            file_size,
+            delimiter,
+            has_header,
+            edits,
+            replacement,
+            deleted_rows,
+            inserted_rows,
+            target,
+            config,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_worker_with_options(
+        source_path: PathBuf,
+        file_size: u64,
+        delimiter: u8,
+        has_header: bool,
+        edits: SaveEdits,
+        replacement: Option<LiteralReplacement>,
+        deleted_rows: Vec<RangeInclusive<u64>>,
+        inserted_rows: Option<RowInsertion>,
+        target: SaveTarget,
+        config: ExportConfig,
+        completed_record_count: Option<u64>,
+        source_index: Option<StructuralIndex>,
+        replace_tuning: Option<replace_parallel::ReplaceParallelTuning>,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption("save-as chunk must be non-zero"));
@@ -1490,6 +1537,9 @@ impl SaveAsJob {
                     has_header,
                     &edits,
                     config,
+                    completed_record_count,
+                    source_index.as_ref(),
+                    replace_tuning.as_ref(),
                     &worker_state,
                 );
                 match &result {
@@ -1618,10 +1668,14 @@ impl ReplaceAllJob {
             SaveWorkerOutcome::Complete {
                 summary,
                 replacements,
+                output_index,
+                effective_workers,
             } => Ok(ReplaceAllOutcome::Complete(ReplaceAllSummary {
                 destination: summary.destination,
+                output_index,
                 bytes_written: summary.bytes_written,
                 replacements,
+                effective_workers,
             })),
             SaveWorkerOutcome::NoMatch => Ok(ReplaceAllOutcome::NoMatch),
             SaveWorkerOutcome::Cancelled => Ok(ReplaceAllOutcome::Cancelled),
@@ -1653,6 +1707,7 @@ impl CleanupJob {
             SaveWorkerOutcome::Complete {
                 summary,
                 replacements,
+                ..
             } => Ok(CleanupOutcome::Complete(CleanupSummary {
                 destination: summary.destination,
                 bytes_written: summary.bytes_written,
@@ -1969,7 +2024,36 @@ impl Session {
         replacement: LiteralReplacement,
         destination: impl AsRef<Path>,
     ) -> Result<ReplaceAllJob, QuarryError> {
-        let inner = SaveAsJob::start_worker(
+        self.start_create_replaced_working_copy_with_options(
+            header_renames,
+            cell_edits,
+            replacement,
+            destination,
+            ReplaceAllOptions::default(),
+        )
+    }
+
+    /// Replace all literal matches across data cells, optionally parallelizing across a
+    /// validated `StructuralIndex` and emitting a `CompletedIndex` for the output file.
+    pub fn start_create_replaced_working_copy_with_options(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        replacement: LiteralReplacement,
+        destination: impl AsRef<Path>,
+        options: ReplaceAllOptions<'_>,
+    ) -> Result<ReplaceAllJob, QuarryError> {
+        let requested_workers = crate::pool::resolve_worker_count(options.threads)?;
+        let completed_records = self.completed_record_count();
+        let validated_index = options
+            .source_index
+            .filter(|index| {
+                index.matches_provenance(&self.source_stamp, self.dialect.delimiter, self.encoding)
+                    && index.indexed_bytes() == self.file_size
+                    && completed_records == Some(index.indexed_rows())
+            })
+            .cloned();
+        let inner = SaveAsJob::start_worker_with_options(
             self.path.clone(),
             self.file_size,
             self.dialect.delimiter,
@@ -1980,11 +2064,18 @@ impl Session {
                 transformation: None,
             },
             Some(replacement),
+            Vec::new(),
+            None,
             SaveTarget::WorkingCopy(
                 destination.as_ref().to_path_buf(),
                 self.source_stamp.clone(),
             ),
             self.export_config(),
+            completed_records,
+            validated_index,
+            Some(replace_parallel::ReplaceParallelTuning::for_production(
+                requested_workers,
+            )),
         )?;
         Ok(ReplaceAllJob { inner })
     }
@@ -3291,8 +3382,11 @@ fn run_export(
 struct SaveCopySummary {
     bytes_written: u64,
     replacements: u64,
+    output_index: Option<StructuralIndex>,
+    effective_workers: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_save_as(
     mut source: File,
     mut output: ExportTarget,
@@ -3300,7 +3394,10 @@ fn run_save_as(
     has_header: bool,
     edits: &PreparedSaveEdits,
     config: ExportConfig,
-    shared: &SharedState,
+    completed_record_count: Option<u64>,
+    source_index: Option<&StructuralIndex>,
+    replace_tuning: Option<&replace_parallel::ReplaceParallelTuning>,
+    shared: &Arc<SharedState>,
 ) -> Result<SaveWorkerOutcome, QuarryError> {
     if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(SaveWorkerOutcome::Cancelled);
@@ -3309,22 +3406,26 @@ fn run_save_as(
         || edits.replacement.is_some()
         || edits.inserted_rows.is_some()
     {
-        shared.preparing.store(true, Ordering::Release);
-        let Some(records) = crate::storage::count_records_encoded(
-            &mut source,
-            delimiter,
-            config.source_encoding,
-            &shared.cancel_requested,
-            |bytes| {
-                shared
-                    .preparation_bytes_scanned
-                    .store(bytes, Ordering::Release);
-            },
-        )?
-        else {
-            return Ok(SaveWorkerOutcome::Cancelled);
-        };
-        records
+        if let Some(records) = completed_record_count {
+            records
+        } else {
+            shared.preparing.store(true, Ordering::Release);
+            let Some(records) = crate::storage::count_records_encoded(
+                &mut source,
+                delimiter,
+                config.source_encoding,
+                &shared.cancel_requested,
+                |bytes| {
+                    shared
+                        .preparation_bytes_scanned
+                        .store(bytes, Ordering::Release);
+                },
+            )?
+            else {
+                return Ok(SaveWorkerOutcome::Cancelled);
+            };
+            records
+        }
     } else {
         0
     };
@@ -3380,7 +3481,38 @@ fn run_save_as(
         .store(required, Ordering::Release);
     shared.preparing.store(false, Ordering::Release);
     let source_had_bom = source_starts_with_bom(&mut source, config.source_encoding)?;
-    let copied = if config.source_encoding != crate::Encoding::Utf8
+    let use_parallel_replace = edits.replacement.is_some()
+        && edits.transformation.is_none()
+        && edits.deleted_rows.is_empty()
+        && edits.inserted_rows.is_none()
+        && config.source_encoding == crate::Encoding::Utf8
+        && config.output_encoding == crate::Encoding::Utf8
+        && source_index
+            .zip(replace_tuning)
+            .is_some_and(|(idx, tuning)| {
+                replace_parallel::can_run_parallel_replace(idx, shared.total_bytes, tuning)
+            });
+    let copied = if use_parallel_replace {
+        replace_parallel::copy_with_replaced_records_parallel(
+            source,
+            &mut output,
+            delimiter,
+            has_header,
+            edits,
+            config,
+            source_index.expect("checked above"),
+            replace_tuning.expect("checked above"),
+            shared,
+        )
+        .map(|opt| {
+            opt.map(|res| SaveCopySummary {
+                bytes_written: res.bytes_written,
+                replacements: res.replacements,
+                output_index: Some(res.output_index),
+                effective_workers: res.effective_workers,
+            })
+        })
+    } else if config.source_encoding != crate::Encoding::Utf8
         || config.output_encoding != crate::Encoding::Utf8
     {
         copy_encoded_records(
@@ -3421,6 +3553,8 @@ fn run_save_as(
             result.map(|bytes_written| SaveCopySummary {
                 bytes_written,
                 replacements: 0,
+                output_index: None,
+                effective_workers: 1,
             })
         })
     } else {
@@ -3458,17 +3592,40 @@ fn run_save_as(
                     .bytes_written
                     .store(summary.bytes_written, Ordering::Release);
             }
-            match output.publish(
-                summary.replacements,
-                summary.bytes_written,
-                &shared.cancel_requested,
-            )? {
+            let (outcome, output_stamp) = if summary.output_index.is_some() {
+                output.publish_with_stamp(
+                    summary.replacements,
+                    summary.bytes_written,
+                    &shared.cancel_requested,
+                )?
+            } else {
+                (
+                    output.publish(
+                        summary.replacements,
+                        summary.bytes_written,
+                        &shared.cancel_requested,
+                    )?,
+                    None,
+                )
+            };
+            match outcome {
                 FilterExportOutcome::Complete(published) => Ok(SaveWorkerOutcome::Complete {
                     summary: SaveAsSummary {
                         destination: published.destination,
                         bytes_written: published.bytes_written,
                     },
                     replacements: published.rows_written,
+                    output_index: summary.output_index.zip(output_stamp).and_then(
+                        |(index, stamp)| {
+                            CompletedIndex::from_output(
+                                index,
+                                stamp,
+                                delimiter,
+                                config.output_encoding,
+                            )
+                        },
+                    ),
+                    effective_workers: summary.effective_workers,
                 }),
                 FilterExportOutcome::Cancelled => Ok(SaveWorkerOutcome::Cancelled),
             }
@@ -3487,6 +3644,7 @@ fn run_save_as(
 struct EncodedSaveState<'a> {
     output: &'a mut ExportTarget,
     edits: &'a PreparedSaveEdits,
+    replacement_matcher: Option<&'a ByteMatcher<'a>>,
     config: ExportConfig,
     shared: &'a SharedState,
     delimiter: u8,
@@ -3499,6 +3657,8 @@ struct EncodedSaveState<'a> {
     last_trailing_cr: bool,
     last_record_bytes: u64,
     replacements: u64,
+    output_index: Option<StructuralIndex>,
+    maximum_width: usize,
 }
 
 impl EncodedSaveState<'_> {
@@ -3611,6 +3771,7 @@ impl EncodedSaveState<'_> {
             self.delimiter,
             self.has_header,
             self.edits,
+            self.replacement_matcher,
             self.config.max_record_bytes,
         )?;
         if guard_first {
@@ -3623,6 +3784,14 @@ impl EncodedSaveState<'_> {
             });
         }
         self.replacements = self.replacements.saturating_add(written.replacements);
+        if let Some(index) = &mut self.output_index {
+            index.record_boundary(self.output.bytes_written());
+            let mut width_scanner =
+                quarry_delimited::StructuralScanner::<true>::new(self.delimiter)?;
+            width_scanner.scan_chunk(record, 0, |_| {})?;
+            width_scanner.finish(record.len() as u64, |_| {})?;
+            self.maximum_width = self.maximum_width.max(width_scanner.maximum_width());
+        }
         self.last_record_bytes = actual;
         self.last_terminated = record.ends_with(b"\n");
         self.last_trailing_cr = record.ends_with(b"\r");
@@ -3704,9 +3873,19 @@ fn copy_encoded_records(
 ) -> Result<Option<SaveCopySummary>, QuarryError> {
     let source_had_bom = source_starts_with_bom(source, config.source_encoding)?;
     let mut scanner = crate::encoding::RecordScanner::new(delimiter, config.source_encoding)?;
+    let replacement_matcher = edits
+        .replacement
+        .as_ref()
+        .map(|r| ByteMatcher::new(&r.needle, r.case_sensitivity));
+    let output_index = if edits.replacement.is_some() {
+        Some(StructuralIndex::new(IndexConfig::default())?)
+    } else {
+        None
+    };
     let mut state = EncodedSaveState {
         output,
         edits,
+        replacement_matcher: replacement_matcher.as_ref(),
         config,
         shared,
         delimiter,
@@ -3719,6 +3898,8 @@ fn copy_encoded_records(
         last_trailing_cr: false,
         last_record_bytes: 0,
         replacements: 0,
+        output_index,
+        maximum_width: 0,
     };
     let mut chunk = vec![0; config.source_encoding.chunk_size(config.chunk_bytes)];
     let mut record = Vec::new();
@@ -3742,9 +3923,16 @@ fn copy_encoded_records(
             if cancelled || !state.finish()? {
                 return Ok(None);
             }
+            let bytes_written = state.output.bytes_written();
+            let output_index = state.output_index.map(|mut index| {
+                index.finish_output(bytes_written, state.maximum_width);
+                index
+            });
             return Ok(Some(SaveCopySummary {
-                bytes_written: state.output.bytes_written(),
+                bytes_written,
                 replacements: state.replacements,
+                output_index,
+                effective_workers: 1,
             }));
         }
         let mut start = 0;
@@ -4175,6 +4363,7 @@ fn copy_with_inserted_rows(
                         delimiter,
                         has_header,
                         edits,
+                        None,
                         config.max_record_bytes,
                     )?;
                     record_output_bytes = written.bytes_written;
@@ -4308,6 +4497,8 @@ fn copy_with_inserted_rows(
     Ok(Some(SaveCopySummary {
         bytes_written,
         replacements: 0,
+        output_index: None,
+        effective_workers: 1,
     }))
 }
 
@@ -4320,7 +4511,16 @@ fn copy_with_rewritten_records(
     config: ExportConfig,
     shared: &SharedState,
 ) -> Result<Option<SaveCopySummary>, QuarryError> {
-    let mut scanner = RecordScanner::new(delimiter)?;
+    let mut scanner = quarry_delimited::StructuralScanner::<true>::new(delimiter)?;
+    let replacement_matcher = edits
+        .replacement
+        .as_ref()
+        .map(|r| ByteMatcher::new(&r.needle, r.case_sensitivity));
+    let mut output_index = if edits.replacement.is_some() {
+        Some(StructuralIndex::new(IndexConfig::default())?)
+    } else {
+        None
+    };
     let mut chunk = vec![0; config.chunk_bytes];
     let mut record = Vec::new();
     let mut absolute_start = 0_u64;
@@ -4369,6 +4569,7 @@ fn copy_with_rewritten_records(
                         delimiter,
                         has_header,
                         edits,
+                        replacement_matcher.as_ref(),
                         config.max_record_bytes,
                     ) {
                         Ok(written) => match output.finish_first_record_bom_guard() {
@@ -4377,6 +4578,9 @@ fn copy_with_rewritten_records(
                                     .saturating_add(marker_bytes)
                                     .saturating_add(written.bytes_written);
                                 replacements = replacements.saturating_add(written.replacements);
+                                if let Some(index) = &mut output_index {
+                                    index.record_boundary(bytes_written);
+                                }
                             }
                             Err(error) => deferred_error = Some(error),
                         },
@@ -4399,7 +4603,10 @@ fn copy_with_rewritten_records(
                     );
                     match output.finish_first_record_bom_guard() {
                         Ok(marker_bytes) => {
-                            bytes_written = bytes_written.saturating_add(marker_bytes)
+                            bytes_written = bytes_written.saturating_add(marker_bytes);
+                            if let Some(index) = &mut output_index {
+                                index.record_boundary(bytes_written);
+                            }
                         }
                         Err(error) => deferred_error = Some(error),
                     }
@@ -4429,9 +4636,15 @@ fn copy_with_rewritten_records(
             {
                 return Err(QuarryError::InvalidOption("deleted row is out of range"));
             }
+            let output_index = output_index.map(|mut index| {
+                index.finish_output(bytes_written, scanner.maximum_width());
+                index
+            });
             return Ok(Some(SaveCopySummary {
                 bytes_written,
                 replacements,
+                output_index,
+                effective_workers: 1,
             }));
         }
 
@@ -4450,7 +4663,13 @@ fn copy_with_rewritten_records(
                         || row_number == 0 && !edits.headers.is_empty()
                         || has_cell_edits
                     {
-                        record.extend_from_slice(&chunk[segment_start..local_end]);
+                        let slice = &chunk[segment_start..local_end];
+                        let rec: &[u8] = if record.is_empty() {
+                            slice
+                        } else {
+                            record.extend_from_slice(slice);
+                            &record
+                        };
                         begin_first_retained_record_bom_guard(
                             output,
                             &mut first_retained_record_pending,
@@ -4458,11 +4677,12 @@ fn copy_with_rewritten_records(
                         );
                         match write_saved_record(
                             output,
-                            &record,
+                            rec,
                             row_number,
                             delimiter,
                             has_header,
                             edits,
+                            replacement_matcher.as_ref(),
                             config.max_record_bytes,
                         ) {
                             Ok(written) => match output.finish_first_record_bom_guard() {
@@ -4472,6 +4692,9 @@ fn copy_with_rewritten_records(
                                         .saturating_add(written.bytes_written);
                                     replacements =
                                         replacements.saturating_add(written.replacements);
+                                    if let Some(index) = &mut output_index {
+                                        index.record_boundary(bytes_written);
+                                    }
                                 }
                                 Err(error) => deferred_error = Some(error),
                             },
@@ -4491,7 +4714,10 @@ fn copy_with_rewritten_records(
                             Ok(marker_bytes) => {
                                 bytes_written = bytes_written
                                     .saturating_add(raw.len() as u64)
-                                    .saturating_add(marker_bytes)
+                                    .saturating_add(marker_bytes);
+                                if let Some(index) = &mut output_index {
+                                    index.record_boundary(bytes_written);
+                                }
                             }
                             Err(error) => deferred_error = Some(error),
                         }
@@ -4507,7 +4733,9 @@ fn copy_with_rewritten_records(
                     }
                 }
             }
-            record.clear();
+            if !record.is_empty() {
+                record.clear();
+            }
             row_number += 1;
             segment_start = local_end;
         });
@@ -4586,6 +4814,7 @@ fn begin_first_retained_record_bom_guard(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_saved_record(
     output: &mut ExportTarget,
     record: &[u8],
@@ -4593,6 +4822,7 @@ fn write_saved_record(
     delimiter: u8,
     has_header: bool,
     edits: &PreparedSaveEdits,
+    replacement_matcher: Option<&ByteMatcher<'_>>,
     max_record_bytes: usize,
 ) -> Result<SaveCopySummary, QuarryError> {
     if record.len() > max_record_bytes {
@@ -4617,6 +4847,8 @@ fn write_saved_record(
             return Ok(SaveCopySummary {
                 bytes_written,
                 replacements: 0,
+                output_index: None,
+                effective_workers: 1,
             });
         }
         return write_cleaned_data_record(
@@ -4643,6 +4875,8 @@ fn write_saved_record(
         .map(|bytes_written| SaveCopySummary {
             bytes_written,
             replacements: 0,
+            output_index: None,
+            effective_workers: 1,
         });
     }
     if let Some(replacement) = &edits.replacement {
@@ -4656,8 +4890,11 @@ fn write_saved_record(
             return Ok(SaveCopySummary {
                 bytes_written,
                 replacements: 0,
+                output_index: None,
+                effective_workers: 1,
             });
         }
+        let matcher = replacement_matcher.expect("replacement matcher prepared");
         return write_replaced_data_record(
             output,
             record,
@@ -4665,6 +4902,7 @@ fn write_saved_record(
             delimiter,
             &edits.cells,
             replacement,
+            matcher,
             max_record_bytes,
         );
     }
@@ -4673,6 +4911,8 @@ fn write_saved_record(
             .map(|bytes_written| SaveCopySummary {
                 bytes_written,
                 replacements: 0,
+                output_index: None,
+                effective_workers: 1,
             });
     }
     let has_cell_edits = edits
@@ -4692,12 +4932,16 @@ fn write_saved_record(
         .map(|bytes_written| SaveCopySummary {
             bytes_written,
             replacements: 0,
+            output_index: None,
+            effective_workers: 1,
         });
     }
     output.write_all(record)?;
     Ok(SaveCopySummary {
         bytes_written: record.len() as u64,
         replacements: 0,
+        output_index: None,
+        effective_workers: 1,
     })
 }
 
@@ -4749,6 +4993,8 @@ fn write_cleaned_data_record(
         return Ok(SaveCopySummary {
             bytes_written: original.len() as u64,
             replacements: 0,
+            output_index: None,
+            effective_workers: 1,
         });
     }
     let bytes_written = write_serialized_fields(
@@ -4763,9 +5009,12 @@ fn write_cleaned_data_record(
     Ok(SaveCopySummary {
         bytes_written,
         replacements: changes,
+        output_index: None,
+        effective_workers: 1,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_replaced_data_record(
     output: &mut ExportTarget,
     record: &[u8],
@@ -4773,6 +5022,7 @@ fn write_replaced_data_record(
     delimiter: u8,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     replacement: &LiteralReplacement,
+    matcher: &ByteMatcher,
     max_record_bytes: usize,
 ) -> Result<SaveCopySummary, QuarryError> {
     if record.len() > max_record_bytes {
@@ -4788,6 +5038,17 @@ fn write_replaced_data_record(
     } else {
         (&[][..], record)
     };
+    let row_edits = cell_edits.range((row_number, 0)..=(row_number, usize::MAX));
+    let has_cell_edits = row_edits.clone().next().is_some();
+    if !has_cell_edits && !replacement.needle.contains(&b'"') && matcher.find(record).is_none() {
+        output.write_all(original)?;
+        return Ok(SaveCopySummary {
+            bytes_written: original.len() as u64,
+            replacements: 0,
+            output_index: None,
+            effective_workers: 1,
+        });
+    }
     let ending = if record.ends_with(b"\r\n") {
         b"\r\n".as_slice()
     } else if record.ends_with(b"\n") {
@@ -4796,7 +5057,6 @@ fn write_replaced_data_record(
         b"".as_slice()
     };
     let fields = parse_record(record, delimiter)?;
-    let row_edits = cell_edits.range((row_number, 0)..=(row_number, usize::MAX));
     if row_edits
         .clone()
         .next_back()
@@ -4806,7 +5066,6 @@ fn write_replaced_data_record(
             "cell edit column is out of range",
         ));
     }
-    let has_cell_edits = row_edits.clone().next().is_some();
     let mut replacements = 0_u64;
     let mut decoded_bytes = 0_usize;
     let mut replaced_fields = Vec::with_capacity(fields.len());
@@ -4814,7 +5073,12 @@ fn write_replaced_data_record(
         let value = cell_edits
             .get(&(row_number, column))
             .map_or_else(|| field.as_ref(), Vec::as_slice);
-        let (value, count) = replace_literal(value, replacement, max_record_bytes)?;
+        let (value, count) = replace_parallel::replace_literal_with_matcher(
+            value,
+            matcher,
+            replacement,
+            max_record_bytes,
+        )?;
         decoded_bytes = decoded_bytes.saturating_add(value.len());
         if decoded_bytes > max_record_bytes {
             return Err(QuarryError::RecordTooLarge {
@@ -4830,6 +5094,8 @@ fn write_replaced_data_record(
         return Ok(SaveCopySummary {
             bytes_written: original.len() as u64,
             replacements: 0,
+            output_index: None,
+            effective_workers: 1,
         });
     }
     let bytes_written = write_serialized_fields(
@@ -4844,43 +5110,9 @@ fn write_replaced_data_record(
     Ok(SaveCopySummary {
         bytes_written,
         replacements,
+        output_index: None,
+        effective_workers: 1,
     })
-}
-
-fn replace_literal(
-    field: &[u8],
-    replacement: &LiteralReplacement,
-    max_record_bytes: usize,
-) -> Result<(Vec<u8>, u64), QuarryError> {
-    let matcher = ByteMatcher::new(&replacement.needle, replacement.case_sensitivity);
-    let mut count = 0_usize;
-    let mut remainder = field;
-    while let Some(position) = matcher.find(remainder) {
-        count = count.saturating_add(1);
-        remainder = &remainder[position + replacement.needle.len()..];
-    }
-    if count == 0 {
-        return Ok((field.to_vec(), 0));
-    }
-    let output_len = field
-        .len()
-        .saturating_sub(replacement.needle.len().saturating_mul(count))
-        .saturating_add(replacement.replacement.len().saturating_mul(count));
-    if output_len > max_record_bytes {
-        return Err(QuarryError::RecordTooLarge {
-            limit: max_record_bytes,
-        });
-    }
-
-    let mut output = Vec::with_capacity(output_len);
-    let mut remainder = field;
-    while let Some(position) = matcher.find(remainder) {
-        output.extend_from_slice(&remainder[..position]);
-        output.extend_from_slice(&replacement.replacement);
-        remainder = &remainder[position + replacement.needle.len()..];
-    }
-    output.extend_from_slice(remainder);
-    Ok((output, count as u64))
 }
 
 fn write_transformed_record(
@@ -5557,9 +5789,10 @@ mod tests {
 
     use super::{
         ColumnTransformation, ExportConfig, ExportTarget, FilterExportJob, FilterExportOutcome,
-        LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob, ReplaceAllOutcome,
-        SaveAsJob, SaveAsOutcome, SaveEdits, SaveTarget, SharedState, SplitAnalysisJob,
-        SplitAnalysisOutcome, WorkerCompletion, split_field,
+        LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob, ReplaceAllOptions,
+        ReplaceAllOutcome, SaveAsJob, SaveAsOutcome, SaveEdits, SaveTarget, SharedState,
+        SplitAnalysisJob, SplitAnalysisOutcome, UTF8_BOM, WorkerCompletion, replace_parallel,
+        split_field,
     };
     use crate::{
         CaseSensitivity, FilterOperator, FilterQuery, HeaderMode, IndexConfig, OpenOptions,
@@ -10059,6 +10292,454 @@ mod tests {
             assert_eq!(fs::read(selected.join("joined.csv")).unwrap(), b"unrelated");
             assert_eq!(fs::read_dir(actual_parent).unwrap().count(), 1);
             assert_eq!(fs::read(source).unwrap(), b"id\none\n");
+        }
+    }
+
+    #[test]
+    fn parallel_replace_all_matches_serial_and_emits_exact_index_for_w_1_4_8() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.csv");
+        let mut raw = UTF8_BOM.to_vec();
+        raw.extend_from_slice(b"id,tag,body\r\n");
+        for i in 0..4_000_u64 {
+            let tag = if i % 7 == 0 {
+                "Foo"
+            } else if i % 11 == 0 {
+                "foo"
+            } else {
+                "bar"
+            };
+            let body = if i % 23 == 0 {
+                format!("\"quoted \"\"Foo\"\"\r\nline-{i}\"")
+            } else if i % 19 == 0 {
+                format!("prefix-foo-suffix-{i}")
+            } else {
+                format!("plain-{i}")
+            };
+            let ending = if i == 3_999 { "" } else { "\r\n" };
+            raw.extend_from_slice(format!("{i:05},{tag},{body}{ending}").as_bytes());
+        }
+        fs::write(&source, &raw).unwrap();
+        let session = Session::open(
+            &source,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let index = session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 128,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let header_renames = BTreeMap::from([(0, b"ID".to_vec())]);
+        let cell_edits = BTreeMap::from([
+            ((1, 2), b"edited-Foo-value".to_vec()),
+            ((2500, 1), b"baz".to_vec()),
+        ]);
+
+        for (label, replacement) in [
+            (
+                "sensitive",
+                LiteralReplacement {
+                    needle: b"Foo".to_vec(),
+                    replacement: b"QUX,QUUX".to_vec(),
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+            ),
+            (
+                "insensitive",
+                LiteralReplacement {
+                    needle: b"foo".to_vec(),
+                    replacement: b"X".to_vec(),
+                    case_sensitivity: CaseSensitivity::Insensitive,
+                },
+            ),
+            (
+                "quote-needle",
+                LiteralReplacement {
+                    needle: b"\"Foo\"".to_vec(),
+                    replacement: b"'Replaced'".to_vec(),
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+            ),
+        ] {
+            let mut baseline: Option<(Vec<u8>, u64)> = None;
+            for workers in [1_usize, 4, 8] {
+                let dest = dir.path().join(format!("out-{label}-w{workers}.csv"));
+                let tuning = replace_parallel::ReplaceParallelTuning {
+                    requested_workers: workers,
+                    min_stripe_bytes: 1,
+                    flush_chunk_bytes: 8 * 1024,
+                    reorder_budget_bytes: 64 * 1024,
+                    max_head_in_flight: 2,
+                    delay_stripe_zero: None,
+                };
+                let inner = SaveAsJob::start_worker_with_options(
+                    session.path.clone(),
+                    session.file_size,
+                    session.dialect.delimiter,
+                    session.dialect.has_header,
+                    SaveEdits {
+                        headers: header_renames.clone(),
+                        cells: cell_edits.clone(),
+                        transformation: None,
+                    },
+                    Some(replacement.clone()),
+                    Vec::new(),
+                    None,
+                    SaveTarget::WorkingCopy(dest.clone(), session.source_stamp.clone()),
+                    session.export_config(),
+                    Some(index.indexed_rows()),
+                    Some(index.clone()),
+                    Some(tuning),
+                )
+                .unwrap();
+                let job = ReplaceAllJob { inner };
+                let ReplaceAllOutcome::Complete(summary) = job.wait().unwrap() else {
+                    panic!("{label} w={workers} did not complete");
+                };
+                if workers > 1 {
+                    assert!(summary.effective_workers > 1, "{label} w={workers}");
+                } else {
+                    assert_eq!(summary.effective_workers, 1, "{label} w={workers}");
+                }
+                let output_index = summary
+                    .output_index
+                    .expect("Replace All must emit CompletedIndex");
+                let out_session = Session::open(
+                    &dest,
+                    OpenOptions {
+                        delimiter: Some(b','),
+                        header_mode: HeaderMode::FirstRow,
+                        ..OpenOptions::default()
+                    },
+                )
+                .unwrap();
+                let adopted = out_session
+                    .adopt_completed_index(output_index)
+                    .expect("adopted replace output index");
+                let fresh = out_session
+                    .start_indexing(IndexConfig::default())
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                assert_eq!(adopted.indexed_rows(), fresh.indexed_rows());
+                assert_eq!(adopted.indexed_bytes(), fresh.indexed_bytes());
+                assert_eq!(
+                    adopted.checkpoints(),
+                    fresh.checkpoints(),
+                    "{label} w={workers} output_index mismatch"
+                );
+                let bytes = fs::read(&dest).unwrap();
+                if let Some((ref expected_bytes, expected_count)) = baseline {
+                    assert_eq!(summary.replacements, expected_count, "{label} w={workers}");
+                    assert_eq!(&bytes, expected_bytes, "{label} w={workers} byte mismatch");
+                } else {
+                    baseline = Some((bytes, summary.replacements));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_replace_all_handles_slow_and_expanding_first_stripe_under_tight_reorder_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("expanding.csv");
+        let mut raw = String::from("id,val\n");
+        for i in 0..2_000_u64 {
+            // Every row in the first stripe expands ~20x when `a` -> 20 `X`s.
+            let val = if i < 400 { "aaaaaaaaaa" } else { "bbbbbbbbbb" };
+            raw.push_str(&format!("{i:05},{val}\n"));
+        }
+        fs::write(&source, raw.as_bytes()).unwrap();
+        let session = Session::open(
+            &source,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let index = session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 100,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let replacement = LiteralReplacement {
+            needle: b"a".to_vec(),
+            replacement: vec![b'X'; 20],
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+
+        let serial_dest = dir.path().join("serial.csv");
+        let ReplaceAllOutcome::Complete(serial) = session
+            .start_create_replaced_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                replacement.clone(),
+                &serial_dest,
+                ReplaceAllOptions {
+                    source_index: Some(&index),
+                    threads: Some(1),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("serial did not complete");
+        };
+
+        let parallel_dest = dir.path().join("parallel.csv");
+        let inner = SaveAsJob::start_worker_with_options(
+            session.path.clone(),
+            session.file_size,
+            session.dialect.delimiter,
+            session.dialect.has_header,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            Some(replacement.clone()),
+            Vec::new(),
+            None,
+            SaveTarget::WorkingCopy(parallel_dest.clone(), session.source_stamp.clone()),
+            session.export_config(),
+            Some(index.indexed_rows()),
+            Some(index.clone()),
+            Some(replace_parallel::ReplaceParallelTuning {
+                requested_workers: 4,
+                min_stripe_bytes: 1,
+                flush_chunk_bytes: 4 * 1024,
+                reorder_budget_bytes: 2 * 1024,
+                max_head_in_flight: 2,
+                delay_stripe_zero: Some(Duration::from_millis(40)),
+            }),
+        )
+        .unwrap();
+        let job = ReplaceAllJob { inner };
+        let ReplaceAllOutcome::Complete(parallel_summary) = job.wait().unwrap() else {
+            panic!("parallel did not complete");
+        };
+        assert!(parallel_summary.effective_workers >= 2);
+        assert_eq!(parallel_summary.replacements, serial.replacements);
+        assert_eq!(
+            fs::read(&parallel_dest).unwrap(),
+            fs::read(&serial_dest).unwrap()
+        );
+
+        // Cancel under tight reorder backpressure with delayed stripe 0 must finish cleanly.
+        let cancel_dest = dir.path().join("cancelled.csv");
+        let cancel_inner = SaveAsJob::start_worker_with_options(
+            session.path.clone(),
+            session.file_size,
+            session.dialect.delimiter,
+            session.dialect.has_header,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            Some(replacement),
+            Vec::new(),
+            None,
+            SaveTarget::WorkingCopy(cancel_dest.clone(), session.source_stamp.clone()),
+            session.export_config(),
+            Some(index.indexed_rows()),
+            Some(index),
+            Some(replace_parallel::ReplaceParallelTuning {
+                requested_workers: 4,
+                min_stripe_bytes: 1,
+                flush_chunk_bytes: 1024,
+                reorder_budget_bytes: 1024,
+                max_head_in_flight: 1,
+                delay_stripe_zero: Some(Duration::from_millis(80)),
+            }),
+        )
+        .unwrap();
+        let cancel_job = ReplaceAllJob {
+            inner: cancel_inner,
+        };
+        std::thread::sleep(Duration::from_millis(15));
+        cancel_job.cancel();
+        assert_eq!(cancel_job.wait().unwrap(), ReplaceAllOutcome::Cancelled);
+        assert!(!cancel_dest.exists());
+    }
+
+    #[test]
+    fn parallel_replace_all_no_match_errors_and_foreign_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_a = dir.path().join("a.csv");
+        let file_b = dir.path().join("b.csv");
+        let mut a = String::from("k,v\n");
+        let mut b = String::from("k,v\n");
+        for i in 0..256 {
+            a.push_str(&format!("{i:04},{}\n", "a".repeat(594)));
+            let first = if i == 0 {
+                100
+            } else if i == 255 {
+                300
+            } else {
+                200
+            };
+            b.push_str(&format!(
+                "{i:04},\"{}\n{}\"\n",
+                "b".repeat(first),
+                "c".repeat(391)
+            ));
+        }
+        assert_eq!(a.len(), b.len());
+        fs::write(&file_a, a.as_bytes()).unwrap();
+        fs::write(&file_b, b.as_bytes()).unwrap();
+        let sa = Session::open(
+            &file_a,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let sb = Session::open(
+            &file_b,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let idx_a = sa
+            .start_indexing(IndexConfig {
+                checkpoint_every: 16,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let idx_b = sb
+            .start_indexing(IndexConfig {
+                checkpoint_every: 16,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        // No-match parallel replace must return NoMatch without creating destination.
+        let nomatch_dest = dir.path().join("nomatch.csv");
+        assert_eq!(
+            sb.start_create_replaced_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                LiteralReplacement {
+                    needle: b"NO_SUCH_TOKEN".to_vec(),
+                    replacement: b"X".to_vec(),
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &nomatch_dest,
+                ReplaceAllOptions {
+                    source_index: Some(&idx_b),
+                    threads: Some(4),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap(),
+            ReplaceAllOutcome::NoMatch
+        );
+        assert!(!nomatch_dest.exists());
+
+        // Foreign index with matching size/rows must fall back cleanly to serial.
+        let local_dest = dir.path().join("local.csv");
+        let ReplaceAllOutcome::Complete(local) = sb
+            .start_create_replaced_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                LiteralReplacement {
+                    needle: b"bbb".to_vec(),
+                    replacement: b"ZZZ".to_vec(),
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &local_dest,
+                ReplaceAllOptions {
+                    source_index: Some(&idx_b),
+                    threads: Some(4),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("local replace failed");
+        };
+        assert!(local.effective_workers >= 2);
+
+        let foreign_dest = dir.path().join("foreign.csv");
+        let ReplaceAllOutcome::Complete(foreign) = sb
+            .start_create_replaced_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                LiteralReplacement {
+                    needle: b"bbb".to_vec(),
+                    replacement: b"ZZZ".to_vec(),
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &foreign_dest,
+                ReplaceAllOptions {
+                    source_index: Some(&idx_a),
+                    threads: Some(4),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("foreign replace failed");
+        };
+        assert_eq!(foreign.effective_workers, 1);
+        assert_eq!(foreign.replacements, local.replacements);
+        assert_eq!(
+            fs::read(&foreign_dest).unwrap(),
+            fs::read(&local_dest).unwrap()
+        );
+
+        // Out-of-range cell edit column & row must fail cleanly without publishing.
+        for edits in [
+            BTreeMap::from([((10, 5), b"bad-col".to_vec())]),
+            BTreeMap::from([((999, 0), b"bad-row".to_vec())]),
+        ] {
+            let err_dest = dir.path().join("err.csv");
+            let result = sb
+                .start_create_replaced_working_copy_with_options(
+                    BTreeMap::new(),
+                    edits,
+                    LiteralReplacement {
+                        needle: b"bbb".to_vec(),
+                        replacement: b"ZZZ".to_vec(),
+                        case_sensitivity: CaseSensitivity::Sensitive,
+                    },
+                    &err_dest,
+                    ReplaceAllOptions {
+                        source_index: Some(&idx_b),
+                        threads: Some(4),
+                    },
+                )
+                .unwrap()
+                .wait();
+            assert!(matches!(result, Err(QuarryError::InvalidOption(_))));
+            assert!(!err_dest.exists());
         }
     }
 }

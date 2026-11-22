@@ -1150,6 +1150,7 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut replacement = None;
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut threads = None;
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -1175,7 +1176,7 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
                 }
             }
             "--threads" => {
-                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -1206,8 +1207,17 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
+    let source_index_started = Instant::now();
+    let source_index = session
+        .start_indexing_with_options(
+            IndexConfig::default(),
+            threads,
+            IndexCacheConfig::disabled(),
+        )?
+        .wait()?;
+    let source_index_elapsed = source_index_started.elapsed();
     let source_size_before = session.file_size;
-    let job = session.start_create_replaced_working_copy(
+    let job = session.start_create_replaced_working_copy_with_options(
         BTreeMap::new(),
         BTreeMap::new(),
         LiteralReplacement {
@@ -1216,6 +1226,10 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
             case_sensitivity: CaseSensitivity::Sensitive,
         },
         &destination,
+        quarry_core::ReplaceAllOptions {
+            source_index: Some(&source_index),
+            threads,
+        },
     )?;
     let (outcome, progress, cancellation) =
         wait_for_replace_all(job, cancel_after_bytes, Duration::from_millis(1))?;
@@ -1226,7 +1240,7 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
     let replace_peak_rss = peak_rss_bytes();
     let replace_current_rss = current_rss_bytes();
 
-    let (outcome_label, published_bytes, replacements) = match &outcome {
+    let (outcome_label, published_bytes, replacements, effective_workers) = match &outcome {
         ReplaceAllOutcome::Complete(summary) => {
             let output_size = std::fs::metadata(&summary.destination)?.len();
             if summary.bytes_written != progress.bytes_written
@@ -1235,23 +1249,32 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
             {
                 return Err("published output does not match Replace All progress".into());
             }
-            ("complete", Some(output_size), summary.replacements)
+            (
+                "complete",
+                Some(output_size),
+                summary.replacements,
+                summary.effective_workers,
+            )
         }
         ReplaceAllOutcome::NoMatch => {
             if destination.exists() {
                 return Err("no-match Replace All published a destination file".into());
             }
-            ("no match", None, 0)
+            ("no match", None, 0, 1)
         }
         ReplaceAllOutcome::Cancelled => {
             if destination.exists() {
                 return Err("cancelled Replace All published a destination file".into());
             }
-            ("cancelled", None, 0)
+            ("cancelled", None, 0, 1)
         }
     };
 
     println!("Quarry Replace All Save As benchmark\n");
+    println!(
+        "Source indexing time: {:.3} s (before Replace All)",
+        source_index_elapsed.as_secs_f64()
+    );
     println!("Source: {}", session.path().display());
     println!(
         "Source size: {} ({} bytes)",
@@ -1268,6 +1291,7 @@ fn replace_all_save_as_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Replace All cache state: {cache_state}");
+    println!("Effective workers: {effective_workers}");
     println!("Query: {}", render_field(&query));
     println!("Replacement: {}", render_field(&replacement));
     println!("Outcome: {outcome_label}");
@@ -1355,6 +1379,8 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     let mut header_mode = HeaderMode::Auto;
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut threads = None;
+    let mut memory_budget_bytes = None;
     let mut cursor = 0;
     while cursor < args.len() {
         match args[cursor].as_str() {
@@ -1392,7 +1418,14 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
                 }
             }
             "--threads" => {
-                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
+            }
+            "--memory-budget" => {
+                memory_budget_bytes =
+                    Some(value(&args, &mut cursor, "--memory-budget")?.parse::<usize>()?);
+                if memory_budget_bytes == Some(0) {
+                    return Err("--memory-budget must be non-zero".into());
+                }
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -1423,6 +1456,18 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
+    let source_index_started = Instant::now();
+    let source_index = session
+        .start_indexing_with_options(
+            IndexConfig::default(),
+            threads,
+            IndexCacheConfig::disabled(),
+        )?
+        .wait()?;
+    println!(
+        "Source indexing time: {:.3} s (before duplicates)",
+        source_index_started.elapsed().as_secs_f64()
+    );
 
     // Analysis needs a private candidate, which is removed on both success and error.
     let analysis_directory = if destination.is_none() {
@@ -1470,12 +1515,17 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
             human_bytes(space.available_bytes),
             space.available_bytes
         );
-        let job = session.start_find_duplicates_with_temp_directory(
+        let job = session.start_find_duplicates_with_options(
             BTreeMap::new(),
             BTreeMap::new(),
             spec.clone(),
             &output,
-            &temporary_directory,
+            quarry_core::DuplicateOptions {
+                temporary_directory: Some(&temporary_directory),
+                source_index: Some(&source_index),
+                threads,
+                memory_budget_bytes,
+            },
         )?;
         let (outcome, progress, cancellation) = wait_for_duplicates(job, cancel_after_bytes)?;
         let source_size_after = std::fs::metadata(session.path())?.len();
@@ -1562,6 +1612,17 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
         );
         println!("Sorted runs created: {}", progress.runs_created);
         println!("Merge passes: {}", progress.merge_passes);
+        println!("Effective workers: {}", progress.effective_workers);
+        if let DuplicateOutcome::Complete(summary) = &outcome {
+            println!(
+                "In-memory fast path: {}",
+                if summary.in_memory_fast_path {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+        }
         let elapsed = match &outcome {
             DuplicateOutcome::Complete(summary) => summary.elapsed,
             DuplicateOutcome::Cancelled => progress.elapsed,

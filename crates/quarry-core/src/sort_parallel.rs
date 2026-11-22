@@ -12,10 +12,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use quarry_delimited::parse_record;
 
 use super::{
-    MERGE_MEMORY_BUDGET_BYTES, OutputVerifier, PendingOutputEntry, RecordMultisetFingerprint,
-    RunOrder, SharedState, SortConfig, SortDirection, SortPlan, SortVerification, UTF8_BOM,
-    delimited_field_len, effective_merge_fan_in, merge_runs_to_run, record_ending,
-    serialize_fields, write_entry_parts, write_output, write_verified_output_entry,
+    DuplicateSpec, MERGE_MEMORY_BUDGET_BYTES, NUMERIC_KEY_OVERHEAD, OutputVerifier,
+    PendingOutputEntry, RecordMultisetFingerprint, RunOrder, SharedState, SortConfig,
+    SortDirection, SortPlan, SortVerification, UTF8_BOM, delimited_field_len,
+    effective_merge_fan_in, merge_runs_to_run_with_dedup, record_ending, serialize_fields,
+    write_entry_parts, write_output, write_verified_output_entry,
 };
 use crate::Encoding;
 use crate::encoding::RecordScanner;
@@ -35,7 +36,50 @@ const BUDGET_REFILL_QUANTUM: usize = 256 * 1024;
 const MERGE_STREAM_BUFFER_BYTES: usize = 8 * 1024;
 /// Cap steady-state external spill run-generation buffers across all workers so multi-GB
 /// external sorts stay well inside the 256 MiB RSS envelope while still needing <= 2 merge passes.
-const EXTERNAL_SPILL_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+pub(super) const EXTERNAL_SPILL_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone)]
+pub(super) enum AdaptiveRunOrder {
+    MultiSort(Arc<SortPlan>),
+    Duplicates(Arc<DuplicateSpec>),
+}
+
+impl AdaptiveRunOrder {
+    pub(super) fn direction(&self) -> SortDirection {
+        match self {
+            Self::MultiSort(plan) => plan.direction(),
+            Self::Duplicates(_) => SortDirection::Ascending,
+        }
+    }
+
+    pub(super) fn as_run_order(&self) -> RunOrder<'_> {
+        match self {
+            Self::MultiSort(plan) => RunOrder::MultiSort(plan),
+            Self::Duplicates(spec) => RunOrder::Duplicates(spec),
+        }
+    }
+
+    pub(super) fn is_composite_key(&self) -> bool {
+        match self {
+            Self::MultiSort(plan) => plan.keys.len() > 1,
+            Self::Duplicates(spec) => spec.columns.len() > 1,
+        }
+    }
+
+    pub(super) fn key_overhead_bytes(&self) -> usize {
+        match self {
+            Self::MultiSort(plan) => plan
+                .keys
+                .len()
+                .saturating_mul(NUMERIC_KEY_OVERHEAD.saturating_add(2)),
+            Self::Duplicates(spec) => spec.columns.len().saturating_mul(8),
+        }
+    }
+
+    pub(super) fn dedup_on_flush(&self) -> bool {
+        matches!(self, Self::Duplicates(_))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ArenaEntry {
@@ -70,6 +114,10 @@ impl RunArena {
 
     pub(super) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(super) fn tracked_bytes(&self) -> usize {
+        self.tracked_bytes
     }
 
     pub(super) const fn entry_footprint(key_len: usize, record_len: usize) -> usize {
@@ -107,6 +155,20 @@ impl RunArena {
         self.bytes.extend_from_slice(key);
         let record_offset = self.bytes.len();
         self.bytes.extend_from_slice(record);
+        if self.entries.len() == self.entries.capacity() {
+            if let Some(cap) = bytes_cap_hint {
+                let max_entries = (cap / ARENA_ENTRY_BYTES).max(1);
+                let next_cap = self
+                    .entries
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(64)
+                    .min(max_entries.max(self.entries.len().saturating_add(1)));
+                self.entries.reserve_exact(next_cap - self.entries.len());
+            } else {
+                self.entries.reserve(1);
+            }
+        }
         self.entries.push(ArenaEntry {
             key_offset,
             key_len: key.len(),
@@ -169,31 +231,42 @@ impl RunArena {
         self.sorted = false;
     }
 
-    pub(super) fn flush_to_workspace(
+    pub(super) fn flush_to_workspace_mode(
         &mut self,
         direction: SortDirection,
+        dedup: bool,
         workspace: &LazyRunWorkspace,
         shared: &SharedState,
         retain_bytes_cap: usize,
-    ) -> Result<Option<SpillFile>, QuarryError> {
+    ) -> Result<Option<(SpillFile, u64)>, QuarryError> {
         if self.entries.is_empty() {
             return Ok(None);
         }
+        debug_assert!(!dedup || direction == SortDirection::Ascending);
         self.sort(direction);
         let (path, mut writer) = workspace.create_run()?;
+        let mut dropped = 0_u64;
+        let mut prev_key: Option<(usize, usize)> = None;
         for (idx, entry) in self.entries.iter().enumerate() {
             if (idx & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
                 return Ok(None);
             }
             let key = &self.bytes[entry.key_offset..entry.key_offset + entry.key_len];
+            if dedup && prev_key.is_some_and(|(off, len)| &self.bytes[off..off + len] == key) {
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
             let record = &self.bytes[entry.record_offset..entry.record_offset + entry.record_len];
             let bytes = write_entry_parts(&mut writer, key, record, entry.ordinal)?;
             shared.add_temporary_bytes(bytes);
+            if dedup {
+                prev_key = Some((entry.key_offset, entry.key_len));
+            }
         }
         writer.flush()?;
         self.clear_for_reuse(retain_bytes_cap);
         shared.runs_created.fetch_add(1, Ordering::AcqRel);
-        Ok(Some(path))
+        Ok(Some((path, dropped)))
     }
 }
 
@@ -781,11 +854,12 @@ fn evaluate_record<'a>(
     }
     let key = match order {
         RunOrder::Duplicates(spec) => spec.key(value_at, config.max_record_bytes)?,
+        #[cfg(test)]
         RunOrder::Sort(spec) => SortPlan::from(spec).key(value_at, ordinal)?,
         RunOrder::MultiSort(spec) => spec.key(value_at, ordinal)?,
     };
     let effective_record: Cow<'a, [u8]> = if row_edits.is_empty()
-        && !(matches!(order, RunOrder::Sort(_) | RunOrder::MultiSort(_))
+        && !(matches!(order, RunOrder::MultiSort(_))
             && physical_row > 0
             && body.starts_with(UTF8_BOM))
     {
@@ -960,6 +1034,8 @@ pub(super) fn conservative_record_expansion_bound(
 fn spill_collected_arenas(
     collector: &Mutex<ParallelCollector>,
     direction: SortDirection,
+    dedup: bool,
+    early_duplicates: Option<&AtomicU64>,
     workspace: &LazyRunWorkspace,
     shared: &SharedState,
 ) -> Result<bool, QuarryError> {
@@ -972,10 +1048,15 @@ fn spill_collected_arenas(
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(false);
         }
-        if let Some(run) = item
+        if let Some((run, dropped)) = item
             .arena
-            .flush_to_workspace(direction, workspace, shared, 0)?
+            .flush_to_workspace_mode(direction, dedup, workspace, shared, 0)?
         {
+            if dropped > 0
+                && let Some(counter) = early_duplicates
+            {
+                counter.fetch_add(dropped, Ordering::AcqRel);
+            }
             new_runs.push(run);
         }
         drop(item);
@@ -994,7 +1075,7 @@ pub(super) fn create_initial_runs_adaptive(
     has_header: bool,
     header_renames: Arc<BTreeMap<usize, Vec<u8>>>,
     cell_edits: Arc<BTreeMap<(u64, usize), Vec<u8>>>,
-    spec: Arc<SortPlan>,
+    order: AdaptiveRunOrder,
     bom_present: bool,
     config: SortConfig,
     workspace: Arc<LazyRunWorkspace>,
@@ -1004,6 +1085,7 @@ pub(super) fn create_initial_runs_adaptive(
     min_parallel_stripe_bytes: u64,
     job_budget: Arc<JobMemoryBudget>,
     large_record_gate: Arc<LargeRecordGate>,
+    early_duplicates: Option<Arc<AtomicU64>>,
 ) -> Result<AdaptiveScanOutcome, QuarryError> {
     let parallel_eligible = requested_workers > 1
         && matches!(
@@ -1042,7 +1124,7 @@ pub(super) fn create_initial_runs_adaptive(
             has_header,
             header_renames,
             cell_edits,
-            spec,
+            order,
             bom_present,
             config,
             workspace,
@@ -1051,6 +1133,7 @@ pub(super) fn create_initial_runs_adaptive(
             requested_workers,
             job_budget,
             large_record_gate,
+            early_duplicates,
         )
     } else {
         create_initial_runs_serial(
@@ -1059,13 +1142,14 @@ pub(super) fn create_initial_runs_adaptive(
             has_header,
             &header_renames,
             &cell_edits,
-            &spec,
+            &order,
             bom_present,
             config,
             &workspace,
             &shared,
             &job_budget,
             &large_record_gate,
+            early_duplicates.as_deref(),
         )
     }
 }
@@ -1077,13 +1161,14 @@ fn create_initial_runs_serial(
     has_header: bool,
     header_renames: &BTreeMap<usize, Vec<u8>>,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
-    spec: &SortPlan,
+    order: &AdaptiveRunOrder,
     bom_present: bool,
     config: SortConfig,
     workspace: &LazyRunWorkspace,
     shared: &SharedState,
     job_budget: &Arc<JobMemoryBudget>,
     large_record_gate: &Arc<LargeRecordGate>,
+    early_duplicates: Option<&AtomicU64>,
 ) -> Result<AdaptiveScanOutcome, QuarryError> {
     let mut reader = source.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
@@ -1103,7 +1188,28 @@ fn create_initial_runs_serial(
     let mut arena = RunArena::new();
     let mut budget_guard: Option<JobBudgetGuard> = None;
     let mut large_guard: Option<LargeRecordGuard> = None;
-    let direction = spec.direction();
+    let direction = order.direction();
+    let dedup = order.dedup_on_flush();
+    let composite_key = order.is_composite_key();
+    let key_overhead = order.key_overhead_bytes();
+
+    let flush_serial = |arena: &mut RunArena,
+                        runs: &mut Vec<SpillFile>,
+                        retain_bytes_cap: usize|
+     -> Result<bool, QuarryError> {
+        let Some((run, dropped)) =
+            arena.flush_to_workspace_mode(direction, dedup, workspace, shared, retain_bytes_cap)?
+        else {
+            return Ok(false);
+        };
+        if dropped > 0
+            && let Some(counter) = early_duplicates
+        {
+            counter.fetch_add(dropped, Ordering::AcqRel);
+        }
+        runs.push(run);
+        Ok(true)
+    };
 
     let serial_spill_cap = job_budget.limit().clamp(1, EXTERNAL_SPILL_TOTAL_BYTES);
     let mut handle_record = |raw_record: &[u8],
@@ -1118,8 +1224,9 @@ fn create_initial_runs_serial(
             delimiter,
             row_edit_bytes(cell_edits, header_renames, has_header, row_num),
             config.encoding,
-            spec.keys.len() > 1,
-        );
+            composite_key,
+        )
+        .saturating_add(key_overhead);
         if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
             && large_guard.is_none()
         {
@@ -1128,12 +1235,9 @@ fn create_initial_runs_serial(
             } else {
                 if !arena.is_empty() {
                     job_budget.mark_spilled();
-                    let Some(run) =
-                        arena.flush_to_workspace(direction, workspace, shared, serial_spill_cap)?
-                    else {
+                    if !flush_serial(arena, runs, serial_spill_cap)? {
                         return Ok(false);
-                    };
-                    runs.push(run);
+                    }
                     budget_guard.take();
                 }
                 let Some(g) = large_record_gate.acquire(&shared.cancel_requested) else {
@@ -1149,7 +1253,7 @@ fn create_initial_runs_serial(
             has_header,
             header_renames,
             cell_edits,
-            RunOrder::MultiSort(spec),
+            order.as_run_order(),
             bom_present,
             config,
             &shared.cancel_requested,
@@ -1177,16 +1281,9 @@ fn create_initial_runs_serial(
                     } else {
                         if !arena.is_empty() {
                             job_budget.mark_spilled();
-                            let Some(run) = arena.flush_to_workspace(
-                                direction,
-                                workspace,
-                                shared,
-                                serial_spill_cap,
-                            )?
-                            else {
+                            if !flush_serial(arena, runs, serial_spill_cap)? {
                                 return Ok(false);
-                            };
-                            runs.push(run);
+                            }
                             budget_guard.take();
                         }
                         let Some(g) = large_record_gate.acquire(&shared.cancel_requested) else {
@@ -1202,16 +1299,9 @@ fn create_initial_runs_serial(
                         .is_some_and(|g| g.try_reserve_additional(footprint, cap));
                     if !fits {
                         job_budget.mark_spilled();
-                        let Some(run) = arena.flush_to_workspace(
-                            direction,
-                            workspace,
-                            shared,
-                            serial_spill_cap,
-                        )?
-                        else {
+                        if !flush_serial(arena, runs, serial_spill_cap)? {
                             return Ok(false);
-                        };
-                        runs.push(run);
+                        }
                         budget_guard.take();
                     }
                 }
@@ -1235,11 +1325,9 @@ fn create_initial_runs_serial(
                     && (job_budget.is_spilled() || footprint > job_budget.limit())
                 {
                     job_budget.mark_spilled();
-                    let Some(run) = arena.flush_to_workspace(direction, workspace, shared, 0)?
-                    else {
+                    if !flush_serial(arena, runs, 0)? {
                         return Ok(false);
-                    };
-                    runs.push(run);
+                    }
                     budget_guard.take();
                 }
             }
@@ -1354,12 +1442,9 @@ fn create_initial_runs_serial(
             } else {
                 if !arena.is_empty() {
                     job_budget.mark_spilled();
-                    let Some(run) =
-                        arena.flush_to_workspace(direction, workspace, shared, serial_spill_cap)?
-                    else {
+                    if !flush_serial(&mut arena, &mut runs, serial_spill_cap)? {
                         return Ok(AdaptiveScanOutcome::Cancelled);
-                    };
-                    runs.push(run);
+                    }
                     budget_guard.take();
                 }
                 let Some(g) = large_record_gate.acquire(&shared.cancel_requested) else {
@@ -1386,10 +1471,9 @@ fn create_initial_runs_serial(
     let mut in_memory_runs = Vec::new();
     if !arena.is_empty() {
         if !runs.is_empty() || job_budget.is_spilled() {
-            let Some(run) = arena.flush_to_workspace(direction, workspace, shared, 0)? else {
+            if !flush_serial(&mut arena, &mut runs, 0)? {
                 return Ok(AdaptiveScanOutcome::Cancelled);
-            };
-            runs.push(run);
+            }
             budget_guard.take();
         } else {
             arena.sort(direction);
@@ -1420,7 +1504,7 @@ fn create_initial_runs_parallel(
     has_header: bool,
     header_renames: Arc<BTreeMap<usize, Vec<u8>>>,
     cell_edits: Arc<BTreeMap<(u64, usize), Vec<u8>>>,
-    spec: Arc<SortPlan>,
+    order: AdaptiveRunOrder,
     bom_present: bool,
     config: SortConfig,
     workspace: Arc<LazyRunWorkspace>,
@@ -1429,6 +1513,7 @@ fn create_initial_runs_parallel(
     requested_workers: usize,
     job_budget: Arc<JobMemoryBudget>,
     large_record_gate: Arc<LargeRecordGate>,
+    early_duplicates: Option<Arc<AtomicU64>>,
 ) -> Result<AdaptiveScanOutcome, QuarryError> {
     let worker_count = requested_workers.min(stripes.len()).max(1);
     let executor = JobExecutor::new(engine_pool(), JobPriority::Foreground, worker_count)?;
@@ -1448,7 +1533,7 @@ fn create_initial_runs_parallel(
         let source = Arc::clone(&source);
         let header_renames = Arc::clone(&header_renames);
         let cell_edits = Arc::clone(&cell_edits);
-        let spec = Arc::clone(&spec);
+        let order = order.clone();
         let workspace = Arc::clone(&workspace);
         let shared_worker = Arc::clone(&shared);
         let stripes = Arc::clone(&stripes);
@@ -1457,10 +1542,14 @@ fn create_initial_runs_parallel(
         let collector = Arc::clone(&collector);
         let job_budget = Arc::clone(&job_budget);
         let large_record_gate = Arc::clone(&large_record_gate);
+        let early_duplicates = early_duplicates.clone();
 
         let spawned = executor.spawn(&shared.cancel_requested, move || {
             let shared = shared_worker;
-            let direction = spec.direction();
+            let direction = order.direction();
+            let dedup = order.dedup_on_flush();
+            let composite_key = order.is_composite_key();
+            let key_overhead = order.key_overhead_bytes();
             let mut chunk = vec![0_u8; config.encoding.chunk_size(config.chunk_bytes)];
             let mut record = Vec::new();
             let mut arena = RunArena::new();
@@ -1482,8 +1571,9 @@ fn create_initial_runs_parallel(
              -> Result<bool, QuarryError> {
                 job_budget.mark_spilled();
                 if !arena.is_empty() {
-                    let Some(run) = arena.flush_to_workspace(
+                    let Some((run, dropped)) = arena.flush_to_workspace_mode(
                         direction,
+                        dedup,
                         &workspace,
                         &shared,
                         worker_spill_cap,
@@ -1491,10 +1581,22 @@ fn create_initial_runs_parallel(
                     else {
                         return Ok(false);
                     };
+                    if dropped > 0
+                        && let Some(counter) = early_duplicates.as_deref()
+                    {
+                        counter.fetch_add(dropped, Ordering::AcqRel);
+                    }
                     local_runs.push(run);
                     budget_guard.take();
                 }
-                if !spill_collected_arenas(&collector, direction, &workspace, &shared)? {
+                if !spill_collected_arenas(
+                    &collector,
+                    direction,
+                    dedup,
+                    early_duplicates.as_deref(),
+                    &workspace,
+                    &shared,
+                )? {
                     return Ok(false);
                 }
                 Ok(true)
@@ -1551,8 +1653,9 @@ fn create_initial_runs_parallel(
                         delimiter,
                         row_edit_bytes(&cell_edits, &header_renames, has_header, row_num),
                         config.encoding,
-                        spec.keys.len() > 1,
-                    );
+                        composite_key,
+                    )
+                    .saturating_add(key_overhead);
                     if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
                         && large_guard.is_none()
                     {
@@ -1576,7 +1679,7 @@ fn create_initial_runs_parallel(
                         has_header,
                         &header_renames,
                         &cell_edits,
-                        RunOrder::MultiSort(&spec),
+                        order.as_run_order(),
                         bom_present,
                         config,
                         &shared.cancel_requested,
@@ -1633,7 +1736,12 @@ fn create_initial_runs_parallel(
                                     || {
                                         job_budget.mark_spilled();
                                         spill_collected_arenas(
-                                            &collector, direction, &workspace, &shared,
+                                            &collector,
+                                            direction,
+                                            dedup,
+                                            early_duplicates.as_deref(),
+                                            &workspace,
+                                            &shared,
                                         )
                                     },
                                 )?
@@ -1655,16 +1763,27 @@ fn create_initial_runs_parallel(
                             {
                                 job_budget.mark_spilled();
                                 if !arena.is_empty() {
-                                    let Some(run) = arena
-                                        .flush_to_workspace(direction, &workspace, &shared, 0)?
+                                    let Some((run, dropped)) = arena.flush_to_workspace_mode(
+                                        direction, dedup, &workspace, &shared, 0,
+                                    )?
                                     else {
                                         return Ok(false);
                                     };
+                                    if dropped > 0
+                                        && let Some(counter) = early_duplicates.as_deref()
+                                    {
+                                        counter.fetch_add(dropped, Ordering::AcqRel);
+                                    }
                                     local_runs.push(run);
                                     budget_guard.take();
                                 }
                                 if !spill_collected_arenas(
-                                    &collector, direction, &workspace, &shared,
+                                    &collector,
+                                    direction,
+                                    dedup,
+                                    early_duplicates.as_deref(),
+                                    &workspace,
+                                    &shared,
                                 )? {
                                     return Ok(false);
                                 }
@@ -1882,8 +2001,15 @@ fn create_initial_runs_parallel(
             {
                 arena.sort(direction);
                 if job_budget.is_spilled() {
-                    match arena.flush_to_workspace(direction, &workspace, &shared, 0) {
-                        Ok(Some(run)) => local_runs.push(run),
+                    match arena.flush_to_workspace_mode(direction, dedup, &workspace, &shared, 0) {
+                        Ok(Some((run, dropped))) => {
+                            if dropped > 0
+                                && let Some(counter) = early_duplicates.as_deref()
+                            {
+                                counter.fetch_add(dropped, Ordering::AcqRel);
+                            }
+                            local_runs.push(run);
+                        }
                         Ok(None) => {}
                         Err(err) => {
                             collector.lock().unwrap().record_error(
@@ -1898,8 +2024,17 @@ fn create_initial_runs_parallel(
                     let mut guard = collector.lock().unwrap();
                     if job_budget.is_spilled() {
                         drop(guard);
-                        match arena.flush_to_workspace(direction, &workspace, &shared, 0) {
-                            Ok(Some(run)) => local_runs.push(run),
+                        match arena
+                            .flush_to_workspace_mode(direction, dedup, &workspace, &shared, 0)
+                        {
+                            Ok(Some((run, dropped))) => {
+                                if dropped > 0
+                                    && let Some(counter) = early_duplicates.as_deref()
+                                {
+                                    counter.fetch_add(dropped, Ordering::AcqRel);
+                                }
+                                local_runs.push(run);
+                            }
                             Ok(None) => {}
                             Err(err) => {
                                 collector.lock().unwrap().record_error(
@@ -1974,15 +2109,21 @@ fn create_initial_runs_parallel(
 
     // If any spill happened, flush any remaining in-memory arenas so all runs go through external merge.
     if job_budget.is_spilled() || !collected.spilled_runs.is_empty() {
-        let direction = spec.direction();
+        let direction = order.direction();
+        let dedup = order.dedup_on_flush();
         for mut item in collected.completed_arenas.drain(..) {
             if shared.cancel_requested.load(Ordering::Acquire) {
                 return Ok(AdaptiveScanOutcome::Cancelled);
             }
-            if let Some(run) = item
+            if let Some((run, dropped)) = item
                 .arena
-                .flush_to_workspace(direction, &workspace, &shared, 0)?
+                .flush_to_workspace_mode(direction, dedup, &workspace, &shared, 0)?
             {
+                if dropped > 0
+                    && let Some(counter) = early_duplicates.as_deref()
+                {
+                    counter.fetch_add(dropped, Ordering::AcqRel);
+                }
                 collected.spilled_runs.push(run);
             }
             drop(item);
@@ -2122,6 +2263,146 @@ pub(super) fn write_in_memory_runs_to_output(
     Ok(Some(writer.finish()?))
 }
 
+/// Deduplicate one or more already-sorted in-memory arenas (ascending by `(key, ordinal)`)
+/// keeping only the lowest-ordinal occurrence of each key, restore original source order
+/// via compact `(ordinal, run_index, entry_index)` triples (zero record-byte copying), and
+/// stream directly through `VerifiedOutputWriter` with zero temporary spill files.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn deduplicate_in_memory_runs_to_output(
+    runs: &[InMemoryRun],
+    duplicate_rows_counter: &AtomicU64,
+    retained_rows_counter: &AtomicU64,
+    output: &mut ExportTarget,
+    preferred_ending: &[u8],
+    max_record_bytes: usize,
+    prior_bytes_written: u64,
+    first_record_prefix_bytes: u64,
+    shared: &SharedState,
+    output_index: Option<&mut StructuralIndex>,
+) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
+    let total_entries: usize = runs.iter().map(|run| run.arena.len()).sum();
+    let mut survivors: Vec<(u64, usize, usize)> = Vec::with_capacity(total_entries);
+    let mut expected_records = RecordMultisetFingerprint::default();
+    let mut duplicates = 0_u64;
+    let mut retained = 0_u64;
+
+    if runs.len() == 1 {
+        let arena = &runs[0].arena;
+        let mut prev_idx: Option<usize> = None;
+        for idx in 0..arena.len() {
+            if (idx & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let key = arena.key_at(idx);
+            if prev_idx.is_some_and(|prev| arena.key_at(prev) == key) {
+                duplicates = duplicates.saturating_add(1);
+            } else {
+                prev_idx = Some(idx);
+                expected_records.observe(arena.record_at(idx));
+                survivors.push((arena.ordinal_at(idx), 0, idx));
+                retained = retained.saturating_add(1);
+            }
+        }
+    } else if runs.len() > 1 {
+        struct DedupHeapItem<'a> {
+            run_index: usize,
+            entry_index: usize,
+            key: &'a [u8],
+            ordinal: u64,
+        }
+        impl Eq for DedupHeapItem<'_> {}
+        impl PartialEq for DedupHeapItem<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                self.run_index == other.run_index && self.entry_index == other.entry_index
+            }
+        }
+        impl Ord for DedupHeapItem<'_> {
+            fn cmp(&self, other: &Self) -> CmpOrdering {
+                compare_key_ordinal(
+                    self.key,
+                    self.ordinal,
+                    other.key,
+                    other.ordinal,
+                    SortDirection::Ascending,
+                )
+                .reverse()
+                .then_with(|| other.run_index.cmp(&self.run_index))
+            }
+        }
+        impl PartialOrd for DedupHeapItem<'_> {
+            fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut heap = BinaryHeap::with_capacity(runs.len());
+        for (run_index, run) in runs.iter().enumerate() {
+            if !run.arena.is_empty() {
+                heap.push(DedupHeapItem {
+                    run_index,
+                    entry_index: 0,
+                    key: run.arena.key_at(0),
+                    ordinal: run.arena.ordinal_at(0),
+                });
+            }
+        }
+
+        let mut prev: Option<(usize, usize)> = None;
+        let mut step = 0_usize;
+        while let Some(item) = heap.pop() {
+            if (step & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            step = step.saturating_add(1);
+            let arena = &runs[item.run_index].arena;
+            if prev.is_some_and(|(pr, pe)| runs[pr].arena.key_at(pe) == item.key) {
+                duplicates = duplicates.saturating_add(1);
+            } else {
+                prev = Some((item.run_index, item.entry_index));
+                expected_records.observe(arena.record_at(item.entry_index));
+                survivors.push((item.ordinal, item.run_index, item.entry_index));
+                retained = retained.saturating_add(1);
+            }
+            let next_idx = item.entry_index + 1;
+            if next_idx < arena.len() {
+                heap.push(DedupHeapItem {
+                    run_index: item.run_index,
+                    entry_index: next_idx,
+                    key: arena.key_at(next_idx),
+                    ordinal: arena.ordinal_at(next_idx),
+                });
+            }
+        }
+    }
+
+    duplicate_rows_counter.fetch_add(duplicates, Ordering::AcqRel);
+    retained_rows_counter.fetch_add(retained, Ordering::AcqRel);
+
+    survivors.sort_unstable_by_key(|&(ordinal, _, _)| ordinal);
+
+    let mut writer = VerifiedOutputWriter::new(
+        output,
+        preferred_ending,
+        expected_records,
+        max_record_bytes,
+        prior_bytes_written,
+        first_record_prefix_bytes,
+        shared,
+        output_index,
+    );
+    for (idx, (ordinal, run_index, entry_index)) in survivors.into_iter().enumerate() {
+        if (idx & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let key_bytes = ordinal.to_be_bytes();
+        writer.flush_previous_before(&key_bytes, ordinal)?;
+        let record = runs[run_index].arena.record_at(entry_index).to_vec();
+        writer.set_pending(key_bytes.to_vec(), record, ordinal);
+    }
+
+    Ok(Some(writer.finish()?))
+}
+
 /// Compute the safe concurrent merge group count that splits `MERGE_MEMORY_BUDGET_BYTES`
 /// and stays strictly inside `fd_budget_limit`, scaling down to 1 when required.
 pub(super) fn compute_merge_concurrency(
@@ -2167,6 +2448,33 @@ pub(super) fn reduce_runs_parallel(
     requested_workers: usize,
     fd_budget: &Arc<FdBudget>,
 ) -> Result<bool, QuarryError> {
+    reduce_runs_parallel_with_dedup(
+        runs,
+        direction,
+        max_key_bytes,
+        config,
+        workspace,
+        shared,
+        requested_workers,
+        fd_budget,
+        None,
+    )
+}
+
+/// Reduce runs in parallel, optionally eliminating duplicate keys (ascending order) during each
+/// intermediate merge pass and recording dropped duplicates in `dedup_counter`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reduce_runs_parallel_with_dedup(
+    runs: &mut Vec<SpillFile>,
+    direction: SortDirection,
+    max_key_bytes: usize,
+    config: SortConfig,
+    workspace: &Arc<LazyRunWorkspace>,
+    shared: &Arc<SharedState>,
+    requested_workers: usize,
+    fd_budget: &Arc<FdBudget>,
+    dedup_counter: Option<Arc<AtomicU64>>,
+) -> Result<bool, QuarryError> {
     let merge_fan_in = effective_merge_fan_in(config, max_key_bytes);
     while runs.len() > merge_fan_in {
         let mut groups: Vec<Vec<SpillFile>> = Vec::with_capacity(runs.len().div_ceil(merge_fan_in));
@@ -2202,8 +2510,14 @@ pub(super) fn reduce_runs_parallel(
                     return Ok(false);
                 };
                 let (path, writer) = workspace.create_run()?;
-                let merged =
-                    merge_runs_to_run(&group, writer, direction, config.max_record_bytes, shared)?;
+                let merged = merge_runs_to_run_with_dedup(
+                    &group,
+                    writer,
+                    direction,
+                    config.max_record_bytes,
+                    shared,
+                    dedup_counter.as_deref(),
+                )?;
                 drop(fd_guard);
                 if !merged {
                     return Ok(false);
@@ -2246,6 +2560,7 @@ pub(super) fn reduce_runs_parallel(
             let outputs = Arc::clone(&outputs);
             let first_error = Arc::clone(&first_error);
             let stop = Arc::clone(&stop);
+            let dedup_counter = dedup_counter.clone();
 
             let spawned = executor.spawn(&shared.cancel_requested, move || {
                 let _fd_guard = fd_guard;
@@ -2255,12 +2570,13 @@ pub(super) fn reduce_runs_parallel(
                 }
                 let outcome = (|| -> Result<Option<SpillFile>, QuarryError> {
                     let (path, writer) = workspace.create_run()?;
-                    let merged = merge_runs_to_run(
+                    let merged = merge_runs_to_run_with_dedup(
                         &group,
                         writer,
                         direction,
                         config.max_record_bytes,
                         &shared,
+                        dedup_counter.as_deref(),
                     )?;
                     if !merged {
                         return Ok(None);

@@ -1881,7 +1881,7 @@ impl QuarryApp {
             replacement,
             MaterializedWorkingCopy {
                 path: summary.destination,
-                output_index: None,
+                output_index: summary.output_index,
                 undo,
                 selected_columns,
                 notice: format!(
@@ -7242,7 +7242,7 @@ impl Document {
             renames,
         } = self.prepare_materialization()?;
         let selected_columns = columns.iter().copied().collect();
-        let job = match self.session.start_find_duplicates(
+        let job = match self.session.start_find_duplicates_with_options(
             renames,
             self.owned_cell_edits(),
             DuplicateSpec {
@@ -7250,6 +7250,12 @@ impl Document {
                 case_sensitivity,
             },
             &destination,
+            quarry_core::DuplicateOptions {
+                temporary_directory: Some(&self.working_directory),
+                source_index: self.index.as_ref(),
+                threads: None,
+                memory_budget_bytes: None,
+            },
         ) {
             Ok(job) => job,
             Err(error) => {
@@ -7531,16 +7537,22 @@ impl Document {
             destination,
             renames,
         } = self.prepare_materialization()?;
-        let job = match self.session.start_create_replaced_working_copy(
-            renames,
-            self.owned_cell_edits(),
-            LiteralReplacement {
-                needle: query.to_vec(),
-                replacement: replacement.to_vec(),
-                case_sensitivity,
-            },
-            destination.clone(),
-        ) {
+        let job = match self
+            .session
+            .start_create_replaced_working_copy_with_options(
+                renames,
+                self.owned_cell_edits(),
+                LiteralReplacement {
+                    needle: query.to_vec(),
+                    replacement: replacement.to_vec(),
+                    case_sensitivity,
+                },
+                destination.clone(),
+                quarry_core::ReplaceAllOptions {
+                    source_index: self.index.as_ref(),
+                    threads: None,
+                },
+            ) {
             Ok(job) => job,
             Err(QuarryError::SourceChanged) => {
                 self.cleanup_empty_working_copy();
@@ -7883,7 +7895,7 @@ impl Document {
                     let count = summary.replacements;
                     Ok(Some(MaterializedWorkingCopy {
                         path: summary.destination,
-                        output_index: None,
+                        output_index: summary.output_index,
                         undo,
                         selected_columns,
                         notice: format!(
