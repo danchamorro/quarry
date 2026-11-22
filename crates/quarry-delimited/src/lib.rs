@@ -80,6 +80,8 @@ pub type RecordScanner = StructuralScanner<false>;
 #[derive(Debug, Clone)]
 pub struct StructuralScanner<const TRACK_WIDTH: bool> {
     separators: usize,
+    first_record_width: usize,
+    max_width_after_first: usize,
     maximum_width: usize,
     dialect: ScannerDialect,
     backend: SimdBackend,
@@ -147,6 +149,8 @@ impl<const TRACK_WIDTH: bool> StructuralScanner<TRACK_WIDTH> {
         };
         Ok(Self {
             separators: 0,
+            first_record_width: 0,
+            max_width_after_first: 0,
             maximum_width: 0,
             dialect,
             backend,
@@ -203,7 +207,13 @@ impl<const TRACK_WIDTH: bool> StructuralScanner<TRACK_WIDTH> {
 
     fn end_record(&mut self) {
         if TRACK_WIDTH {
-            self.maximum_width = self.maximum_width.max(self.separators.saturating_add(1));
+            let width = self.separators.saturating_add(1);
+            if self.first_record_width == 0 {
+                self.first_record_width = width;
+            } else {
+                self.max_width_after_first = self.max_width_after_first.max(width);
+            }
+            self.maximum_width = self.maximum_width.max(width);
             self.separators = 0;
         }
     }
@@ -625,6 +635,26 @@ impl StructuralScanner<true> {
     /// Widest completed logical record, or zero when no record has ended.
     pub fn maximum_width(&self) -> usize {
         self.maximum_width
+    }
+
+    /// Width of the first completed logical record in this scanner, or zero if none ended.
+    pub fn first_record_width(&self) -> usize {
+        self.first_record_width
+    }
+
+    /// Widest completed logical record after the first completed record, or zero if fewer than two ended.
+    pub fn max_width_after_first(&self) -> usize {
+        self.max_width_after_first
+    }
+
+    /// Unquoted delimiters counted in the currently open record since the last record end.
+    pub fn current_separators(&self) -> usize {
+        self.separators
+    }
+
+    /// Seed the pending delimiter count when resuming a record across chunk boundaries.
+    pub fn set_separators(&mut self, separators: usize) {
+        self.separators = separators;
     }
 }
 
