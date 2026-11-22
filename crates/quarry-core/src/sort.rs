@@ -833,13 +833,14 @@ impl Session {
             Some(bytes) => bytes,
             None => default_single_run_memory_budget_bytes(),
         };
-        // Only trust a caller-supplied index when it matches this session's validated
-        // completed-index record count (bound to source_stamp, delimiter, encoding, and file_size).
+        // Only trust a caller-supplied index when its provenance matches this session's exact
+        // source file stamp, delimiter, encoding, byte length, and completed record count.
         let completed_records = self.completed_record_count();
         let validated_index = options
             .source_index
             .filter(|index| {
-                index.indexed_bytes() == self.file_size
+                index.matches_provenance(&self.source_stamp, self.dialect.delimiter, self.encoding)
+                    && index.indexed_bytes() == self.file_size
                     && completed_records == Some(index.indexed_rows())
             })
             .cloned();
@@ -4935,5 +4936,75 @@ mod tests {
 
         job.release_shared_reservation();
         assert_eq!(shared.used(), 0);
+    }
+
+    #[test]
+    fn foreign_index_with_matching_size_and_rows_falls_back_to_serial_cleanly() {
+        // Two distinct CSVs with identical byte size, row count, delimiter, and encoding,
+        // where file_a's checkpoints fall inside a quoted multiline record of file_b.
+        // Passing file_a's index when sorting file_b must reject the foreign provenance and
+        // fall back cleanly to serial scanning instead of failing with `SourceChanged`.
+        let directory = tempfile::tempdir().unwrap();
+        let file_a = directory.path().join("a.csv");
+        let file_b = directory.path().join("b.csv");
+
+        let a_bytes = b"k,v\n3,aaaaaaaaaa\n2,bbbbbbbbbb\n1,cccccccccc\n";
+        let b_bytes = b"k,v\n3,\"aa\nbbbbbb\"\n2,ccccccccc\n1,dddddddddd\n";
+        assert_eq!(a_bytes.len(), b_bytes.len());
+        fs::write(&file_a, a_bytes).unwrap();
+        fs::write(&file_b, b_bytes).unwrap();
+
+        let sa = session(&file_a, HeaderMode::FirstRow);
+        let sb = session(&file_b, HeaderMode::FirstRow);
+        let idx_a = sa
+            .start_indexing(IndexConfig {
+                checkpoint_every: 1,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let idx_b = sb
+            .start_indexing(IndexConfig {
+                checkpoint_every: 1,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(idx_a.indexed_bytes(), idx_b.indexed_bytes());
+        assert_eq!(idx_a.indexed_rows(), idx_b.indexed_rows());
+        assert!(idx_b.matches_provenance(&sb.source_stamp, sb.dialect.delimiter, sb.encoding));
+        assert!(!idx_a.matches_provenance(&sb.source_stamp, sb.dialect.delimiter, sb.encoding));
+
+        let dest = directory.path().join("sorted_b.csv");
+        let job = sb
+            .start_create_sorted_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SortSpec {
+                    column: 0,
+                    mode: SortMode::Number,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &dest,
+                SortOptions {
+                    temporary_directory: Some(directory.path()),
+                    threads: Some(4),
+                    source_index: Some(&idx_a),
+                    memory_budget_bytes: Some(1024 * 1024),
+                },
+            )
+            .unwrap();
+        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("sort cancelled");
+        };
+        assert_eq!(summary.effective_workers, 1);
+        assert_eq!(summary.rows_sorted, 3);
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"k,v\n1,dddddddddd\n2,ccccccccc\n3,\"aa\nbbbbbb\"\n"
+        );
     }
 }

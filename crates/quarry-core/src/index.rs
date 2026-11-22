@@ -83,6 +83,13 @@ impl Default for IndexTelemetry {
 }
 
 #[derive(Debug, Clone)]
+struct IndexProvenance {
+    source_stamp: Box<SourceStamp>,
+    delimiter: u8,
+    encoding: Encoding,
+}
+
+#[derive(Debug, Clone)]
 pub struct StructuralIndex {
     checkpoints: Vec<Checkpoint>,
     checkpoint_every: u64,
@@ -92,6 +99,7 @@ pub struct StructuralIndex {
     maximum_width: usize,
     indexed_bytes: u64,
     telemetry: IndexTelemetry,
+    provenance: Option<IndexProvenance>,
 }
 
 impl PartialEq for StructuralIndex {
@@ -131,6 +139,7 @@ impl StructuralIndex {
             maximum_width: 0,
             indexed_bytes: 0,
             telemetry: IndexTelemetry::default(),
+            provenance: None,
         })
     }
 
@@ -314,6 +323,32 @@ impl StructuralIndex {
         &self.checkpoints
     }
 
+    pub(crate) fn set_provenance(
+        &mut self,
+        source_stamp: SourceStamp,
+        delimiter: u8,
+        encoding: Encoding,
+    ) {
+        self.provenance = Some(IndexProvenance {
+            source_stamp: Box::new(source_stamp),
+            delimiter,
+            encoding,
+        });
+    }
+
+    pub(crate) fn matches_provenance(
+        &self,
+        source_stamp: &SourceStamp,
+        delimiter: u8,
+        encoding: Encoding,
+    ) -> bool {
+        self.provenance.as_ref().is_some_and(|p| {
+            p.delimiter == delimiter
+                && p.encoding == encoding
+                && p.source_stamp.matches(source_stamp)
+        })
+    }
+
     pub fn nearest_checkpoint(&self, row: u64) -> Checkpoint {
         let position = self
             .checkpoints
@@ -372,7 +407,13 @@ impl Session {
             file_size: completed.index.indexed_bytes,
             records: completed.index.indexed_rows,
         });
-        Ok(*completed.index)
+        let mut index = *completed.index;
+        index.set_provenance(
+            *completed.source_stamp,
+            completed.delimiter,
+            completed.encoding,
+        );
+        Ok(index)
     }
 }
 
@@ -528,6 +569,7 @@ impl IndexJob {
                         {
                             let mut guard = worker_state.index.write().unwrap();
                             *guard = cached;
+                            guard.set_provenance(source_stamp.clone(), delimiter, encoding);
                         }
                         worker_state
                             .bytes_scanned
@@ -561,7 +603,11 @@ impl IndexJob {
                         && worker_state.bytes_scanned.load(Ordering::Acquire)
                             == source_stamp.file_size()
                     {
-                        let snapshot = worker_state.index.read().unwrap().clone();
+                        let snapshot = {
+                            let mut guard = worker_state.index.write().unwrap();
+                            guard.set_provenance(source_stamp.clone(), delimiter, encoding);
+                            guard.clone()
+                        };
                         *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
                             delimiter,
                             encoding,
