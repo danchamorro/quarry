@@ -12,9 +12,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use quarry_delimited::parse_record;
 
 use super::{
-    DuplicateSpec, MERGE_MEMORY_BUDGET_BYTES, NUMERIC_KEY_OVERHEAD, OutputVerifier,
-    PendingOutputEntry, RecordMultisetFingerprint, RunOrder, SharedState, SortConfig,
-    SortDirection, SortPlan, SortVerification, UTF8_BOM, delimited_field_len,
+    ALL_FIELDS_KEY_BYTES, DedupComparator, DuplicateSpec, DuplicateTarget,
+    MERGE_MEMORY_BUDGET_BYTES, NUMERIC_KEY_OVERHEAD, OutputVerifier, PendingOutputEntry,
+    RecordMultisetFingerprint, RunOrder, SharedState, SortConfig, SortDirection, SortMode,
+    SortPlan, SortVerification, UTF8_BOM, delimited_field_len, duplicate::records_equal_all_fields,
     effective_merge_fan_in, merge_runs_to_run_with_dedup, record_ending, serialize_fields,
     write_entry_parts, write_output, write_verified_output_entry,
 };
@@ -59,10 +60,22 @@ impl AdaptiveRunOrder {
         }
     }
 
-    pub(super) fn is_composite_key(&self) -> bool {
+    pub(super) fn key_expansion_multiplier(&self) -> usize {
         match self {
-            Self::MultiSort(plan) => plan.keys.len() > 1,
-            Self::Duplicates(spec) => spec.columns.len() > 1,
+            Self::MultiSort(plan) => {
+                let has_natural = plan.keys.iter().any(|k| k.mode == SortMode::Natural);
+                if plan.keys.len() > 1 {
+                    if has_natural { 3 } else { 2 }
+                } else if has_natural {
+                    2
+                } else {
+                    1
+                }
+            }
+            Self::Duplicates(spec) => match &spec.target {
+                DuplicateTarget::Columns(_) => 1,
+                DuplicateTarget::AllFields => 0,
+            },
         }
     }
 
@@ -71,13 +84,24 @@ impl AdaptiveRunOrder {
             Self::MultiSort(plan) => plan
                 .keys
                 .len()
-                .saturating_mul(NUMERIC_KEY_OVERHEAD.saturating_add(2)),
-            Self::Duplicates(spec) => spec.columns.len().saturating_mul(8),
+                .saturating_mul(NUMERIC_KEY_OVERHEAD.saturating_add(2))
+                .saturating_add(2),
+            Self::Duplicates(spec) => match &spec.target {
+                DuplicateTarget::Columns(columns) => columns.len().saturating_mul(8),
+                DuplicateTarget::AllFields => ALL_FIELDS_KEY_BYTES,
+            },
         }
     }
 
     pub(super) fn dedup_on_flush(&self) -> bool {
         matches!(self, Self::Duplicates(_))
+    }
+
+    pub(super) fn dedup_comparator(&self, delimiter: u8) -> DedupComparator {
+        match self {
+            Self::MultiSort(_) => DedupComparator::KeyOnly,
+            Self::Duplicates(spec) => spec.comparator(delimiter),
+        }
     }
 }
 
@@ -293,6 +317,7 @@ impl RunArena {
         &mut self,
         direction: SortDirection,
         dedup: bool,
+        comparator: DedupComparator,
         workspace: &LazyRunWorkspace,
         shared: &SharedState,
         retain_bytes_cap: usize,
@@ -305,20 +330,55 @@ impl RunArena {
         let (path, mut writer) = workspace.create_run()?;
         let mut dropped = 0_u64;
         let mut prev_key: Option<(usize, usize)> = None;
+        let mut bucket_survivors: Vec<(usize, usize)> = Vec::new();
         for (idx, entry) in self.entries.iter().enumerate() {
             if (idx & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
                 return Ok(None);
             }
             let key = &self.bytes[entry.key_offset..entry.key_offset + entry.key_len];
-            if dedup && prev_key.is_some_and(|(off, len)| &self.bytes[off..off + len] == key) {
-                dropped = dropped.saturating_add(1);
-                continue;
-            }
             let record = &self.bytes[entry.record_offset..entry.record_offset + entry.record_len];
+            let same_key = prev_key.is_some_and(|(off, len)| &self.bytes[off..off + len] == key);
+            if dedup && same_key {
+                match comparator {
+                    DedupComparator::KeyOnly => {
+                        dropped = dropped.saturating_add(1);
+                        continue;
+                    }
+                    DedupComparator::AllFields {
+                        delimiter,
+                        case_sensitivity,
+                    } => {
+                        let mut is_dup = false;
+                        for &(r_off, r_len) in &bucket_survivors {
+                            if records_equal_all_fields(
+                                &self.bytes[r_off..r_off + r_len],
+                                record,
+                                delimiter,
+                                case_sensitivity,
+                            )? {
+                                is_dup = true;
+                                break;
+                            }
+                        }
+                        if is_dup {
+                            dropped = dropped.saturating_add(1);
+                            continue;
+                        }
+                        let bytes = write_entry_parts(&mut writer, key, record, entry.ordinal)?;
+                        shared.add_temporary_bytes(bytes);
+                        bucket_survivors.push((entry.record_offset, entry.record_len));
+                        continue;
+                    }
+                }
+            }
             let bytes = write_entry_parts(&mut writer, key, record, entry.ordinal)?;
             shared.add_temporary_bytes(bytes);
             if dedup {
                 prev_key = Some((entry.key_offset, entry.key_len));
+                if matches!(comparator, DedupComparator::AllFields { .. }) {
+                    bucket_survivors.clear();
+                    bucket_survivors.push((entry.record_offset, entry.record_len));
+                }
             }
         }
         writer.flush()?;
@@ -977,7 +1037,7 @@ fn evaluate_record<'a>(
         }
     }
     let key = match order {
-        RunOrder::Duplicates(spec) => spec.key(value_at, config.max_record_bytes)?,
+        RunOrder::Duplicates(spec) => spec.key(fields.len(), value_at, config.max_record_bytes)?,
         #[cfg(test)]
         RunOrder::Sort(spec) => SortPlan::from(spec).key(value_at, ordinal)?,
         RunOrder::MultiSort(spec) => spec.key(value_at, ordinal)?,
@@ -1107,7 +1167,7 @@ pub(super) fn conservative_record_expansion_bound(
     delimiter: u8,
     edit_bytes: usize,
     encoding: Encoding,
-    composite_key: bool,
+    key_multiplier: usize,
 ) -> usize {
     let raw_len = raw_record.len();
     let decode_multiplier = match encoding {
@@ -1126,7 +1186,6 @@ pub(super) fn conservative_record_expansion_bound(
     } else {
         decoded_bound
     };
-    let key_multiplier = if composite_key { 2 } else { 1 };
     let key_bound = decoded_bound
         .saturating_add(edit_bytes)
         .saturating_mul(key_multiplier);
@@ -1182,6 +1241,7 @@ fn spill_collected_arenas(
     collector: &Mutex<ParallelCollector>,
     direction: SortDirection,
     dedup: bool,
+    comparator: DedupComparator,
     early_duplicates: Option<&AtomicU64>,
     workspace: &LazyRunWorkspace,
     shared: &SharedState,
@@ -1197,7 +1257,7 @@ fn spill_collected_arenas(
         }
         if let Some((run, dropped)) = item
             .arena
-            .flush_to_workspace_mode(direction, dedup, workspace, shared, 0)?
+            .flush_to_workspace_mode(direction, dedup, comparator, workspace, shared, 0)?
         {
             record_flushed_run(run, dropped, early_duplicates, &mut new_runs);
         }
@@ -1332,7 +1392,8 @@ fn create_initial_runs_serial(
     let mut large_guard: Option<LargeRecordGuard> = None;
     let direction = order.direction();
     let dedup = order.dedup_on_flush();
-    let composite_key = order.is_composite_key();
+    let comparator = order.dedup_comparator(delimiter);
+    let key_multiplier = order.key_expansion_multiplier();
     let key_overhead = order.key_overhead_bytes();
 
     let flush_serial = |arena: &mut RunArena,
@@ -1340,8 +1401,14 @@ fn create_initial_runs_serial(
                         budget_guard: &mut Option<JobBudgetGuard>,
                         retain_bytes_cap: usize|
      -> Result<bool, QuarryError> {
-        let Some((run, dropped)) =
-            arena.flush_to_workspace_mode(direction, dedup, workspace, shared, retain_bytes_cap)?
+        let Some((run, dropped)) = arena.flush_to_workspace_mode(
+            direction,
+            dedup,
+            comparator,
+            workspace,
+            shared,
+            retain_bytes_cap,
+        )?
         else {
             return Ok(false);
         };
@@ -1363,7 +1430,7 @@ fn create_initial_runs_serial(
             delimiter,
             row_edit_bytes(cell_edits, header_renames, has_header, row_num),
             config.encoding,
-            composite_key,
+            key_multiplier,
         )
         .saturating_add(key_overhead);
         if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
@@ -1719,6 +1786,8 @@ fn create_initial_runs_parallel(
     let collector = Arc::new(Mutex::new(ParallelCollector::new()));
     let worker_spill_cap =
         (job_budget.limit().min(EXTERNAL_SPILL_TOTAL_BYTES) / actual_workers).max(1);
+    #[cfg(test)]
+    let forced_collision = super::duplicate::collision_test::capture();
 
     for _ in 0..actual_workers {
         let source = Arc::clone(&source);
@@ -1734,12 +1803,17 @@ fn create_initial_runs_parallel(
         let job_budget = Arc::clone(&job_budget);
         let large_record_gate = Arc::clone(&large_record_gate);
         let early_duplicates = early_duplicates.clone();
+        #[cfg(test)]
+        let forced_collision = forced_collision.clone();
 
         let spawned = executor.spawn(&shared.cancel_requested, move || {
+            #[cfg(test)]
+            let _collision_guard = super::duplicate::collision_test::install(forced_collision);
             let shared = shared_worker;
             let direction = order.direction();
             let dedup = order.dedup_on_flush();
-            let composite_key = order.is_composite_key();
+            let comparator = order.dedup_comparator(delimiter);
+            let key_multiplier = order.key_expansion_multiplier();
             let key_overhead = order.key_overhead_bytes();
             let mut chunk = vec![0_u8; config.encoding.chunk_size(config.chunk_bytes)];
             let mut record = Vec::new();
@@ -1766,6 +1840,7 @@ fn create_initial_runs_parallel(
                     let Some((run, dropped)) = arena.flush_to_workspace_mode(
                         direction,
                         dedup,
+                        comparator,
                         &workspace,
                         &shared,
                         retain_bytes_cap,
@@ -1783,6 +1858,7 @@ fn create_initial_runs_parallel(
                     &collector,
                     direction,
                     dedup,
+                    comparator,
                     early_duplicates.as_deref(),
                     &workspace,
                     &shared,
@@ -1843,7 +1919,7 @@ fn create_initial_runs_parallel(
                         delimiter,
                         row_edit_bytes(&cell_edits, &header_renames, has_header, row_num),
                         config.encoding,
-                        composite_key,
+                        key_multiplier,
                     )
                     .saturating_add(key_overhead);
                     if (pre_bound > LARGE_RECORD_GATE_BYTES || pre_bound > job_budget.limit())
@@ -1995,6 +2071,7 @@ fn create_initial_runs_parallel(
                                                     &collector,
                                                     direction,
                                                     dedup,
+                                                    comparator,
                                                     early_duplicates.as_deref(),
                                                     &workspace,
                                                     &shared,
@@ -2247,9 +2324,9 @@ fn create_initial_runs_parallel(
                     |arena: &mut RunArena,
                      budget_guard: &mut Option<JobBudgetGuard>,
                      local_runs: &mut Vec<SpillFile>| {
-                        match arena
-                            .flush_to_workspace_mode(direction, dedup, &workspace, &shared, 0)
-                        {
+                        match arena.flush_to_workspace_mode(
+                            direction, dedup, comparator, &workspace, &shared, 0,
+                        ) {
                             Ok(Some((run, dropped))) => {
                                 record_flushed_run(
                                     run,
@@ -2346,13 +2423,14 @@ fn create_initial_runs_parallel(
     if job_budget.is_spilled() || !collected.spilled_runs.is_empty() {
         let direction = order.direction();
         let dedup = order.dedup_on_flush();
+        let comparator = order.dedup_comparator(delimiter);
         for mut item in collected.completed_arenas.drain(..) {
             if shared.cancel_requested.load(Ordering::Acquire) {
                 return Ok(AdaptiveScanOutcome::Cancelled);
             }
             if let Some((run, dropped)) = item
                 .arena
-                .flush_to_workspace_mode(direction, dedup, &workspace, &shared, 0)?
+                .flush_to_workspace_mode(direction, dedup, comparator, &workspace, &shared, 0)?
             {
                 record_flushed_run(
                     run,
@@ -2521,6 +2599,7 @@ pub(super) fn count_record_fields(record: &[u8], delimiter: u8) -> Result<usize,
 pub(super) fn deduplicate_in_memory_runs_to_output(
     runs: &mut [InMemoryRun],
     delimiter: u8,
+    comparator: DedupComparator,
     duplicate_rows_counter: &AtomicU64,
     retained_rows_counter: &AtomicU64,
     output: &mut ExportTarget,
@@ -2540,17 +2619,52 @@ pub(super) fn deduplicate_in_memory_runs_to_output(
         let arena = &mut runs[0].arena;
         let mut write_idx = 0_usize;
         let mut prev_key: Option<(usize, usize)> = None;
+        let mut bucket_survivors: Vec<(usize, usize)> = Vec::new();
         for read_idx in 0..arena.entries.len() {
             if (read_idx & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
                 return Ok(None);
             }
             let entry = arena.entries[read_idx];
             let key = &arena.bytes[entry.key_offset..entry.key_offset + entry.key_len];
-            if prev_key.is_some_and(|(off, len)| &arena.bytes[off..off + len] == key) {
+            let rec = &arena.bytes[entry.record_offset..entry.record_offset + entry.record_len];
+            let same_key = prev_key.is_some_and(|(off, len)| &arena.bytes[off..off + len] == key);
+            let is_dup = if same_key {
+                match comparator {
+                    DedupComparator::KeyOnly => true,
+                    DedupComparator::AllFields {
+                        delimiter,
+                        case_sensitivity,
+                    } => {
+                        let mut matched = false;
+                        for &(r_off, r_len) in &bucket_survivors {
+                            if records_equal_all_fields(
+                                &arena.bytes[r_off..r_off + r_len],
+                                rec,
+                                delimiter,
+                                case_sensitivity,
+                            )? {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        matched
+                    }
+                }
+            } else {
+                false
+            };
+            if is_dup {
                 duplicates = duplicates.saturating_add(1);
             } else {
-                prev_key = Some((entry.key_offset, entry.key_len));
-                let rec = &arena.bytes[entry.record_offset..entry.record_offset + entry.record_len];
+                if !same_key {
+                    prev_key = Some((entry.key_offset, entry.key_len));
+                    if matches!(comparator, DedupComparator::AllFields { .. }) {
+                        bucket_survivors.clear();
+                    }
+                }
+                if matches!(comparator, DedupComparator::AllFields { .. }) {
+                    bucket_survivors.push((entry.record_offset, entry.record_len));
+                }
                 expected_records.observe(rec);
                 retained_max_width = retained_max_width.max(count_record_fields(rec, delimiter)?);
                 arena.entries[write_idx] = entry;
@@ -2644,6 +2758,7 @@ pub(super) fn deduplicate_in_memory_runs_to_output(
         }
 
         let mut prev: Option<(usize, usize)> = None;
+        let mut bucket_survivors: Vec<(usize, usize)> = Vec::new();
         let mut step = 0_usize;
         while let Some(item) = heap.pop() {
             if (step & 0x3ff) == 0 && shared.cancel_requested.load(Ordering::Acquire) {
@@ -2651,11 +2766,45 @@ pub(super) fn deduplicate_in_memory_runs_to_output(
             }
             step = step.saturating_add(1);
             let arena = &runs[item.run_index].arena;
-            if prev.is_some_and(|(pr, pe)| runs[pr].arena.key_at(pe) == item.key) {
+            let rec = arena.record_at(item.entry_index);
+            let same_key = prev.is_some_and(|(pr, pe)| runs[pr].arena.key_at(pe) == item.key);
+            let is_dup = if same_key {
+                match comparator {
+                    DedupComparator::KeyOnly => true,
+                    DedupComparator::AllFields {
+                        delimiter,
+                        case_sensitivity,
+                    } => {
+                        let mut matched = false;
+                        for &(pr, pe) in &bucket_survivors {
+                            if records_equal_all_fields(
+                                runs[pr].arena.record_at(pe),
+                                rec,
+                                delimiter,
+                                case_sensitivity,
+                            )? {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        matched
+                    }
+                }
+            } else {
+                false
+            };
+            if is_dup {
                 duplicates = duplicates.saturating_add(1);
             } else {
-                prev = Some((item.run_index, item.entry_index));
-                let rec = arena.record_at(item.entry_index);
+                if !same_key {
+                    prev = Some((item.run_index, item.entry_index));
+                    if matches!(comparator, DedupComparator::AllFields { .. }) {
+                        bucket_survivors.clear();
+                    }
+                }
+                if matches!(comparator, DedupComparator::AllFields { .. }) {
+                    bucket_survivors.push((item.run_index, item.entry_index));
+                }
                 expected_records.observe(rec);
                 retained_max_width = retained_max_width.max(count_record_fields(rec, delimiter)?);
                 survivors.push((item.ordinal, item.run_index, item.entry_index));
@@ -2762,6 +2911,7 @@ pub(super) fn reduce_runs_parallel(
         requested_workers,
         fd_budget,
         None,
+        DedupComparator::KeyOnly,
     )
 }
 
@@ -2778,6 +2928,7 @@ pub(super) fn reduce_runs_parallel_with_dedup(
     requested_workers: usize,
     fd_budget: &Arc<FdBudget>,
     dedup_counter: Option<Arc<AtomicU64>>,
+    comparator: DedupComparator,
 ) -> Result<bool, QuarryError> {
     let merge_fan_in = effective_merge_fan_in(config, max_key_bytes);
     while runs.len() > merge_fan_in {
@@ -2821,6 +2972,7 @@ pub(super) fn reduce_runs_parallel_with_dedup(
                     config.max_record_bytes,
                     shared,
                     dedup_counter.as_deref(),
+                    comparator,
                 )?;
                 drop(fd_guard);
                 if !merged {
@@ -2881,6 +3033,7 @@ pub(super) fn reduce_runs_parallel_with_dedup(
                         config.max_record_bytes,
                         &shared,
                         dedup_counter.as_deref(),
+                        comparator,
                     )?;
                     if !merged {
                         return Ok(None);

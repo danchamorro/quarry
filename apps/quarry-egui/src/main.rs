@@ -31,15 +31,16 @@ use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 use quarry_core::SearchProgress;
 use quarry_core::{
     CaseSensitivity, CleanupJob, CleanupOperation, CleanupOutcome, ColumnCleanup,
-    ColumnTransformation, CompletedIndex, DateTimeFormat, DuplicateJob, DuplicateOutcome,
-    DuplicateSpec, DuplicateSummary, Encoding, FilterExportJob, FilterExportOutcome,
-    FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
-    FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
-    IndexJob, IndexProgress, LiteralReplacement, MAX_SORT_KEYS, MAX_TRANSFORMATION_COLUMNS,
-    OpenOptions, QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob,
-    SaveAsOutcome, SaveAsProgress, SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session,
-    SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SortSpec, SplitAnalysisJob,
-    SplitAnalysisOutcome, StructuralIndex,
+    ColumnTransformation, CompletedIndex, DateFormatSuggestion, DateFormatSuggestionConfig,
+    DateTimeFormat, DuplicateJob, DuplicateOutcome, DuplicateSpec, DuplicateSummary,
+    DuplicateTarget, Encoding, FilterExportJob, FilterExportOutcome, FilterExportProgress,
+    FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate, FilterProgress,
+    FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig, IndexJob,
+    IndexProgress, LiteralReplacement, MAX_SORT_KEYS, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
+    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome,
+    SaveAsProgress, SearchJob, SearchMatch, SearchOutcome, SearchPosition, Session, SortDirection,
+    SortJob, SortMode, SortOutcome, SortPlan, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
+    StructuralIndex,
 };
 
 mod about;
@@ -534,6 +535,8 @@ struct StructuralDialog {
     sort_mode: SortMode,
     sort_levels: Vec<SortSpec>,
     match_case: bool,
+    duplicate_all_fields: bool,
+    date_format_suggestions: BTreeMap<usize, Option<DateFormatSuggestion>>,
 }
 
 impl StructuralDialog {
@@ -590,6 +593,8 @@ impl StructuralDialog {
             sort_mode: SortMode::Text,
             sort_levels: Vec::new(),
             match_case: false,
+            duplicate_all_fields: false,
+            date_format_suggestions: BTreeMap::new(),
         }
     }
 
@@ -605,6 +610,8 @@ impl StructuralDialog {
             sort_mode: SortMode::Text,
             sort_levels: Vec::new(),
             match_case: false,
+            duplicate_all_fields: false,
+            date_format_suggestions: BTreeMap::new(),
         }
     }
 
@@ -623,6 +630,8 @@ impl StructuralDialog {
             sort_mode: SortMode::Text,
             sort_levels: Vec::new(),
             match_case: false,
+            duplicate_all_fields: false,
+            date_format_suggestions: BTreeMap::new(),
         }
     }
 
@@ -638,6 +647,8 @@ impl StructuralDialog {
             sort_mode: SortMode::Text,
             sort_levels: Vec::new(),
             match_case: false,
+            duplicate_all_fields: false,
+            date_format_suggestions: BTreeMap::new(),
         }
     }
 
@@ -668,10 +679,20 @@ impl StructuralDialog {
     }
 
     fn duplicates(columns: Vec<usize>) -> Self {
+        let duplicate_all_fields = columns.is_empty();
         Self {
             request: StructuralRequest::Duplicates,
             columns,
+            duplicate_all_fields,
             ..Self::sort(0)
+        }
+    }
+
+    fn duplicate_target(&self) -> DuplicateTarget {
+        if self.duplicate_all_fields {
+            DuplicateTarget::AllFields
+        } else {
+            DuplicateTarget::Columns(self.columns.clone())
         }
     }
 }
@@ -1707,8 +1728,10 @@ impl QuarryApp {
                 StructuralRequest::Sort => {
                     document.start_sort_plan(dialog.sort_plan(self.active.sort_match_case))
                 }
-                StructuralRequest::Duplicates => document
-                    .start_find_duplicates(dialog.columns, case_sensitivity(dialog.match_case)),
+                StructuralRequest::Duplicates => document.start_find_duplicates_target(
+                    dialog.duplicate_target(),
+                    case_sensitivity(dialog.match_case),
+                ),
             });
         match result {
             Ok(()) => {
@@ -4625,6 +4648,7 @@ enum StructuralDialogAction {
 fn sort_mode_label(mode: SortMode) -> &'static str {
     match mode {
         SortMode::Text => "Text",
+        SortMode::Natural => "Natural",
         SortMode::Number => "Number",
         SortMode::DateTime { .. } => "Date / time",
         SortMode::CharacterCount => "Character count",
@@ -4632,6 +4656,53 @@ fn sort_mode_label(mode: SortMode) -> &'static str {
         SortMode::Shuffle { .. } => "Shuffle",
         SortMode::Reverse => "Reverse",
     }
+}
+
+/// Format a bounded date/time sample hint without ever auto-selecting a format.
+fn format_date_suggestion_hint(suggestion: &DateFormatSuggestion) -> String {
+    let row_noun = if suggestion.sampled_rows == 1 {
+        "row"
+    } else {
+        "rows"
+    };
+    let value_noun = if suggestion.sampled_nonblank_values == 1 {
+        "value"
+    } else {
+        "values"
+    };
+    let scope = if suggestion.truncated {
+        format!("first {} sampled {row_noun}", suggestion.sampled_rows)
+    } else {
+        format!("{} sampled {row_noun}", suggestion.sampled_rows)
+    };
+    if suggestion.sampled_nonblank_values == 0 {
+        return format!(
+            "Sample hint ({scope}): no nonblank values found. Choose a format explicitly."
+        );
+    }
+    if let Some(format) = suggestion.unambiguous_format() {
+        return format!(
+            "Sample hint ({} {value_noun} in {scope}): matches {}. Choose explicitly; full file is checked when sorting.",
+            suggestion.sampled_nonblank_values,
+            format.label()
+        );
+    }
+    if suggestion.is_ambiguous() {
+        let labels = suggestion
+            .matching_formats
+            .iter()
+            .map(|format| format.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "Sample hint ({} {value_noun} in {scope}): ambiguous — matches {labels}. Choose explicitly; full file is checked when sorting.",
+            suggestion.sampled_nonblank_values
+        );
+    }
+    format!(
+        "Sample hint ({} {value_noun} in {scope}): no single date/time format matched all sampled values.",
+        suggestion.sampled_nonblank_values
+    )
 }
 
 fn parse_insertion_count(input: &str) -> Result<u64, String> {
@@ -4857,6 +4928,7 @@ fn show_additional_sort_level(
     document: &Document,
     key: &mut SortSpec,
     index: usize,
+    date_suggestions: &mut BTreeMap<usize, Option<DateFormatSuggestion>>,
 ) {
     ui.push_id(("sort-level", index), |ui| {
         show_sort_column(ui, document, &mut key.column, index);
@@ -4868,6 +4940,7 @@ fn show_additional_sort_level(
             .show_ui(ui, |ui| {
                 for mode in [
                     SortMode::Text,
+                    SortMode::Natural,
                     SortMode::Number,
                     SortMode::DateTime {
                         format: DateTimeFormat::YearMonthDay,
@@ -4918,6 +4991,12 @@ fn show_additional_sort_level(
                 node.set_label(format!("Date / time format (level {})", index + 1))
             });
             ui.small(format.description());
+            let suggestion = date_suggestions
+                .entry(key.column)
+                .or_insert_with(|| document.suggest_date_time_formats(key.column));
+            if let Some(suggestion) = suggestion.as_ref() {
+                ui.small(format_date_suggestion_hint(suggestion));
+            }
         }
         let directions = [SortDirection::Ascending, SortDirection::Descending]
             .map(|direction| (direction, sort_direction_label(key.mode, direction)));
@@ -4930,7 +5009,7 @@ fn show_additional_sort_level(
                 node.set_label(format!("{label} (level {})", index + 1));
             });
         }
-        if key.mode == SortMode::Text {
+        if matches!(key.mode, SortMode::Text | SortMode::Natural) {
             let mut sensitive = key.case_sensitivity == CaseSensitivity::Sensitive;
             let response = ui.checkbox(&mut sensitive, "Match case");
             let _ = ui.ctx().accesskit_node_builder(response.id, |node| {
@@ -4958,6 +5037,13 @@ fn sort_value_description(mode: SortMode, match_case: bool) -> &'static str {
                 "Uppercase and lowercase letters sort separately."
             } else {
                 "Uppercase and lowercase letters sort together."
+            }
+        }
+        SortMode::Natural => {
+            if match_case {
+                "ASCII digit runs compare numerically (for example v1.9 before v1.10). Uppercase and lowercase letters sort separately. Leading zeros tie-break in original row order."
+            } else {
+                "ASCII digit runs compare numerically (for example v1.9 before v1.10). Uppercase and lowercase letters sort together. Leading zeros tie-break in original row order."
             }
         }
         SortMode::Number => {
@@ -5030,7 +5116,13 @@ fn show_structural_dialog(
             "Selected column{}: {columns}",
             if dialog.columns.len() == 1 { "" } else { "s" }
         );
-        if !matches!(dialog.request, StructuralRequest::InsertRows | StructuralRequest::InsertColumns | StructuralRequest::Sort) {
+        if !matches!(
+            dialog.request,
+            StructuralRequest::InsertRows
+                | StructuralRequest::InsertColumns
+                | StructuralRequest::Sort
+                | StructuralRequest::Duplicates
+        ) {
             ui.add(egui::Label::new(&selected).truncate()).on_hover_text(&selected);
         }
         ui.add_space(6.0);
@@ -5076,11 +5168,32 @@ fn show_structural_dialog(
                 (reason.is_none(), focused, reason)
             }
             StructuralRequest::Duplicates => {
-                ui.label("Find rows with matching values in the selected columns.");
+                theme::section_label(ui, "Match");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut dialog.duplicate_all_fields, false, "Selected columns");
+                    ui.radio_value(
+                        &mut dialog.duplicate_all_fields,
+                        true,
+                        "All fields (whole row)",
+                    );
+                });
+                if !dialog.duplicate_all_fields && !dialog.columns.is_empty() {
+                    ui.add(egui::Label::new(&selected).truncate())
+                        .on_hover_text(&selected);
+                }
+                if dialog.duplicate_all_fields {
+                    ui.label("Find rows with identical decoded values across every field.");
+                } else {
+                    ui.label("Find rows with matching values in the selected columns.");
+                }
                 ui.checkbox(&mut dialog.match_case, "Match case");
                 ui.label("Review the count first. Removal keeps the first occurrence in the current row order.");
                 egui::CollapsingHeader::new("Details").id_salt("duplicate-details").show(ui, |ui| {
-                    ui.label("Compare the values in every selected column. Blank and missing fields match; spaces are significant.");
+                    if dialog.duplicate_all_fields {
+                        ui.label("Compare every decoded field and exact field count (for example a,b differs from a,b,; quoted and unquoted forms match). Spaces are significant.");
+                    } else {
+                        ui.label("Compare the values in every selected column. Blank and missing fields match; spaces are significant.");
+                    }
                     ui.label(if dialog.match_case {
                         "Uppercase and lowercase letters match separately."
                     } else {
@@ -5088,7 +5201,8 @@ fn show_structural_dialog(
                     });
                     ui.label("The header stays fixed. Unsaved cell values are included in the comparison.");
                 });
-                let reason = dialog.columns.is_empty().then(|| "Select at least one numbered column first.".to_owned());
+                let reason = (!dialog.duplicate_all_fields && dialog.columns.is_empty())
+                    .then(|| "Select at least one numbered column first.".to_owned());
                 if let Some(reason) = &reason { ui.colored_label(ui.visuals().error_fg_color, reason); }
                 (reason.is_none(), false, reason)
             }
@@ -5155,7 +5269,7 @@ fn show_structural_dialog(
                     .selected_text(sort_mode_label(dialog.sort_mode))
                     .popup_style(egui::style::StyleModifier::new(tool_dialog_style))
                     .show_ui(ui, |ui| {
-                        for mode in [SortMode::Text, SortMode::Number,
+                        for mode in [SortMode::Text, SortMode::Natural, SortMode::Number,
                             SortMode::DateTime { format: DateTimeFormat::YearMonthDay }, SortMode::CharacterCount,
                             SortMode::WordCount, SortMode::Shuffle { seed: 0 }, SortMode::Reverse] {
                             let selected = dialog.sort_mode == mode || matches!((dialog.sort_mode, mode),
@@ -5180,6 +5294,14 @@ fn show_structural_dialog(
                         }).response.labelled_by(label.id);
                     let _ = ui.ctx().accesskit_node_builder(response.id, |node| node.set_label("Date / time format"));
                     ui.small(format.description());
+                    let primary_column = dialog.columns[0];
+                    let suggestion = dialog
+                        .date_format_suggestions
+                        .entry(primary_column)
+                        .or_insert_with(|| document.suggest_date_time_formats(primary_column));
+                    if let Some(suggestion) = suggestion.as_ref() {
+                        ui.small(format_date_suggestion_hint(suggestion));
+                    }
                     ui.small("Blank cells sort first oldest, last newest. Other invalid values stop the sort. Surrounding ASCII whitespace is ignored.");
                 }
                 if dialog.sort_mode.uses_column() {
@@ -5188,7 +5310,9 @@ fn show_structural_dialog(
                         .map(|direction| (direction, sort_direction_label(dialog.sort_mode, direction)));
                     theme::segmented(ui, &mut dialog.sort_direction, &directions);
                 }
-                if dialog.sort_mode == SortMode::Text { ui.checkbox(sort_match_case, "Match case"); }
+                if matches!(dialog.sort_mode, SortMode::Text | SortMode::Natural) {
+                    ui.checkbox(sort_match_case, "Match case");
+                }
                 let values = sort_value_description(dialog.sort_mode, *sort_match_case);
                 if dialog.sort_mode.uses_column() {
                     let mut keys = dialog.sort_plan(*sort_match_case).keys;
@@ -5197,7 +5321,13 @@ fn show_structural_dialog(
                     for index in 0..keys.len() {
                         if index > 0 {
                             ui.separator();
-                            show_additional_sort_level(ui, document, &mut keys[index], index);
+                            show_additional_sort_level(
+                                ui,
+                                document,
+                                &mut keys[index],
+                                index,
+                                &mut dialog.date_format_suggestions,
+                            );
                         }
                         ui.horizontal(|ui| {
                             ui.weak(format!("Level {}", index + 1));
@@ -5226,8 +5356,9 @@ fn show_structural_dialog(
                     dialog.set_sort_keys(keys, sort_match_case);
                 }
                 let ordering = sort_ordering_description(dialog.sort_mode);
-                let sort_disk = document.sort_plan_disk_estimate(dialog.sort_plan(*sort_match_case).keys.len());
-                let reason = dialog.sort_plan(*sort_match_case).validate().err()
+                let sort_plan = dialog.sort_plan(*sort_match_case);
+                let sort_disk = document.sort_plan_disk_estimate(&sort_plan);
+                let reason = sort_plan.validate().err()
                     .map(|error| error.to_string()).or_else(|| sort_disk.is_none().then(|| {
                     "Wait for indexing to finish so Quarry can calculate temporary disk space."
                         .to_owned()
@@ -7177,7 +7308,7 @@ impl Document {
         }
         plan.validate()
             .map_err(|error| AppMessage::warning(error.to_string()))?;
-        if self.sort_plan_disk_estimate(plan.keys.len()).is_none() {
+        if self.sort_plan_disk_estimate(&plan).is_none() {
             return Err(AppMessage::warning(
                 "Wait for indexing to finish so Quarry can calculate temporary disk space.",
             ));
@@ -7241,22 +7372,37 @@ impl Document {
         Ok(())
     }
 
+    #[cfg(test)]
     fn start_find_duplicates(
         &mut self,
         columns: Vec<usize>,
         case_sensitivity: CaseSensitivity,
     ) -> Result<(), AppMessage> {
+        self.start_find_duplicates_target(DuplicateTarget::Columns(columns), case_sensitivity)
+    }
+
+    fn start_find_duplicates_target(
+        &mut self,
+        target: DuplicateTarget,
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<(), AppMessage> {
         if let Some(reason) = self.structural_edit_disabled_reason() {
             return Err(AppMessage::warning(reason));
         }
-        if columns.is_empty() {
-            return Err(AppMessage::warning(
-                "Select at least one numbered column first.",
-            ));
-        }
-        for &column in &columns {
-            self.validate_column(column).map_err(AppMessage::warning)?;
-        }
+        let selected_columns = match &target {
+            DuplicateTarget::Columns(columns) => {
+                if columns.is_empty() {
+                    return Err(AppMessage::warning(
+                        "Select at least one numbered column first.",
+                    ));
+                }
+                for &column in columns {
+                    self.validate_column(column).map_err(AppMessage::warning)?;
+                }
+                columns.iter().copied().collect()
+            }
+            DuplicateTarget::AllFields => BTreeSet::new(),
+        };
         self.commit_edits();
         self.cancel_search();
         let MaterializationPreparation {
@@ -7264,12 +7410,11 @@ impl Document {
             destination,
             renames,
         } = self.prepare_materialization()?;
-        let selected_columns = columns.iter().copied().collect();
         let job = match self.session.start_find_duplicates_with_options(
             renames,
             self.owned_cell_edits(),
             DuplicateSpec {
-                columns,
+                target,
                 case_sensitivity,
             },
             &destination,
@@ -7309,14 +7454,45 @@ impl Document {
         Ok(())
     }
 
+    /// Sample bounded rows and bytes of effective (edited) values for `column` without cloning
+    /// the document's edit overlay.
+    fn suggest_date_time_formats(&self, column: usize) -> Option<DateFormatSuggestion> {
+        let active_edit = self
+            .cell_edit
+            .as_ref()
+            .map(|edit| ((edit.row, edit.column), edit.draft.as_bytes()));
+        self.session
+            .suggest_date_time_formats_with_lookup(
+                column,
+                |row, col| {
+                    if let Some(((er, ec), bytes)) = active_edit
+                        && er == row
+                        && ec == col
+                    {
+                        return Some(bytes);
+                    }
+                    self.cell_edits
+                        .get(&(row, col))
+                        .map(|value| value.as_slice())
+                },
+                DateFormatSuggestionConfig::default(),
+            )
+            .ok()
+    }
+
     /// Dialog frames borrow effective values; only actual core jobs need owned snapshots.
     #[cfg(test)]
     fn sort_temporary_disk_estimate(&self) -> Option<u64> {
-        self.sort_plan_disk_estimate(1)
+        self.sort_plan_disk_estimate(&SortPlan::from(SortSpec {
+            column: 0,
+            mode: SortMode::Text,
+            direction: SortDirection::Ascending,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        }))
     }
 
     /// Include all comparison levels while borrowing the current edit overlay.
-    fn sort_plan_disk_estimate(&self, key_count: usize) -> Option<u64> {
+    fn sort_plan_disk_estimate(&self, plan: &SortPlan) -> Option<u64> {
         let records = self.index.as_ref()?.indexed_rows();
         let mut headers: BTreeMap<_, _> = self
             .header_renames
@@ -7334,7 +7510,7 @@ impl Document {
         if let Some(edit) = &self.cell_edit {
             cells.insert((edit.row, edit.column), edit.draft.as_bytes());
         }
-        Some(quarry_core::estimate_multi_sort_temporary_bytes(
+        Some(quarry_core::estimate_sort_plan_temporary_bytes(
             quarry_core::estimate_edited_output_bytes_from_values(
                 self.session.file_size.saturating_mul(
                     if self.session.encoding() == Encoding::Utf8 {
@@ -7350,7 +7526,7 @@ impl Document {
                 None,
             ),
             records.saturating_sub(self.data_start),
-            key_count,
+            plan,
         ))
     }
 
@@ -25396,6 +25572,7 @@ mod tests {
         ctx.enable_accesskit();
         let output = ctx.run(grid_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
+                let mut date_suggestions = std::collections::BTreeMap::new();
                 for index in 1..=2 {
                     let mut key = super::SortSpec {
                         column: index,
@@ -25403,7 +25580,13 @@ mod tests {
                         direction: super::SortDirection::Ascending,
                         case_sensitivity: CaseSensitivity::Insensitive,
                     };
-                    super::show_additional_sort_level(ui, document, &mut key, index);
+                    super::show_additional_sort_level(
+                        ui,
+                        document,
+                        &mut key,
+                        index,
+                        &mut date_suggestions,
+                    );
                 }
             });
         });
@@ -25748,5 +25931,117 @@ mod tests {
         assert_eq!(document.cell_edits[&(1, 1)].as_slice(), b"pending");
         assert!(document.can_undo());
         assert_eq!(fs::read(source).unwrap(), b"name,value\nrow,original\n");
+    }
+
+    #[test]
+    fn sort_dialog_natural_mode_and_bounded_date_suggestion_hint_never_auto_select() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phase3b-sort.csv");
+        fs::write(
+            &path,
+            b"ver,when\nv1.10,01/02/2020\nv1.2,03/04/2026\nV1.9,01/02/2020\n",
+        )
+        .unwrap();
+        let mut app = individual_edit_app(&path);
+        let document = app.active.document.as_ref().unwrap();
+
+        // Natural sort mode plan & disk estimate.
+        let mut natural_dialog = StructuralDialog::sort(0);
+        natural_dialog.sort_mode = SortMode::Natural;
+        let natural_plan = natural_dialog.sort_plan(false);
+        assert_eq!(natural_plan.keys[0].mode, SortMode::Natural);
+        assert_eq!(
+            natural_plan.keys[0].case_sensitivity,
+            CaseSensitivity::Insensitive
+        );
+        let text_plan = StructuralDialog::sort(0).sort_plan(false);
+        assert!(
+            document.sort_plan_disk_estimate(&natural_plan).unwrap()
+                > document.sort_plan_disk_estimate(&text_plan).unwrap()
+        );
+
+        // Date / time mode caches bounded suggestion without copying edits or auto-selecting.
+        let mut date_dialog = StructuralDialog::sort(1);
+        date_dialog.sort_mode = SortMode::DateTime {
+            format: quarry_core::DateTimeFormat::YearMonthDay,
+        };
+        super::OWNED_EDIT_SNAPSHOT_BYTES.with(|bytes| bytes.set(0));
+        let ctx = egui::Context::default();
+        let mut sort_match_case = false;
+        let _ = ctx.run(grid_input(), |ctx| {
+            let _ = super::show_structural_dialog(
+                ctx,
+                &mut date_dialog,
+                &mut sort_match_case,
+                document,
+            );
+        });
+        assert_eq!(
+            super::OWNED_EDIT_SNAPSHOT_BYTES.with(std::cell::Cell::get),
+            0
+        );
+        // Must NEVER auto-change the user's chosen format.
+        assert_eq!(
+            date_dialog.sort_mode,
+            SortMode::DateTime {
+                format: quarry_core::DateTimeFormat::YearMonthDay
+            }
+        );
+        let cached = date_dialog
+            .date_format_suggestions
+            .get(&1)
+            .and_then(|entry| entry.as_ref())
+            .expect("date suggestion should be cached for column 1");
+        assert!(cached.is_ambiguous());
+        let hint = super::format_date_suggestion_hint(cached);
+        assert!(hint.contains("ambiguous"));
+        assert!(hint.contains("MM/DD/YYYY"));
+        assert!(hint.contains("DD/MM/YYYY"));
+
+        // Run Natural sort end-to-end through the dialog.
+        app.open_structural_dialog(natural_dialog);
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_structural_edit(&mut app);
+        let document = app.active.document.as_ref().unwrap();
+        let rows = document
+            .session
+            .read_rows(document.index.as_ref().unwrap(), 1, 3)
+            .unwrap();
+        let first_col: Vec<String> = rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.fields[0]).into_owned())
+            .collect();
+        assert_eq!(first_col, vec!["v1.2", "V1.9", "v1.10"]);
+    }
+
+    #[test]
+    fn duplicates_dialog_all_fields_runs_without_selected_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phase3b-dedup.csv");
+        fs::write(&path, b"a,b\nx,1\n\"x\",1\nx,1,\ny,2\n").unwrap();
+        let mut app = individual_edit_app(&path);
+
+        let dialog = StructuralDialog::duplicates(Vec::new());
+        assert!(dialog.duplicate_all_fields);
+        assert_eq!(
+            dialog.duplicate_target(),
+            quarry_core::DuplicateTarget::AllFields
+        );
+        app.open_structural_dialog(dialog);
+        app.apply_structural_dialog_action(StructuralDialogAction::Apply);
+        finish_duplicate_search(&mut app);
+        let Some(super::StructuralJob::DuplicatePreview { summary, .. }) =
+            &app.active.document.as_ref().unwrap().structural_job
+        else {
+            panic!("expected duplicate preview");
+        };
+        assert_eq!(summary.duplicate_rows, 1);
+        assert_eq!(summary.retained_rows, 3);
+        app.confirm_duplicate_removal().unwrap();
+        let document = app.active.document.as_ref().unwrap();
+        assert_eq!(
+            fs::read_to_string(document.session.path()).unwrap(),
+            "a,b\nx,1\nx,1,\ny,2\n"
+        );
     }
 }

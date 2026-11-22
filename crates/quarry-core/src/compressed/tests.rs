@@ -1883,10 +1883,7 @@ fn every_writer_rejects_compressed_destination_names() {
         let error = expect_err(session.start_find_duplicates(
             BTreeMap::new(),
             BTreeMap::new(),
-            crate::DuplicateSpec {
-                columns: vec![0],
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            crate::DuplicateSpec::columns(vec![0], CaseSensitivity::Sensitive),
             &destination,
         ));
         assert!(invalid(&error), "duplicates {name}: {error:?}");

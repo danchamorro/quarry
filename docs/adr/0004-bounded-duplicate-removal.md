@@ -37,3 +37,37 @@ free-space controls reserved for priority 4.
 The [validation report](../benchmarks/2026-09-05-find-remove-duplicates.md)
 records exact retained bytes, cancellation, cleanup, source preservation,
 and measured memory and disk use on the deterministic 1 GB workload.
+
+## Amendment (2026-11-22): Whole-row duplicate target (`AllFields`)
+
+Duplicate detection now supports `DuplicateTarget::AllFields` in addition to
+`DuplicateTarget::Columns(Vec<usize>)`.
+
+### Whole-row semantics
+- Compare the complete decoded field tuple of each effective (edited) data row
+  together with its explicit field count (`a,b` with 2 fields differs from
+  `a,b,` with 3 fields, while `"a",b` matches `a,b`).
+- Exclude the file BOM once at byte 0 only, exclude the header row when
+  present, exclude outer `CRLF`/`LF` record endings, and decode UTF-16 inputs
+  to UTF-8 before comparison.
+- ASCII case-insensitive folding (`CaseSensitivity::Insensitive`) folds ASCII
+  letters only; whitespace and non-ASCII bytes remain exact.
+
+### Single-copy frame layout and collision safety
+- Storing a length-framed copy of every decoded field in the run key would
+  double temporary frame payloads across merge generations.
+- Instead, `DuplicateTarget::AllFields` stores each effective record once per
+  frame alongside a fixed 24-byte key: `(field_count: u64 BE, dual_hash_128)`
+  computed over the normalized decoded field tuple.
+- Runs sort and merge strictly by `(24-byte key, ordinal)`. Whenever adjacent
+  entries share a 24-byte key during run flushes, in-memory deduplication,
+  intermediate merge passes, or `retain_first_runs`, Quarry compares the
+  decoded field tuples directly against the distinct survivors retained for
+  that key bucket (with a raw-byte fast path after stripping outer line
+  endings). Even under an adversarial 128-bit hash collision, this guarantees
+  zero false positives, zero false negatives, and stable first-occurrence
+  retention.
+- Temporary disk preflight (`estimate_duplicate_target_temporary_bytes`) uses
+  `2 * E + 112 * R` for `AllFields` (two generations of single-copy records
+  plus 24-byte keys and frame headers) rather than the `4 * E` two-copy
+  selected-column allowance.

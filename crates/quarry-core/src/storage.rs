@@ -461,6 +461,24 @@ pub const fn estimate_duplicate_temporary_bytes(
     )
 }
 
+/// Conservative disk allowance for a duplicate target. Whole-row (`AllFields`) frames store
+/// each record once with a fixed 24-byte comparison key, avoiding payload doubling across
+/// merge generations.
+pub fn estimate_duplicate_target_temporary_bytes(
+    effective_bytes: u64,
+    rows: u64,
+    target: &crate::DuplicateTarget,
+) -> u64 {
+    match target {
+        crate::DuplicateTarget::Columns(columns) => {
+            estimate_duplicate_temporary_bytes(effective_bytes, rows, columns.len())
+        }
+        crate::DuplicateTarget::AllFields => effective_bytes
+            .saturating_mul(2)
+            .saturating_add(rows.saturating_mul(112)),
+    }
+}
+
 /// Count logical records without retaining them, then rewind for the operation.
 /// This avoids assuming a byte is a row and rejecting ordinary large files.
 #[cfg(test)]
@@ -708,10 +726,7 @@ mod tests {
             .start_find_duplicates(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                DuplicateSpec {
-                    columns: vec![0],
-                    case_sensitivity: CaseSensitivity::Sensitive,
-                },
+                DuplicateSpec::columns(vec![0], CaseSensitivity::Sensitive),
                 directory.join("duplicates.csv"),
             )
             .unwrap()

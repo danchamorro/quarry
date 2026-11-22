@@ -1,7 +1,70 @@
 //! Fixed-format Gregorian chronology keys. Parsing never consults a locale or
 //! the machine's timezone, and never changes the original cell spelling.
 
-use crate::QuarryError;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io;
+
+use crate::encoding::RecordScanner;
+use crate::export::source_matches_stamp;
+use crate::{QuarryError, Session, parse_encoded_record};
+
+/// Default upper bound on data rows sampled for bounded date/time format suggestions.
+pub const DEFAULT_DATE_FORMAT_SUGGESTION_MAX_ROWS: usize = 1_000;
+/// Default upper bound on source + edited bytes sampled for date/time format suggestions.
+pub const DEFAULT_DATE_FORMAT_SUGGESTION_MAX_BYTES: usize = 256 * 1024;
+
+/// Bounded sampling limits for suggesting candidate `DateTimeFormat` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DateFormatSuggestionConfig {
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for DateFormatSuggestionConfig {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_DATE_FORMAT_SUGGESTION_MAX_ROWS,
+            max_bytes: DEFAULT_DATE_FORMAT_SUGGESTION_MAX_BYTES,
+        }
+    }
+}
+
+/// Advisory result of sampling a column's effective values against all fixed `DateTimeFormat`
+/// grammars. Callers must never auto-select from this suggestion; explicit format selection
+/// and full sort-time validation remain mandatory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DateFormatSuggestion {
+    /// Every `DateTimeFormat` (in `DateTimeFormat::ALL` order) that parsed every sampled
+    /// nonblank value without error. Empty when no nonblank values were sampled or no
+    /// single format matched every sampled nonblank value.
+    pub matching_formats: Vec<DateTimeFormat>,
+    /// Data rows inspected within `max_rows` and `max_bytes`.
+    pub sampled_rows: usize,
+    /// Nonblank (after ASCII whitespace trimming) values tested.
+    pub sampled_nonblank_values: usize,
+    /// Bytes inspected across sampled source data and edited cell overlays.
+    pub sampled_bytes: usize,
+    /// True when sampling stopped before EOF due to `max_rows` or `max_bytes`.
+    pub truncated: bool,
+}
+
+impl DateFormatSuggestion {
+    /// True when more than one fixed format matches all sampled nonblank values
+    /// (for example `01/02/2020`, which is valid under both `MM/DD/YYYY` and `DD/MM/YYYY`).
+    pub fn is_ambiguous(&self) -> bool {
+        self.matching_formats.len() > 1
+    }
+
+    /// Returns the sole matching format iff exactly one format matched all sampled nonblank values.
+    pub fn unambiguous_format(&self) -> Option<DateTimeFormat> {
+        if self.matching_formats.len() == 1 {
+            Some(self.matching_formats[0])
+        } else {
+            None
+        }
+    }
+}
 
 /// Explicit input grammars; none infer date order or a machine timezone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +276,313 @@ pub(crate) fn date_time_key(value: &[u8], format: DateTimeFormat) -> Result<Vec<
     Ok(key)
 }
 
+struct FormatSampler {
+    candidates: [bool; 5],
+    sampled_rows: usize,
+    sampled_nonblank_values: usize,
+}
+
+impl FormatSampler {
+    fn new() -> Self {
+        Self {
+            candidates: [true; 5],
+            sampled_rows: 0,
+            sampled_nonblank_values: 0,
+        }
+    }
+
+    fn observe(&mut self, value: &[u8]) {
+        self.sampled_rows = self.sampled_rows.saturating_add(1);
+        let trimmed = value.trim_ascii();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.sampled_nonblank_values = self.sampled_nonblank_values.saturating_add(1);
+        for (index, &format) in DateTimeFormat::ALL.iter().enumerate() {
+            if self.candidates[index] && date_time_key(trimmed, format).is_err() {
+                self.candidates[index] = false;
+            }
+        }
+    }
+
+    fn any_remaining(&self) -> bool {
+        self.candidates.iter().any(|&ok| ok)
+    }
+
+    fn finish(self, sampled_bytes: usize, truncated: bool) -> DateFormatSuggestion {
+        let matching_formats = if self.sampled_nonblank_values == 0 {
+            Vec::new()
+        } else {
+            DateTimeFormat::ALL
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &format)| self.candidates[index].then_some(format))
+                .collect()
+        };
+        DateFormatSuggestion {
+            matching_formats,
+            sampled_rows: self.sampled_rows,
+            sampled_nonblank_values: self.sampled_nonblank_values,
+            sampled_bytes,
+            truncated,
+        }
+    }
+}
+
+/// Evaluate an iterator of effective field values within strict row and byte bounds and
+/// return every `DateTimeFormat` that parses all sampled nonblank values.
+pub fn suggest_date_time_formats_from_values<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+    config: DateFormatSuggestionConfig,
+) -> DateFormatSuggestion {
+    if config.max_rows == 0 || config.max_bytes == 0 {
+        return DateFormatSuggestion {
+            matching_formats: Vec::new(),
+            sampled_rows: 0,
+            sampled_nonblank_values: 0,
+            sampled_bytes: 0,
+            truncated: true,
+        };
+    }
+    let mut sampler = FormatSampler::new();
+    let mut sampled_bytes = 0_usize;
+    let mut truncated = false;
+    for value in values {
+        if sampler.sampled_rows >= config.max_rows {
+            truncated = true;
+            break;
+        }
+        let next_bytes = sampled_bytes.saturating_add(value.len());
+        if next_bytes > config.max_bytes {
+            truncated = true;
+            break;
+        }
+        sampled_bytes = next_bytes;
+        sampler.observe(value);
+        if !sampler.any_remaining() {
+            break;
+        }
+    }
+    sampler.finish(sampled_bytes, truncated)
+}
+
+impl Session {
+    /// Sample bounded rows and bytes of effective (edited) values for `column` and return every
+    /// `DateTimeFormat` that parses all sampled nonblank values. Never auto-selects a format;
+    /// full validation still runs during sort execution.
+    pub fn suggest_date_time_formats(
+        &self,
+        column: usize,
+        cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+        config: DateFormatSuggestionConfig,
+    ) -> Result<DateFormatSuggestion, QuarryError> {
+        self.suggest_date_time_formats_with_lookup(
+            column,
+            |row, col| cell_edits.get(&(row, col)).map(Vec::as_slice),
+            config,
+        )
+    }
+
+    /// Borrow-friendly variant of `suggest_date_time_formats` that consults unsaved edits through
+    /// `edit_lookup` without cloning the edit overlay.
+    pub fn suggest_date_time_formats_with_lookup<'a>(
+        &self,
+        column: usize,
+        mut edit_lookup: impl FnMut(u64, usize) -> Option<&'a [u8]>,
+        config: DateFormatSuggestionConfig,
+    ) -> Result<DateFormatSuggestion, QuarryError> {
+        if config.max_rows == 0 || config.max_bytes == 0 {
+            return Err(QuarryError::InvalidOption(
+                "date format suggestion max_rows and max_bytes must be non-zero",
+            ));
+        }
+        let mut file = File::open(&self.path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                QuarryError::SourceChanged
+            } else {
+                error.into()
+            }
+        })?;
+        if !source_matches_stamp(&file, &self.path, &self.source_stamp)? {
+            return Err(QuarryError::SourceChanged);
+        }
+        let encoding = self.encoding;
+        let delimiter = self.dialect.delimiter;
+        let has_header = self.dialect.has_header;
+        if encoding.is_utf16() && config.max_bytes < 2 {
+            return Ok(DateFormatSuggestion {
+                matching_formats: Vec::new(),
+                sampled_rows: 0,
+                sampled_nonblank_values: 0,
+                sampled_bytes: 0,
+                truncated: self.file_size > 0,
+            });
+        }
+        let mut scanner = RecordScanner::new(delimiter, encoding)?;
+        let chunk_cap = encoding
+            .chunk_size(config.max_bytes.min(64 * 1024))
+            .min(if encoding.is_utf16() {
+                config.max_bytes & !1
+            } else {
+                config.max_bytes
+            })
+            .max(if encoding.is_utf16() { 2 } else { 1 });
+        let mut chunk = vec![0_u8; chunk_cap];
+        let mut record = Vec::new();
+        let mut offset = 0_u64;
+        let mut physical_row = 0_u64;
+        let mut source_bytes_read = 0_usize;
+        let mut consumed_source_bytes = 0_usize;
+        let mut edit_bytes_read = 0_usize;
+        let mut sampler = FormatSampler::new();
+        let mut truncated = false;
+        let mut stop = false;
+        let mut reached_eof = false;
+
+        let mut process_record = |rec: &[u8],
+                                  row_num: u64,
+                                  sampler: &mut FormatSampler,
+                                  consumed_source_bytes: &mut usize,
+                                  edit_bytes_read: &mut usize,
+                                  truncated: &mut bool,
+                                  stop: &mut bool|
+         -> Result<(), QuarryError> {
+            let record_source_bytes = rec.len();
+            if has_header && row_num == 0 {
+                *consumed_source_bytes = consumed_source_bytes.saturating_add(record_source_bytes);
+                return Ok(());
+            }
+            if sampler.sampled_rows >= config.max_rows {
+                *truncated = true;
+                *stop = true;
+                return Ok(());
+            }
+            if let Some(edited) = edit_lookup(row_num, column) {
+                let next_total = consumed_source_bytes
+                    .saturating_add(record_source_bytes)
+                    .saturating_add(*edit_bytes_read)
+                    .saturating_add(edited.len());
+                if next_total > config.max_bytes {
+                    *truncated = true;
+                    *stop = true;
+                    return Ok(());
+                }
+                *consumed_source_bytes = consumed_source_bytes.saturating_add(record_source_bytes);
+                *edit_bytes_read = edit_bytes_read.saturating_add(edited.len());
+                sampler.observe(edited);
+            } else {
+                let next_total = consumed_source_bytes
+                    .saturating_add(record_source_bytes)
+                    .saturating_add(*edit_bytes_read);
+                if next_total > config.max_bytes {
+                    *truncated = true;
+                    *stop = true;
+                    return Ok(());
+                }
+                *consumed_source_bytes = consumed_source_bytes.saturating_add(record_source_bytes);
+                let fields = parse_encoded_record(rec, delimiter, row_num, encoding)?;
+                let value = fields.get(column).map_or(&[][..], |field| field.as_ref());
+                sampler.observe(value);
+            }
+            if !sampler.any_remaining() {
+                *stop = true;
+            }
+            Ok(())
+        };
+
+        while !stop {
+            let remaining = config
+                .max_bytes
+                .saturating_sub(source_bytes_read.saturating_add(edit_bytes_read));
+            let mut to_read = remaining.min(chunk.len());
+            if encoding.is_utf16() {
+                to_read &= !1;
+            }
+            if to_read == 0 {
+                if offset < self.file_size {
+                    truncated = true;
+                } else {
+                    reached_eof = true;
+                }
+                break;
+            }
+            let read = encoding.read_chunk(&mut file, &mut chunk[..to_read])?;
+            if read == 0 {
+                reached_eof = true;
+                break;
+            }
+            source_bytes_read = source_bytes_read.saturating_add(read);
+            let mut segment_start = 0_usize;
+            let mut deferred_error = None;
+            let scan_result = scanner.scan_chunk(&chunk[..read], offset, |absolute_end| {
+                let local_end = (absolute_end - offset) as usize;
+                if deferred_error.is_none() && !stop {
+                    record.extend_from_slice(&chunk[segment_start..local_end]);
+                    if let Err(error) = process_record(
+                        &record,
+                        physical_row,
+                        &mut sampler,
+                        &mut consumed_source_bytes,
+                        &mut edit_bytes_read,
+                        &mut truncated,
+                        &mut stop,
+                    ) {
+                        deferred_error = Some(error);
+                    }
+                }
+                record.clear();
+                physical_row = physical_row.saturating_add(1);
+                segment_start = local_end;
+            });
+            offset = offset.saturating_add(read as u64);
+            if let Some(error) = deferred_error {
+                return Err(error);
+            }
+            scan_result?;
+            if !stop {
+                record.extend_from_slice(&chunk[segment_start..read]);
+                if offset >= self.file_size {
+                    reached_eof = true;
+                    break;
+                }
+            }
+        }
+
+        if reached_eof && !stop {
+            let mut deferred_error = None;
+            let finish_result = scanner.finish(offset, |_| {
+                if deferred_error.is_none()
+                    && !stop
+                    && let Err(error) = process_record(
+                        &record,
+                        physical_row,
+                        &mut sampler,
+                        &mut consumed_source_bytes,
+                        &mut edit_bytes_read,
+                        &mut truncated,
+                        &mut stop,
+                    )
+                {
+                    deferred_error = Some(error);
+                }
+                record.clear();
+                physical_row = physical_row.saturating_add(1);
+            });
+            if let Some(error) = deferred_error {
+                return Err(error);
+            }
+            finish_result?;
+        } else if !reached_eof && offset < self.file_size {
+            truncated = true;
+        }
+
+        Ok(sampler.finish(
+            consumed_source_bytes.saturating_add(edit_bytes_read),
+            truncated,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +747,222 @@ mod tests {
             assert!(date_time_key(&vec![b'1'; 100_000], format).is_err());
             assert_eq!(date_time_key(b" \r\n\t", format).unwrap(), Vec::<u8>::new());
         }
+    }
+
+    #[test]
+    fn suggestion_detects_unambiguous_ambiguous_blank_and_mixed_samples() {
+        let cfg = DateFormatSuggestionConfig::default();
+
+        // Unambiguous YYYY-MM-DD with blanks and ASCII whitespace.
+        let ymd = suggest_date_time_formats_from_values(
+            [b"".as_slice(), b"  ", b"2026-03-04", b" 2025-12-31\t"],
+            cfg,
+        );
+        assert_eq!(ymd.matching_formats, vec![DateTimeFormat::YearMonthDay]);
+        assert!(!ymd.is_ambiguous());
+        assert_eq!(ymd.unambiguous_format(), Some(DateTimeFormat::YearMonthDay));
+        assert_eq!(ymd.sampled_rows, 4);
+        assert_eq!(ymd.sampled_nonblank_values, 2);
+        assert!(!ymd.truncated);
+
+        // Ambiguous slash dates: 01/02/2020 matches both MM/DD/YYYY and DD/MM/YYYY.
+        let amb =
+            suggest_date_time_formats_from_values([b"01/02/2020".as_slice(), b"03/04/2026"], cfg);
+        assert_eq!(
+            amb.matching_formats,
+            vec![DateTimeFormat::MonthDayYear, DateTimeFormat::DayMonthYear]
+        );
+        assert!(amb.is_ambiguous());
+        assert_eq!(amb.unambiguous_format(), None);
+
+        // Later unambiguous row narrows to MonthDayYear.
+        let mdy =
+            suggest_date_time_formats_from_values([b"01/02/2020".as_slice(), b"03/25/2026"], cfg);
+        assert_eq!(mdy.matching_formats, vec![DateTimeFormat::MonthDayYear]);
+        assert!(!mdy.is_ambiguous());
+
+        // DayMonthYear.
+        let dmy = suggest_date_time_formats_from_values([b"25/03/2026".as_slice()], cfg);
+        assert_eq!(dmy.unambiguous_format(), Some(DateTimeFormat::DayMonthYear));
+
+        // DateTime vs Rfc3339.
+        let dt = suggest_date_time_formats_from_values([b"2026-03-04 09:30:00".as_slice()], cfg);
+        assert_eq!(dt.unambiguous_format(), Some(DateTimeFormat::DateTime));
+        let rfc = suggest_date_time_formats_from_values([b"2026-03-04T09:30:00Z".as_slice()], cfg);
+        assert_eq!(rfc.unambiguous_format(), Some(DateTimeFormat::Rfc3339));
+
+        // All blank -> empty and not ambiguous.
+        let blank = suggest_date_time_formats_from_values([b"".as_slice(), b"   "], cfg);
+        assert!(blank.matching_formats.is_empty());
+        assert!(!blank.is_ambiguous());
+        assert_eq!(blank.sampled_nonblank_values, 0);
+
+        // Mixed incompatible values -> empty.
+        let mixed =
+            suggest_date_time_formats_from_values([b"2026-03-04".as_slice(), b"03/04/2026"], cfg);
+        assert!(mixed.matching_formats.is_empty());
+        assert!(!mixed.is_ambiguous());
+    }
+
+    #[test]
+    fn session_suggestion_respects_row_byte_bounds_edits_and_utf16() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dates.csv");
+        // Row 1 & 2 are ambiguous; row 3 disambiguates MDY; row 4 is invalid text.
+        std::fs::write(
+            &path,
+            b"id,when\n1,01/02/2020\n2,03/04/2026\n3,03/25/2026\n4,not-a-date",
+        )
+        .unwrap();
+        let session = Session::open(
+            &path,
+            crate::OpenOptions {
+                header_mode: crate::HeaderMode::FirstRow,
+                delimiter: Some(b','),
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        // Bounded to 2 rows -> ambiguous [MDY, DMY], truncated.
+        let two = session
+            .suggest_date_time_formats(
+                1,
+                &BTreeMap::new(),
+                DateFormatSuggestionConfig {
+                    max_rows: 2,
+                    max_bytes: 1024,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            two.matching_formats,
+            vec![DateTimeFormat::MonthDayYear, DateTimeFormat::DayMonthYear]
+        );
+        assert!(two.is_ambiguous());
+        assert!(two.truncated);
+
+        // Bounded to 3 rows -> unambiguous MDY, truncated before invalid row 4.
+        let three = session
+            .suggest_date_time_formats(
+                1,
+                &BTreeMap::new(),
+                DateFormatSuggestionConfig {
+                    max_rows: 3,
+                    max_bytes: 1024,
+                },
+            )
+            .unwrap();
+        assert_eq!(three.matching_formats, vec![DateTimeFormat::MonthDayYear]);
+        assert!(three.truncated);
+
+        // Unbounded rows sees invalid row 4 -> empty.
+        let all = session
+            .suggest_date_time_formats(1, &BTreeMap::new(), DateFormatSuggestionConfig::default())
+            .unwrap();
+        assert!(all.matching_formats.is_empty());
+
+        // Unsaved edit fixes row 4 -> unambiguous MDY across entire file (not truncated).
+        let edits = BTreeMap::from([((4, 1), b"04/20/2026".to_vec())]);
+        let fixed = session
+            .suggest_date_time_formats(1, &edits, DateFormatSuggestionConfig::default())
+            .unwrap();
+        assert_eq!(fixed.matching_formats, vec![DateTimeFormat::MonthDayYear]);
+        assert!(!fixed.truncated);
+        assert_eq!(fixed.sampled_rows, 4);
+
+        // Exact byte cap equal to file length still reads final newline-less record.
+        let file_len = std::fs::metadata(&path).unwrap().len() as usize;
+        let exact_bytes = session
+            .suggest_date_time_formats(
+                1,
+                &BTreeMap::new(),
+                DateFormatSuggestionConfig {
+                    max_rows: 10,
+                    max_bytes: file_len,
+                },
+            )
+            .unwrap();
+        assert_eq!(exact_bytes.sampled_rows, 4);
+        assert!(exact_bytes.matching_formats.is_empty());
+
+        // Strict byte cap stops early without reading full file.
+        let tiny_bytes = session
+            .suggest_date_time_formats(
+                1,
+                &BTreeMap::new(),
+                DateFormatSuggestionConfig {
+                    max_rows: 100,
+                    max_bytes: 24,
+                },
+            )
+            .unwrap();
+        assert!(tiny_bytes.sampled_bytes <= 24);
+        assert!(tiny_bytes.truncated);
+        assert!(tiny_bytes.is_ambiguous());
+
+        // Read-ahead in a file larger than max_bytes must not crowd out a short edit on row 1.
+        let large_path = dir.path().join("large-edited.csv");
+        let mut large_csv = String::from("id,when\n1,not-a-date\n");
+        for row in 2..=400 {
+            large_csv.push_str(&format!("{row},2026-03-04\n"));
+        }
+        assert!(large_csv.len() > 4096);
+        std::fs::write(&large_path, large_csv.as_bytes()).unwrap();
+        let large_session = Session::open(
+            &large_path,
+            crate::OpenOptions {
+                header_mode: crate::HeaderMode::FirstRow,
+                delimiter: Some(b','),
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let row1_edit = BTreeMap::from([((1, 1), b"2026-03-01".to_vec())]);
+        let large_sugg = large_session
+            .suggest_date_time_formats(
+                1,
+                &row1_edit,
+                DateFormatSuggestionConfig {
+                    max_rows: 1000,
+                    max_bytes: 4096,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            large_sugg.unambiguous_format(),
+            Some(DateTimeFormat::YearMonthDay)
+        );
+        assert!(large_sugg.sampled_rows > 100);
+        assert!(large_sugg.sampled_bytes <= 4096);
+        assert!(large_sugg.truncated);
+
+        // UTF-16LE with BOM.
+        let utf16_path = dir.path().join("dates-utf16.csv");
+        let mut utf16 = crate::Encoding::Utf16Le.bom().to_vec();
+        utf16.extend_from_slice(
+            &crate::Encoding::Utf16Le
+                .encode(b"d\r\n2026-03-04\r\n2026-03-05\r\n", 4096)
+                .unwrap(),
+        );
+        std::fs::write(&utf16_path, &utf16).unwrap();
+        let utf16_session = Session::open_with_encoding(
+            &utf16_path,
+            crate::OpenOptions {
+                header_mode: crate::HeaderMode::FirstRow,
+                delimiter: Some(b','),
+                ..crate::OpenOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        let u16_sugg = utf16_session
+            .suggest_date_time_formats(0, &BTreeMap::new(), DateFormatSuggestionConfig::default())
+            .unwrap();
+        assert_eq!(
+            u16_sugg.unambiguous_format(),
+            Some(DateTimeFormat::YearMonthDay)
+        );
+        assert!(!u16_sugg.truncated);
     }
 }
