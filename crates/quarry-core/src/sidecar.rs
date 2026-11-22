@@ -1904,12 +1904,14 @@ pub(crate) fn set_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> io::
             CloseHandle(token);
             return Err(err);
         }
-        let mut buf = vec![0u8; needed as usize];
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0usize; words];
+        let buf_len = (words * std::mem::size_of::<usize>()) as u32;
         let ok = GetTokenInformation(
             token,
             TOKEN_USER_CLASS,
             buf.as_mut_ptr().cast(),
-            needed,
+            buf_len,
             &mut needed,
         );
         CloseHandle(token);
