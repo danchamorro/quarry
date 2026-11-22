@@ -545,7 +545,7 @@ impl QuarryApp {
     pub(super) fn poll_inspections(&mut self, ctx: &egui::Context) {
         for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
             let was_recovering = tab.inspection.recovering();
-            tab.inspection.poll(tab.document.as_ref());
+            tab.inspection.poll(tab.state.document.as_ref());
             if was_recovering && !tab.inspection.recovering() {
                 tab.write_destination = None;
             }
@@ -642,7 +642,7 @@ impl QuarryApp {
         let state = &mut self.active.inspection;
         let busy = state.busy();
         egui::Window::new("Inspect File")
-            .id(egui::Id::new(("inspection", self.active.id)))
+            .id(egui::Id::new(("inspection", self.active.state.id)))
             .open(&mut open)
             .default_size([730.0, 600.0])
             .resizable(true)
@@ -837,7 +837,7 @@ impl QuarryApp {
         let Some(record) = finding.record else {
             return;
         };
-        let Some(doc) = self.active.document.as_mut() else {
+        let Some(doc) = self.active.state.document.as_mut() else {
             return;
         };
         if !paths_alias(doc.session.path(), &report.path) || !report.is_current() {

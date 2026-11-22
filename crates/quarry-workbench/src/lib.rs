@@ -4,6 +4,7 @@ pub mod compressed;
 pub mod document;
 pub mod history;
 pub mod selection;
+pub mod tab;
 pub mod whitespace;
 
 pub use document::{
@@ -19,6 +20,10 @@ pub use history::{
 pub use selection::{
     CellCoord, ColumnView, CursorSelectionMode, GridCursor, GridSelection, RowSelection,
     SelectionModifiers, select_column, selected_split_column, validated_column_selection,
+};
+pub use tab::{
+    DelimiterMode, FilterRuleDraft, TabCloseState, WorkbenchTab, filter_predicate_from_rule,
+    filter_query_from_rules,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
