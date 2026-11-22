@@ -801,6 +801,66 @@ fn simd_block_classifier_matches_oracle_across_every_64_byte_alignment() {
 }
 
 #[test]
+fn simd_preserves_field_start_after_quote_across_quote_free_block() {
+    let active = active_simd_backend();
+    let dialect = ScannerDialect::rfc4180(b',');
+
+    // Block 0 (64 bytes): `"aaaa...a"` -> ends in `AfterQuote`.
+    // Block 1 (64 bytes, zero quotes): `\n` + 62 `a` + `,` -> transitions to `FieldStart`.
+    // Block 2: `"b"\n` -> valid quoted field at offset 128.
+    let mut after_quote_lf_then_delim = Vec::new();
+    after_quote_lf_then_delim.push(b'"');
+    after_quote_lf_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_lf_then_delim.push(b'"');
+    after_quote_lf_then_delim.push(b'\n');
+    after_quote_lf_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_lf_then_delim.push(b',');
+    after_quote_lf_then_delim.extend_from_slice(b"\"b\"\n");
+
+    // Same pattern with `AfterQuoteCr` at block 0/1 boundary (`"\r` at bytes 62..64).
+    let mut after_quote_cr_lf_then_delim = Vec::new();
+    after_quote_cr_lf_then_delim.push(b'"');
+    after_quote_cr_lf_then_delim.extend_from_slice(&[b'a'; 61]);
+    after_quote_cr_lf_then_delim.extend_from_slice(b"\"\r");
+    after_quote_cr_lf_then_delim.push(b'\n');
+    after_quote_cr_lf_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_cr_lf_then_delim.push(b',');
+    after_quote_cr_lf_then_delim.extend_from_slice(b"\"b\"\n");
+
+    // Same pattern with `AfterQuote` followed immediately by `,` at byte 64 and `,` at byte 127.
+    let mut after_quote_delim_then_delim = Vec::new();
+    after_quote_delim_then_delim.push(b'"');
+    after_quote_delim_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_delim_then_delim.push(b'"');
+    after_quote_delim_then_delim.push(b',');
+    after_quote_delim_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_delim_then_delim.push(b',');
+    after_quote_delim_then_delim.extend_from_slice(b"\"b\"\n");
+
+    for case in [
+        after_quote_lf_then_delim,
+        after_quote_cr_lf_then_delim,
+        after_quote_delim_then_delim,
+    ] {
+        let expected = scalar_oracle_scan_dialect(&case, dialect, ByteEncodingClass::Utf8);
+        assert!(expected.is_ok());
+        for chunk_size in [64usize, 128, case.len()] {
+            let scalar = run_dialect_backend(
+                &case,
+                dialect,
+                ByteEncodingClass::Utf8,
+                SimdBackend::Scalar,
+                chunk_size,
+            );
+            let simd =
+                run_dialect_backend(&case, dialect, ByteEncodingClass::Utf8, active, chunk_size);
+            assert_eq!(scalar, expected);
+            assert_eq!(simd, expected);
+        }
+    }
+}
+
+#[test]
 fn simd_matches_scalar_on_large_seeded_quoted_and_escape_streams() {
     let active = active_simd_backend();
     let mut rng = XorShift64(0x2026_1121_51AD_0007);

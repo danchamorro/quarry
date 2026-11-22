@@ -206,9 +206,6 @@ fn classify_block_scalar(
         if byte == b'\n' {
             masks.lf |= bit;
         }
-        if need_delim && byte == dialect.delimiter {
-            masks.delim |= bit;
-        }
         if dialect.quote == Some(byte) {
             masks.quote |= bit;
         }
@@ -217,6 +214,13 @@ fn classify_block_scalar(
         }
         if esc_byte == Some(byte) {
             masks.escape |= bit;
+        }
+    }
+    if need_delim || masks.quote != 0 {
+        for (i, &byte) in block.iter().enumerate() {
+            if byte == dialect.delimiter {
+                masks.delim |= 1u64 << i;
+            }
         }
     }
     masks

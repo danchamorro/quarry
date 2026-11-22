@@ -353,7 +353,9 @@ impl<const TRACK_WIDTH: bool> StructuralScanner<TRACK_WIDTH> {
         block_start: u64,
         on_record_end: &mut impl FnMut(u64),
     ) -> Result<u64, ParseError> {
-        let masks = simd::classify_block_64(block, self.dialect, self.backend, TRACK_WIDTH);
+        let need_delim =
+            TRACK_WIDTH || !matches!(self.state, ScanState::FieldStart | ScanState::Unquoted);
+        let masks = simd::classify_block_64(block, self.dialect, self.backend, need_delim);
 
         // Fast path A: unquoted block with zero quote characters.
         if masks.quote == 0 && matches!(self.state, ScanState::FieldStart | ScanState::Unquoted) {
