@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,14 +17,20 @@ use quarry_core::{
     FilterProgress, FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress,
     LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome,
     SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition,
-    SearchProgress, Session, SortDirection, SortJob, SortMode, SortOutcome, SortProgress, SortSpec,
-    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, StructuralIndex,
-    WorkingCopyCleanup, check_storage, detect_compression, estimate_edited_output_bytes,
-    estimate_sort_temporary_bytes, inspect_storage, is_compressed_destination,
+    SearchProgress, SearchTelemetry, Session, SortDirection, SortJob, SortMode, SortOutcome,
+    SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress,
+    StructuralIndex, WorkingCopyCleanup, check_storage, detect_compression,
+    estimate_edited_output_bytes, estimate_sort_temporary_bytes, inspect_storage,
+    is_compressed_destination,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
-type SearchRun = (SearchOutcome, SearchProgress, Option<(u64, Duration)>);
+type SearchRun = (
+    SearchOutcome,
+    SearchProgress,
+    SearchTelemetry,
+    Option<(u64, Duration)>,
+);
 type FilterRun = (FilterIndex, FilterProgress, Option<(u64, Duration)>);
 type FilterExportRun = (
     FilterExportOutcome,
@@ -359,6 +366,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     let mut and_predicates = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut threads = None;
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -394,7 +402,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
                 }
             }
             "--threads" => {
-                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -429,7 +437,8 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
-    let job = session.start_filter(query)?;
+    let job =
+        session.start_filter_with_edits_and_threads(query, Arc::new(BTreeMap::new()), threads)?;
     let (index, progress, cancellation) =
         wait_for_filter(job, cancel_after_bytes, Duration::from_millis(1))?;
     let samples = sample_filtered_rows(session, &index)?;
@@ -596,6 +605,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     let mut and_predicates = Vec::new();
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
+    let mut threads = None;
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -632,7 +642,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
                 }
             }
             "--threads" => {
-                let _ = parse_threads(value(&args, &mut cursor, "--threads")?)?;
+                threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -670,7 +680,13 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be less than file size".into());
     }
     let source_size_before = session.file_size;
-    let job = session.start_filtered_export(query.clone(), &destination)?;
+    let job = session.start_filtered_export_with_edits_and_threads(
+        query.clone(),
+        Arc::new(BTreeMap::new()),
+        BTreeMap::new(),
+        &destination,
+        threads,
+    )?;
     let (outcome, progress, cancellation) =
         wait_for_export(job, cancel_after_bytes, Duration::from_millis(1))?;
     let source_size_after = std::fs::metadata(session.path())?.len();
@@ -3137,8 +3153,15 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes.is_some_and(|bytes| bytes >= search_bytes) {
         return Err("cancel-after-bytes must be less than the searchable byte span".into());
     }
-    let job = session.start_search(&index, query.clone(), start)?;
-    let (outcome, progress, cancellation) =
+    let job = session.start_search_with_options(
+        &index,
+        query.clone(),
+        start,
+        BTreeMap::new(),
+        CaseSensitivity::Sensitive,
+        threads,
+    )?;
+    let (outcome, progress, search_telemetry, cancellation) =
         wait_for_search(job, cancel_after_bytes, Duration::from_millis(1))?;
 
     println!("Quarry search benchmark\n");
@@ -3165,6 +3188,11 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     let telemetry = index.telemetry();
     println!("Engine workers: {}", telemetry.effective_workers);
     println!("SIMD backend: {}", telemetry.simd_backend);
+    println!("Search workers: {}", search_telemetry.effective_workers);
+    println!(
+        "Wasted-work bound: {}",
+        human_bytes(search_telemetry.wasted_work_bound_bytes)
+    );
     let time_label = if matches!(&outcome, SearchOutcome::Match(_)) {
         "Time to first match"
     } else {
@@ -3266,6 +3294,7 @@ fn wait_for_search(
     }
 
     let progress = job.progress();
+    let telemetry = job.telemetry();
     let outcome = job.wait()?;
     interrupt::check()?;
     let cancellation = cancellation.map(|(bytes, started)| (bytes, started.elapsed()));
@@ -3275,7 +3304,7 @@ fn wait_for_search(
     if cancel_after_bytes.is_some() && !matches!(outcome, SearchOutcome::Cancelled) {
         return Err("search completed before cancellation took effect".into());
     }
-    Ok((outcome, progress, cancellation))
+    Ok((outcome, progress, telemetry, cancellation))
 }
 
 fn viewport_command(args: Vec<String>) -> CliResult<()> {

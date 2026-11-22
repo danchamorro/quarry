@@ -91,7 +91,9 @@ pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
 };
 use quarry_delimited::{ParseError, parse_record};
-pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
+pub use search::{
+    SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress, SearchTelemetry,
+};
 pub use sort::{
     DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
     MAX_SORT_KEYS, SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SortProgress, SortSpec,
