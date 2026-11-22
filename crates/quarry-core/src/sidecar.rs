@@ -1305,14 +1305,17 @@ fn create_private_dir_all(dir: &Path) -> io::Result<()> {
 }
 
 fn resolve_and_harden_cache_dir(config: &IndexCacheConfig) -> Option<PathBuf> {
+    let env_override =
+        std::env::var_os("QUARRY_INDEX_CACHE_DIR").is_some_and(|value| !value.is_empty());
+    let is_user_selected = config.cache_dir.is_some() || env_override;
     let dir = config.cache_dir.clone().or_else(default_index_cache_dir)?;
 
     reject_symlink_components(&dir).ok()?;
 
     let existed = fs::symlink_metadata(&dir).is_ok();
-    if existed && config.cache_dir.is_some() {
-        // Never mutate permissions/ACLs on an existing user-selected directory;
-        // require it to already be strictly owner-only on a local filesystem.
+    if existed && is_user_selected {
+        // Never mutate permissions/ACLs on an existing user-selected directory (including
+        // `QUARRY_INDEX_CACHE_DIR`); require it to already be strictly owner-only on a local FS.
         return verify_existing_private_cache_dir(&dir).then_some(dir);
     }
 

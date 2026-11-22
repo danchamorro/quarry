@@ -401,7 +401,7 @@ impl QuarryApp {
                 }
                 egui::ScrollArea::vertical()
                     .id_salt("quarry-storage-details-scroll")
-                    .max_height((ctx.content_rect().height() - 260.0).clamp(80.0, 360.0))
+                    .max_height((ctx.content_rect().height() - 220.0).clamp(80.0, 440.0))
                     .show(ui, |ui| {
                         let mut details = |ui: &mut egui::Ui| {
                             if review.operation.is_some() {
@@ -477,7 +477,7 @@ impl QuarryApp {
                                         }
                                     }
                                 }
-                                ui.small("Stores structural offsets only in a private folder (up to 256 MB). File names and cell contents are never written.");
+                                ui.small("Stores structural offsets only in a private folder (up to 256 MB); never file names or cell data.");
                             }
                         };
                         if review.operation.is_none() {
