@@ -695,7 +695,7 @@ fn encode_sidecar_bytes(
     out.extend_from_slice(&index.checkpoint_every().to_le_bytes()); // 224..232
     out.extend_from_slice(&index.checkpoint_byte_stride().unwrap_or(0).to_le_bytes()); // 232..240
     out.extend_from_slice(&(checkpoints.len() as u32).to_le_bytes()); // 240..244
-    out.extend_from_slice(&[0u8; 12]); // 244..256 reserved
+    out.extend_from_slice(&[0u8; 12]); // 244..256 keyed MAC slot (filled after CRC)
     debug_assert_eq!(out.len(), SIDECAR_HEADER_LEN);
 
     for cp in checkpoints {
@@ -706,6 +706,40 @@ fn encode_sidecar_bytes(
     let crc = crc32c(&out[16..]);
     out[12..16].copy_from_slice(&crc.to_le_bytes());
     Some(out)
+}
+
+fn compute_sidecar_mac(key: &[u8; 32], encoded: &[u8]) -> [u8; 12] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"quarry-sidecar-mac-v1:");
+    hasher.update(key);
+    hasher.update(b"\0");
+    hasher.update(&encoded[0..12]);
+    hasher.update(&encoded[16..244]);
+    hasher.update(&encoded[SIDECAR_HEADER_LEN..]);
+    let digest = hasher.finalize();
+    let mut tag = [0u8; 12];
+    tag.copy_from_slice(&digest[..12]);
+    tag
+}
+
+fn seal_sidecar_mac(key: &[u8; 32], encoded: &mut [u8]) {
+    let tag = compute_sidecar_mac(key, encoded);
+    encoded[244..256].copy_from_slice(&tag);
+    let crc = crc32c(&encoded[16..]);
+    encoded[12..16].copy_from_slice(&crc.to_le_bytes());
+}
+
+fn verify_sidecar_mac(key: &[u8; 32], encoded: &[u8]) -> bool {
+    if encoded.len() < SIDECAR_HEADER_LEN {
+        return false;
+    }
+    let expected = compute_sidecar_mac(key, encoded);
+    // Constant-time comparison over the 12-byte MAC tag.
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(&encoded[244..256]) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 /// Decodes an untrusted sidecar byte buffer. Never panics on any input.
@@ -1095,15 +1129,18 @@ fn resolve_and_harden_cache_dir(config: &IndexCacheConfig) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
             FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
         if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
             return None;
         }
         let dir_file = fs::OpenOptions::new()
-            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&dir)
@@ -1112,6 +1149,13 @@ fn resolve_and_harden_cache_dir(config: &IndexCacheConfig) -> Option<PathBuf> {
         if !dir_meta.is_dir()
             || (dir_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
             || !is_eligible_windows_filesystem(&dir_file)
+        {
+            return None;
+        }
+        // Apply and verify a protected owner-only DACL (current user + SYSTEM) stripping
+        // any inherited grants.
+        if set_windows_owner_only_dacl(dir_file.as_raw_handle()).is_err()
+            || !verify_windows_owner_only_dacl(dir_file.as_raw_handle())
         {
             return None;
         }
@@ -1151,6 +1195,10 @@ fn read_verified_key(key_path: &Path) -> Option<[u8; 32]> {
         use std::os::unix::fs::MetadataExt;
         if meta.uid() != rustix::process::getuid().as_raw() || (meta.mode() & 0o077) != 0 {
             return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::storage::set_macos_acl(&file, None).ok()?;
         }
     }
     let mut key = [0u8; 32];
@@ -1245,6 +1293,7 @@ fn open_private_readonly_nofollow(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
         };
@@ -1257,6 +1306,12 @@ fn open_private_readonly_nofollow(path: &Path) -> io::Result<File> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "sidecar must not be a reparse point",
+            ));
+        }
+        if !verify_windows_owner_only_dacl(file.as_raw_handle()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "sidecar file is not restricted to owner-only ACL",
             ));
         }
         Ok(file)
@@ -1287,13 +1342,22 @@ fn create_private_exclusive_file(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        };
+        const WRITE_DAC: u32 = 0x0004_0000;
+        let file = fs::OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC)
             .create_new(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
+            .open(path)?;
+        if let Err(err) = set_windows_owner_only_dacl(file.as_raw_handle()) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(err);
+        }
+        Ok(file)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1303,6 +1367,335 @@ fn create_private_exclusive_file(path: &Path) -> io::Result<File> {
             .write(true)
             .create_new(true)
             .open(path)
+    }
+}
+
+#[cfg(windows)]
+fn set_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> io::Result<()> {
+    use std::ffi::c_void;
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+    const SDDL_REVISION_1: u32 = 1;
+    const SE_FILE_OBJECT: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut c_void,
+            desired_access: u32,
+            token_handle: *mut *mut c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut c_void,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut c_void, string_sid: *mut *mut u16) -> i32;
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+        fn GetSecurityDescriptorDacl(
+            security_descriptor: *mut c_void,
+            dacl_present: *mut i32,
+            dacl: *mut *mut c_void,
+            dacl_defaulted: *mut i32,
+        ) -> i32;
+        fn SetSecurityInfo(
+            handle: *mut c_void,
+            object_type: u32,
+            security_info: u32,
+            owner: *mut c_void,
+            group: *mut c_void,
+            dacl: *mut c_void,
+            sacl: *mut c_void,
+        ) -> u32;
+    }
+
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut needed: u32 = 0;
+        let _ = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        if needed == 0 {
+            let err = io::Error::last_os_error();
+            CloseHandle(token);
+            return Err(err);
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sid_ptr = (*buf.as_ptr().cast::<SidAndAttributes>()).sid;
+        let mut sid_wstr: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid_ptr, &mut sid_wstr) == 0 || sid_wstr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut sid_len = 0usize;
+        while *sid_wstr.add(sid_len) != 0 {
+            sid_len += 1;
+        }
+        let sid_str = String::from_utf16_lossy(std::slice::from_raw_parts(sid_wstr, sid_len));
+        LocalFree(sid_wstr.cast());
+
+        let sddl = format!("D:P(A;OICI;FA;;;{sid_str})(A;OICI;FA;;;SY)\0");
+        let sddl_wide: Vec<u16> = sddl.encode_utf16().collect();
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        ) == 0
+            || sd.is_null()
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut dacl_present: i32 = 0;
+        let mut dacl_defaulted: i32 = 0;
+        let mut dacl: *mut c_void = std::ptr::null_mut();
+        let dacl_ok =
+            GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted);
+        let status = if dacl_ok != 0 && dacl_present != 0 {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        } else {
+            1
+        };
+        LocalFree(sd);
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn verify_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> bool {
+    use std::ffi::c_void;
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const ACL_SIZE_INFORMATION_CLASS: u32 = 2;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
+    }
+
+    #[repr(C)]
+    struct AclSizeInformation {
+        ace_count: u32,
+        acl_bytes_in_use: u32,
+        acl_bytes_free: u32,
+    }
+
+    #[repr(C)]
+    struct AceHeader {
+        ace_type: u8,
+        ace_flags: u8,
+        ace_size: u16,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut c_void,
+            desired_access: u32,
+            token_handle: *mut *mut c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut c_void,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut *mut c_void) -> i32;
+        fn EqualSid(sid1: *mut c_void, sid2: *mut c_void) -> i32;
+        fn GetSecurityInfo(
+            handle: *mut c_void,
+            object_type: u32,
+            security_info: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            security_descriptor: *mut *mut c_void,
+        ) -> u32;
+        fn GetAclInformation(
+            acl: *mut c_void,
+            acl_information: *mut c_void,
+            acl_information_length: u32,
+            acl_information_class: u32,
+        ) -> i32;
+        fn GetAce(acl: *mut c_void, ace_index: u32, ace: *mut *mut c_void) -> i32;
+    }
+
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut needed: u32 = 0;
+        let _ = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        if needed == 0 {
+            CloseHandle(token);
+            return false;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return false;
+        }
+        let user_sid = (*buf.as_ptr().cast::<SidAndAttributes>()).sid;
+
+        let system_sid_wide: Vec<u16> = "S-1-5-18\0".encode_utf16().collect();
+        let mut system_sid: *mut c_void = std::ptr::null_mut();
+        if ConvertStringSidToSidW(system_sid_wide.as_ptr(), &mut system_sid) == 0
+            || system_sid.is_null()
+        {
+            return false;
+        }
+
+        let mut owner_sid: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut c_void = std::ptr::null_mut();
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        let status = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        );
+        if status != 0 || sd.is_null() {
+            LocalFree(system_sid);
+            return false;
+        }
+
+        let mut allowed =
+            !owner_sid.is_null() && EqualSid(owner_sid, user_sid) != 0 && !dacl.is_null();
+        if allowed {
+            let mut size_info = AclSizeInformation {
+                ace_count: 0,
+                acl_bytes_in_use: 0,
+                acl_bytes_free: 0,
+            };
+            if GetAclInformation(
+                dacl,
+                std::ptr::from_mut(&mut size_info).cast(),
+                std::mem::size_of::<AclSizeInformation>() as u32,
+                ACL_SIZE_INFORMATION_CLASS,
+            ) == 0
+            {
+                allowed = false;
+            } else {
+                for i in 0..size_info.ace_count {
+                    let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+                    if GetAce(dacl, i, &mut ace_ptr) == 0 || ace_ptr.is_null() {
+                        allowed = false;
+                        break;
+                    }
+                    let hdr = &*ace_ptr.cast::<AceHeader>();
+                    match hdr.ace_type {
+                        ACCESS_ALLOWED_ACE_TYPE => {
+                            if (hdr.ace_size as usize) <= 8 {
+                                allowed = false;
+                                break;
+                            }
+                            let ace_sid = ace_ptr.cast::<u8>().add(8).cast::<c_void>();
+                            if EqualSid(ace_sid, user_sid) == 0
+                                && EqualSid(ace_sid, system_sid) == 0
+                            {
+                                allowed = false;
+                                break;
+                            }
+                        }
+                        ACCESS_DENIED_ACE_TYPE => {}
+                        _ => {
+                            allowed = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        LocalFree(sd);
+        LocalFree(system_sid);
+        allowed
     }
 }
 
@@ -1352,6 +1745,10 @@ pub(crate) fn try_load_sidecar(
         if meta.uid() != rustix::process::getuid().as_raw() || (meta.mode() & 0o077) != 0 {
             return None;
         }
+        #[cfg(target_os = "macos")]
+        {
+            crate::storage::set_macos_acl(&sidecar_file, None).ok()?;
+        }
     }
 
     let mut raw = Vec::with_capacity(meta.len() as usize);
@@ -1364,6 +1761,9 @@ pub(crate) fn try_load_sidecar(
     }
 
     let decoded = decode_sidecar_bytes(&raw)?;
+    if !verify_sidecar_mac(&key, &raw) {
+        return None;
+    }
     let (exp_delim, exp_quote, exp_esc_kind, exp_esc_byte) = dialect_to_tags(dialect);
     if decoded.encoding_tag != encoding_to_tag(encoding)
         || decoded.delimiter != exp_delim
@@ -1482,7 +1882,7 @@ fn try_save_sidecar(
     let last_record_hash = compute_last_record_hash(file, file_size, index.checkpoints()).ok()?;
     let dialect = ScannerDialect::rfc4180(delimiter);
 
-    let encoded = encode_sidecar_bytes(
+    let mut encoded = encode_sidecar_bytes(
         &identity,
         encoding,
         dialect,
@@ -1491,6 +1891,7 @@ fn try_save_sidecar(
         &last_record_hash,
         index,
     )?;
+    seal_sidecar_mac(&key, &mut encoded);
     if (encoded.len() as u64) > cache_config.max_cache_bytes {
         return None;
     }
@@ -2180,5 +2581,101 @@ mod tests {
             "unchanged file without trailing newline should hit sidecar cache"
         );
         assert_eq!(second, first);
+    }
+
+    #[test]
+    fn zero_max_cache_bytes_disables_saving_and_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("zero_cache");
+        let csv_path = dir.path().join("sample.csv");
+        fs::write(&csv_path, b"a,b\n1,2\n3,4\n").unwrap();
+
+        let cache_cfg = IndexCacheConfig {
+            enabled: true,
+            cache_dir: Some(cache_dir.clone()),
+            max_cache_bytes: 0,
+            min_file_bytes: 0,
+        };
+        let index_cfg = IndexConfig {
+            chunk_bytes: 64,
+            checkpoint_every: 2,
+            memory_budget_bytes: 64 * 1024,
+        };
+
+        let session = Session::open(&csv_path, OpenOptions::default()).unwrap();
+        let first = session
+            .start_indexing_with_options(index_cfg, Some(1), cache_cfg.clone())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!first.telemetry().cache_hit);
+        assert!(
+            !cache_dir.exists(),
+            "max_cache_bytes == 0 must not create or populate the cache directory"
+        );
+
+        let second = session
+            .start_indexing_with_options(index_cfg, Some(1), cache_cfg)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!second.telemetry().cache_hit);
+    }
+
+    #[test]
+    fn forged_sidecar_with_valid_crc_but_wrong_mac_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("mac_cache");
+        let csv_path = dir.path().join("sample.csv");
+        fs::write(&csv_path, b"a,b\n1,2\n3,4\n5,6\n").unwrap();
+
+        let cache_cfg = IndexCacheConfig {
+            enabled: true,
+            cache_dir: Some(cache_dir.clone()),
+            max_cache_bytes: 16 * 1024 * 1024,
+            min_file_bytes: 0,
+        };
+        let index_cfg = IndexConfig {
+            chunk_bytes: 64,
+            checkpoint_every: 2,
+            memory_budget_bytes: 64 * 1024,
+        };
+
+        let session = Session::open(&csv_path, OpenOptions::default()).unwrap();
+        let first = session
+            .start_indexing_with_options(index_cfg, Some(1), cache_cfg.clone())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!first.telemetry().cache_hit);
+
+        // Tamper with `max_width` inside the sidecar and recompute the unkeyed CRC32C
+        // without updating the keyed MAC.
+        let sidecar_path = fs::read_dir(&cache_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "qidx"))
+            .expect("sidecar file should exist");
+        let mut raw = fs::read(&sidecar_path).unwrap();
+        raw[216..224].copy_from_slice(&999u64.to_le_bytes());
+        let crc = crc32c(&raw[16..]);
+        raw[12..16].copy_from_slice(&crc.to_le_bytes());
+        fs::write(&sidecar_path, &raw).unwrap();
+        assert!(
+            decode_sidecar_bytes(&raw).is_some(),
+            "forged buffer has a valid structural CRC32C"
+        );
+
+        let second = session
+            .start_indexing_with_options(index_cfg, Some(1), cache_cfg)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            !second.telemetry().cache_hit,
+            "forged sidecar with invalid keyed MAC must be rejected"
+        );
+        assert_eq!(second.maximum_width(), first.maximum_width());
     }
 }
