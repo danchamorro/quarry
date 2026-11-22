@@ -168,3 +168,82 @@ completed in **0.472 s** (`25.12 GiB/s`, **16.6×** faster than Phase 1).
   all 14 output-producing workloads matched Phase 1 golden SHA-256 digests 100%.
 - Zero third-party dependencies were added across all of Phase 2 (`Cargo.lock` unchanged since
   Phase 1 `178cabb`).
+
+---
+
+## 5. Reproduction Commands
+
+All CLI measurements below use the frozen release binary built by `scripts/benchmark-public-datasets.py`
+(`quarry-bench`) with an isolated `0700` `QUARRY_INDEX_CACHE_DIR`:
+
+### Full 30-Workload Suite & Golden Digest Parity
+
+```bash
+CACHE_DIR="$(mktemp -d)" && chmod 700 "$CACHE_DIR"
+QUARRY_INDEX_CACHE_DIR="$CACHE_DIR" python3 scripts/benchmark-public-datasets.py . \
+  /tmp/quarry-phase2-public-bench \
+  --expected-outputs docs/benchmarks/2026-11-21-phase1-public-datasets-golden.json \
+  --threads 8
+```
+
+### Single-Thread SIMD vs Scalar Oracle
+
+```bash
+cargo test --release -p quarry-delimited --test scalar_oracle --locked -- --ignored --nocapture
+```
+
+### Parallel Scaling (`T ∈ {1, 2, 4, 8}`) & Validated Sidecar Hit + Row Seek
+
+```bash
+BENCH=/tmp/quarry-phase2-public-bench/quarry-bench
+# Cache-miss indexing (repeat for T=1,2,4,8 on both datasets):
+"$BENCH" open daily_weather_preprocessed_1896_2023.csv --rows 100 --metrics-only --no-index-cache --cache-state warm --threads "$T"
+# Seed isolated cache once, then measure scan-only search, filter, and export for T=1,2,4,8:
+"$BENCH" open daily_weather_preprocessed_1896_2023.csv --rows 100 --metrics-only --cache-state warm --threads 8
+"$BENCH" search daily_weather_preprocessed_1896_2023.csv --query QUARRY_NOT_PRESENT_20260911 --cache-state warm --threads "$T"
+"$BENCH" filter daily_weather_preprocessed_1896_2023.csv --column 5 --operator between --value 70 --upper-bound 80 --and 1 equals C0X100 --cache-state warm --threads "$T"
+"$BENCH" export daily_weather_preprocessed_1896_2023.csv --output /tmp/out.csv --column 5 --operator between --value 70 --upper-bound 80 --and 1 equals C0X100 --cache-state warm --threads "$T"
+# Validated sidecar hit + deep row seek (5 repeats; row 100000000 for weather, row 20000000 for HN):
+"$BENCH" open daily_weather_preprocessed_1896_2023.csv --rows 100 --metrics-only --jump 100000000 --jump-count 5 --cache-state warm --threads 8
+"$BENCH" open hacknernews.csv --rows 100 --metrics-only --jump 20000000 --jump-count 5 --cache-state warm --threads 8
+```
+
+### Cancellation Shutdown Latency (10 Samples Each)
+
+Cancellation is requested by `quarry-bench` on the 1 ms progress-poll loop the first time
+`progress.bytes_scanned >= 67,108,864` (`64 MiB`). Timing starts immediately before calling
+`job.cancel()` and stops immediately after `job.wait()` returns following worker shutdown
+(`Poll-inclusive cancellation latency` in `apps/quarry-cli/src/lib.rs`). Each `export` sample
+also verifies zero leftover output or staging files in the output directory after return:
+
+```bash
+# Repeat 10 times each on daily_weather_preprocessed_1896_2023.csv at --threads 8:
+"$BENCH" search daily_weather_preprocessed_1896_2023.csv --query QUARRY_NOT_PRESENT_20260911 --cancel-after-bytes 67108864 --threads 8
+"$BENCH" filter daily_weather_preprocessed_1896_2023.csv --column 5 --operator between --value 70 --upper-bound 80 --and 1 equals C0X100 --cancel-after-bytes 67108864 --threads 8
+"$BENCH" export daily_weather_preprocessed_1896_2023.csv --output /tmp/cancel-exp.csv --column 5 --operator between --value 70 --upper-bound 80 --and 1 equals C0X100 --cancel-after-bytes 67108864 --threads 8
+```
+
+### `C04` 10M-Row Synthetic CSV Warm CLI Bootstrap (5 Samples)
+
+Generate the deterministic 10,000,001-row (`346,666,621`-byte) CSV, warm the OS page cache with
+a full sequential read, and time 5 runs of `open --no-wait`:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+p = Path("/tmp/synthetic_10m.csv")
+with p.open("wb") as f:
+    f.write(b"id,station,temp,flag,note\n")
+    buf = bytearray()
+    for i in range(1, 10_000_001):
+        buf.extend(f"{i},ST{i % 1000:04d},{(i % 900) / 10.0:.1f},OK,row-{i}\n".encode())
+        if len(buf) >= 4 * 1024 * 1024:
+            f.write(buf); buf.clear()
+    if buf:
+        f.write(buf)
+PY
+shasum -a 256 /tmp/synthetic_10m.csv >/dev/null
+for _ in 1 2 3 4 5; do
+  "$BENCH" open /tmp/synthetic_10m.csv --rows 100 --metrics-only --no-wait --cache-state warm
+done
+```
