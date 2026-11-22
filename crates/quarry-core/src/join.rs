@@ -48,8 +48,9 @@ const MAX_COALESCE_SPAN_BYTES: u64 = 256 * 1024;
 #[cfg(test)]
 mod storage_test {
     use std::cell::RefCell;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
 
     #[derive(Clone, Default)]
     pub(super) struct Hook {
@@ -57,10 +58,15 @@ mod storage_test {
         pub(super) force_sort_merge: bool,
         pub(super) force_hash_join: bool,
         pub(super) force_hash_partition_fallback_bytes: Option<usize>,
+        pub(super) force_hash_budget_limits: Option<(usize, usize)>,
+        pub(super) force_hash_workers: Option<usize>,
+        pub(super) force_single_pool_worker: bool,
         pub(super) force_hash_collision: bool,
         pub(super) pread_calls: Option<Arc<AtomicU64>>,
         pub(super) hash_fallback_partitions: Option<Arc<AtomicUsize>>,
         pub(super) hash_partitions_processed: Option<Arc<AtomicUsize>>,
+        pub(super) budget_wait_signal: Option<Arc<Mutex<Option<mpsc::Sender<()>>>>>,
+        pub(super) pause_first_hash_worker_until_cancel: Option<Arc<AtomicBool>>,
     }
 
     thread_local! {
@@ -100,6 +106,18 @@ mod storage_test {
         ACTIVE.with(|slot| slot.borrow().force_hash_partition_fallback_bytes)
     }
 
+    pub(super) fn force_hash_budget_limits() -> Option<(usize, usize)> {
+        ACTIVE.with(|slot| slot.borrow().force_hash_budget_limits)
+    }
+
+    pub(super) fn force_hash_workers() -> Option<usize> {
+        ACTIVE.with(|slot| slot.borrow().force_hash_workers)
+    }
+
+    pub(super) fn force_single_pool_worker() -> bool {
+        ACTIVE.with(|slot| slot.borrow().force_single_pool_worker)
+    }
+
     pub(super) fn force_hash_collision() -> bool {
         ACTIVE.with(|slot| slot.borrow().force_hash_collision)
     }
@@ -126,6 +144,30 @@ mod storage_test {
                 counter.fetch_add(1, Ordering::AcqRel);
             }
         });
+    }
+
+    pub(super) fn notify_budget_wait() {
+        ACTIVE.with(|slot| {
+            if let Some(signal) = slot.borrow().budget_wait_signal.as_ref()
+                && let Ok(mut guard) = signal.lock()
+                && let Some(sender) = guard.take()
+            {
+                let _ = sender.send(());
+            }
+        });
+    }
+
+    pub(super) fn maybe_pause_first_hash_worker(cancel: &AtomicBool) {
+        let gate = ACTIVE.with(|slot| slot.borrow().pause_first_hash_worker_until_cancel.clone());
+        if let Some(flag) = gate
+            && flag
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
 }
 
@@ -1334,6 +1376,10 @@ impl<'a> Runs<'a> {
     /// Keep one key per input stream and one payload live during a merge.
     fn merge(&self, runs: Vec<Run>) -> JResult<Run> {
         self.state.check()?;
+        let _fd_guard = crate::pool::engine_pool()
+            .fd_budget()
+            .acquire(runs.len().saturating_add(1), &self.state.cancel)
+            .ok_or(Failure::Cancelled)?;
         let mut readers: Vec<_> = runs
             .iter()
             .map(|run| {
@@ -1387,6 +1433,7 @@ impl<'a> Runs<'a> {
         self.flush_writer(&mut writer)?;
         drop(writer);
         drop(readers);
+        drop(_fd_guard);
         for run in runs {
             run.path.remove()?;
             self.state.temporary.fetch_sub(run.bytes, Ordering::AcqRel);
@@ -8657,7 +8704,18 @@ mod tests {
             h.join().unwrap();
         }
 
-        // 2. Cancellation under tight memory backpressure releases all temp files cleanly.
+        // 2. Deterministic cancellation while a worker is actively blocked in `JobByteBudget::acquire`.
+        let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+        let wait_signal = Arc::new(Mutex::new(Some(wait_tx)));
+        let pause_first = Arc::new(AtomicBool::new(false));
+        let _guard = storage_test::install(storage_test::Hook {
+            force_hash_join: true,
+            force_hash_budget_limits: Some((8 * 1024, 8 * 1024)),
+            force_hash_workers: Some(2),
+            budget_wait_signal: Some(Arc::clone(&wait_signal)),
+            pause_first_hash_worker_until_cancel: Some(Arc::clone(&pause_first)),
+            ..storage_test::Hook::default()
+        });
         let cancel_job = analyze_join(
             [
                 JoinInput {
@@ -8687,17 +8745,185 @@ mod tests {
             },
         )
         .unwrap();
+        wait_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second worker must enter JobByteBudget backpressure wait");
         cancel_job.cancel();
         let outcome = cancel_job.wait().unwrap();
-        if let Some(plan) = outcome {
-            let cancel_out = dir.path().join("cancel-out.csv");
-            let write_job = plan.start_write(cancel_out.clone()).unwrap();
-            write_job.cancel();
-            let write_outcome = write_job.wait().unwrap();
-            if write_outcome.is_none() {
-                assert!(!cancel_out.exists());
+        assert!(
+            outcome.is_none(),
+            "job cancelled while waiting on JobByteBudget must return Cancelled (None)"
+        );
+        assert!(workspaces(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn partitioned_hash_join_single_worker_long_keys_and_tight_fan_in_parity() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Single-worker pool fallback must inspect, partition, analyze, and write both sides.
+        let m1 = dir.path().join("sw-main.csv");
+        let a1 = dir.path().join("sw-add.csv");
+        fs::write(&m1, b"k,v\na,1\nb,2\n,3\nc,4\n").unwrap();
+        fs::write(&a1, b"k,w\nb,20\nc,30\n,40\nd,50\n").unwrap();
+        let make_inputs = |mp: &Path, ap: &Path| {
+            [
+                JoinInput {
+                    path: mp.to_path_buf(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+                JoinInput {
+                    path: ap.to_path_buf(),
+                    delimiter: Some(b','),
+                    has_header: true,
+                    encoding: Some(Encoding::Utf8),
+                    key_columns: vec![0],
+                    expected_version: None,
+                    require_unique: false,
+                },
+            ]
+        };
+        let cfg_full = hash_config(JoinMode::Full, JoinCase::Sensitive);
+        let sw_out = dir.path().join("sw-hash.csv");
+        let sm_out = dir.path().join("sw-sort.csv");
+        {
+            let _guard = storage_test::install(storage_test::Hook {
+                force_hash_join: true,
+                force_single_pool_worker: true,
+                ..storage_test::Hook::default()
+            });
+            let plan = analyze_join(make_inputs(&m1, &a1), dir.path().to_owned(), cfg_full)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(plan.execution, PlanExecution::PartitionedHash(_)));
+            plan.start_write(sw_out.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+        }
+        {
+            let _guard = storage_test::install(storage_test::Hook {
+                force_sort_merge: true,
+                ..storage_test::Hook::default()
+            });
+            let plan = analyze_join(make_inputs(&m1, &a1), dir.path().to_owned(), cfg_full)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            plan.start_write(sm_out.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(fs::read(&sw_out).unwrap(), fs::read(&sm_out).unwrap());
+
+        // 2. Full join with empty keys on both sides under `max_merge_fan_in = 2` must respect fan_in.
+        let tight_cfg = JoinConfig {
+            max_merge_fan_in: 2,
+            ..cfg_full
+        };
+        let tight_out = dir.path().join("tight-fanin.csv");
+        {
+            let _guard = storage_test::install(storage_test::Hook {
+                force_hash_join: true,
+                ..storage_test::Hook::default()
+            });
+            let plan = analyze_join(make_inputs(&m1, &a1), dir.path().to_owned(), tight_cfg)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(plan.execution, PlanExecution::PartitionedHash(_)));
+            plan.start_write(tight_out.clone())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(fs::read(&tight_out).unwrap(), fs::read(&sm_out).unwrap());
+
+        // 3. Long multi-KiB keys across duplicates, unmatched rows, and previews match sort-merge.
+        let m_long = dir.path().join("long-main.csv");
+        let a_long = dir.path().join("long-add.csv");
+        let mut lm = String::from("k,v\n");
+        let mut la = String::from("k,w\n");
+        let pad = "X".repeat(16 * 1024);
+        for i in 0..24 {
+            let key = format!("k{i:03}-{pad}");
+            lm.push_str(&format!("{key},m{i}\n"));
+            if i < 6 {
+                lm.push_str(&format!("{key},m{i}-dup\n"));
+            }
+            if i % 2 == 0 {
+                la.push_str(&format!("{key},a{i}\n"));
             }
         }
+        for i in 24..36 {
+            let key = format!("u{i:03}-{pad}");
+            la.push_str(&format!("{key},a{i}\n"));
+        }
+        fs::write(&m_long, lm.as_bytes()).unwrap();
+        fs::write(&a_long, la.as_bytes()).unwrap();
+
+        let long_hash_out = dir.path().join("long-hash.csv");
+        let long_sort_out = dir.path().join("long-sort.csv");
+        let hash_plan = analyze_join(
+            make_inputs(&m_long, &a_long),
+            dir.path().to_owned(),
+            cfg_full,
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            hash_plan.execution,
+            PlanExecution::PartitionedHash(_)
+        ));
+        let hash_preview = hash_plan.analysis().preview.clone();
+        let hash_dup_len = hash_plan.analysis().duplicate_samples.len();
+        hash_plan
+            .start_write(long_hash_out.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+
+        let _sm = storage_test::install(storage_test::Hook {
+            force_sort_merge: true,
+            ..storage_test::Hook::default()
+        });
+        let sort_plan = analyze_join(
+            make_inputs(&m_long, &a_long),
+            dir.path().to_owned(),
+            cfg_full,
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .unwrap();
+        assert_eq!(hash_preview, sort_plan.analysis().preview);
+        assert_eq!(hash_dup_len, sort_plan.analysis().duplicate_samples.len());
+        sort_plan
+            .start_write(long_sort_out.clone())
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(&long_hash_out).unwrap(),
+            fs::read(&long_sort_out).unwrap()
+        );
         assert!(workspaces(dir.path()).is_empty());
     }
 }

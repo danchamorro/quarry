@@ -23,6 +23,9 @@ const MIN_HASH_MEMORY_BYTES: usize = 2 * 1024 * 1024;
 const MIN_PARTITION_MEM_CAP: usize = 64 * 1024;
 const MAX_PARTITION_MEM_CAP: usize = 128 * 1024 * 1024;
 const MAX_HASH_WORKERS: usize = 8;
+/// Maximum raw framed-key bytes retained per sample ordering key so sample maps remain bounded
+/// regardless of source key length (well within `GROUP_EXAMPLE_RESERVE`).
+const MAX_SAMPLE_KEY_PREFIX: usize = 256;
 /// Many-to-many pair threshold above which a partition falls back to bounded-block sort-merge
 /// during creation so explosive skew never retains unbounded groups in hash buffers.
 const SKEW_FALLBACK_PAIR_THRESHOLD: u64 = 65_536;
@@ -30,6 +33,122 @@ const EMPTY_SLOT: u32 = 0;
 const NO_NEXT_ROW: u32 = u32::MAX;
 const MATCHED_BIT: u32 = 1_u32 << 31;
 const KEY_LEN_MASK: u32 = !MATCHED_BIT;
+
+/// 128-bit dual-stream digest of a framed comparison key (zero heap allocation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct KeyDigest {
+    a: u64,
+    b: u64,
+}
+
+impl KeyDigest {
+    const INIT_A: u64 = 0xcbf2_9ce4_8422_2325;
+    const INIT_B: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    #[inline]
+    fn new() -> Self {
+        Self {
+            a: Self::INIT_A,
+            b: Self::INIT_B,
+        }
+    }
+
+    #[inline]
+    fn feed_byte(&mut self, byte: u8) {
+        self.a ^= u64::from(byte);
+        self.a = self.a.wrapping_mul(0x0000_0100_0000_01b3);
+        self.b ^= u64::from(byte).wrapping_add(0x51);
+        self.b = self.b.wrapping_mul(0x9e37_79b1_85eb_ca87).rotate_left(7);
+    }
+
+    #[inline]
+    fn feed_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.feed_byte(byte);
+        }
+    }
+
+    #[inline]
+    fn finish(mut self) -> Self {
+        self.a ^= self.a >> 30;
+        self.a = self.a.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        self.a ^= self.a >> 27;
+        self.a = self.a.wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.a ^= self.a >> 31;
+
+        self.b ^= self.b >> 33;
+        self.b = self.b.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        self.b ^= self.b >> 33;
+        self.b = self.b.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        self.b ^= self.b >> 33;
+        self
+    }
+
+    fn from_bytes(key: &[u8]) -> Self {
+        let mut h = Self::new();
+        h.feed_bytes(key);
+        h.finish()
+    }
+
+    fn from_empty_ordinal(ordinal: u64) -> Self {
+        let mut h = Self::new();
+        h.feed_byte(0);
+        h.feed_bytes(&ordinal.to_be_bytes());
+        h.finish()
+    }
+
+    fn from_fields(
+        fields: &[Cow<'_, [u8]>],
+        columns: &[usize],
+        ordinal: u64,
+        case: JoinCase,
+    ) -> Self {
+        if columns
+            .iter()
+            .any(|&column| fields.get(column).is_none_or(|field| field.is_empty()))
+        {
+            return Self::from_empty_ordinal(ordinal);
+        }
+        let mut h = Self::new();
+        h.feed_byte(1);
+        for &column in columns {
+            let value = &fields[column];
+            h.feed_bytes(&(value.len() as u64).to_be_bytes());
+            for &byte in value.as_ref() {
+                h.feed_byte(case.byte(byte));
+            }
+        }
+        h.finish()
+    }
+}
+
+/// Bounded sample ordering key (`<= 256` prefix bytes + 16-byte digest) so duplicate and
+/// unmatched sample maps retain O(1) bytes even for multi-megabyte join keys.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SampleKey {
+    prefix: Vec<u8>,
+    digest: KeyDigest,
+}
+
+impl SampleKey {
+    fn from_bytes(key: &[u8]) -> Self {
+        let len = key.len().min(MAX_SAMPLE_KEY_PREFIX);
+        let mut prefix = Vec::with_capacity(len);
+        prefix.extend_from_slice(&key[..len]);
+        Self {
+            prefix,
+            digest: KeyDigest::from_bytes(key),
+        }
+    }
+
+    fn cmp_raw(&self, key: &[u8]) -> CmpOrdering {
+        let prefix = &key[..key.len().min(MAX_SAMPLE_KEY_PREFIX)];
+        match self.prefix.as_slice().cmp(prefix) {
+            CmpOrdering::Equal => self.digest.cmp(&KeyDigest::from_bytes(key)),
+            other => other,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct PartitionMeta {
@@ -131,8 +250,13 @@ fn hash_budget_limits(config: JoinConfig) -> (usize, usize) {
     let total = (available / 2).clamp(MIN_PARTITION_MEM_CAP, 256 * 1024 * 1024);
     let per_partition = (total / 2).clamp(MIN_PARTITION_MEM_CAP, MAX_PARTITION_MEM_CAP);
     #[cfg(test)]
-    if let Some(forced) = storage_test::force_hash_partition_fallback_bytes() {
-        return (total.min(forced.max(1)), forced.max(1));
+    {
+        if let Some((forced_total, forced_per_part)) = storage_test::force_hash_budget_limits() {
+            return (forced_total.max(1), forced_per_part.max(1));
+        }
+        if let Some(forced) = storage_test::force_hash_partition_fallback_bytes() {
+            return (total.min(forced.max(1)), forced.max(1));
+        }
     }
     (total, per_partition)
 }
@@ -211,6 +335,8 @@ impl JobByteBudget {
                     bytes: need,
                 });
             }
+            #[cfg(test)]
+            storage_test::notify_budget_wait();
             let (next, _) = self
                 .available
                 .wait_timeout(used, Duration::from_millis(10))
@@ -220,13 +346,20 @@ impl JobByteBudget {
     }
 }
 
-/// Run `worker_count` tasks on the global `EnginePool` and join all of them before returning.
+/// Run up to `desired_workers` tasks on the global `EnginePool` and join all of them before returning.
 fn run_on_engine_pool<F>(desired_workers: usize, task_factory: F) -> JResult<()>
 where
     F: Fn(usize) + Send + Sync + 'static,
 {
     let pool = engine_pool();
-    let workers = pool.ensure_workers(desired_workers.max(1))?;
+    let desired = desired_workers.max(1);
+    #[cfg(test)]
+    let desired = if storage_test::force_single_pool_worker() {
+        1
+    } else {
+        desired
+    };
+    let workers = pool.ensure_workers(desired)?;
     if workers <= 1 {
         task_factory(0);
         return Ok(());
@@ -301,6 +434,24 @@ where
     Ok(())
 }
 
+/// Run both logical sides (`0` and `1`) across up to 2 pool workers, falling back to running both
+/// sequentially on the caller thread if the pool returns only 1 worker.
+fn run_pair_on_engine_pool<F>(side_task: F) -> JResult<()>
+where
+    F: Fn(usize) + Send + Sync + 'static,
+{
+    let next_side = Arc::new(AtomicUsize::new(0));
+    run_on_engine_pool(2, move |_| {
+        loop {
+            let side = next_side.fetch_add(1, Ordering::AcqRel);
+            if side >= 2 {
+                break;
+            }
+            side_task(side);
+        }
+    })
+}
+
 /// Run two independent inspection passes in parallel while preserving Main-before-Additional error priority.
 pub(super) fn inspect_pair(
     inputs: [JoinInput; 2],
@@ -312,26 +463,21 @@ pub(super) fn inspect_pair(
     let [left_input, right_input] = inputs;
     let [left_working, right_working] = working;
 
-    let left_failed = Arc::new(AtomicBool::new(false));
     let left_result: Arc<Mutex<Option<JResult<Inspected>>>> = Arc::new(Mutex::new(None));
     let right_result: Arc<Mutex<Option<JResult<Inspected>>>> = Arc::new(Mutex::new(None));
 
     let left_slot = Arc::new(Mutex::new(Some((left_input, left_working))));
     let right_slot = Arc::new(Mutex::new(Some((right_input, right_working))));
     let state_arc = Arc::clone(state);
-    let left_failed_worker = Arc::clone(&left_failed);
     let left_result_worker = Arc::clone(&left_result);
     let right_result_worker = Arc::clone(&right_result);
 
-    run_on_engine_pool(2, move |idx| {
+    run_pair_on_engine_pool(move |idx| {
         if idx == 0 {
             let Some((input, working)) = left_slot.lock().unwrap().take() else {
                 return;
             };
             let res = inspect_inner(input, working, config, &state_arc);
-            if res.is_err() {
-                left_failed_worker.store(true, Ordering::Release);
-            }
             *left_result_worker.lock().unwrap() = Some(res);
         } else {
             let Some((input, working)) = right_slot.lock().unwrap().take() else {
@@ -412,6 +558,11 @@ fn partition_one_input(
     config: JoinConfig,
     state: &Progress,
 ) -> JResult<(PartitionedInput, LocatorFingerprint)> {
+    let _fd_guard = engine_pool()
+        .fd_budget()
+        .acquire(partition_count.saturating_add(2), &state.cancel)
+        .ok_or(Failure::Cancelled)?;
+
     let mut part_metas: Vec<PartitionMeta> = (0..partition_count)
         .map(|_| PartitionMeta::default())
         .collect();
@@ -552,6 +703,7 @@ fn partition_one_input(
     for mut writer in part_writers.into_iter().flatten() {
         flush_partition_writer(workspace, state, &mut writer)?;
     }
+    drop(_fd_guard);
     if rows != input.info.data_rows {
         return Err(QuarryError::SourceChanged.into());
     }
@@ -579,7 +731,7 @@ pub(super) fn prepare_and_analyze_hash(
     let total_frame_bytes = add(inspected[0].frame_bytes, inspected[1].frame_bytes)?;
     let partition_count = choose_partition_count(total_frame_bytes, config);
     let fd_cap = engine_pool().fd_budget().limit();
-    let parallel_partition = fd_cap >= 2 * partition_count + 16;
+    let parallel_partition = fd_cap >= 2 * (partition_count + 2);
     let writer_buf_bytes =
         (config.run_memory_bytes / (4 * partition_count)).clamp(4 * 1024, 64 * 1024);
 
@@ -602,7 +754,7 @@ pub(super) fn prepare_and_analyze_hash(
         let ws = Arc::clone(workspace);
         let st = Arc::clone(state);
 
-        run_on_engine_pool(2, move |idx| {
+        run_pair_on_engine_pool(move |idx| {
             if idx == 0 {
                 let res = partition_one_input(
                     &l_in.0,
@@ -1024,13 +1176,40 @@ impl AnalysisTable {
         let start = group.key_start as usize;
         &self.key_arena[start..start + group.key_len as usize]
     }
+
+    #[inline]
+    fn find(&self, key: &[u8]) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let h = hash_key(key);
+        let mask = self.slots.len() - 1;
+        let mut pos = (h as usize) & mask;
+        loop {
+            let slot = self.slots[pos];
+            if slot == EMPTY_SLOT {
+                return None;
+            }
+            let idx = (slot - 1) as usize;
+            let group = &self.groups[idx];
+            if group.hash == h
+                && group.key_len as usize == key.len()
+                && &self.key_arena[group.key_start as usize..group.key_start as usize + key.len()]
+                    == key
+            {
+                return Some(idx);
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
 }
 
+#[derive(Clone, Copy)]
 struct PreviewCandidate {
     main_row: Option<RowRef>,
     additional_row: Option<RowRef>,
-    left_key: Option<Vec<u8>>,
-    right_key: Option<Vec<u8>>,
+    left_key: Option<KeyDigest>,
+    right_key: Option<KeyDigest>,
 }
 
 struct PartitionAnalysisOut {
@@ -1043,8 +1222,8 @@ struct PartitionAnalysisOut {
     many_to_many_pairs: u64,
     output_rows: u64,
     output_bytes: u64,
-    duplicate_samples: BTreeMap<Vec<u8>, JoinDuplicateExample>,
-    unmatched_samples: [BTreeMap<Vec<u8>, JoinUnmatchedExample>; 2],
+    duplicate_samples: BTreeMap<SampleKey, JoinDuplicateExample>,
+    unmatched_samples: [BTreeMap<SampleKey, JoinUnmatchedExample>; 2],
     preview_candidates: BTreeMap<(u64, u64), PreviewCandidate>,
     unique_error: Option<(usize, u64)>,
 }
@@ -1094,7 +1273,12 @@ fn estimate_build_ram(meta: &PartitionMeta) -> usize {
         .saturating_add(slots.saturating_mul(std::mem::size_of::<u32>()))
 }
 
-fn insert_bounded_sample<V>(map: &mut BTreeMap<Vec<u8>, V>, key: Vec<u8>, value: V, limit: usize) {
+fn insert_bounded_sample<V>(
+    map: &mut BTreeMap<SampleKey, V>,
+    key: SampleKey,
+    value: V,
+    limit: usize,
+) {
     if limit == 0 {
         return;
     }
@@ -1122,6 +1306,34 @@ fn insert_bounded_preview(
     map.insert(order, candidate);
     while map.len() > limit {
         map.pop_last();
+    }
+}
+
+fn cleanup_fallback_runs<T>(
+    primary: JResult<T>,
+    runs: &[(&SpillFile, u64)],
+    state: &Progress,
+) -> JResult<T> {
+    let mut cleanup_err: Option<QuarryError> = None;
+    for &(file, bytes) in runs {
+        match file.remove() {
+            Ok(()) => state.sub_disk(bytes),
+            Err(err) => {
+                if cleanup_err.is_none() {
+                    cleanup_err = Some(err.into());
+                }
+            }
+        }
+    }
+    match (primary, cleanup_err) {
+        (Ok(val), None) => Ok(val),
+        (Ok(_), Some(err)) => Err(err.into()),
+        (Err(primary_err), None) => Err(primary_err),
+        (Err(primary_err), Some(err)) => Err(error(format!(
+            "{}. Could not remove private fallback sort data: {err}",
+            primary_err.description()
+        ))
+        .into()),
     }
 }
 
@@ -1212,9 +1424,7 @@ fn analyze_partition_sort_merge(
     let sorted1 = match sort_partition_file(&inputs[1], metas[1], workspace, config, state) {
         Ok(run) => run,
         Err(err) => {
-            let _ = sorted0.path.remove();
-            state.sub_disk(sorted0.bytes);
-            return Err(err);
+            return cleanup_fallback_runs(Err(err), &[(&sorted0.path, sorted0.bytes)], state);
         }
     };
     let s0_path = sorted0.path.clone();
@@ -1230,7 +1440,7 @@ fn analyze_partition_sort_merge(
         view1.info.data_rows = metas[1].rows;
         let views = [view0, view1];
 
-        let build_side = usize::from(metas[1].bytes < metas[0].bytes);
+        let build_side = usize::from(estimate_build_ram(metas[1]) < estimate_build_ram(metas[0]));
         let fallback_extra = mul(add(metas[0].bytes, metas[1].bytes)?, 2)?;
         let mut out = PartitionAnalysisOut::empty(PartitionPlan {
             build_side,
@@ -1255,7 +1465,7 @@ fn analyze_partition_sort_merge(
                     let key = &left.as_ref().or(right.as_ref()).unwrap().key;
                     insert_bounded_sample(
                         &mut out.duplicate_samples,
-                        key.clone(),
+                        SampleKey::from_bytes(key),
                         JoinDuplicateExample {
                             key: key_label(key)?,
                             main_rows: left.as_ref().map_or(0, |g| g.range.rows),
@@ -1268,7 +1478,7 @@ fn analyze_partition_sort_merge(
                     (Some(group), None) => {
                         insert_bounded_sample(
                             &mut out.unmatched_samples[0],
-                            group.key.clone(),
+                            SampleKey::from_bytes(&group.key),
                             JoinUnmatchedExample {
                                 data_row: group.first_ordinal + 1,
                                 key: Some(key_label(&group.key)?),
@@ -1279,7 +1489,7 @@ fn analyze_partition_sort_merge(
                     (None, Some(group)) => {
                         insert_bounded_sample(
                             &mut out.unmatched_samples[1],
-                            group.key.clone(),
+                            SampleKey::from_bytes(&group.key),
                             JoinUnmatchedExample {
                                 data_row: group.first_ordinal + 1,
                                 key: Some(key_label(&group.key)?),
@@ -1302,10 +1512,10 @@ fn analyze_partition_sort_merge(
                             .last_key_value()
                             .is_some_and(|(&last, _)| min_order < last));
                 let left_key = may_improve_preview
-                    .then(|| left.as_ref().map(|g| g.key.clone()))
+                    .then(|| left.as_ref().map(|g| KeyDigest::from_bytes(&g.key)))
                     .flatten();
                 let right_key = may_improve_preview
-                    .then(|| right.as_ref().map(|g| g.key.clone()))
+                    .then(|| right.as_ref().map(|g| KeyDigest::from_bytes(&g.key)))
                     .flatten();
                 let left_data = left.map(Group::into_data);
                 let right_data = right.map(Group::into_data);
@@ -1397,8 +1607,8 @@ fn analyze_partition_sort_merge(
                                 PreviewCandidate {
                                     main_row,
                                     additional_row: add_row,
-                                    left_key: left_key.clone(),
-                                    right_key: right_key.clone(),
+                                    left_key,
+                                    right_key,
                                 },
                                 config.preview_rows,
                             );
@@ -1426,11 +1636,7 @@ fn analyze_partition_sort_merge(
         Ok(out)
     })();
 
-    let _ = s0_path.remove();
-    state.sub_disk(s0_bytes);
-    let _ = s1_path.remove();
-    state.sub_disk(s1_bytes);
-    result
+    cleanup_fallback_runs(result, &[(&s0_path, s0_bytes), (&s1_path, s1_bytes)], state)
 }
 
 fn temporary_info_clone(info: &JoinInputInfo) -> JoinInputInfo {
@@ -1670,6 +1876,11 @@ fn analyze_partition_hash(
     state: &Progress,
 ) -> JResult<Option<PartitionAnalysisOut>> {
     table.prepare_for_metas(metas, mem_cap);
+    #[cfg(test)]
+    {
+        storage_test::maybe_pause_first_hash_worker(&state.cancel);
+        state.check()?;
+    }
     let mut earliest_unique: Option<(usize, u64)> = None;
 
     for side in 0..2 {
@@ -1730,7 +1941,9 @@ fn analyze_partition_hash(
         }
     }
 
-    let build_side = usize::from(metas[1].bytes < metas[0].bytes);
+    let est_build_0 = estimate_build_ram(metas[0]);
+    let est_build_1 = estimate_build_ram(metas[1]);
+    let build_side = usize::from(est_build_1 < est_build_0);
     let mut out = PartitionAnalysisOut::empty(PartitionPlan {
         build_side,
         use_sort_merge: false,
@@ -1758,11 +1971,11 @@ fn analyze_partition_hash(
                 || out
                     .duplicate_samples
                     .last_key_value()
-                    .is_some_and(|(last, _)| key < last.as_slice())
+                    .is_some_and(|(last, _)| last.cmp_raw(key) == CmpOrdering::Greater)
             {
                 insert_bounded_sample(
                     &mut out.duplicate_samples,
-                    key.to_vec(),
+                    SampleKey::from_bytes(key),
                     JoinDuplicateExample {
                         key: key_label(key)?,
                         main_rows: u64::from(group.rows[0]),
@@ -1779,11 +1992,11 @@ fn analyze_partition_hash(
             if out.unmatched_samples[0].len() < MAX_GROUP_EXAMPLES
                 || out.unmatched_samples[0]
                     .last_key_value()
-                    .is_some_and(|(last, _)| key < last.as_slice())
+                    .is_some_and(|(last, _)| last.cmp_raw(key) == CmpOrdering::Greater)
             {
                 insert_bounded_sample(
                     &mut out.unmatched_samples[0],
-                    key.to_vec(),
+                    SampleKey::from_bytes(key),
                     JoinUnmatchedExample {
                         data_row: group.first_ordinal[0] + 1,
                         key: Some(key_label(key)?),
@@ -1796,11 +2009,11 @@ fn analyze_partition_hash(
             if out.unmatched_samples[1].len() < MAX_GROUP_EXAMPLES
                 || out.unmatched_samples[1]
                     .last_key_value()
-                    .is_some_and(|(last, _)| key < last.as_slice())
+                    .is_some_and(|(last, _)| last.cmp_raw(key) == CmpOrdering::Greater)
             {
                 insert_bounded_sample(
                     &mut out.unmatched_samples[1],
-                    key.to_vec(),
+                    SampleKey::from_bytes(key),
                     JoinUnmatchedExample {
                         data_row: group.first_ordinal[1] + 1,
                         key: Some(key_label(key)?),
@@ -1871,41 +2084,64 @@ fn analyze_partition_hash(
         }
     }
 
-    // Collect exact preview RowRefs for the <= `preview_rows` qualifying groups in this partition.
+    // Collect exact preview RowRefs for the <= `preview_rows` qualifying groups in this partition,
+    // looking up group indices directly in `table` (zero key cloning) while re-validating every
+    // partition frame's ordinal order, bounds, and `LocatorFingerprint`.
     if !preview_groups.is_empty() {
-        let mut preview_keys: HashMap<Vec<u8>, [Vec<RowRef>; 2]> = HashMap::new();
+        let mut preview_group_slot: HashMap<usize, usize> =
+            HashMap::with_capacity(preview_groups.len());
+        let mut preview_rows_by_slot: Vec<[Vec<RowRef>; 2]> =
+            Vec::with_capacity(preview_groups.len());
         for &group_idx in preview_groups.values() {
-            let group = &table.groups[group_idx];
-            preview_keys.insert(table.key_bytes(group).to_vec(), [Vec::new(), Vec::new()]);
+            let slot = preview_rows_by_slot.len();
+            preview_group_slot.insert(group_idx, slot);
+            preview_rows_by_slot.push([Vec::new(), Vec::new()]);
         }
         for side in 0..2 {
             let Some(file) = metas[side].file.as_ref() else {
                 continue;
             };
             let mut reader = BufReader::with_capacity(READ_CHUNK, file.open()?);
+            let mut seen_rows = 0_u64;
+            let mut last_ordinal: Option<u64> = None;
+            let mut observed_fp = LocatorFingerprint::default();
             while let Some(head) = read_head(&mut reader, config, state)? {
+                state.check()?;
+                if last_ordinal.is_some_and(|last| head.ordinal <= last) {
+                    return Err(error("Private join ordinals are out of order.").into());
+                }
                 let raw =
                     read_exact_fixed::<ROW_LOCATOR_BYTES>(&mut reader, head.record_len, state)?;
-                if let Some(lists) = preview_keys.get_mut(&head.key)
-                    && lists[side].len() < config.preview_rows
+                let locator = RowLocator::from_le_bytes(&raw);
+                validate_row_locator(locator, &inputs[side], head.ordinal, config)?;
+                observed_fp.observe_row(head.ordinal, locator, &head.key);
+                if let Some(group_idx) = table.find(&head.key)
+                    && let Some(&slot) = preview_group_slot.get(&group_idx)
+                    && preview_rows_by_slot[slot][side].len() < config.preview_rows
                 {
-                    let locator = RowLocator::from_le_bytes(&raw);
-                    lists[side].push(RowRef {
+                    preview_rows_by_slot[slot][side].push(RowRef {
                         ordinal: head.ordinal,
                         source_offset: locator.source_offset,
                         record_len: locator.record_len,
                     });
                 }
+                last_ordinal = Some(head.ordinal);
+                seen_rows = add(seen_rows, 1)?;
+            }
+            if seen_rows != metas[side].rows || observed_fp != metas[side].fingerprint {
+                return Err(error("Private join row locators changed.").into());
             }
         }
         for &group_idx in preview_groups.values() {
-            let group = &table.groups[group_idx];
-            let key_bytes = table.key_bytes(group);
-            let Some(lists) = preview_keys.get(key_bytes) else {
+            let Some(&slot) = preview_group_slot.get(&group_idx) else {
                 continue;
             };
-            let (left_rows, right_rows) = (&lists[0], &lists[1]);
-            let key_vec = key_bytes.to_vec();
+            let group = &table.groups[group_idx];
+            let key_digest = KeyDigest::from_bytes(table.key_bytes(group));
+            let (left_rows, right_rows) = (
+                &preview_rows_by_slot[slot][0],
+                &preview_rows_by_slot[slot][1],
+            );
             match (left_rows.is_empty(), right_rows.is_empty()) {
                 (false, false) => {
                     let right_drives = config.mode == JoinMode::Right;
@@ -1921,8 +2157,8 @@ fn analyze_partition_hash(
                                     PreviewCandidate {
                                         main_row: Some(l),
                                         additional_row: Some(r),
-                                        left_key: Some(key_vec.clone()),
-                                        right_key: Some(key_vec.clone()),
+                                        left_key: Some(key_digest),
+                                        right_key: Some(key_digest),
                                     },
                                     config.preview_rows,
                                 );
@@ -1943,8 +2179,8 @@ fn analyze_partition_hash(
                                     PreviewCandidate {
                                         main_row: Some(l),
                                         additional_row: Some(r),
-                                        left_key: Some(key_vec.clone()),
-                                        right_key: Some(key_vec.clone()),
+                                        left_key: Some(key_digest),
+                                        right_key: Some(key_digest),
                                     },
                                     config.preview_rows,
                                 );
@@ -1965,7 +2201,7 @@ fn analyze_partition_hash(
                             PreviewCandidate {
                                 main_row: Some(l),
                                 additional_row: None,
-                                left_key: Some(key_vec.clone()),
+                                left_key: Some(key_digest),
                                 right_key: None,
                             },
                             config.preview_rows,
@@ -1982,7 +2218,7 @@ fn analyze_partition_hash(
                                 main_row: None,
                                 additional_row: Some(r),
                                 left_key: None,
-                                right_key: Some(key_vec.clone()),
+                                right_key: Some(key_digest),
                             },
                             config.preview_rows,
                         );
@@ -1994,13 +2230,106 @@ fn analyze_partition_hash(
     }
 
     // Decide whether creation should automatically fall back to sort-merge for this partition.
-    let est_build = estimate_build_ram(metas[build_side]);
+    let est_build = est_build_0.min(est_build_1);
     if est_build > create_mem_cap || out.plan.max_group_pairs > SKEW_FALLBACK_PAIR_THRESHOLD {
         out.plan.use_sort_merge = true;
         out.plan.fallback_extra_bytes = mul(add(metas[0].bytes, metas[1].bytes)?, 2)?;
     }
 
     Ok(Some(out))
+}
+
+struct AnalysisAccumulator {
+    partition_plans: Vec<Option<PartitionPlan>>,
+    completed: usize,
+    matching: [u64; 2],
+    pairs: u64,
+    unmatched: [u64; 2],
+    duplicate_groups: [u64; 2],
+    many_to_many_groups: u64,
+    many_to_many_pairs: u64,
+    output_rows: u64,
+    output_bytes: u64,
+    duplicate_samples: BTreeMap<SampleKey, JoinDuplicateExample>,
+    unmatched_samples: [BTreeMap<SampleKey, JoinUnmatchedExample>; 2],
+    preview_candidates: BTreeMap<(u64, u64), PreviewCandidate>,
+    earliest_unique: Option<(usize, u64)>,
+    first_error: Option<Failure>,
+}
+
+impl AnalysisAccumulator {
+    fn new(partition_count: usize, header_bytes: u64) -> Self {
+        Self {
+            partition_plans: vec![None; partition_count],
+            completed: 0,
+            matching: [0, 0],
+            pairs: 0,
+            unmatched: [0, 0],
+            duplicate_groups: [0, 0],
+            many_to_many_groups: 0,
+            many_to_many_pairs: 0,
+            output_rows: 0,
+            output_bytes: header_bytes,
+            duplicate_samples: BTreeMap::new(),
+            unmatched_samples: [BTreeMap::new(), BTreeMap::new()],
+            preview_candidates: BTreeMap::new(),
+            earliest_unique: None,
+            first_error: None,
+        }
+    }
+
+    fn fold(&mut self, partition: usize, res: JResult<PartitionAnalysisOut>, preview_rows: usize) {
+        self.completed += 1;
+        let part = match res {
+            Ok(part) => part,
+            Err(err) => {
+                if self.first_error.is_none() {
+                    self.first_error = Some(err);
+                }
+                return;
+            }
+        };
+        if let Some(u) = part.unique_error {
+            if self.earliest_unique.is_none_or(|prev| u < prev) {
+                self.earliest_unique = Some(u);
+            }
+            return;
+        }
+        self.partition_plans[partition] = Some(part.plan);
+        let merge_counts = (|| -> JResult<()> {
+            self.matching[0] = add(self.matching[0], part.matching[0])?;
+            self.matching[1] = add(self.matching[1], part.matching[1])?;
+            self.pairs = add(self.pairs, part.pairs)?;
+            self.unmatched[0] = add(self.unmatched[0], part.unmatched[0])?;
+            self.unmatched[1] = add(self.unmatched[1], part.unmatched[1])?;
+            self.duplicate_groups[0] = add(self.duplicate_groups[0], part.duplicate_groups[0])?;
+            self.duplicate_groups[1] = add(self.duplicate_groups[1], part.duplicate_groups[1])?;
+            self.many_to_many_groups = add(self.many_to_many_groups, part.many_to_many_groups)?;
+            self.many_to_many_pairs = add(self.many_to_many_pairs, part.many_to_many_pairs)?;
+            self.output_rows = add(self.output_rows, part.output_rows)?;
+            self.output_bytes = add(self.output_bytes, part.output_bytes)?;
+            Ok(())
+        })();
+        if let Err(err) = merge_counts {
+            if self.first_error.is_none() {
+                self.first_error = Some(err);
+            }
+            return;
+        }
+        for (k, v) in part.duplicate_samples {
+            insert_bounded_sample(&mut self.duplicate_samples, k, v, MAX_GROUP_EXAMPLES);
+        }
+        let [u0, u1] = part.unmatched_samples;
+        for (k, v) in u0 {
+            insert_bounded_sample(&mut self.unmatched_samples[0], k, v, MAX_GROUP_EXAMPLES);
+        }
+        for (k, v) in u1 {
+            insert_bounded_sample(&mut self.unmatched_samples[1], k, v, MAX_GROUP_EXAMPLES);
+        }
+        for (order, cand) in part.preview_candidates {
+            insert_bounded_preview(&mut self.preview_candidates, order, cand, preview_rows);
+        }
+    }
 }
 
 fn analyze_partitioned(
@@ -2030,12 +2359,18 @@ fn analyze_partitioned(
     let budget = Arc::new(JobByteBudget::new(hash_budget_total));
     let fallback_lock = Arc::new(Mutex::new(()));
     let next_part = Arc::new(AtomicUsize::new(0));
-    let results: Arc<Mutex<Vec<Option<JResult<PartitionAnalysisOut>>>>> =
-        Arc::new(Mutex::new((0..partition_count).map(|_| None).collect()));
+    let accumulator = Arc::new(Mutex::new(AnalysisAccumulator::new(
+        partition_count,
+        header_bytes,
+    )));
     let workers = default_worker_threads()
         .clamp(1, MAX_HASH_WORKERS)
         .min(partition_count)
         .min(max_concurrent_tables);
+    #[cfg(test)]
+    let workers = storage_test::force_hash_workers().map_or(workers, |forced| {
+        forced.clamp(1, MAX_HASH_WORKERS).min(partition_count)
+    });
 
     // Share read-only slices via raw-free Arc wrappers built from cloned lightweight metadata.
     let shared_inputs = Arc::new([
@@ -2074,12 +2409,13 @@ fn analyze_partitioned(
     let b_arc = Arc::clone(&budget);
     let fb_arc = Arc::clone(&fallback_lock);
     let np_arc = Arc::clone(&next_part);
-    let res_arc = Arc::clone(&results);
+    let acc_arc = Arc::clone(&accumulator);
     let in_arc = Arc::clone(&shared_inputs);
     let sd_arc = Arc::clone(&shared_sides);
 
     run_on_engine_pool(workers, move |_| {
         let mut table = AnalysisTable::new();
+        let mut held_permit: Option<JobBytePermit<'_>> = None;
         loop {
             if st.check().is_err() {
                 break;
@@ -2101,120 +2437,69 @@ fn analyze_partitioned(
                 #[cfg(test)]
                 storage_test::record_hash_partition();
 
-                let est = estimate_analysis_ram(metas[0], metas[1]);
-                {
-                    let _permit = b_arc.acquire(est.min(per_partition_cap), &st)?;
-                    if let Some(analyzed) = analyze_partition_hash(
-                        &in_arc,
-                        metas,
-                        columns,
-                        &mut table,
-                        per_partition_cap,
-                        per_partition_cap,
-                        config,
-                        &st,
-                    )? {
-                        st.records.fetch_add(metas[0].rows, Ordering::AcqRel);
-                        return Ok(analyzed);
+                let est = estimate_analysis_ram(metas[0], metas[1]).min(per_partition_cap);
+                let need = est.max(1);
+                // Keep retained table capacity charged to `JobByteBudget` at all times; release
+                // both `table` and `held_permit` before acquiring a larger permit so we never
+                // hold uncharged memory or deadlock under backpressure.
+                let permit_bytes = match held_permit.as_ref() {
+                    Some(permit) if permit.bytes >= need => permit.bytes,
+                    _ => {
+                        table.reset(0);
+                        held_permit = None;
+                        let permit = b_arc.acquire(need, &st)?;
+                        let bytes = permit.bytes;
+                        held_permit = Some(permit);
+                        bytes
                     }
-                    // Exceeded budget dynamically; drop permit before sort-merge fallback.
+                };
+                let effective_cap = permit_bytes.min(per_partition_cap);
+                if let Some(analyzed) = analyze_partition_hash(
+                    &in_arc,
+                    metas,
+                    columns,
+                    &mut table,
+                    effective_cap,
+                    per_partition_cap,
+                    config,
+                    &st,
+                )? {
+                    if table.mem_bytes() > permit_bytes {
+                        table.reset(0);
+                    }
+                    st.records.fetch_add(metas[0].rows, Ordering::AcqRel);
+                    return Ok(analyzed);
                 }
+                // Exceeded budget dynamically; release table and permit before sort-merge fallback.
                 table.reset(0);
+                held_permit = None;
                 let _fb = fb_arc.lock().unwrap();
                 let analyzed =
                     analyze_partition_sort_merge(&in_arc, metas, columns, &ws, config, &st)?;
                 st.records.fetch_add(metas[0].rows, Ordering::AcqRel);
                 Ok(analyzed)
             })();
-            res_arc.lock().unwrap()[p] = Some(out);
+            if out.is_err() {
+                table.reset(0);
+                held_permit = None;
+            }
+            acc_arc.lock().unwrap().fold(p, out, config.preview_rows);
         }
+        drop(table);
+        drop(held_permit);
     })?;
 
     state.check()?;
     let sides = Arc::try_unwrap(shared_sides).expect("analysis workers finished");
     drop(shared_inputs);
 
-    let mut matching = [0_u64; 2];
-    let mut pairs = 0_u64;
-    let mut unmatched = [0_u64; 2];
-    let mut duplicate_groups = [0_u64; 2];
-    let mut many_to_many_groups = 0_u64;
-    let mut many_to_many_pairs = 0_u64;
-    let mut output_rows = 0_u64;
-    let mut output_bytes = header_bytes;
-    let mut duplicate_samples_map: BTreeMap<Vec<u8>, JoinDuplicateExample> = BTreeMap::new();
-    let mut unmatched_matchable_maps: [BTreeMap<Vec<u8>, JoinUnmatchedExample>; 2] =
-        [BTreeMap::new(), BTreeMap::new()];
-    let mut preview_candidates: BTreeMap<(u64, u64), PreviewCandidate> = BTreeMap::new();
-    let mut partition_plans = Vec::with_capacity(partition_count);
-    let mut max_fallback_extra = 0_u64;
-    let mut earliest_unique: Option<(usize, u64)> = None;
-    let mut first_error: Option<Failure> = None;
+    let acc = Arc::try_unwrap(accumulator)
+        .ok()
+        .expect("analysis accumulator unshared")
+        .into_inner()
+        .unwrap();
 
-    let part_results = std::mem::take(&mut *results.lock().unwrap());
-    for slot in part_results {
-        let Some(res) = slot else {
-            return Err(Failure::Cancelled);
-        };
-        match res {
-            Err(err) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-            Ok(part) => {
-                if let Some(u) = part.unique_error {
-                    if earliest_unique.is_none_or(|prev| u < prev) {
-                        earliest_unique = Some(u);
-                    }
-                    continue;
-                }
-                partition_plans.push(part.plan);
-                max_fallback_extra = max_fallback_extra.max(part.plan.fallback_extra_bytes);
-                matching[0] = add(matching[0], part.matching[0])?;
-                matching[1] = add(matching[1], part.matching[1])?;
-                pairs = add(pairs, part.pairs)?;
-                unmatched[0] = add(unmatched[0], part.unmatched[0])?;
-                unmatched[1] = add(unmatched[1], part.unmatched[1])?;
-                duplicate_groups[0] = add(duplicate_groups[0], part.duplicate_groups[0])?;
-                duplicate_groups[1] = add(duplicate_groups[1], part.duplicate_groups[1])?;
-                many_to_many_groups = add(many_to_many_groups, part.many_to_many_groups)?;
-                many_to_many_pairs = add(many_to_many_pairs, part.many_to_many_pairs)?;
-                output_rows = add(output_rows, part.output_rows)?;
-                output_bytes = add(output_bytes, part.output_bytes)?;
-                for (k, v) in part.duplicate_samples {
-                    insert_bounded_sample(&mut duplicate_samples_map, k, v, MAX_GROUP_EXAMPLES);
-                }
-                let [u0, u1] = part.unmatched_samples;
-                for (k, v) in u0 {
-                    insert_bounded_sample(
-                        &mut unmatched_matchable_maps[0],
-                        k,
-                        v,
-                        MAX_GROUP_EXAMPLES,
-                    );
-                }
-                for (k, v) in u1 {
-                    insert_bounded_sample(
-                        &mut unmatched_matchable_maps[1],
-                        k,
-                        v,
-                        MAX_GROUP_EXAMPLES,
-                    );
-                }
-                for (order, cand) in part.preview_candidates {
-                    insert_bounded_preview(
-                        &mut preview_candidates,
-                        order,
-                        cand,
-                        config.preview_rows,
-                    );
-                }
-            }
-        }
-    }
-
-    if let Some((side, record)) = earliest_unique {
+    if let Some((side, record)) = acc.earliest_unique {
         return Err(input_error(
             &inputs[side].info.path,
             Some(record),
@@ -2222,9 +2507,40 @@ fn analyze_partitioned(
         )
         .into());
     }
-    if let Some(err) = first_error {
+    if let Some(err) = acc.first_error {
         return Err(err);
     }
+    if acc.completed != partition_count {
+        return Err(Failure::Cancelled);
+    }
+
+    let partition_plans: Vec<PartitionPlan> = acc
+        .partition_plans
+        .into_iter()
+        .map(|slot| slot.ok_or(Failure::Cancelled))
+        .collect::<JResult<_>>()?;
+
+    // Creation-time fallbacks are serialized under `fallback_lock`, so reserve the single largest
+    // partition's worst-case fallback scratch (2x both sides) across ALL partitions, covering
+    // both planned and dynamic creation-time fallbacks.
+    let mut max_fallback_extra = 0_u64;
+    for p in 0..partition_count {
+        let part_bytes = add(sides[0].partitions[p].bytes, sides[1].partitions[p].bytes)?;
+        let fallback_bytes = mul(part_bytes, 2)?;
+        max_fallback_extra = max_fallback_extra.max(fallback_bytes);
+    }
+
+    let matching = acc.matching;
+    let pairs = acc.pairs;
+    let mut unmatched = acc.unmatched;
+    let duplicate_groups = acc.duplicate_groups;
+    let many_to_many_groups = acc.many_to_many_groups;
+    let many_to_many_pairs = acc.many_to_many_pairs;
+    let mut output_rows = acc.output_rows;
+    let mut output_bytes = acc.output_bytes;
+    let duplicate_samples_map = acc.duplicate_samples;
+    let unmatched_matchable_maps = acc.unmatched_samples;
+    let mut preview_candidates = acc.preview_candidates;
 
     // Account for empty/missing-key streams (`key[0] == 0`), which sort before all `key[0] == 1`
     // unmatched samples and are never matched.
@@ -2259,17 +2575,15 @@ fn analyze_partitioned(
                         (side == 0).then_some(row.ordinal),
                         (side == 1).then_some(row.ordinal),
                     );
-                    let mut empty_key = Vec::with_capacity(9);
-                    empty_key.push(0);
-                    empty_key.extend_from_slice(&row.ordinal.to_be_bytes());
+                    let empty_digest = KeyDigest::from_empty_ordinal(row.ordinal);
                     insert_bounded_preview(
                         &mut preview_candidates,
                         order,
                         PreviewCandidate {
                             main_row: (side == 0).then_some(row),
                             additional_row: (side == 1).then_some(row),
-                            left_key: (side == 0).then(|| empty_key.clone()),
-                            right_key: (side == 1).then_some(empty_key),
+                            left_key: (side == 0).then_some(empty_digest),
+                            right_key: (side == 1).then_some(empty_digest),
                         },
                         config.preview_rows,
                     );
@@ -2292,7 +2606,7 @@ fn analyze_partitioned(
     for (_, cand) in preview_candidates {
         let mut load = |side: usize,
                         row: Option<RowRef>,
-                        expected_key: Option<&[u8]>|
+                        expected_digest: Option<KeyDigest>|
          -> JResult<Option<Vec<u8>>> {
             let Some(row) = row else {
                 return Ok(None);
@@ -2319,7 +2633,7 @@ fn analyze_partitioned(
                 config,
                 state,
             )?;
-            if let Some(expected_key) = expected_key {
+            if let Some(expected_digest) = expected_digest {
                 let parsed = fields(
                     &record,
                     inputs[side].info.delimiter,
@@ -2328,20 +2642,47 @@ fn analyze_partitioned(
                     row.ordinal + 1,
                     config,
                 )?;
-                if !key_matches(
-                    expected_key,
+                let observed = KeyDigest::from_fields(
                     &parsed,
                     &inputs[side].key_columns,
                     row.ordinal,
                     config.case,
-                ) {
+                );
+                if observed != expected_digest {
                     return Err(error("Private join key differs from its record.").into());
                 }
             }
             Ok(Some(record))
         };
-        let left_rec = load(0, cand.main_row, cand.left_key.as_deref())?;
-        let right_rec = load(1, cand.additional_row, cand.right_key.as_deref())?;
+        let left_rec = load(0, cand.main_row, cand.left_key)?;
+        let right_rec = load(1, cand.additional_row, cand.right_key)?;
+        if let (Some(l_rec), Some(r_rec)) = (left_rec.as_deref(), right_rec.as_deref()) {
+            let l_parsed = fields(
+                l_rec,
+                inputs[0].info.delimiter,
+                false,
+                &inputs[0].info.path,
+                cand.main_row.map_or(0, |r| r.ordinal + 1),
+                config,
+            )?;
+            let r_parsed = fields(
+                r_rec,
+                inputs[1].info.delimiter,
+                false,
+                &inputs[1].info.path,
+                cand.additional_row.map_or(0, |r| r.ordinal + 1),
+                config,
+            )?;
+            if !fields_keys_match(
+                &l_parsed,
+                &inputs[0].key_columns,
+                &r_parsed,
+                &inputs[1].key_columns,
+                config.case,
+            ) {
+                return Err(error("Private join key differs from its record.").into());
+            }
+        }
         output_record_into(
             inputs,
             left_rec.as_deref(),
@@ -2725,9 +3066,11 @@ fn create_partition_single_side_retained(
     drop(writer);
     drop(reader);
     if seen_rows != meta.rows || observed_fp != meta.fingerprint {
-        let _ = out_path.remove();
-        state.sub_disk(bytes);
-        return Err(error("Private join row locators changed.").into());
+        return cleanup_fallback_runs(
+            Err(error("Private join row locators changed.").into()),
+            &[(&out_path, bytes)],
+            state,
+        );
     }
     Ok(PartitionCreateOut {
         run: (bytes > 0).then_some(Run {
@@ -2736,6 +3079,91 @@ fn create_partition_single_side_retained(
         }),
         count: seen_rows,
         pair_fingerprint: pair_fp,
+    })
+}
+
+/// Convert a retained empty-key row stream (`key[0] == 0`, already in ascending source ordinal
+/// order) into a pre-sorted `PairLocator` `Run` when `fan_in` is too narrow to keep all empty
+/// streams open directly alongside `pair_runs`.
+fn create_empty_pair_run(
+    input: &PreparedInput,
+    side: usize,
+    empty: &EmptyPartitionMeta,
+    workspace: &SpillWorkspace,
+    config: JoinConfig,
+    state: &Progress,
+) -> JResult<Run> {
+    let file = empty
+        .file
+        .as_ref()
+        .ok_or_else(|| error("Missing private empty-key stream."))?;
+    let mut reader = BufReader::with_capacity(READ_CHUNK, file.open()?);
+    let (out_path, mut writer) = workspace.create_run()?;
+    let mut seen_rows = 0_u64;
+    let mut last_ordinal: Option<u64> = None;
+    let mut observed_fp = LocatorFingerprint::default();
+    let mut bytes = 0_u64;
+
+    let build_res = (|| -> JResult<()> {
+        while let Some(head) = read_head(&mut reader, config, state)? {
+            state.check()?;
+            if last_ordinal.is_some_and(|last| head.ordinal <= last) {
+                return Err(error("Private join ordinals are out of order.").into());
+            }
+            let raw = read_exact_fixed::<ROW_LOCATOR_BYTES>(&mut reader, head.record_len, state)?;
+            let locator = RowLocator::from_le_bytes(&raw);
+            validate_row_locator(locator, input, head.ordinal, config)?;
+            observed_fp.observe_row(head.ordinal, locator, &head.key);
+
+            let order = pair_order(
+                config.mode,
+                (side == 0).then_some(head.ordinal),
+                (side == 1).then_some(head.ordinal),
+            );
+            let pair_loc = if side == 0 {
+                PairLocator {
+                    main_offset: locator.source_offset,
+                    main_len: locator.record_len,
+                    additional_offset: 0,
+                    additional_len: 0,
+                }
+            } else {
+                PairLocator {
+                    main_offset: 0,
+                    main_len: 0,
+                    additional_offset: locator.source_offset,
+                    additional_len: locator.record_len,
+                }
+            };
+            let pkey = pair_key(order);
+            let ploc = pair_loc.to_le_bytes();
+            let written =
+                write_partition_frame(workspace, state, &mut writer, &pkey, &ploc, order.0)?;
+            bytes = add(bytes, written)?;
+            state.add_disk(written)?;
+            last_ordinal = Some(head.ordinal);
+            seen_rows = add(seen_rows, 1)?;
+        }
+        flush_partition_writer(workspace, state, &mut writer)?;
+        Ok(())
+    })();
+    drop(writer);
+    drop(reader);
+    if let Err(err) = build_res {
+        return cleanup_fallback_runs(Err(err), &[(&out_path, bytes)], state);
+    }
+    if seen_rows != empty.rows || observed_fp != empty.fingerprint {
+        return cleanup_fallback_runs(
+            Err(error("Private join row locators changed.").into()),
+            &[(&out_path, bytes)],
+            state,
+        );
+    }
+    file.remove()?;
+    state.sub_disk(empty.bytes);
+    Ok(Run {
+        path: out_path,
+        bytes,
     })
 }
 
@@ -2976,9 +3404,7 @@ fn create_partition_sort_merge(
     let sorted1 = match sort_partition_file(&inputs[1], metas[1], workspace, config, state) {
         Ok(run) => run,
         Err(err) => {
-            let _ = sorted0.path.remove();
-            state.sub_disk(sorted0.bytes);
-            return Err(err);
+            return cleanup_fallback_runs(Err(err), &[(&sorted0.path, sorted0.bytes)], state);
         }
     };
     let s0_path = sorted0.path.clone();
@@ -3049,11 +3475,7 @@ fn create_partition_sort_merge(
         })
     })();
 
-    let _ = s0_path.remove();
-    state.sub_disk(s0_bytes);
-    let _ = s1_path.remove();
-    state.sub_disk(s1_bytes);
-    result
+    cleanup_fallback_runs(result, &[(&s0_path, s0_bytes), (&s1_path, s1_bytes)], state)
 }
 
 enum MergeStream {
@@ -3273,8 +3695,13 @@ pub(super) fn write_partitioned(
         .min(partition_count)
         .min(max_concurrent_tables);
     let worker_run_mem = (config.run_memory_bytes / workers.max(1)).max(MIN_HASH_RUN_BYTES);
+    let fd_cap = engine_pool().fd_budget().limit();
+    let worker_max_fan_in = (fd_cap / workers.max(1))
+        .saturating_sub(3)
+        .clamp(2, config.max_merge_fan_in);
     let worker_run_config = JoinConfig {
         run_memory_bytes: worker_run_mem.min(config.run_memory_bytes),
+        max_merge_fan_in: worker_max_fan_in,
         ..config
     };
 
@@ -3351,6 +3778,7 @@ pub(super) fn write_partitioned(
 
     run_on_engine_pool(workers, move |_| {
         let mut table = BuildTable::new();
+        let mut held_permit: Option<JobBytePermit<'_>> = None;
         loop {
             if st.check().is_err() {
                 break;
@@ -3370,6 +3798,8 @@ pub(super) fn write_partitioned(
                     });
                 }
                 if metas[0].rows == 0 || metas[1].rows == 0 {
+                    table.reset(0);
+                    held_permit = None;
                     let present = usize::from(metas[1].rows > 0);
                     let retained = config.mode.retains(present == 0, present == 1);
                     let res = if retained {
@@ -3395,30 +3825,52 @@ pub(super) fn write_partitioned(
                 if !part_plan.use_sort_merge {
                     let est = estimate_build_ram(metas[part_plan.build_side]);
                     if est <= per_partition_cap {
-                        let _permit = b_arc.acquire(est, &st)?;
+                        let need = est.max(1);
+                        let permit_bytes = match held_permit.as_ref() {
+                            Some(permit) if permit.bytes >= need => permit.bytes,
+                            _ => {
+                                table.reset(0);
+                                held_permit = None;
+                                let permit = b_arc.acquire(need, &st)?;
+                                let bytes = permit.bytes;
+                                held_permit = Some(permit);
+                                bytes
+                            }
+                        };
+                        let effective_cap = permit_bytes.min(per_partition_cap);
                         if let Some(created) = create_partition_hash(
                             &in_arc,
                             metas,
                             part_plan.build_side,
                             &mut table,
-                            per_partition_cap,
+                            effective_cap,
                             worker_run_config,
                             &ws,
                             &st,
                         )? {
+                            if table.mem_bytes() > permit_bytes {
+                                table.reset(0);
+                            }
                             unlink_partition_pair(metas, &st)?;
                             return Ok(created);
                         }
                     }
                 }
                 table.reset(0);
+                held_permit = None;
                 let _fb = fb_arc.lock().unwrap();
                 let created = create_partition_sort_merge(&in_arc, metas, &ws, config, &st)?;
                 unlink_partition_pair(metas, &st)?;
                 Ok(created)
             })();
+            if out.is_err() {
+                table.reset(0);
+                held_permit = None;
+            }
             res_arc.lock().unwrap()[p] = Some(out);
         }
+        drop(table);
+        drop(held_permit);
     })?;
 
     state.check()?;
@@ -3442,8 +3894,23 @@ pub(super) fn write_partitioned(
     #[cfg(test)]
     crate::join_faults::observe(crate::join_faults::Event::RestoringOrder);
 
-    // Ensure total open streams <= fan_in before streaming merge directly into materialization.
-    let fan_in = config.fan_in(16);
+    // Ensure total open streams (pair_runs + retained_empty_sides) <= fan_in before streaming
+    // merge directly into materialization. When `fan_in == 2` and both sides retain empty keys
+    // alongside non-empty `pair_runs`, convert empty stream(s) into pre-sorted `PairLocator` runs
+    // first so `pair_runs.len() + retained_empty_sides.len() <= fan_in` holds strictly.
+    let fan_in = config.fan_in(16).min(fd_cap.saturating_sub(4).max(2));
+    while pair_runs.len().saturating_add(retained_empty_sides.len()) > fan_in
+        && retained_empty_sides.len() >= fan_in
+    {
+        let side = retained_empty_sides.pop().unwrap();
+        let empty = &hash_plan.sides[side].empty;
+        let run = create_empty_pair_run(&plan.inputs[side], side, empty, workspace, config, state)?;
+        if run.bytes > 0 {
+            pair_runs.push(run);
+        } else {
+            run.path.remove()?;
+        }
+    }
     let max_pair_runs = fan_in.saturating_sub(retained_empty_sides.len()).max(1);
     if pair_runs.len() > max_pair_runs {
         pair_runs.sort_by_key(|r| r.bytes);
@@ -3457,8 +3924,19 @@ pub(super) fn write_partitioned(
         }
     }
 
-    let mut streams: Vec<MergeStream> =
-        Vec::with_capacity(pair_runs.len() + retained_empty_sides.len());
+    let total_streams = pair_runs.len().saturating_add(retained_empty_sides.len());
+    let _merge_fd_guard = if total_streams > 0 {
+        Some(
+            engine_pool()
+                .fd_budget()
+                .acquire(total_streams, &state.cancel)
+                .ok_or(Failure::Cancelled)?,
+        )
+    } else {
+        None
+    };
+
+    let mut streams: Vec<MergeStream> = Vec::with_capacity(total_streams);
     for run in pair_runs {
         let reader = BufReader::with_capacity(READ_CHUNK, run.path.open()?);
         streams.push(MergeStream::PairRun {
@@ -3530,17 +4008,17 @@ pub(super) fn write_partitioned(
         state,
     );
 
-    // Unlink all remaining stream files cleanly.
+    // Unlink all remaining stream files cleanly, subtracting bytes only after removal succeeds.
+    let mut cleanup_err: Option<QuarryError> = None;
     for stream in streams {
-        match stream {
+        let (file, bytes) = match stream {
             MergeStream::PairRun {
                 reader,
                 file,
                 bytes,
             } => {
                 drop(reader);
-                let _ = file.remove();
-                state.sub_disk(bytes);
+                (file, bytes)
             }
             MergeStream::EmptyRows {
                 reader,
@@ -3549,11 +4027,28 @@ pub(super) fn write_partitioned(
                 ..
             } => {
                 drop(reader);
-                let _ = file.remove();
-                state.sub_disk(bytes);
+                (file, bytes)
+            }
+        };
+        match file.remove() {
+            Ok(()) => state.sub_disk(bytes),
+            Err(err) => {
+                if cleanup_err.is_none() {
+                    cleanup_err = Some(err.into());
+                }
             }
         }
     }
+    drop(_merge_fd_guard);
 
-    materialize_result
+    match (materialize_result, cleanup_err) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(err)) => Err(err.into()),
+        (Err(primary), None) => Err(primary),
+        (Err(primary), Some(err)) => Err(error(format!(
+            "{}. Could not remove private join stream data: {err}",
+            primary.description()
+        ))
+        .into()),
+    }
 }

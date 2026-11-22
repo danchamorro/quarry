@@ -73,41 +73,41 @@ Verified on the same Apple Silicon macOS host via clean-checkout release builds 
 
 ### `narrow` — 10,000,000 short rows/side (200.0 MB/side, 10% match rate, Left Join)
 
-| Metric | Baseline (`6bc42a9`) | Phase 3C-2 (`e954a63` uncontended) | Phase 3C-3 (`1f0655e`) | Speedup vs Baseline |
-|---|---:|---:|---:|---:|
-| `Inspecting inputs` | 1.364 s | 1.41 s | **0.753 s** | **1.81× faster** |
-| `Sorting keys` / partitioning | 9.845 s | 9.30 s | **2.276 s** | **4.33× faster** |
-| `Analyzing matches` | 203.375 s | 1.75 s | **1.094 s** | **185.9× faster** |
-| **Analysis total** | **214.58 s** | **12.46 s** | **4.112 s** | **52.2× faster** |
-| `Creating joined rows` | 207.915 s | 7.61 s | **6.943 s** | **29.9× faster** |
-| `Saving joined file` | 0.065 s | 0.069 s | **0.013 s** | **5.0× faster** |
-| **Total wall time** | **422.57 s** | **20.07 s** | **11.079 s** | **38.1× faster** |
-| **Peak RSS (`time -l`)** | **638.55 MiB** | 41.47 MiB (`4cc14bb`) | **384.66 MiB** (`< 512 MiB` cap) | 1.66× lower |
-| **Peak temporary bytes** | 2.52 GB | 2.76 GB (`4cc14bb`) | **1.66 GB** (`1,656,844,000 B <= 1,678,000,064 B` allowance) | **1.52× smaller** |
-| **Output SHA-256 oracle** | Exact match | Exact match | **Exact match** | 100% parity |
+| Metric | Baseline (`6bc42a9`) | Phase 3C-2 (`e954a63`, uncontended) | Phase 3C-2 (`4cc14bb`) | Phase 3C-3 (`1f0655e`) | Speedup vs Baseline |
+|---|---:|---:|---:|---:|---:|
+| `Inspecting inputs` | 1.364 s | 1.41 s | 1.413 s | **0.753 s** | **1.81× faster** |
+| `Sorting keys` / partitioning | 9.845 s | 9.30 s | 23.798 s* | **2.276 s** | **4.33× faster** |
+| `Analyzing matches` | 203.375 s | 1.75 s | 1.556 s | **1.094 s** | **185.9× faster** |
+| **Analysis total** | **214.58 s** | **12.46 s** | **26.77 s*** | **4.112 s** | **52.2× faster** |
+| `Creating joined rows` | 207.915 s | 7.61 s | 20.142 s* | **6.943 s** | **29.9× faster** |
+| `Saving joined file` | 0.065 s | — | 0.069 s | **0.013 s** | **5.0× faster** |
+| **Total wall time** | **422.57 s** | **20.07 s** | **46.98 s*** | **11.079 s** | **38.1× faster** |
+| **Peak RSS (`time -l`)** | **638.55 MiB** | — | 41.47 MiB | **384.66 MiB** (`< 512 MiB` cap) | 1.66× lower |
+| **Peak temporary bytes** | 2.52 GB | — | 2.76 GB | **1.66 GB** (`1,656,844,000 B <= 1,678,000,064 B` allowance) | **1.52× smaller** |
+| **Output SHA-256 oracle** | Exact match | Exact match | Exact match | **Exact match** | 100% parity |
 
 ### `large` — 18.0 GiB total (73,728 rows/side × 128 KiB payload, Left Join)
 
-| Metric | Baseline (`6bc42a9`) | Phase 3C-2 (`e954a63` uncontended) | Phase 3C-3 (`1f0655e`) | Speedup vs Baseline |
-|---|---:|---:|---:|---:|
-| `Inspecting inputs` | 3.634 s | 4.16 s | **1.726 s** | **2.11× faster** |
-| `Sorting keys` / partitioning | 24.833 s | 12.21 s | **5.882 s** | **4.22× faster** |
-| `Analyzing matches` | 27.575 s | 0.017 s | **0.013 s** | **2,121× faster** |
-| **Analysis total** | **56.04 s** | **16.39 s** | **7.609 s** | **7.37× faster** |
-| `Creating joined rows` | 39.561 s | 12.53 s | **11.464 s** | **3.45× faster** |
-| `Saving joined file` | 1.127 s | 0.028 s | **0.013 s** | **86.7× faster** |
-| **Total wall time** | **96.74 s** | **29.39 s** | **19.098 s** | **5.07× faster** |
-| **Peak RSS (`time -l`)** | **44.03 MiB** | 31.11 MiB | **15.22 MiB** (`15,958,016 B`) | **2.89× lower** |
-| **Peak temporary bytes** | **38.69 GB** | 9.69 GB | **9.68 GB** (`9,679,938,858 B`, only 5.3 MB above 9.67 GB output) | **4.00× smaller** |
-| **Output SHA-256 oracle** | Exact match | Exact match | **Exact match** | 100% parity |
+| Metric | Baseline (`6bc42a9`) | Phase 3C-2 (`e954a63`, uncontended) | Phase 3C-2 (`4cc14bb`) | Phase 3C-3 (`1f0655e`) | Speedup vs Baseline |
+|---|---:|---:|---:|---:|---:|
+| `Inspecting inputs` | 3.634 s | — | 4.162 s | **1.726 s** | **2.11× faster** |
+| `Sorting keys` / partitioning | 24.833 s | — | 12.209 s | **5.882 s** | **4.22× faster** |
+| `Analyzing matches` | 27.575 s | — | 0.017 s | **0.013 s** | **2,121× faster** |
+| **Analysis total** | **56.04 s** | — | **16.39 s** | **7.609 s** | **7.37× faster** |
+| `Creating joined rows` | 39.561 s | 12.526 s | 44.391 s* | **11.464 s** | **3.45× faster** |
+| `Saving joined file` | 1.127 s | — | 0.028 s | **0.013 s** | **86.7× faster** |
+| **Total wall time** | **96.74 s** | **29.39 s** | **60.81 s*** | **19.098 s** | **5.07× faster** |
+| **Peak RSS (`time -l`)** | **44.03 MiB** | — | 31.11 MiB | **15.22 MiB** (`15,958,016 B`) | **2.89× lower** |
+| **Peak temporary bytes** | **38.69 GB** | — | 9.69 GB | **9.68 GB** (`9,679,938,858 B`, only 5.3 MB above 9.67 GB output) | **4.00× smaller** |
+| **Output SHA-256 oracle** | Exact match | Exact match | Exact match | **Exact match** | 100% parity |
 
 ### `skew` — 1,024 × 1,536 Cartesian duplicate group (1,572,864 output rows, 814.7 MB output)
 
-| Metric | Phase 3C-2 (`4cc14bb` / uncontended) | Phase 3C-3 (`1f0655e`) |
-|---|---:|---:|
-| `analysis_seconds` | 0.034 s | **0.013 s** |
-| `total_seconds` | 8.638 s* (2.461 s uncontended) | **2.365 s** |
-| **Peak RSS (`time -l`)** | 7.09 MiB | **6.88 MiB** (`7,208,960 B`) |
-| **Peak group buffer** | 24,576 B (cap `131,072 B`) | **32,768 B** (cap `131,072 B`, automatic skew fallback) |
-| **Peak temporary bytes** | 928.14 MB | **927.99 MB** (`927,989,824 B <= 1,041,532,992 B` allowance) |
-| **Output SHA-256 oracle** | Exact match | **Exact match (`all_checks_passed: true`)** |
+| Metric | Phase 3C-2 (`e954a63`, uncontended) | Phase 3C-2 (`4cc14bb`) | Phase 3C-3 (`1f0655e`) |
+|---|---:|---:|---:|
+| `analysis_seconds` | — | 0.034 s | **0.013 s** |
+| `total_seconds` | 2.461 s | 8.638 s* | **2.365 s** |
+| **Peak RSS (`time -l`)** | — | 7.09 MiB | **6.88 MiB** (`7,208,960 B`) |
+| **Peak group buffer** | — | 24,576 B (cap `131,072 B`) | **32,768 B** (cap `131,072 B`, automatic skew fallback) |
+| **Peak temporary bytes** | — | 928.14 MB | **927.99 MB** (`927,989,824 B <= 1,041,532,992 B` allowance) |
+| **Output SHA-256 oracle** | Exact match | Exact match | **Exact match (`all_checks_passed: true`)** |
