@@ -94,49 +94,53 @@ Executed via:
 
 ## 2. Parallel Scaling & Disk Preflight Verification (`W ∈ {1, 4, 8}`)
 
-Measured on a deterministic 10,000,000-row synthetic CSV (`520,008,359 B`, ~495.9 MiB) using the
-frozen `quarry-bench` binary with an isolated warm sidecar cache. All three worker counts produced
-**100% byte-identical SHA-256 outputs** per operation and kept observed peak temporary disk well
-beneath the advertised preflight allowance:
+Measured on a deterministic 10,000,000-row synthetic CSV (`520,008,359 B`, ~495.9 MiB; generator and
+full commands in Section 5) using the frozen `quarry-bench` binary with an isolated warm sidecar
+cache. All three worker counts produced **100% byte-identical SHA-256 outputs** per operation.
+`sort-save-as` stayed well beneath its printed ADR 0010 preflight allowance (`4.66 GiB`) at every
+worker count; `duplicates --output` prints observed peak temporary disk (`3.83–28.30 MiB`, well
+beneath input size) without printing its numeric preflight estimate; and `replace-all-save-as` uses
+zero temporary spill runs (writing a single `520,008,359 B` output staging file beside the
+destination):
 
-| Operation | Workers (`W`) | Op Wall (s) | Cmd Wall (s) | Speedup vs `W=1` | Peak RSS | Peak Temp vs Preflight Est. | SHA-256 Parity |
+| Operation | Workers (`W`) | Op Wall (s) | Cmd Wall (s) | Speedup vs `W=1` | Peak RSS | Measured Peak Temp / Preflight Allowance | Full Output SHA-256 |
 |---|---:|---:|---:|---:|---:|---|---|
-| `sort-save-as` (number) | 1 | 5.952 | 10.801 | 1.00× | 135.31 MiB | 1.31 GiB `<=` 4.66 GiB | `7f1def86…` |
-| `sort-save-as` (number) | 4 | **2.983** | 7.643 | **2.00×** | 148.72 MiB | 1.31 GiB `<=` 4.66 GiB | Exact match |
-| `sort-save-as` (number) | 8 | 3.867 | 8.328 | 1.54× | 165.69 MiB | 1.64 GiB `<=` 4.66 GiB | Exact match |
-| `duplicates --output` | 1 | 3.300 | 3.430 | 1.00× | 135.86 MiB | 3.83 MiB | `627f88eb…` |
-| `duplicates --output` | 4 | 0.874 | 0.916 | 3.78× | 146.20 MiB | 14.13 MiB | Exact match |
-| `duplicates --output` | 8 | **0.491** | 0.521 | **6.72×** | 169.12 MiB | 28.30 MiB | Exact match |
-| `replace-all-save-as` | 1 | 0.785 | 0.915 | 1.00× | 5.23 MiB | Staging only | `be6d2332…` |
-| `replace-all-save-as` | 4 | **0.128** | 0.170 | **6.13×** | 105.64 MiB | Staging only | Exact match |
-| `replace-all-save-as` | 8 | 0.152 | 0.179 | 5.16× | 121.09 MiB | Staging only | Exact match |
+| `sort-save-as` (col 3, number) | 1 | 5.952 | 10.801 | 1.00× | 135.31 MiB | `1.31 GiB <= 4.66 GiB` (printed preflight) | `7f1def8658da6f4b8fb9a11335d7eb58df4033b7194295de9a494e0dc022bef9` |
+| `sort-save-as` (col 3, number) | 4 | **2.983** | 7.643 | **2.00×** | 148.72 MiB | `1.31 GiB <= 4.66 GiB` (printed preflight) | Exact match |
+| `sort-save-as` (col 3, number) | 8 | 3.867 | 8.328 | 1.54× | 165.69 MiB | `1.64 GiB <= 4.66 GiB` (printed preflight) | Exact match |
+| `duplicates --output` (col 2, match-case) | 1 | 3.300 | 3.430 | 1.00× | 135.86 MiB | `3.83 MiB` peak temp (CLI preflight value not printed; formal numeric comparison pending) | `627f88eb7cfb487485ceb98db0f48c96b2fafad9bcb0c8227f46443db639c9e7` |
+| `duplicates --output` (col 2, match-case) | 4 | 0.874 | 0.916 | 3.78× | 146.20 MiB | `14.13 MiB` peak temp (CLI preflight value not printed; formal numeric comparison pending) | Exact match |
+| `duplicates --output` (col 2, match-case) | 8 | **0.491** | 0.521 | **6.72×** | 169.12 MiB | `28.30 MiB` peak temp (CLI preflight value not printed; formal numeric comparison pending) | Exact match |
+| `replace-all-save-as` (`ST0042`→`ST9942`) | 1 | 0.785 | 0.915 | 1.00× | 5.23 MiB | `0 B` spill runs (`495.92 MiB` / `520,008,359 B` single destination staging file; no separate scratch allowance) | `be6d2332e51ceccaa91cc60faba61132b81e929e90adbdf811279ce480b81d2f` |
+| `replace-all-save-as` (`ST0042`→`ST9942`) | 4 | **0.128** | 0.170 | **6.13×** | 105.64 MiB | `0 B` spill runs (`495.92 MiB` / `520,008,359 B` single destination staging file; no separate scratch allowance) | Exact match |
+| `replace-all-save-as` (`ST0042`→`ST9942`) | 8 | 0.152 | 0.179 | 5.16× | 121.09 MiB | `0 B` spill runs (`495.92 MiB` / `520,008,359 B` single destination staging file; no separate scratch allowance) | Exact match |
 
 ---
 
 ## 3. Adaptive 300 MB Single-Run Memory Budget Transition (`T14` / `C16`)
 
 Verified on deterministic wide-row synthetic CSVs (`16 KiB` rows so tracked payload closely tracks
-raw file size) using the frozen `quarry-bench` binary across default `300,000,000 B` single-run
-budget vs explicit forced-spill `--memory-budget`:
+raw file size; exact generator and commands in Section 5) using the frozen `quarry-bench` binary
+across default `300,000,000 B` single-run budget vs explicit forced-spill `--memory-budget`:
 
 ### Delete Duplicates (`299,000,000 B` vs `301,000,000 B` under default 300 MB budget)
 
-| Input Size | Configuration | In-Memory Fast Path | Runs Created | Op Wall (s) | Peak Temp | Peak RSS | Output SHA-256 |
+| Input Size | Configuration | In-Memory Fast Path | Runs Created | Op Wall (s) | Peak Temp | Peak RSS | Full Output SHA-256 |
 |---|---|---|---:|---:|---:|---:|---|
-| `299,000,000 B` (18,268 rows) | Default 300 MB (`--threads 1`) | **yes** | **0** | **0.593** | 234.13 MiB (output staging only) | 294.39 MiB | `e553a7fb…` |
-| `299,000,000 B` (18,268 rows) | Forced spill `--memory-budget 64000000` (`--threads 4`) | no | 28 | 0.779 | 520.40 MiB | 114.23 MiB | **Exact match** (`e553a7fb…`) |
-| `301,000,000 B` (18,390 rows) | Default 300 MB (`--threads 1`) | **no** | **10** | 1.031 | 471.17 MiB | 326.48 MiB | **Exact match** (`e553a7fb…`) |
-| `301,000,000 B` (18,390 rows) | Forced spill `--memory-budget 64000000` (`--threads 4`) | no | 28 | 0.828 | 522.31 MiB | 115.27 MiB | **Exact match** (`e553a7fb…`) |
+| `299,000,000 B` (18,268 rows) | Default 300 MB (`--threads 1`) | **yes** | **0** | **0.593** | 234.13 MiB (output staging only) | 294.39 MiB | `e553a7fb258a704215b1200c8ae9194e22bd6aa820722c51a95ffd2052a5f8ff` |
+| `299,000,000 B` (18,268 rows) | Forced spill `--memory-budget 64000000` (`--threads 4`) | no | 28 | 0.779 | 520.40 MiB | 114.23 MiB | **Exact match** |
+| `301,000,000 B` (18,390 rows) | Default 300 MB (`--threads 1`) | **no** | **10** | 1.031 | 471.17 MiB | 326.48 MiB | **Exact match** |
+| `301,000,000 B` (18,390 rows) | Forced spill `--memory-budget 64000000` (`--threads 4`) | no | 28 | 0.828 | 522.31 MiB | 115.27 MiB | **Exact match** |
 
 ### External Sort (`295,015,190 B` tracked payload `< 300 MB` vs `> 290 MB` & `301 MB`)
 
-| Input Size | Configuration | In-Memory Fast Path | Runs Created | Op Wall (s) | Peak Temp | Peak RSS | Output SHA-256 |
+| Input Size | Configuration | In-Memory Fast Path | Runs Created | Op Wall (s) | Peak Temp | Peak RSS | Full Output SHA-256 |
 |---|---|---|---:|---:|---:|---:|---|
-| `295,015,190 B` | Default 300 MB (`--threads 1`) | **yes** | **0** | **0.534** | 281.35 MiB (output staging only) | 290.56 MiB | `32d49d2c…` |
-| `295,015,190 B` | `--memory-budget 290000000` (`--threads 1`) | **no** | **2** | 0.762 | 563.35 MiB | 290.59 MiB | **Exact match** (`32d49d2c…`) |
-| `295,015,190 B` | Default 300 MB (`--threads 4`, 4-worker budget split) | no | 8 | 0.528 | 563.35 MiB | 308.91 MiB | **Exact match** (`32d49d2c…`) |
-| `295,015,190 B` | Forced spill `--memory-budget 64000000` (`--threads 4`) | no | 20 | 0.525 | 563.35 MiB | 85.55 MiB | **Exact match** (`32d49d2c…`) |
-| `301,000,000 B` | Default 300 MB (`--threads 1`) | **no** | **2** | 0.772 | 574.78 MiB | 294.39 MiB | `4de72cdf…` (matches 64 MB forced spill) |
+| `295,015,190 B` | Default 300 MB (`--threads 1`) | **yes** | **0** | **0.534** | 281.35 MiB (output staging only) | 290.56 MiB | `32d49d2cbc3c137a0b10c58e231bfbf83369bbf87586966b41931f365d5b88b9` |
+| `295,015,190 B` | `--memory-budget 290000000` (`--threads 1`) | **no** | **2** | 0.762 | 563.35 MiB | 290.59 MiB | **Exact match** |
+| `295,015,190 B` | Default 300 MB (`--threads 4`, 4-worker budget split) | no | 8 | 0.528 | 563.35 MiB | 308.91 MiB | **Exact match** |
+| `295,015,190 B` | Forced spill `--memory-budget 64000000` (`--threads 4`) | no | 20 | 0.525 | 563.35 MiB | 85.55 MiB | **Exact match** |
+| `301,000,000 B` | Default 300 MB (`--threads 1`) | **no** | **2** | 0.772 | 574.78 MiB | 294.39 MiB | `4de72cdffcfe8a68b37e9272f3935c3eb1331e9016ba4d0d62b3c6ef7d23ff24` (matches 64 MB forced spill) |
 
 Because `sort-save-as` tracks both raw record bytes and encoded sort key + entry metadata in its
 unified `RunArena`, a `295.0 MB` wide-row file stays in-memory with `0` spill runs under the default
@@ -166,16 +170,107 @@ Phase 3C-1/3C-2/3C-3 phase breakdown.)*
 
 ## 5. Reproduction Commands
 
+### 5.1 Full 30-Workload Public Dataset Suite & Golden SHA-256 Parity
+
 ```bash
-# 1. Full 30-workload public dataset suite & Phase 1 golden SHA-256 verification:
 CACHE_DIR="$(mktemp -d)" && chmod 700 "$CACHE_DIR"
 PYTHONDONTWRITEBYTECODE=1 QUARRY_INDEX_CACHE_DIR="$CACHE_DIR" python3 scripts/benchmark-public-datasets.py . \
   /tmp/quarry-phase3-public-bench \
   --expected-outputs docs/benchmarks/2026-11-21-phase1-public-datasets-golden.json \
   --threads 8
+```
 
-# 2. Clean-main Join acceptance suite (narrow, large, skew):
+### 5.2 Clean-Main Join Acceptance Suite (`narrow`, `large`, `skew`)
+
+```bash
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench-join-acceptance.py --case narrow --root /tmp/quarry-phase3-join-narrow
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench-join-acceptance.py --case large --root /tmp/quarry-phase3-join-large --allow-below-ram
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench-join-acceptance.py --case skew --root /tmp/quarry-phase3-join-skew
+```
+
+### 5.3 Section 2: `W ∈ {1, 4, 8}` Scaling Synthetic Generator & Commands
+
+Generate the deterministic 10,000,000-row CSV (`520,008,359 B`, no external seed needed) and run
+each operation at `W ∈ {1, 4, 8}` against the frozen release binary `BENCH`:
+
+```bash
+BENCH=/tmp/quarry-phase3-public-bench/quarry-bench
+python3 - <<'PY'
+from pathlib import Path
+p = Path("/tmp/synth_500mb.csv")
+with p.open("wb") as f:
+    f.write(b"id,station,temp,flag,note\n")
+    buf = bytearray()
+    for i in range(1, 10_000_001):
+        st = f"ST{(i * 31) % 5000:04d}"
+        temp = ((i * 17) % 1200 - 200) / 10.0
+        buf.extend(f"{i:08d},{st},{temp:.1f},OK,record-payload-{i:08d}-end\n".encode())
+        if len(buf) >= 4 * 1024 * 1024:
+            f.write(buf); buf.clear()
+    if buf:
+        f.write(buf)
+PY
+
+# Seed warm sidecar index once:
+QUARRY_INDEX_CACHE_DIR="$CACHE_DIR" "$BENCH" open /tmp/synth_500mb.csv --rows 10 --metrics-only --threads 8 --cache-state warm
+
+# Repeat for W in 1 4 8:
+for W in 1 4 8; do
+  mkdir -p "/tmp/scale-sort-w$W" "/tmp/scale-dup-w$W" "/tmp/scale-rep-w$W"
+  QUARRY_INDEX_CACHE_DIR="$CACHE_DIR" "$BENCH" sort-save-as /tmp/synth_500mb.csv "/tmp/scale-sort-w$W/out.csv" \
+    --column 3 --mode number --order asc --header first-row --temp-dir "/tmp/scale-sort-w$W" --threads "$W" --cache-state warm
+  QUARRY_INDEX_CACHE_DIR="$CACHE_DIR" "$BENCH" duplicates /tmp/synth_500mb.csv \
+    --columns 2 --match-case --header first-row --temp-dir "/tmp/scale-dup-w$W" --output "/tmp/scale-dup-w$W/out.csv" --threads "$W" --cache-state warm
+  QUARRY_INDEX_CACHE_DIR="$CACHE_DIR" "$BENCH" replace-all-save-as /tmp/synth_500mb.csv \
+    --output "/tmp/scale-rep-w$W/out.csv" --query ST0042 --replacement ST9942 --threads "$W" --cache-state warm
+done
+```
+
+### 5.4 Section 3: Adaptive 300 MB Single-Run Threshold Generator & Commands
+
+Generate the deterministic wide-row CSVs (`295,015,190 B`, `299,000,000 B`, and `301,000,000 B`)
+and compare the default `300,000,000 B` single-run budget against explicit forced-spill budgets:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+
+def make_wide_csv(path: Path, target_bytes: int, exact_tail: bool):
+    header = b"id,key,payload\n"
+    pad = "P" * 16350
+    with path.open("wb") as f:
+        f.write(header)
+        written, i, buf = len(header), 0, bytearray()
+        while written < target_bytes:
+            k = (i * 7919) % 15000
+            line = f"{i:08d},{k:06d},{pad}\n".encode()
+            if exact_tail and written + len(line) > target_bytes and written > target_bytes - 20000:
+                rem = target_bytes - written
+                prefix = f"{i:08d},{k:06d},".encode()
+                if rem > len(prefix) + 1:
+                    buf.extend(prefix + (b"P" * (rem - len(prefix) - 1)) + b"\n")
+                break
+            buf.extend(line); written += len(line); i += 1
+            if len(buf) >= 4 * 1024 * 1024:
+                f.write(buf); buf.clear()
+        if buf:
+            f.write(buf)
+
+make_wide_csv(Path("/tmp/file_295mb.csv"), 295_000_000, exact_tail=False) # 295,015,190 B
+make_wide_csv(Path("/tmp/file_299mb.csv"), 299_000_000, exact_tail=True)  # 299,000,000 B
+make_wide_csv(Path("/tmp/file_301mb.csv"), 301_000_000, exact_tail=True)  # 301,000,000 B
+PY
+
+# Delete Duplicates: 299 MB (in-memory fast path) vs 301 MB (spill) vs forced 64 MB spill
+"$BENCH" duplicates /tmp/file_299mb.csv --columns 2 --match-case --header first-row --temp-dir /tmp/t299-d1 --output /tmp/t299-d1/out.csv --threads 1 --cache-state warm
+"$BENCH" duplicates /tmp/file_299mb.csv --columns 2 --match-case --header first-row --temp-dir /tmp/t299-d4s --output /tmp/t299-d4s/out.csv --threads 4 --memory-budget 64000000 --cache-state warm
+"$BENCH" duplicates /tmp/file_301mb.csv --columns 2 --match-case --header first-row --temp-dir /tmp/t301-d1 --output /tmp/t301-d1/out.csv --threads 1 --cache-state warm
+"$BENCH" duplicates /tmp/file_301mb.csv --columns 2 --match-case --header first-row --temp-dir /tmp/t301-d4s --output /tmp/t301-d4s/out.csv --threads 4 --memory-budget 64000000 --cache-state warm
+
+# Sort: 295 MB (in-memory fast path) vs 290 MB budget spill vs 4-worker split vs 64 MB forced spill vs 301 MB spill
+"$BENCH" sort-save-as /tmp/file_295mb.csv /tmp/t295-s1/out.csv --column 2 --mode number --order asc --header first-row --temp-dir /tmp/t295-s1 --threads 1 --cache-state warm
+"$BENCH" sort-save-as /tmp/file_295mb.csv /tmp/t295-s290/out.csv --column 2 --mode number --order asc --header first-row --temp-dir /tmp/t295-s290 --threads 1 --memory-budget 290000000 --cache-state warm
+"$BENCH" sort-save-as /tmp/file_295mb.csv /tmp/t295-s4/out.csv --column 2 --mode number --order asc --header first-row --temp-dir /tmp/t295-s4 --threads 4 --cache-state warm
+"$BENCH" sort-save-as /tmp/file_295mb.csv /tmp/t295-s64/out.csv --column 2 --mode number --order asc --header first-row --temp-dir /tmp/t295-s64 --threads 4 --memory-budget 64000000 --cache-state warm
+"$BENCH" sort-save-as /tmp/file_301mb.csv /tmp/t301-s1/out.csv --column 2 --mode number --order asc --header first-row --temp-dir /tmp/t301-s1 --threads 1 --cache-state warm
 ```
