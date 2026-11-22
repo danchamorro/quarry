@@ -270,3 +270,23 @@ The desktop renders exact matching-row counts for each side as well as pairs.
 Source guards preserve the logical input path and Main/Additional role with
 the active phase when reporting a conflict. The display and early-conflict
 regressions failed before these additions and pass afterward.
+
+## Amendment (2026-11-22): Key-Only Late Materialization & Partitioned Multi-Threaded Hash-Join (T6)
+
+Empirical profiling of the original payload-copying external sort-merge engine (`docs/benchmarks/2026-11-22-phase3c-join-profiling.md`) showed two bottlenecks:
+1. Copying full record payloads into sorted runs and ordinal-ordering runs inflated peak temporary disk to 4.0× the final output size on 18 GiB wide joins (`38.69 GB` temp vs `9.67 GB` output).
+2. Single-threaded key sorting, per-group file reopens/seeks, and single-threaded ordinal restoration dominated 10M-row/side narrow joins (`422.57 s` baseline wall time).
+
+### Amended Decision
+1. **Key-only sorted/partitioned frames and late materialization (seekable inputs):**
+   - Regular uncompressed seekable inputs (saved files and open working documents backed by pinned `WorkingCopyStorage` + immutable `Arc` edit overlays) store 24-byte `RowLocator { source_offset, record_len, value_bytes }` payloads instead of copying full records into private runs, and 32-byte `PairLocator` payloads in ordinal-ordering streams.
+   - Output materialization reads source records in effective-size-bounded batches (accounting for worst-case encoding expansion and working-document edit sizes, with cross-batch driving-row reuse) via offset-sorted coalesced positional `pread`/`seek_read` + OS read-ahead, revalidates source stamps and key-record matches, and verifies 128-bit order-independent `LocatorFingerprint`s across both prepared inputs and output pairs before publication.
+   - Non-seekable inputs retain the inline `SpooledPayload` external sort-merge fallback and never issue positional `pread` calls against the source handle.
+2. **Partitioned multi-threaded hash-join with automatic sort-merge skew fallback (`crates/quarry-core/src/join_hash.rs`):**
+   - For seekable inputs with sufficient memory and merge fan-in, `analyze_join` inspects both inputs in parallel (preserving deterministic Main-before-Additional error priority) and partitions compact key + `RowLocator` frames once into `P` power-of-two private partition pairs (`P <= 32`, bounded by FD and run-memory limits) inside the owned `SpillWorkspace`.
+   - Rows with empty or missing key components (`key[0] == 0`) bypass hashing into per-side ordinal-sorted unmatchable streams, avoiding unnecessary hash or sort work while preserving exact unmatched counts, samples, and preview order.
+   - Partitions are analyzed and probed in parallel on the shared `EnginePool` using reusable arena-backed open-addressed hash tables under a job-scoped tracked byte budget (keeping combined hash + fallback working memory strictly within the 512 MiB ceiling and cancelling cleanly under memory backpressure).
+   - For creation, each partition selects the smaller side by estimated resident bytes as its build side, probes the larger side to emit sorted `PairLocator` runs, and immediately unlinks finished partition files. Sorted partition runs and retained empty-key streams merge directly into late materialization via a bounded `K`-way heap (`<= fan_in`), eliminating a redundant full-output pair-ordering pass on disk.
+   - **Automatic skew and memory-cap fallback:** Any partition whose hash table would exceed its per-partition memory cap or whose maximum matched-key expansion exceeds the many-to-many skew threshold (`65,536` pairs) falls back automatically to the existing ADR 0011 external sort-merge and bounded duplicate-block path (serialized under a fallback lock so combined RAM and worst-case per-volume disk preflight allowances remain exact).
+3. **Unchanged product semantics:**
+   - All four join modes (`Left`, `Inner`, `Right`, `Full`), composite tuple keys, ASCII case sensitivity, uniqueness diagnostics (earliest physical record), duplicate/unmatched samples, preview ordering, working-document overlays, source-stamp revalidation, private permissions, and atomic create-new publication remain 100% byte-identical to external sort-merge.
