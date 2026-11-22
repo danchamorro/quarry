@@ -64,7 +64,12 @@ pub(crate) fn advise_readahead(file: &File, offset: u64, len: u64) {
 
     #[cfg(target_os = "linux")]
     {
-        let _ = rustix::fs::fadvise(file, offset, len, rustix::fs::Advice::Sequential);
+        let _ = rustix::fs::fadvise(
+            file,
+            offset,
+            std::num::NonZeroU64::new(len),
+            rustix::fs::Advice::Sequential,
+        );
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
