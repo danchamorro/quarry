@@ -14,14 +14,14 @@ use quarry_core::{
     CompressedRawDecompressJob, CompressionFormat, DateTimeFormat, DecompressedCopy, Dialect,
     DuplicateJob, DuplicateOutcome, DuplicateSpec, Encoding, FilterExportJob, FilterExportOutcome,
     FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
-    FilterProgress, FilterQuery, HeaderMode, IndexConfig, IndexJob, IndexProgress,
-    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome,
-    SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition,
-    SearchProgress, SearchTelemetry, Session, SortDirection, SortJob, SortMode, SortOutcome,
-    SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress,
-    StructuralIndex, WorkingCopyCleanup, check_storage, detect_compression,
-    estimate_edited_output_bytes, estimate_sort_temporary_bytes, inspect_storage,
-    is_compressed_destination,
+    FilterProgress, FilterQuery, HeaderMode, IndexCacheConfig, IndexConfig, IndexJob,
+    IndexProgress, LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob,
+    ReplaceAllOutcome, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome,
+    SearchPosition, SearchProgress, SearchTelemetry, Session, SortDirection, SortJob, SortMode,
+    SortOutcome, SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
+    SplitAnalysisProgress, StructuralIndex, WorkingCopyCleanup, check_storage, clear_index_cache,
+    detect_compression, estimate_edited_output_bytes, estimate_sort_temporary_bytes,
+    inspect_storage, is_compressed_destination,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -61,6 +61,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("transform-save-as") => transform_save_as_command(args.collect()),
         Some("sort-save-as") => sort_save_as_command(args.collect()),
         Some("duplicates") => duplicates_command(args.collect()),
+        Some("clear-index-cache") => clear_index_cache_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -270,10 +271,12 @@ fn print_help() {
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry convert-utf8 <FILE> --output FILE [--edit DATA_ROW COLUMN VALUE]... \
          [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
+           quarry clear-index-cache [--index-cache-dir DIRECTORY]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
          --output FILE [--seed 1]\n\n\
          Commands that read an input file accept --encoding auto|utf8|utf16le|utf16be|windows1252|latin1; generate does not.\n\
          Parallel engine commands accept --threads N (default: available_parallelism - 1).\n\
+         Indexing commands (open, viewport, search) accept --no-index-cache and --index-cache-dir DIRECTORY.\n\
          Auto detects Unicode BOMs and otherwise uses UTF-8; no legacy guessing.\n\n\
          Compressed input: inspect, open, viewport, search, filter, export, and convert-utf8 read gzip (.gz) files.\n\
          Quarry decompresses the file once into a private temporary copy and indexes it in the same pass.\n\
@@ -301,6 +304,32 @@ fn parse_threads(raw: &str) -> CliResult<usize> {
         return Err("--threads must be at least 1".into());
     }
     Ok(threads)
+}
+
+fn clear_index_cache_command(args: Vec<String>) -> CliResult<()> {
+    let mut cache_dir = None;
+    let mut cursor = 0;
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--index-cache-dir" => {
+                cache_dir = Some(PathBuf::from(value(
+                    &args,
+                    &mut cursor,
+                    "--index-cache-dir",
+                )?));
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option {option:?}").into());
+            }
+            argument => return Err(format!("unexpected argument {argument:?}").into()),
+        }
+        cursor += 1;
+    }
+    let summary = clear_index_cache(cache_dir.as_deref())?;
+    println!("Index cache cleared");
+    println!("Files removed: {}", summary.files_removed);
+    println!("Bytes reclaimed: {}", human_bytes(summary.bytes_reclaimed));
+    Ok(())
 }
 
 fn parse_filter_operator(value: &str, option: &str) -> CliResult<FilterOperator> {
@@ -3086,6 +3115,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
     let mut threads = None;
+    let mut index_cache = IndexCacheConfig::default();
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -3109,6 +3139,14 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
             }
             "--threads" => {
                 threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
+            }
+            "--no-index-cache" => index_cache.enabled = false,
+            "--index-cache-dir" => {
+                index_cache.cache_dir = Some(PathBuf::from(value(
+                    &args,
+                    &mut cursor,
+                    "--index-cache-dir",
+                )?));
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -3143,7 +3181,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     let index = match prepared_index {
         Some(index) => index,
         None => session
-            .start_indexing_with_threads(IndexConfig::default(), threads)?
+            .start_indexing_with_options(IndexConfig::default(), threads, index_cache)?
             .wait()?,
     };
     let index_elapsed = index_started.elapsed();
@@ -3318,6 +3356,7 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     let mut interval_ms = 16_u64;
     let mut chunk_bytes = IndexConfig::default().chunk_bytes;
     let mut threads = None;
+    let mut index_cache = IndexCacheConfig::default();
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -3338,6 +3377,14 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
             }
             "--threads" => {
                 threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
+            }
+            "--no-index-cache" => index_cache.enabled = false,
+            "--index-cache-dir" => {
+                index_cache.cache_dir = Some(PathBuf::from(value(
+                    &args,
+                    &mut cursor,
+                    "--index-cache-dir",
+                )?));
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -3380,12 +3427,16 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
     let index = match prepared_index {
         Some(index) => index,
         None => {
-            let job = session.start_indexing_with_threads(
+            if live {
+                index_cache.enabled = false;
+            }
+            let job = session.start_indexing_with_options(
                 IndexConfig {
                     chunk_bytes,
                     ..IndexConfig::default()
                 },
                 threads,
+                index_cache,
             )?;
             if live {
                 return benchmark_live_viewports(
@@ -3668,6 +3719,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
     let mut wait_for_index = true;
     let mut metrics_only = false;
     let mut threads = None;
+    let mut index_cache = IndexCacheConfig::default();
     let mut compressed = CompressedArgs::default();
     let mut cursor = 0;
 
@@ -3688,6 +3740,14 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
             }
             "--threads" => {
                 threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
+            }
+            "--no-index-cache" => index_cache.enabled = false,
+            "--index-cache-dir" => {
+                index_cache.cache_dir = Some(PathBuf::from(value(
+                    &args,
+                    &mut cursor,
+                    "--index-cache-dir",
+                )?));
             }
             "--metrics-only" => metrics_only = true,
             "--no-wait" => wait_for_index = false,
@@ -3730,7 +3790,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
         },
         encoding,
     )?;
-    let job = session.start_indexing_with_threads(IndexConfig::default(), threads)?;
+    let job = session.start_indexing_with_options(IndexConfig::default(), threads, index_cache)?;
     let memory_at_first_rows = current_rss_bytes();
 
     println!("Quarry\n");
@@ -3831,7 +3891,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
             );
             last_report = Instant::now();
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(1));
     }
     if let Some(error) = job.error() {
         return Err(error.into());
@@ -3847,6 +3907,10 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
         human_bytes(rate(progress.bytes_scanned, progress.elapsed))
     );
     let telemetry = index.telemetry();
+    println!(
+        "Index cache: {}",
+        if telemetry.cache_hit { "hit" } else { "miss" }
+    );
     println!("Engine workers: {}", telemetry.effective_workers);
     println!("SIMD backend: {}", telemetry.simd_backend);
     println!(

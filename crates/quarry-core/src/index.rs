@@ -16,6 +16,7 @@ use crate::encoding::EncodedScanner;
 use crate::export::source_matches_stamp;
 use crate::pool::{JobExecutor, JobPriority, engine_pool, resolve_worker_count};
 use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
+use crate::sidecar::{IndexCacheConfig, save_sidecar, try_load_sidecar};
 use crate::source_stamp::open_regular_file;
 use crate::{CompletedRecordCount, QuarryError, Session, SourceStamp};
 
@@ -63,6 +64,7 @@ pub struct IndexTelemetry {
     pub quoted_entry_chunks: u64,
     pub rescanned_bytes: u64,
     pub byte_stride_checkpoints: bool,
+    pub cache_hit: bool,
 }
 
 impl Default for IndexTelemetry {
@@ -75,6 +77,7 @@ impl Default for IndexTelemetry {
             quoted_entry_chunks: 0,
             rescanned_bytes: 0,
             byte_stride_checkpoints: false,
+            cache_hit: false,
         }
     }
 }
@@ -134,6 +137,54 @@ impl StructuralIndex {
     pub(crate) fn enable_byte_stride_checkpoints(&mut self, stride: u64) {
         self.checkpoint_byte_stride = Some(stride.max(1));
         self.telemetry.byte_stride_checkpoints = true;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_validated_sidecar(
+        config: IndexConfig,
+        mut checkpoints: Vec<Checkpoint>,
+        mut checkpoint_every: u64,
+        mut checkpoint_byte_stride: Option<u64>,
+        byte_stride_checkpoints: bool,
+        indexed_rows: u64,
+        maximum_width: usize,
+        indexed_bytes: u64,
+    ) -> Result<Self, QuarryError> {
+        let mut index = Self::new(config)?;
+        while checkpoints.len() > index.max_checkpoints {
+            if let Some(stride) = checkpoint_byte_stride {
+                let new_stride = stride.saturating_mul(2);
+                checkpoint_byte_stride = Some(new_stride);
+            } else {
+                checkpoint_every = checkpoint_every.saturating_mul(2);
+            }
+            let mut write = 0usize;
+            for read in 0..checkpoints.len() {
+                if read % 2 == 0 {
+                    checkpoints[write] = checkpoints[read];
+                    write += 1;
+                }
+            }
+            checkpoints.truncate(write);
+        }
+        checkpoints.shrink_to_fit();
+        index.checkpoints = checkpoints;
+        index.checkpoint_every = checkpoint_every.max(1);
+        index.checkpoint_byte_stride = checkpoint_byte_stride;
+        index.indexed_rows = indexed_rows;
+        index.maximum_width = maximum_width;
+        index.indexed_bytes = indexed_bytes;
+        index.telemetry = IndexTelemetry {
+            effective_workers: 0,
+            simd_backend: active_simd_backend(),
+            chunks_processed: 0,
+            dual_scan_chunks: 0,
+            quoted_entry_chunks: 0,
+            rescanned_bytes: 0,
+            byte_stride_checkpoints,
+            cache_hit: true,
+        };
+        Ok(index)
     }
 
     pub(crate) fn record_boundary(&mut self, offset: u64) {
@@ -393,18 +444,38 @@ impl IndexJob {
         config: IndexConfig,
         threads: Option<usize>,
     ) -> Result<Self, QuarryError> {
+        Self::start_with_options(session, config, threads, IndexCacheConfig::default())
+    }
+
+    pub(crate) fn start_with_options(
+        session: &Session,
+        config: IndexConfig,
+        threads: Option<usize>,
+        cache_config: IndexCacheConfig,
+    ) -> Result<Self, QuarryError> {
         let requested_threads = resolve_worker_count(threads)?;
-        Self::start_with_tuning(
+        Self::start_with_tuning_and_cache(
             session,
             config,
             ParallelTuning::for_production(requested_threads),
+            cache_config,
         )
     }
 
+    #[cfg(test)]
     fn start_with_tuning(
         session: &Session,
         config: IndexConfig,
         tuning: ParallelTuning,
+    ) -> Result<Self, QuarryError> {
+        Self::start_with_tuning_and_cache(session, config, tuning, IndexCacheConfig::disabled())
+    }
+
+    fn start_with_tuning_and_cache(
+        session: &Session,
+        config: IndexConfig,
+        tuning: ParallelTuning,
+        cache_config: IndexCacheConfig,
     ) -> Result<Self, QuarryError> {
         let index = StructuralIndex::new(config)?;
         let path = session.path.clone();
@@ -434,16 +505,50 @@ impl IndexJob {
             .name("quarry-index".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
-                let result = run_indexer(
-                    file,
-                    file_size,
-                    delimiter,
-                    encoding,
-                    config,
-                    tuning,
-                    &worker_state,
-                )
-                .and_then(|file| {
+                let result = (|| {
+                    if let Some(cached) = try_load_sidecar(
+                        &file,
+                        &path,
+                        file_size,
+                        delimiter,
+                        encoding,
+                        config,
+                        &cache_config,
+                    ) {
+                        if !source_matches_stamp(&file, &path, &source_stamp)? {
+                            return Err(QuarryError::SourceChanged);
+                        }
+                        let rows = cached.indexed_rows;
+                        let max_width = cached.maximum_width;
+                        {
+                            let mut guard = worker_state.index.write().unwrap();
+                            *guard = cached;
+                        }
+                        worker_state
+                            .bytes_scanned
+                            .store(file_size, Ordering::Release);
+                        worker_state.rows_scanned.store(rows, Ordering::Release);
+                        worker_state
+                            .columns_found
+                            .store(max_width, Ordering::Release);
+                        *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
+                            delimiter,
+                            encoding,
+                            file_size: source_stamp.file_size(),
+                            records: rows,
+                        });
+                        return Ok(());
+                    }
+
+                    let file = run_indexer(
+                        file,
+                        file_size,
+                        delimiter,
+                        encoding,
+                        config,
+                        tuning,
+                        &worker_state,
+                    )?;
                     if !source_matches_stamp(&file, &path, &source_stamp)? {
                         return Err(QuarryError::SourceChanged);
                     }
@@ -451,15 +556,25 @@ impl IndexJob {
                         && worker_state.bytes_scanned.load(Ordering::Acquire)
                             == source_stamp.file_size()
                     {
+                        let snapshot = worker_state.index.read().unwrap().clone();
                         *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
                             delimiter,
                             encoding,
                             file_size: source_stamp.file_size(),
-                            records: worker_state.index.read().unwrap().indexed_rows,
+                            records: snapshot.indexed_rows,
                         });
+                        save_sidecar(
+                            &file,
+                            &path,
+                            file_size,
+                            delimiter,
+                            encoding,
+                            &snapshot,
+                            &cache_config,
+                        );
                     }
                     Ok(())
-                });
+                })();
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
                 }
