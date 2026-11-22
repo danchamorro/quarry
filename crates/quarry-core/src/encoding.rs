@@ -48,6 +48,18 @@ impl Encoding {
         matches!(self, Self::Utf16Le | Self::Utf16Be)
     }
 
+    /// Type-level SIMD encoding whitelist: only ASCII-safe byte encodings may use the
+    /// 64-byte SIMD structural classifier; UTF-16 stays on the scalar encoding-aware path.
+    pub(crate) fn simd_byte_class(self) -> Option<quarry_delimited::ByteEncodingClass> {
+        match self {
+            Self::Utf8 => Some(quarry_delimited::ByteEncodingClass::Utf8),
+            Self::Latin1 | Self::Windows1252 => {
+                Some(quarry_delimited::ByteEncodingClass::SingleByteAsciiSuperset)
+            }
+            Self::Utf16Le | Self::Utf16Be => None,
+        }
+    }
+
     pub(crate) fn width(self) -> usize {
         if self.is_utf16() { 2 } else { 1 }
     }
@@ -385,10 +397,28 @@ impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
             ));
         }
         let logical = offset / encoding.width() as u64;
-        let inner = if encoding == Encoding::Utf8 {
-            quarry_delimited::StructuralScanner::at_offset(delimiter, logical)?
-        } else {
-            quarry_delimited::StructuralScanner::at_offset_without_bom(delimiter, logical)?
+        let dialect = quarry_delimited::ScannerDialect::rfc4180(delimiter);
+        let inner = match encoding.simd_byte_class() {
+            Some(quarry_delimited::ByteEncodingClass::Utf8) => {
+                quarry_delimited::StructuralScanner::with_dialect(
+                    dialect,
+                    logical,
+                    quarry_delimited::ByteEncodingClass::Utf8,
+                )?
+            }
+            Some(class) => quarry_delimited::StructuralScanner::with_dialect_without_bom(
+                dialect, logical, class,
+            )?,
+            None => {
+                // UTF-16 shadow scans stay strictly on the scalar path (SingleByteAsciiSuperset
+                // disables UTF-8 BOM stripping at construction).
+                quarry_delimited::StructuralScanner::with_dialect_and_backend(
+                    dialect,
+                    logical,
+                    quarry_delimited::ByteEncodingClass::SingleByteAsciiSuperset,
+                    quarry_delimited::SimdBackend::Scalar,
+                )?
+            }
         };
         Ok(Self {
             inner,
@@ -430,9 +460,11 @@ impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
             if self.at_start {
                 self.at_start = false;
                 if unit == 0xfeff {
-                    self.inner = quarry_delimited::StructuralScanner::at_offset_without_bom(
-                        self.delimiter,
+                    self.inner = quarry_delimited::StructuralScanner::with_dialect_and_backend(
+                        quarry_delimited::ScannerDialect::rfc4180(self.delimiter),
                         1,
+                        quarry_delimited::ByteEncodingClass::SingleByteAsciiSuperset,
+                        quarry_delimited::SimdBackend::Scalar,
                     )?;
                     skip = 1;
                     continue;

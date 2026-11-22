@@ -83,6 +83,9 @@ pub use join::{
     JoinOutputColumn, JoinOutputOptions, JoinSource, analyze_join_with_output, read_join_header,
     read_join_header_with_format,
 };
+pub use quarry_delimited::{
+    ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
+};
 use quarry_delimited::{ParseError, parse_record};
 pub use search::{SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress};
 pub use sort::{

@@ -8,7 +8,8 @@
 use std::borrow::Cow;
 
 use quarry_delimited::{
-    ParseError, ParseErrorKind, RecordScanner, StructuralScanner, parse_record,
+    ByteEncodingClass, EscapeRule, ParseError, ParseErrorKind, RecordScanner, ScannerDialect,
+    SimdBackend, StructuralScanner, active_simd_backend, parse_record, parse_record_with_dialect,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,6 +545,460 @@ fn scalar_oracle_matches_parse_record_on_malformed_inputs_and_invalid_delimiters
         assert_eq!(
             actual, expected,
             "random parse_record case={case_idx} delimiter={delimiter:?} record={record:?}"
+        );
+    }
+}
+
+/// Independent pure-scalar reference scanner supporting arbitrary `ScannerDialect`.
+fn scalar_oracle_scan_dialect(
+    bytes: &[u8],
+    dialect: ScannerDialect,
+    encoding: ByteEncodingClass,
+) -> Result<OracleScanResult, ParseError> {
+    dialect.validate(encoding)?;
+
+    let (mut index, mut record_start) =
+        if encoding == ByteEncodingClass::Utf8 && bytes.starts_with(b"\xEF\xBB\xBF") {
+            (3usize, 3u64)
+        } else {
+            (0usize, 0u64)
+        };
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        FieldStart,
+        Unquoted,
+        Quoted,
+        QuotedEscape,
+        AfterQuote,
+        AfterQuoteCr,
+    }
+
+    let mut state = State::FieldStart;
+    let mut ends = Vec::new();
+    let mut separators: usize = 0;
+    let mut max_width: usize = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let offset = index as u64;
+        match state {
+            State::FieldStart => {
+                if byte == dialect.delimiter {
+                    separators = separators.saturating_add(1);
+                } else if dialect.quote == Some(byte) {
+                    state = State::Quoted;
+                } else if byte == b'\n' {
+                    max_width = max_width.max(separators.saturating_add(1));
+                    separators = 0;
+                    let end = offset + 1;
+                    ends.push(end);
+                    record_start = end;
+                } else {
+                    state = State::Unquoted;
+                }
+            }
+            State::Unquoted => {
+                if byte == dialect.delimiter {
+                    separators = separators.saturating_add(1);
+                    state = State::FieldStart;
+                } else if dialect.quote == Some(byte) {
+                    return Err(ParseError {
+                        offset,
+                        kind: ParseErrorKind::UnexpectedQuote,
+                    });
+                } else if byte == b'\n' {
+                    max_width = max_width.max(separators.saturating_add(1));
+                    separators = 0;
+                    let end = offset + 1;
+                    ends.push(end);
+                    record_start = end;
+                    state = State::FieldStart;
+                }
+            }
+            State::Quoted => match dialect.escape {
+                EscapeRule::DoubledQuote => {
+                    if dialect.quote == Some(byte) {
+                        state = State::AfterQuote;
+                    }
+                }
+                EscapeRule::EscapeByte(esc) => {
+                    if byte == esc {
+                        state = State::QuotedEscape;
+                    } else if dialect.quote == Some(byte) {
+                        state = State::AfterQuote;
+                    }
+                }
+            },
+            State::QuotedEscape => {
+                state = State::Quoted;
+            }
+            State::AfterQuote => {
+                if dialect.escape == EscapeRule::DoubledQuote && dialect.quote == Some(byte) {
+                    state = State::Quoted;
+                } else if byte == dialect.delimiter {
+                    separators = separators.saturating_add(1);
+                    state = State::FieldStart;
+                } else if byte == b'\r' {
+                    state = State::AfterQuoteCr;
+                } else if byte == b'\n' {
+                    max_width = max_width.max(separators.saturating_add(1));
+                    separators = 0;
+                    let end = offset + 1;
+                    ends.push(end);
+                    record_start = end;
+                    state = State::FieldStart;
+                } else {
+                    return Err(ParseError {
+                        offset,
+                        kind: ParseErrorKind::UnexpectedAfterQuote(byte),
+                    });
+                }
+            }
+            State::AfterQuoteCr => {
+                if byte != b'\n' {
+                    return Err(ParseError {
+                        offset,
+                        kind: ParseErrorKind::ExpectedLfAfterCr,
+                    });
+                }
+                max_width = max_width.max(separators.saturating_add(1));
+                separators = 0;
+                let end = offset + 1;
+                ends.push(end);
+                record_start = end;
+                state = State::FieldStart;
+            }
+        }
+        index += 1;
+    }
+
+    let absolute_end = bytes.len() as u64;
+    match state {
+        State::Quoted | State::QuotedEscape => {
+            return Err(ParseError {
+                offset: absolute_end,
+                kind: ParseErrorKind::UnterminatedQuote,
+            });
+        }
+        State::AfterQuoteCr => {
+            return Err(ParseError {
+                offset: absolute_end,
+                kind: ParseErrorKind::ExpectedLfAfterCr,
+            });
+        }
+        State::FieldStart | State::Unquoted | State::AfterQuote => {}
+    }
+
+    if absolute_end > record_start {
+        max_width = max_width.max(separators.saturating_add(1));
+        ends.push(absolute_end);
+    }
+
+    Ok(OracleScanResult { ends, max_width })
+}
+
+fn run_dialect_backend(
+    input: &[u8],
+    dialect: ScannerDialect,
+    encoding: ByteEncodingClass,
+    backend: SimdBackend,
+    chunk_size: usize,
+) -> Result<OracleScanResult, ParseError> {
+    let mut s_plain =
+        StructuralScanner::<false>::with_dialect_and_backend(dialect, 0, encoding, backend)?;
+    let mut s_width =
+        StructuralScanner::<true>::with_dialect_and_backend(dialect, 0, encoding, backend)?;
+    let mut ends_plain = Vec::new();
+    let mut ends_width = Vec::new();
+    let mut offset = 0usize;
+    while offset < input.len() {
+        let next = (offset + chunk_size).min(input.len());
+        let r1 = s_plain.scan_chunk(&input[offset..next], offset as u64, |e| ends_plain.push(e));
+        let r2 = s_width.scan_chunk(&input[offset..next], offset as u64, |e| ends_width.push(e));
+        assert_eq!(r1, r2, "plain vs width diverged for backend={backend}");
+        r1?;
+        offset = next;
+    }
+    let f1 = s_plain.finish(input.len() as u64, |e| ends_plain.push(e));
+    let f2 = s_width.finish(input.len() as u64, |e| ends_width.push(e));
+    assert_eq!(f1, f2);
+    f1?;
+    assert_eq!(ends_plain, ends_width);
+    Ok(OracleScanResult {
+        ends: ends_width,
+        max_width: s_width.maximum_width(),
+    })
+}
+
+#[test]
+fn simd_block_classifier_matches_oracle_across_every_64_byte_alignment() {
+    let active = active_simd_backend();
+    let dialects = [
+        ScannerDialect::rfc4180(b','),
+        ScannerDialect::new(b';', Some(b'\''), EscapeRule::DoubledQuote),
+        ScannerDialect::new(b',', Some(b'"'), EscapeRule::EscapeByte(b'\\')),
+        ScannerDialect::new(b'\t', None, EscapeRule::DoubledQuote),
+    ];
+
+    let payloads: &[&[u8]] = &[
+        b"alpha,beta,gamma\n1,2,3\r\n4,5,6\n",
+        b"\"quoted,field\",\"esc \"\"quote\"\"\",\"multi\nline\"\r\nplain,end\n",
+        b"\"bs \\\"quote\\\"\",\"double \\\\\",\"trailing \\\\\\\"\"\r\nC:\\raw\\path,ok\n",
+        b"\"bad\"after,2\n",
+        b"unquoted\"bad,2\n",
+        b"\"ok\"\rx,2\n",
+        b"\"unterminated\nstill,open",
+        b"'sq''esc';'multi\r\nline'\r\nnext;row\n",
+        b"col1\t\"raw_quote\"\tcol3\ncol4\tcol5\n",
+    ];
+
+    for dialect in dialects {
+        for &payload in payloads {
+            // Slide payload across all 65 byte prefix alignments so every byte crosses a 64-byte boundary.
+            for pad in 0..=64 {
+                let mut input = vec![b'p'; pad];
+                input.push(b'\n');
+                input.extend_from_slice(payload);
+                // Ensure input spans multiple 64-byte blocks.
+                input.extend_from_slice(&[b'z'; 70]);
+                if !payload.contains(&b'"') && !payload.contains(&b'\'') {
+                    input.push(b'\n');
+                }
+
+                let expected = scalar_oracle_scan_dialect(&input, dialect, ByteEncodingClass::Utf8);
+                for chunk_size in [64usize, 128, 131, input.len().max(1)] {
+                    let scalar_res = run_dialect_backend(
+                        &input,
+                        dialect,
+                        ByteEncodingClass::Utf8,
+                        SimdBackend::Scalar,
+                        chunk_size,
+                    );
+                    let simd_res = run_dialect_backend(
+                        &input,
+                        dialect,
+                        ByteEncodingClass::Utf8,
+                        active,
+                        chunk_size,
+                    );
+                    assert_eq!(
+                        scalar_res, expected,
+                        "scalar mismatch dialect={dialect:?} pad={pad} chunk={chunk_size}"
+                    );
+                    assert_eq!(
+                        simd_res, expected,
+                        "simd ({active}) mismatch dialect={dialect:?} pad={pad} chunk={chunk_size}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn simd_preserves_field_start_after_quote_across_quote_free_block() {
+    let active = active_simd_backend();
+    let dialect = ScannerDialect::rfc4180(b',');
+
+    // Block 0 (64 bytes): `"aaaa...a"` -> ends in `AfterQuote`.
+    // Block 1 (64 bytes, zero quotes): `\n` + 62 `a` + `,` -> transitions to `FieldStart`.
+    // Block 2: `"b"\n` -> valid quoted field at offset 128.
+    let mut after_quote_lf_then_delim = Vec::new();
+    after_quote_lf_then_delim.push(b'"');
+    after_quote_lf_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_lf_then_delim.push(b'"');
+    after_quote_lf_then_delim.push(b'\n');
+    after_quote_lf_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_lf_then_delim.push(b',');
+    after_quote_lf_then_delim.extend_from_slice(b"\"b\"\n");
+
+    // Same pattern with `AfterQuoteCr` at block 0/1 boundary (`"\r` at bytes 62..64).
+    let mut after_quote_cr_lf_then_delim = Vec::new();
+    after_quote_cr_lf_then_delim.push(b'"');
+    after_quote_cr_lf_then_delim.extend_from_slice(&[b'a'; 61]);
+    after_quote_cr_lf_then_delim.extend_from_slice(b"\"\r");
+    after_quote_cr_lf_then_delim.push(b'\n');
+    after_quote_cr_lf_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_cr_lf_then_delim.push(b',');
+    after_quote_cr_lf_then_delim.extend_from_slice(b"\"b\"\n");
+
+    // Same pattern with `AfterQuote` followed immediately by `,` at byte 64 and `,` at byte 127.
+    let mut after_quote_delim_then_delim = Vec::new();
+    after_quote_delim_then_delim.push(b'"');
+    after_quote_delim_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_delim_then_delim.push(b'"');
+    after_quote_delim_then_delim.push(b',');
+    after_quote_delim_then_delim.extend_from_slice(&[b'a'; 62]);
+    after_quote_delim_then_delim.push(b',');
+    after_quote_delim_then_delim.extend_from_slice(b"\"b\"\n");
+
+    for case in [
+        after_quote_lf_then_delim,
+        after_quote_cr_lf_then_delim,
+        after_quote_delim_then_delim,
+    ] {
+        let expected = scalar_oracle_scan_dialect(&case, dialect, ByteEncodingClass::Utf8);
+        assert!(expected.is_ok());
+        for chunk_size in [64usize, 128, case.len()] {
+            let scalar = run_dialect_backend(
+                &case,
+                dialect,
+                ByteEncodingClass::Utf8,
+                SimdBackend::Scalar,
+                chunk_size,
+            );
+            let simd =
+                run_dialect_backend(&case, dialect, ByteEncodingClass::Utf8, active, chunk_size);
+            assert_eq!(scalar, expected);
+            assert_eq!(simd, expected);
+        }
+    }
+}
+
+#[test]
+fn simd_matches_scalar_on_large_seeded_quoted_and_escape_streams() {
+    let active = active_simd_backend();
+    let mut rng = XorShift64(0x2026_1121_51AD_0007);
+
+    for dialect in [
+        ScannerDialect::rfc4180(b','),
+        ScannerDialect::new(b',', Some(b'"'), EscapeRule::EscapeByte(b'\\')),
+        ScannerDialect::new(b'|', None, EscapeRule::DoubledQuote),
+    ] {
+        let mut input = Vec::with_capacity(64 * 1024);
+        for row in 0..1000 {
+            let cols = 1 + rng.gen_range(8);
+            for col in 0..cols {
+                if col > 0 {
+                    input.push(dialect.delimiter);
+                }
+                if let Some(q) = dialect.quote
+                    && rng.gen_range(3) == 0
+                {
+                    input.push(q);
+                    let flen = rng.gen_range(24);
+                    for _ in 0..flen {
+                        match rng.gen_range(12) {
+                            0 => match dialect.escape {
+                                EscapeRule::DoubledQuote => {
+                                    input.push(q);
+                                    input.push(q);
+                                }
+                                EscapeRule::EscapeByte(esc) => {
+                                    input.push(esc);
+                                    input.push(q);
+                                }
+                            },
+                            1 => match dialect.escape {
+                                EscapeRule::DoubledQuote => input.push(b'\\'),
+                                EscapeRule::EscapeByte(esc) => {
+                                    input.push(esc);
+                                    input.push(esc);
+                                }
+                            },
+                            2 => input.push(b'\n'),
+                            3 => input.push(dialect.delimiter),
+                            _ => input.push(b'a' + (rng.gen_range(26) as u8)),
+                        }
+                    }
+                    input.push(q);
+                } else {
+                    let flen = rng.gen_range(16);
+                    for _ in 0..flen {
+                        input.push(b'0' + (rng.gen_range(10) as u8));
+                    }
+                }
+            }
+            if row % 3 == 0 {
+                input.extend_from_slice(b"\r\n");
+            } else {
+                input.push(b'\n');
+            }
+        }
+
+        let expected =
+            scalar_oracle_scan_dialect(&input, dialect, ByteEncodingClass::Utf8).unwrap();
+        let simd_res =
+            run_dialect_backend(&input, dialect, ByteEncodingClass::Utf8, active, 1024).unwrap();
+        assert_eq!(
+            simd_res, expected,
+            "large seeded stream diverged for {dialect:?}"
+        );
+
+        // Verify parse_record_with_dialect succeeds on every scanned record.
+        let mut start = 0usize;
+        for &end in &expected.ends {
+            let rec = &input[start..end as usize];
+            let parsed = parse_record_with_dialect(rec, dialect, ByteEncodingClass::Utf8).unwrap();
+            assert!(!parsed.is_empty());
+            start = end as usize;
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode throughput measurement"]
+fn measure_single_thread_simd_vs_scalar_throughput() {
+    use std::time::Instant;
+
+    let active = active_simd_backend();
+    let unquoted_row = b"C0X100,2023-07-15,28.4,31.2,25.1,1012.3,78,2.4,180,0.0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20\n";
+    let quoted_row = b"12345678,story,\"ClickHouse, \"\"quoted\"\" text with\nnewline\",author_name,2023-07-15 12:34:56,142,88,https://example.com/path\n";
+
+    for (label, row) in [
+        ("unquoted-weather-like", unquoted_row.as_slice()),
+        ("quoted-hn-like", quoted_row.as_slice()),
+    ] {
+        let target_bytes = 64 * 1024 * 1024; // 64 MiB in-memory buffer
+        let repeats = target_bytes / row.len();
+        let mut buf = Vec::with_capacity(repeats * row.len());
+        for _ in 0..repeats {
+            buf.extend_from_slice(row);
+        }
+        let dialect = ScannerDialect::rfc4180(b',');
+
+        // Warmup + measure scalar (TRACK_WIDTH = true, matching structural indexer).
+        let mut scalar_records = 0u64;
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            let mut s = StructuralScanner::<true>::with_dialect_and_backend(
+                dialect,
+                0,
+                ByteEncodingClass::Utf8,
+                SimdBackend::Scalar,
+            )
+            .unwrap();
+            scalar_records = s.scan_chunk(&buf, 0, |_| {}).unwrap();
+            s.finish(buf.len() as u64, |_| {}).unwrap();
+        }
+        let scalar_secs = t0.elapsed().as_secs_f64() / 5.0;
+
+        // Warmup + measure active SIMD backend.
+        let mut simd_records = 0u64;
+        let t1 = Instant::now();
+        for _ in 0..5 {
+            let mut s = StructuralScanner::<true>::with_dialect_and_backend(
+                dialect,
+                0,
+                ByteEncodingClass::Utf8,
+                active,
+            )
+            .unwrap();
+            simd_records = s.scan_chunk(&buf, 0, |_| {}).unwrap();
+            s.finish(buf.len() as u64, |_| {}).unwrap();
+        }
+        let simd_secs = t1.elapsed().as_secs_f64() / 5.0;
+
+        assert_eq!(scalar_records, simd_records);
+        let gb = buf.len() as f64 / 1e9;
+        println!(
+            "{label}: scalar={:.2} GB/s ({:.3} ms), {active}={:.2} GB/s ({:.3} ms), speedup={:.2}x",
+            gb / scalar_secs,
+            scalar_secs * 1000.0,
+            gb / simd_secs,
+            simd_secs * 1000.0,
+            scalar_secs / simd_secs
         );
     }
 }
