@@ -5096,6 +5096,7 @@ mod tests {
             .wait()
             .unwrap();
         let dest_delim = directory.path().join("sorted-delim.csv");
+        let gate_before = engine_pool().large_record_gate().acquisitions();
         let SortOutcome::Complete(delim_summary) = sd
             .start_create_sorted_working_copy_with_options(
                 BTreeMap::new(),
@@ -5115,6 +5116,16 @@ mod tests {
         else {
             panic!("delimiter-heavy sort cancelled");
         };
+        let gate_after = engine_pool().large_record_gate().acquisitions();
+        assert!(
+            delim_summary.effective_workers >= 2,
+            "delimiter-heavy sort should run in parallel, got {} worker(s)",
+            delim_summary.effective_workers
+        );
+        assert!(
+            gate_after >= gate_before + 4,
+            "expected each delimiter-heavy row to acquire LargeRecordGate (before={gate_before}, after={gate_after})"
+        );
         assert_eq!(delim_summary.rows_sorted, 4);
         assert_eq!(
             fs::read_to_string(&dest_delim).unwrap(),

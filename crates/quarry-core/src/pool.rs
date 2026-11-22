@@ -471,6 +471,8 @@ impl ByteBudget {
 pub(crate) struct LargeRecordGate {
     held: Mutex<bool>,
     available: Condvar,
+    #[cfg(test)]
+    acquisitions: AtomicUsize,
 }
 
 pub(crate) struct LargeRecordGuard {
@@ -490,13 +492,22 @@ impl LargeRecordGate {
         Self {
             held: Mutex::new(false),
             available: Condvar::new(),
+            #[cfg(test)]
+            acquisitions: AtomicUsize::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquisitions(&self) -> usize {
+        self.acquisitions.load(Ordering::Acquire)
     }
 
     pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<LargeRecordGuard> {
         let mut held = self.held.lock().unwrap();
         if !*held {
             *held = true;
+            #[cfg(test)]
+            self.acquisitions.fetch_add(1, Ordering::AcqRel);
             Some(LargeRecordGuard {
                 gate: Arc::clone(self),
             })
@@ -513,6 +524,8 @@ impl LargeRecordGate {
             }
             if !*held {
                 *held = true;
+                #[cfg(test)]
+                self.acquisitions.fetch_add(1, Ordering::AcqRel);
                 return Some(LargeRecordGuard {
                     gate: Arc::clone(self),
                 });
