@@ -764,6 +764,17 @@ fn scan_search_stripe(
     })
 }
 
+/// Appends `bytes` to `record` while keeping `record.capacity() <= max_cap` (never doubling past
+/// `max_cap`, so transient reallocation holds at most `2 * max_cap`).
+fn append_bounded_record(record: &mut Vec<u8>, bytes: &[u8], max_cap: usize) {
+    let needed = record.len().saturating_add(bytes.len());
+    if needed > record.capacity() {
+        let next_cap = record.capacity().saturating_mul(2).max(needed).min(max_cap);
+        record.reserve_exact(next_cap.saturating_sub(record.len()));
+    }
+    record.extend_from_slice(bytes);
+}
+
 /// Bounded streaming stripe scan for stripes whose span exceeds `MAX_SINGLE_READ_STRIPE_BYTES`
 /// or `2 * max_record_bytes`, enforcing `max_record_bytes` incrementally without buffering the
 /// entire stripe in memory.
@@ -879,7 +890,14 @@ fn scan_search_stripe_streaming(
                             limit: max_record_bytes,
                         });
                     } else {
-                        record.extend_from_slice(&chunk[segment_start..local_end]);
+                        let record_cap = (stripe.end_offset - stripe.start_offset)
+                            .min(max_record_bytes as u64)
+                            as usize;
+                        append_bounded_record(
+                            &mut record,
+                            &chunk[segment_start..local_end],
+                            record_cap,
+                        );
                         if row_has_edit || !can_prefilter || matcher.find(&record).is_some() {
                             match find_record(
                                 &matcher,
@@ -947,7 +965,9 @@ fn scan_search_stripe_streaming(
                     }),
                 });
             }
-            record.extend_from_slice(&chunk[segment_start..read]);
+            let record_cap =
+                (stripe.end_offset - stripe.start_offset).min(max_record_bytes as u64) as usize;
+            append_bounded_record(&mut record, &chunk[segment_start..read], record_cap);
         }
     }
 
@@ -1026,14 +1046,17 @@ fn scan_search_stripe_streaming(
 /// Conservative peak live memory bound for scanning a search stripe.
 ///
 /// Single-read stripes buffer the entire stripe (`<= MAX_SINGLE_READ_STRIPE_BYTES`).
-/// Streaming stripes read in `WORKER_CANCEL_SLICE_BYTES` pieces while retaining at most
-/// one active record up to `max_record_bytes`.
+/// Streaming stripes hold a `WORKER_CANCEL_SLICE_BYTES` read buffer plus one active
+/// record buffer whose capacity is capped at `stripe_span.min(max_record_bytes)` via
+/// `append_bounded_record` (and transiently up to `2 * record_cap` while reallocating).
 fn search_stripe_memory_bound(stripe_span: u64, max_record_bytes: usize) -> u64 {
     if stripe_span > MAX_SINGLE_READ_STRIPE_BYTES
         || stripe_span > (max_record_bytes as u64).saturating_mul(2)
     {
-        stripe_span
-            .min((max_record_bytes as u64).saturating_add(WORKER_CANCEL_SLICE_BYTES as u64))
+        let record_cap_bound = stripe_span.min(max_record_bytes as u64);
+        record_cap_bound
+            .saturating_mul(2)
+            .saturating_add(WORKER_CANCEL_SLICE_BYTES as u64)
             .max(1)
     } else {
         stripe_span.max(1)
@@ -1306,6 +1329,9 @@ fn run_search_bounded(
             encoding.read_chunk(&mut file, &mut chunk[..cap])?
         };
         if read == 0 {
+            if remaining > 0 {
+                return Err(QuarryError::SourceChanged);
+            }
             if indexed_frontier == file_size {
                 let has_final_record = scanner.finish(absolute_start, |_| {})?;
                 if has_final_record {
