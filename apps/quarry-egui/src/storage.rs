@@ -172,6 +172,7 @@ pub(super) struct StorageReview {
     worker: Option<JoinHandle<Result<(StorageSpace, u64), String>>>,
     index_cache_enabled: bool,
     cache_clear_status: Option<Result<String, String>>,
+    cache_clear_worker: Option<JoinHandle<Result<String, String>>>,
 }
 
 impl StorageReview {
@@ -192,6 +193,7 @@ impl StorageReview {
             worker: None,
             index_cache_enabled,
             cache_clear_status: None,
+            cache_clear_worker: None,
         };
         review.check();
         review
@@ -225,6 +227,41 @@ impl StorageReview {
                 Err("Storage check failed. Try checking the folder again.".into())
             }));
         }
+        if self
+            .cache_clear_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            self.cache_clear_status = Some(
+                self.cache_clear_worker
+                    .take()
+                    .unwrap()
+                    .join()
+                    .unwrap_or_else(|_| Err("Failed to clear index cache.".into())),
+            );
+        }
+    }
+
+    fn start_clear_index_cache(&mut self) {
+        if self.cache_clear_worker.is_some() {
+            return;
+        }
+        self.cache_clear_status = None;
+        self.cache_clear_worker = Some(thread::spawn(|| {
+            quarry_core::clear_index_cache(None)
+                .map(|summary| {
+                    if summary.files_removed == 0 {
+                        "Index cache is already empty.".into()
+                    } else {
+                        format!(
+                            "Cleared {} cached index files ({}).",
+                            summary.files_removed,
+                            format_bytes(summary.bytes_reclaimed)
+                        )
+                    }
+                })
+                .map_err(|error| error.to_string())
+        }));
     }
 
     fn ready(&self) -> bool {
@@ -336,6 +373,7 @@ impl QuarryApp {
         let mut accept = false;
         let mut cancel = false;
         let mut check = false;
+        let mut clear_cache = false;
         let modal = egui::Modal::new(egui::Id::new("quarry-storage-review"))
             .frame(compact_tool_frame(ctx))
             .backdrop_color(Color32::from_black_alpha(40))
@@ -449,22 +487,16 @@ impl QuarryApp {
                                     "Reuse cached index for large local files",
                                 );
                                 ui.horizontal_wrapped(|ui| {
-                                    if ui.button("Clear index cache").clicked() {
-                                        review.cache_clear_status = Some(
-                                            quarry_core::clear_index_cache(None)
-                                                .map(|summary| {
-                                                    if summary.files_removed == 0 {
-                                                        "Index cache is already empty.".into()
-                                                    } else {
-                                                        format!(
-                                                            "Cleared {} cached index files ({}).",
-                                                            summary.files_removed,
-                                                            format_bytes(summary.bytes_reclaimed)
-                                                        )
-                                                    }
-                                                })
-                                                .map_err(|error| error.to_string()),
-                                        );
+                                    let clearing = review.cache_clear_worker.is_some();
+                                    if ui
+                                        .add_enabled(!clearing, egui::Button::new("Clear index cache"))
+                                        .clicked()
+                                    {
+                                        clear_cache = true;
+                                    }
+                                    if clearing {
+                                        ui.spinner();
+                                        ui.small("Clearing index cache…");
                                     }
                                 });
                                 if let Some(status) = &review.cache_clear_status {
@@ -501,6 +533,9 @@ impl QuarryApp {
         cancel |= modal.should_close();
         if check {
             review.check();
+        }
+        if clear_cache {
+            review.start_clear_index_cache();
         }
         if cancel {
             self.active.storage_review = None;
@@ -1210,6 +1245,7 @@ mod tests {
             ))),
             index_cache_enabled: true,
             cache_clear_status: None,
+            cache_clear_worker: None,
         });
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
