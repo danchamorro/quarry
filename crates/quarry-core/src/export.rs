@@ -10388,6 +10388,8 @@ mod tests {
                     delay_stripe_zero: None,
                     max_chunk_bytes_seen: None,
                     on_reorder_wait: None,
+                    max_non_head_output_bytes_seen: None,
+                    large_gate_acquisitions: None,
                 };
                 let inner = SaveAsJob::start_worker_with_options(
                     session.path.clone(),
@@ -10535,6 +10537,8 @@ mod tests {
                 delay_stripe_zero: Some(Duration::from_millis(40)),
                 max_chunk_bytes_seen: Some(Arc::clone(&max_chunk_seen)),
                 on_reorder_wait: None,
+                max_non_head_output_bytes_seen: None,
+                large_gate_acquisitions: None,
             }),
         )
         .unwrap();
@@ -10585,6 +10589,8 @@ mod tests {
                 delay_stripe_zero: Some(Duration::from_millis(500)),
                 max_chunk_bytes_seen: None,
                 on_reorder_wait: Some(Arc::clone(&waited_on_reorder)),
+                max_non_head_output_bytes_seen: None,
+                large_gate_acquisitions: None,
             }),
         )
         .unwrap();
@@ -10637,6 +10643,8 @@ mod tests {
             case_sensitivity: CaseSensitivity::Sensitive,
         };
         let large_dest = dir.path().join("large-expand-out.csv");
+        let max_non_head_retained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let large_gate_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let large_inner = SaveAsJob::start_worker_with_options(
             large_session.path.clone(),
             large_session.file_size,
@@ -10663,6 +10671,8 @@ mod tests {
                 delay_stripe_zero: Some(Duration::from_millis(50)),
                 max_chunk_bytes_seen: None,
                 on_reorder_wait: None,
+                max_non_head_output_bytes_seen: Some(Arc::clone(&max_non_head_retained)),
+                large_gate_acquisitions: Some(Arc::clone(&large_gate_hits)),
             }),
         )
         .unwrap();
@@ -10672,6 +10682,94 @@ mod tests {
         };
         assert!(large_summary.effective_workers >= 2);
         assert_eq!(large_summary.replacements, 8 * 2_500);
+        // Because non-head workers pre-acquire reorder_budget before expanding, at most ONE
+        // oversized ~5.12 MiB output chunk can be retained across all non-head workers at once
+        // (well below 2x a single expanded row).
+        let single_expanded_row_bytes = 2_500 * 2_048 + 16;
+        assert!(
+            max_non_head_retained.load(Ordering::Acquire) <= single_expanded_row_bytes + 64 * 1024,
+            "non-head retained oversized output exceeded single-record bound: {}",
+            max_non_head_retained.load(Ordering::Acquire)
+        );
+        assert!(
+            large_gate_hits.load(Ordering::Acquire) >= 8,
+            "expected large-record gate acquisition for all 8 expanding rows, got {}",
+            large_gate_hits.load(Ordering::Acquire)
+        );
+
+        // Delimiter-heavy records smaller than 4 MiB in raw and output size must still acquire
+        // `LargeRecordGate` because parsing allocates `Vec<Cow>` + `Vec<Vec>` per field.
+        let delim_source = dir.path().join("delim-heavy.csv");
+        let many_commas = format!("x{}\n", ",".repeat(100_000));
+        let mut delim_raw = String::from("h0,h1\n");
+        for _ in 0..4 {
+            delim_raw.push_str(&many_commas);
+        }
+        fs::write(&delim_source, delim_raw.as_bytes()).unwrap();
+        let delim_session = Session::open(
+            &delim_source,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let delim_index = delim_session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 1,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let delim_gate_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delim_dest = dir.path().join("delim-heavy-out.csv");
+        let delim_inner = SaveAsJob::start_worker_with_options(
+            delim_session.path.clone(),
+            delim_session.file_size,
+            delim_session.dialect.delimiter,
+            delim_session.dialect.has_header,
+            SaveEdits {
+                headers: BTreeMap::new(),
+                cells: BTreeMap::new(),
+                transformation: None,
+            },
+            Some(LiteralReplacement {
+                needle: b"x".to_vec(),
+                replacement: b"y".to_vec(),
+                case_sensitivity: CaseSensitivity::Sensitive,
+            }),
+            Vec::new(),
+            None,
+            SaveTarget::WorkingCopy(delim_dest.clone(), delim_session.source_stamp.clone()),
+            delim_session.export_config(),
+            Some(delim_index.indexed_rows()),
+            Some(delim_index),
+            Some(replace_parallel::ReplaceParallelTuning {
+                requested_workers: 4,
+                min_stripe_bytes: 1,
+                flush_chunk_bytes: 1024 * 1024,
+                reorder_budget_bytes: 64 * 1024 * 1024,
+                max_head_in_flight: 4,
+                delay_stripe_zero: None,
+                max_chunk_bytes_seen: None,
+                on_reorder_wait: None,
+                max_non_head_output_bytes_seen: None,
+                large_gate_acquisitions: Some(Arc::clone(&delim_gate_hits)),
+            }),
+        )
+        .unwrap();
+        let delim_job = ReplaceAllJob { inner: delim_inner };
+        let ReplaceAllOutcome::Complete(delim_summary) = delim_job.wait().unwrap() else {
+            panic!("delimiter-heavy parallel replace did not complete");
+        };
+        assert_eq!(delim_summary.replacements, 4);
+        assert!(
+            delim_gate_hits.load(Ordering::Acquire) >= 4,
+            "expected large-record gate acquisition for delimiter-heavy rows, got {}",
+            delim_gate_hits.load(Ordering::Acquire)
+        );
     }
 
     #[test]
