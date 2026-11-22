@@ -160,12 +160,7 @@ impl StoragePreferences {
             .ok_or_else(|| std::io::Error::other("Invalid storage preference location"))?;
         std::fs::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        quarry_core::restrict_private_file(file.path(), file.as_file())?;
         file.write_all(encoded.as_bytes())?;
         file.flush()?;
         file.persist(path).map_err(|e| e.error)?;
@@ -938,6 +933,7 @@ impl QuarryApp {
             return;
         }
         let mut review = self.active.storage_review.take().unwrap();
+        let mut persistence_warning = None;
         if working {
             let chosen = PathBuf::from(&review.path_input);
             let is_custom = chosen != std::env::temp_dir();
@@ -953,16 +949,21 @@ impl QuarryApp {
                 .storage_preferences
                 .set_scratch_directory(is_custom.then_some(chosen.as_path()))
             {
-                self.active.notice = Some(AppMessage::warning(format!(
+                let warning = AppMessage::warning(format!(
                     "Using {} for this session, but Quarry could not save this preference: {error}",
                     chosen.display()
-                )));
+                ));
+                self.active.notice = Some(warning.clone());
+                persistence_warning = Some(warning);
             }
             for tab in std::iter::once(&mut self.active).chain(self.tabs.iter_mut()) {
                 if let Some(document) = tab.document.as_mut() {
                     document.working_directory = self.working_directory.clone();
                     document.custom_working_directory = self.custom_working_directory;
                 }
+            }
+            if let Some(dialog) = self.join_files.as_mut() {
+                dialog.temporary = self.working_directory.clone();
             }
         }
         if let Some(operation) = review.operation {
@@ -971,6 +972,9 @@ impl QuarryApp {
             self.active.storage_approved = true;
             self.resume_storage_operation(operation, ctx);
             self.active.storage_approved = false;
+            if self.active.notice.is_none() {
+                self.active.notice = persistence_warning;
+            }
         }
     }
 

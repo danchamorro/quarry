@@ -287,7 +287,7 @@ pub(super) struct JoinDialog {
     acknowledge_expansion: bool,
     acknowledge_layout: bool,
     mode: JoinMode,
-    temporary: PathBuf,
+    pub(super) temporary: PathBuf,
     header_jobs: [Option<JoinJob<HeaderInfo>>; 2],
     retired_headers: Vec<RetiredHeader>,
     checking: Option<JoinJob<JoinPlan>>,
@@ -2250,9 +2250,7 @@ impl QuarryApp {
         }
         self.ensure_working_directory_available()?;
         let dialog = self.join_files.as_mut().unwrap();
-        if self.custom_working_directory {
-            dialog.temporary = self.working_directory.clone();
-        }
+        dialog.temporary = self.working_directory.clone();
         dialog.start_analysis(working);
         Ok(())
     }
@@ -2718,8 +2716,8 @@ mod tests {
     fn prepare(app: &mut QuarryApp, dir: &Path) -> (PathBuf, PathBuf) {
         let a = fixture(dir, "main.csv", b"id,name\nb,Bob\na,Alice\nz,Last\n");
         let b = fixture(dir, "additional.csv", b"id,city\na,Seattle\nb,LA\n");
+        app.working_directory = dir.to_path_buf();
         app.open_join_files();
-        app.join_files.as_mut().unwrap().temporary = dir.to_path_buf();
         app.join_files.as_mut().unwrap().read_header(0, a.clone());
         finish(app);
         app.join_files.as_mut().unwrap().read_header(1, b.clone());

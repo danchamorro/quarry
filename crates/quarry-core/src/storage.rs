@@ -512,6 +512,56 @@ pub(crate) fn count_records_encoded(
     }
 }
 
+/// Restrict a newly created private file to owner-only permissions before writing sensitive
+/// data (POSIX `0600` + empty ACL on macOS, protected owner-only DACL on Windows).
+pub fn restrict_private_file(path: &Path, file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        #[cfg(target_os = "macos")]
+        set_macos_acl(file, None)?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        let expected = crate::SourceStamp::from_file(file)?;
+        let acl_handle = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let meta = acl_handle.metadata()?;
+        if !meta.is_file() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private file cannot be a reparse point",
+            ));
+        }
+        let observed = crate::SourceStamp::from_file(&acl_handle)?;
+        if !expected.same_identity(&observed) {
+            return Err(io::Error::other(
+                "private file changed while restricting permissions",
+            ));
+        }
+        crate::sidecar::set_windows_owner_only_dacl(acl_handle.as_raw_handle())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, file);
+        Ok(())
+    }
+}
+
 /// Identifies filesystems that cannot store extended ACLs.
 #[cfg(target_os = "macos")]
 fn unsupported_acl(error: &io::Error) -> bool {

@@ -109,7 +109,8 @@ pub use sort::{
 };
 pub use storage::{
     StorageSpace, check_storage, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
-    estimate_edited_output_bytes_from_values, inspect_storage, validate_scratch_directory,
+    estimate_edited_output_bytes_from_values, inspect_storage, restrict_private_file,
+    validate_scratch_directory,
 };
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
