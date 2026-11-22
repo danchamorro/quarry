@@ -4882,4 +4882,47 @@ mod tests {
         assert_eq!(outputs[1], outputs[2]);
         assert!(sort_artifacts(directory.path()).is_empty());
     }
+
+    #[test]
+    fn job_memory_budget_retains_shared_reservation_until_live_arenas_drop() {
+        let shared = Arc::new(crate::pool::ByteBudget::new(300_000_000));
+        let cancelled = AtomicBool::new(false);
+        let job = parallel::JobMemoryBudget::acquire_for_job(300_000_000, &shared, &cancelled)
+            .expect("acquired job budget");
+        assert_eq!(shared.used(), 300_000_000);
+
+        // Hold 220 MiB (> 128 MiB steady-state spill cap) in a live arena guard.
+        let live_bytes = 220 * 1024 * 1024;
+        let live_guard = job
+            .try_acquire_empty(live_bytes)
+            .expect("live arena admitted");
+
+        // Marking spilled must shrink only the unused headroom (300 MB -> 220 MiB), never
+        // releasing bytes still occupied by live arenas.
+        job.mark_spilled();
+        assert_eq!(shared.used(), live_bytes);
+
+        // A concurrent job wanting > 80 MB cannot over-commit the 300 MB shared budget until
+        // the live arena actually flushes and drops its guard.
+        let shared_clone = Arc::clone(&shared);
+        let waiter_cancel = Arc::new(AtomicBool::new(false));
+        let waiter_cancel_clone = Arc::clone(&waiter_cancel);
+        let waiter = std::thread::spawn(move || {
+            shared_clone
+                .acquire_up_to(100 * 1024 * 1024, 150 * 1024 * 1024, &waiter_cancel_clone)
+                .map(|g| g.bytes())
+        });
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(shared.used(), live_bytes);
+
+        // Dropping the live arena shrinks the reservation down to `EXTERNAL_SPILL_TOTAL_BYTES`
+        // (128 MiB), freeing ~158 MiB so the concurrent job admits cleanly without over-commit.
+        drop(live_guard);
+        let granted = waiter.join().unwrap().expect("waiter admitted after flush");
+        assert!(granted >= 100 * 1024 * 1024);
+        assert!(granted <= 300_000_000 - 128 * 1024 * 1024);
+
+        job.release_shared_reservation();
+        assert_eq!(shared.used(), 0);
+    }
 }

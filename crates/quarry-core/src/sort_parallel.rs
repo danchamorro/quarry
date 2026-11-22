@@ -265,6 +265,9 @@ impl Drop for JobBudgetGuard {
         if self.reserved > 0 {
             let mut used = self.job.used.lock().unwrap();
             *used = used.saturating_sub(self.reserved);
+            if self.job.spilled.load(Ordering::Acquire) {
+                self.job.shrink_shared_reservation_locked(*used);
+            }
             self.job.available.notify_all();
         }
     }
@@ -295,18 +298,32 @@ impl JobMemoryBudget {
         self.limit
     }
 
+    fn effective_limit(&self) -> usize {
+        if self.spilled.load(Ordering::Acquire) {
+            self.limit.clamp(1, EXTERNAL_SPILL_TOTAL_BYTES)
+        } else {
+            self.limit
+        }
+    }
+
+    fn shrink_shared_reservation_locked(&self, current_used: usize) {
+        if let Some(guard) = self.shared_guard.lock().unwrap().as_mut() {
+            // Never release shared budget still held by live arenas; shrink down toward
+            // `EXTERNAL_SPILL_TOTAL_BYTES` only as live arena reservations are dropped.
+            let steady_target = self.limit.clamp(1, EXTERNAL_SPILL_TOTAL_BYTES);
+            let target = current_used.max(steady_target);
+            guard.shrink_to(target);
+        }
+    }
+
     pub(super) fn is_spilled(&self) -> bool {
         self.spilled.load(Ordering::Acquire)
     }
 
     pub(super) fn mark_spilled(&self) {
-        if !self.spilled.swap(true, Ordering::AcqRel)
-            && let Some(guard) = self.shared_guard.lock().unwrap().as_mut()
-        {
-            // Once spilling, steady-state worker arenas are capped at `EXTERNAL_SPILL_TOTAL_BYTES`,
-            // so release any excess reservation immediately for concurrent engine jobs.
-            let target = self.limit.clamp(1, EXTERNAL_SPILL_TOTAL_BYTES);
-            guard.shrink_to(target);
+        if !self.spilled.swap(true, Ordering::AcqRel) {
+            let used = self.used.lock().unwrap();
+            self.shrink_shared_reservation_locked(*used);
         }
     }
 
@@ -320,7 +337,8 @@ impl JobMemoryBudget {
     pub(super) fn try_acquire_empty(self: &Arc<Self>, bytes: usize) -> Option<JobBudgetGuard> {
         let needed = bytes.max(1);
         let mut used = self.used.lock().unwrap();
-        if *used != 0 && used.saturating_add(needed) > self.limit {
+        let effective_limit = self.effective_limit();
+        if *used != 0 && used.saturating_add(needed) > effective_limit {
             return None;
         }
         *used = used.saturating_add(needed);
@@ -367,7 +385,8 @@ impl JobMemoryBudget {
                 return Ok(Some(guard));
             }
             let used = self.used.lock().unwrap();
-            if *used == 0 || used.saturating_add(needed) <= self.limit {
+            let effective_limit = self.effective_limit();
+            if *used == 0 || used.saturating_add(needed) <= effective_limit {
                 continue;
             }
             let _ = self
@@ -397,10 +416,11 @@ impl JobBudgetGuard {
             return true;
         }
         let exact_deficit = new_used - self.reserved;
-        let quantum = if self.job.limit >= 4 * 1024 * 1024 {
+        let effective_limit = self.job.effective_limit();
+        let quantum = if effective_limit >= 4 * 1024 * 1024 {
             let max_quantum = worker_cap
                 .map(|cap| cap.saturating_sub(self.reserved))
-                .unwrap_or(self.job.limit.saturating_sub(self.reserved));
+                .unwrap_or(effective_limit.saturating_sub(self.reserved));
             exact_deficit
                 .max(BUDGET_REFILL_QUANTUM)
                 .min(max_quantum.max(exact_deficit))
@@ -422,7 +442,8 @@ impl JobBudgetGuard {
             return true;
         }
         let mut used = self.job.used.lock().unwrap();
-        if used.saturating_add(delta) > self.job.limit {
+        let effective_limit = self.job.effective_limit();
+        if used.saturating_add(delta) > effective_limit {
             return false;
         }
         *used = used.saturating_add(delta);

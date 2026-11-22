@@ -2140,5 +2140,37 @@ mod tests {
                 loaded.load_error
             );
         }
+
+        // Resuming a successful storage-reviewed operation after a preference-save failure must
+        // preserve the persistence warning instead of clearing `active.notice`.
+        let unwritable_pref = dir.path().join("pref-parent-is-file");
+        std::fs::write(&unwritable_pref, b"block").unwrap();
+        let mut app = QuarryApp::new(Some(source), Instant::now());
+        finish(&mut app);
+        app.storage_preferences = StoragePreferences::load(Some(unwritable_pref.join("prefs")));
+        let valid_dir = dir.path().join("valid-session-scratch");
+        std::fs::create_dir(&valid_dir).unwrap();
+        let ctx = egui::Context::default();
+        app.begin_storage_review(PendingStorageOperation::DeleteRows(vec![1..=1]));
+        let review = app.active.storage_review.as_mut().unwrap();
+        review.path_input = valid_dir.display().to_string();
+        review.checked_path = valid_dir.clone();
+        review.result = Some(Ok((
+            StorageSpace {
+                directory: valid_dir.clone(),
+                required_bytes: 1,
+                available_bytes: 1024 * 1024,
+            },
+            1,
+        )));
+        app.accept_storage_review(&ctx, true);
+        assert!(
+            app.active
+                .notice
+                .as_ref()
+                .is_some_and(|m| m.text.contains("could not save this preference")),
+            "expected persistence warning to survive successful resumed operation, got {:?}",
+            app.active.notice.as_ref().map(|m| &m.text)
+        );
     }
 }
