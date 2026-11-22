@@ -18,8 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use quarry_delimited::{EscapeRule, ScannerDialect};
 
 use crate::encoding::RecordScanner;
+use crate::export::source_matches_stamp;
 use crate::positional_io::read_at_exact_or_eof;
-use crate::{Checkpoint, Encoding, IndexConfig, QuarryError, StructuralIndex};
+use crate::{Checkpoint, Encoding, IndexConfig, QuarryError, SourceStamp, StructuralIndex};
 
 /// Default maximum total size of the persistent sidecar cache directory (256 MiB).
 pub const DEFAULT_INDEX_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -907,6 +908,7 @@ fn compute_last_record_hash(
 fn spot_check_checkpoints(
     file: &File,
     file_size: u64,
+    indexed_rows: u64,
     delimiter: u8,
     encoding: Encoding,
     checkpoints: &[Checkpoint],
@@ -934,13 +936,16 @@ fn spot_check_checkpoints(
         if cp.offset == 0 || cp.offset > file_size {
             return false;
         }
-        // Check that the byte(s) immediately preceding `cp.offset` form a literal LF newline.
+        // A valid file without a trailing newline may emit its final checkpoint at EOF (`file_size`).
+        if cp.offset == file_size {
+            if cp.row != indexed_rows {
+                return false;
+            }
+            continue;
+        }
+        // Non-EOF checkpoints must sit immediately after a literal LF newline.
         if !preceded_by_lf(file, cp.offset, encoding) {
             return false;
-        }
-        // If `cp.offset == file_size`, there are no bytes after it to scan forward.
-        if cp.offset == file_size {
-            continue;
         }
 
         let next_cp = checkpoints.get(idx + 1).copied();
@@ -1072,13 +1077,42 @@ fn resolve_and_harden_cache_dir(config: &IndexCacheConfig) -> Option<PathBuf> {
                 return None;
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            use rustix::fs::{Mode, OFlags};
+            let fd = rustix::fs::open(
+                &dir,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .ok()?;
+            let dir_file = File::from(fd);
+            // Clear any inherited ACL grants so cache files remain strictly owner-only.
+            crate::storage::set_macos_acl(&dir_file, None).ok()?;
+        }
     }
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
         if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return None;
+        }
+        let dir_file = fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&dir)
+            .ok()?;
+        let dir_meta = dir_file.metadata().ok()?;
+        if !dir_meta.is_dir()
+            || (dir_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || !is_eligible_windows_filesystem(&dir_file)
+        {
             return None;
         }
     }
@@ -1245,6 +1279,8 @@ fn create_private_exclusive_file(path: &Path) -> io::Result<File> {
         )?;
         let file = File::from(fd);
         let _ = rustix::fs::fchmod(&file, Mode::from_raw_mode(0o600));
+        #[cfg(target_os = "macos")]
+        crate::storage::set_macos_acl(&file, None)?;
         Ok(file)
     }
 
@@ -1283,7 +1319,10 @@ pub(crate) fn try_load_sidecar(
     index_config: IndexConfig,
     cache_config: &IndexCacheConfig,
 ) -> Option<StructuralIndex> {
-    if !cache_config.enabled || file_size < cache_config.min_file_bytes {
+    if !cache_config.enabled
+        || cache_config.max_cache_bytes == 0
+        || file_size < cache_config.min_file_bytes
+    {
         return None;
     }
     if !is_eligible_local_filesystem(file) {
@@ -1343,7 +1382,14 @@ pub(crate) fn try_load_sidecar(
         return None;
     }
 
-    if !spot_check_checkpoints(file, file_size, delimiter, encoding, &decoded.checkpoints) {
+    if !spot_check_checkpoints(
+        file,
+        file_size,
+        decoded.indexed_rows,
+        delimiter,
+        encoding,
+        &decoded.checkpoints,
+    ) {
         return None;
     }
 
@@ -1377,9 +1423,11 @@ pub(crate) fn try_load_sidecar(
 /// write + `fsync` + rename, followed by concurrent-process-safe LRU eviction.
 ///
 /// Failures are silently ignored so cache I/O problems never break indexing.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn save_sidecar(
     file: &File,
     path: &Path,
+    expected_stamp: &SourceStamp,
     file_size: u64,
     delimiter: u8,
     encoding: Encoding,
@@ -1389,6 +1437,7 @@ pub(crate) fn save_sidecar(
     let _ = try_save_sidecar(
         file,
         path,
+        expected_stamp,
         file_size,
         delimiter,
         encoding,
@@ -1397,9 +1446,11 @@ pub(crate) fn save_sidecar(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_save_sidecar(
     file: &File,
     path: &Path,
+    expected_stamp: &SourceStamp,
     file_size: u64,
     delimiter: u8,
     encoding: Encoding,
@@ -1407,6 +1458,7 @@ fn try_save_sidecar(
     cache_config: &IndexCacheConfig,
 ) -> Option<()> {
     if !cache_config.enabled
+        || cache_config.max_cache_bytes == 0
         || file_size < cache_config.min_file_bytes
         || index.indexed_bytes() != file_size
     {
@@ -1420,6 +1472,9 @@ fn try_save_sidecar(
     let key = load_or_create_cache_key(&cache_dir)?;
     let identity = ExtendedIdentity::from_file(file).ok()?;
     if identity.file_size != file_size {
+        return None;
+    }
+    if !source_matches_stamp(file, path, expected_stamp).ok()? {
         return None;
     }
 
@@ -1436,13 +1491,13 @@ fn try_save_sidecar(
         &last_record_hash,
         index,
     )?;
-    if cache_config.max_cache_bytes > 0 && (encoded.len() as u64) > cache_config.max_cache_bytes {
+    if (encoded.len() as u64) > cache_config.max_cache_bytes {
         return None;
     }
 
-    // Re-check file identity right before committing the sidecar.
+    // Re-check file identity and original indexed SourceStamp right before publishing.
     let recheck = ExtendedIdentity::from_file(file).ok()?;
-    if !recheck.matches(&identity) {
+    if !recheck.matches(&identity) || !source_matches_stamp(file, path, expected_stamp).ok()? {
         return None;
     }
 
@@ -2079,5 +2134,51 @@ mod tests {
             }
             let _ = decode_sidecar_bytes(&buf);
         }
+    }
+
+    #[test]
+    fn sidecar_accepts_eof_checkpoint_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let csv_path = dir.path().join("no_trailing_lf.csv");
+        // Four records with no trailing newline and `checkpoint_every: 2` emits a final
+        // checkpoint at `(row: 4, offset: file_size)`.
+        fs::write(&csv_path, b"a,b\n1,2\n3,4\n5,6").unwrap();
+
+        let cache_cfg = IndexCacheConfig {
+            enabled: true,
+            cache_dir: Some(cache_dir),
+            max_cache_bytes: 16 * 1024 * 1024,
+            min_file_bytes: 0,
+        };
+        let index_cfg = IndexConfig {
+            chunk_bytes: 64,
+            checkpoint_every: 2,
+            memory_budget_bytes: 64 * 1024,
+        };
+
+        let session = Session::open(&csv_path, OpenOptions::default()).unwrap();
+        let first = session
+            .start_indexing_with_options(index_cfg, Some(1), cache_cfg.clone())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!first.telemetry().cache_hit);
+        assert_eq!(first.indexed_rows(), 4);
+        assert_eq!(
+            first.checkpoints().last().unwrap().offset,
+            session.file_size
+        );
+
+        let second = session
+            .start_indexing_with_options(index_cfg, Some(1), cache_cfg)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            second.telemetry().cache_hit,
+            "unchanged file without trailing newline should hit sidecar cache"
+        );
+        assert_eq!(second, first);
     }
 }

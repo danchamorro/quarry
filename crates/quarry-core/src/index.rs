@@ -566,6 +566,7 @@ impl IndexJob {
                         save_sidecar(
                             &file,
                             &path,
+                            &source_stamp,
                             file_size,
                             delimiter,
                             encoding,
