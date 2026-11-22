@@ -154,7 +154,7 @@ impl<const TRACK_WIDTH: bool> StructuralScanner<TRACK_WIDTH> {
             record_start,
             bom_prefix: [0; 3],
             bom_prefix_len: 0,
-            bom_checked: record_start != 0,
+            bom_checked: record_start != 0 || encoding != ByteEncodingClass::Utf8,
         })
     }
 
@@ -173,11 +173,6 @@ impl<const TRACK_WIDTH: bool> StructuralScanner<TRACK_WIDTH> {
         scanner.bom_checked = true;
         scanner.state = ScanState::Quoted;
         Ok(scanner)
-    }
-
-    /// Disable BOM stripping on an existing scanner (for non-UTF-8 single-byte encodings).
-    pub fn disable_bom_check(&mut self) {
-        self.bom_checked = true;
     }
 
     /// Returns the SIMD backend active for this scanner instance.
@@ -984,6 +979,23 @@ mod tests {
             }
             assert!(!scanner.finish(3, |end| ends.push(end)).unwrap());
             assert!(ends.is_empty());
+
+            // Single-byte encodings treat EF BB BF as ordinary data bytes rather than a UTF-8 BOM.
+            let mut latin1 = super::StructuralScanner::<true>::with_dialect(
+                ScannerDialect::rfc4180(b','),
+                0,
+                ByteEncodingClass::SingleByteAsciiSuperset,
+            )
+            .unwrap();
+            let mut latin1_ends = Vec::new();
+            for (chunk, offset) in bytes.chunks(chunk_bytes).zip((0..).step_by(chunk_bytes)) {
+                latin1
+                    .scan_chunk(chunk, offset as u64, |end| latin1_ends.push(end))
+                    .unwrap();
+            }
+            assert!(latin1.finish(3, |end| latin1_ends.push(end)).unwrap());
+            assert_eq!(latin1_ends, vec![3]);
+            assert_eq!(latin1.maximum_width(), 1);
         }
     }
 

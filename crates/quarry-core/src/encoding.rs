@@ -410,15 +410,14 @@ impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
                 dialect, logical, class,
             )?,
             None => {
-                // UTF-16 shadow scans stay strictly on the scalar path.
-                let mut scanner = quarry_delimited::StructuralScanner::with_dialect_and_backend(
+                // UTF-16 shadow scans stay strictly on the scalar path (SingleByteAsciiSuperset
+                // disables UTF-8 BOM stripping at construction).
+                quarry_delimited::StructuralScanner::with_dialect_and_backend(
                     dialect,
                     logical,
                     quarry_delimited::ByteEncodingClass::SingleByteAsciiSuperset,
                     quarry_delimited::SimdBackend::Scalar,
-                )?;
-                scanner.disable_bom_check();
-                scanner
+                )?
             }
         };
         Ok(Self {
@@ -461,15 +460,12 @@ impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
             if self.at_start {
                 self.at_start = false;
                 if unit == 0xfeff {
-                    let mut scanner =
-                        quarry_delimited::StructuralScanner::with_dialect_and_backend(
-                            quarry_delimited::ScannerDialect::rfc4180(self.delimiter),
-                            1,
-                            quarry_delimited::ByteEncodingClass::SingleByteAsciiSuperset,
-                            quarry_delimited::SimdBackend::Scalar,
-                        )?;
-                    scanner.disable_bom_check();
-                    self.inner = scanner;
+                    self.inner = quarry_delimited::StructuralScanner::with_dialect_and_backend(
+                        quarry_delimited::ScannerDialect::rfc4180(self.delimiter),
+                        1,
+                        quarry_delimited::ByteEncodingClass::SingleByteAsciiSuperset,
+                        quarry_delimited::SimdBackend::Scalar,
+                    )?;
                     skip = 1;
                     continue;
                 }

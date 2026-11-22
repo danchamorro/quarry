@@ -709,10 +709,6 @@ fn run_dialect_backend(
         StructuralScanner::<false>::with_dialect_and_backend(dialect, 0, encoding, backend)?;
     let mut s_width =
         StructuralScanner::<true>::with_dialect_and_backend(dialect, 0, encoding, backend)?;
-    if encoding != ByteEncodingClass::Utf8 {
-        s_plain.disable_bom_check();
-        s_width.disable_bom_check();
-    }
     let mut ends_plain = Vec::new();
     let mut ends_width = Vec::new();
     let mut offset = 0usize;
