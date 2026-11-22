@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::fs;
 use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
-use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Write};
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,17 +15,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::Encoding;
+#[cfg(test)]
 use crate::encoding::RecordScanner;
+#[cfg(test)]
 use quarry_delimited::parse_record;
 
 use crate::date_time_sort::date_time_key;
 use crate::estimate_edited_output_bytes;
 use crate::export::{ExportTarget, PrivatePublication, source_matches_stamp};
 use crate::pool::{default_single_run_memory_budget_bytes, engine_pool, resolve_worker_count};
-use crate::spill::{
-    self, FrameHead as RunHead, FrameLimits, FrameReadError, SpillFile,
-    SpillWorkspace as RunWorkspace,
-};
+#[cfg(test)]
+use crate::spill::SpillWorkspace as RunWorkspace;
+use crate::spill::{self, FrameHead as RunHead, FrameLimits, FrameReadError, SpillFile};
 use crate::storage::{check_operation_storage, output_parent, storage_error};
 use crate::{
     CaseSensitivity, CompletedIndex, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, DateTimeFormat,
@@ -35,7 +38,8 @@ mod duplicate;
 #[path = "sort_parallel.rs"]
 mod parallel;
 pub use duplicate::{
-    DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
+    DuplicateJob, DuplicateOptions, DuplicateOutcome, DuplicateProgress, DuplicateSpec,
+    DuplicateSummary,
 };
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -944,6 +948,7 @@ fn source_has_bom(source: &mut File, encoding: Encoding) -> Result<bool, QuarryE
     crate::export::source_starts_with_bom(source, encoding)
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 struct RunEntry {
     key: Vec<u8>,
@@ -951,6 +956,7 @@ struct RunEntry {
     ordinal: u64,
 }
 
+#[cfg(test)]
 fn compare_entries(left: &RunEntry, right: &RunEntry, direction: SortDirection) -> CmpOrdering {
     let key_order = match direction {
         SortDirection::Ascending => left.key.cmp(&right.key),
@@ -1104,6 +1110,8 @@ fn invalid_sort_output(message: &'static str) -> QuarryError {
     io::Error::new(io::ErrorKind::InvalidData, message).into()
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 struct ScanSummary {
     header: Option<Vec<u8>>,
     preferred_ending: Vec<u8>,
@@ -1116,6 +1124,7 @@ struct ScanSummary {
     records: RecordMultisetFingerprint,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuilderStep {
     Complete,
@@ -1124,11 +1133,13 @@ enum BuilderStep {
 
 #[derive(Clone, Copy)]
 enum RunOrder<'a> {
+    #[cfg(test)]
     Sort(SortSpec),
     MultiSort(&'a SortPlan),
     Duplicates(&'a DuplicateSpec),
 }
 
+#[cfg(test)]
 impl From<SortSpec> for RunOrder<'_> {
     /// Adapt a legacy single-key scan without changing its key representation.
     fn from(spec: SortSpec) -> Self {
@@ -1136,6 +1147,7 @@ impl From<SortSpec> for RunOrder<'_> {
     }
 }
 
+#[cfg(test)]
 impl<'a> From<&'a SortPlan> for RunOrder<'a> {
     /// Borrow the validated plan for all rows in the streaming scan.
     fn from(spec: &'a SortPlan) -> Self {
@@ -1143,6 +1155,7 @@ impl<'a> From<&'a SortPlan> for RunOrder<'a> {
     }
 }
 
+#[cfg(test)]
 impl<'a> From<&'a DuplicateSpec> for RunOrder<'a> {
     /// Share run storage with duplicate detection while preserving its equality keys.
     fn from(spec: &'a DuplicateSpec) -> Self {
@@ -1150,6 +1163,7 @@ impl<'a> From<&'a DuplicateSpec> for RunOrder<'a> {
     }
 }
 
+#[cfg(test)]
 impl RunOrder<'_> {
     /// Composite keys embed their per-level directions; duplicates always merge ascending.
     fn direction(self) -> SortDirection {
@@ -1161,6 +1175,7 @@ impl RunOrder<'_> {
     }
 }
 
+#[cfg(test)]
 struct InitialRunBuilder<'a> {
     delimiter: u8,
     has_header: bool,
@@ -1183,6 +1198,7 @@ struct InitialRunBuilder<'a> {
     records: RecordMultisetFingerprint,
 }
 
+#[cfg(test)]
 impl<'a> InitialRunBuilder<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1435,11 +1451,13 @@ impl<'a> InitialRunBuilder<'a> {
     }
 }
 
+#[cfg(test)]
 enum ScanOutcome {
     Complete(ScanSummary),
     Cancelled,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 /// Stream source records into bounded sorted runs, stopping promptly on cancellation.
 fn create_initial_runs<'a>(
@@ -1732,7 +1750,7 @@ fn run_sort_inner(
         has_header,
         header_renames,
         cell_edits,
-        Arc::clone(&spec),
+        parallel::AdaptiveRunOrder::MultiSort(Arc::clone(&spec)),
         bom_present,
         config,
         Arc::clone(workspace),
@@ -1742,6 +1760,7 @@ fn run_sort_inner(
         min_parallel_stripe_bytes,
         Arc::clone(&job_budget),
         Arc::clone(pool.large_record_gate()),
+        None,
     )?
     else {
         return Ok(None);
@@ -1844,41 +1863,8 @@ fn run_sort_inner(
     }))
 }
 
-fn reduce_runs(
-    runs: &mut Vec<SpillFile>,
-    direction: SortDirection,
-    max_key_bytes: usize,
-    config: SortConfig,
-    workspace: &RunWorkspace,
-    shared: &SharedState,
-) -> Result<bool, QuarryError> {
-    let merge_fan_in = effective_merge_fan_in(config, max_key_bytes);
-    while runs.len() > merge_fan_in {
-        let mut next = Vec::with_capacity(runs.len().div_ceil(merge_fan_in));
-        for group in runs.chunks(merge_fan_in) {
-            if shared.cancel_requested.load(Ordering::Acquire) {
-                return Ok(false);
-            }
-            let (path, writer) = workspace.create_run()?;
-            if !merge_runs_to_run(group, writer, direction, config.max_record_bytes, shared)? {
-                return Ok(false);
-            }
-            for old in group {
-                let bytes = old.metadata()?.len();
-                old.remove()?;
-                shared.remove_temporary_bytes(bytes);
-            }
-            next.push(path);
-            shared.runs_created.fetch_add(1, Ordering::AcqRel);
-        }
-        *runs = next;
-        shared.merge_passes.fetch_add(1, Ordering::AcqRel);
-    }
-
-    Ok(true)
-}
-
 /// Serialize a complete in-memory sort entry in the shared spill format.
+#[cfg(test)]
 fn write_entry(writer: &mut BufWriter<File>, entry: &RunEntry) -> Result<u64, QuarryError> {
     write_entry_parts(writer, &entry.key, &entry.record, entry.ordinal)
 }
@@ -1962,34 +1948,46 @@ fn seed_heap(
     Ok(Some(heap))
 }
 
-fn merge_runs_to_run(
+fn merge_runs_to_run_with_dedup(
     paths: &[SpillFile],
     mut writer: BufWriter<File>,
     direction: SortDirection,
     max_record_bytes: usize,
     shared: &SharedState,
+    dedup_counter: Option<&AtomicU64>,
 ) -> Result<bool, QuarryError> {
+    debug_assert!(dedup_counter.is_none() || direction == SortDirection::Ascending);
     let mut readers = open_run_readers(paths)?;
     let Some(mut heap) = seed_heap(&mut readers, direction, max_record_bytes, shared)? else {
         return Ok(false);
     };
+    let mut previous_key: Option<Vec<u8>> = None;
     while let Some(item) = heap.pop() {
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(false);
         }
-        let record = read_record(
-            &mut readers[item.run_index],
-            item.head.record_len,
-            max_record_bytes,
-        )?;
-        if shared.cancel_requested.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        let bytes = write_entry_parts(&mut writer, &item.head.key, &record, item.head.ordinal)?;
-        shared.add_temporary_bytes(bytes);
         let run_index = item.run_index;
-        drop(record);
-        drop(item);
+        if let Some(counter) = dedup_counter
+            && previous_key.as_deref() == Some(item.head.key.as_slice())
+        {
+            readers[run_index].seek_relative(item.head.record_len as i64)?;
+            counter.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let record = read_record(
+                &mut readers[run_index],
+                item.head.record_len,
+                max_record_bytes,
+            )?;
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let bytes = write_entry_parts(&mut writer, &item.head.key, &record, item.head.ordinal)?;
+            shared.add_temporary_bytes(bytes);
+            drop(record);
+            if dedup_counter.is_some() {
+                previous_key = Some(item.head.key);
+            }
+        }
         if let Some(head) = read_head(&mut readers[run_index], max_record_bytes)? {
             heap.push(HeapEntry {
                 head,
@@ -4982,12 +4980,21 @@ mod tests {
         let mut a_bytes = String::from("k,v\n");
         let mut b_bytes = String::from("k,v\n");
         for i in (0..256).rev() {
-            // Each row in both files has identical length (600 bytes), but file_b embeds a
-            // quoted newline at a different offset so file_a's checkpoints fall mid-quote.
+            // Keep total byte size and 256-row count identical across both files, while shifting
+            // logical record boundaries in `file_b` (row 0 is 100 bytes shorter, row 255 is 100
+            // bytes longer) so `idx_a`'s interior checkpoints land strictly inside quoted fields
+            // of `file_b`.
             a_bytes.push_str(&format!("{i:04},{}\n", "a".repeat(594)));
+            let b_first_half = if i == 255 {
+                100
+            } else if i == 0 {
+                300
+            } else {
+                200
+            };
             b_bytes.push_str(&format!(
                 "{i:04},\"{}\n{}\"\n",
-                "b".repeat(200),
+                "b".repeat(b_first_half),
                 "c".repeat(391)
             ));
         }
@@ -5016,6 +5023,12 @@ mod tests {
             .unwrap();
         assert_eq!(idx_a.indexed_bytes(), idx_b.indexed_bytes());
         assert_eq!(idx_a.indexed_rows(), idx_b.indexed_rows());
+        // Prove an interior checkpoint of `idx_a` does NOT match `idx_b` and lands inside a
+        // quoted field of `file_b`.
+        let cp_a = idx_a.checkpoints()[1];
+        let cp_b = idx_b.checkpoints()[1];
+        assert_ne!(cp_a.offset, cp_b.offset);
+        assert_eq!(b_bytes.as_bytes()[cp_a.offset as usize], b'b');
         assert!(idx_b.matches_provenance(&sb.source_stamp, sb.dialect.delimiter, sb.encoding));
         assert!(!idx_a.matches_provenance(&sb.source_stamp, sb.dialect.delimiter, sb.encoding));
 
@@ -5079,9 +5092,11 @@ mod tests {
         );
 
         // Also exercise parallel sorting on delimiter-heavy rows (< 4 MiB raw, > 4 MiB descriptors).
+        // Keep the header short (1 column) and measure gate admissions against a fresh isolated
+        // `LargeRecordGate` so every acquisition proves a data row took the gate.
         let delim_source = directory.path().join("delimiter-heavy.csv");
         let commas = ",".repeat(120 * 1024);
-        let mut delim_content = format!("k{commas}\n");
+        let mut delim_content = String::from("k\n");
         for key in (0..4).rev() {
             delim_content.push_str(&format!("{key}{commas}\n"));
         }
@@ -5095,8 +5110,60 @@ mod tests {
             .unwrap()
             .wait()
             .unwrap();
+        let isolated_gate = Arc::new(crate::pool::LargeRecordGate::new());
+        let isolated_shared_budget = Arc::new(crate::pool::ByteBudget::new(8 * 1024 * 1024));
+        let isolated_shared = Arc::new(SharedState::new(sd.file_size));
+        let isolated_job_budget = parallel::JobMemoryBudget::acquire_for_job(
+            2 * 1024 * 1024,
+            &isolated_shared_budget,
+            &isolated_shared.cancel_requested,
+        )
+        .unwrap();
+        let isolated_ws = Arc::new(parallel::LazyRunWorkspace::new(
+            directory.path().to_path_buf(),
+        ));
+        let isolated_scan = parallel::create_initial_runs_adaptive(
+            Arc::new(File::open(&delim_source).unwrap()),
+            sd.file_size,
+            sd.dialect.delimiter,
+            sd.dialect.has_header,
+            Arc::new(BTreeMap::new()),
+            Arc::new(BTreeMap::new()),
+            parallel::AdaptiveRunOrder::MultiSort(Arc::new(SortPlan::from(spec))),
+            false,
+            SortConfig {
+                run_memory_bytes: 2 * 1024 * 1024,
+                ..DEFAULT_SORT_CONFIG
+            },
+            Arc::clone(&isolated_ws),
+            Arc::clone(&isolated_shared),
+            Some(&idx_d),
+            4,
+            1,
+            Arc::clone(&isolated_job_budget),
+            Arc::clone(&isolated_gate),
+            None,
+        )
+        .unwrap();
+        let parallel::AdaptiveScanOutcome::Complete(isolated_summary) = isolated_scan else {
+            panic!("isolated delimiter-heavy scan cancelled");
+        };
+        assert_eq!(isolated_summary.rows, 4);
+        assert!(isolated_summary.effective_workers >= 2);
+        assert_eq!(
+            isolated_gate.acquisitions(),
+            4,
+            "expected exactly the 4 delimiter-heavy data rows to acquire LargeRecordGate"
+        );
+        drop(isolated_summary);
+        isolated_job_budget.release_shared_reservation();
+        Arc::try_unwrap(isolated_ws)
+            .ok()
+            .unwrap()
+            .cleanup()
+            .unwrap();
+
         let dest_delim = directory.path().join("sorted-delim.csv");
-        let gate_before = engine_pool().large_record_gate().acquisitions();
         let SortOutcome::Complete(delim_summary) = sd
             .start_create_sorted_working_copy_with_options(
                 BTreeMap::new(),
@@ -5116,20 +5183,15 @@ mod tests {
         else {
             panic!("delimiter-heavy sort cancelled");
         };
-        let gate_after = engine_pool().large_record_gate().acquisitions();
         assert!(
             delim_summary.effective_workers >= 2,
             "delimiter-heavy sort should run in parallel, got {} worker(s)",
             delim_summary.effective_workers
         );
-        assert!(
-            gate_after >= gate_before + 4,
-            "expected each delimiter-heavy row to acquire LargeRecordGate (before={gate_before}, after={gate_after})"
-        );
         assert_eq!(delim_summary.rows_sorted, 4);
         assert_eq!(
             fs::read_to_string(&dest_delim).unwrap(),
-            format!("k{commas}\n0{commas}\n1{commas}\n2{commas}\n3{commas}\n")
+            format!("k\n0{commas}\n1{commas}\n2{commas}\n3{commas}\n")
         );
     }
 }

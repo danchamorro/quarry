@@ -59,6 +59,16 @@ impl DuplicateSpec {
     }
 }
 
+/// Execution options for duplicate removal, including parallel striping, scratch location,
+/// and the adaptive single-run memory budget (300 MB default, capped by physical RAM).
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateOptions<'a> {
+    pub temporary_directory: Option<&'a Path>,
+    pub source_index: Option<&'a StructuralIndex>,
+    pub threads: Option<usize>,
+    pub memory_budget_bytes: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DuplicateProgress {
     pub bytes_scanned: u64,
@@ -71,6 +81,7 @@ pub struct DuplicateProgress {
     pub peak_temporary_bytes: u64,
     pub merge_passes: u64,
     pub header_rows: u64,
+    pub effective_workers: usize,
     pub elapsed: Duration,
     pub cancellation_latency: Option<Duration>,
     /// Ready to consume with wait(), not proof of publication. The candidate
@@ -84,6 +95,7 @@ pub struct DuplicateProgress {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateSummary {
     pub destination: PathBuf,
+    pub output_index: Option<CompletedIndex>,
     pub rows_scanned: u64,
     pub duplicate_rows: u64,
     pub retained_rows: u64,
@@ -92,6 +104,8 @@ pub struct DuplicateSummary {
     pub peak_temporary_bytes: u64,
     pub merge_passes: u64,
     pub header_rows: u64,
+    pub effective_workers: usize,
+    pub in_memory_fast_path: bool,
     pub elapsed: Duration,
 }
 
@@ -102,8 +116,8 @@ pub enum DuplicateOutcome {
 }
 
 struct DuplicateState {
-    sort: SharedState,
-    duplicate_rows: AtomicU64,
+    sort: Arc<SharedState>,
+    duplicate_rows: Arc<AtomicU64>,
     retained_rows: AtomicU64,
 }
 
@@ -122,6 +136,7 @@ impl DuplicateJob {
         self.publication.retain_storage(storage)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn start(
         session: &Session,
@@ -131,7 +146,7 @@ impl DuplicateJob {
         destination: PathBuf,
         config: SortConfig,
     ) -> Result<Self, QuarryError> {
-        Self::start_with_temp_directory(
+        Self::start_with_options_internal(
             session,
             header_renames,
             cell_edits,
@@ -139,11 +154,15 @@ impl DuplicateJob {
             destination,
             config,
             None,
+            session.completed_record_count(),
+            None,
+            Some(1),
+            parallel::DEFAULT_MIN_PARALLEL_STRIPE_BYTES,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_with_temp_directory(
+    fn start_with_options_internal(
         session: &Session,
         header_renames: BTreeMap<usize, Vec<u8>>,
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
@@ -151,8 +170,13 @@ impl DuplicateJob {
         destination: PathBuf,
         config: SortConfig,
         temporary_directory: Option<PathBuf>,
+        completed_record_count: Option<u64>,
+        source_index: Option<StructuralIndex>,
+        threads: Option<usize>,
+        min_parallel_stripe_bytes: u64,
     ) -> Result<Self, QuarryError> {
         validate_config(config)?;
+        let requested_workers = resolve_worker_count(threads)?;
         validate_overlays(
             session.dialect.has_header,
             &header_renames,
@@ -186,8 +210,8 @@ impl DuplicateJob {
             .defer_private_publication()
             .expect("duplicate output is private");
         let shared = Arc::new(DuplicateState {
-            sort: SharedState::new(session.file_size),
-            duplicate_rows: AtomicU64::new(0),
+            sort: Arc::new(SharedState::new(session.file_size)),
+            duplicate_rows: Arc::new(AtomicU64::new(0)),
             retained_rows: AtomicU64::new(0),
         });
         let worker_state = Arc::clone(&shared);
@@ -196,20 +220,24 @@ impl DuplicateJob {
             .spawn(move || {
                 let mut completion = WorkerCompletion::new(&worker_state.sort);
                 let mut result = run_duplicates(
-                    &mut source,
+                    source,
                     &source_path,
                     &source_stamp,
                     delimiter,
                     has_header,
-                    &header_renames,
-                    &cell_edits,
-                    &spec,
+                    header_renames,
+                    cell_edits,
+                    spec,
                     destination,
                     output,
                     bom_present,
                     config,
                     &worker_state,
                     temporary_directory.as_deref(),
+                    completed_record_count,
+                    source_index,
+                    requested_workers,
+                    min_parallel_stripe_bytes,
                 );
                 match &result {
                     Ok(DuplicateOutcome::Cancelled) => {
@@ -246,6 +274,7 @@ impl DuplicateJob {
             peak_temporary_bytes: shared.peak_temporary_bytes.load(Ordering::Acquire),
             merge_passes: shared.merge_passes.load(Ordering::Acquire),
             header_rows: shared.header_rows.load(Ordering::Acquire),
+            effective_workers: shared.effective_workers.load(Ordering::Acquire),
             elapsed: shared.elapsed(),
             cancellation_latency: shared.cancellation_latency(),
             done: shared.done.load(Ordering::Acquire) || self.publication.is_ready(),
@@ -294,16 +323,12 @@ impl Session {
         spec: DuplicateSpec,
         destination: impl AsRef<Path>,
     ) -> Result<DuplicateJob, QuarryError> {
-        DuplicateJob::start(
-            self,
+        self.start_find_duplicates_with_options(
             header_renames,
             cell_edits,
             spec,
-            destination.as_ref().to_path_buf(),
-            SortConfig {
-                encoding: self.encoding,
-                ..DEFAULT_SORT_CONFIG
-            },
+            destination,
+            DuplicateOptions::default(),
         )
     }
 
@@ -315,7 +340,49 @@ impl Session {
         destination: impl AsRef<Path>,
         temporary_directory: impl AsRef<Path>,
     ) -> Result<DuplicateJob, QuarryError> {
-        DuplicateJob::start_with_temp_directory(
+        self.start_find_duplicates_with_options(
+            header_renames,
+            cell_edits,
+            spec,
+            destination,
+            DuplicateOptions {
+                temporary_directory: Some(temporary_directory.as_ref()),
+                ..DuplicateOptions::default()
+            },
+        )
+    }
+
+    /// Analyze duplicates with explicit parallel striping, scratch directory,
+    /// and adaptive single-run memory budget options.
+    pub fn start_find_duplicates_with_options(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        spec: DuplicateSpec,
+        destination: impl AsRef<Path>,
+        options: DuplicateOptions<'_>,
+    ) -> Result<DuplicateJob, QuarryError> {
+        let run_memory_bytes = match options.memory_budget_bytes {
+            Some(0) => {
+                return Err(QuarryError::InvalidOption(
+                    "sort chunk, run memory, and record limit must be non-zero",
+                ));
+            }
+            Some(bytes) => bytes,
+            None => default_single_run_memory_budget_bytes(),
+        };
+        // Only trust a caller-supplied index when its provenance matches this session's exact
+        // source file stamp, delimiter, encoding, byte length, and completed record count.
+        let completed_records = self.completed_record_count();
+        let validated_index = options
+            .source_index
+            .filter(|index| {
+                index.matches_provenance(&self.source_stamp, self.dialect.delimiter, self.encoding)
+                    && index.indexed_bytes() == self.file_size
+                    && completed_records == Some(index.indexed_rows())
+            })
+            .cloned();
+        DuplicateJob::start_with_options_internal(
             self,
             header_renames,
             cell_edits,
@@ -323,46 +390,74 @@ impl Session {
             destination.as_ref().to_path_buf(),
             SortConfig {
                 encoding: self.encoding,
+                run_memory_bytes,
                 ..DEFAULT_SORT_CONFIG
             },
-            Some(temporary_directory.as_ref().to_path_buf()),
+            options.temporary_directory.map(Path::to_path_buf),
+            completed_records,
+            validated_index,
+            options.threads,
+            parallel::DEFAULT_MIN_PARALLEL_STRIPE_BYTES,
         )
     }
 }
 
+struct BuiltDuplicateOutput {
+    rows_scanned: u64,
+    retained_rows: u64,
+    bytes_written: u64,
+    index: StructuralIndex,
+    in_memory_fast_path: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_duplicates(
-    source: &mut File,
+    mut source: File,
     source_path: &Path,
     source_stamp: &SourceStamp,
     delimiter: u8,
     has_header: bool,
-    header_renames: &BTreeMap<usize, Vec<u8>>,
-    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
-    spec: &DuplicateSpec,
+    header_renames: BTreeMap<usize, Vec<u8>>,
+    cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+    spec: DuplicateSpec,
     destination: PathBuf,
     mut output: ExportTarget,
     bom_present: bool,
     config: SortConfig,
     state: &DuplicateState,
     temporary_directory: Option<&Path>,
+    completed_record_count: Option<u64>,
+    source_index: Option<StructuralIndex>,
+    requested_workers: usize,
+    min_parallel_stripe_bytes: u64,
 ) -> Result<DuplicateOutcome, QuarryError> {
     let shared = &state.sort;
-    let Some(records) = crate::storage::count_records_encoded(
-        source,
-        delimiter,
-        config.encoding,
-        &shared.cancel_requested,
-        |_| {},
-    )?
-    else {
-        return Ok(DuplicateOutcome::Cancelled);
+    let records = match completed_record_count {
+        Some(records) => records,
+        None => {
+            shared.preparing.store(true, Ordering::Release);
+            let Some(records) = crate::storage::count_records_encoded(
+                &mut source,
+                delimiter,
+                config.encoding,
+                &shared.cancel_requested,
+                |bytes| {
+                    shared
+                        .preparation_bytes_scanned
+                        .store(bytes, Ordering::Release);
+                },
+            )?
+            else {
+                return Ok(DuplicateOutcome::Cancelled);
+            };
+            records
+        }
     };
     let output_bytes = estimate_edited_output_bytes(
         shared.total_bytes,
         records,
-        header_renames,
-        cell_edits,
+        &header_renames,
+        &cell_edits,
         None,
         None,
     );
@@ -382,39 +477,251 @@ fn run_duplicates(
         ),
         output_bytes,
     )?;
-    let workspace = RunWorkspace::create_in(temporary_directory, "sort")?;
-    let built = (|| {
-        let ScanOutcome::Complete(mut scan) = create_initial_runs(
-            source,
-            delimiter,
-            has_header,
-            header_renames,
-            cell_edits,
-            spec,
+    let workspace = Arc::new(parallel::LazyRunWorkspace::new(
+        temporary_directory.to_path_buf(),
+    ));
+    let source = Arc::new(source);
+    let built = run_duplicates_inner(
+        source,
+        source_path,
+        source_stamp,
+        delimiter,
+        has_header,
+        Arc::new(header_renames),
+        Arc::new(cell_edits),
+        Arc::new(spec),
+        &mut output,
+        bom_present,
+        config,
+        &workspace,
+        state,
+        source_index.as_ref(),
+        requested_workers,
+        min_parallel_stripe_bytes,
+    );
+    let cleanup = Arc::try_unwrap(workspace)
+        .ok()
+        .expect("all duplicate workers drained before workspace cleanup")
+        .cleanup();
+    let built = built.map_err(|error| match error {
+        QuarryError::Io(error) => storage_error(temporary_directory, error),
+        error => error,
+    })?;
+    cleanup?;
+    let Some(BuiltDuplicateOutput {
+        rows_scanned,
+        retained_rows,
+        bytes_written,
+        index,
+        in_memory_fast_path,
+    }) = built
+    else {
+        return Ok(DuplicateOutcome::Cancelled);
+    };
+    let (outcome, output_stamp) =
+        output.publish_with_stamp(retained_rows, bytes_written, &shared.cancel_requested)?;
+    match outcome {
+        FilterExportOutcome::Cancelled => Ok(DuplicateOutcome::Cancelled),
+        FilterExportOutcome::Complete(summary) => {
+            Ok(DuplicateOutcome::Complete(DuplicateSummary {
+                destination: summary.destination,
+                output_index: output_stamp.and_then(|stamp| {
+                    CompletedIndex::from_output(index, stamp, delimiter, config.encoding)
+                }),
+                rows_scanned,
+                duplicate_rows: rows_scanned - retained_rows,
+                retained_rows,
+                bytes_written: summary.bytes_written,
+                runs_created: shared.runs_created.load(Ordering::Acquire),
+                peak_temporary_bytes: shared.peak_temporary_bytes.load(Ordering::Acquire),
+                merge_passes: shared.merge_passes.load(Ordering::Acquire),
+                header_rows: shared.header_rows.load(Ordering::Acquire),
+                effective_workers: shared.effective_workers.load(Ordering::Acquire),
+                in_memory_fast_path,
+                elapsed: Duration::ZERO,
+            }))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_duplicates_inner(
+    source: Arc<File>,
+    source_path: &Path,
+    source_stamp: &SourceStamp,
+    delimiter: u8,
+    has_header: bool,
+    header_renames: Arc<BTreeMap<usize, Vec<u8>>>,
+    cell_edits: Arc<BTreeMap<(u64, usize), Vec<u8>>>,
+    spec: Arc<DuplicateSpec>,
+    output: &mut ExportTarget,
+    bom_present: bool,
+    config: SortConfig,
+    workspace: &Arc<parallel::LazyRunWorkspace>,
+    state: &DuplicateState,
+    source_index: Option<&StructuralIndex>,
+    requested_workers: usize,
+    min_parallel_stripe_bytes: u64,
+) -> Result<Option<BuiltDuplicateOutput>, QuarryError> {
+    let shared = &state.sort;
+    let pool = engine_pool();
+    let Some(job_budget) = parallel::JobMemoryBudget::acquire_for_job(
+        config.run_memory_bytes,
+        pool.out_of_core_budget(),
+        &shared.cancel_requested,
+    ) else {
+        return Ok(None);
+    };
+    let parallel::AdaptiveScanOutcome::Complete(mut scan) = parallel::create_initial_runs_adaptive(
+        Arc::clone(&source),
+        shared.total_bytes,
+        delimiter,
+        has_header,
+        header_renames,
+        cell_edits,
+        parallel::AdaptiveRunOrder::Duplicates(spec),
+        bom_present,
+        config,
+        Arc::clone(workspace),
+        Arc::clone(shared),
+        source_index,
+        requested_workers,
+        min_parallel_stripe_bytes,
+        Arc::clone(&job_budget),
+        Arc::clone(pool.large_record_gate()),
+        Some(Arc::clone(&state.duplicate_rows)),
+    )?
+    else {
+        return Ok(None);
+    };
+    shared
+        .effective_workers
+        .fetch_max(scan.effective_workers, Ordering::AcqRel);
+    if !source_matches_stamp(&source, source_path, source_stamp)? {
+        return Err(QuarryError::SourceChanged);
+    }
+    if shared.cancel_requested.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+
+    let mut survivor_guard = None;
+    let mut in_memory_fast_path = scan.runs.is_empty();
+    if in_memory_fast_path && scan.in_memory_runs.len() > 1 {
+        let total_entries: usize = scan.in_memory_runs.iter().map(|run| run.arena.len()).sum();
+        let survivor_bytes =
+            total_entries.saturating_mul(std::mem::size_of::<(u64, usize, usize)>());
+        if let Some(guard) = job_budget.try_acquire_within_limit(survivor_bytes) {
+            survivor_guard = Some(guard);
+        } else {
+            // The survivor reference vector plus live worker arenas would exceed the job budget;
+            // flush the sorted in-memory arenas to disk and run the bounded spill path instead.
+            job_budget.mark_spilled();
+            for mut item in scan.in_memory_runs.drain(..) {
+                if shared.cancel_requested.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                if let Some((run, dropped)) = item.arena.flush_to_workspace_mode(
+                    SortDirection::Ascending,
+                    true,
+                    workspace,
+                    shared,
+                    0,
+                )? {
+                    if dropped > 0 {
+                        state.duplicate_rows.fetch_add(dropped, Ordering::AcqRel);
+                    }
+                    scan.runs.push(run);
+                }
+                drop(item);
+            }
+            in_memory_fast_path = false;
+        }
+    }
+    let mut index = StructuralIndex::new(IndexConfig::default())?;
+    let header_width = match scan.header.as_deref() {
+        Some(hdr) => parallel::count_record_fields(hdr, delimiter)?,
+        None => 0,
+    };
+
+    let (retained, bytes_written, retained_max_width) = if in_memory_fast_path {
+        let prefix_bytes = parallel::write_output_header_and_bom(
+            output,
             bom_present,
-            config,
-            &workspace,
+            scan.header.as_deref(),
+            &mut index,
             shared,
-        )?
+        )?;
+        let Some((retained, data_bytes, data_max_width, _)) =
+            parallel::deduplicate_in_memory_runs_to_output(
+                &mut scan.in_memory_runs,
+                delimiter,
+                &state.duplicate_rows,
+                &state.retained_rows,
+                output,
+                &scan.preferred_ending,
+                config.max_record_bytes,
+                prefix_bytes,
+                if has_header { 0 } else { prefix_bytes },
+                shared,
+                Some(&mut index),
+            )?
         else {
             return Ok(None);
         };
-        if !source_matches_stamp(source, source_path, source_stamp)? {
-            return Err(QuarryError::SourceChanged);
+        drop(survivor_guard);
+        drop(scan.in_memory_runs);
+        job_budget.release_shared_reservation();
+        if state.retained_rows.load(Ordering::Acquire)
+            + state.duplicate_rows.load(Ordering::Acquire)
+            != scan.rows
+        {
+            return Err(invalid_sort_output("duplicate run row count changed"));
         }
-        if !reduce_runs(
+        if retained != state.retained_rows.load(Ordering::Acquire) {
+            return Err(invalid_sort_output("retained duplicate row count changed"));
+        }
+        (
+            retained,
+            prefix_bytes.saturating_add(data_bytes),
+            header_width.max(data_max_width),
+        )
+    } else {
+        const SURVIVOR_RUN_CAP_BYTES: usize = 32 * 1024 * 1024;
+        let survivor_cap = job_budget.limit().clamp(1, SURVIVOR_RUN_CAP_BYTES);
+        // Shrink the coordinator's shared out-of-core reservation to the exact survivor arena cap
+        // and keep it held through `retain_first_runs` so the survivor arena is always budgeted.
+        job_budget.shrink_shared_reservation_to(survivor_cap);
+        if !parallel::reduce_runs_parallel_with_dedup(
             &mut scan.runs,
             SortDirection::Ascending,
             scan.max_key_bytes,
             config,
-            &workspace,
+            workspace,
             shared,
+            scan.effective_workers,
+            pool.fd_budget(),
+            Some(Arc::clone(&state.duplicate_rows)),
         )? {
             return Ok(None);
         }
-        let Some((mut survivors, records)) =
-            retain_first_runs(&scan.runs, config, &workspace, state)?
+        let Some(fd_guard) = pool
+            .fd_budget()
+            .acquire(scan.runs.len().saturating_add(1), &shared.cancel_requested)
         else {
+            return Ok(None);
+        };
+        let retained_result = retain_first_runs(
+            &scan.runs,
+            delimiter,
+            config,
+            workspace,
+            state,
+            &job_budget,
+            survivor_cap,
+        );
+        drop(fd_guard);
+        job_budget.release_shared_reservation();
+        let Some((mut survivors, records, data_max_width)) = retained_result? else {
             return Ok(None);
         };
         if state.retained_rows.load(Ordering::Acquire)
@@ -424,33 +731,28 @@ fn run_duplicates(
             return Err(invalid_sort_output("duplicate run row count changed"));
         }
         remove_runs(&scan.runs, shared)?;
-        if !reduce_runs(
+        if !parallel::reduce_runs_parallel(
             &mut survivors,
             SortDirection::Ascending,
             8,
             config,
-            &workspace,
+            workspace,
             shared,
+            scan.effective_workers,
+            pool.fd_budget(),
         )? {
             return Ok(None);
         }
-        let mut prefix_bytes = 0;
-        if bom_present {
-            write_output(&mut output, UTF8_BOM, shared)?;
-            prefix_bytes = output.bytes_written();
-        }
-        if let Some(header) = &scan.header {
-            write_output(&mut output, header, shared)?;
-            prefix_bytes = output.bytes_written();
-            if prefix_bytes > output.record_limit() as u64 {
-                return Err(QuarryError::RecordTooLarge {
-                    limit: output.record_limit(),
-                });
-            }
-        }
+        let prefix_bytes = parallel::write_output_header_and_bom(
+            output,
+            bom_present,
+            scan.header.as_deref(),
+            &mut index,
+            shared,
+        )?;
         let Some((retained, data_bytes, _)) = merge_runs_to_output(
             &survivors,
-            &mut output,
+            output,
             SortDirection::Ascending,
             &scan.preferred_ending,
             records,
@@ -458,7 +760,7 @@ fn run_duplicates(
             prefix_bytes,
             if has_header { 0 } else { prefix_bytes },
             shared,
-            None,
+            Some(&mut index),
         )?
         else {
             return Ok(None);
@@ -469,36 +771,22 @@ fn run_duplicates(
         if !survivors.is_empty() {
             shared.merge_passes.fetch_add(1, Ordering::AcqRel);
         }
-        let bytes_written = prefix_bytes.saturating_add(data_bytes);
-        shared.bytes_written.store(bytes_written, Ordering::Release);
-        Ok(Some((scan.rows, retained, bytes_written)))
-    })();
-    let cleanup = workspace.cleanup();
-    let built = built.map_err(|error| match error {
-        QuarryError::Io(error) => storage_error(temporary_directory, error),
-        error => error,
-    })?;
-    cleanup?;
-    let Some((rows_scanned, retained_rows, bytes_written)) = built else {
-        return Ok(DuplicateOutcome::Cancelled);
+        (
+            retained,
+            prefix_bytes.saturating_add(data_bytes),
+            header_width.max(data_max_width),
+        )
     };
-    match output.publish(retained_rows, bytes_written, &shared.cancel_requested)? {
-        FilterExportOutcome::Cancelled => Ok(DuplicateOutcome::Cancelled),
-        FilterExportOutcome::Complete(summary) => {
-            Ok(DuplicateOutcome::Complete(DuplicateSummary {
-                destination: summary.destination,
-                rows_scanned,
-                duplicate_rows: rows_scanned - retained_rows,
-                retained_rows,
-                bytes_written: summary.bytes_written,
-                runs_created: shared.runs_created.load(Ordering::Acquire),
-                peak_temporary_bytes: shared.peak_temporary_bytes.load(Ordering::Acquire),
-                merge_passes: shared.merge_passes.load(Ordering::Acquire),
-                header_rows: shared.header_rows.load(Ordering::Acquire),
-                elapsed: Duration::ZERO,
-            }))
-        }
-    }
+
+    index.finish_output(bytes_written, retained_max_width);
+    shared.bytes_written.store(bytes_written, Ordering::Release);
+    Ok(Some(BuiltDuplicateOutput {
+        rows_scanned: scan.rows,
+        retained_rows: retained,
+        bytes_written,
+        index,
+        in_memory_fast_path,
+    }))
 }
 
 fn remove_runs(paths: &[SpillFile], shared: &SharedState) -> Result<(), QuarryError> {
@@ -510,36 +798,21 @@ fn remove_runs(paths: &[SpillFile], shared: &SharedState) -> Result<(), QuarryEr
     Ok(())
 }
 
-fn flush_survivors(
-    entries: &mut Vec<RunEntry>,
-    runs: &mut Vec<SpillFile>,
-    workspace: &RunWorkspace,
-    shared: &SharedState,
-) -> Result<bool, QuarryError> {
-    if entries.is_empty() {
-        return Ok(true);
-    }
-    entries.sort_unstable_by_key(|entry| entry.ordinal);
-    let (path, mut writer) = workspace.create_run()?;
-    for entry in entries.drain(..) {
-        if shared.cancel_requested.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        shared.add_temporary_bytes(write_entry(&mut writer, &entry)?);
-    }
-    writer.flush()?;
-    runs.push(path);
-    shared.runs_created.fetch_add(1, Ordering::AcqRel);
-    Ok(true)
-}
-
 fn retain_first_runs(
     paths: &[SpillFile],
+    delimiter: u8,
     config: SortConfig,
-    workspace: &RunWorkspace,
+    workspace: &parallel::LazyRunWorkspace,
     state: &DuplicateState,
-) -> Result<Option<(Vec<SpillFile>, RecordMultisetFingerprint)>, QuarryError> {
+    job_budget: &Arc<parallel::JobMemoryBudget>,
+    survivor_cap: usize,
+) -> Result<Option<(Vec<SpillFile>, RecordMultisetFingerprint, usize)>, QuarryError> {
     let shared = &state.sort;
+    let Some(_survivor_budget_guard) =
+        job_budget.acquire_empty(survivor_cap, &shared.cancel_requested)
+    else {
+        return Ok(None);
+    };
     let mut readers = open_run_readers(paths)?;
     let Some(mut heap) = seed_heap(
         &mut readers,
@@ -551,10 +824,10 @@ fn retain_first_runs(
         return Ok(None);
     };
     let mut previous_key: Option<Vec<u8>> = None;
-    let mut entries = Vec::new();
-    let mut entry_bytes = 0_usize;
+    let mut arena = parallel::RunArena::new();
     let mut runs = Vec::new();
     let mut records = RecordMultisetFingerprint::default();
+    let mut retained_max_width = 0_usize;
     while let Some(item) = heap.pop() {
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(None);
@@ -565,22 +838,44 @@ fn retain_first_runs(
             state.duplicate_rows.fetch_add(1, Ordering::AcqRel);
         } else {
             let record = read_record(reader, item.head.record_len, config.max_record_bytes)?;
-            let entry_size = record.len().saturating_add(32);
-            if !entries.is_empty()
-                && entry_bytes.saturating_add(entry_size) > config.run_memory_bytes
-            {
-                if !flush_survivors(&mut entries, &mut runs, workspace, shared)? {
-                    return Ok(None);
+            retained_max_width =
+                retained_max_width.max(parallel::count_record_fields(&record, delimiter)?);
+            let ordinal_key = item.head.ordinal.to_be_bytes();
+            if parallel::RunArena::entry_footprint(ordinal_key.len(), record.len()) > survivor_cap {
+                // Stream oversized survivors directly to their own spill run without staging a
+                // second full copy inside the bounded survivor arena.
+                let (path, mut writer) = workspace.create_run()?;
+                let bytes =
+                    write_entry_parts(&mut writer, &ordinal_key, &record, item.head.ordinal)?;
+                writer.flush()?;
+                shared.add_temporary_bytes(bytes);
+                shared.runs_created.fetch_add(1, Ordering::AcqRel);
+                runs.push(path);
+                records.observe(&record);
+            } else {
+                let planned = arena.planned_capacity_bytes(8, record.len(), Some(survivor_cap));
+                if !arena.is_empty() && planned > survivor_cap {
+                    let Some((run, _)) = arena.flush_to_workspace_mode(
+                        SortDirection::Ascending,
+                        false,
+                        workspace,
+                        shared,
+                        survivor_cap,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    runs.push(run);
                 }
-                entry_bytes = 0;
+                if arena.is_empty()
+                    && arena.planned_capacity_bytes(8, record.len(), Some(survivor_cap))
+                        > survivor_cap
+                {
+                    arena.clear_for_reuse(0);
+                }
+                records.observe(&record);
+                arena.push_bounded(&ordinal_key, &record, item.head.ordinal, Some(survivor_cap));
             }
-            records.observe(&record);
-            entries.push(RunEntry {
-                key: item.head.ordinal.to_be_bytes().to_vec(),
-                record,
-                ordinal: item.head.ordinal,
-            });
-            entry_bytes = entry_bytes.saturating_add(entry_size);
             previous_key = Some(item.head.key);
             state.retained_rows.fetch_add(1, Ordering::AcqRel);
         }
@@ -592,13 +887,18 @@ fn retain_first_runs(
             });
         }
     }
-    if !flush_survivors(&mut entries, &mut runs, workspace, shared)? {
-        return Ok(None);
+    if !arena.is_empty() {
+        let Some((run, _)) =
+            arena.flush_to_workspace_mode(SortDirection::Ascending, false, workspace, shared, 0)?
+        else {
+            return Ok(None);
+        };
+        runs.push(run);
     }
     if !paths.is_empty() {
         shared.merge_passes.fetch_add(1, Ordering::AcqRel);
     }
-    Ok(Some((runs, records)))
+    Ok(Some((runs, records, retained_max_width)))
 }
 
 #[cfg(test)]
@@ -1044,7 +1344,7 @@ mod tests {
         let bytes = b"key,note\na,first\na,later\n";
         let fixture = Case::new(bytes);
         let session = fixture.session(HeaderMode::FirstRow);
-        let mut source = File::open(&fixture.source).unwrap();
+        let source = File::open(&fixture.source).unwrap();
         let output = ExportTarget::new_private_guarded(
             &fixture.source,
             fixture.destination.clone(),
@@ -1056,25 +1356,29 @@ mod tests {
         fs::rename(&fixture.source, &moved).unwrap();
         fs::write(&fixture.source, b"external,change\n").unwrap();
         let state = DuplicateState {
-            sort: SharedState::new(bytes.len() as u64),
-            duplicate_rows: AtomicU64::new(0),
+            sort: Arc::new(SharedState::new(bytes.len() as u64)),
+            duplicate_rows: Arc::new(AtomicU64::new(0)),
             retained_rows: AtomicU64::new(0),
         };
         let result = run_duplicates(
-            &mut source,
+            source,
             &fixture.source,
             &session.source_stamp,
             b',',
             true,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &spec(&[0], CaseSensitivity::Sensitive),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            spec(&[0], CaseSensitivity::Sensitive),
             fixture.destination.clone(),
             output,
             false,
             tiny_config(),
             &state,
             None,
+            None,
+            None,
+            1,
+            parallel::DEFAULT_MIN_PARALLEL_STRIPE_BYTES,
         );
         assert!(matches!(result, Err(QuarryError::SourceChanged)));
         assert!(!fixture.destination.exists());
@@ -1152,5 +1456,441 @@ mod tests {
                 assert_eq!(fs::read(&fixture.source).unwrap(), bytes);
             }
         }
+    }
+
+    #[test]
+    fn parallel_duplicates_match_serial_in_memory_and_spilled_for_w_1_4_8() {
+        let mut raw = UTF8_BOM.to_vec();
+        raw.extend_from_slice(b"key,sub,seq,note\r\n");
+        for i in 0..4_000_u64 {
+            let key = if i % 2 == 0 {
+                format!("K{:02}", i % 37)
+            } else {
+                format!("k{:02}", i % 37)
+            };
+            let sub = format!("S{}", i % 11);
+            let note = if i % 29 == 0 {
+                format!("\"multi\r\nline-{i}\"")
+            } else {
+                format!("row-{i}")
+            };
+            let ending = if i == 3_999 { "" } else { "\r\n" };
+            raw.extend_from_slice(format!("{key},{sub},{i},{note}{ending}").as_bytes());
+        }
+        let fixture = Case::new(&raw);
+        let session = fixture.session(HeaderMode::FirstRow);
+        let index = session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 128,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let header_renames = BTreeMap::from([(0, b"KEY".to_vec())]);
+        let cell_edits = BTreeMap::from([
+            ((1, 0), b"EDITED_UNIQUE".to_vec()),
+            ((2000, 3), b"edited,note".to_vec()),
+        ]);
+
+        for case in [CaseSensitivity::Insensitive, CaseSensitivity::Sensitive] {
+            let dup_spec = spec(&[0, 1], case);
+            let mut baseline: Option<Vec<u8>> = None;
+            for (mode, memory_budget, merge_fan_in, expect_fast_path) in [
+                ("in-memory", 32 * 1024 * 1024, 32, true),
+                ("spilled", 8 * 1024, 3, false),
+            ] {
+                for workers in [1_usize, 4, 8] {
+                    let dest = fixture
+                        .directory
+                        .join(format!("dup-{case:?}-{mode}-w{workers}.csv"));
+                    let job = DuplicateJob::start_with_options_internal(
+                        &session,
+                        header_renames.clone(),
+                        cell_edits.clone(),
+                        dup_spec.clone(),
+                        dest.clone(),
+                        SortConfig {
+                            run_memory_bytes: memory_budget,
+                            merge_fan_in,
+                            ..DEFAULT_SORT_CONFIG
+                        },
+                        Some(fixture.directory.clone()),
+                        Some(index.indexed_rows()),
+                        Some(index.clone()),
+                        Some(workers),
+                        1,
+                    )
+                    .unwrap();
+                    let DuplicateOutcome::Complete(summary) = job.wait().unwrap() else {
+                        panic!("{mode} w={workers} cancelled");
+                    };
+                    assert_eq!(summary.in_memory_fast_path, expect_fast_path);
+                    if expect_fast_path {
+                        assert_eq!(summary.runs_created, 0);
+                        assert_eq!(summary.merge_passes, 0);
+                    } else {
+                        assert!(summary.runs_created > 0);
+                    }
+                    if workers > 1 {
+                        assert!(summary.effective_workers > 1);
+                    } else {
+                        assert_eq!(summary.effective_workers, 1);
+                    }
+                    assert_eq!(summary.rows_scanned, 4_000);
+                    assert_eq!(
+                        summary.retained_rows + summary.duplicate_rows,
+                        summary.rows_scanned
+                    );
+                    if let Some(output_index) = summary.output_index {
+                        let out_session = Session::open(
+                            &dest,
+                            QuarryOpenOptions {
+                                delimiter: Some(b','),
+                                header_mode: HeaderMode::FirstRow,
+                                ..QuarryOpenOptions::default()
+                            },
+                        )
+                        .unwrap();
+                        let adopted = out_session
+                            .adopt_completed_index(output_index)
+                            .expect("adopted duplicate output index");
+                        let fresh = out_session
+                            .start_indexing(IndexConfig::default())
+                            .unwrap()
+                            .wait()
+                            .unwrap();
+                        assert_eq!(adopted, fresh, "{mode} w={workers} output_index mismatch");
+                    } else {
+                        assert!(
+                            !cfg!(target_os = "macos"),
+                            "local macOS publication must retain duplicate index provenance"
+                        );
+                    }
+                    assert!(fixture.artifacts().is_empty());
+
+                    let bytes = fs::read(&dest).unwrap();
+                    if let Some(ref expected) = baseline {
+                        assert_eq!(&bytes, expected, "{case:?} {mode} w={workers} mismatch");
+                    } else {
+                        baseline = Some(bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_duplicates_rejects_foreign_index_and_cancels_cleanly() {
+        let mut a = String::from("k,v\n");
+        let mut b = String::from("k,v\n");
+        for i in 0..256 {
+            a.push_str(&format!("{:02},{}\n", i % 19, "a".repeat(596)));
+            let first = if i == 0 {
+                100
+            } else if i == 255 {
+                300
+            } else {
+                200
+            };
+            b.push_str(&format!(
+                "{:02},\"{}\n{}\"\n",
+                i % 19,
+                "b".repeat(first),
+                "c".repeat(393)
+            ));
+        }
+        assert_eq!(a.len(), b.len());
+        let fa = Case::new(a.as_bytes());
+        let fb = Case::new(b.as_bytes());
+        let sa = fa.session(HeaderMode::FirstRow);
+        let sb = fb.session(HeaderMode::FirstRow);
+        let idx_a = sa
+            .start_indexing(IndexConfig {
+                checkpoint_every: 16,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let idx_b = sb
+            .start_indexing(IndexConfig {
+                checkpoint_every: 16,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let dest_local = fb.directory.join("local.csv");
+        let DuplicateOutcome::Complete(local) = sb
+            .start_find_duplicates_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                spec(&[0], CaseSensitivity::Sensitive),
+                &dest_local,
+                DuplicateOptions {
+                    temporary_directory: Some(&fb.directory),
+                    source_index: Some(&idx_b),
+                    threads: Some(4),
+                    memory_budget_bytes: Some(1024 * 1024),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("local cancelled");
+        };
+        assert!(local.effective_workers >= 2);
+        assert_eq!(local.retained_rows, 19);
+        assert_eq!(local.duplicate_rows, 256 - 19);
+
+        let dest_foreign = fb.directory.join("foreign.csv");
+        let DuplicateOutcome::Complete(foreign) = sb
+            .start_find_duplicates_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                spec(&[0], CaseSensitivity::Sensitive),
+                &dest_foreign,
+                DuplicateOptions {
+                    temporary_directory: Some(&fb.directory),
+                    source_index: Some(&idx_a),
+                    threads: Some(4),
+                    memory_budget_bytes: Some(1024 * 1024),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("foreign cancelled");
+        };
+        assert_eq!(foreign.effective_workers, 1);
+        assert_eq!(
+            fs::read(&dest_foreign).unwrap(),
+            fs::read(&dest_local).unwrap()
+        );
+
+        let dest_cancel = fb.directory.join("cancel.csv");
+        let job = sb
+            .start_find_duplicates_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                spec(&[0], CaseSensitivity::Sensitive),
+                &dest_cancel,
+                DuplicateOptions {
+                    temporary_directory: Some(&fb.directory),
+                    source_index: Some(&idx_b),
+                    threads: Some(4),
+                    memory_budget_bytes: Some(4 * 1024),
+                },
+            )
+            .unwrap();
+        job.cancel();
+        assert_eq!(job.wait().unwrap(), DuplicateOutcome::Cancelled);
+        assert!(!dest_cancel.exists());
+        assert!(fb.artifacts().is_empty());
+    }
+
+    #[test]
+    fn removed_wider_duplicate_row_does_not_inflate_output_index_width() {
+        // Removing the wider duplicate row `a,b,c,d` leaves a 2-column file `a,b\n`; the
+        // emitted output index must report width 2 (not 4) across both in-memory and spilled paths.
+        let raw = b"a,b\na,b,c,d\n";
+        let fixture = Case::new(raw);
+        let session = fixture.session(HeaderMode::NoHeader);
+        for (label, budget) in [("in-memory", 64 * 1024), ("spilled", 64)] {
+            let dest = fixture.directory.join(format!("narrow-{label}.csv"));
+            let job = DuplicateJob::start(
+                &session,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                spec(&[0], CaseSensitivity::Sensitive),
+                dest.clone(),
+                SortConfig {
+                    run_memory_bytes: budget,
+                    ..tiny_config()
+                },
+            )
+            .unwrap();
+            let DuplicateOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("{label} cancelled");
+            };
+            assert_eq!(summary.retained_rows, 1);
+            assert_eq!(summary.duplicate_rows, 1);
+            assert_eq!(fs::read(&dest).unwrap(), b"a,b\n");
+            if let Some(output_index) = summary.output_index {
+                let out_session = Session::open(
+                    &dest,
+                    QuarryOpenOptions {
+                        delimiter: Some(b','),
+                        header_mode: HeaderMode::NoHeader,
+                        ..QuarryOpenOptions::default()
+                    },
+                )
+                .unwrap();
+                let adopted = out_session
+                    .adopt_completed_index(output_index)
+                    .expect("adopt duplicate index");
+                let fresh = out_session
+                    .start_indexing(IndexConfig::default())
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                assert_eq!(adopted.maximum_width(), 2, "{label} width inflated");
+                assert_eq!(adopted, fresh, "{label} output index mismatch");
+            } else {
+                assert!(!cfg!(target_os = "macos"));
+            }
+        }
+    }
+
+    #[test]
+    fn run_arena_combined_capacity_stays_within_cap_and_reuses_cleanly() {
+        // On a 64-bit target with 24-byte payloads (8-byte key + 16-byte record) and a 1,024-byte
+        // budget, `plan_growth` must leave room for payloads so multiple rows fit before a spill
+        // (and after reuse) instead of reserving all budget for `entries` and producing 1-row runs.
+        let small_cap = 1024_usize;
+        let mut small_arena = parallel::RunArena::new();
+        let mut run_lengths = Vec::new();
+        let mut current_run_rows = 0_usize;
+        for ordinal in 0_u64..64 {
+            let key = format!("k{ordinal:07}");
+            let rec = format!("r{ordinal:014}\n");
+            assert_eq!(key.len() + rec.len(), 24);
+            let planned = small_arena.planned_capacity_bytes(key.len(), rec.len(), Some(small_cap));
+            if !small_arena.is_empty() && planned > small_cap {
+                assert!(small_arena.capacity_bytes() <= small_cap);
+                run_lengths.push(current_run_rows);
+                small_arena.clear_for_reuse(small_cap);
+                assert!(small_arena.capacity_bytes() <= small_cap);
+                current_run_rows = 0;
+            }
+            small_arena.push_bounded(key.as_bytes(), rec.as_bytes(), ordinal, Some(small_cap));
+            current_run_rows += 1;
+            assert!(
+                small_arena.capacity_bytes() <= small_cap,
+                "combined arena capacity {} exceeded small_cap {small_cap}",
+                small_arena.capacity_bytes()
+            );
+        }
+        assert!(
+            !run_lengths.is_empty() && run_lengths.iter().all(|&rows| rows >= 12),
+            "expected balanced multi-row runs before spilling under 1024B cap, got {run_lengths:?}"
+        );
+
+        let cap = 4096_usize;
+        let mut arena = parallel::RunArena::new();
+        for ordinal in 0_u64..1000 {
+            let key = format!("k{ordinal:04}");
+            let rec = format!("k{ordinal:04},v\n");
+            let planned = arena.planned_capacity_bytes(key.len(), rec.len(), Some(cap));
+            if !arena.is_empty() && planned > cap {
+                assert!(arena.capacity_bytes() <= cap);
+                arena.clear_for_reuse(cap);
+                assert!(arena.capacity_bytes() <= cap);
+                continue;
+            }
+            arena.push_bounded(key.as_bytes(), rec.as_bytes(), ordinal, Some(cap));
+            assert!(
+                arena.capacity_bytes() <= cap,
+                "combined arena capacity {} exceeded cap {cap}",
+                arena.capacity_bytes()
+            );
+        }
+        // Single oversized entry is admitted on an empty arena with exact minimum capacity.
+        arena.clear_for_reuse(0);
+        assert_eq!(arena.capacity_bytes(), 0);
+        let big = vec![b'x'; cap + 512];
+        arena.push_bounded(b"k", &big, 0, Some(cap));
+        assert!(arena.capacity_bytes() > big.len());
+        arena.clear_for_reuse(cap);
+        assert_eq!(
+            arena.capacity_bytes(),
+            0,
+            "oversized arena must not be retained past retain_bytes_cap"
+        );
+    }
+
+    #[test]
+    fn parallel_duplicates_spills_when_survivor_vector_exceeds_budget() {
+        // Short unique rows have a high survivor-vector overhead (24 B/row) relative to payload,
+        // so a tight budget that fits the live worker arenas still cannot fit `arenas + survivors`
+        // and must spill cleanly while matching the spacious in-memory output byte-for-byte.
+        let mut raw = String::from("k\n");
+        for i in 0..4_000_u64 {
+            raw.push_str(&format!("{i:04}\n"));
+        }
+        let fixture = Case::new(raw.as_bytes());
+        let session = fixture.session(HeaderMode::FirstRow);
+        let index = session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 256,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let spacious_dest = fixture.directory.join("spacious.csv");
+        let DuplicateOutcome::Complete(spacious) = DuplicateJob::start_with_options_internal(
+            &session,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            spec(&[0], CaseSensitivity::Sensitive),
+            spacious_dest.clone(),
+            SortConfig {
+                run_memory_bytes: 8 * 1024 * 1024,
+                ..tiny_config()
+            },
+            None,
+            Some(index.indexed_rows()),
+            Some(index.clone()),
+            Some(4),
+            1,
+        )
+        .unwrap()
+        .wait()
+        .unwrap() else {
+            panic!("spacious cancelled");
+        };
+        assert!(spacious.in_memory_fast_path);
+
+        // ~4000 rows * (~50 B arena footprint) ~= 200 KiB; survivors alone add 96 KiB.
+        // Choose a budget around 256 KiB where arenas fit (~200-230 KiB) or barely fit,
+        // and adding 96 KiB for `survivors` exceeds the budget so it must spill cleanly.
+        let tight_dest = fixture.directory.join("tight.csv");
+        let DuplicateOutcome::Complete(tight) = DuplicateJob::start_with_options_internal(
+            &session,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            spec(&[0], CaseSensitivity::Sensitive),
+            tight_dest.clone(),
+            SortConfig {
+                run_memory_bytes: 256 * 1024,
+                ..tiny_config()
+            },
+            None,
+            Some(index.indexed_rows()),
+            Some(index),
+            Some(4),
+            1,
+        )
+        .unwrap()
+        .wait()
+        .unwrap() else {
+            panic!("tight cancelled");
+        };
+        assert!(
+            !tight.in_memory_fast_path,
+            "tight budget must spill instead of allocating unbudgeted survivor vector"
+        );
+        assert_eq!(tight.retained_rows, spacious.retained_rows);
+        assert_eq!(tight.duplicate_rows, spacious.duplicate_rows);
+        assert_eq!(
+            fs::read(&tight_dest).unwrap(),
+            fs::read(&spacious_dest).unwrap()
+        );
     }
 }

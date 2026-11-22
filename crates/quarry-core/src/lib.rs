@@ -56,9 +56,9 @@ use encoding::RecordScanner;
 pub use export::{
     CleanupJob, CleanupOutcome, CleanupSummary, ColumnTransformation, FilterExportJob,
     FilterExportOutcome, FilterExportProgress, FilterExportSummary, LiteralReplacement,
-    MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob, ReplaceAllOutcome, ReplaceAllSummary, RowInsertion,
-    SaveAsJob, SaveAsOutcome, SaveAsProgress, SaveAsSummary, SplitAnalysisJob,
-    SplitAnalysisOutcome, SplitAnalysisProgress, SplitAnalysisSummary,
+    MAX_TRANSFORMATION_COLUMNS, ReplaceAllJob, ReplaceAllOptions, ReplaceAllOutcome,
+    ReplaceAllSummary, RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SaveAsSummary,
+    SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress, SplitAnalysisSummary,
 };
 pub use filter::{
     FilterEdits, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
@@ -102,9 +102,9 @@ pub use sidecar::{
     IndexCacheConfig, clear_index_cache, default_index_cache_dir,
 };
 pub use sort::{
-    DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
-    MAX_SORT_KEYS, SortDirection, SortJob, SortMode, SortOptions, SortOutcome, SortPlan,
-    SortProgress, SortSpec, SortSummary, estimate_multi_sort_temporary_bytes,
+    DuplicateJob, DuplicateOptions, DuplicateOutcome, DuplicateProgress, DuplicateSpec,
+    DuplicateSummary, MAX_SORT_KEYS, SortDirection, SortJob, SortMode, SortOptions, SortOutcome,
+    SortPlan, SortProgress, SortSpec, SortSummary, estimate_multi_sort_temporary_bytes,
     estimate_sort_temporary_bytes,
 };
 pub use storage::{
