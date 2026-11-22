@@ -97,6 +97,142 @@ pub fn check_storage(
     inspect_storage(directory)?.require(additional_required_bytes)
 }
 
+/// Strictly validate a user-selected scratch directory before use or persistence:
+/// must be an existing absolute directory, must not traverse or target a symlink / reparse point,
+/// must be owned by the current user, and must support private temporary storage creation.
+pub fn validate_scratch_directory(directory: &Path) -> Result<StorageSpace, QuarryError> {
+    let result = (|| -> io::Result<StorageSpace> {
+        if directory.as_os_str().is_empty() || !directory.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "temporary folder must be an absolute path",
+            ));
+        }
+        reject_scratch_symlink_components(directory)?;
+        let metadata = fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "temporary folder cannot be a symbolic link",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "location must be a directory",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            if metadata.uid() != rustix::process::geteuid().as_raw() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "temporary folder must be owned by the current user",
+                ));
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            const READ_CONTROL: u32 = 0x0002_0000;
+            if (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "temporary folder cannot be a reparse point or symlink",
+                ));
+            }
+            let dir_handle = OpenOptions::new()
+                .access_mode(READ_CONTROL)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(directory)?;
+            if !crate::sidecar::verify_windows_handle_owned_by_current_user(
+                dir_handle.as_raw_handle(),
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "temporary folder must be owned by the current user",
+                ));
+            }
+        }
+
+        // Verify the volume can create an owner-only private workspace (including POSIX 0700 + ACL checks)
+        // and write/remove a private probe file inside it.
+        let available_bytes = available_space(directory)?;
+        let probe_workspace = crate::spill::SpillWorkspace::create_in(directory, "probe").map_err(
+            |error| match error {
+                QuarryError::Storage { error, .. } | QuarryError::Io(error) => error,
+                other => io::Error::other(other.to_string()),
+            },
+        )?;
+        let probe_result = (|| -> io::Result<()> {
+            let (run, mut writer) = probe_workspace.create_run().map_err(|error| match error {
+                QuarryError::Storage { error, .. } | QuarryError::Io(error) => error,
+                other => io::Error::other(other.to_string()),
+            })?;
+            writer.write_all(&[0])?;
+            writer.flush()?;
+            drop(writer);
+            run.remove()?;
+            Ok(())
+        })();
+        let cleanup_result = probe_workspace.cleanup().map_err(|error| match error {
+            QuarryError::Storage { error, .. } | QuarryError::Io(error) => error,
+            other => io::Error::other(other.to_string()),
+        });
+        probe_result?;
+        cleanup_result?;
+        Ok(StorageSpace {
+            directory: directory.to_path_buf(),
+            required_bytes: 0,
+            available_bytes,
+        })
+    })();
+    result.map_err(|error| storage_error(directory, error))
+}
+
+fn reject_scratch_symlink_components(path: &Path) -> io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        ) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&current)?;
+        // On macOS, `/var` and `/tmp` are OS-level root symlinks to `/private/*`.
+        #[cfg(target_os = "macos")]
+        if current == Path::new("/var") || current == Path::new("/tmp") {
+            continue;
+        }
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "temporary folder cannot traverse or target a symbolic link",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "temporary folder cannot traverse or target a reparse point",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) fn available_space(directory: &Path) -> io::Result<u64> {
     let space = rustix::fs::statvfs(directory)?;
@@ -755,5 +891,35 @@ mod tests {
             .is_ok()
         );
         assert!(validate_acl_update(&file, true, Ok(())).is_err());
+    }
+
+    #[test]
+    fn validate_scratch_directory_accepts_user_dir_and_rejects_invalid_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let space = super::validate_scratch_directory(dir.path()).unwrap();
+        assert_eq!(space.directory, dir.path());
+
+        let missing = dir.path().join("missing-drive");
+        assert!(super::validate_scratch_directory(&missing).is_err());
+
+        let regular = dir.path().join("file.txt");
+        fs::write(&regular, b"x").unwrap();
+        assert!(super::validate_scratch_directory(&regular).is_err());
+
+        assert!(super::validate_scratch_directory(Path::new("")).is_err());
+        assert!(super::validate_scratch_directory(Path::new("relative/scratch")).is_err());
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("real");
+            fs::create_dir(&target).unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(super::validate_scratch_directory(&link).is_err());
+            let nested = target.join("child");
+            fs::create_dir(&nested).unwrap();
+            assert!(super::validate_scratch_directory(&link.join("child")).is_err());
+            assert!(super::validate_scratch_directory(&nested).is_ok());
+        }
     }
 }

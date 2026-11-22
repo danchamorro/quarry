@@ -319,6 +319,14 @@ impl Document {
         if !matches!(compressed.phase, Phase::Pending(_)) {
             return Ok(false);
         }
+        if self.custom_working_directory
+            && let Err(error) = quarry_core::validate_scratch_directory(&self.working_directory)
+        {
+            return Err(storage::format_unavailable_scratch_notice(
+                &self.working_directory,
+                &error.to_string(),
+            ));
+        }
         let Phase::Pending(bootstrap) = std::mem::replace(&mut compressed.phase, Phase::Preview)
         else {
             unreachable!("the phase was checked above");

@@ -86,7 +86,10 @@ pub use join::{
     JoinOutputColumn, JoinOutputOptions, JoinSource, analyze_join_with_output, read_join_header,
     read_join_header_with_format,
 };
-pub use pool::default_worker_threads;
+pub use pool::{
+    DEFAULT_SINGLE_RUN_MEMORY_BUDGET_BYTES, default_single_run_memory_budget_bytes,
+    default_worker_threads,
+};
 pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
 };
@@ -100,12 +103,13 @@ pub use sidecar::{
 };
 pub use sort::{
     DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
-    MAX_SORT_KEYS, SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SortProgress, SortSpec,
-    SortSummary, estimate_multi_sort_temporary_bytes, estimate_sort_temporary_bytes,
+    MAX_SORT_KEYS, SortDirection, SortJob, SortMode, SortOptions, SortOutcome, SortPlan,
+    SortProgress, SortSpec, SortSummary, estimate_multi_sort_temporary_bytes,
+    estimate_sort_temporary_bytes,
 };
 pub use storage::{
     StorageSpace, check_storage, estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
-    estimate_edited_output_bytes_from_values, inspect_storage,
+    estimate_edited_output_bytes_from_values, inspect_storage, validate_scratch_directory,
 };
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;

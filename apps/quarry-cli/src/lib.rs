@@ -263,7 +263,7 @@ fn print_help() {
          [--order asc|desc] [--mode text|number|date|characters|words|shuffle|reverse] \
          [--date-format ymd|mdy|dmy|datetime|rfc3339] \
          [--seed N] [--delimiter ,] [--header auto|first-row|none] \
-         [--temp-dir DIRECTORY] \
+         [--temp-dir DIRECTORY] [--threads N] [--memory-budget BYTES] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry duplicates <FILE> --columns 1,2 [--match-case] [--output FILE] \
          [--temp-dir DIRECTORY] \
@@ -1661,6 +1661,7 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
     let mut threads = None;
+    let mut memory_budget_bytes = None;
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -1721,6 +1722,13 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
             }
             "--threads" => {
                 threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
+            }
+            "--memory-budget" => {
+                memory_budget_bytes =
+                    Some(value(&args, &mut cursor, "--memory-budget")?.parse::<usize>()?);
+                if memory_budget_bytes == Some(0) {
+                    return Err("--memory-budget must be non-zero".into());
+                }
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -1830,12 +1838,17 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         human_bytes(space.available_bytes),
         space.available_bytes
     );
-    let job = session.start_create_sorted_working_copy_with_temp_directory(
+    let job = session.start_create_sorted_working_copy_with_options(
         BTreeMap::new(),
         BTreeMap::new(),
         spec,
         &destination,
-        &temporary_directory,
+        quarry_core::SortOptions {
+            temporary_directory: Some(&temporary_directory),
+            source_index: Some(&source_index),
+            threads,
+            memory_budget_bytes,
+        },
     )?;
     let (outcome, progress, cancellation_requested_at) =
         wait_for_sort(job, cancel_after_bytes, Duration::from_millis(1))?;
@@ -1968,6 +1981,17 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     println!("Header rows: {}", progress.header_rows);
     println!("Sorted runs created: {}", progress.runs_created);
     println!("Merge passes: {}", progress.merge_passes);
+    println!("Sort workers: {}", progress.effective_workers);
+    if let SortOutcome::Complete(summary) = &outcome {
+        println!(
+            "In-memory fast path: {}",
+            if summary.in_memory_fast_path {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
     println!(
         "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
         human_bytes(progress.bytes_scanned),

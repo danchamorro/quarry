@@ -1968,6 +1968,138 @@ fn set_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> io::Result<()> 
 }
 
 #[cfg(windows)]
+pub(crate) fn verify_windows_handle_owned_by_current_user(handle: *mut std::ffi::c_void) -> bool {
+    use std::ffi::c_void;
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+    const TOKEN_OWNER_CLASS: u32 = 4;
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut c_void,
+            desired_access: u32,
+            token_handle: *mut *mut c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut c_void,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn EqualSid(sid1: *mut c_void, sid2: *mut c_void) -> i32;
+        fn GetSecurityInfo(
+            handle: *mut c_void,
+            object_type: u32,
+            security_info: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            security_descriptor: *mut *mut c_void,
+        ) -> u32;
+    }
+
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut needed: u32 = 0;
+        let _ = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        if needed == 0 {
+            CloseHandle(token);
+            return false;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        if GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            CloseHandle(token);
+            return false;
+        }
+        let user_sid = (*buf.as_ptr().cast::<SidAndAttributes>()).sid;
+
+        let mut owner_needed: u32 = 0;
+        let _ = GetTokenInformation(
+            token,
+            TOKEN_OWNER_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut owner_needed,
+        );
+        let mut owner_buf = if owner_needed > 0 {
+            vec![0u8; owner_needed as usize]
+        } else {
+            Vec::new()
+        };
+        let token_owner_sid = if owner_needed > 0
+            && GetTokenInformation(
+                token,
+                TOKEN_OWNER_CLASS,
+                owner_buf.as_mut_ptr().cast(),
+                owner_needed,
+                &mut owner_needed,
+            ) != 0
+        {
+            *owner_buf.as_ptr().cast::<*mut c_void>()
+        } else {
+            std::ptr::null_mut()
+        };
+        CloseHandle(token);
+
+        let mut owner_sid: *mut c_void = std::ptr::null_mut();
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        let status = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        );
+        if status != 0 || sd.is_null() {
+            return false;
+        }
+        let matches = !owner_sid.is_null()
+            && (EqualSid(owner_sid, user_sid) != 0
+                || (!token_owner_sid.is_null() && EqualSid(owner_sid, token_owner_sid) != 0));
+        LocalFree(sd);
+        matches
+    }
+}
+
+#[cfg(windows)]
 fn verify_windows_owner_only_dacl(handle: *mut std::ffi::c_void) -> bool {
     use std::ffi::c_void;
 

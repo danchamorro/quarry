@@ -16,6 +16,136 @@ pub(crate) const MAX_POOL_WORKERS: usize = 64;
 /// Default shared byte budget across all concurrent engine worker allocations (48 MiB).
 pub(crate) const DEFAULT_SHARED_BYTE_BUDGET: usize = 48 * 1024 * 1024;
 
+/// Default tracked-payload single-run memory budget for out-of-core operations (300 MB decimal).
+pub const DEFAULT_SINGLE_RUN_MEMORY_BUDGET_BYTES: usize = 300_000_000;
+
+/// Minimum floor for the adaptive single-run memory budget (16 MiB).
+const MIN_ADAPTIVE_SINGLE_RUN_MEMORY_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+
+/// Record size threshold above which workers must acquire the large-record admission gate
+/// so at most one worker holds an oversized record at a time.
+pub(crate) const LARGE_RECORD_GATE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Query total physical RAM on the host when supported by the OS.
+pub(crate) fn physical_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+        let mut mem: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: `mib` has length 2, `mem` is a writable `u64`, and `len` is its exact byte size.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut mem as *mut u64).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && len == std::mem::size_of::<u64>() && mem > 0 {
+            Some(mem)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return kib.checked_mul(1024);
+            }
+        }
+        None
+    }
+
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            dw_length: u32,
+            dw_memory_load: u32,
+            ull_total_phys: u64,
+            ull_avail_phys: u64,
+            ull_total_page_file: u64,
+            ull_avail_page_file: u64,
+            ull_total_virtual: u64,
+            ull_avail_virtual: u64,
+            ull_avail_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            dw_memory_load: 0,
+            ull_total_phys: 0,
+            ull_avail_phys: 0,
+            ull_total_page_file: 0,
+            ull_avail_page_file: 0,
+            ull_total_virtual: 0,
+            ull_avail_virtual: 0,
+            ull_avail_extended_virtual: 0,
+        };
+        // SAFETY: `status` has `dw_length` initialized to its exact struct size.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ull_total_phys > 0 {
+            Some(status.ull_total_phys)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+/// Cap the default 300 MB single-run memory budget to a safe fraction (25%) of physical RAM.
+pub fn default_single_run_memory_budget_bytes() -> usize {
+    cap_single_run_budget_for_ram(
+        DEFAULT_SINGLE_RUN_MEMORY_BUDGET_BYTES,
+        physical_memory_bytes(),
+    )
+}
+
+pub(crate) fn cap_single_run_budget_for_ram(requested: usize, physical_ram: Option<u64>) -> usize {
+    match physical_ram {
+        Some(ram) => {
+            let quarter = (ram / 4).min(usize::MAX as u64) as usize;
+            let cap = quarter.clamp(
+                MIN_ADAPTIVE_SINGLE_RUN_MEMORY_BUDGET_BYTES,
+                DEFAULT_SINGLE_RUN_MEMORY_BUDGET_BYTES,
+            );
+            requested.min(cap).max(1)
+        }
+        None => requested.max(1),
+    }
+}
+
+/// Safe concurrent file-descriptor ceiling for merge groups, staying well beneath macOS's 256 soft limit.
+pub(crate) fn default_fd_budget_limit() -> usize {
+    #[cfg(unix)]
+    {
+        let rlim = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        if let Some(soft) = rlim.current {
+            let safe = soft.saturating_sub(64).min(soft / 2);
+            return safe.clamp(4, 192) as usize;
+        }
+        128
+    }
+
+    #[cfg(not(unix))]
+    {
+        192
+    }
+}
+
 /// Default engine worker count: `available_parallelism() - 1`, clamped to at least 1.
 pub fn default_worker_threads() -> usize {
     thread::available_parallelism()
@@ -55,6 +185,9 @@ pub(crate) struct EnginePool {
     queue: Mutex<PoolQueue>,
     ready: Condvar,
     byte_budget: Arc<ByteBudget>,
+    out_of_core_budget: Arc<ByteBudget>,
+    large_record_gate: Arc<LargeRecordGate>,
+    fd_budget: Arc<FdBudget>,
 }
 
 impl EnginePool {
@@ -68,11 +201,26 @@ impl EnginePool {
             }),
             ready: Condvar::new(),
             byte_budget: Arc::new(ByteBudget::new(byte_budget_bytes)),
+            out_of_core_budget: Arc::new(ByteBudget::new(default_single_run_memory_budget_bytes())),
+            large_record_gate: Arc::new(LargeRecordGate::new()),
+            fd_budget: Arc::new(FdBudget::new(default_fd_budget_limit())),
         }
     }
 
     pub(crate) fn byte_budget(&self) -> &Arc<ByteBudget> {
         &self.byte_budget
+    }
+
+    pub(crate) fn out_of_core_budget(&self) -> &Arc<ByteBudget> {
+        &self.out_of_core_budget
+    }
+
+    pub(crate) fn large_record_gate(&self) -> &Arc<LargeRecordGate> {
+        &self.large_record_gate
+    }
+
+    pub(crate) fn fd_budget(&self) -> &Arc<FdBudget> {
+        &self.fd_budget
     }
 
     /// Ensure at least one worker thread exists (targeting `target_workers`, capped at `MAX_POOL_WORKERS`).
@@ -163,8 +311,33 @@ pub(crate) struct BudgetGuard {
     bytes: usize,
 }
 
+impl BudgetGuard {
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Attempt to expand this reservation by `extra_bytes` without blocking.
+    pub(crate) fn try_grow(&mut self, extra_bytes: usize) -> bool {
+        if extra_bytes == 0 {
+            return true;
+        }
+        let mut used = self.budget.used.lock().unwrap();
+        if used.saturating_add(extra_bytes) <= self.budget.limit {
+            *used = used.saturating_add(extra_bytes);
+            self.bytes = self.bytes.saturating_add(extra_bytes);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Drop for BudgetGuard {
     fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
         let mut used = self.budget.used.lock().unwrap();
         *used = used.saturating_sub(self.bytes);
         self.budget.available.notify_all();
@@ -243,10 +416,150 @@ impl ByteBudget {
         }
     }
 
+    /// Attempt a non-blocking reservation if `bytes` fit within `self.limit`.
+    pub(crate) fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BudgetGuard> {
+        let requested = bytes.max(1);
+        let mut used = self.used.lock().unwrap();
+        if used.saturating_add(requested) <= self.limit {
+            *used = used.saturating_add(requested);
+            Some(BudgetGuard {
+                budget: Arc::clone(self),
+                bytes: requested,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Wake any waiters whose bypass predicate may now hold (e.g., head-of-line cursor advanced).
     pub(crate) fn notify_all(&self) {
         let _guard = self.used.lock().unwrap();
         self.available.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        *self.used.lock().unwrap()
+    }
+}
+
+/// Mutual-exclusion admission gate ensuring at most one worker holds an oversized record at a time.
+pub(crate) struct LargeRecordGate {
+    held: Mutex<bool>,
+    available: Condvar,
+}
+
+pub(crate) struct LargeRecordGuard {
+    gate: Arc<LargeRecordGate>,
+}
+
+impl Drop for LargeRecordGuard {
+    fn drop(&mut self) {
+        let mut held = self.gate.held.lock().unwrap();
+        *held = false;
+        self.gate.available.notify_all();
+    }
+}
+
+impl LargeRecordGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            held: Mutex::new(false),
+            available: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<LargeRecordGuard> {
+        let mut held = self.held.lock().unwrap();
+        if !*held {
+            *held = true;
+            Some(LargeRecordGuard {
+                gate: Arc::clone(self),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn acquire(self: &Arc<Self>, cancelled: &AtomicBool) -> Option<LargeRecordGuard> {
+        let mut held = self.held.lock().unwrap();
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return None;
+            }
+            if !*held {
+                *held = true;
+                return Some(LargeRecordGuard {
+                    gate: Arc::clone(self),
+                });
+            }
+            let (next, _) = self
+                .available
+                .wait_timeout(held, std::time::Duration::from_millis(2))
+                .unwrap();
+            held = next;
+        }
+    }
+}
+
+/// Shared file-descriptor reservation limiter keeping concurrent merges beneath OS FD soft limits.
+pub(crate) struct FdBudget {
+    limit: usize,
+    used: Mutex<usize>,
+    available: Condvar,
+}
+
+pub(crate) struct FdGuard {
+    budget: Arc<FdBudget>,
+    count: usize,
+}
+
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock().unwrap();
+        *used = used.saturating_sub(self.count);
+        self.budget.available.notify_all();
+    }
+}
+
+impl FdBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            used: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Reserve `count` file descriptors, admitting a single request > limit once `used == 0`.
+    pub(crate) fn acquire(
+        self: &Arc<Self>,
+        count: usize,
+        cancelled: &AtomicBool,
+    ) -> Option<FdGuard> {
+        let requested = count.max(1);
+        let mut used = self.used.lock().unwrap();
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return None;
+            }
+            if *used == 0 || used.saturating_add(requested) <= self.limit {
+                *used = used.saturating_add(requested);
+                return Some(FdGuard {
+                    budget: Arc::clone(self),
+                    count: requested,
+                });
+            }
+            let (next, _) = self
+                .available
+                .wait_timeout(used, std::time::Duration::from_millis(2))
+                .unwrap();
+            used = next;
+        }
     }
 
     #[cfg(test)]
@@ -429,5 +742,81 @@ mod tests {
         executor.drain().unwrap();
         assert_eq!(done.load(Ordering::Acquire), 12);
         assert!(peak.load(Ordering::Acquire) <= 3);
+    }
+
+    #[test]
+    fn adaptive_single_run_budget_caps_by_physical_ram() {
+        assert_eq!(
+            super::cap_single_run_budget_for_ram(300_000_000, Some(16 * 1024 * 1024 * 1024)),
+            300_000_000
+        );
+        assert_eq!(
+            super::cap_single_run_budget_for_ram(300_000_000, Some(512 * 1024 * 1024)),
+            128 * 1024 * 1024
+        );
+        assert_eq!(
+            super::cap_single_run_budget_for_ram(300_000_000, Some(32 * 1024 * 1024)),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            super::cap_single_run_budget_for_ram(300_000_000, None),
+            300_000_000
+        );
+        assert!(super::default_single_run_memory_budget_bytes() <= 300_000_000);
+        assert!(super::default_fd_budget_limit() >= 4);
+    }
+
+    #[test]
+    fn large_record_gate_allows_one_holder_and_wakes_on_cancel() {
+        let gate = Arc::new(super::LargeRecordGate::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let first = gate.acquire(&cancelled).expect("first holder admitted");
+        let gate_clone = Arc::clone(&gate);
+        let cancel_clone = Arc::clone(&cancelled);
+        let waiter = thread::spawn(move || gate_clone.acquire(&cancel_clone).is_some());
+        thread::sleep(Duration::from_millis(10));
+        cancelled.store(true, Ordering::Release);
+        assert!(!waiter.join().unwrap());
+        drop(first);
+        let fresh = AtomicBool::new(false);
+        assert!(gate.acquire(&fresh).is_some());
+    }
+
+    #[test]
+    fn fd_budget_bounds_concurrent_reservations_and_admits_single_large_request() {
+        let budget = Arc::new(super::FdBudget::new(10));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let g1 = budget.acquire(6, &cancelled).expect("fits");
+        assert_eq!(budget.used(), 6);
+        let b2 = Arc::clone(&budget);
+        let c2 = Arc::clone(&cancelled);
+        let waiter = thread::spawn(move || b2.acquire(6, &c2).is_some());
+        thread::sleep(Duration::from_millis(10));
+        drop(g1);
+        assert!(waiter.join().unwrap());
+        assert_eq!(budget.used(), 0);
+        // A single request larger than limit is still admitted when idle.
+        let large = budget
+            .acquire(33, &cancelled)
+            .expect("single merge admitted");
+        assert_eq!(budget.used(), 33);
+        drop(large);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn budget_guard_try_grow_and_try_acquire_respect_limit() {
+        let budget = Arc::new(ByteBudget::new(1000));
+        let mut g1 = budget.try_acquire(400).expect("fits");
+        assert_eq!(g1.bytes(), 400);
+        assert!(g1.try_grow(500));
+        assert_eq!(g1.bytes(), 900);
+        assert!(!g1.try_grow(200));
+        assert!(budget.try_acquire(200).is_none());
+        let g2 = budget.try_acquire(100).expect("fits remainder");
+        assert_eq!(budget.used(), 1000);
+        drop(g2);
+        drop(g1);
+        assert_eq!(budget.used(), 0);
     }
 }

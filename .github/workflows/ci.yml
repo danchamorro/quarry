@@ -102,6 +102,8 @@ jobs:
       - run: cargo test -p quarry-core --locked publication_wrappers_keep_primary_errors_and_staging_cleanup_context
       - run: cargo test -p quarry-core --locked duplicate_uniqueness_diagnostic_uses_each_inputs_header_record_offset
       - run: cargo test -p quarry-core --locked spill::tests
+      - run: cargo test -p quarry-core --locked pool::tests
+      - run: cargo test -p quarry-core --locked storage::tests
       - run: cargo test -p quarry-core --locked join::working::tests
       - run: cargo test -p quarry-core --locked working_storage::tests
       - run: cargo test -p quarry-core --locked sidecar::tests

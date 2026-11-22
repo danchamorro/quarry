@@ -2385,6 +2385,11 @@ impl QuarryApp {
 
     /// Keep one join draft, using the configured private-storage location.
     pub(super) fn open_join_files(&mut self) {
+        if let Err(message) = self.ensure_working_directory_available() {
+            self.active.notice = Some(AppMessage::warning(message));
+            self.open_storage_settings();
+            return;
+        }
         if self.join_files.is_none() {
             self.join_files = Some(JoinDialog::new(self.working_directory.clone()));
             self.preselect_open_join_documents();

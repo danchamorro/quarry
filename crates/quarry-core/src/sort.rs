@@ -7,7 +7,7 @@ use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ use quarry_delimited::parse_record;
 use crate::date_time_sort::date_time_key;
 use crate::estimate_edited_output_bytes;
 use crate::export::{ExportTarget, PrivatePublication, source_matches_stamp};
+use crate::pool::{default_single_run_memory_budget_bytes, engine_pool, resolve_worker_count};
 use crate::spill::{
     self, FrameHead as RunHead, FrameLimits, FrameReadError, SpillFile,
     SpillWorkspace as RunWorkspace,
@@ -31,6 +32,8 @@ use crate::{
 
 #[path = "duplicate.rs"]
 mod duplicate;
+#[path = "sort_parallel.rs"]
+mod parallel;
 pub use duplicate::{
     DuplicateJob, DuplicateOutcome, DuplicateProgress, DuplicateSpec, DuplicateSummary,
 };
@@ -329,6 +332,16 @@ pub(crate) fn numeric_key(value: &[u8]) -> Result<Vec<u8>, QuarryError> {
     Ok(key)
 }
 
+/// Execution options for sorting a working copy, including parallel striping, scratch location,
+/// and the adaptive single-run memory budget (300 MB default, capped by physical RAM).
+#[derive(Debug, Clone, Default)]
+pub struct SortOptions<'a> {
+    pub temporary_directory: Option<&'a Path>,
+    pub source_index: Option<&'a StructuralIndex>,
+    pub threads: Option<usize>,
+    pub memory_budget_bytes: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SortProgress {
     /// Preparing storage and the first run, before normal scan progress is available.
@@ -343,6 +356,7 @@ pub struct SortProgress {
     pub peak_temporary_bytes: u64,
     pub merge_passes: u64,
     pub header_rows: u64,
+    pub effective_workers: usize,
     pub elapsed: Duration,
     pub cancellation_latency: Option<Duration>,
     /// Ready to consume with wait(), not proof of publication. The destination
@@ -361,6 +375,8 @@ pub struct SortSummary {
     pub peak_temporary_bytes: u64,
     pub merge_passes: u64,
     pub header_rows: u64,
+    pub effective_workers: usize,
+    pub in_memory_fast_path: bool,
     pub elapsed: Duration,
     pub record_multiset_verified: bool,
     pub stable_ties_verified: bool,
@@ -428,6 +444,7 @@ struct SharedState {
     peak_temporary_bytes: AtomicU64,
     merge_passes: AtomicU64,
     header_rows: AtomicU64,
+    effective_workers: AtomicUsize,
     started: Instant,
     elapsed_nanos: AtomicU64,
     cancel_requested_at: Mutex<Option<Instant>>,
@@ -452,6 +469,7 @@ impl SharedState {
             peak_temporary_bytes: AtomicU64::new(0),
             merge_passes: AtomicU64::new(0),
             header_rows: AtomicU64::new(0),
+            effective_workers: AtomicUsize::new(1),
             started: Instant::now(),
             elapsed_nanos: AtomicU64::new(0),
             cancel_requested_at: Mutex::new(None),
@@ -574,6 +592,7 @@ impl SortJob {
     }
 
     /// Start a guarded private sort with scratch files beside the destination.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn start(
         source_path: PathBuf,
@@ -588,7 +607,7 @@ impl SortJob {
         config: SortConfig,
         completed_record_count: Option<u64>,
     ) -> Result<Self, QuarryError> {
-        Self::start_with_temp_directory(
+        Self::start_with_options_internal(
             source_path,
             file_size,
             delimiter,
@@ -601,12 +620,15 @@ impl SortJob {
             config,
             None,
             completed_record_count,
+            None,
+            None,
+            parallel::DEFAULT_MIN_PARALLEL_STRIPE_BYTES,
         )
     }
 
     /// Validate the plan and source before spawning the worker; publish only in wait().
     #[allow(clippy::too_many_arguments)]
-    fn start_with_temp_directory(
+    fn start_with_options_internal(
         source_path: PathBuf,
         file_size: u64,
         delimiter: u8,
@@ -619,8 +641,12 @@ impl SortJob {
         config: SortConfig,
         temporary_directory: Option<PathBuf>,
         completed_record_count: Option<u64>,
+        source_index: Option<StructuralIndex>,
+        threads: Option<usize>,
+        min_parallel_stripe_bytes: u64,
     ) -> Result<Self, QuarryError> {
         validate_config(config)?;
+        let requested_workers = resolve_worker_count(threads)?;
         let spec = spec.into();
         spec.validate()?;
         validate_overlays(has_header, &header_renames, &cell_edits, config)?;
@@ -653,21 +679,24 @@ impl SortJob {
             .spawn(move || {
                 let mut completion = WorkerCompletion::new(&worker_state);
                 let mut result = run_sort(
-                    &mut source,
+                    source,
                     &source_path,
                     &source_stamp,
                     delimiter,
                     has_header,
-                    &header_renames,
-                    &cell_edits,
-                    &spec,
+                    header_renames,
+                    cell_edits,
+                    spec,
                     destination,
                     output,
                     bom_present,
                     config,
-                    &worker_state,
+                    Arc::clone(&worker_state),
                     temporary_directory.as_deref(),
                     completed_record_count,
+                    source_index,
+                    requested_workers,
+                    min_parallel_stripe_bytes,
                 );
                 match &result {
                     Ok(SortOutcome::Cancelled) => {
@@ -706,6 +735,7 @@ impl SortJob {
             peak_temporary_bytes: self.shared.peak_temporary_bytes.load(Ordering::Acquire),
             merge_passes: self.shared.merge_passes.load(Ordering::Acquire),
             header_rows: self.shared.header_rows.load(Ordering::Acquire),
+            effective_workers: self.shared.effective_workers.load(Ordering::Acquire),
             elapsed: self.shared.elapsed(),
             cancellation_latency: self.shared.cancellation_latency(),
             done: self.shared.done.load(Ordering::Acquire) || self.publication.is_ready(),
@@ -753,21 +783,12 @@ impl Session {
         spec: impl Into<SortPlan>,
         destination: impl AsRef<Path>,
     ) -> Result<SortJob, QuarryError> {
-        SortJob::start(
-            self.path.clone(),
-            self.file_size,
-            self.dialect.delimiter,
-            self.dialect.has_header,
+        self.start_create_sorted_working_copy_with_options(
             header_renames,
             cell_edits,
             spec,
-            destination.as_ref().to_path_buf(),
-            self.source_stamp.clone(),
-            SortConfig {
-                encoding: self.encoding,
-                ..DEFAULT_SORT_CONFIG
-            },
-            self.completed_record_count(),
+            destination,
+            SortOptions::default(),
         )
     }
 
@@ -781,7 +802,44 @@ impl Session {
         destination: impl AsRef<Path>,
         temporary_directory: impl AsRef<Path>,
     ) -> Result<SortJob, QuarryError> {
-        SortJob::start_with_temp_directory(
+        self.start_create_sorted_working_copy_with_options(
+            header_renames,
+            cell_edits,
+            spec,
+            destination,
+            SortOptions {
+                temporary_directory: Some(temporary_directory.as_ref()),
+                ..SortOptions::default()
+            },
+        )
+    }
+
+    /// Create a sorted working copy with explicit parallel striping, scratch directory,
+    /// and adaptive single-run memory budget options.
+    pub fn start_create_sorted_working_copy_with_options(
+        &self,
+        header_renames: BTreeMap<usize, Vec<u8>>,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        spec: impl Into<SortPlan>,
+        destination: impl AsRef<Path>,
+        options: SortOptions<'_>,
+    ) -> Result<SortJob, QuarryError> {
+        let run_memory_bytes = match options.memory_budget_bytes {
+            Some(0) => {
+                return Err(QuarryError::InvalidOption(
+                    "sort chunk, run memory, and record limit must be non-zero",
+                ));
+            }
+            Some(bytes) => bytes,
+            None => default_single_run_memory_budget_bytes(),
+        };
+        let completed_records = self.completed_record_count().or_else(|| {
+            options
+                .source_index
+                .filter(|index| index.indexed_bytes() == self.file_size)
+                .map(StructuralIndex::indexed_rows)
+        });
+        SortJob::start_with_options_internal(
             self.path.clone(),
             self.file_size,
             self.dialect.delimiter,
@@ -793,10 +851,14 @@ impl Session {
             self.source_stamp.clone(),
             SortConfig {
                 encoding: self.encoding,
+                run_memory_bytes,
                 ..DEFAULT_SORT_CONFIG
             },
-            Some(temporary_directory.as_ref().to_path_buf()),
-            self.completed_record_count(),
+            options.temporary_directory.map(Path::to_path_buf),
+            completed_records,
+            options.source_index.cloned(),
+            options.threads,
+            parallel::DEFAULT_MIN_PARALLEL_STRIPE_BYTES,
         )
     }
 }
@@ -911,11 +973,13 @@ impl Ord for HeapEntry {
 }
 
 fn compare_heads(left: &RunHead, right: &RunHead, direction: SortDirection) -> CmpOrdering {
-    let key_order = match direction {
-        SortDirection::Ascending => left.key.cmp(&right.key),
-        SortDirection::Descending => right.key.cmp(&left.key),
-    };
-    key_order.then_with(|| left.ordinal.cmp(&right.ordinal))
+    parallel::compare_key_ordinal(
+        &left.key,
+        left.ordinal,
+        &right.key,
+        right.ordinal,
+        direction,
+    )
 }
 
 impl PartialOrd for HeapEntry {
@@ -945,6 +1009,14 @@ impl RecordMultisetFingerprint {
         self.sum_a = self.sum_a.wrapping_add(hash_a);
         self.xor_b ^= hash_b;
         self.sum_b = self.sum_b.wrapping_add(hash_b);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.count = self.count.saturating_add(other.count);
+        self.xor_a ^= other.xor_a;
+        self.sum_a = self.sum_a.wrapping_add(other.sum_a);
+        self.xor_b ^= other.xor_b;
+        self.sum_b = self.sum_b.wrapping_add(other.sum_b);
     }
 }
 
@@ -1033,7 +1105,9 @@ struct ScanSummary {
     runs: Vec<SpillFile>,
     rows: u64,
     max_key_bytes: usize,
+    #[allow(dead_code)]
     maximum_width: usize,
+    #[allow(dead_code)]
     records: RecordMultisetFingerprint,
 }
 
@@ -1479,21 +1553,24 @@ fn create_initial_runs<'a>(
 #[allow(clippy::too_many_arguments)]
 /// Check storage and produce a verified candidate for guarded publication.
 fn run_sort(
-    source: &mut File,
+    mut source: File,
     source_path: &Path,
     source_stamp: &SourceStamp,
     delimiter: u8,
     has_header: bool,
-    header_renames: &BTreeMap<usize, Vec<u8>>,
-    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
-    spec: &SortPlan,
+    header_renames: BTreeMap<usize, Vec<u8>>,
+    cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+    spec: SortPlan,
     destination: PathBuf,
     mut output: ExportTarget,
     bom_present: bool,
     config: SortConfig,
-    shared: &SharedState,
+    shared: Arc<SharedState>,
     temporary_directory: Option<&Path>,
     completed_record_count: Option<u64>,
+    source_index: Option<StructuralIndex>,
+    requested_workers: usize,
+    min_parallel_stripe_bytes: u64,
 ) -> Result<SortOutcome, QuarryError> {
     if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(SortOutcome::Cancelled);
@@ -1502,7 +1579,7 @@ fn run_sort(
         Some(records) => records,
         None => {
             let Some(records) = crate::storage::count_records_encoded(
-                source,
+                &mut source,
                 delimiter,
                 config.encoding,
                 &shared.cancel_requested,
@@ -1521,8 +1598,8 @@ fn run_sort(
     let output_bytes = estimate_edited_output_bytes(
         shared.total_bytes,
         records,
-        header_renames,
-        cell_edits,
+        &header_renames,
+        &cell_edits,
         None,
         None,
     );
@@ -1542,29 +1619,45 @@ fn run_sort(
         ),
         output_bytes,
     )?;
-    let workspace = RunWorkspace::create_in(temporary_directory, "sort")?;
+    let workspace = Arc::new(parallel::LazyRunWorkspace::new(
+        temporary_directory.to_path_buf(),
+    ));
+    let source = Arc::new(source);
     let built = run_sort_inner(
         source,
         source_path,
         source_stamp,
         delimiter,
         has_header,
-        header_renames,
-        cell_edits,
-        spec,
+        Arc::new(header_renames),
+        Arc::new(cell_edits),
+        Arc::new(spec),
         &mut output,
         bom_present,
         config,
         &workspace,
-        shared,
+        &shared,
+        source_index.as_ref(),
+        requested_workers,
+        min_parallel_stripe_bytes,
     );
-    let cleanup = workspace.cleanup();
+    let cleanup = Arc::try_unwrap(workspace)
+        .ok()
+        .expect("all sort workers drained before workspace cleanup")
+        .cleanup();
     let built = built.map_err(|error| match error {
         QuarryError::Io(error) => storage_error(temporary_directory, error),
         error => error,
     })?;
     cleanup?;
-    let Some((rows, bytes_written, verification, index)) = built else {
+    let Some(BuiltSortOutput {
+        rows,
+        bytes_written,
+        verification,
+        index,
+        in_memory_fast_path,
+    }) = built
+    else {
         return Ok(SortOutcome::Cancelled);
     };
     let (outcome, output_stamp) =
@@ -1581,6 +1674,8 @@ fn run_sort(
             peak_temporary_bytes: shared.peak_temporary_bytes.load(Ordering::Acquire),
             merge_passes: shared.merge_passes.load(Ordering::Acquire),
             header_rows: shared.header_rows.load(Ordering::Acquire),
+            effective_workers: shared.effective_workers.load(Ordering::Acquire),
+            in_memory_fast_path,
             elapsed: Duration::ZERO,
             record_multiset_verified: verification.record_multiset_verified,
             stable_ties_verified: verification.stable_ties_verified,
@@ -1589,92 +1684,134 @@ fn run_sort(
     }
 }
 
+struct BuiltSortOutput {
+    rows: u64,
+    bytes_written: u64,
+    verification: SortVerification,
+    index: StructuralIndex,
+    in_memory_fast_path: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Scan effective rows, merge sorted runs, and build the output index while writing.
+/// Scan effective rows, merge sorted runs (or stream in-memory arenas), and build the output index while writing.
 fn run_sort_inner(
-    source: &mut File,
+    source: Arc<File>,
     source_path: &Path,
     source_stamp: &SourceStamp,
     delimiter: u8,
     has_header: bool,
-    header_renames: &BTreeMap<usize, Vec<u8>>,
-    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
-    spec: &SortPlan,
+    header_renames: Arc<BTreeMap<usize, Vec<u8>>>,
+    cell_edits: Arc<BTreeMap<(u64, usize), Vec<u8>>>,
+    spec: Arc<SortPlan>,
     output: &mut ExportTarget,
     bom_present: bool,
     config: SortConfig,
-    workspace: &RunWorkspace,
-    shared: &SharedState,
-) -> Result<Option<(u64, u64, SortVerification, StructuralIndex)>, QuarryError> {
-    let ScanOutcome::Complete(mut scan) = create_initial_runs(
-        source,
+    workspace: &Arc<parallel::LazyRunWorkspace>,
+    shared: &Arc<SharedState>,
+    source_index: Option<&StructuralIndex>,
+    requested_workers: usize,
+    min_parallel_stripe_bytes: u64,
+) -> Result<Option<BuiltSortOutput>, QuarryError> {
+    let pool = engine_pool();
+    let job_budget = Arc::new(parallel::JobMemoryBudget::new(
+        config.run_memory_bytes,
+        Arc::clone(pool.out_of_core_budget()),
+    ));
+    let parallel::AdaptiveScanOutcome::Complete(mut scan) = parallel::create_initial_runs_adaptive(
+        Arc::clone(&source),
+        shared.total_bytes,
         delimiter,
         has_header,
         header_renames,
         cell_edits,
-        spec,
+        Arc::clone(&spec),
         bom_present,
         config,
-        workspace,
-        shared,
+        Arc::clone(workspace),
+        Arc::clone(shared),
+        source_index,
+        requested_workers,
+        min_parallel_stripe_bytes,
+        job_budget,
+        Arc::clone(pool.large_record_gate()),
     )?
     else {
         return Ok(None);
     };
-    if !source_matches_stamp(source, source_path, source_stamp)? {
+    shared
+        .effective_workers
+        .fetch_max(scan.effective_workers, Ordering::AcqRel);
+    if !source_matches_stamp(&source, source_path, source_stamp)? {
         return Err(QuarryError::SourceChanged);
     }
     if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(None);
     }
 
-    if !reduce_runs(
-        &mut scan.runs,
-        spec.direction(),
-        scan.max_key_bytes,
-        config,
-        workspace,
-        shared,
-    )? {
+    let in_memory_fast_path = scan.runs.is_empty();
+    if !in_memory_fast_path
+        && !parallel::reduce_runs_parallel(
+            &mut scan.runs,
+            spec.direction(),
+            scan.max_key_bytes,
+            config,
+            workspace,
+            shared,
+            requested_workers,
+            pool.fd_budget(),
+        )?
+    {
         return Ok(None);
     }
 
     let mut index = StructuralIndex::new(IndexConfig::default())?;
-    let mut bytes_written = 0_u64;
-    if bom_present {
-        write_output(output, UTF8_BOM, shared)?;
-        bytes_written = output.bytes_written();
-    }
-    if let Some(header) = &scan.header {
-        write_output(output, header, shared)?;
-        bytes_written = output.bytes_written();
-        if bytes_written > output.record_limit() as u64 {
-            return Err(QuarryError::RecordTooLarge {
-                limit: output.record_limit(),
-            });
-        }
-        index.record_boundary(bytes_written);
-    }
-    shared.bytes_written.store(bytes_written, Ordering::Release);
-
-    let Some((rows_written, data_bytes, verification)) = merge_runs_to_output(
-        &scan.runs,
+    let mut bytes_written = parallel::write_output_header_and_bom(
         output,
-        spec.direction(),
-        &scan.preferred_ending,
-        scan.records,
-        config.max_record_bytes,
-        bytes_written,
-        if has_header { 0 } else { bytes_written },
+        bom_present,
+        scan.header.as_deref(),
+        &mut index,
         shared,
-        Some(&mut index),
-    )?
-    else {
-        return Ok(None);
+    )?;
+
+    let first_record_prefix_bytes = if has_header { 0 } else { bytes_written };
+    let (rows_written, data_bytes, verification) = if in_memory_fast_path {
+        let Some(result) = parallel::write_in_memory_runs_to_output(
+            &scan.in_memory_runs,
+            output,
+            spec.direction(),
+            &scan.preferred_ending,
+            scan.records,
+            config.max_record_bytes,
+            bytes_written,
+            first_record_prefix_bytes,
+            shared,
+            Some(&mut index),
+        )?
+        else {
+            return Ok(None);
+        };
+        result
+    } else {
+        let Some(result) = merge_runs_to_output(
+            &scan.runs,
+            output,
+            spec.direction(),
+            &scan.preferred_ending,
+            scan.records,
+            config.max_record_bytes,
+            bytes_written,
+            first_record_prefix_bytes,
+            shared,
+            Some(&mut index),
+        )?
+        else {
+            return Ok(None);
+        };
+        if !scan.runs.is_empty() {
+            shared.merge_passes.fetch_add(1, Ordering::AcqRel);
+        }
+        result
     };
-    if !scan.runs.is_empty() {
-        shared.merge_passes.fetch_add(1, Ordering::AcqRel);
-    }
     if rows_written != scan.rows {
         return Err(
             io::Error::new(io::ErrorKind::InvalidData, "sort run row count changed").into(),
@@ -1683,7 +1820,13 @@ fn run_sort_inner(
     bytes_written = bytes_written.saturating_add(data_bytes);
     index.finish_output(bytes_written, scan.maximum_width);
     shared.bytes_written.store(bytes_written, Ordering::Release);
-    Ok(Some((scan.rows, bytes_written, verification, index)))
+    Ok(Some(BuiltSortOutput {
+        rows: scan.rows,
+        bytes_written,
+        verification,
+        index,
+        in_memory_fast_path,
+    }))
 }
 
 fn reduce_runs(
@@ -1859,53 +2002,29 @@ fn merge_runs_to_output(
     expected_records: RecordMultisetFingerprint,
     max_record_bytes: usize,
     prior_bytes_written: u64,
-    mut first_record_prefix_bytes: u64,
+    first_record_prefix_bytes: u64,
     shared: &SharedState,
-    mut output_index: Option<&mut StructuralIndex>,
+    output_index: Option<&mut StructuralIndex>,
 ) -> Result<Option<(u64, u64, SortVerification)>, QuarryError> {
     let mut readers = open_run_readers(paths)?;
     let Some(mut heap) = seed_heap(&mut readers, direction, max_record_bytes, shared)? else {
         return Ok(None);
     };
-    let mut verifier = OutputVerifier::new(expected_records);
-    let mut pending: Option<PendingOutputEntry> = None;
-    let mut rows = 0_u64;
-    let mut bytes_written = 0_u64;
+    let mut writer = parallel::VerifiedOutputWriter::new(
+        output,
+        preferred_ending,
+        expected_records,
+        max_record_bytes,
+        prior_bytes_written,
+        first_record_prefix_bytes,
+        shared,
+        output_index,
+    );
     while let Some(item) = heap.pop() {
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(None);
         }
-        if let Some(previous) = pending.take() {
-            verifier.verify_adjacent(
-                &previous.key,
-                previous.ordinal,
-                &item.head.key,
-                item.head.ordinal,
-            )?;
-            let inserted_ending = if previous.record.ends_with(b"\n") {
-                b"".as_slice()
-            } else {
-                preferred_ending
-            };
-            if previous.record.len().saturating_add(inserted_ending.len()) > max_record_bytes {
-                return Err(QuarryError::RecordTooLarge {
-                    limit: max_record_bytes,
-                });
-            }
-            let written = write_verified_output_entry(
-                output,
-                previous,
-                inserted_ending,
-                first_record_prefix_bytes,
-                &mut verifier,
-                shared,
-            )?;
-            first_record_prefix_bytes = 0;
-            bytes_written = bytes_written.saturating_add(written);
-            if let Some(index) = &mut output_index {
-                index.record_boundary(prior_bytes_written.saturating_add(bytes_written));
-            }
-        }
+        writer.flush_previous_before(&item.head.key, item.head.ordinal)?;
         if shared.cancel_requested.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -1915,12 +2034,7 @@ fn merge_runs_to_output(
             max_record_bytes,
         )?;
         let run_index = item.run_index;
-        pending = Some(PendingOutputEntry {
-            key: item.head.key,
-            record,
-            ordinal: item.head.ordinal,
-        });
-        rows = rows.saturating_add(1);
+        writer.set_pending(item.head.key, record, item.head.ordinal);
         if let Some(head) = read_head(&mut readers[run_index], max_record_bytes)? {
             heap.push(HeapEntry {
                 head,
@@ -1928,27 +2042,8 @@ fn merge_runs_to_output(
                 direction,
             });
         }
-        shared.bytes_written.store(
-            prior_bytes_written.saturating_add(bytes_written),
-            Ordering::Release,
-        );
     }
-    if let Some(last) = pending {
-        let written = write_verified_output_entry(
-            output,
-            last,
-            b"",
-            first_record_prefix_bytes,
-            &mut verifier,
-            shared,
-        )?;
-        bytes_written = bytes_written.saturating_add(written);
-        if let Some(index) = output_index {
-            index.record_boundary(prior_bytes_written.saturating_add(bytes_written));
-        }
-    }
-    let verification = verifier.finish()?;
-    Ok(Some((rows, bytes_written, verification)))
+    Ok(Some(writer.finish()?))
 }
 
 fn write_verified_output_entry(
@@ -3403,7 +3498,7 @@ mod tests {
         let source_bytes = b"id,key\n1,b\n2,a\n";
         fs::write(&source_path, source_bytes).unwrap();
         let source_session = session(&source_path, HeaderMode::FirstRow);
-        let mut source = File::open(&source_path).unwrap();
+        let source = File::open(&source_path).unwrap();
         let output = ExportTarget::new_private_guarded(
             &source_path,
             destination.clone(),
@@ -3413,17 +3508,17 @@ mod tests {
         .unwrap();
         fs::rename(&source_path, &moved_source).unwrap();
         fs::write(&source_path, b"external,change\n").unwrap();
-        let shared = SharedState::new(source_bytes.len() as u64);
+        let shared = Arc::new(SharedState::new(source_bytes.len() as u64));
 
         let result = run_sort(
-            &mut source,
+            source,
             &source_path,
             &source_session.source_stamp,
             b',',
             true,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &SortPlan::from(SortSpec {
+            BTreeMap::new(),
+            BTreeMap::new(),
+            SortPlan::from(SortSpec {
                 mode: SortMode::Text,
                 column: 1,
                 direction: SortDirection::Ascending,
@@ -3433,9 +3528,12 @@ mod tests {
             output,
             false,
             tiny_config(),
-            &shared,
+            shared,
             None,
             None,
+            None,
+            1,
+            parallel::DEFAULT_MIN_PARALLEL_STRIPE_BYTES,
         );
 
         assert!(matches!(result, Err(QuarryError::SourceChanged)));
@@ -4036,5 +4134,531 @@ mod tests {
         let path = workspace.path.clone();
         workspace.cleanup().unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn adaptive_threshold_transition_matches_byte_for_byte_across_workers() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let mut data = String::from("id,score,note\n");
+        for i in 0..3_000_u64 {
+            let score = ((i * 7919) % 101) as i64 - 50;
+            let note = if i % 17 == 0 {
+                format!("\"line\n{i}\"")
+            } else {
+                format!("row-{i:04}")
+            };
+            data.push_str(&format!("{i:05},{score},{note}\n"));
+        }
+        fs::write(&source, data.as_bytes()).unwrap();
+        let source_session = session(&source, HeaderMode::FirstRow);
+        let index = source_session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 256,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let plan = SortPlan {
+            keys: vec![
+                SortSpec {
+                    column: 1,
+                    mode: SortMode::Number,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                SortSpec {
+                    column: 2,
+                    mode: SortMode::Text,
+                    direction: SortDirection::Descending,
+                    case_sensitivity: CaseSensitivity::Insensitive,
+                },
+            ],
+        };
+        let edits = BTreeMap::from([((1500, 1), b"-999".to_vec()), ((10, 2), b"ZZZ".to_vec())]);
+
+        let mut expected_bytes: Option<Vec<u8>> = None;
+        for (label, threads, budget, expect_fast_path) in [
+            ("serial-in-memory", 1, 2 * 1024 * 1024, true),
+            ("serial-spilled", 1, 8 * 1024, false),
+            ("parallel-in-memory", 4, 2 * 1024 * 1024, true),
+            ("parallel-spilled", 4, 8 * 1024, false),
+        ] {
+            let destination = directory.path().join(format!("{label}.csv"));
+            let job = SortJob::start_with_options_internal(
+                source_session.path.clone(),
+                source_session.file_size,
+                source_session.dialect.delimiter,
+                source_session.dialect.has_header,
+                BTreeMap::new(),
+                edits.clone(),
+                plan.clone(),
+                destination.clone(),
+                source_session.source_stamp.clone(),
+                SortConfig {
+                    run_memory_bytes: budget,
+                    merge_fan_in: 4,
+                    ..DEFAULT_SORT_CONFIG
+                },
+                Some(directory.path().to_path_buf()),
+                Some(index.indexed_rows()),
+                Some(index.clone()),
+                Some(threads),
+                1,
+            )
+            .unwrap();
+            let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+                panic!("{label}: unexpectedly cancelled");
+            };
+            assert_eq!(summary.in_memory_fast_path, expect_fast_path, "{label}");
+            if expect_fast_path {
+                assert_eq!(summary.runs_created, 0, "{label}");
+                assert_eq!(summary.merge_passes, 0, "{label}");
+            } else {
+                assert!(summary.runs_created >= 2, "{label}");
+                assert!(summary.merge_passes >= 1, "{label}");
+            }
+            if threads > 1 {
+                assert!(summary.effective_workers > 1, "{label}");
+            } else {
+                assert_eq!(summary.effective_workers, 1, "{label}");
+            }
+            assert!(summary.record_multiset_verified && summary.stable_ties_verified);
+            assert!(sort_artifacts(directory.path()).is_empty());
+
+            let bytes = fs::read(&destination).unwrap();
+            if let Some(ref baseline) = expected_bytes {
+                assert_eq!(&bytes, baseline, "{label} differed from serial baseline");
+            } else {
+                expected_bytes = Some(bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_multipass_sort_matches_serial_and_stays_within_disk_estimate_for_w_1_4_8() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.csv");
+        let mut raw = UTF8_BOM.to_vec();
+        raw.extend_from_slice(b"id,num,date,text\r\n");
+        for i in 0..4_000_u64 {
+            let num = ((i * 2654435761) % 37) as i64 - 18;
+            let day = (i % 28) + 1;
+            let text = if i % 23 == 0 {
+                format!("\"quoted,\r\nval-{i}\"")
+            } else {
+                format!("Val-{}", i % 13)
+            };
+            let ending = if i == 3_999 { "" } else { "\r\n" };
+            raw.extend_from_slice(
+                format!("{i:05},{num},2026-03-{day:02},{text}{ending}").as_bytes(),
+            );
+        }
+        fs::write(&source, &raw).unwrap();
+        let source_session = session(&source, HeaderMode::FirstRow);
+        let index = source_session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 128,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let edits = BTreeMap::from([
+            ((1, 1), b"9999".to_vec()),
+            ((2000, 3), b"edited-value".to_vec()),
+        ]);
+        let effective_estimate = estimate_edited_output_bytes(
+            source_session.file_size,
+            index.indexed_rows(),
+            &BTreeMap::new(),
+            &edits,
+            None,
+            None,
+        );
+        let data_rows = index.indexed_rows() - 1;
+
+        for (name, plan) in [
+            (
+                "number",
+                SortPlan::from(SortSpec {
+                    column: 1,
+                    mode: SortMode::Number,
+                    direction: SortDirection::Descending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                }),
+            ),
+            (
+                "date",
+                SortPlan::from(SortSpec {
+                    column: 2,
+                    mode: SortMode::DateTime {
+                        format: DateTimeFormat::YearMonthDay,
+                    },
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                }),
+            ),
+            (
+                "multi",
+                SortPlan {
+                    keys: vec![
+                        SortSpec {
+                            column: 1,
+                            mode: SortMode::Number,
+                            direction: SortDirection::Ascending,
+                            case_sensitivity: CaseSensitivity::Sensitive,
+                        },
+                        SortSpec {
+                            column: 3,
+                            mode: SortMode::Text,
+                            direction: SortDirection::Descending,
+                            case_sensitivity: CaseSensitivity::Insensitive,
+                        },
+                    ],
+                },
+            ),
+            (
+                "shuffle",
+                SortPlan::from(SortSpec {
+                    column: 0,
+                    mode: SortMode::Shuffle { seed: 42 },
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                }),
+            ),
+            (
+                "reverse",
+                SortPlan::from(SortSpec {
+                    column: 0,
+                    mode: SortMode::Reverse,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                }),
+            ),
+        ] {
+            let disk_allowance =
+                estimate_multi_sort_temporary_bytes(effective_estimate, data_rows, plan.keys.len());
+            let mut baseline: Option<Vec<u8>> = None;
+            for workers in [1_usize, 4, 8] {
+                let destination = directory.path().join(format!("{name}-w{workers}.csv"));
+                let job = SortJob::start_with_options_internal(
+                    source_session.path.clone(),
+                    source_session.file_size,
+                    source_session.dialect.delimiter,
+                    source_session.dialect.has_header,
+                    BTreeMap::new(),
+                    edits.clone(),
+                    plan.clone(),
+                    destination.clone(),
+                    source_session.source_stamp.clone(),
+                    SortConfig {
+                        run_memory_bytes: 4 * 1024,
+                        merge_fan_in: 3,
+                        ..DEFAULT_SORT_CONFIG
+                    },
+                    Some(directory.path().to_path_buf()),
+                    Some(index.indexed_rows()),
+                    Some(index.clone()),
+                    Some(workers),
+                    1,
+                )
+                .unwrap();
+                let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+                    panic!("{name} w={workers} cancelled");
+                };
+                assert!(summary.merge_passes >= 2, "{name} w={workers}");
+                assert!(
+                    summary.peak_temporary_bytes <= disk_allowance,
+                    "{name} w={workers}: peak {} exceeded allowance {}",
+                    summary.peak_temporary_bytes,
+                    disk_allowance
+                );
+                if workers > 1 {
+                    assert!(summary.effective_workers > 1, "{name} w={workers}");
+                }
+                assert!(summary.record_multiset_verified && summary.stable_ties_verified);
+                assert!(sort_artifacts(directory.path()).is_empty());
+
+                let bytes = fs::read(&destination).unwrap();
+                if let Some(ref expected) = baseline {
+                    assert_eq!(&bytes, expected, "{name} w={workers} mismatch");
+                } else {
+                    baseline = Some(bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_sort_reports_earliest_error_coordinates_identically_across_workers() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("bad.csv");
+        let mut data = String::from("id,value\n");
+        for i in 1..=2_000_u64 {
+            if i == 17 || i == 900 || i == 1_900 {
+                data.push_str(&format!("{i},not-a-number\n"));
+            } else {
+                data.push_str(&format!("{i},{i}\n"));
+            }
+        }
+        fs::write(&source, data.as_bytes()).unwrap();
+        let source_session = session(&source, HeaderMode::FirstRow);
+        let index = source_session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 100,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        for workers in [1_usize, 4, 8] {
+            let destination = directory.path().join(format!("err-w{workers}.csv"));
+            let job = SortJob::start_with_options_internal(
+                source_session.path.clone(),
+                source_session.file_size,
+                source_session.dialect.delimiter,
+                source_session.dialect.has_header,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                number_spec(SortDirection::Ascending),
+                destination.clone(),
+                source_session.source_stamp.clone(),
+                SortConfig {
+                    run_memory_bytes: 2 * 1024,
+                    merge_fan_in: 3,
+                    ..DEFAULT_SORT_CONFIG
+                },
+                Some(directory.path().to_path_buf()),
+                Some(index.indexed_rows()),
+                Some(index.clone()),
+                Some(workers),
+                1,
+            )
+            .unwrap();
+            let err = job.wait().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    QuarryError::InvalidNumericSortValue {
+                        data_row: 17,
+                        column: 2
+                    }
+                ),
+                "w={workers}: got {err:?}"
+            );
+            assert!(!destination.exists());
+            assert!(sort_artifacts(directory.path()).is_empty());
+        }
+    }
+
+    #[test]
+    fn parallel_sort_falls_back_to_serial_without_index_or_on_utf16() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("plain.csv");
+        fs::write(&source, b"k,v\n3,c\n1,a\n2,b\n").unwrap();
+        let s = session(&source, HeaderMode::FirstRow);
+        let dest = directory.path().join("out.csv");
+        let job = s
+            .start_create_sorted_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SortSpec {
+                    column: 0,
+                    mode: SortMode::Number,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &dest,
+                SortOptions {
+                    threads: Some(4),
+                    source_index: None,
+                    ..SortOptions::default()
+                },
+            )
+            .unwrap();
+        let SortOutcome::Complete(summary) = job.wait().unwrap() else {
+            panic!("cancelled");
+        };
+        assert_eq!(summary.effective_workers, 1);
+        assert!(summary.in_memory_fast_path);
+        assert_eq!(fs::read(&dest).unwrap(), b"k,v\n1,a\n2,b\n3,c\n");
+
+        let utf16_src = directory.path().join("utf16.csv");
+        let mut encoded = vec![0xFF, 0xFE];
+        for unit in "k,v\n2,b\n1,a\n".encode_utf16() {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&utf16_src, &encoded).unwrap();
+        let s16 = Session::open_with_encoding(
+            &utf16_src,
+            QuarryOpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..QuarryOpenOptions::default()
+            },
+            Some(Encoding::Utf16Le),
+        )
+        .unwrap();
+        let idx16 = s16
+            .start_indexing(IndexConfig {
+                checkpoint_every: 1,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let dest16 = directory.path().join("out16.csv");
+        let job16 = s16
+            .start_create_sorted_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                SortSpec {
+                    column: 0,
+                    mode: SortMode::Number,
+                    direction: SortDirection::Ascending,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &dest16,
+                SortOptions {
+                    threads: Some(4),
+                    source_index: Some(&idx16),
+                    ..SortOptions::default()
+                },
+            )
+            .unwrap();
+        let SortOutcome::Complete(summary16) = job16.wait().unwrap() else {
+            panic!("cancelled");
+        };
+        assert_eq!(summary16.effective_workers, 1);
+        assert!(summary16.in_memory_fast_path);
+    }
+
+    #[test]
+    fn merge_concurrency_splits_budget_and_scales_down_for_fd_and_key_limits() {
+        // Normal small keys with generous FD limit allows multiple concurrent merge groups.
+        assert_eq!(
+            parallel::compute_merge_concurrency(8, 6, 32, 64, 64 * 1024 * 1024, 128),
+            3
+        );
+        // Tight FD limit scales concurrency down to 1 safely.
+        assert_eq!(
+            parallel::compute_merge_concurrency(8, 6, 32, 64, 64 * 1024 * 1024, 40),
+            1
+        );
+        // Huge keys approaching the 256 MiB merge budget scale concurrency down to 1.
+        assert_eq!(
+            parallel::compute_merge_concurrency(8, 6, 4, 40 * 1024 * 1024, 64 * 1024 * 1024, 192),
+            1
+        );
+        // Never exceeds group count or requested workers.
+        assert_eq!(
+            parallel::compute_merge_concurrency(8, 2, 16, 64, 1024 * 1024, 192),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_parallel_sorts_and_cancellation_stay_clean() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("concurrent.csv");
+        let mut data = String::from("id,n\n");
+        for i in 0..3_000_u64 {
+            data.push_str(&format!("{i:05},{}\n", (i * 97) % 500));
+        }
+        fs::write(&source, data.as_bytes()).unwrap();
+        let s = session(&source, HeaderMode::FirstRow);
+        let idx = s
+            .start_indexing(IndexConfig {
+                checkpoint_every: 128,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let d1 = directory.path().join("c1.csv");
+        let d2 = directory.path().join("c2.csv");
+        let d3 = directory.path().join("cancelled.csv");
+        let j1 = SortJob::start_with_options_internal(
+            s.path.clone(),
+            s.file_size,
+            s.dialect.delimiter,
+            s.dialect.has_header,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            number_spec(SortDirection::Ascending),
+            d1.clone(),
+            s.source_stamp.clone(),
+            SortConfig {
+                run_memory_bytes: 8 * 1024,
+                merge_fan_in: 3,
+                ..DEFAULT_SORT_CONFIG
+            },
+            Some(directory.path().to_path_buf()),
+            Some(idx.indexed_rows()),
+            Some(idx.clone()),
+            Some(4),
+            1,
+        )
+        .unwrap();
+        let j2 = SortJob::start_with_options_internal(
+            s.path.clone(),
+            s.file_size,
+            s.dialect.delimiter,
+            s.dialect.has_header,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            number_spec(SortDirection::Ascending),
+            d2.clone(),
+            s.source_stamp.clone(),
+            SortConfig {
+                run_memory_bytes: 8 * 1024,
+                merge_fan_in: 3,
+                ..DEFAULT_SORT_CONFIG
+            },
+            Some(directory.path().to_path_buf()),
+            Some(idx.indexed_rows()),
+            Some(idx.clone()),
+            Some(4),
+            1,
+        )
+        .unwrap();
+        let j3 = SortJob::start_with_options_internal(
+            s.path.clone(),
+            s.file_size,
+            s.dialect.delimiter,
+            s.dialect.has_header,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            number_spec(SortDirection::Ascending),
+            d3.clone(),
+            s.source_stamp.clone(),
+            SortConfig {
+                run_memory_bytes: 4 * 1024,
+                merge_fan_in: 2,
+                ..DEFAULT_SORT_CONFIG
+            },
+            Some(directory.path().to_path_buf()),
+            Some(idx.indexed_rows()),
+            Some(idx),
+            Some(4),
+            1,
+        )
+        .unwrap();
+        j3.cancel();
+
+        let o1 = j1.wait().unwrap();
+        let o2 = j2.wait().unwrap();
+        let o3 = j3.wait().unwrap();
+        assert!(matches!(o1, SortOutcome::Complete(_)));
+        assert!(matches!(o2, SortOutcome::Complete(_)));
+        assert_eq!(o3, SortOutcome::Cancelled);
+        assert_eq!(fs::read(&d1).unwrap(), fs::read(&d2).unwrap());
+        assert!(!d3.exists());
+        assert!(sort_artifacts(directory.path()).is_empty());
     }
 }
