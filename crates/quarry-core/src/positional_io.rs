@@ -129,4 +129,62 @@ mod tests {
         let mut buf = [0u8; 16];
         assert_eq!(read_at_exact_or_eof(&file, 100, &mut buf).unwrap(), 0);
     }
+
+    #[test]
+    fn external_truncation_returns_eof_and_source_changed_without_sigbus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncation.csv");
+        let mut payload = Vec::with_capacity(131_072);
+        payload.extend_from_slice(b"id,value\n");
+        for i in 1..=8_000_u32 {
+            payload.extend_from_slice(format!("{i},row-{i:05}\n").as_bytes());
+        }
+        std::fs::write(&path, &payload).unwrap();
+
+        let reader = File::open(&path).unwrap();
+        let session = crate::Session::open(&path, crate::OpenOptions::default()).unwrap();
+        let index = session
+            .start_indexing_with_options(
+                crate::IndexConfig::default(),
+                Some(4),
+                crate::IndexCacheConfig::disabled(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(index.indexed_rows(), 8_001);
+
+        // Externally truncate the live source file while handles and sessions remain open.
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.set_len(16).unwrap();
+        writer.sync_all().unwrap();
+
+        // Reading past the new EOF returns 0 bytes cleanly (no SIGBUS).
+        let mut buf = [0u8; 4096];
+        assert_eq!(read_at_exact_or_eof(&reader, 65_536, &mut buf).unwrap(), 0);
+        // Viewport reads past the truncated EOF return empty cleanly without crashing.
+        assert!(session.read_rows(&index, 500, 10).unwrap().is_empty());
+
+        // Parallel re-indexing and parallel search report typed `SourceChanged` errors cleanly.
+        let reindex = session
+            .start_indexing_with_options(
+                crate::IndexConfig::default(),
+                Some(4),
+                crate::IndexCacheConfig::disabled(),
+            )
+            .and_then(|job| job.wait());
+        assert!(matches!(reindex, Err(crate::QuarryError::SourceChanged)));
+
+        let search = session
+            .start_search_with_options(
+                &index,
+                b"row-07000".to_vec(),
+                crate::SearchPosition { row: 0, column: 0 },
+                std::collections::BTreeMap::new(),
+                crate::CaseSensitivity::Sensitive,
+                Some(4),
+            )
+            .and_then(|job| job.wait());
+        assert!(matches!(search, Err(crate::QuarryError::SourceChanged)));
+    }
 }
