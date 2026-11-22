@@ -2529,7 +2529,9 @@ fn decode_seekable_raw(
         Some(working) => working.record(&decoded, physical_row, config, state)?,
         None => Cow::Borrowed(decoded.as_ref()),
     };
-    Ok(effective.into_owned())
+    let mut owned = effective.into_owned();
+    owned.shrink_to_fit();
+    Ok(owned)
 }
 
 fn materialize_seekable_record(
