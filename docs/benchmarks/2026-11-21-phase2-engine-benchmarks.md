@@ -27,7 +27,7 @@ machine-readable golden digests
 | Cache protocol | `warm` — Full SHA-256 read before suite start; isolated `0700` `QUARRY_INDEX_CACHE_DIR` |
 | Suite Started / Finished (UTC) | `2026-11-22T03:45:28.025033+00:00` -> `2026-11-22T04:35:58.606624+00:00` |
 | Sources unchanged | `True` (exact SHA-256 match before and after) |
-| Golden output parity | **14/14 output-producing workloads (30/30 total)** matched Phase 1 SHA-256, bytes, and quote-aware row counts (`0` unterminated quotes) |
+| Golden output parity | **14/14 output-producing workloads** matched Phase 1 SHA-256, bytes, and quote-aware row counts (`30/30` workloads exited `0`; `0` unterminated quotes) |
 
 ## Verified Inputs
 
@@ -38,13 +38,15 @@ machine-readable golden digests
 
 ---
 
-## 1. Single-Thread SIMD (`neon`) vs Pure-Scalar Oracle
+## 1. Single-Thread SIMD (`neon`) vs `SimdBackend::Scalar` Backend
 
-Measured via `cargo test --release -p quarry-delimited --test scalar_oracle --locked -- --ignored --nocapture`
-(provisional Phase 2 gate: `>= 3×` single-thread speedup; oracle parity verified across all 8 non-ignored
-oracle tests and all 11 generated torture-corpus fixtures):
+Measured via `cargo test --release -p quarry-delimited --test scalar_oracle --locked -- --ignored --nocapture`,
+which benchmarks `StructuralScanner` with `SimdBackend::Neon` against `SimdBackend::Scalar`
+(provisional Phase 2 gate: `>= 3×` single-thread speedup). Byte-for-byte parity against the
+independent pure-scalar reference oracle is verified separately by the 8 non-ignored tests in
+`crates/quarry-delimited/tests/scalar_oracle.rs` and all 11 generated torture-corpus fixtures:
 
-| Workload | Scalar | SIMD (`neon`) | Single-Thread Speedup | Gate (`>= 3×`) |
+| Workload | `SimdBackend::Scalar` | SIMD (`neon`) | Single-Thread Speedup | Gate (`>= 3×`) |
 |---|---:|---:|---:|---|
 | Unquoted weather-like | 0.23 GB/s (293.171 ms) | 9.52 GB/s (7.048 ms) | **41.60×** | Pass |
 | Quoted Hacker News-like | 0.87 GB/s (77.461 ms) | 7.23 GB/s (9.279 ms) | **8.35×** | Pass |
@@ -107,6 +109,7 @@ All filtered exports verified byte-identical to Phase 1 golden SHA-256 digests a
 | Hacker News scan-only `filter-and` vs whole command | `<= 4 s` | **1.617 s** scan (`1.659 s` wall; `1.573 s` in full suite) | Pass |
 | Peak index RSS (8 threads) | `<= 64 MiB` | **20.16 MiB** (weather) / **24.95 MiB** (HN) | Pass |
 | Cancellation shutdown latency (Weather, 8 threads, 10 samples each, 0 orphan files) | `< 25 ms` p95 | `search`: **1.280 ms p95** (median 1.267 ms); `filter`: **1.391 ms p95** (median 1.356 ms); `export`: **1.285 ms p95** (median 1.270 ms) | Pass |
+| External truncation safety (`C02`) | Typed EOF / `SourceChanged` (no `SIGBUS`) | Verified by `positional_io::tests::external_truncation_returns_eof_and_source_changed_without_sigbus`, `index::tests::changed_source_cannot_return_an_index_or_publish_a_record_count`, and `filter::tests::filter_snapshots_reject_changed_or_unrelated_sources` | Pass |
 
 ---
 
@@ -186,10 +189,11 @@ QUARRY_INDEX_CACHE_DIR="$CACHE_DIR" python3 scripts/benchmark-public-datasets.py
   --threads 8
 ```
 
-### Single-Thread SIMD vs Scalar Oracle
+### Single-Thread SIMD vs `SimdBackend::Scalar` & External Truncation Safety
 
 ```bash
 cargo test --release -p quarry-delimited --test scalar_oracle --locked -- --ignored --nocapture
+cargo test --release -p quarry-core --locked positional_io::tests::external_truncation_returns_eof_and_source_changed_without_sigbus
 ```
 
 ### Parallel Scaling (`T ∈ {1, 2, 4, 8}`) & Validated Sidecar Hit + Row Seek
