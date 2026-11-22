@@ -1117,7 +1117,7 @@ fn run_filter(
     let matchers = compile_matchers(query)?;
     let groups = predicate_groups(query);
     let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
-    let mut field_ranges = Vec::with_capacity(max_column + 1);
+    let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
     let mut scanner = RecordScanner::new(delimiter, encoding)?;
     let mut chunk = vec![0; encoding.chunk_size(chunk_bytes)];
     let mut absolute_start = 0_u64;
@@ -1401,8 +1401,12 @@ fn eval_filter_slice_from_field_start(
     let mut matches = Vec::new();
     let mut local_row = 0u64;
     let mut record_start = slice_start;
-    let mut field_ranges = Vec::with_capacity(max_column + 1);
+    let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
     let mut deferred_error: Option<QuarryError> = None;
+    // Only record 0 at byte offset 0 may strip a file-leading UTF-8 BOM. Speculative workers
+    // scanning non-initial chunks with `base_row == 0` use a non-zero synthetic row so leading
+    // U+FEFF bytes stay literal cell data; exact edit re-evaluations already pass `base_row > 0`.
+    let bom_row_offset: u64 = u64::from(slice_start != 0 && base_row == 0);
 
     let mut offset = 0usize;
     while offset < buf.len() {
@@ -1428,7 +1432,7 @@ fn eval_filter_slice_from_field_start(
                             match record_matches_fast(
                                 &buf[s..e],
                                 delimiter,
-                                row,
+                                row.saturating_add(bom_row_offset),
                                 query,
                                 matchers,
                                 groups,
@@ -1439,7 +1443,19 @@ fn eval_filter_slice_from_field_start(
                             ) {
                                 Ok(true) => matches.push((local_row, record_start)),
                                 Ok(false) => {}
-                                Err(err) => deferred_error = Some(err),
+                                Err(err) => {
+                                    deferred_error = Some(match err {
+                                        QuarryError::RecordEncoding { record, cause }
+                                            if bom_row_offset != 0 =>
+                                        {
+                                            QuarryError::RecordEncoding {
+                                                record: record.saturating_sub(bom_row_offset),
+                                                cause,
+                                            }
+                                        }
+                                        other => other,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1473,7 +1489,7 @@ fn eval_filter_slice_from_field_start(
                         match record_matches_fast(
                             rec,
                             delimiter,
-                            row,
+                            row.saturating_add(bom_row_offset),
                             query,
                             matchers,
                             groups,
@@ -1484,7 +1500,19 @@ fn eval_filter_slice_from_field_start(
                         ) {
                             Ok(true) => matches.push((local_row, record_start)),
                             Ok(false) => {}
-                            Err(err) => deferred_error = Some(err),
+                            Err(err) => {
+                                deferred_error = Some(match err {
+                                    QuarryError::RecordEncoding { record, cause }
+                                        if bom_row_offset != 0 =>
+                                    {
+                                        QuarryError::RecordEncoding {
+                                            record: record.saturating_sub(bom_row_offset),
+                                            cause,
+                                        }
+                                    }
+                                    other => other,
+                                });
+                            }
                         }
                     }
                 }
@@ -1608,7 +1636,11 @@ fn scan_filter_chunk_worker(
                     first_end = Some(re);
                 }
             }) {
-                first_error = Some(QuarryError::Parse(err));
+                // Only record errors before the incoming record closes; errors after `first_end`
+                // belong to the tail and are reported after validating the stitched row.
+                if first_end.is_none() {
+                    first_error = Some(QuarryError::Parse(err));
+                }
             }
             pos = step_end;
         }
@@ -1720,7 +1752,7 @@ impl FilterMergeState {
         shared: &SharedState,
     ) -> Result<(), QuarryError> {
         let mut publish_buf = Vec::new();
-        let mut field_ranges = Vec::with_capacity(max_column + 1);
+        let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
 
         while let Some(result) = self.pending.remove(&self.next_id) {
             self.next_id += 1;
@@ -1765,11 +1797,12 @@ impl FilterMergeState {
                     ) else {
                         return Ok(());
                     };
-                    if let Some(err) = exact.error {
-                        return Err(err);
-                    }
                     for (local_row, offset) in exact.matches {
                         publish_buf.push((base_row + local_row, offset));
+                    }
+                    if let Some(err) = exact.error {
+                        publish_matches(shared, &mut publish_buf);
+                        return Err(err);
                     }
                     self.rows_scanned += exact.rows;
                     self.in_quote = exact.end_in_quote;
@@ -1777,11 +1810,12 @@ impl FilterMergeState {
                         self.open_record_start = open;
                     }
                 } else {
-                    if let Some(err) = chunk.field_start.error {
-                        return Err(adjust_worker_error(err, base_row));
-                    }
                     for (local_row, offset) in chunk.field_start.matches {
                         publish_buf.push((base_row + local_row, offset));
+                    }
+                    if let Some(err) = chunk.field_start.error {
+                        publish_matches(shared, &mut publish_buf);
+                        return Err(adjust_worker_error(err, base_row));
                     }
                     self.rows_scanned += chunk.field_start.rows;
                     self.in_quote = chunk.field_start.end_in_quote;
@@ -1865,11 +1899,12 @@ impl FilterMergeState {
                             ) else {
                                 return Ok(());
                             };
-                            if let Some(err) = exact.error {
-                                return Err(err);
-                            }
                             for (local_row, offset) in exact.matches {
                                 publish_buf.push((tail_base + local_row, offset));
+                            }
+                            if let Some(err) = exact.error {
+                                publish_matches(shared, &mut publish_buf);
+                                return Err(err);
                             }
                             self.rows_scanned += exact.rows;
                             self.in_quote = exact.end_in_quote;
@@ -1877,11 +1912,12 @@ impl FilterMergeState {
                                 self.open_record_start = open;
                             }
                         } else {
-                            if let Some(err) = tail.error {
-                                return Err(adjust_worker_error(err, tail_base));
-                            }
                             for (local_row, offset) in tail.matches {
                                 publish_buf.push((tail_base + local_row, offset));
+                            }
+                            if let Some(err) = tail.error {
+                                publish_matches(shared, &mut publish_buf);
+                                return Err(adjust_worker_error(err, tail_base));
                             }
                             self.rows_scanned += tail.rows;
                             self.in_quote = tail.end_in_quote;
@@ -1945,7 +1981,7 @@ fn scan_filter_giant_line_sequential(
     };
     let mut buf = vec![0u8; read_chunk_bytes.clamp(64 * 1024, 1024 * 1024)];
     let mut publish_buf = Vec::new();
-    let mut field_ranges = Vec::with_capacity(max_column + 1);
+    let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
 
     while pos < file_size {
         if shared.cancel_requested.load(Ordering::Acquire) {
@@ -2027,9 +2063,18 @@ fn scan_filter_giant_line_sequential(
             record_start = absolute_end;
         });
         if let Some(err) = deferred_error {
+            publish_matches(shared, &mut publish_buf);
             return Err(err);
         }
         scan_res?;
+        if merge.rows_scanned >= data_start
+            && next_pos.saturating_sub(record_start) > max_record_bytes as u64
+        {
+            publish_matches(shared, &mut publish_buf);
+            return Err(QuarryError::RecordTooLarge {
+                limit: max_record_bytes,
+            });
+        }
         if next_pos == file_size && scanner.finish(file_size, |_| {})? {
             let row = merge.rows_scanned;
             if row >= data_start {
@@ -2190,7 +2235,13 @@ fn run_parallel_filter(
                             return Err(err);
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if executor.has_panicked() {
+                            stop_flag.store(true, Ordering::Release);
+                            return Err(QuarryError::WorkerPanicked);
+                        }
+                        continue;
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -2253,7 +2304,13 @@ fn run_parallel_filter(
                                         return Err(err);
                                     }
                                 }
-                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    if executor.has_panicked() {
+                                        stop_flag.store(true, Ordering::Release);
+                                        return Err(QuarryError::WorkerPanicked);
+                                    }
+                                    continue;
+                                }
                                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             }
                         }
@@ -2376,7 +2433,13 @@ fn run_parallel_filter(
                         return Err(err);
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if executor.has_panicked() {
+                        stop_flag.store(true, Ordering::Release);
+                        return Err(QuarryError::WorkerPanicked);
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -3833,5 +3896,73 @@ mod tests {
             (QuarryError::Parse(a), QuarryError::Parse(b)) => assert_eq!(a, b),
             (a, b) => panic!("expected matching Parse errors, got seq={a:?} par={b:?}"),
         }
+    }
+
+    #[test]
+    fn parallel_filter_preserves_leading_utf8_bom_bytes_in_non_initial_chunks() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"name,val\n");
+        for i in 1..=200_u32 {
+            data.extend_from_slice(format!("plain_{i:04},x\n").as_bytes());
+        }
+        // Place records with literal leading U+FEFF across several small chunks so at least one
+        // lands immediately after a chunk boundary.
+        for i in 0..40_u32 {
+            data.extend_from_slice(b"\xEF\xBB\xBFtarget,");
+            data.extend_from_slice(format!("{i}\n").as_bytes());
+        }
+        let path = fixture(&data);
+        let session = session(&path, HeaderMode::FirstRow);
+
+        for needle in [b"target".as_slice(), b"\xEF\xBB\xBFtarget".as_slice()] {
+            let query = FilterQuery::single(0, FilterOperator::Equals, needle.to_vec());
+            let seq = session
+                .start_filter_with_edits_and_threads(query.clone(), Arc::default(), Some(1))
+                .unwrap()
+                .wait()
+                .unwrap();
+            let par = FilterJob::start_with_edits_and_tuning(
+                session.path().to_path_buf(),
+                session.file_size,
+                session.dialect.delimiter,
+                u64::from(session.dialect.has_header),
+                query,
+                DEFAULT_FILTER_SCAN_CONFIG,
+                Arc::default(),
+                Some(session.source_stamp.clone()),
+                session.encoding,
+                super::FilterParallelTuning {
+                    requested_threads: 4,
+                    min_parallel_bytes: 64,
+                    chunk_bytes: 128,
+                    max_alignment_search: 256,
+                    delay_chunk_zero: None,
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+            assert_eq!(par.matches_found(), seq.matches_found());
+            if needle == b"target" {
+                assert_eq!(par.matches_found(), 0);
+            } else {
+                assert_eq!(par.matches_found(), 40);
+            }
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filter_handles_huge_column_index_without_large_allocation() {
+        let path = fixture(b"a,b\n1,2\n3,4\n");
+        let session = session(&path, HeaderMode::FirstRow);
+        let query = FilterQuery::single(1_000_000_000, FilterOperator::Equals, b"1".to_vec());
+        let index = session
+            .start_filter_with_edits_and_threads(query, Arc::default(), Some(1))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(index.matches_found(), 0);
+        fs::remove_file(path).unwrap();
     }
 }

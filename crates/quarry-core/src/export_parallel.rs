@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ const ALIGNMENT_PROBE_BYTES: usize = 64 * 1024;
 const MAX_ALIGNMENT_SEARCH_BYTES: u64 = 256 * 1024;
 const WORKER_CANCEL_SLICE_BYTES: usize = 256 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ExportParallelTuning {
     pub(super) requested_threads: usize,
     pub(super) min_parallel_bytes: u64,
@@ -39,6 +39,8 @@ pub(super) struct ExportParallelTuning {
     pub(super) reorder_budget_bytes: usize,
     #[cfg(test)]
     pub(super) delay_chunk_zero: Option<Duration>,
+    #[cfg(test)]
+    pub(super) on_reorder_wait: Option<Arc<AtomicBool>>,
 }
 
 impl ExportParallelTuning {
@@ -51,6 +53,8 @@ impl ExportParallelTuning {
             reorder_budget_bytes: DEFAULT_EXPORT_REORDER_BUDGET_BYTES,
             #[cfg(test)]
             delay_chunk_zero: None,
+            #[cfg(test)]
+            on_reorder_wait: None,
         }
     }
 }
@@ -78,7 +82,7 @@ struct ExportChunkResult {
     is_last: bool,
     field_start: ExportRangeOutcome,
     quoted: Option<ExportQuotedOutcome>,
-    _reorder_guard: BudgetGuard,
+    _reorder_guards: Vec<BudgetGuard>,
 }
 
 fn find_export_next_lf(
@@ -108,6 +112,7 @@ fn find_export_next_lf(
 
 #[allow(clippy::too_many_arguments)]
 fn format_export_slice_from_field_start(
+    id: u64,
     buf: &[u8],
     slice_start: u64,
     end: u64,
@@ -120,6 +125,10 @@ fn format_export_slice_from_field_start(
     matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
     max_column: usize,
+    reorder_budget: &Arc<ByteBudget>,
+    next_merge_id: &AtomicU64,
+    reorder_guards: &mut Vec<BudgetGuard>,
+    reserved_bytes: &mut usize,
     stop_flag: &AtomicBool,
 ) -> Option<ExportRangeOutcome> {
     let mut scanner = match StructuralScanner::<false>::with_dialect_without_bom(
@@ -142,15 +151,32 @@ fn format_export_slice_from_field_start(
     };
 
     let empty_edits: FilterEdits = Arc::default();
-    let mut output_bytes = Vec::new();
+    let mut output_bytes: Vec<u8> = Vec::new();
     let mut first_match_raw: Option<Vec<u8>> = None;
     let mut rows_written = 0u64;
     let mut local_row = 0u64;
     let mut record_start = slice_start;
-    let mut field_ranges = Vec::with_capacity(max_column + 1);
+    let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
     let mut deferred_error: Option<QuarryError> = None;
+    let mut cancelled_in_budget = false;
 
-    let mut emit_record = |rec: &[u8], row: u64| -> Result<(), QuarryError> {
+    let mut reserve_for_capacity = |needed_extra_cap: usize| -> bool {
+        if needed_extra_cap == 0 {
+            return true;
+        }
+        // Charge speculative output capacity before allocating so workers stall within
+        // the 64 MiB reorder ceiling; head-of-line chunk bypasses to prevent deadlock.
+        let Some(guard) = reorder_budget.acquire_or_bypass(needed_extra_cap, stop_flag, || {
+            id == next_merge_id.load(Ordering::Acquire)
+        }) else {
+            return false;
+        };
+        *reserved_bytes = reserved_bytes.saturating_add(needed_extra_cap);
+        reorder_guards.push(guard);
+        true
+    };
+
+    let mut emit_record = |rec: &[u8], row: u64| -> Result<bool, QuarryError> {
         if rec.len() > config.max_record_bytes {
             return Err(QuarryError::RecordTooLarge {
                 limit: config.max_record_bytes,
@@ -182,13 +208,37 @@ fn format_export_slice_from_field_start(
                 });
             }
             if first_match_raw.is_none() {
-                first_match_raw = Some(decoded_bytes.to_vec());
+                if !reserve_for_capacity(decoded_bytes.len()) {
+                    return Ok(false);
+                }
+                let mut first = Vec::with_capacity(decoded_bytes.len());
+                first.extend_from_slice(decoded_bytes);
+                let extra_cap = first.capacity().saturating_sub(decoded_bytes.len());
+                if !reserve_for_capacity(extra_cap) {
+                    return Ok(false);
+                }
+                first_match_raw = Some(first);
             } else {
-                output_bytes.extend_from_slice(encoded.as_ref());
+                let enc = encoded.as_ref();
+                let needed_len = output_bytes.len().saturating_add(enc.len());
+                if needed_len > output_bytes.capacity() {
+                    let prev_cap = output_bytes.capacity();
+                    let next_cap = prev_cap.saturating_mul(2).max(needed_len).max(4096);
+                    let delta = next_cap.saturating_sub(prev_cap);
+                    if !reserve_for_capacity(delta) {
+                        return Ok(false);
+                    }
+                    output_bytes.reserve_exact(delta);
+                    let actual_extra = output_bytes.capacity().saturating_sub(next_cap);
+                    if !reserve_for_capacity(actual_extra) {
+                        return Ok(false);
+                    }
+                }
+                output_bytes.extend_from_slice(enc);
             }
             rows_written += 1;
         }
-        Ok(())
+        Ok(true)
     };
 
     let mut offset = 0usize;
@@ -201,18 +251,23 @@ fn format_export_slice_from_field_start(
             &buf[offset..sub_end],
             slice_start + offset as u64,
             |absolute_end| {
-                if deferred_error.is_none() {
+                if deferred_error.is_none() && !cancelled_in_budget {
                     let s = (record_start - slice_start) as usize;
                     let e = (absolute_end - slice_start) as usize;
                     // Use non-zero synthetic row (>0) so row-0 BOM stripping is never applied to non-initial chunks.
-                    if let Err(err) = emit_record(&buf[s..e], local_row + 1) {
-                        deferred_error = Some(err);
+                    match emit_record(&buf[s..e], local_row + 1) {
+                        Ok(true) => {}
+                        Ok(false) => cancelled_in_budget = true,
+                        Err(err) => deferred_error = Some(err),
                     }
                 }
                 local_row += 1;
                 record_start = absolute_end;
             },
         );
+        if cancelled_in_budget {
+            return None;
+        }
         if deferred_error.is_some() {
             break;
         }
@@ -223,12 +278,14 @@ fn format_export_slice_from_field_start(
         offset = sub_end;
     }
 
-    if deferred_error.is_none() && is_last {
+    if deferred_error.is_none() && !cancelled_in_budget && is_last {
         match scanner.finish(end, |_| {}) {
             Ok(true) => {
                 let s = (record_start - slice_start) as usize;
-                if let Err(err) = emit_record(&buf[s..], local_row + 1) {
-                    deferred_error = Some(err);
+                match emit_record(&buf[s..], local_row + 1) {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(err) => deferred_error = Some(err),
                 }
                 local_row += 1;
                 record_start = end;
@@ -264,6 +321,7 @@ fn scan_export_chunk_worker(
     byte_class: ByteEncodingClass,
     query: &FilterQuery,
     reorder_budget: &Arc<ByteBudget>,
+    next_merge_id: &AtomicU64,
     stop_flag: &AtomicBool,
     #[cfg(test)] delay_chunk_zero: Option<Duration>,
 ) -> Option<Result<ExportChunkResult, QuarryError>> {
@@ -303,8 +361,8 @@ fn scan_export_chunk_worker(
     // thread so row-0 BOM handling, header renaming, and edits match `scan_export` identically;
     // still scan chunk 0 here only for row count / end state if needed, OR let writer handle chunk 0 directly.
     if start == 0 {
-        // Reserve 1 byte so the guard protocol stays uniform.
-        let reorder_guard = reorder_budget.acquire(1, stop_flag)?;
+        let reorder_guard = reorder_budget
+            .acquire_or_bypass(1, stop_flag, || id == next_merge_id.load(Ordering::Acquire))?;
         return Some(Ok(ExportChunkResult {
             id,
             start,
@@ -320,13 +378,32 @@ fn scan_export_chunk_worker(
                 error: None,
             },
             quoted: None,
-            _reorder_guard: reorder_guard,
+            _reorder_guards: vec![reorder_guard],
         }));
     }
 
+    let mut reorder_guards = Vec::new();
+    let mut reserved_bytes = 0usize;
+
     let field_start = format_export_slice_from_field_start(
-        &buf, start, end, is_last, delimiter, dialect, config, byte_class, query, &matchers,
-        &groups, max_column, stop_flag,
+        id,
+        &buf,
+        start,
+        end,
+        is_last,
+        delimiter,
+        dialect,
+        config,
+        byte_class,
+        query,
+        &matchers,
+        &groups,
+        max_column,
+        reorder_budget,
+        next_merge_id,
+        &mut reorder_guards,
+        &mut reserved_bytes,
+        stop_flag,
     )?;
 
     let quoted = if dialect.quote.is_some_and(|q| memchr(q, &buf).is_some()) {
@@ -352,7 +429,11 @@ fn scan_export_chunk_worker(
                     first_end = Some(re);
                 }
             }) {
-                first_error = Some(QuarryError::Parse(err));
+                // Only record errors that occur before the incoming record closes; errors after
+                // `first_end` belong to the tail and are reported after validating the stitched row.
+                if first_end.is_none() {
+                    first_error = Some(QuarryError::Parse(err));
+                }
             }
             pos = step_end;
         }
@@ -369,8 +450,24 @@ fn scan_export_chunk_worker(
         {
             let tail_slice = &buf[(fe - start) as usize..];
             Some(format_export_slice_from_field_start(
-                tail_slice, fe, end, is_last, delimiter, dialect, config, byte_class, query,
-                &matchers, &groups, max_column, stop_flag,
+                id,
+                tail_slice,
+                fe,
+                end,
+                is_last,
+                delimiter,
+                dialect,
+                config,
+                byte_class,
+                query,
+                &matchers,
+                &groups,
+                max_column,
+                reorder_budget,
+                next_merge_id,
+                &mut reorder_guards,
+                &mut reserved_bytes,
+                stop_flag,
             )?)
         } else {
             None
@@ -391,26 +488,7 @@ fn scan_export_chunk_worker(
         })
     };
 
-    // Enforce the output-byte-bounded reorder buffer (<= 64 MiB default): stall workers under
-    // backpressure until the ordered writer drains earlier chunks, or wake immediately on cancel.
-    let buffered_output_bytes = field_start
-        .output_bytes
-        .len()
-        .saturating_add(field_start.first_match_raw.as_ref().map_or(0, Vec::len))
-        .saturating_add(
-            quoted
-                .as_ref()
-                .and_then(|q| q.tail.as_ref())
-                .map_or(0, |t| {
-                    t.output_bytes
-                        .len()
-                        .saturating_add(t.first_match_raw.as_ref().map_or(0, Vec::len))
-                }),
-        )
-        .max(1);
     drop(buf);
-    let reorder_guard = reorder_budget.acquire(buffered_output_bytes, stop_flag)?;
-
     Some(Ok(ExportChunkResult {
         id,
         start,
@@ -418,7 +496,7 @@ fn scan_export_chunk_worker(
         is_last,
         field_start,
         quoted,
-        _reorder_guard: reorder_guard,
+        _reorder_guards: reorder_guards,
     }))
 }
 
@@ -440,11 +518,13 @@ struct ExportMergeState {
     rows_written: u64,
     bytes_written: u64,
     next_id: u64,
+    next_merge_id: Arc<AtomicU64>,
+    reorder_budget: Arc<ByteBudget>,
     pending: BTreeMap<u64, Result<ExportChunkResult, QuarryError>>,
 }
 
 impl ExportMergeState {
-    fn new() -> Self {
+    fn new(next_merge_id: Arc<AtomicU64>, reorder_budget: Arc<ByteBudget>) -> Self {
         Self {
             in_quote: false,
             open_record_start: 0,
@@ -452,6 +532,8 @@ impl ExportMergeState {
             rows_written: 0,
             bytes_written: 0,
             next_id: 0,
+            next_merge_id,
+            reorder_budget,
             pending: BTreeMap::new(),
         }
     }
@@ -606,6 +688,8 @@ impl ExportMergeState {
     ) -> Result<(), QuarryError> {
         while let Some(result) = self.pending.remove(&self.next_id) {
             self.next_id += 1;
+            self.next_merge_id.store(self.next_id, Ordering::Release);
+            self.reorder_budget.notify_all();
             let chunk = result?;
 
             if chunk.start == 0 {
@@ -883,6 +967,11 @@ fn scan_export_giant_line_sequential(
             return Err(err);
         }
         scan_res?;
+        if next_pos.saturating_sub(rec_start) > config.max_record_bytes as u64 {
+            return Err(QuarryError::RecordTooLarge {
+                limit: config.max_record_bytes,
+            });
+        }
         if next_pos == file_size && scanner.finish(file_size, |_| {})? {
             let rec_len = file_size.saturating_sub(rec_start);
             if rec_len > config.max_record_bytes as u64 {
@@ -958,13 +1047,20 @@ pub(super) fn scan_export_parallel(
     let effective_workers = executor.effective_workers();
 
     let file = Arc::new(source.try_clone()?);
+    #[cfg(test)]
+    let reorder_budget = Arc::new(ByteBudget::with_wait_signal(
+        tuning.reorder_budget_bytes.max(1),
+        tuning.on_reorder_wait.clone(),
+    ));
+    #[cfg(not(test))]
     let reorder_budget = Arc::new(ByteBudget::new(tuning.reorder_budget_bytes.max(1)));
+    let next_merge_id = Arc::new(AtomicU64::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Result<ExportChunkResult, QuarryError>>();
     let max_window = (effective_workers * 2).clamp(2, 16);
     let query_arc = Arc::new(query.clone());
 
-    let mut merge = ExportMergeState::new();
+    let mut merge = ExportMergeState::new(Arc::clone(&next_merge_id), Arc::clone(&reorder_budget));
     let mut cursor = 0u64;
     let mut next_chunk_id = 0u64;
 
@@ -1040,7 +1136,13 @@ pub(super) fn scan_export_parallel(
                             return Err(err);
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if executor.has_panicked() {
+                            stop_flag.store(true, Ordering::Release);
+                            return Err(QuarryError::WorkerPanicked);
+                        }
+                        continue;
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -1099,7 +1201,13 @@ pub(super) fn scan_export_parallel(
                                         return Err(err);
                                     }
                                 }
-                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    if executor.has_panicked() {
+                                        stop_flag.store(true, Ordering::Release);
+                                        return Err(QuarryError::WorkerPanicked);
+                                    }
+                                    continue;
+                                }
                                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             }
                         }
@@ -1149,6 +1257,7 @@ pub(super) fn scan_export_parallel(
             let worker_file = Arc::clone(&file);
             let worker_query = Arc::clone(&query_arc);
             let worker_reorder = Arc::clone(&reorder_budget);
+            let worker_next_merge = Arc::clone(&next_merge_id);
             let worker_stop = Arc::clone(&stop_flag);
             let worker_tx = tx.clone();
             #[cfg(test)]
@@ -1168,6 +1277,7 @@ pub(super) fn scan_export_parallel(
                     byte_class,
                     &worker_query,
                     &worker_reorder,
+                    &worker_next_merge,
                     &worker_stop,
                     #[cfg(test)]
                     delay_zero,
@@ -1217,7 +1327,13 @@ pub(super) fn scan_export_parallel(
                         return Err(err);
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if executor.has_panicked() {
+                        stop_flag.store(true, Ordering::Release);
+                        return Err(QuarryError::WorkerPanicked);
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -1350,6 +1466,7 @@ mod tests {
                 max_alignment_search: 256,
                 reorder_budget_bytes: 64 * 1024,
                 delay_chunk_zero: Some(Duration::from_millis(20)),
+                on_reorder_wait: None,
             },
         )
         .unwrap()
@@ -1384,6 +1501,7 @@ mod tests {
         let query = FilterQuery::single(1, FilterOperator::Contains, b"match_payload".to_vec());
 
         // Tiny reorder budget (4 KiB) + slow chunk 0 forces later workers to stall on backpressure.
+        let waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let job = FilterExportJob::start_with_edits_and_tuning(
             session.path().to_path_buf(),
             session.file_size,
@@ -1400,13 +1518,21 @@ mod tests {
                 chunk_bytes: 4 * 1024,
                 max_alignment_search: 1024,
                 reorder_budget_bytes: 4 * 1024,
-                delay_chunk_zero: Some(Duration::from_millis(250)),
+                delay_chunk_zero: Some(Duration::from_millis(500)),
+                on_reorder_wait: Some(Arc::clone(&waited)),
             },
         )
         .unwrap();
 
-        // Wait briefly so workers fill the 4 KiB reorder budget and stall while chunk 0 sleeps.
-        std::thread::sleep(Duration::from_millis(30));
+        // Wait deterministically until a worker actually parks on the reorder budget.
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while !waited.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                Instant::now() < wait_deadline,
+                "expected at least one worker to hit reorder backpressure"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let cancel_started = Instant::now();
         job.cancel();
         let outcome = job.wait().unwrap();
@@ -1475,6 +1601,7 @@ mod tests {
                 max_alignment_search: 4 * 1024,
                 reorder_budget_bytes: 2 * 1024 * 1024,
                 delay_chunk_zero: None,
+                on_reorder_wait: None,
             },
         )
         .unwrap()
@@ -1494,5 +1621,74 @@ mod tests {
             1,
             "failed export must leave zero staged temporary files"
         );
+    }
+
+    #[test]
+    fn parallel_filtered_export_never_deadlocks_when_later_chunks_fill_reorder_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("head_of_line.csv");
+        let seq_dest = dir.path().join("seq.csv");
+        let par_dest = dir.path().join("par.csv");
+
+        let mut data = Vec::with_capacity(200_000);
+        data.extend_from_slice(b"id,payload\n");
+        for i in 1..=1_500_u32 {
+            data.extend_from_slice(
+                format!("{i},match_payload_{i:06}_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n")
+                    .as_bytes(),
+            );
+        }
+        fs::write(&source, &data).unwrap();
+
+        let session = Session::open(&source, OpenOptions::default()).unwrap();
+        let query = FilterQuery::single(1, FilterOperator::Contains, b"match_payload".to_vec());
+
+        let seq_out = session
+            .start_filtered_export_with_edits_and_threads(
+                query.clone(),
+                Arc::default(),
+                BTreeMap::new(),
+                &seq_dest,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        let FilterExportOutcome::Complete(seq_summary) = seq_out else {
+            panic!("expected sequential export complete");
+        };
+
+        // Later chunks exhaust the 4 KiB reorder budget while chunk 0 is delayed; head-of-line
+        // bypass guarantees chunk 0 still acquires budget and drains without deadlocking.
+        let par_out = FilterExportJob::start_with_edits_and_tuning(
+            session.path().to_path_buf(),
+            session.file_size,
+            session.dialect.delimiter,
+            session.dialect.has_header,
+            query,
+            par_dest.clone(),
+            session.export_config(),
+            FilteredEdits::default(),
+            Some(session.source_stamp.clone()),
+            ExportParallelTuning {
+                requested_threads: 4,
+                min_parallel_bytes: 64,
+                chunk_bytes: 4 * 1024,
+                max_alignment_search: 1024,
+                reorder_budget_bytes: 4 * 1024,
+                delay_chunk_zero: Some(Duration::from_millis(60)),
+                on_reorder_wait: None,
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        let FilterExportOutcome::Complete(par_summary) = par_out else {
+            panic!("expected parallel export complete");
+        };
+
+        assert_eq!(par_summary.rows_written, seq_summary.rows_written);
+        assert_eq!(par_summary.bytes_written, seq_summary.bytes_written);
+        assert_eq!(fs::read(&par_dest).unwrap(), fs::read(&seq_dest).unwrap());
     }
 }

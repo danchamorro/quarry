@@ -154,6 +154,8 @@ pub(crate) struct ByteBudget {
     limit: usize,
     used: Mutex<usize>,
     available: Condvar,
+    #[cfg(test)]
+    wait_signal: Option<Arc<AtomicBool>>,
 }
 
 pub(crate) struct BudgetGuard {
@@ -175,6 +177,18 @@ impl ByteBudget {
             limit: limit.max(1),
             used: Mutex::new(0),
             available: Condvar::new(),
+            #[cfg(test)]
+            wait_signal: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_wait_signal(limit: usize, wait_signal: Option<Arc<AtomicBool>>) -> Self {
+        Self {
+            limit: limit.max(1),
+            used: Mutex::new(0),
+            available: Condvar::new(),
+            wait_signal,
         }
     }
 
@@ -187,13 +201,24 @@ impl ByteBudget {
         bytes: usize,
         cancelled: &AtomicBool,
     ) -> Option<BudgetGuard> {
+        self.acquire_or_bypass(bytes, cancelled, || false)
+    }
+
+    /// Reserve `bytes` from the shared budget, waiting until space frees up, `bypass()`
+    /// becomes true (e.g., head-of-line chunk needed to unblock draining), or `cancelled` fires.
+    pub(crate) fn acquire_or_bypass(
+        self: &Arc<Self>,
+        bytes: usize,
+        cancelled: &AtomicBool,
+        bypass: impl Fn() -> bool,
+    ) -> Option<BudgetGuard> {
         let requested = bytes.max(1);
         let mut used = self.used.lock().unwrap();
         loop {
             if cancelled.load(Ordering::Acquire) {
                 return None;
             }
-            if *used == 0 || used.saturating_add(requested) <= self.limit {
+            if *used == 0 || used.saturating_add(requested) <= self.limit || bypass() {
                 *used = used.saturating_add(requested);
                 return Some(BudgetGuard {
                     budget: Arc::clone(self),
@@ -202,12 +227,22 @@ impl ByteBudget {
             }
             // Wait with a short timeout so an external cancel store wakes us promptly without
             // needing every caller to signal this condvar explicitly.
+            #[cfg(test)]
+            if let Some(signal) = &self.wait_signal {
+                signal.store(true, Ordering::Release);
+            }
             let (next_guard, _) = self
                 .available
                 .wait_timeout(used, std::time::Duration::from_millis(2))
                 .unwrap();
             used = next_guard;
         }
+    }
+
+    /// Wake any waiters whose bypass predicate may now hold (e.g., head-of-line cursor advanced).
+    pub(crate) fn notify_all(&self) {
+        let _guard = self.used.lock().unwrap();
+        self.available.notify_all();
     }
 
     #[cfg(test)]
@@ -246,6 +281,10 @@ impl JobExecutor {
 
     pub(crate) fn effective_workers(&self) -> usize {
         self.max_workers
+    }
+
+    pub(crate) fn has_panicked(&self) -> bool {
+        self.panicked.load(Ordering::Acquire)
     }
 
     /// Wait for a per-job worker slot (bounded by `max_workers`), then submit `work` to the pool.

@@ -18,6 +18,7 @@ use crate::{
 };
 
 const DEFAULT_SEARCH_STRIPE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SINGLE_READ_STRIPE_BYTES: u64 = 8 * 1024 * 1024;
 const WORKER_CANCEL_SLICE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +123,7 @@ struct SearchTuning {
     requested_threads: usize,
     stripe_target_bytes: u64,
     #[cfg(test)]
-    delay_stripe_zero: Option<Duration>,
+    wait_for_later_hit_before_stripe_zero: bool,
 }
 
 impl SearchTuning {
@@ -131,7 +132,7 @@ impl SearchTuning {
             requested_threads,
             stripe_target_bytes: DEFAULT_SEARCH_STRIPE_BYTES,
             #[cfg(test)]
-            delay_stripe_zero: None,
+            wait_for_later_hit_before_stripe_zero: false,
         }
     }
 }
@@ -503,13 +504,17 @@ fn scan_search_stripe(
     encoding: Encoding,
     stop_flag: &AtomicBool,
     earliest_hit_stripe: &AtomicU64,
-    #[cfg(test)] delay_stripe_zero: Option<Duration>,
+    #[cfg(test)] wait_for_later_hit_before_stripe_zero: bool,
 ) -> Option<StripeResult> {
     #[cfg(test)]
-    if stripe.id == 0
-        && let Some(delay) = delay_stripe_zero
-    {
-        thread::sleep(delay);
+    if stripe.id == 0 && wait_for_later_hit_before_stripe_zero {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while earliest_hit_stripe.load(Ordering::Acquire) == u64::MAX
+            && !stop_flag.load(Ordering::Acquire)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     if stop_flag.load(Ordering::Acquire) || stripe.id > earliest_hit_stripe.load(Ordering::Acquire)
@@ -527,18 +532,26 @@ fn scan_search_stripe(
         });
     }
 
-    let len = match usize::try_from(span) {
-        Ok(len) => len,
-        Err(_) => {
-            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
-            return Some(StripeResult {
-                id: stripe.id,
-                bytes: 0,
-                rows: 0,
-                outcome: Err(QuarryError::InvalidOption("search stripe overflow")),
-            });
-        }
-    };
+    // Stream oversized stripes in bounded chunks so sparse checkpoints or multi-GB records
+    // never allocate an unbounded buffer before enforcing `max_record_bytes`.
+    if span > MAX_SINGLE_READ_STRIPE_BYTES || span > (max_record_bytes as u64).saturating_mul(2) {
+        return scan_search_stripe_streaming(
+            stripe,
+            file,
+            delimiter,
+            needle,
+            case_sensitivity,
+            start,
+            cell_edits,
+            edited_rows,
+            max_record_bytes,
+            encoding,
+            stop_flag,
+            earliest_hit_stripe,
+        );
+    }
+
+    let len = span as usize;
 
     let mut buf = vec![0u8; len];
     match read_at_exact_or_eof(file, stripe.start_offset, &mut buf) {
@@ -743,6 +756,265 @@ fn scan_search_stripe(
     })
 }
 
+/// Bounded streaming stripe scan for stripes whose span exceeds `MAX_SINGLE_READ_STRIPE_BYTES`
+/// or `2 * max_record_bytes`, enforcing `max_record_bytes` incrementally without buffering the
+/// entire stripe in memory.
+#[allow(clippy::too_many_arguments)]
+fn scan_search_stripe_streaming(
+    stripe: SearchStripe,
+    file: &File,
+    delimiter: u8,
+    needle: &[u8],
+    case_sensitivity: CaseSensitivity,
+    start: SearchPosition,
+    cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    edited_rows: &BTreeSet<u64>,
+    max_record_bytes: usize,
+    encoding: Encoding,
+    stop_flag: &AtomicBool,
+    earliest_hit_stripe: &AtomicU64,
+) -> Option<StripeResult> {
+    let matcher = ByteMatcher::new(needle, case_sensitivity);
+    let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
+    let mut scanner = match RecordScanner::at_offset(delimiter, stripe.start_offset, encoding) {
+        Ok(scanner) => scanner,
+        Err(error) => {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: 0,
+                rows: 0,
+                outcome: Err(error),
+            });
+        }
+    };
+
+    let chunk_cap = encoding
+        .chunk_size(WORKER_CANCEL_SLICE_BYTES.min(DEFAULT_READ_CHUNK))
+        .max(2);
+    let mut chunk = vec![0u8; chunk_cap];
+    let mut absolute_start = stripe.start_offset;
+    let mut row_number = stripe.start_row;
+    let mut record_start = stripe.start_offset;
+    let mut rows_scanned = 0u64;
+    let mut record = Vec::new();
+
+    while absolute_start < stripe.end_offset {
+        if stop_flag.load(Ordering::Acquire)
+            || stripe.id > earliest_hit_stripe.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let remaining = stripe.end_offset - absolute_start;
+        let mut want = remaining.min(chunk.len() as u64) as usize;
+        if matches!(encoding, Encoding::Utf16Le | Encoding::Utf16Be) && want > 1 {
+            want &= !1;
+        }
+        let read = match read_at_exact_or_eof(file, absolute_start, &mut chunk[..want]) {
+            Ok(n) if n == want => n,
+            Ok(_) => {
+                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                return Some(StripeResult {
+                    id: stripe.id,
+                    bytes: absolute_start - stripe.start_offset,
+                    rows: rows_scanned,
+                    outcome: Err(QuarryError::SourceChanged),
+                });
+            }
+            Err(error) => {
+                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                return Some(StripeResult {
+                    id: stripe.id,
+                    bytes: absolute_start - stripe.start_offset,
+                    rows: rows_scanned,
+                    outcome: Err(QuarryError::Io(error)),
+                });
+            }
+        };
+
+        let chunk_has_raw_hit = !can_prefilter || matcher.find(&chunk[..read]).is_some();
+        let mut segment_start = 0usize;
+        let mut found: Option<SearchMatch> = None;
+        let mut deferred_error: Option<QuarryError> = None;
+        let scan_res = scanner.scan_chunk(&chunk[..read], absolute_start, |absolute_end| {
+            let local_end = (absolute_end - absolute_start) as usize;
+            if found.is_none() && deferred_error.is_none() && row_number >= start.row {
+                let row_has_edit = !edited_rows.is_empty() && edited_rows.contains(&row_number);
+                if record.is_empty() {
+                    let rec_bytes = &chunk[segment_start..local_end];
+                    if rec_bytes.len() > max_record_bytes {
+                        deferred_error = Some(QuarryError::RecordTooLarge {
+                            limit: max_record_bytes,
+                        });
+                    } else if row_has_edit
+                        || (chunk_has_raw_hit
+                            && (!can_prefilter || matcher.find(rec_bytes).is_some()))
+                    {
+                        match find_record(
+                            &matcher,
+                            rec_bytes,
+                            delimiter,
+                            row_number,
+                            record_start,
+                            start,
+                            cell_edits,
+                            encoding,
+                        ) {
+                            Ok(res) => found = res,
+                            Err(err) => deferred_error = Some(err),
+                        }
+                    }
+                } else {
+                    let total_len = record.len().saturating_add(local_end - segment_start);
+                    if total_len > max_record_bytes {
+                        deferred_error = Some(QuarryError::RecordTooLarge {
+                            limit: max_record_bytes,
+                        });
+                    } else {
+                        record.extend_from_slice(&chunk[segment_start..local_end]);
+                        if row_has_edit || !can_prefilter || matcher.find(&record).is_some() {
+                            match find_record(
+                                &matcher,
+                                &record,
+                                delimiter,
+                                row_number,
+                                record_start,
+                                start,
+                                cell_edits,
+                                encoding,
+                            ) {
+                                Ok(res) => found = res,
+                                Err(err) => deferred_error = Some(err),
+                            }
+                        }
+                    }
+                }
+            }
+            record.clear();
+            row_number += 1;
+            record_start = absolute_end;
+            rows_scanned += 1;
+            segment_start = local_end;
+        });
+
+        absolute_start += read as u64;
+        if let Some(error) = deferred_error {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: absolute_start - stripe.start_offset,
+                rows: rows_scanned,
+                outcome: Err(error),
+            });
+        }
+        if let Some(hit) = found {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: absolute_start - stripe.start_offset,
+                rows: rows_scanned,
+                outcome: Ok(Some(hit)),
+            });
+        }
+        if let Err(error) = scan_res {
+            earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+            return Some(StripeResult {
+                id: stripe.id,
+                bytes: absolute_start - stripe.start_offset,
+                rows: rows_scanned,
+                outcome: Err(error),
+            });
+        }
+
+        if row_number >= start.row {
+            let tail_len = read - segment_start;
+            if record.len().saturating_add(tail_len) > max_record_bytes {
+                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                return Some(StripeResult {
+                    id: stripe.id,
+                    bytes: absolute_start - stripe.start_offset,
+                    rows: rows_scanned,
+                    outcome: Err(QuarryError::RecordTooLarge {
+                        limit: max_record_bytes,
+                    }),
+                });
+            }
+            record.extend_from_slice(&chunk[segment_start..read]);
+        }
+    }
+
+    if stripe.is_eof {
+        match scanner.finish(stripe.end_offset, |_| {}) {
+            Ok(true) => {
+                rows_scanned += 1;
+                if row_number >= start.row {
+                    if record.len() > max_record_bytes {
+                        earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                        return Some(StripeResult {
+                            id: stripe.id,
+                            bytes: stripe.end_offset - stripe.start_offset,
+                            rows: rows_scanned,
+                            outcome: Err(QuarryError::RecordTooLarge {
+                                limit: max_record_bytes,
+                            }),
+                        });
+                    }
+                    let row_has_edit = !edited_rows.is_empty() && edited_rows.contains(&row_number);
+                    if row_has_edit || !can_prefilter || matcher.find(&record).is_some() {
+                        match find_record(
+                            &matcher,
+                            &record,
+                            delimiter,
+                            row_number,
+                            record_start,
+                            start,
+                            cell_edits,
+                            encoding,
+                        ) {
+                            Ok(Some(hit)) => {
+                                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                                return Some(StripeResult {
+                                    id: stripe.id,
+                                    bytes: stripe.end_offset - stripe.start_offset,
+                                    rows: rows_scanned,
+                                    outcome: Ok(Some(hit)),
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                                return Some(StripeResult {
+                                    id: stripe.id,
+                                    bytes: stripe.end_offset - stripe.start_offset,
+                                    rows: rows_scanned,
+                                    outcome: Err(error),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
+                return Some(StripeResult {
+                    id: stripe.id,
+                    bytes: stripe.end_offset - stripe.start_offset,
+                    rows: rows_scanned,
+                    outcome: Err(error),
+                });
+            }
+        }
+    }
+
+    Some(StripeResult {
+        id: stripe.id,
+        bytes: stripe.end_offset - stripe.start_offset,
+        rows: rows_scanned,
+        outcome: Ok(None),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_parallel_search(
     file: Arc<File>,
@@ -813,16 +1085,28 @@ fn run_parallel_search(
             }
             let stripe = stripes[next_dispatch_idx];
             next_dispatch_idx += 1;
-            let stripe_bytes = stripe.end_offset.saturating_sub(stripe.start_offset) as usize;
+            let stripe_span = stripe.end_offset.saturating_sub(stripe.start_offset);
+            let budget_request = stripe_span
+                .min(MAX_SINGLE_READ_STRIPE_BYTES)
+                .min(
+                    (max_record_bytes as u64)
+                        .saturating_mul(2)
+                        .max(WORKER_CANCEL_SLICE_BYTES as u64),
+                )
+                .max(1) as usize;
             let Some(budget_guard) = pool
                 .byte_budget()
-                .acquire(stripe_bytes.max(1), &shared.cancelled)
+                .acquire(budget_request, &shared.cancelled)
             else {
                 stop_flag.store(true, Ordering::Release);
                 final_outcome = Some(Ok(SearchOutcome::Cancelled));
                 break;
             };
-            advise_readahead(&file, stripe.start_offset, stripe_bytes as u64);
+            advise_readahead(
+                &file,
+                stripe.start_offset,
+                stripe_span.min(MAX_SINGLE_READ_STRIPE_BYTES),
+            );
 
             let worker_file = Arc::clone(&file);
             let worker_needle = Arc::clone(&needle_arc);
@@ -832,7 +1116,7 @@ fn run_parallel_search(
             let worker_earliest = Arc::clone(&earliest_hit_stripe);
             let worker_tx = tx.clone();
             #[cfg(test)]
-            let delay_zero = tuning.delay_stripe_zero;
+            let wait_zero = tuning.wait_for_later_hit_before_stripe_zero;
 
             if !executor.spawn(&shared.cancelled, move || {
                 let _budget = budget_guard;
@@ -850,7 +1134,7 @@ fn run_parallel_search(
                     &worker_stop,
                     &worker_earliest,
                     #[cfg(test)]
-                    delay_zero,
+                    wait_zero,
                 );
                 drop(_budget);
                 if let Some(res) = res {
@@ -909,7 +1193,14 @@ fn run_parallel_search(
                     }
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if executor.has_panicked() {
+                    stop_flag.store(true, Ordering::Release);
+                    final_outcome = Some(Err(QuarryError::WorkerPanicked));
+                    break;
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 final_outcome = Some(Ok(SearchOutcome::Cancelled));
                 break;
@@ -1625,8 +1916,10 @@ mod tests {
     fn parallel_search_slow_first_stripe_beats_faster_competing_later_hit() {
         let mut data = Vec::new();
         data.extend_from_slice(b"id,text\n");
-        for i in 1..=200_u32 {
-            if i == 25 || i == 150 {
+        // With checkpoint_every = 20 and stripe_target_bytes = 256:
+        // stripe 0 covers rows 0..20 (hit at row 5), stripe 1 covers rows 20..40 (hit at row 30).
+        for i in 1..=100_u32 {
+            if i == 5 || i == 30 {
                 data.extend_from_slice(format!("{i},needle_hit_{i}\n").as_bytes());
             } else {
                 data.extend_from_slice(format!("{i},ordinary_row_{i:04}\n").as_bytes());
@@ -1661,14 +1954,14 @@ mod tests {
                 SearchTuning {
                     requested_threads: 4,
                     stripe_target_bytes: 256,
-                    delay_stripe_zero: Some(Duration::from_millis(30)),
+                    wait_for_later_hit_before_stripe_zero: true,
                 },
             )
             .unwrap();
         let outcome = job.wait().unwrap();
         match outcome {
-            SearchOutcome::Match(found) => assert_eq!(found.row, 25),
-            other => panic!("expected earliest hit on row 25, got {other:?}"),
+            SearchOutcome::Match(found) => assert_eq!(found.row, 5),
+            other => panic!("expected earliest hit on row 5, got {other:?}"),
         }
 
         fs::remove_file(path).unwrap();
@@ -1678,11 +1971,11 @@ mod tests {
     fn parallel_search_preceding_parse_error_beats_later_stripe_hit() {
         let mut data = Vec::new();
         data.extend_from_slice(b"id,text\n");
-        for i in 1..=200_u32 {
-            if i == 25 {
-                data.extend_from_slice(b"25,\"bad\"trailing\n");
-            } else if i == 150 {
-                data.extend_from_slice(b"150,needle_hit\n");
+        for i in 1..=100_u32 {
+            if i == 5 {
+                data.extend_from_slice(b"5,\"bad\"trailing\n");
+            } else if i == 30 {
+                data.extend_from_slice(b"30,needle_hit\n");
             } else {
                 data.extend_from_slice(format!("{i},ordinary_row_{i:04}\n").as_bytes());
             }
@@ -1691,11 +1984,11 @@ mod tests {
         // Open with a clean copy first so bootstrap succeeds, then build checkpoints matching rows.
         let mut clean = Vec::new();
         clean.extend_from_slice(b"id,text\n");
-        for i in 1..=200_u32 {
-            if i == 25 {
-                clean.extend_from_slice(b"25,good_trailing\n");
-            } else if i == 150 {
-                clean.extend_from_slice(b"150,needle_hit\n");
+        for i in 1..=100_u32 {
+            if i == 5 {
+                clean.extend_from_slice(b"5,good_trailing\n");
+            } else if i == 30 {
+                clean.extend_from_slice(b"30,needle_hit\n");
             } else {
                 clean.extend_from_slice(format!("{i},ordinary_row_{i:04}\n").as_bytes());
             }
@@ -1719,7 +2012,7 @@ mod tests {
             .unwrap()
             .wait()
             .unwrap();
-        // Overwrite with same-length malformed row 25 to verify stripe 0's parse error beats stripe > 0's hit.
+        // Overwrite with same-length malformed row 5 (in stripe 0) while stripe 1 hits row 30 first.
         fs::write(&path, &data).unwrap();
 
         let err = session
@@ -1732,7 +2025,7 @@ mod tests {
                 SearchTuning {
                     requested_threads: 4,
                     stripe_target_bytes: 256,
-                    delay_stripe_zero: Some(Duration::from_millis(25)),
+                    wait_for_later_hit_before_stripe_zero: true,
                 },
             )
             .unwrap()
@@ -1750,31 +2043,34 @@ mod tests {
     fn parallel_search_respects_live_index_frontier_and_never_reports_false_not_found() {
         let mut data = Vec::new();
         data.extend_from_slice(b"id,text\n");
-        for i in 1..=20_000_u32 {
-            if i == 19_999 {
-                data.extend_from_slice(b"19999,tail_only_needle\n");
+        for i in 1..=600_u32 {
+            if i == 599 {
+                data.extend_from_slice(b"599,tail_only_needle\n");
             } else {
                 data.extend_from_slice(format!("{i},row_{i:05}\n").as_bytes());
             }
         }
         let path = fixture(&data);
         let session = Session::open(&path, OpenOptions::default()).unwrap();
-        let index_job = session
-            .start_indexing(IndexConfig {
-                chunk_bytes: 16,
-                checkpoint_every: 50,
-                memory_budget_bytes: 64 * 1024,
-            })
-            .unwrap();
-        let partial = loop {
-            let snap = index_job.snapshot();
-            if snap.indexed_rows() >= 200 || index_job.progress().done {
-                index_job.cancel();
-                break snap;
+
+        // Build a deterministic partial index stopping at row 200 (well before EOF).
+        let mut partial = crate::StructuralIndex::new(IndexConfig {
+            chunk_bytes: 64,
+            checkpoint_every: 50,
+            memory_budget_bytes: 64 * 1024,
+        })
+        .unwrap();
+        let mut boundaries = 0usize;
+        for (idx, &byte) in data.iter().enumerate() {
+            if byte == b'\n' {
+                partial.record_boundary((idx + 1) as u64);
+                boundaries += 1;
+                if boundaries == 200 {
+                    break;
+                }
             }
-            thread::yield_now();
-        };
-        drop(index_job);
+        }
+        assert_eq!(partial.indexed_rows(), 200);
         assert!(
             partial.indexed_bytes() < session.file_size,
             "partial snapshot must stop before EOF"
@@ -1790,7 +2086,7 @@ mod tests {
                 SearchTuning {
                     requested_threads: 4,
                     stripe_target_bytes: 256,
-                    delay_stripe_zero: None,
+                    wait_for_later_hit_before_stripe_zero: false,
                 },
             )
             .unwrap();
@@ -1834,7 +2130,7 @@ mod tests {
                 .unwrap()
                 .wait()
                 .unwrap(),
-            SearchOutcome::Match(m) if m.row == 19_999
+            SearchOutcome::Match(m) if m.row == 599
         ));
 
         fs::remove_file(path).unwrap();
@@ -1936,6 +2232,63 @@ mod tests {
             Err(QuarryError::RecordTooLarge { limit: 8 })
         ));
 
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parallel_search_streams_oversized_stripe_and_rejects_oversized_record_without_oom() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"id,note\n");
+        for i in 1..=20_u32 {
+            data.extend_from_slice(format!("{i:04},ok\n").as_bytes());
+        }
+        // Oversized record (200 bytes > max_record_bytes = 64) in a later stripe.
+        data.extend_from_slice(b"0021,");
+        data.extend(std::iter::repeat_n(b'x', 200));
+        data.extend_from_slice(b"\n");
+        let path = fixture(&data);
+        let (session, _) = session_and_index(&path, true);
+        let index = session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 64,
+                checkpoint_every: 10,
+                memory_budget_bytes: 1024,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let job = SearchJob::start_plan(
+            session.path().to_path_buf(),
+            session.file_size,
+            index.indexed_bytes(),
+            index.indexed_rows(),
+            session.dialect.delimiter,
+            b"missing".to_vec(),
+            CaseSensitivity::Sensitive,
+            SearchPosition { row: 1, column: 0 },
+            index.nearest_checkpoint(1),
+            super::build_search_stripes(
+                &index,
+                index.nearest_checkpoint(1),
+                index.indexed_bytes(),
+                session.file_size,
+                32,
+            ),
+            BTreeMap::new(),
+            64,
+            session.encoding,
+            SearchTuning {
+                requested_threads: 4,
+                stripe_target_bytes: 32,
+                wait_for_later_hit_before_stripe_zero: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            job.wait(),
+            Err(QuarryError::RecordTooLarge { limit: 64 })
+        ));
         fs::remove_file(path).unwrap();
     }
 }
