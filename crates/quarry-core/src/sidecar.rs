@@ -1710,12 +1710,22 @@ fn open_private_readonly_nofollow(path: &Path) -> io::Result<File> {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
         };
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         let file = fs::OpenOptions::new()
-            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES)
+            .share_mode(share)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
+            .open(path)
+            .or_else(|_| {
+                fs::OpenOptions::new()
+                    .access_mode(FILE_GENERIC_READ)
+                    .share_mode(share)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)
+            })?;
         let meta = file.metadata()?;
         if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
             return Err(io::Error::new(
@@ -2232,10 +2242,7 @@ pub(crate) fn try_load_sidecar(
     .ok()?;
 
     // Best-effort LRU touch directly on the already-validated file handle (no second path lookup).
-    #[cfg(unix)]
-    {
-        let _ = sidecar_file.set_modified(SystemTime::now());
-    }
+    let _ = sidecar_file.set_modified(SystemTime::now());
 
     Some(index)
 }
