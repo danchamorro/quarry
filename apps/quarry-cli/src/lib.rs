@@ -306,17 +306,24 @@ fn parse_threads(raw: &str) -> CliResult<usize> {
     Ok(threads)
 }
 
+fn parse_index_cache_dir(args: &[String], cursor: &mut usize) -> CliResult<PathBuf> {
+    let raw = value(args, cursor, "--index-cache-dir")?;
+    if raw.starts_with('-') {
+        return Err(
+            "--index-cache-dir requires a directory path (prefix with ./ if the name starts with '-')"
+                .into(),
+        );
+    }
+    Ok(PathBuf::from(raw))
+}
+
 fn clear_index_cache_command(args: Vec<String>) -> CliResult<()> {
     let mut cache_dir = None;
     let mut cursor = 0;
     while cursor < args.len() {
         match args[cursor].as_str() {
             "--index-cache-dir" => {
-                cache_dir = Some(PathBuf::from(value(
-                    &args,
-                    &mut cursor,
-                    "--index-cache-dir",
-                )?));
+                cache_dir = Some(parse_index_cache_dir(&args, &mut cursor)?);
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -1773,7 +1780,11 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
     }
     let source_index_started = Instant::now();
     let source_index = session
-        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .start_indexing_with_options(
+            IndexConfig::default(),
+            threads,
+            IndexCacheConfig::disabled(),
+        )?
         .wait()?;
     println!(
         "Source indexing time: {:.3} s (before sort)",
@@ -2195,7 +2206,11 @@ fn validate_sorted_output_with_threads(
     let index_handoff_elapsed = adopted_index.as_ref().map(|_| handoff_started.elapsed());
     let started = Instant::now();
     let output_index = output
-        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .start_indexing_with_options(
+            IndexConfig::default(),
+            threads,
+            IndexCacheConfig::disabled(),
+        )?
         .wait()?;
     if output_index.indexed_rows() != source_index.indexed_rows() {
         return Err("sorted output record count changed".into());
@@ -2856,10 +2871,18 @@ fn validate_saved_transformation_with_threads(
         Some(source.encoding()),
     )?;
     let source_index = source
-        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .start_indexing_with_options(
+            IndexConfig::default(),
+            threads,
+            IndexCacheConfig::disabled(),
+        )?
         .wait()?;
     let output_index = output
-        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .start_indexing_with_options(
+            IndexConfig::default(),
+            threads,
+            IndexCacheConfig::disabled(),
+        )?
         .wait()?;
     if output_index.indexed_rows() != source_index.indexed_rows() {
         return Err("transformed output record count changed".into());
@@ -3012,7 +3035,11 @@ fn validate_saved_edits_with_threads(
         Some(encoding),
     )?;
     let index = session
-        .start_indexing_with_threads(IndexConfig::default(), threads)?
+        .start_indexing_with_options(
+            IndexConfig::default(),
+            threads,
+            IndexCacheConfig::disabled(),
+        )?
         .wait()?;
     let mut current_row = None;
     let mut row = None;
@@ -3142,11 +3169,7 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
             }
             "--no-index-cache" => index_cache.enabled = false,
             "--index-cache-dir" => {
-                index_cache.cache_dir = Some(PathBuf::from(value(
-                    &args,
-                    &mut cursor,
-                    "--index-cache-dir",
-                )?));
+                index_cache.cache_dir = Some(parse_index_cache_dir(&args, &mut cursor)?);
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -3380,11 +3403,7 @@ fn viewport_command(args: Vec<String>) -> CliResult<()> {
             }
             "--no-index-cache" => index_cache.enabled = false,
             "--index-cache-dir" => {
-                index_cache.cache_dir = Some(PathBuf::from(value(
-                    &args,
-                    &mut cursor,
-                    "--index-cache-dir",
-                )?));
+                index_cache.cache_dir = Some(parse_index_cache_dir(&args, &mut cursor)?);
             }
             "--temp-dir" | "--max-decompressed-bytes" => compressed.parse(&args, &mut cursor)?,
             option if option.starts_with('-') => {
@@ -3743,11 +3762,7 @@ fn open_command(args: Vec<String>) -> CliResult<()> {
             }
             "--no-index-cache" => index_cache.enabled = false,
             "--index-cache-dir" => {
-                index_cache.cache_dir = Some(PathBuf::from(value(
-                    &args,
-                    &mut cursor,
-                    "--index-cache-dir",
-                )?));
+                index_cache.cache_dir = Some(parse_index_cache_dir(&args, &mut cursor)?);
             }
             "--metrics-only" => metrics_only = true,
             "--no-wait" => wait_for_index = false,
@@ -6763,5 +6778,50 @@ mod tests {
             "name,value\r\ncafé 😀,1\r\n".as_bytes()
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn index_cache_dir_rejects_option_tokens_and_allows_relative_prefix() {
+        for args in [
+            vec![
+                "open".into(),
+                "sample.csv".into(),
+                "--index-cache-dir".into(),
+                "--no-index-cache".into(),
+            ],
+            vec![
+                "search".into(),
+                "sample.csv".into(),
+                "--query".into(),
+                "x".into(),
+                "--index-cache-dir".into(),
+                "--no-index-cache".into(),
+            ],
+            vec![
+                "viewport".into(),
+                "sample.csv".into(),
+                "--index-cache-dir".into(),
+                "--no-index-cache".into(),
+            ],
+            vec![
+                "clear-index-cache".into(),
+                "--index-cache-dir".into(),
+                "--no-index-cache".into(),
+            ],
+        ] {
+            let err = super::run(args).unwrap_err();
+            assert!(
+                err.to_string().contains("--index-cache-dir"),
+                "expected missing cache dir error, got: {err}"
+            );
+        }
+
+        let args = vec!["--index-cache-dir".into(), "./--no-index-cache".into()];
+        let mut cursor = 0;
+        assert_eq!(
+            super::parse_index_cache_dir(&args, &mut cursor).unwrap(),
+            std::path::PathBuf::from("./--no-index-cache")
+        );
+        assert_eq!(cursor, 1);
     }
 }

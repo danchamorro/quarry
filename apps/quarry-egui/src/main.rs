@@ -350,6 +350,8 @@ struct QuarryApp {
     join_files: Option<join_files::JoinDialog>,
     working_directory: PathBuf,
     index_cache_enabled: bool,
+    cache_clear_status: Option<Result<String, String>>,
+    cache_clear_worker: Option<std::thread::JoinHandle<Result<String, String>>>,
     active: DocumentTab,
     tabs: Vec<DocumentTab>,
     next_tab_id: u64,
@@ -805,6 +807,8 @@ impl QuarryApp {
             document_cleanup: None,
             working_directory: std::env::temp_dir(),
             index_cache_enabled: true,
+            cache_clear_status: None,
+            cache_clear_worker: None,
             active: DocumentTab::new(1),
             tabs: Vec::new(),
             next_tab_id: 2,
@@ -2349,6 +2353,7 @@ impl eframe::App for QuarryApp {
         self.reset_tab_focus(ctx);
         self.poll_document_tabs(ctx);
         self.poll_inspections(ctx);
+        self.poll_cache_clear_worker();
 
         if self.active.close_confirmation_open {
             self.about.open = false;
@@ -3018,7 +3023,7 @@ impl eframe::App for QuarryApp {
         {
             self.about.show(ctx);
         }
-        if self.document_tabs().any(DocumentTab::busy) {
+        if self.document_tabs().any(DocumentTab::busy) || self.cache_clear_worker.is_some() {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
         if self.combine_files.is_some() {

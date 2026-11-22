@@ -280,7 +280,12 @@ pub fn clear_index_cache(cache_dir: Option<&Path>) -> Result<CacheClearSummary, 
         ));
     }
 
-    let _lock = acquire_cache_lock(&resolved, true);
+    let Some(_lock) = acquire_cache_lock(&resolved, true) else {
+        return Err(QuarryError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot acquire exclusive lock on index cache directory",
+        )));
+    };
 
     let mut summary = CacheClearSummary::default();
     let entries = match fs::read_dir(&resolved) {
@@ -289,7 +294,12 @@ pub fn clear_index_cache(cache_dir: Option<&Path>) -> Result<CacheClearSummary, 
         Err(err) => return Err(QuarryError::Io(err)),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(QuarryError::Io(err)),
+        };
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -301,8 +311,10 @@ pub fn clear_index_cache(cache_dir: Option<&Path>) -> Result<CacheClearSummary, 
         if !is_managed {
             continue;
         }
-        let Ok(entry_meta) = fs::symlink_metadata(&path) else {
-            continue;
+        let entry_meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(QuarryError::Io(err)),
         };
         if entry_meta.file_type().is_symlink() || !entry_meta.is_file() {
             continue;
@@ -598,6 +610,7 @@ fn is_allowed_linux_fs_magic(magic: u64) -> bool {
     const CEPH_SUPER_MAGIC: u64 = 0x00c3_6400;
     const NINEP_MAGIC: u64 = 0x0102_1997;
     const AFS_SUPER_MAGIC: u64 = 0x5346_414f;
+    const KAFS_SUPER_MAGIC: u64 = 0x6b41_4653;
     const CODA_SUPER_MAGIC: u64 = 0x7375_7245;
     const NCP_SUPER_MAGIC: u64 = 0x564c;
 
@@ -613,6 +626,7 @@ fn is_allowed_linux_fs_magic(magic: u64) -> bool {
             | CEPH_SUPER_MAGIC
             | NINEP_MAGIC
             | AFS_SUPER_MAGIC
+            | KAFS_SUPER_MAGIC
             | CODA_SUPER_MAGIC
             | NCP_SUPER_MAGIC
     )
@@ -2358,6 +2372,9 @@ fn try_save_sidecar(
     // Coordinate across processes and reserve full staging capacity before creating a temp file.
     // Non-blocking lock ensures optional cache writes never stall indexing or cancellation.
     let _lock = acquire_cache_lock(&cache_dir, false)?;
+    if read_verified_key(&cache_dir.join(CACHE_KEY_FILENAME)) != Some(key) {
+        return None;
+    }
     if !reserve_cache_budget(&cache_dir, cache_config.max_cache_bytes, encoded_len) {
         return None;
     }
@@ -2777,6 +2794,8 @@ mod tests {
         assert!(!is_allowed_linux_fs_magic(0x6969)); // nfs
         assert!(!is_allowed_linux_fs_magic(0xfe53_4d42)); // smb2
         assert!(!is_allowed_linux_fs_magic(0x6573_5546)); // fuse
+        assert!(!is_allowed_linux_fs_magic(0x5346_414f)); // afs
+        assert!(!is_allowed_linux_fs_magic(0x6b41_4653)); // linux kAFS
     }
 
     #[test]
@@ -3331,5 +3350,31 @@ mod tests {
         symlink(&shared, &link).unwrap();
         let nested = link.join("child");
         assert!(clear_index_cache(Some(&nested)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_index_cache_fails_without_deleting_when_lock_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("private-cache");
+        fs::create_dir(&cache_dir).unwrap();
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let managed = cache_dir.join(format!("idx-{}.qidx", "a".repeat(64)));
+        fs::write(&managed, b"dummy").unwrap();
+        // Replace `.cache.lock` with a directory so `acquire_cache_lock` fails cleanly.
+        fs::create_dir(cache_dir.join(super::CACHE_LOCK_FILENAME)).unwrap();
+
+        let err = clear_index_cache(Some(&cache_dir)).unwrap_err();
+        assert!(
+            err.to_string().contains("exclusive lock"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            managed.exists(),
+            "cache entries must not be deleted when lock cannot be acquired"
+        );
     }
 }
