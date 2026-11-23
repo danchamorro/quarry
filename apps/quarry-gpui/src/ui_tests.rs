@@ -1915,7 +1915,20 @@ cyan = "#449dab"
         q.snapshot(cx).is_some_and(|i| i.index_done)
     });
 
-    // 2. Switch to Dark mode via action and verify GPUI ThemeMode + persisted preference.
+    // 2. Switch to Dark mode via action and verify GPUI ThemeMode, persisted preference, and
+    //    that an existing active file-operation notice is never overwritten by theme changes.
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.set_window_message(
+                win_id,
+                Some(quarry_workbench::AppMessage::error(
+                    "Save failed: disk full",
+                )),
+                cx,
+            );
+        });
+    });
     cx.update_window(handle.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
             q.theme_dark_action(&crate::menus::ThemeDark, window, cx)
@@ -1926,6 +1939,14 @@ cyan = "#449dab"
         assert_eq!(
             gpui_kit::component::Theme::global(cx).colors.danger,
             gpui_kit::rgb(quarry_workbench::DARK.error_text.to_rgb_hex()).into()
+        );
+        assert_eq!(
+            controller
+                .read(cx)
+                .window_message(win_id)
+                .map(|m| m.text.as_str()),
+            Some("Save failed: disk full"),
+            "theme switching must not overwrite file-operation notices"
         );
     })
     .unwrap();
@@ -2010,6 +2031,7 @@ cyan = "#449dab"
             .update(cx, |c, cx| c.reload_omarchy_theme_now(cx))
             .expect("missing colors.toml should transition to fallback");
         assert!(fallback.warning.is_some());
+        assert!(controller.read(cx).theme_warning().is_some());
     });
     std::fs::write(
         omarchy_dir.join("colors.toml"),
@@ -2021,6 +2043,10 @@ cyan = "#449dab"
             .update(cx, |c, cx| c.reload_omarchy_theme_now(cx))
             .expect("subsequent reload should recover once colors.toml is ready");
         assert!(recovered.warning.is_none());
+        assert!(
+            controller.read(cx).theme_warning().is_none(),
+            "Omarchy fallback warning must clear automatically when sync recovers"
+        );
         assert_eq!(
             recovered.palette.canvas,
             quarry_workbench::Rgba::rgb(0x1a, 0x1b, 0x26)
@@ -2082,12 +2108,24 @@ fn two_hundred_tabs_across_four_windows_stay_bounded_and_preserve_dirty_work(
         });
     }
 
-    // Verify 200 total tabs, >= 1 hydrated tab per window, and internal FD budget < 128.
+    // Verify 200 total tabs, >= 1 hydrated tab in EVERY window simultaneously, and FD budget < 128.
+    let window_ids: Vec<_> = windows
+        .iter()
+        .map(|(_, view)| cx.update(|cx| view.read(cx).window_id))
+        .collect();
     cx.update(|cx| {
         let sched = controller.read(cx).scheduler();
         assert_eq!(sched.total_tabs(), 200);
         assert!(sched.hydrated_count() >= 4);
         assert!(sched.hydrated_count() <= 8);
+        for &wid in &window_ids {
+            assert!(
+                sched.tabs_in_window(wid).into_iter().any(|id| {
+                    sched.residency(id) == Some(quarry_workbench::ResidencyState::Hydrated)
+                }),
+                "window {wid:?} must keep at least one hydrated tab"
+            );
+        }
         assert!(sched.fd_budget().snapshot().peak_reserved < 128);
         assert!(sched.fd_budget().snapshot().total_reserved < 128);
     });

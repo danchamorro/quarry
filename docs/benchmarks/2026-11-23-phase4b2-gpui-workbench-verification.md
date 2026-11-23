@@ -42,7 +42,8 @@ python3 scripts/generate-200-file-corpus.py --output-dir /tmp/quarry-200-corpus
 
 ### Honest Venue Boundaries
 
-- All 200-tab measurements stay well below the Phase 4A/4B gate (`<= 1 GiB` peak RSS and `< 128` process FDs) in a single process on both macOS and Linux/Omarchy.
+- All recorded 200-tab measurements stayed well below `1 GiB` memory and `< 128` process FDs in a single process on both macOS and Linux/Omarchy. Specifically, the Linux/Omarchy run records kernel peak RSS (`VmHWM = 351.13 MiB <= 1 GiB`), whereas the macOS VM runs record post-load `ps -o rss` snapshots (`141.39 MiB`, `148.62 MiB`, `153.02 MiB`) rather than continuous peak-RSS sampling; full peak-RSS sampling across interactive multi-window churn on macOS remains tracked for Phase 4B-3.
+- On `macOS VM 1`, the two-window run verified the live `accesskit_macos` accessibility tree (`vmpal_tree` confirming `[a13]`, `[a17]`, `tab group`, `toolbar`, and `table` cell labels); live audible/caption-panel VoiceOver speech verification across both windows remains tracked for Phase 4B-3 cutover (`T2`).
 - On `Omarchy VM 4`, Hyprland's session was screen-locked (`solitaryBlockedBy: ["LOCK", ...]`) during this run, so unlocked visual pixel inspection of `1.25×`/`1.5×` fractional scaling and unlocked AT-SPI inspection remain tracked for an unlocked Linux/Omarchy session in Phase 4B-3 / 9B (building on the unlocked `accesskit_unix 0.22.1` AT-SPI baseline recorded in `docs/benchmarks/2026-11-23-phase4b1-gpui-hardening.md`).
 - 120 Hz hardware frame-deadline tracing (`C07`/`C08`) remains scoped to an owner-approved physical display venue (`T18`) in Phase 4B-3 / Phase 6.
 

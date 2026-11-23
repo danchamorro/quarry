@@ -176,6 +176,7 @@ pub struct WorkbenchController {
     theme_home: Option<PathBuf>,
     system_appearance: ThemeAppearance,
     resolved_theme: ResolvedTheme,
+    theme_error: Option<String>,
     omarchy_last_check: Instant,
     omarchy_fingerprint: Option<String>,
     combine: Box<CombineWorkflow>,
@@ -237,6 +238,9 @@ impl WorkbenchController {
             config.index_cache_enabled = enabled;
         }
         let system_appearance = ThemeAppearance::Light;
+        let pre_fingerprint = (theme_prefs.preference == ThemePreference::Omarchy)
+            .then(|| theme_home.as_deref().and_then(omarchy_theme_fingerprint))
+            .flatten();
         let resolved_theme = resolve_theme(
             theme_prefs.preference,
             system_appearance,
@@ -245,7 +249,7 @@ impl WorkbenchController {
         let omarchy_fingerprint = if theme_prefs.preference == ThemePreference::Omarchy
             && resolved_theme.warning.is_none()
         {
-            theme_home.as_deref().and_then(omarchy_theme_fingerprint)
+            pre_fingerprint
         } else {
             None
         };
@@ -261,6 +265,7 @@ impl WorkbenchController {
             theme_home,
             system_appearance,
             resolved_theme,
+            theme_error: None,
             omarchy_last_check: Instant::now(),
             omarchy_fingerprint,
             combine: Box::default(),
@@ -392,24 +397,46 @@ impl WorkbenchController {
         &self.resolved_theme
     }
 
+    pub fn theme_warning(&self) -> Option<&str> {
+        self.theme_error
+            .as_deref()
+            .or(self.resolved_theme.warning.as_deref())
+    }
+
+    pub fn clear_theme_error(&mut self, cx: &mut Context<Self>) {
+        if self.theme_error.take().is_some() {
+            cx.notify();
+        }
+    }
+
     pub fn set_theme_preference(
         &mut self,
         preference: ThemePreference,
         cx: &mut Context<Self>,
     ) -> Result<ResolvedTheme, String> {
-        self.theme_prefs.set_preference(preference)?;
+        if let Err(error) = self.theme_prefs.set_preference(preference) {
+            self.theme_error = Some(error.clone());
+            cx.notify();
+            return Err(error);
+        }
+        self.theme_error = None;
+        self.omarchy_last_check = Instant::now();
+        let pre_fingerprint = (preference == ThemePreference::Omarchy)
+            .then(|| {
+                self.theme_home
+                    .as_deref()
+                    .and_then(omarchy_theme_fingerprint)
+            })
+            .flatten();
         let resolved = resolve_theme(
             preference,
             self.system_appearance,
             self.theme_home.as_deref(),
         );
         self.resolved_theme = resolved.clone();
-        self.omarchy_last_check = Instant::now();
         self.omarchy_fingerprint =
             if preference == ThemePreference::Omarchy && resolved.warning.is_none() {
-                self.theme_home
-                    .as_deref()
-                    .and_then(omarchy_theme_fingerprint)
+                pre_fingerprint
             } else {
                 None
             };

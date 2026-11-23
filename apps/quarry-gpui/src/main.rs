@@ -1919,26 +1919,52 @@ impl QuarryWindow {
     }
 
     fn set_theme_preference(&mut self, preference: ThemePreference, cx: &mut Context<Self>) {
-        let outcome = self
+        if let Ok(resolved) = self
             .controller
-            .update(cx, |c, cx| c.set_theme_preference(preference, cx));
-        match outcome {
-            Ok(resolved) => {
-                apply_resolved_theme(&resolved, cx);
-                cx.refresh_windows();
-                if let Some(warning) = resolved.warning {
-                    self.set_message(AppMessage::warning(warning), cx);
-                } else {
-                    self.set_message(
-                        AppMessage::status(format!("Theme: {}", resolved.source_label)),
-                        cx,
-                    );
-                }
-            }
-            Err(error) => {
-                self.set_message(AppMessage::error(error), cx);
-            }
+            .update(cx, |c, cx| c.set_theme_preference(preference, cx))
+        {
+            apply_resolved_theme(&resolved, cx);
+            cx.refresh_windows();
         }
+    }
+
+    #[inline(never)]
+    fn render_theme_banner(
+        &self,
+        tokens: &quarry_workbench::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let text = self.controller.read(cx).theme_warning()?.to_owned();
+        let can_dismiss = self.controller.read(cx).resolved_theme().warning.is_none();
+        Some(
+            div()
+                .id("theme-warning-banner")
+                .role(Role::Status)
+                .aria_label(text.clone())
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                .text_color(rgb(tokens.warning_text.to_rgb_hex()))
+                .child(div().flex_1().min_w_0().child(text))
+                .when(can_dismiss, |bar| {
+                    bar.child(
+                        Button::new("dismiss-theme-warning")
+                            .label("×")
+                            .accessibility_label("Dismiss theme notice")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.controller.update(cx, |c, cx| c.clear_theme_error(cx));
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn theme_system_action(&mut self, _: &ThemeSystem, _: &mut Window, cx: &mut Context<Self>) {
@@ -2744,6 +2770,10 @@ impl Render for QuarryWindow {
             );
         }
 
+        if let Some(theme_banner) = self.render_theme_banner(&tokens, cx) {
+            body = body.child(theme_banner);
+        }
+
         if let Some(msg) = message {
             let is_error = msg.severity == MessageSeverity::Error;
             let is_warning = msg.severity == MessageSeverity::Warning;
@@ -2935,21 +2965,39 @@ pub(crate) fn apply_resolved_theme(resolved: &ResolvedTheme, cx: &mut App) {
     Theme::change(mode, None, cx);
     let tokens = &resolved.palette;
     let is_dark = resolved.appearance == ThemeAppearance::Dark;
-    let primary_hover = tokens.selection_strong.blend(
-        if is_dark {
-            tokens.text
-        } else {
-            tokens.on_accent
-        },
-        0.10,
+    let contrast_safe_primary_variant =
+        |preferred: quarry_workbench::Rgba, alternate: quarry_workbench::Rgba| {
+            if quarry_workbench::contrast_ratio(tokens.on_accent, preferred) >= 4.5 {
+                preferred
+            } else if quarry_workbench::contrast_ratio(tokens.on_accent, alternate) >= 4.5 {
+                alternate
+            } else {
+                tokens.selection_strong
+            }
+        };
+    let primary_hover = contrast_safe_primary_variant(
+        tokens.selection_strong.blend(
+            if is_dark {
+                tokens.text
+            } else {
+                tokens.on_accent
+            },
+            0.10,
+        ),
+        tokens.selection_strong.blend(tokens.canvas, 0.10),
     );
-    let primary_active = tokens.selection_strong.blend(
-        if is_dark {
-            tokens.canvas
-        } else {
-            tokens.on_accent
-        },
-        0.18,
+    let primary_active = contrast_safe_primary_variant(
+        tokens.selection_strong.blend(
+            if is_dark {
+                tokens.canvas
+            } else {
+                tokens.on_accent
+            },
+            0.18,
+        ),
+        tokens
+            .selection_strong
+            .blend(if is_dark { tokens.text } else { tokens.canvas }, 0.16),
     );
 
     let theme = Theme::global_mut(cx);

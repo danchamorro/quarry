@@ -199,12 +199,17 @@ pub fn palette_meets_wcag_aa(palette: &Palette) -> bool {
         && contrast_ratio(palette.text, palette.zebra) >= 4.5
         && contrast_ratio(palette.text, palette.chrome) >= 4.5
         && contrast_ratio(palette.text, palette.selection) >= 4.5
+        && contrast_ratio(palette.text, palette.control) >= 4.5
+        && contrast_ratio(palette.text, palette.hover) >= 4.5
         && contrast_ratio(palette.text_secondary, palette.canvas) >= 4.5
+        && contrast_ratio(palette.text_secondary, palette.chrome) >= 4.5
         && contrast_ratio(palette.text_secondary, palette.header_fill) >= 4.5
+        && contrast_ratio(palette.text_secondary, palette.control) >= 4.5
         && contrast_ratio(palette.on_accent, palette.selection_strong) >= 4.5
         && contrast_ratio(palette.accent_text, palette.canvas) >= 4.5
         && contrast_ratio(palette.error_text, palette.error_fill) >= 4.5
         && contrast_ratio(palette.error_text, palette.canvas) >= 4.5
+        && contrast_ratio(palette.error_text, palette.chrome) >= 4.5
         && contrast_ratio(palette.warning_text, palette.warning_fill) >= 4.5
         && contrast_ratio(palette.success_text, palette.canvas) >= 4.5
 }
@@ -375,12 +380,16 @@ impl ThemePreferences {
         let parent = path
             .parent()
             .ok_or_else(|| "Invalid theme preferences path.".to_owned())?;
+        #[cfg(unix)]
+        let parent_existed = parent.is_dir();
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create config directory: {error}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            if !parent_existed {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
 
         let file_name = path
@@ -502,8 +511,9 @@ fn omarchy_candidate_generation_files(home: &Path) -> [PathBuf; 3] {
     ]
 }
 
-/// Reads an allowlisted local file with strict canonical-root validation, regular-file check,
-/// and `max_bytes` cap so symlink escapes and oversized files are rejected cleanly.
+/// Reads an allowlisted local file with directory-handle-relative containment (`openat` +
+/// `O_NOFOLLOW` + `O_NONBLOCK`), regular-file check, and `max_bytes` cap so symlink escapes,
+/// path-swap TOCTOU races, FIFOs, and oversized files are rejected cleanly.
 fn read_allowlisted_file(
     candidate: &Path,
     canonical_roots: &[PathBuf],
@@ -518,32 +528,27 @@ fn read_allowlisted_file(
             candidate.display()
         )
     })?;
-    if !canonical_roots
+    let Some((root, relative)) = canonical_roots
         .iter()
-        .any(|root| canonical.starts_with(root))
-    {
+        .find_map(|root| canonical.strip_prefix(root).ok().map(|rel| (root, rel)))
+    else {
         return Err(format!(
             "Refused to read Omarchy theme file outside allowed roots ({}).",
             candidate.display()
         ));
-    }
-    let pre_meta = std::fs::symlink_metadata(&canonical).map_err(|error| {
-        format!(
-            "Could not inspect Omarchy theme file {}: {error}",
-            canonical.display()
-        )
-    })?;
-    if !pre_meta.is_file() {
-        return Err(format!(
-            "Omarchy theme path {} is not a regular file.",
-            candidate.display()
-        ));
-    }
-    let file = quarry_core::open_regular_file_nofollow(&canonical).map_err(|error| {
-        format!(
-            "Could not open Omarchy theme file {}: {error}",
-            canonical.display()
-        )
+    };
+    let file = quarry_core::open_contained_regular_file(root, relative).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidInput {
+            format!(
+                "Omarchy theme path {} is not a regular file.",
+                candidate.display()
+            )
+        } else {
+            format!(
+                "Could not open Omarchy theme file {}: {error}",
+                canonical.display()
+            )
+        }
     })?;
     let meta = file.metadata().map_err(|error| {
         format!(
@@ -592,9 +597,21 @@ fn canonical_omarchy_roots(home: &Path) -> Vec<PathBuf> {
     if !home.is_absolute() {
         return Vec::new();
     }
+    let Ok(canon_home) = std::fs::canonicalize(home) else {
+        return Vec::new();
+    };
+    let expected = omarchy_allowed_roots(&canon_home);
     omarchy_allowed_roots(home)
         .into_iter()
-        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .filter_map(|root| {
+            let resolved = std::fs::canonicalize(&root).ok()?;
+            // Accept a configured root only when it resolves to one of the three canonical
+            // allowlisted Omarchy directories beneath `canon_home`, rejecting symlink escapes.
+            expected
+                .iter()
+                .any(|allowed| resolved == *allowed)
+                .then_some(resolved)
+        })
         .collect()
 }
 
@@ -617,9 +634,13 @@ pub fn omarchy_theme_fingerprint(home: &Path) -> Option<String> {
     }
     for color_file in omarchy_candidate_color_files(home) {
         if let Ok(canonical) = std::fs::canonicalize(&color_file)
-            && roots.iter().any(|root| canonical.starts_with(root))
-            && let Ok(meta) = std::fs::metadata(&canonical)
+            && let Some((root, relative)) = roots
+                .iter()
+                .find_map(|root| canonical.strip_prefix(root).ok().map(|rel| (root, rel)))
+            && let Ok(file) = quarry_core::open_contained_regular_file(root, relative)
+            && let Ok(meta) = file.metadata()
             && meta.is_file()
+            && meta.len() <= MAX_OMARCHY_THEME_BYTES
         {
             let mtime = meta
                 .modified()
@@ -872,13 +893,18 @@ fn parse_omarchy_palette(
             canvas.blend(Rgba::rgb(0, 0, 0), 0.04)
         }
     });
-    let lighter = color(&["lighter_background"]).unwrap_or_else(|| {
-        if is_dark {
-            canvas.blend(foreground, 0.08)
-        } else {
-            canvas.blend(Rgba::rgb(255, 255, 255), 0.08)
-        }
-    });
+    let fallback_lighter = if is_dark {
+        canvas.blend(foreground, 0.08)
+    } else {
+        canvas.blend(Rgba::rgb(255, 255, 255), 0.08)
+    };
+    let raw_lighter = color(&["lighter_background"]).unwrap_or(fallback_lighter);
+    // Keep elevated surfaces readable under foreground text (avoid e.g. white lighter_background on dark mode).
+    let lighter = if contrast_ratio(foreground, raw_lighter) >= 4.5 {
+        raw_lighter
+    } else {
+        fallback_lighter
+    };
     let muted = color(&["muted", "color8"]).unwrap_or_else(|| canvas.blend(foreground, 0.28));
     let accent = color(&["accent", "blue", "color4"]).unwrap_or(base.selection_strong);
     let raw_selection =
@@ -889,10 +915,10 @@ fn parse_omarchy_palette(
     let grid_line = canvas.blend(muted, 0.24);
     let hover = canvas.blend(lighter, 0.75);
     let pressed = canvas.blend(muted, 0.45);
-    let control = if is_dark { lighter } else { canvas };
+    let mut control = if is_dark { lighter } else { canvas };
     let control_border = canvas.blend(muted, 0.60);
 
-    // Ensure primary text stays WCAG AA against canvas, zebra, chrome, and selection.
+    // Ensure primary text stays WCAG AA against canvas, zebra, chrome, control, hover, and selection.
     let bright_fg = color(&["bright_foreground", "light_foreground"]).unwrap_or(foreground);
     let text = ensure_contrast(foreground, canvas, bright_fg, 4.5);
     let selection = if contrast_ratio(text, raw_selection) >= 4.5 {
@@ -903,17 +929,24 @@ fn parse_omarchy_palette(
     let text = if contrast_ratio(text, selection) >= 4.5
         && contrast_ratio(text, chrome) >= 4.5
         && contrast_ratio(text, zebra) >= 4.5
+        && contrast_ratio(text, control) >= 4.5
+        && contrast_ratio(text, hover) >= 4.5
     {
         text
     } else {
         ensure_contrast(bright_fg, selection, base.text, 4.5)
     };
+    if contrast_ratio(text, control) < 4.5 {
+        control = canvas;
+    }
 
     let raw_secondary =
         color(&["dark_foreground", "color8"]).unwrap_or_else(|| canvas.blend(text, 0.68));
     let mut text_secondary = ensure_contrast(raw_secondary, canvas, text, 4.5);
-    if contrast_ratio(text_secondary, header_fill) < 4.5 {
-        text_secondary = ensure_contrast(text_secondary.blend(text, 0.45), header_fill, text, 4.5);
+    for surface in [chrome, header_fill, control] {
+        if contrast_ratio(text_secondary, surface) < 4.5 {
+            text_secondary = ensure_contrast(text_secondary.blend(text, 0.5), surface, text, 4.5);
+        }
     }
     let text_tertiary = canvas.blend(text, 0.45);
 
@@ -936,8 +969,10 @@ fn parse_omarchy_palette(
     let error_fill = canvas.blend(raw_red, if is_dark { 0.18 } else { 0.12 });
     let warning_fill = canvas.blend(raw_yellow, if is_dark { 0.18 } else { 0.14 });
     let mut error_text = ensure_contrast(raw_red, error_fill, base.error_text, 4.5);
-    if contrast_ratio(error_text, canvas) < 4.5 {
-        error_text = ensure_contrast(error_text, canvas, base.error_text, 4.5);
+    for surface in [canvas, chrome] {
+        if contrast_ratio(error_text, surface) < 4.5 {
+            error_text = ensure_contrast(error_text, surface, base.error_text, 4.5);
+        }
     }
     let warning_text = ensure_contrast(raw_yellow, warning_fill, base.warning_text, 4.5);
     let success_text = ensure_contrast(raw_green, canvas, base.success_text, 4.5);
@@ -983,27 +1018,60 @@ fn parse_omarchy_palette(
 /// thousands separators, optional decimal, optional scientific exponent, optional `%`).
 /// Used by desktop frontends to right-align numeric cells with OpenType `tnum` tabular figures.
 pub fn looks_numeric(text: &str) -> bool {
-    let text = text.trim();
-    let body = text
-        .trim_start_matches(['-', '+', '$', '€', '£'])
-        .trim_end_matches('%');
-    if body.is_empty() || body.len() > 32 {
+    let mut s = text.trim();
+    if s.is_empty() || s.len() > 36 {
         return false;
     }
-    let (mantissa, exponent) = match body.find(['e', 'E']) {
-        Some(index) => (&body[..index], Some(&body[index + 1..])),
-        None => (body, None),
+    let mut saw_sign = false;
+    let mut saw_currency = false;
+    loop {
+        if !saw_sign && let Some(rest) = s.strip_prefix(['+', '-']) {
+            saw_sign = true;
+            s = rest;
+        } else if !saw_currency && let Some(rest) = s.strip_prefix(['$', '€', '£']) {
+            saw_currency = true;
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    if let Some(rest) = s.strip_suffix('%') {
+        s = rest;
+    }
+    if s.is_empty() || s.len() > 32 {
+        return false;
+    }
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(index) => (&s[..index], Some(&s[index + 1..])),
+        None => (s, None),
     };
-    let mantissa_ok = mantissa.bytes().any(|byte| byte.is_ascii_digit())
-        && mantissa
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b','))
-        && mantissa.bytes().filter(|byte| *byte == b'.').count() <= 1;
+    let (int_part, frac_part) = match mantissa.find('.') {
+        Some(index) => (&mantissa[..index], Some(&mantissa[index + 1..])),
+        None => (mantissa, None),
+    };
+    if let Some(frac) = frac_part
+        && !frac.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let int_ok = if int_part.is_empty() {
+        frac_part.is_some_and(|frac| !frac.is_empty())
+    } else if int_part.contains(',') {
+        let mut groups = int_part.split(',');
+        let first = groups.next().unwrap_or("");
+        (1..=3).contains(&first.len())
+            && first.bytes().all(|byte| byte.is_ascii_digit())
+            && groups.all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()))
+    } else {
+        int_part.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let has_digit = int_part.bytes().any(|byte| byte.is_ascii_digit())
+        || frac_part.is_some_and(|frac| !frac.is_empty());
     let exponent_ok = exponent.is_none_or(|exponent| {
         let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
         !digits.is_empty() && digits.len() <= 7 && digits.bytes().all(|byte| byte.is_ascii_digit())
     });
-    mantissa_ok && exponent_ok
+    int_ok && has_digit && exponent_ok
 }
 
 /// Classifies a cell's raw bytes before whitespace rendering turns edge spaces into marks.
@@ -1308,13 +1376,63 @@ cyan = "#449dab"
         assert!(looks_numeric("42"));
         assert!(looks_numeric(" -1,204.50 "));
         assert!(looks_numeric("$1,204.50"));
+        assert!(looks_numeric("-$1,204.50"));
         assert!(looks_numeric("99.5%"));
         assert!(looks_numeric("1.5e-3"));
         assert!(!looks_numeric(""));
         assert!(!looks_numeric("alpha"));
+        assert!(!looks_numeric("++42"));
+        assert!(!looks_numeric("99%%"));
+        assert!(!looks_numeric("1,,2"));
+        assert!(!looks_numeric("1,23"));
+        assert!(!looks_numeric("1.2,3"));
         assert!(!looks_numeric("1.2.3"));
         assert!(!looks_numeric("2026-11-23"));
         assert!(source_looks_numeric(b"12345"));
         assert!(!source_looks_numeric(&[b'1'; 65]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omarchy_theme_sync_rejects_escaped_allowed_root_symlink_and_white_control_on_dark() {
+        use std::os::unix::fs::symlink;
+
+        // Symlinking ~/.config/omarchy itself to an external directory must be rejected.
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_theme = outside.path().join("current/theme");
+        std::fs::create_dir_all(&outside_theme).unwrap();
+        std::fs::write(
+            outside_theme.join("colors.toml"),
+            "mode = \"dark\"\nbackground = \"#111111\"\nforeground = \"#eeeeee\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join(".config")).unwrap();
+        symlink(outside.path(), home.path().join(".config/omarchy")).unwrap();
+        let escaped_root = resolve_theme(
+            ThemePreference::Omarchy,
+            ThemeAppearance::Light,
+            Some(home.path()),
+        );
+        assert_eq!(escaped_root.palette, LIGHT);
+        assert!(escaped_root.warning.is_some());
+
+        // Extreme lighter_background (#ffffff) on dark mode (#000000) must still yield a
+        // WCAG AA palette for control/text_secondary surfaces.
+        let home2 = tempfile::tempdir().unwrap();
+        let theme_dir = home2.path().join(".local/state/omarchy/current/theme");
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        std::fs::write(
+            theme_dir.join("colors.toml"),
+            "mode = \"dark\"\nbackground = \"#000000\"\nlighter_background = \"#ffffff\"\nforeground = \"#eeeeee\"\n",
+        )
+        .unwrap();
+        let resolved = resolve_theme(
+            ThemePreference::Omarchy,
+            ThemeAppearance::Dark,
+            Some(home2.path()),
+        );
+        assert!(resolved.warning.is_none());
+        assert!(palette_meets_wcag_aa(&resolved.palette));
     }
 }

@@ -354,6 +354,7 @@ impl TableDelegate for Grid {
         };
         let mut cell = div()
             .id(("grid-cell", row * 1024 + column))
+            .relative()
             .size_full()
             .flex()
             .items_center()
@@ -398,10 +399,12 @@ impl TableDelegate for Grid {
         if has_whitespace_mark {
             cell = cell.child(
                 div()
+                    .absolute()
+                    .top(px(2.))
+                    .right(px(2.))
                     .w(px(5.))
                     .h(px(5.))
                     .rounded_full()
-                    .flex_shrink_0()
                     .bg(rgb(tokens.indicator_fill.to_rgb_hex())),
             );
         }

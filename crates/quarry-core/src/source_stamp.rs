@@ -57,6 +57,75 @@ pub fn open_regular_file_nofollow(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Opens `relative` beneath `root` while enforcing directory-handle-relative containment on
+/// every path segment (`O_NOFOLLOW` + `O_DIRECTORY` for intermediate dirs and `O_NOFOLLOW` +
+/// `O_NONBLOCK` for the leaf regular file on Unix).
+pub fn open_contained_regular_file(root: &Path, relative: &Path) -> io::Result<File> {
+    use std::path::Component;
+
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(seg) => segments.push(seg),
+            Component::CurDir => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Relative path escapes allowed root.",
+                ));
+            }
+        }
+    }
+    let Some((leaf, parents)) = segments.split_last() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Path does not name a file inside the allowed root.",
+        ));
+    };
+
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open, openat};
+        let mut dir_fd = open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?;
+        for seg in parents {
+            dir_fd = openat(
+                &dir_fd,
+                *seg,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+        }
+        let leaf_fd = openat(
+            &dir_fd,
+            *leaf,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?;
+        let file = File::from(leaf_fd);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Path is not a regular file.",
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut full = root.to_path_buf();
+        for seg in parents {
+            full.push(seg);
+        }
+        full.push(leaf);
+        open_regular_file_nofollow(&full)
+    }
+}
+
 /// OS-level file identity (`(dev, ino)` on Unix, `(volume_serial, file_id)` on Windows)
 /// retained by dormant tab stubs without keeping an open file descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
