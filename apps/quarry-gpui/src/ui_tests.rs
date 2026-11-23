@@ -2185,3 +2185,628 @@ fn two_hundred_tabs_across_four_windows_stay_bounded_and_preserve_dirty_work(
         );
     });
 }
+
+#[test]
+fn file_url_and_launch_arg_parsing_handles_finder_paths_and_rejects_remote_urls() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    assert_eq!(
+        crate::file_url_to_path("file:///Users/test/My%20Data%20%231.csv"),
+        Some(PathBuf::from("/Users/test/My Data #1.csv"))
+    );
+    assert_eq!(
+        crate::file_url_to_path("FILE://LOCALHOST/tmp/caf%C3%A9.csv?ignored=1#frag"),
+        Some(PathBuf::from("/tmp/café.csv"))
+    );
+    assert_eq!(
+        crate::file_url_to_path("https://example.com/data.csv"),
+        None
+    );
+    assert_eq!(
+        crate::file_url_to_path("file://evil.example/data.csv"),
+        None
+    );
+    assert_eq!(crate::file_url_to_path("file:///tmp/bad%2"), None);
+    assert_eq!(crate::file_url_to_path("file:///tmp/bad%ZZ.csv"), None);
+    assert_eq!(crate::file_url_to_path("file:///tmp/null%00.csv"), None);
+
+    let filtered = crate::filter_launch_paths([
+        OsString::from("-psn_0_12345"),
+        OsString::from("/tmp/first.csv"),
+        OsString::from("/tmp/second.csv"),
+    ]);
+    assert_eq!(
+        filtered,
+        vec![
+            PathBuf::from("/tmp/first.csv"),
+            PathBuf::from("/tmp/second.csv"),
+        ]
+    );
+}
+
+#[test]
+fn about_dialog_info_plist_parser_reads_quarry_metadata_and_rejects_foreign_bundles() {
+    let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.danchamorro.quarry</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>214</string>
+    <key>QuarryArchitecture</key>
+    <string>arm64</string>
+    <key>QuarryGitRevision</key>
+    <string>b3afd22baf1a89d23505e0b4cf6ab4b6f2611dfc</string>
+    <key>QuarrySourceStatus</key>
+    <string>clean</string>
+</dict>
+</plist>"#;
+    let info = crate::workflows_ui::parse_info_plist(plist, "io.github.danchamorro.quarry")
+        .expect("matching bundle id must parse");
+    assert_eq!(info.version.as_deref(), Some("0.1.0"));
+    assert_eq!(info.build.as_deref(), Some("214"));
+    assert_eq!(info.architecture.as_deref(), Some("arm64"));
+    assert_eq!(
+        info.revision.as_deref(),
+        Some("b3afd22baf1a89d23505e0b4cf6ab4b6f2611dfc")
+    );
+    assert_eq!(info.source_status.as_deref(), Some("clean"));
+    let formatted = crate::workflows_ui::format_build_details(&info);
+    assert!(formatted.contains("Quarry 0.1.0"));
+    assert!(formatted.contains("Build: 214"));
+    assert!(formatted.contains("Revision: b3afd22baf1a89d23505e0b4cf6ab4b6f2611dfc"));
+    assert!(formatted.contains("Source status: clean"));
+    assert!(!formatted.contains("GPUI preview"));
+
+    let foreign = plist.replace("io.github.danchamorro.quarry", "com.example.other");
+    assert!(
+        crate::workflows_ui::parse_info_plist(&foreign, "io.github.danchamorro.quarry").is_none()
+    );
+}
+
+#[gpui_kit::test]
+fn two_dirty_docs_in_two_windows_close_original_edit_and_save_survivor(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("alpha.csv");
+    let path_b = dir.path().join("beta.csv");
+    std::fs::write(&path_a, "id,val\n1,orig_a\n").unwrap();
+    std::fs::write(&path_b, "id,val\n1,orig_b\n").unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+
+    let (w1_handle, w1_view) = open_test_window(cx, &controller);
+    let (w2_handle, w2_view) = open_test_window(cx, &controller);
+    let w1_id = cx.update(|cx| w1_view.read(cx).window_id);
+    let w2_id = cx.update(|cx| w2_view.read(cx).window_id);
+
+    cx.update_window(w1_handle.into(), |_, window, cx| {
+        w1_view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_a.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.update_window(w2_handle.into(), |_, window, cx| {
+        w2_view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_b.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+    wait_for_ui(cx, w2_handle, &controller, &w2_view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+
+    let doc_a = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(w1_id)
+            .unwrap()
+    });
+    let doc_b = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(w2_id)
+            .unwrap()
+    });
+
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.apply_cell_edit(w1_id, doc_a, 1, 1, "dirty_a".into(), cx)
+                .unwrap();
+            c.apply_cell_edit(w2_id, doc_b, 1, 1, "dirty_b_1".into(), cx)
+                .unwrap();
+        });
+    });
+
+    // Request closing Window 1 -> prompts for doc_a -> Discard closes Window 1 cleanly.
+    let review = cx.update(|cx| controller.update(cx, |c, cx| c.request_close_window(w1_id, cx)));
+    let review_token = match review {
+        crate::workbench::CloseReviewAction::ConfirmTab {
+            review_token,
+            window_id,
+            document_id,
+            ..
+        } => {
+            assert_eq!(window_id, w1_id);
+            assert_eq!(document_id, doc_a);
+            review_token
+        }
+        other => panic!("expected ConfirmTab for dirty doc_a, got {other:?}"),
+    };
+    let next = cx
+        .update(|cx| controller.update(cx, |c, cx| c.approve_discard_in_review(review_token, cx)));
+    assert!(matches!(next, crate::workbench::CloseReviewAction::Proceed));
+    // `sync_from_controller` reacts to `cx.notify()` and closes Window 1 cleanly.
+    cx.update(|cx| {
+        assert!(
+            controller.read(cx).window_handle(w1_id).is_none(),
+            "Window 1 handle must be unregistered once closed"
+        );
+        assert!(
+            controller
+                .read(cx)
+                .scheduler()
+                .tabs_in_window(w1_id)
+                .is_empty()
+        );
+        assert_eq!(
+            controller.read(cx).scheduler().tabs_in_window(w2_id),
+            vec![doc_b]
+        );
+    });
+
+    // Survivor Window 2 still owns dirty doc_b; make another edit and save it to disk.
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.apply_cell_edit(w2_id, doc_b, 1, 1, "dirty_b_final".into(), cx)
+                .unwrap();
+            c.start_save_active(w2_id, Some(doc_b), None, None, cx)
+                .unwrap();
+        });
+    });
+    wait_for_ui(cx, w2_handle, &controller, &w2_view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| !i.saving && !i.dirty)
+    });
+
+    assert_eq!(
+        std::fs::read_to_string(&path_a).unwrap(),
+        "id,val\n1,orig_a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path_b).unwrap(),
+        "id,val\n1,dirty_b_final\n"
+    );
+}
+
+#[gpui_kit::test]
+fn quit_cancelled_at_second_dirty_prompt_preserves_survivor_work_and_undo_history(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("first.csv");
+    let path_b = dir.path().join("second.csv");
+    std::fs::write(&path_a, "id,val\n1,a0\n").unwrap();
+    std::fs::write(&path_b, "id,val\n1,b0\n").unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+
+    let (w1_handle, w1_view) = open_test_window(cx, &controller);
+    let (w2_handle, w2_view) = open_test_window(cx, &controller);
+    let w1_id = cx.update(|cx| w1_view.read(cx).window_id);
+    let w2_id = cx.update(|cx| w2_view.read(cx).window_id);
+
+    cx.update_window(w1_handle.into(), |_, window, cx| {
+        w1_view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_a.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.update_window(w2_handle.into(), |_, window, cx| {
+        w2_view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_b.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+    wait_for_ui(cx, w2_handle, &controller, &w2_view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+
+    let doc_a = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(w1_id)
+            .unwrap()
+    });
+    let doc_b = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(w2_id)
+            .unwrap()
+    });
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.apply_cell_edit(w1_id, doc_a, 1, 1, "a1".into(), cx)
+                .unwrap();
+            c.apply_cell_edit(w2_id, doc_b, 1, 1, "b1".into(), cx)
+                .unwrap();
+            c.apply_cell_edit(w2_id, doc_b, 1, 1, "b2".into(), cx)
+                .unwrap();
+        });
+    });
+
+    // Cmd+Q starts unified cross-window quit review -> prompts on first dirty doc.
+    let first_prompt = cx.update(|cx| controller.update(cx, |c, cx| c.request_quit(cx)));
+    let (token_1, doc_1) = match first_prompt {
+        crate::workbench::CloseReviewAction::ConfirmTab {
+            review_token,
+            document_id,
+            ..
+        } => (review_token, document_id),
+        other => panic!("expected first ConfirmTab during quit, got {other:?}"),
+    };
+    let expected_survivor = if doc_1 == doc_a { doc_b } else { doc_a };
+    let survivor_window = if expected_survivor == doc_b {
+        w2_id
+    } else {
+        w1_id
+    };
+
+    // Discard the first dirty doc -> review advances to the second dirty doc.
+    let second_prompt =
+        cx.update(|cx| controller.update(cx, |c, cx| c.approve_discard_in_review(token_1, cx)));
+    let (token_2, doc_2) = match second_prompt {
+        crate::workbench::CloseReviewAction::ConfirmTab {
+            review_token,
+            document_id,
+            ..
+        } => (review_token, document_id),
+        other => panic!("expected second ConfirmTab during quit, got {other:?}"),
+    };
+    assert_eq!(doc_2, expected_survivor);
+
+    // Cancel ("Keep Editing") at the second dirty prompt!
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| c.cancel_close_review(Some(token_2), cx));
+    });
+
+    cx.update(|cx| {
+        assert!(!controller.update(cx, |c, _| c.take_quit_complete()));
+        let sched = controller.read(cx).scheduler();
+        let tab = sched
+            .tab(expected_survivor)
+            .expect("survivor tab must remain open");
+        let doc = tab
+            .document
+            .as_ref()
+            .expect("survivor doc must stay intact");
+        assert!(doc.is_dirty());
+        if expected_survivor == doc_b {
+            assert_eq!(
+                doc.cell_edits.get(&(1, 1)).map(|v| v.as_slice()),
+                Some(b"b2".as_slice())
+            );
+        }
+    });
+
+    // Verify Undo & Redo history survived intact on doc_b (the second dirty doc).
+    if expected_survivor == doc_b {
+        cx.update(|cx| {
+            // `redo = false` -> Undo restores edit 1 (`b1`).
+            controller
+                .update(cx, |c, cx| c.undo_redo_active(survivor_window, false, cx))
+                .unwrap();
+            let doc = controller
+                .read(cx)
+                .scheduler()
+                .tab(doc_b)
+                .unwrap()
+                .document
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                doc.cell_edits.get(&(1, 1)).map(|v| v.as_slice()),
+                Some(b"b1".as_slice())
+            );
+            // `redo = true` -> Redo restores edit 2 (`b2`).
+            controller
+                .update(cx, |c, cx| c.undo_redo_active(survivor_window, true, cx))
+                .unwrap();
+            let doc = controller
+                .read(cx)
+                .scheduler()
+                .tab(doc_b)
+                .unwrap()
+                .document
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                doc.cell_edits.get(&(1, 1)).map(|v| v.as_slice()),
+                Some(b"b2".as_slice())
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn save_as_targets_originating_document_across_focus_change(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("source_a.csv");
+    let path_b = dir.path().join("source_b.csv");
+    let path_c = dir.path().join("source_c.csv");
+    let copy_a = dir.path().join("source_a-copy.csv");
+    let copy_wrong = dir.path().join("source_a-wrong.csv");
+    std::fs::write(&path_a, "id,val\n1,alpha\n").unwrap();
+    std::fs::write(&path_b, "id,val\n1,beta\n").unwrap();
+    std::fs::write(&path_c, "id,val\n1,gamma\n").unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+
+    let (w1_handle, w1_view) = open_test_window(cx, &controller);
+    let (w2_handle, w2_view) = open_test_window(cx, &controller);
+    let w1_id = cx.update(|cx| w1_view.read(cx).window_id);
+    let w2_id = cx.update(|cx| w2_view.read(cx).window_id);
+    cx.update_window(w1_handle.into(), |_, window, cx| {
+        w1_view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_a.clone(), path_c.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.update_window(w2_handle.into(), |_, window, cx| {
+        w2_view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_b.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    let w1_tabs = cx.update(|cx| controller.read(cx).scheduler().tabs_in_window(w1_id));
+    assert_eq!(w1_tabs.len(), 2);
+    let (doc_a, doc_c) = (w1_tabs[0], w1_tabs[1]);
+
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| c.activate_tab(w1_id, doc_a, cx).unwrap());
+    });
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.document_id == doc_a && i.index_done)
+    });
+    wait_for_ui(cx, w2_handle, &controller, &w2_view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.apply_cell_edit(w1_id, doc_a, 1, 1, "ALPHA_EDITED".into(), cx)
+                .unwrap();
+        });
+    });
+
+    // 1. Focus shifts to Window 2 while Window 1's Save As sheet for `doc_a` is open.
+    // Completing Save As still targets `w1_id`/`doc_a` and writes `doc_a`'s edited rows.
+    cx.update_window(w2_handle.into(), |_, window, _| window.activate_window())
+        .unwrap();
+    let doc_b = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(w2_id)
+            .unwrap()
+    });
+    assert_ne!(doc_b, doc_a);
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.start_save_active(w1_id, Some(doc_a), Some(copy_a.clone()), None, cx)
+                .unwrap();
+        });
+    });
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |_, _, cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .tab(doc_a)
+            .is_some_and(|t| !t.document_writing())
+            && copy_a.exists()
+    });
+    assert_eq!(
+        std::fs::read_to_string(&copy_a).unwrap(),
+        "id,val\n1,ALPHA_EDITED\n"
+    );
+
+    // 2. Switching active tab inside Window 1 before Save As starts rejects cleanly
+    // instead of saving `doc_c` under `doc_a`'s chosen destination.
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| c.activate_tab(w1_id, doc_c, cx).unwrap());
+    });
+    let rejected = cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.start_save_active(w1_id, Some(doc_a), Some(copy_wrong.clone()), None, cx)
+        })
+    });
+    assert!(
+        rejected.is_err(),
+        "same-window tab switch before Save As starts must be rejected"
+    );
+    assert!(!copy_wrong.exists());
+}
+
+#[gpui_kit::test]
+fn external_open_urls_routes_hardlink_alias_to_owning_window(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let orig_path = dir.path().join("owned.csv");
+    let alias_path = dir.path().join("hardlink_alias.csv");
+    let other_path = dir.path().join("other.csv");
+    let fresh_path = dir.path().join("fresh.csv");
+    std::fs::write(&orig_path, "id,name\n1,Owned\n").unwrap();
+    std::fs::hard_link(&orig_path, &alias_path).unwrap();
+    std::fs::write(&other_path, "id,name\n2,Other\n").unwrap();
+    std::fs::write(&fresh_path, "id,name\n3,Fresh\n").unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+
+    let (w1_handle, w1_view) = open_test_window(cx, &controller);
+    let (w2_handle, w2_view) = open_test_window(cx, &controller);
+    let w1_id = cx.update(|cx| w1_view.read(cx).window_id);
+    let w2_id = cx.update(|cx| w2_view.read(cx).window_id);
+
+    cx.update_window(w1_handle.into(), |_, window, cx| {
+        w1_view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![orig_path.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.update_window(w2_handle.into(), |_, window, cx| {
+        w2_view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![other_path.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+    wait_for_ui(cx, w2_handle, &controller, &w2_view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+    let doc_orig = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(w1_id)
+            .unwrap()
+    });
+
+    // Simulate Finder opening the hard-link alias while Window 2 is the active/preferred window.
+    let alias_url = format!("file://{}", alias_path.display());
+    let parsed_alias = crate::file_url_to_path(&alias_url).expect("file URL must parse");
+    let route = cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.open_external_paths(Some(w2_id), vec![parsed_alias], cx)
+        })
+    });
+    assert_eq!(
+        route.expect("external open should return outcome").unwrap(),
+        (w1_id, doc_orig),
+        "hard-link alias must route back to Window 1's existing tab"
+    );
+    cx.update(|cx| {
+        let sched = controller.read(cx).scheduler();
+        assert_eq!(sched.total_tabs(), 2, "must not duplicate hard-linked file");
+        assert_eq!(sched.active_document(w1_id), Some(doc_orig));
+    });
+
+    // Opening a brand-new file via external open opens it in the active window (Window 2).
+    let fresh_outcome = cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.open_external_paths(Some(w2_id), vec![fresh_path.clone()], cx)
+        })
+    });
+    let (opened_win, opened_doc) = fresh_outcome.unwrap().unwrap();
+    assert_eq!(opened_win, w2_id);
+    cx.update(|cx| {
+        let sched = controller.read(cx).scheduler();
+        assert_eq!(sched.total_tabs(), 3);
+        assert_eq!(sched.active_document(w2_id), Some(opened_doc));
+    });
+}

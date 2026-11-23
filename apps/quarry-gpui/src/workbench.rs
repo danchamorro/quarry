@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::Root;
-use gpui_kit::{App, AppContext, Context, Entity, Global, WindowHandle};
+use gpui_kit::{AnyWindowHandle, App, AppContext, Context, Entity, Global, WindowHandle};
 use quarry_core::{
     CaseSensitivity, ColumnCleanup, DateFormatSuggestion, DuplicateTarget, Encoding, FilterQuery,
     HeaderMode, JoinMode, OpenOptions, SortPlan, StorageSpace, raise_nofile_limit,
@@ -680,6 +680,60 @@ impl WorkbenchController {
 
     pub fn window_handle(&self, id: WindowId) -> Option<WindowHandle<Root>> {
         self.windows.get(&id).copied()
+    }
+
+    /// Selects the window that should receive an externally opened document (such as a Finder
+    /// `application:openURLs:` request): prefers the active GPUI window if registered, falling
+    /// back to the first open window.
+    pub fn preferred_window_for_external_open(
+        &self,
+        active_window: Option<AnyWindowHandle>,
+    ) -> Option<WindowId> {
+        if let Some(active) = active_window
+            && let Some((&window_id, _)) = self
+                .windows
+                .iter()
+                .find(|(_, handle)| AnyWindowHandle::from(**handle) == active)
+        {
+            return Some(window_id);
+        }
+        self.windows.keys().next().copied()
+    }
+
+    /// Handles an OS-level document open request (e.g., macOS Finder double-click or `open -a`).
+    /// Returns `None` when `paths` is empty or no window is open yet so the caller can open a new
+    /// window. Existing documents (including hard-link aliases owned by another window) route to
+    /// and activate their owning window rather than opening a duplicate tab.
+    pub fn open_external_paths(
+        &mut self,
+        preferred_window: Option<WindowId>,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(WindowId, DocumentId), AppMessage>> {
+        if paths.is_empty() {
+            return None;
+        }
+        let target_window = preferred_window.or_else(|| self.windows.keys().next().copied())?;
+        let result = self.open_paths(target_window, paths, OpenOptions::default(), None, cx);
+        match &result {
+            Ok((owner_window, _)) => {
+                if let Some(handle) = self.window_handle(*owner_window) {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                }
+            }
+            Err(message) => {
+                self.set_window_message(target_window, Some(message.clone()), cx);
+                if let Some(handle) = self.window_handle(target_window) {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                }
+            }
+        }
+        Some(result)
+    }
+
+    /// Best-effort non-blocking cleanup invoked when GPUI notifies `on_app_quit`.
+    pub fn shutdown_cleanup(&mut self) {
+        self.join.release_all_async();
     }
 
     pub fn show_all_whitespace(&self) -> bool {

@@ -9,7 +9,13 @@ mod workflows_ui;
 #[cfg(test)]
 mod ui_tests;
 
+use std::cell::RefCell;
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::rc::Rc;
+
+#[cfg(target_os = "macos")]
+const APP_ID: &str = "io.github.danchamorro.quarry";
 
 #[cfg(not(target_os = "macos"))]
 use gpui_kit::component::menu::AppMenuBar;
@@ -2910,7 +2916,7 @@ impl Render for QuarryWindow {
                 self.controller.read(cx).scheduler().hydrated_count()
             )
         } else {
-            "Quarry GPUI".into()
+            "Quarry".into()
         };
 
         body.child(
@@ -3087,6 +3093,110 @@ fn apply_light_theme(cx: &mut App) {
     apply_resolved_theme(&light, cx);
 }
 
+fn filter_launch_paths<I>(args: I) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    args.into_iter()
+        .filter(|arg| !arg.to_string_lossy().starts_with("-psn_"))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parses a local `file://` URL delivered by the OS (for example macOS Finder
+/// `application:openURLs:`) into a local filesystem `PathBuf`. Rejects non-`file`
+/// schemes, remote authorities, malformed percent escapes, and NUL bytes.
+fn file_url_to_path(raw: &str) -> Option<PathBuf> {
+    let rest = if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("file://") {
+        &raw[7..]
+    } else {
+        return None;
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let path_part = if rest.starts_with('/') {
+        rest
+    } else if rest.len() >= 10 && rest[..10].eq_ignore_ascii_case("localhost/") {
+        &rest[9..]
+    } else {
+        return None;
+    };
+
+    let bytes = path_part.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = decode_hex_nibble(bytes[i + 1])?;
+            let lo = decode_hex_nibble(bytes[i + 2])?;
+            let value = (hi << 4) | lo;
+            if value == 0 {
+                return None;
+            }
+            decoded.push(value);
+            i += 3;
+        } else if bytes[i] == 0 {
+            return None;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    if decoded.is_empty() {
+        return None;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(OsString::from_vec(decoded)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(decoded).ok().map(PathBuf::from)
+    }
+}
+
+pub(crate) fn open_external_paths_in_app(
+    controller: &Entity<WorkbenchController>,
+    paths: Vec<PathBuf>,
+    cx: &mut App,
+) -> Option<Result<(WindowId, DocumentId), AppMessage>> {
+    if paths.is_empty() {
+        return None;
+    }
+    let preferred_window = controller
+        .read(cx)
+        .preferred_window_for_external_open(cx.active_window());
+    if preferred_window.is_none() {
+        open_quarry_window(controller.clone(), paths, None, cx);
+        cx.activate(true);
+        return None;
+    }
+    let outcome = controller.update(cx, |controller, cx| {
+        controller.open_external_paths(preferred_window, paths, cx)
+    });
+    cx.activate(true);
+    outcome
+}
+
+#[derive(Default)]
+struct ExternalOpenState {
+    queued: Vec<PathBuf>,
+    ready: Option<(AsyncApp, Entity<WorkbenchController>)>,
+}
+
 fn open_quarry_window(
     controller: Entity<WorkbenchController>,
     initial_paths: Vec<PathBuf>,
@@ -3127,28 +3237,91 @@ fn open_quarry_window(
 }
 
 fn main() {
-    let initial_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(move |cx| {
-            gpui_kit::init(cx);
-            bind_shortcuts(cx);
-            install_menus(cx);
-            let controller = WorkbenchController::init(cx);
-            let initial_theme = controller.read(cx).resolved_theme().clone();
-            apply_resolved_theme(&initial_theme, cx);
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            cx.spawn(async move |cx| {
-                cx.update(|cx| {
-                    open_quarry_window(controller, initial_paths, None, cx);
-                });
-            })
-            .detach();
+    #[cfg(target_os = "macos")]
+    let _install_lock = match quarry_core::acquire_macos_install_lock(APP_ID) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("Quarry cannot start while an update is in progress: {error}");
+            return;
+        }
+    };
+
+    let _nofile_status = quarry_core::raise_nofile_limit(quarry_workbench::DEFAULT_NOFILE_TARGET);
+    let initial_paths = filter_launch_paths(std::env::args_os().skip(1));
+    let external_open = Rc::new(RefCell::new(ExternalOpenState::default()));
+    let external_open_for_urls = Rc::clone(&external_open);
+
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    application.on_open_urls(move |urls| {
+        let paths: Vec<PathBuf> = urls.iter().filter_map(|u| file_url_to_path(u)).collect();
+        if paths.is_empty() {
+            return;
+        }
+        let dispatch = {
+            let mut state = external_open_for_urls.borrow_mut();
+            if let Some((async_app, controller)) = state.ready.clone() {
+                Some((async_app, controller))
+            } else {
+                state.queued.extend(paths.clone());
+                None
+            }
+        };
+        if let Some((async_app, controller)) = dispatch {
+            async_app
+                .spawn(async move |cx| {
+                    cx.update(|cx| {
+                        let _ = open_external_paths_in_app(&controller, paths, cx);
+                    });
+                })
+                .detach();
+        }
+    });
+    application.on_reopen(|cx| {
+        if cx.windows().is_empty()
+            && let Some(controller) = WorkbenchController::try_global(cx)
+        {
+            open_quarry_window(controller, Vec::new(), None, cx);
             cx.activate(true);
-        });
+        }
+    });
+    application.run(move |cx| {
+        gpui_kit::init(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        let controller = WorkbenchController::init(cx);
+        let initial_theme = controller.read(cx).resolved_theme().clone();
+        apply_resolved_theme(&initial_theme, cx);
+        let quit_controller = controller.clone();
+        cx.on_app_quit(move |cx| {
+            quit_controller.update(cx, |controller, _| controller.shutdown_cleanup());
+            async {}
+        })
+        .detach();
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.spawn(async move |cx| {
+            cx.update(|cx| {
+                let mut open_paths = initial_paths;
+                {
+                    let mut state = external_open.borrow_mut();
+                    open_paths.append(&mut state.queued);
+                }
+                open_quarry_window(controller.clone(), open_paths, None, cx);
+                let late_paths = {
+                    let mut state = external_open.borrow_mut();
+                    state.ready = Some((cx.to_async(), controller.clone()));
+                    std::mem::take(&mut state.queued)
+                };
+                if !late_paths.is_empty() {
+                    let _ = open_external_paths_in_app(&controller, late_paths, cx);
+                }
+            });
+        })
+        .detach();
+        cx.activate(true);
+    });
 }
