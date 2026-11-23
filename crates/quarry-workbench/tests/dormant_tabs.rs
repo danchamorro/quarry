@@ -2112,8 +2112,8 @@ fn scheduler_polls_search_filtered_export_sort_cleanup_and_duplicate_removal() {
         3
     );
 
-    // 5. Numeric Sort (Descending) via poll_structural_edits must actually reorder rows
-    // (30, 20, 10) rather than matching the already-ascending dedup order.
+    // 5. Numeric Sort (Descending) via poll_structural_edits reorders rows to (30, 20, 10)
+    // and we assert explicit completion for `ids[0]` before checking the output cells.
     let plan = quarry_core::SortPlan::from(quarry_core::SortSpec {
         column: 1,
         direction: quarry_core::SortDirection::Descending,
@@ -2260,4 +2260,88 @@ fn pending_split_blocks_concurrent_edits_and_workers_enforce_fd_budget() {
             .is_some(),
         "rejected confirmation must preserve pending_materialization"
     );
+
+    // Clear pending split & filter, then verify split analysis->materialization defers
+    // when the FD budget is temporarily full and resumes once descriptors are released.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .clear_filter()
+        .unwrap();
+    scheduler.cancel_pending_materialization(ids[0]);
+    let mut split_sched = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_process_fds: 8,
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    let sids = split_sched
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [dir.path().join("split-fd.csv")],
+            open_options(),
+            None,
+        )
+        .unwrap();
+    finish_active_indexing(&mut split_sched, sids[0]);
+    split_sched
+        .with_reserved_job_fds(
+            sids[0],
+            2,
+            true,
+            |doc| doc.start_split(0, b"-".to_vec()),
+            |e| quarry_workbench::AppMessage::warning(e.to_string()),
+        )
+        .unwrap();
+    // 1 active doc + 2 analysis job = 3 reserved; hold 4 more so 7/8 are used (< 8 cap, 0 free).
+    let blocker = split_sched
+        .fd_budget()
+        .try_reserve(FdCategory::BackgroundJob, 4)
+        .unwrap();
+    assert_eq!(split_sched.fd_budget().snapshot().total_reserved, 7);
+    // Give the tiny split analysis plenty of time to finish on its worker thread, then poll.
+    std::thread::sleep(Duration::from_millis(50));
+    let deferred = split_sched.poll_structural_edits();
+    assert!(deferred.is_empty());
+    assert!(
+        split_sched.sync_fd_leases().is_ok(),
+        "polling while full must defer materialization rather than exceeding FD budget"
+    );
+    assert!(
+        split_sched
+            .tab(sids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .working_copy
+            .is_none(),
+        "materialization must not open working-copy storage while FD budget is full"
+    );
+
+    // Release the blocker lease; polling must now reserve FDs, materialize, and install the split.
+    drop(blocker);
+    let mut split_done = false;
+    for _ in 0..400 {
+        let done = split_sched.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == sids[0]) {
+            assert!(
+                comp.result.is_ok(),
+                "unexpected split error: {:?}",
+                comp.result
+            );
+            split_done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        split_done,
+        "deferred split must complete once FDs are available"
+    );
+    assert!(split_sched.fd_budget().snapshot().peak_reserved < 8);
 }

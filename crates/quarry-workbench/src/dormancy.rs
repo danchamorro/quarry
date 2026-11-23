@@ -2272,14 +2272,21 @@ impl WorkbenchScheduler {
         let mut results = Vec::new();
         let mut ready_to_install: Vec<(DocumentId, MaterializedWorkingCopy)> = Vec::new();
         let mut any_finished = false;
+        let fd_budget = self.fd_budget.clone();
         let ids: Vec<DocumentId> = self.tabs.keys().copied().collect();
         for id in ids {
             let Some(slot) = self.tabs.get_mut(&id) else {
                 continue;
             };
-            if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
+            let SlotResidency::Hydrated {
+                fd_lease,
+                temp_dir_fd_lease,
+                job_fd_lease,
+                ..
+            } = &mut slot.residency
+            else {
                 continue;
-            }
+            };
             let Some(doc) = slot.tab.document.as_mut() else {
                 continue;
             };
@@ -2290,6 +2297,54 @@ impl WorkbenchScheduler {
                 )
             {
                 continue;
+            }
+            let advancing_split_analysis = matches!(
+                doc.structural_job,
+                Some(StructuralJob::AnalyzingSplit { .. })
+            );
+            if advancing_split_analysis {
+                // `poll_structural_edit()` can transition a completed split analysis directly into
+                // `begin_materialization()`, which allocates `original_session` and working-copy
+                // storage. Pre-reserve those descriptors before polling, or defer until capacity
+                // is available so the transition can never bypass the scheduler's FD cap.
+                let base_doc_fds = doc_active_document_fds(doc);
+                let base_dir_fds = doc_retained_dir_fds(doc);
+                let base_job_fds = doc_active_job_fds(doc);
+                let target_doc_fds = base_doc_fds.max(2);
+                let target_dir_fds = base_dir_fds + usize::from(doc.working_copy.is_none());
+                let target_job_fds = base_job_fds.max(2);
+                let reserve_result = (|| -> Result<(), SchedulerError> {
+                    fd_lease.try_resize(target_doc_fds)?;
+                    try_sync_optional_lease(
+                        &fd_budget,
+                        temp_dir_fd_lease,
+                        FdCategory::TempDirectory,
+                        target_dir_fds,
+                    )?;
+                    try_sync_optional_lease(
+                        &fd_budget,
+                        job_fd_lease,
+                        FdCategory::BackgroundJob,
+                        target_job_fds,
+                    )?;
+                    Ok(())
+                })();
+                if reserve_result.is_err() {
+                    let _ = fd_lease.try_resize(base_doc_fds);
+                    let _ = try_sync_optional_lease(
+                        &fd_budget,
+                        temp_dir_fd_lease,
+                        FdCategory::TempDirectory,
+                        base_dir_fds,
+                    );
+                    let _ = try_sync_optional_lease(
+                        &fd_budget,
+                        job_fd_lease,
+                        FdCategory::BackgroundJob,
+                        base_job_fds,
+                    );
+                    continue;
+                }
             }
             match doc.poll_structural_edit() {
                 Ok(Some(ready)) => {
@@ -2318,6 +2373,19 @@ impl WorkbenchScheduler {
                     });
                 }
             }
+            let _ = fd_lease.try_resize(doc_active_document_fds(doc));
+            let _ = try_sync_optional_lease(
+                &fd_budget,
+                temp_dir_fd_lease,
+                FdCategory::TempDirectory,
+                doc_retained_dir_fds(doc),
+            );
+            let _ = try_sync_optional_lease(
+                &fd_budget,
+                job_fd_lease,
+                FdCategory::BackgroundJob,
+                doc_active_job_fds(doc),
+            );
         }
 
         for (id, mut ready) in ready_to_install {
