@@ -26,20 +26,29 @@ fn unix_storage_preferences_path(
         .map(|root| root.join("quarry/storage-preferences"))
 }
 
-/// Persisted user-selected temporary scratch folder across restarts (ADR 0005 amendment).
-/// Only stores an absolute custom folder path; `None` means the OS default temporary folder.
+/// Persisted user-selected temporary scratch folder and sidecar index-cache preference
+/// across restarts (ADR 0005 amendment).
+/// `scratch_directory = None` means the OS default temporary folder; `index_cache_enabled = None`
+/// means the preference was not explicitly written (defaults to `true`).
 #[derive(Debug, Default)]
 pub struct StoragePreferences {
     pub scratch_directory: Option<PathBuf>,
+    pub index_cache_enabled: Option<bool>,
     pub load_error: Option<String>,
     path: Option<PathBuf>,
     persist_enabled: bool,
 }
 
 impl StoragePreferences {
+    /// Effective sidecar index-cache setting (defaults to `true` when unset).
+    pub fn index_cache_enabled(&self) -> bool {
+        self.index_cache_enabled.unwrap_or(true)
+    }
+
     /// Loads preferences from an explicit path without failing when `path` is `None`.
     pub fn load_from(path: Option<PathBuf>, persist_enabled: bool) -> Self {
         let mut scratch_directory = None;
+        let mut index_cache_enabled = None;
         let mut load_error = None;
         if let Some(pref_path) = path.as_ref() {
             match std::fs::File::open(pref_path) {
@@ -59,8 +68,11 @@ impl StoragePreferences {
                                 match String::from_utf8(raw) {
                                     Ok(content) => {
                                         if !content.trim().is_empty() {
-                                            match parse_scratch_directory_pref(&content) {
-                                                Some(dir) => scratch_directory = Some(dir),
+                                            match parse_storage_prefs(&content) {
+                                                Some((dir, cache)) => {
+                                                    scratch_directory = dir;
+                                                    index_cache_enabled = cache;
+                                                }
                                                 None => {
                                                     load_error = Some(format!(
                                                         "Saved temporary folder preference ({}) could not be parsed. Open File > Temporary Storage… to choose your temporary folder again.",
@@ -98,6 +110,7 @@ impl StoragePreferences {
         }
         Self {
             scratch_directory,
+            index_cache_enabled,
             load_error,
             path,
             persist_enabled,
@@ -125,26 +138,24 @@ impl StoragePreferences {
         Self::load_from(path, true)
     }
 
-    /// Updates the in-memory preference and persists it atomically as a private file.
-    pub fn set_scratch_directory(&mut self, directory: Option<&Path>) -> std::io::Result<()> {
-        let encoded = match directory {
-            Some(dir) => {
-                if !dir.is_absolute() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Temporary folder must be an absolute path.",
-                    ));
-                }
-                let encoded = encode_scratch_directory_pref(dir)?;
-                self.scratch_directory = Some(dir.to_path_buf());
-                encoded
-            }
-            None => {
-                self.scratch_directory = None;
-                String::new()
-            }
-        };
-        self.load_error = None;
+    fn persist_current(&self) -> std::io::Result<()> {
+        let mut encoded = String::new();
+        if let Some(dir) = self.scratch_directory.as_deref() {
+            encoded.push_str(&encode_scratch_directory_pref(dir)?);
+        }
+        if let Some(enabled) = self.index_cache_enabled {
+            encoded.push_str(if enabled {
+                "index_cache_enabled=true\n"
+            } else {
+                "index_cache_enabled=false\n"
+            });
+        }
+        if encoded.len() as u64 > MAX_STORAGE_PREFERENCES_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Storage preferences exceed the maximum supported size.",
+            ));
+        }
         let Some(path) = &self.path else {
             if self.persist_enabled {
                 return Err(std::io::Error::other(
@@ -162,6 +173,38 @@ impl StoragePreferences {
         file.write_all(encoded.as_bytes())?;
         file.flush()?;
         file.persist(path).map_err(|e| e.error)?;
+        Ok(())
+    }
+
+    /// Updates the in-memory scratch folder preference and persists it atomically.
+    pub fn set_scratch_directory(&mut self, directory: Option<&Path>) -> std::io::Result<()> {
+        if let Some(dir) = directory
+            && !dir.is_absolute()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Temporary folder must be an absolute path.",
+            ));
+        }
+        let previous = self.scratch_directory.clone();
+        self.scratch_directory = directory.map(Path::to_path_buf);
+        self.load_error = None;
+        if let Err(error) = self.persist_current() {
+            self.scratch_directory = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Updates the persistent sidecar index-cache toggle and saves it atomically.
+    pub fn set_index_cache_enabled(&mut self, enabled: bool) -> std::io::Result<()> {
+        let previous = self.index_cache_enabled;
+        self.index_cache_enabled = Some(enabled);
+        self.load_error = None;
+        if let Err(error) = self.persist_current() {
+            self.index_cache_enabled = previous;
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -214,46 +257,63 @@ fn encode_scratch_directory_pref(path: &Path) -> std::io::Result<String> {
     Ok(encoded)
 }
 
-fn parse_scratch_directory_pref(content: &str) -> Option<PathBuf> {
+fn parse_storage_prefs(content: &str) -> Option<(Option<PathBuf>, Option<bool>)> {
+    let mut scratch = None;
+    let mut cache = None;
+    let mut parsed_any = false;
     for line in content.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(rest) = line.strip_prefix("scratch_directory=")
-            && !rest.is_empty()
-            && !rest.contains('\0')
-        {
-            let candidate = PathBuf::from(rest);
-            if candidate.is_absolute() {
-                return Some(candidate);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("scratch_directory=") {
+            if rest.is_empty() || rest.contains('\0') {
+                return None;
             }
+            let candidate = PathBuf::from(rest);
+            if !candidate.is_absolute() {
+                return None;
+            }
+            scratch = Some(candidate);
+            parsed_any = true;
+            continue;
         }
         #[cfg(unix)]
         if let Some(hex) = line.strip_prefix("scratch_directory_hex=") {
             use std::os::unix::ffi::OsStringExt;
             let hex = hex.trim();
-            if !hex.is_empty() && hex.len().is_multiple_of(2) {
-                let mut bytes = Vec::with_capacity(hex.len() / 2);
-                let mut valid = true;
-                for pair in hex.as_bytes().as_chunks::<2>().0 {
-                    let Ok(s) = std::str::from_utf8(pair) else {
-                        valid = false;
-                        break;
-                    };
-                    let Ok(byte) = u8::from_str_radix(s, 16) else {
-                        valid = false;
-                        break;
-                    };
-                    bytes.push(byte);
-                }
-                if valid && !bytes.contains(&0) {
-                    let candidate = PathBuf::from(std::ffi::OsString::from_vec(bytes));
-                    if candidate.is_absolute() {
-                        return Some(candidate);
-                    }
-                }
+            if hex.is_empty() || !hex.len().is_multiple_of(2) {
+                return None;
             }
+            let mut bytes = Vec::with_capacity(hex.len() / 2);
+            for pair in hex.as_bytes().as_chunks::<2>().0 {
+                let s = std::str::from_utf8(pair).ok()?;
+                let byte = u8::from_str_radix(s, 16).ok()?;
+                bytes.push(byte);
+            }
+            if bytes.contains(&0) {
+                return None;
+            }
+            let candidate = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+            if !candidate.is_absolute() {
+                return None;
+            }
+            scratch = Some(candidate);
+            parsed_any = true;
+            continue;
         }
+        if let Some(val) = line.strip_prefix("index_cache_enabled=") {
+            match val.trim() {
+                "true" => cache = Some(true),
+                "false" => cache = Some(false),
+                _ => return None,
+            }
+            parsed_any = true;
+            continue;
+        }
+        return None;
     }
-    None
+    parsed_any.then_some((scratch, cache))
 }
 
 /// Inspects available disk space for `directory` (validating custom scratch folders) and sums
@@ -319,16 +379,20 @@ mod tests {
         );
 
         prefs.set_scratch_directory(Some(&scratch)).unwrap();
+        prefs.set_index_cache_enabled(false).unwrap();
         let reloaded = StoragePreferences::load_from(Some(pref_path.clone()), true);
         assert_eq!(
             reloaded.scratch_directory.as_deref(),
             Some(scratch.as_path())
         );
+        assert_eq!(reloaded.index_cache_enabled, Some(false));
+        assert!(!reloaded.index_cache_enabled());
         assert!(reloaded.load_error.is_none());
 
         prefs.set_scratch_directory(None).unwrap();
         let cleared = StoragePreferences::load_from(Some(pref_path), true);
         assert!(cleared.scratch_directory.is_none());
+        assert_eq!(cleared.index_cache_enabled, Some(false));
     }
 
     #[test]

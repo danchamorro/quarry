@@ -198,6 +198,9 @@ impl WorkbenchController {
             config.working_directory = dir;
             config.custom_working_directory = true;
         }
+        if let Some(enabled) = storage_prefs.index_cache_enabled {
+            config.index_cache_enabled = enabled;
+        }
         let scheduler = WorkbenchScheduler::new(config);
         let working_dir = scheduler.working_directory().to_path_buf();
         let custom_dir = scheduler.custom_working_directory();
@@ -783,6 +786,18 @@ impl WorkbenchController {
         let Some(id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
+        let is_compressed = self
+            .scheduler
+            .tab(id)
+            .and_then(|t| t.document.as_ref())
+            .is_some_and(Document::is_compressed)
+            || self
+                .scheduler
+                .tab_logical_path(id)
+                .is_some_and(|p| quarry_workbench::compressed::is_gzip(&p));
+        if is_compressed && !self.write_slot_available() {
+            return Err(quarry_workbench::compressed::WRITE_SLOTS_FULL.into());
+        }
         self.scheduler
             .reopen_tab(window, id, options, encoding)
             .map_err(|e| e.to_string())?;
@@ -810,7 +825,7 @@ impl WorkbenchController {
         let Some(id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
-        let (options, encoding) = {
+        let (options, encoding, is_compressed) = {
             let tab = self
                 .scheduler
                 .tab(id)
@@ -819,8 +834,16 @@ impl WorkbenchController {
                 .document
                 .as_ref()
                 .map_or_else(|| tab.open_options(), Document::current_open_options);
-            (options, tab.encoding_mode)
+            let compressed = tab.document.as_ref().is_some_and(Document::is_compressed)
+                || self
+                    .scheduler
+                    .tab_logical_path(id)
+                    .is_some_and(|p| quarry_workbench::compressed::is_gzip(&p));
+            (options, tab.encoding_mode, compressed)
         };
+        if is_compressed && !self.write_slot_available() {
+            return Err(quarry_workbench::compressed::WRITE_SLOTS_FULL.into());
+        }
         self.scheduler
             .reopen_tab(window, id, options, encoding)
             .map_err(|e| e.to_string())?;
@@ -2753,9 +2776,17 @@ impl WorkbenchController {
         Ok(())
     }
 
-    pub fn set_index_cache_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    pub fn set_index_cache_enabled(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.storage_prefs
+            .set_index_cache_enabled(enabled)
+            .map_err(|e| e.to_string())?;
         self.scheduler.set_index_cache_enabled(enabled);
         cx.notify();
+        Ok(())
     }
 
     pub fn start_clear_index_cache(&mut self, cx: &mut Context<Self>) {

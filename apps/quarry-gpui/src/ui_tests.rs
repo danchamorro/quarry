@@ -1570,7 +1570,22 @@ fn gzip_streaming_lifecycle_preview_decompress_and_save_as_uncompressed(cx: &mut
         window.click("gzip-preview-only", cx);
         window.render_frame(cx);
         assert!(window.find("gzip-preview-reload").visible());
-        // Reload from Disk triggers full decompression.
+        // Reload from Disk must respect the shared two-writer cap.
+        {
+            let slots = controller
+                .read(cx)
+                .scheduler()
+                .decompression_slots()
+                .clone();
+            let _s1 = slots.claim();
+            let _s2 = slots.claim();
+            let blocked = controller.update(cx, |c, cx| c.reload_active_tab(win_id, cx));
+            assert!(
+                blocked.is_err(),
+                "reloading a compressed tab must fail while both write slots are occupied"
+            );
+        }
+        // Reload from Disk triggers full decompression once slots are free.
         window.click("gzip-preview-reload", cx);
     })
     .unwrap();
@@ -1581,11 +1596,17 @@ fn gzip_streaming_lifecycle_preview_decompress_and_save_as_uncompressed(cx: &mut
         })
     });
 
-    // Compressed documents are read-only (Save disabled) but Save As is enabled.
+    // Compressed documents are read-only (Save disabled) but Save As is enabled,
+    // and retained_storage_paths() includes the private decompressed copy.
     cx.update(|cx| {
         let q = view.read(cx);
         assert!(!q.command_enabled(quarry_workbench::CommandId::Save, cx));
         assert!(q.command_enabled(quarry_workbench::CommandId::SaveAs, cx));
+        let retained = controller.read(cx).scheduler().retained_storage_paths();
+        assert!(
+            !retained.is_empty(),
+            "completed gzip private copy must be counted in retained_storage_paths()"
+        );
     });
 
     // Reject .gz Save As destination, then write uncompressed copy.
@@ -1709,8 +1730,8 @@ fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
     cx.update(|cx| {
         controller.update(cx, |c, cx| {
             c.set_scratch_directory(custom_scratch.clone(), cx).unwrap();
-            c.set_index_cache_enabled(true, cx);
-            assert!(c.index_cache_enabled());
+            c.set_index_cache_enabled(false, cx).unwrap();
+            assert!(!c.index_cache_enabled());
         });
     });
     let reloaded = quarry_workbench::StoragePreferences::load_from(Some(pref_file), true);
@@ -1718,6 +1739,8 @@ fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
         reloaded.scratch_directory.as_deref(),
         Some(custom_scratch.as_path())
     );
+    assert_eq!(reloaded.index_cache_enabled, Some(false));
+    assert!(!reloaded.index_cache_enabled());
     cx.update(|cx| {
         controller.update(cx, |c, cx| {
             c.reset_scratch_directory(cx).unwrap();

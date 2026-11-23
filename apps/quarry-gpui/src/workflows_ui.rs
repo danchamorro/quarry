@@ -1729,6 +1729,7 @@ pub fn open_temporary_storage_dialog(
                 let c_cache_clr = c_body.clone();
                 let err_choose = err_state.clone();
                 let err_reset = err_state.clone();
+                let err_cache = err_state.clone();
 
                 let space_line = if checking {
                     "Checking temporary folder space…".to_owned()
@@ -1855,8 +1856,12 @@ pub fn open_temporary_storage_dialog(
                                     .label("Enable persistent sidecar index cache for faster reopens")
                                     .checked(cache_enabled)
                                     .on_click(move |checked, _, cx| {
-                                        c_cache_tog.update(cx, |c, cx| {
-                                            c.set_index_cache_enabled(*checked, cx);
+                                        let res = c_cache_tog.update(cx, |c, cx| {
+                                            c.set_index_cache_enabled(*checked, cx)
+                                        });
+                                        err_cache.update(cx, |e, cx| {
+                                            *e = res.err();
+                                            cx.notify();
                                         });
                                     }),
                             )

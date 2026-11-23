@@ -666,7 +666,12 @@ impl JoinWorkflow {
     }
 
     pub fn ready_to_analyze(&self) -> bool {
+        let open_tabs_captured = (0..2).all(|side| {
+            !matches!(self.sides[side], Some(JoinSideSource::OpenTab { .. }))
+                || self.captured[side].is_some()
+        });
         !self.busy()
+            && open_tabs_captured
             && self.sides[0].is_some()
             && self.sides[1].is_some()
             && self.headers[0].is_some()
@@ -857,6 +862,24 @@ impl JoinWorkflow {
         self.cancel_requested = true;
     }
 
+    /// Clears any open-tab side selections and headers whose captures are being released so
+    /// subsequent analyses cannot fall back to unedited disk files.
+    fn clear_open_tab_sides(&mut self) {
+        let mut cleared_any = false;
+        for side in 0..2 {
+            if matches!(self.sides[side], Some(JoinSideSource::OpenTab { .. })) {
+                self.sides[side] = None;
+                self.headers[side] = None;
+                cleared_any = true;
+            }
+            self.captured[side] = None;
+            self.probes[side] = None;
+        }
+        if cleared_any {
+            self.rebuild_output_columns();
+        }
+    }
+
     /// Releases all open-tab `DocumentLease`s and any analyzed join workspace.
     pub fn release_all(&mut self) {
         self.cancel();
@@ -879,8 +902,7 @@ impl JoinWorkflow {
         for cleanup in self.cleanups.drain(..) {
             let _ = cleanup.join();
         }
-        self.captured = [None, None];
-        self.probes = [None, None];
+        self.clear_open_tab_sides();
         self.destination = None;
     }
 
@@ -932,9 +954,9 @@ impl JoinWorkflow {
             match self.writing.take().unwrap().wait() {
                 Ok(Some(summary)) => {
                     self.result = Some(summary);
-                    // Release open-tab leases once the join output is safely published.
-                    self.captured = [None, None];
-                    self.probes = [None, None];
+                    // Release open-tab leases and clear open-tab selections so a later Preview
+                    // cannot silently read unedited disk bytes without re-capturing.
+                    self.clear_open_tab_sides();
                 }
                 Ok(None) => {
                     self.message = Some("Join cancelled. No joined file was published.".into());
@@ -991,6 +1013,7 @@ pub struct InspectWorkflow {
     job: Option<InspectionJob>,
     recovery: Option<RecoveryJob>,
     raw_decompression: Option<RawGzipDecompression>,
+    retired_jobs: Vec<JoinHandle<()>>,
     pub report: Option<InspectionReport>,
     pub selected: BTreeSet<usize>,
     pub focused: usize,
@@ -1027,6 +1050,7 @@ impl InspectWorkflow {
             job: None,
             recovery: None,
             raw_decompression: None,
+            retired_jobs: Vec::new(),
             report: None,
             selected: BTreeSet::new(),
             focused: 0,
@@ -1077,10 +1101,36 @@ impl InspectWorkflow {
         self.message = None;
     }
 
-    pub fn configure_for_document(&mut self, doc_id: DocumentId, doc: &Document) {
+    /// Cancels and detaches any in-flight inspection, recovery, or raw decompression job so
+    /// stale completions can never populate a newly configured target while keeping private
+    /// copies and decompression slots alive until the cancelled worker exits.
+    pub fn discard_in_flight(&mut self) {
         self.cancel();
+        let job = self.job.take();
+        let recovery = self.recovery.take();
+        let raw = self.raw_decompression.take();
+        let private_copy = self.private_copy.take();
+        self.recovery_destination = None;
+        if job.is_some() || recovery.is_some() || raw.is_some() {
+            self.retired_jobs.push(thread::spawn(move || {
+                if let Some(j) = job {
+                    let _ = j.wait();
+                }
+                if let Some(r) = recovery {
+                    let _ = r.wait();
+                }
+                if let Some(raw_decomp) = raw {
+                    let _ = raw_decomp.job.wait();
+                    drop(raw_decomp._slot);
+                }
+                drop(private_copy);
+            }));
+        }
+    }
+
+    pub fn configure_for_document(&mut self, doc_id: DocumentId, doc: &Document) {
+        self.discard_in_flight();
         self.clear_report();
-        self.private_copy = None;
         self.target_doc_id = Some(doc_id);
         self.operation_diagnostic = doc.pending_diagnostic.as_deref().cloned();
         self.delimiter = match doc.session.dialect.delimiter {
@@ -1121,9 +1171,8 @@ impl InspectWorkflow {
     }
 
     pub fn configure_for_failed_open(&mut self, failed: &FailedOpen) {
-        self.cancel();
+        self.discard_in_flight();
         self.clear_report();
-        self.private_copy = None;
         self.target_doc_id = None;
         self.session_for_compressed_guard = None;
         self.edits = InspectionEdits::default();
@@ -1145,9 +1194,8 @@ impl InspectWorkflow {
     }
 
     pub fn configure_for_path(&mut self, path: PathBuf) {
-        self.cancel();
+        self.discard_in_flight();
         self.clear_report();
-        self.private_copy = None;
         self.target_doc_id = None;
         self.session_for_compressed_guard = None;
         self.edits = InspectionEdits::default();
@@ -1410,7 +1458,25 @@ impl InspectWorkflow {
                 Err(error) => self.message = Some(Diagnostic::from_error(&error).details()),
             }
         }
+        let mut remaining = Vec::with_capacity(self.retired_jobs.len());
+        for handle in self.retired_jobs.drain(..) {
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                remaining.push(handle);
+            }
+        }
+        self.retired_jobs = remaining;
         changed
+    }
+}
+
+impl Drop for InspectWorkflow {
+    fn drop(&mut self) {
+        self.discard_in_flight();
+        for handle in self.retired_jobs.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1577,9 +1643,31 @@ mod tests {
         assert!(wf.result.is_some());
         assert!(out.exists());
 
-        // Lease must be released automatically after write completion.
+        // Lease AND open-tab selection must be cleared automatically after write completion so
+        // reopening Join cannot silently run against unedited disk bytes.
         let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
         assert!(!doc.join_reserved());
+        assert!(wf.sides[0].is_none());
+        assert!(wf.headers[0].is_none());
+        assert!(!wf.ready_to_analyze());
+
+        // Also verify release_all() clears OpenTab side selections & headers.
+        {
+            let doc = scheduler
+                .tab_mut(ids[0])
+                .unwrap()
+                .document
+                .as_mut()
+                .unwrap();
+            wf.set_open_tab_side(0, ids[0], "main.csv".into(), doc)
+                .unwrap();
+        }
+        wait_join(&mut wf);
+        assert!(wf.ready_to_analyze());
+        wf.release_all();
+        assert!(wf.sides[0].is_none());
+        assert!(wf.headers[0].is_none());
+        assert!(!wf.ready_to_analyze());
     }
 
     #[test]
@@ -1624,5 +1712,29 @@ mod tests {
         wf.start_inspect(true);
         wait_inspect(&mut wf);
         assert!(!wf.report.as_ref().unwrap().findings.is_empty());
+
+        // Reconfiguring target while an inspection job is in flight must discard the old worker
+        // so poll() never installs the old file's report under the new target.
+        let clean = dir.path().join("clean.csv");
+        std::fs::write(&clean, "x,y\n10,20\n").unwrap();
+        let big_bad = dir.path().join("big_bad.csv");
+        let mut buf = String::from("a,b\n");
+        for _ in 0..10_000 {
+            buf.push_str("1,2,3\n");
+        }
+        std::fs::write(&big_bad, buf).unwrap();
+        wf.configure_for_path(big_bad);
+        wf.start_inspect(true);
+        wf.configure_for_path(clean.clone());
+        assert!(!wf.busy());
+        for _ in 0..40 {
+            wf.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            wf.report.is_none(),
+            "stale inspection from prior target must never populate the newly configured target"
+        );
+        assert_eq!(wf.display_path.as_deref(), Some(clean.as_path()));
     }
 }

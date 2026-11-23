@@ -1726,6 +1726,12 @@ impl WorkbenchScheduler {
         // Validate and prepare the replacement document BEFORE touching the existing slot.
         let mut replacement = Document::prepare_with_encoding(&path, options, encoding)
             .map_err(SchedulerError::OpenFailed)?;
+        if replacement.is_compressed() && !self.write_slot_available() {
+            replacement.shutdown();
+            return Err(SchedulerError::OpenFailed(
+                compressed::WRITE_SLOTS_FULL.into(),
+            ));
+        }
         replacement.working_directory = self.config.working_directory.clone();
         replacement.custom_working_directory = self.config.custom_working_directory;
         replacement.index_cache_enabled = self.config.index_cache_enabled;
@@ -2674,32 +2680,45 @@ impl WorkbenchScheduler {
         self.working_cleanup.clone()
     }
 
-    /// Lists all retained working-copy files across hydrated and dormant tabs for storage review.
+    /// Lists all retained working-copy and completed private decompressed `.gz` files across
+    /// hydrated and dormant tabs for storage review, deduplicating shared paths.
     pub fn retained_storage_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
+        let mut paths = BTreeSet::new();
         for slot in self.tabs.values() {
             if let Some(doc) = slot.tab.document.as_ref() {
                 paths.extend(doc.retained_storage_paths());
-            } else if let SlotResidency::Dormant(dormant) = &slot.residency
-                && let DormantKind::Dirty(dirty) = &dormant.kind
-                && let Some(wc) = dirty.working_copy.as_ref()
-            {
-                if wc.owns(dirty.session.path()) {
-                    paths.push(dirty.session.path().to_path_buf());
+                if doc.compressed_save_as_ready() && !doc.session.path().as_os_str().is_empty() {
+                    paths.insert(doc.session.path().to_path_buf());
                 }
-                if let Some(u) = wc.undo.as_ref()
-                    && wc.owns(&u.path)
-                {
-                    paths.push(u.path.clone());
-                }
-                if let Some(r) = wc.redo.as_ref()
-                    && wc.owns(&r.path)
-                {
-                    paths.push(r.path.clone());
+            } else if let SlotResidency::Dormant(dormant) = &slot.residency {
+                match &dormant.kind {
+                    DormantKind::Dirty(dirty) => {
+                        if let Some(wc) = dirty.working_copy.as_ref() {
+                            if wc.owns(dirty.session.path()) {
+                                paths.insert(dirty.session.path().to_path_buf());
+                            }
+                            if let Some(u) = wc.undo.as_ref()
+                                && wc.owns(&u.path)
+                            {
+                                paths.insert(u.path.clone());
+                            }
+                            if let Some(r) = wc.redo.as_ref()
+                                && wc.owns(&r.path)
+                            {
+                                paths.insert(r.path.clone());
+                            }
+                        }
+                    }
+                    DormantKind::CompressedComplete { session, .. } => {
+                        if !session.path().as_os_str().is_empty() {
+                            paths.insert(session.path().to_path_buf());
+                        }
+                    }
+                    DormantKind::CleanPlain { .. } | DormantKind::CompressedPreview { .. } => {}
                 }
             }
         }
-        paths
+        paths.into_iter().collect()
     }
 
     /// Starts background decompression for a `.gz` tab paused in `Phase::Pending`, enforcing
