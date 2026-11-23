@@ -1923,6 +1923,10 @@ cyan = "#449dab"
         window.render_frame(cx);
         assert!(gpui_kit::component::Theme::global(cx).mode.is_dark());
         assert_eq!(controller.read(cx).active_palette(), quarry_workbench::DARK);
+        assert_eq!(
+            gpui_kit::component::Theme::global(cx).colors.danger,
+            gpui_kit::rgb(quarry_workbench::DARK.error_text.to_rgb_hex()).into()
+        );
     })
     .unwrap();
     let persisted = quarry_workbench::ThemePreferences::load_from(Some(pref_file.clone()), true);

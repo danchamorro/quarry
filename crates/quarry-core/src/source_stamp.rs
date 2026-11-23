@@ -28,6 +28,35 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Opens a regular file without blocking on FIFOs/devices (`O_NONBLOCK`) and without
+/// following a final symlink (`O_NOFOLLOW` on Unix), rejecting non-regular files.
+pub fn open_regular_file_nofollow(path: &Path) -> io::Result<File> {
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Path is not a regular file.",
+        ));
+    }
+    #[cfg(unix)]
+    let file = File::from(rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )?);
+    #[cfg(not(unix))]
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Path is not a regular file.",
+        ));
+    }
+    Ok(file)
+}
+
 /// OS-level file identity (`(dev, ino)` on Unix, `(volume_serial, file_id)` on Windows)
 /// retained by dormant tab stubs without keeping an open file descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

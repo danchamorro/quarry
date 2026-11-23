@@ -2998,11 +2998,36 @@ pub(crate) fn apply_resolved_theme(resolved: &ResolvedTheme, cx: &mut App) {
     theme.colors.link = rgb(tokens.accent_text.to_rgb_hex()).into();
     theme.colors.link_hover = rgb(tokens.accent_text.to_rgb_hex()).into();
     theme.colors.link_active = rgb(tokens.accent_text.to_rgb_hex()).into();
-    theme.colors.danger = rgb(tokens.error_fill.to_rgb_hex()).into();
-    theme.colors.danger_foreground = rgb(tokens.error_text.to_rgb_hex()).into();
-    theme.colors.warning = rgb(tokens.warning_fill.to_rgb_hex()).into();
-    theme.colors.warning_foreground = rgb(tokens.warning_text.to_rgb_hex()).into();
-    theme.colors.success_foreground = rgb(tokens.success_text.to_rgb_hex()).into();
+    theme.colors.danger = rgb(tokens.error_text.to_rgb_hex()).into();
+    theme.colors.danger_foreground = rgb(tokens.canvas.to_rgb_hex()).into();
+    theme.colors.button_danger = rgb(tokens.error_fill.to_rgb_hex()).into();
+    theme.colors.button_danger_hover = rgb(tokens
+        .error_fill
+        .blend(tokens.error_text, 0.14)
+        .to_rgb_hex())
+    .into();
+    theme.colors.button_danger_active = rgb(tokens
+        .error_fill
+        .blend(tokens.error_text, 0.24)
+        .to_rgb_hex())
+    .into();
+    theme.colors.button_danger_foreground = rgb(tokens.error_text.to_rgb_hex()).into();
+    theme.colors.warning = rgb(tokens.warning_text.to_rgb_hex()).into();
+    theme.colors.warning_foreground = rgb(tokens.canvas.to_rgb_hex()).into();
+    theme.colors.button_warning = rgb(tokens.warning_fill.to_rgb_hex()).into();
+    theme.colors.button_warning_hover = rgb(tokens
+        .warning_fill
+        .blend(tokens.warning_text, 0.14)
+        .to_rgb_hex())
+    .into();
+    theme.colors.button_warning_active = rgb(tokens
+        .warning_fill
+        .blend(tokens.warning_text, 0.24)
+        .to_rgb_hex())
+    .into();
+    theme.colors.button_warning_foreground = rgb(tokens.warning_text.to_rgb_hex()).into();
+    theme.colors.success = rgb(tokens.success_text.to_rgb_hex()).into();
+    theme.colors.success_foreground = rgb(tokens.canvas.to_rgb_hex()).into();
     theme.tokens = theme.colors.into();
     Theme::sync_base(cx);
 }

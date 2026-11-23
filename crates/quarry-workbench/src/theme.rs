@@ -204,6 +204,7 @@ pub fn palette_meets_wcag_aa(palette: &Palette) -> bool {
         && contrast_ratio(palette.on_accent, palette.selection_strong) >= 4.5
         && contrast_ratio(palette.accent_text, palette.canvas) >= 4.5
         && contrast_ratio(palette.error_text, palette.error_fill) >= 4.5
+        && contrast_ratio(palette.error_text, palette.canvas) >= 4.5
         && contrast_ratio(palette.warning_text, palette.warning_fill) >= 4.5
         && contrast_ratio(palette.success_text, palette.canvas) >= 4.5
 }
@@ -293,7 +294,7 @@ impl ThemePreferences {
         let mut preference = ThemePreference::default();
         let mut load_error = None;
         if let Some(pref_path) = path.as_ref() {
-            match std::fs::File::open(pref_path) {
+            match quarry_core::open_regular_file_nofollow(pref_path) {
                 Ok(file) => {
                     let mut raw = Vec::new();
                     match file
@@ -526,7 +527,19 @@ fn read_allowlisted_file(
             candidate.display()
         ));
     }
-    let file = std::fs::File::open(&canonical).map_err(|error| {
+    let pre_meta = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        format!(
+            "Could not inspect Omarchy theme file {}: {error}",
+            canonical.display()
+        )
+    })?;
+    if !pre_meta.is_file() {
+        return Err(format!(
+            "Omarchy theme path {} is not a regular file.",
+            candidate.display()
+        ));
+    }
+    let file = quarry_core::open_regular_file_nofollow(&canonical).map_err(|error| {
         format!(
             "Could not open Omarchy theme file {}: {error}",
             canonical.display()
@@ -922,7 +935,10 @@ fn parse_omarchy_palette(
 
     let error_fill = canvas.blend(raw_red, if is_dark { 0.18 } else { 0.12 });
     let warning_fill = canvas.blend(raw_yellow, if is_dark { 0.18 } else { 0.14 });
-    let error_text = ensure_contrast(raw_red, error_fill, base.error_text, 4.5);
+    let mut error_text = ensure_contrast(raw_red, error_fill, base.error_text, 4.5);
+    if contrast_ratio(error_text, canvas) < 4.5 {
+        error_text = ensure_contrast(error_text, canvas, base.error_text, 4.5);
+    }
     let warning_text = ensure_contrast(raw_yellow, warning_fill, base.warning_text, 4.5);
     let success_text = ensure_contrast(raw_green, canvas, base.success_text, 4.5);
 
@@ -1245,6 +1261,46 @@ cyan = "#449dab"
         assert_eq!(allowed.appearance, ThemeAppearance::Light);
         assert_eq!(allowed.palette.canvas, Rgba::rgb(0xf7, 0xf5, 0xf0));
         assert!(palette_meets_wcag_aa(&allowed.palette));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omarchy_theme_sync_rejects_fifo_without_blocking() {
+        let home = tempfile::tempdir().unwrap();
+        let theme_dir = home.path().join(".local/state/omarchy/current/theme");
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        let fifo_colors = theme_dir.join("colors.toml");
+        let fifo_gen = home
+            .path()
+            .join(".local/state/omarchy/current/theme.generation");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo_colors)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo_gen)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(omarchy_theme_fingerprint(home.path()).is_none());
+        let resolved = resolve_theme(
+            ThemePreference::Omarchy,
+            ThemeAppearance::Dark,
+            Some(home.path()),
+        );
+        assert_eq!(resolved.palette, DARK);
+        assert!(
+            resolved
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("regular file"))
+        );
     }
 
     #[test]
