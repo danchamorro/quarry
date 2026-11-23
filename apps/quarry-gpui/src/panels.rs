@@ -24,6 +24,8 @@ pub enum PanelEvent {
     AutoFit,
     Filter(FilterQuery),
     ClearFilter,
+    ExportFiltered,
+    CancelFilterOrExport,
     Reopen(OpenOptions, Option<Encoding>),
 }
 
@@ -102,6 +104,12 @@ pub struct Panels {
     detected: String,
     busy: bool,
     dirty: bool,
+    filter_active: bool,
+    filter_running: bool,
+    can_export_filtered: bool,
+    export_running: bool,
+    filter_status: Option<String>,
+    export_status: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -199,6 +207,12 @@ impl Panels {
             detected: String::new(),
             busy: false,
             dirty: false,
+            filter_active: false,
+            filter_running: false,
+            can_export_filtered: false,
+            export_running: false,
+            filter_status: None,
+            export_status: None,
             _subscriptions: subscriptions,
         }
     }
@@ -242,6 +256,12 @@ impl Panels {
     ) {
         self.dirty = info.dirty;
         self.busy = info.busy;
+        self.filter_active = info.filter_active;
+        self.filter_running = info.filter_running;
+        self.can_export_filtered = info.can_export_filtered;
+        self.export_running = info.export_running;
+        self.filter_status = info.filter_status.clone();
+        self.export_status = info.export_status.clone();
         self.detected = format!(
             "Detected: {} · {} · {}",
             match info.delimiter {
@@ -895,22 +915,67 @@ impl Panels {
                     })
                 },
             )
+            .when_some(
+                self.export_status
+                    .clone()
+                    .or_else(|| self.filter_status.clone()),
+                |this, status| {
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(status)
+                            .when(self.filter_running || self.export_running, |row| {
+                                row.child(
+                                    Button::new("cancel-filter-export")
+                                        .label("Cancel")
+                                        .small()
+                                        .ghost()
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.emit(PanelEvent::CancelFilterOrExport);
+                                        })),
+                                )
+                            }),
+                    )
+                },
+            )
             .child(
                 div()
                     .flex()
                     .justify_between()
+                    .gap_2()
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .child(
-                        Button::new("clear-filter")
-                            .label("Clear filter")
-                            .small()
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.emit(PanelEvent::ClearFilter);
-                                this.close(window, cx);
-                            })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("clear-filter")
+                                    .label("Clear filter")
+                                    .small()
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.emit(PanelEvent::ClearFilter);
+                                        this.close(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("export-filtered")
+                                    .label("Export Filtered…")
+                                    .small()
+                                    .disabled(!self.can_export_filtered || self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.emit(PanelEvent::ExportFiltered);
+                                        this.close(window, cx);
+                                    })),
+                            ),
                     )
                     .child(
                         Button::new("apply-filters")

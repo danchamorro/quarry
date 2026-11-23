@@ -826,3 +826,472 @@ fn in_place_save_reloads_and_multi_tab_close_review_advances_after_save(cx: &mut
     let tab_a = cx.update(|cx| controller.read(cx).scheduler().tabs_in_window(win_id)[0]);
     assert!(!cx.update(|cx| controller.read(cx).scheduler().tab_is_dirty(tab_a)));
 }
+
+#[gpui_kit::test]
+fn find_replace_and_numeric_filter_export_work_through_gpui_ui(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("find_filter.csv");
+    std::fs::write(
+        &source,
+        "item,price,tag\napple,10,fruit\nbanana,25,fruit\ncarrot,5,veg\napple pie,40,dessert\n",
+    )
+    .unwrap();
+
+    let controller = init_test_app(cx);
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![source.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+
+    // Open Find bar via toolbar button and verify Find & Replace controls appear.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("toolbar-find", cx);
+        window.render_frame(cx);
+        assert!(window.find("find-next").visible());
+        assert!(window.find("close-find-bar").visible());
+        window.click("toggle-replace-row", cx);
+        window.render_frame(cx);
+        assert!(window.find("replace-all").visible());
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.find_next_active(
+                    win_id,
+                    b"apple".to_vec(),
+                    quarry_core::CaseSensitivity::Insensitive,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.search_running && i.search_status.is_some())
+            && q.table.read(cx).selected_cell() == Some((0, 1))
+    });
+
+    // Replace Current on first "apple" -> "pear", then Replace All "fruit" -> "produce".
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.replace_current_active(
+                    win_id,
+                    b"apple".to_vec(),
+                    b"pear".to_vec(),
+                    quarry_core::CaseSensitivity::Insensitive,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| !i.search_running && i.dirty)
+    });
+    let doc_id = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(win_id)
+            .unwrap()
+    });
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.replace_all_active(
+                    win_id,
+                    doc_id,
+                    b"fruit".to_vec(),
+                    b"produce".to_vec(),
+                    quarry_core::CaseSensitivity::Sensitive,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done)
+            && controller
+                .read(cx)
+                .active_document(win_id)
+                .and_then(|d| d.effective_cell(1, 2))
+                == Some(b"produce".as_slice())
+    });
+
+    // Close Find bar, apply numeric Between filter [10..30], export filtered rows, then clear.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("close-find-bar", cx);
+    })
+    .unwrap();
+    let query = quarry_core::FilterQuery {
+        predicates: vec![quarry_core::FilterPredicate {
+            column: 1,
+            operator: quarry_core::FilterOperator::Between,
+            value: b"10".to_vec(),
+            upper_bound: Some(b"30".to_vec()),
+        }],
+        case_sensitivity: quarry_core::CaseSensitivity::Insensitive,
+    };
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.start_filter_active(win_id, query, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.filter_active && i.filter_done && i.can_export_filtered)
+    });
+    assert_eq!(
+        cx.update(|cx| view.read(cx).snapshot(cx).unwrap().available_rows),
+        2
+    );
+
+    let export_path = directory.path().join("between-export.csv");
+    let current_doc = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(win_id)
+            .unwrap()
+    });
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_filtered_export_active(win_id, current_doc, export_path.clone(), cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| !i.export_running)
+    });
+    let exported = std::fs::read_to_string(&export_path).unwrap();
+    assert!(exported.contains("pear,10,produce"));
+    assert!(exported.contains("banana,25,produce"));
+    assert!(!exported.contains("carrot"));
+    assert!(!exported.contains("apple pie"));
+}
+
+#[gpui_kit::test]
+fn sort_duplicates_cleanup_and_structural_ops_work_through_gpui_ui(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("structured.csv");
+    std::fs::write(
+        &source,
+        "code,score,label\n  z-1  ,30,hi\na-2,10,dup\na-2,10,dup\nb-3,20,mid\n",
+    )
+    .unwrap();
+
+    let controller = init_test_app(cx);
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![source.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+
+    // 1. Clean Selected Columns (Trim col 0) via dialog UI.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("toolbar-cleanup", cx);
+        window.render_frame(cx);
+        assert!(window.find("apply-cleanup").visible());
+        window.click("apply-cleanup", cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done)
+            && controller
+                .read(cx)
+                .active_document(win_id)
+                .and_then(|d| d.effective_cell(1, 0))
+                == Some(b"z-1".as_slice())
+    });
+
+    // 2. Find & Remove Duplicates via dialog UI + Duplicate Preview confirmation banner.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("toolbar-duplicates", cx);
+        window.render_frame(cx);
+        assert!(window.find("apply-duplicates").visible());
+        window.click("apply-duplicates", cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, window, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.duplicate_preview.is_some())
+            && window.find("confirm-remove-duplicates").visible()
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("confirm-remove-duplicates", cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.duplicate_preview.is_none() && i.total_rows == 3 && i.index_done)
+    });
+
+    // 3. Sort Rows via dialog UI (defaults to col 0 Text Ascending -> a-2, b-3, z-1).
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("toolbar-sort", cx);
+        window.render_frame(cx);
+        assert!(window.find("apply-sort").visible());
+        window.click("apply-sort", cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done)
+            && controller
+                .read(cx)
+                .active_document(win_id)
+                .and_then(|d| d.effective_cell(1, 0))
+                == Some(b"a-2".as_slice())
+    });
+
+    // 4. Split col 0 on "-" -> produces 4 columns ("a", "2", ...), then Combine cols 0+1 on "_".
+    let doc_id = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(win_id)
+            .unwrap()
+    });
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_split_column_active(win_id, doc_id, 0, b"-".to_vec(), cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done && i.headers.len() == 4)
+    });
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_combine_columns_active(win_id, doc_id, vec![0, 1], b"_".to_vec(), cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done && i.headers.len() == 3)
+            && controller
+                .read(cx)
+                .active_document(win_id)
+                .and_then(|d| d.effective_cell(1, 0))
+                == Some(b"a_2".as_slice())
+    });
+
+    // 5. Insert 1 row at position 1, then select row 1 and delete it.
+    let mut insert_dlg = quarry_workbench::StructuralDialog::insert_rows(0);
+    insert_dlg.count = "1".into();
+    insert_dlg.position = "1".into();
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_insert_rows_active(win_id, doc_id, &insert_dlg, cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done && i.total_rows == 4)
+    });
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 1, false, false, cx);
+            c.start_delete_selected_rows_active(win_id, cx).unwrap();
+        });
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done && i.total_rows == 3)
+    });
+
+    // 6. Move col 2 to position 0, then delete col 0.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_move_columns_active(win_id, doc_id, vec![2], 0, cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| {
+            !i.structural_running
+                && i.index_done
+                && i.headers.first().map(String::as_str) == Some("label")
+        })
+    });
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_delete_selected_columns_active(win_id, vec![0], cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done && i.headers.len() == 2)
+    });
+}
+
+#[gpui_kit::test]
+fn find_escape_header_column_default_and_cross_tab_reveal_isolation(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let path_a = directory.path().join("tab-a.csv");
+    let path_b = directory.path().join("tab-b.csv");
+    std::fs::write(&path_a, "col_a,col_b\nfoo,1\nbar,2\n").unwrap();
+    std::fs::write(&path_b, "x,y\n10,20\n30,40\n").unwrap();
+
+    let controller = init_test_app(cx);
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_a.clone(), path_b.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+    let tabs = cx.update(|cx| controller.read(cx).tabs_for_window(win_id));
+    assert_eq!(tabs.len(), 2);
+    let doc_a = tabs[0].id;
+    let doc_b = tabs[1].id;
+
+    // 1. Escape closes the Find & Replace bar from both Find and Replace inputs and restores grid focus.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("toolbar-find", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).find_bar.read(cx).is_open());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).find_bar.read(cx).is_open());
+        assert!(
+            view.read(cx)
+                .table
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        );
+
+        view.update(cx, |q, cx| {
+            q.find_bar.update(cx, |bar, cx| {
+                bar.open_find(true, window, cx);
+                bar.focus_replace_for_test(window, cx);
+            });
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).find_bar.read(cx).is_open());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).find_bar.read(cx).is_open());
+        assert!(
+            view.read(cx)
+                .table
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        );
+    })
+    .unwrap();
+
+    // 2. Selecting a column header overrides an earlier selected cell for dialog defaults.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |t, cx| t.set_selected_cell(0, 1, cx));
+        });
+        controller.update(cx, |c, cx| {
+            c.select_column_active(win_id, 1, false, false, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).active_selected_column(cx), 1);
+    })
+    .unwrap();
+
+    // 3. A pending search reveal for Tab A must NOT move Tab B's selection, and applies once Tab A wakes.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, doc_b, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.document_id == doc_b && i.index_done)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |t, cx| t.set_selected_cell(0, 1, cx));
+        });
+        controller.update(cx, |c, cx| {
+            c.queue_pending_reveal_cell_for_test(doc_a, (2, 1));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+    })
+    .unwrap();
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, doc_a, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.document_id == doc_a)
+            && q.table.read(cx).selected_cell() == Some((1, 2))
+    });
+}

@@ -512,7 +512,7 @@ impl Document {
         }
     }
 
-    pub fn structural_edit_disabled_reason(&self) -> Option<&'static str> {
+    pub fn pending_materialization_confirm_disabled_reason(&self) -> Option<&'static str> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Some(reason);
         }
@@ -535,6 +535,15 @@ impl Document {
         } else {
             None
         }
+    }
+
+    pub fn structural_edit_disabled_reason(&self) -> Option<&'static str> {
+        self.pending_materialization_confirm_disabled_reason()
+            .or_else(|| {
+                self.pending_materialization
+                    .is_some()
+                    .then_some("Confirm or cancel the pending split first.")
+            })
     }
 
     pub fn insertion_disabled_reason(&self, rows: bool) -> Option<&'static str> {

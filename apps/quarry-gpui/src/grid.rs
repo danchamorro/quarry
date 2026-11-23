@@ -7,8 +7,8 @@ use std::ops::Range;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::{
-    App, Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div,
-    px, rgb,
+    App, Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    SharedString, Styled, Window, div, px, rgb,
 };
 use quarry_workbench::{Document, MAX_GRID_TEXT_CHARS, WindowId, field_preview, whitespace};
 
@@ -98,6 +98,39 @@ impl Grid {
         let controller = self.controller.read(cx);
         let doc = controller.active_document(self.window_id)?;
         doc.columns.visible.get(column - 1).copied()
+    }
+
+    /// Maps a physical `(source_row, source_column)` to rendered `(table_row, table_column)` when visible.
+    pub fn display_position_for_source(
+        &self,
+        source_row: u64,
+        source_col: usize,
+        cx: &App,
+    ) -> Option<(usize, usize)> {
+        let controller = self.controller.read(cx);
+        let doc = controller.active_document(self.window_id)?;
+        let table_col = doc
+            .columns
+            .visible
+            .iter()
+            .position(|&c| c == source_col)
+            .map(|ix| ix + 1)?;
+        let table_row = if doc.filter_active() {
+            doc.filtered_rows
+                .iter()
+                .position(|r| r.row == source_row)
+                .map(|rel| (doc.filter_buffer_start as usize).saturating_add(rel))?
+        } else {
+            usize::try_from(source_row.checked_sub(doc.data_start)?).ok()?
+        };
+        Some((table_row, table_col))
+    }
+
+    /// Returns the source row index for rendered `table_row` if loaded.
+    pub fn source_row_at(&self, row: usize, cx: &App) -> Option<u64> {
+        let controller = self.controller.read(cx);
+        let doc = controller.active_document(self.window_id)?;
+        loaded_row(doc, row).map(|(source_row, _)| source_row)
     }
 
     fn display_loaded(&self, row: usize, column: usize, cx: &App) -> Option<String> {
@@ -196,7 +229,12 @@ impl TableDelegate for Grid {
         let Some(&source) = doc.columns.visible.get(column - 1) else {
             return Column::new(format!("missing-{column}"), "");
         };
-        let title = doc.column_name(source);
+        let selected = doc.selected_columns.contains(&source);
+        let title = if selected {
+            format!("✓ {}", doc.column_name(source))
+        } else {
+            doc.column_name(source)
+        };
         Column::new(format!("source-{source}"), title)
             .width(self.widths.get(&source).copied().unwrap_or(px(124.)))
             .min_width(px(60.))
@@ -217,6 +255,58 @@ impl TableDelegate for Grid {
         } else {
             Some(format!("{header}: {value}").into())
         }
+    }
+
+    fn render_th(
+        &mut self,
+        column: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let name = self.column(column, cx).name.clone();
+        if column == 0 {
+            return div()
+                .id("grid-th-row-num")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(name);
+        }
+        let source_col = self.source_column_at(column, cx);
+        let selected = source_col.is_some_and(|src| {
+            self.controller
+                .read(cx)
+                .active_document(self.window_id)
+                .is_some_and(|doc| doc.selected_columns.contains(&src))
+        });
+        let mut header = div()
+            .id(("grid-th", column))
+            .size_full()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .cursor_pointer()
+            .text_color(if selected {
+                cx.theme().primary
+            } else {
+                cx.theme().foreground
+            })
+            .child(name);
+        if let Some(src_col) = source_col {
+            let controller = self.controller.clone();
+            let win_id = self.window_id;
+            header = header.on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                let shift = event.modifiers.shift;
+                let toggle = event.modifiers.platform || event.modifiers.control;
+                controller.update(cx, |controller, cx| {
+                    controller.select_column_active(win_id, src_col, shift, toggle, cx);
+                });
+            });
+        }
+        header
     }
 
     fn render_td(
@@ -241,7 +331,18 @@ impl TableDelegate for Grid {
             false
         };
         let tokens = &quarry_workbench::theme::LIGHT;
+        let row_selected = if column == 0 {
+            self.source_row_at(row, cx).is_some_and(|src_row| {
+                self.controller
+                    .read(cx)
+                    .active_document(self.window_id)
+                    .is_some_and(|doc| doc.selected_rows.contains(src_row))
+            })
+        } else {
+            false
+        };
         let mut cell = div()
+            .id(("grid-cell", row * 1024 + column))
             .size_full()
             .flex()
             .items_center()
@@ -252,18 +353,40 @@ impl TableDelegate for Grid {
             .text_size(px(12.))
             .font_family("Menlo")
             .text_color(if column == 0 {
-                rgb(0x9b7624).into()
+                if row_selected {
+                    cx.theme().primary
+                } else {
+                    rgb(0x9b7624).into()
+                }
             } else {
                 cx.theme().foreground
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(text),
-            );
+            });
+        if row_selected {
+            cell = cell.bg(cx.theme().accent);
+        }
+        if column == 0
+            && let Some(src_row) = self.source_row_at(row, cx)
+        {
+            let controller = self.controller.clone();
+            let win_id = self.window_id;
+            cell = cell
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                    let shift = event.modifiers.shift;
+                    let toggle = event.modifiers.platform || event.modifiers.control;
+                    controller.update(cx, |controller, cx| {
+                        controller.select_row_active(win_id, src_row, shift, toggle, cx);
+                    });
+                });
+        }
+        cell = cell.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(text),
+        );
         if has_whitespace_mark {
             cell = cell.child(
                 div()

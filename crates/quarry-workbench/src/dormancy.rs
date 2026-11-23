@@ -27,12 +27,13 @@
 use crate::compressed::CompressedDormancyPolicy;
 use crate::{
     AppMessage, ColumnView, Document, DocumentId, EditHistory, GridCursor, GridSelection,
-    JOIN_INPUT_RESERVED, RowSelection, SOURCE_CHANGED_NOTICE, SharedCellEdits, StructuralOverlay,
-    WindowId, WorkbenchTab, WorkingCopySnapshot, WorkingCopyState, compressed,
+    JOIN_INPUT_RESERVED, MaterializedWorkingCopy, RowSelection, SOURCE_CHANGED_NOTICE,
+    SharedCellEdits, StructuralJob, StructuralOverlay, WindowId, WorkbenchTab, WorkingCopySnapshot,
+    WorkingCopyState, compressed,
 };
 use quarry_core::{
-    Encoding, FileIdentity, FilterQuery, OpenOptions, QuarryError, Session, SourceGuard,
-    WorkingCopyCleanup, inspect_storage,
+    CompletedIndex, Encoding, FileIdentity, FilterQuery, OpenOptions, QuarryError, Session,
+    SourceGuard, WorkingCopyCleanup, inspect_storage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -280,6 +281,29 @@ pub struct SaveCompletion {
     pub result: Result<(PathBuf, bool), AppMessage>,
 }
 
+/// Completion or failure of a background search job reported by [`WorkbenchScheduler::poll_searches`].
+#[derive(Debug)]
+pub struct SearchCompletion {
+    pub document_id: DocumentId,
+    pub result: Result<Option<(u64, usize)>, String>,
+}
+
+/// Completion or failure of a background filtered export job reported by
+/// [`WorkbenchScheduler::poll_filtered_exports`].
+#[derive(Debug)]
+pub struct ExportCompletion {
+    pub document_id: DocumentId,
+    pub result: Result<Option<String>, String>,
+}
+
+/// Completion or failure of a background structural edit job reported by
+/// [`WorkbenchScheduler::poll_structural_edits`].
+#[derive(Debug)]
+pub struct StructuralCompletion {
+    pub document_id: DocumentId,
+    pub result: Result<Option<String>, AppMessage>,
+}
+
 /// Actionable scheduler failure that always preserves every open document and edit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SchedulerError {
@@ -467,13 +491,14 @@ impl PendingFilterRestore {
 enum SlotResidency {
     Stub(LazyDocumentStub),
     Hydrated {
-        /// Code-counted active-document FD lease; released immediately on dormancy.
-        _fd_lease: FdLease,
+        /// Code-counted active-document FD lease (`session` + optional `original_session`);
+        /// released immediately on dormancy.
+        fd_lease: FdLease,
         /// Code-counted directory FD lease for live `WorkingCopyStorage` or `CompressedBacking`
         /// workspaces; retained across hydrate <-> dormant transitions until the owner drops.
         temp_dir_fd_lease: Option<FdLease>,
-        /// Code-counted background-job FD lease covering active index (1), filter (2),
-        /// and filtered-read (1) workers for the lifetime of those jobs.
+        /// Code-counted background-job FD lease covering active index, filter, filtered-read,
+        /// search, filtered-export, save, and structural workers for the lifetime of those jobs.
         job_fd_lease: Option<FdLease>,
         /// Saved selection and scroll anchor reapplied once a woken filter rebuild finishes
         /// loading its filtered row buffer (so `navigate_filter` does not discard it).
@@ -1001,8 +1026,18 @@ impl WorkbenchScheduler {
             .map(|&(_, doc_id, _)| doc_id)
             .collect();
 
+        let waking_dormant_dirty_has_original = matches!(
+            self.tabs.get(&id).map(|slot| &slot.residency),
+            Some(SlotResidency::Dormant(dormant))
+                if matches!(&dormant.kind, DormantKind::Dirty(dirty) if dirty.original_session.is_some())
+        );
+
         // Reserve an active-document FD lease BEFORE opening the file.
-        let fd_lease = match self.fd_budget.try_reserve(FdCategory::ActiveDocument, 1) {
+        let needed_doc_fds = 1 + usize::from(waking_dormant_dirty_has_original);
+        let fd_lease = match self
+            .fd_budget
+            .try_reserve(FdCategory::ActiveDocument, needed_doc_fds)
+        {
             Ok(lease) => lease,
             Err(error) => {
                 self.restore_evicted_on_failure(&evicted_records);
@@ -1017,7 +1052,7 @@ impl WorkbenchScheduler {
         let previous_residency = std::mem::replace(
             &mut slot.residency,
             SlotResidency::Hydrated {
-                _fd_lease: fd_lease,
+                fd_lease,
                 temp_dir_fd_lease: None,
                 job_fd_lease: None,
                 pending_filter_restore: None,
@@ -1204,7 +1239,7 @@ impl WorkbenchScheduler {
         let Some(doc) = slot.tab.document.as_mut() else {
             return Err(SchedulerError::OpenFailed("Document is not loaded.".into()));
         };
-        let needed_jobs = usize::from(doc.job.is_some()) + FILTER_JOB_AND_READ_FDS;
+        let needed_jobs = doc_non_filter_job_fds(doc) + FILTER_JOB_AND_READ_FDS;
         try_sync_optional_lease(
             &fd_budget,
             job_fd_lease,
@@ -1229,13 +1264,110 @@ impl WorkbenchScheduler {
         Ok(())
     }
 
-    /// Synchronizes live `TempDirectory` and `BackgroundJob` FD reservations across all
-    /// hydrated tabs (accounting for newly acquired working copies, completed gzip workspaces,
-    /// or externally started/completed index, filter, and filtered-read workers).
+    /// Pre-reserves the active-document, temp-directory, and background-job FD leases needed
+    /// before starting a worker on hydrated tab `id`, invokes `op`, and reconciles all live
+    /// leases afterward (rolling back unused reservations if `op` fails or finishes synchronously).
+    pub fn with_reserved_job_fds<T, E>(
+        &mut self,
+        id: DocumentId,
+        extra_job_fds: usize,
+        needs_working_copy: bool,
+        op: impl FnOnce(&mut Document) -> Result<T, E>,
+        on_unavailable: impl FnOnce(SchedulerError) -> E,
+    ) -> Result<T, E> {
+        let fd_budget = self.fd_budget.clone();
+        let Some(slot) = self.tabs.get_mut(&id) else {
+            return Err(on_unavailable(SchedulerError::NotFound(id)));
+        };
+        let SlotResidency::Hydrated {
+            fd_lease,
+            temp_dir_fd_lease,
+            job_fd_lease,
+            ..
+        } = &mut slot.residency
+        else {
+            return Err(on_unavailable(SchedulerError::OpenFailed(
+                "Activate the document before starting this operation.".into(),
+            )));
+        };
+        let Some(doc) = slot.tab.document.as_mut() else {
+            return Err(on_unavailable(SchedulerError::OpenFailed(
+                "Document is not loaded.".into(),
+            )));
+        };
+
+        let base_doc_fds = doc_active_document_fds(doc);
+        let base_dir_fds = doc_retained_dir_fds(doc);
+        let base_job_fds = doc_active_job_fds(doc);
+
+        let target_doc_fds = if needs_working_copy {
+            base_doc_fds.max(2)
+        } else {
+            base_doc_fds
+        };
+        let target_dir_fds =
+            base_dir_fds + usize::from(needs_working_copy && doc.working_copy.is_none());
+        let target_job_fds = base_job_fds.saturating_add(extra_job_fds);
+
+        let reserve_result = (|| -> Result<(), SchedulerError> {
+            fd_lease.try_resize(target_doc_fds)?;
+            try_sync_optional_lease(
+                &fd_budget,
+                temp_dir_fd_lease,
+                FdCategory::TempDirectory,
+                target_dir_fds,
+            )?;
+            try_sync_optional_lease(
+                &fd_budget,
+                job_fd_lease,
+                FdCategory::BackgroundJob,
+                target_job_fds,
+            )?;
+            Ok(())
+        })();
+
+        if let Err(err) = reserve_result {
+            let _ = fd_lease.try_resize(base_doc_fds);
+            let _ = try_sync_optional_lease(
+                &fd_budget,
+                temp_dir_fd_lease,
+                FdCategory::TempDirectory,
+                base_dir_fds,
+            );
+            let _ = try_sync_optional_lease(
+                &fd_budget,
+                job_fd_lease,
+                FdCategory::BackgroundJob,
+                base_job_fds,
+            );
+            return Err(on_unavailable(err));
+        }
+
+        let outcome = op(doc);
+        let _ = fd_lease.try_resize(doc_active_document_fds(doc));
+        let _ = try_sync_optional_lease(
+            &fd_budget,
+            temp_dir_fd_lease,
+            FdCategory::TempDirectory,
+            doc_retained_dir_fds(doc),
+        );
+        let _ = try_sync_optional_lease(
+            &fd_budget,
+            job_fd_lease,
+            FdCategory::BackgroundJob,
+            doc_active_job_fds(doc),
+        );
+        outcome
+    }
+
+    /// Synchronizes live `ActiveDocument`, `TempDirectory`, and `BackgroundJob` FD reservations
+    /// across all hydrated tabs (accounting for `original_session`, working copies, completed gzip
+    /// workspaces, and active index, filter, search, export, save, and structural workers).
     pub fn sync_fd_leases(&mut self) -> Result<(), SchedulerError> {
         let fd_budget = self.fd_budget.clone();
         for slot in self.tabs.values_mut() {
             let SlotResidency::Hydrated {
+                fd_lease,
                 temp_dir_fd_lease,
                 job_fd_lease,
                 ..
@@ -1248,6 +1380,7 @@ impl WorkbenchScheduler {
                 *job_fd_lease = None;
                 continue;
             };
+            fd_lease.try_resize(doc_active_document_fds(doc))?;
             try_sync_optional_lease(
                 &fd_budget,
                 temp_dir_fd_lease,
@@ -1265,16 +1398,16 @@ impl WorkbenchScheduler {
     }
 
     /// Polls active indexing and filter workers on all hydrated tabs and updates live
-    /// directory and background-job FD leases.
+    /// document, directory, and background-job FD leases.
     pub fn poll_all(&mut self) -> Vec<(DocumentId, String)> {
         let mut errors = Vec::new();
         let fd_budget = self.fd_budget.clone();
         for (&id, slot) in &mut self.tabs {
             let SlotResidency::Hydrated {
+                fd_lease,
                 temp_dir_fd_lease,
                 job_fd_lease,
                 pending_filter_restore,
-                ..
             } = &mut slot.residency
             else {
                 continue;
@@ -1288,12 +1421,13 @@ impl WorkbenchScheduler {
             // Reserve descriptors BEFORE polling filter/read workers so `poll_filter()` or
             // `poll_filter_read()` cannot start a queued filter refresh or filtered-read worker
             // without an FD lease.
+            let non_filter_jobs = doc_non_filter_job_fds(doc);
             let can_run_filter_read = if doc.filter_job.is_some() || doc.filter_refresh_pending {
-                let needed = usize::from(doc.job.is_some()) + FILTER_JOB_AND_READ_FDS;
+                let needed = non_filter_jobs + FILTER_JOB_AND_READ_FDS;
                 try_sync_optional_lease(&fd_budget, job_fd_lease, FdCategory::BackgroundJob, needed)
                     .is_ok()
             } else if doc.filter_read.is_some() || doc.pending_filter_read.is_some() {
-                let needed = usize::from(doc.job.is_some()) + 1;
+                let needed = non_filter_jobs + 1;
                 try_sync_optional_lease(&fd_budget, job_fd_lease, FdCategory::BackgroundJob, needed)
                     .is_ok()
             } else {
@@ -1329,6 +1463,7 @@ impl WorkbenchScheduler {
                     }
                 }
             }
+            let _ = fd_lease.try_resize(doc_active_document_fds(doc));
             let _ = try_sync_optional_lease(
                 &fd_budget,
                 temp_dir_fd_lease,
@@ -1972,6 +2107,528 @@ impl WorkbenchScheduler {
         results
     }
 
+    /// Polls active search jobs across all hydrated tabs, returning newly revealed cell coordinates.
+    pub fn poll_searches(&mut self) -> Vec<SearchCompletion> {
+        let mut results = Vec::new();
+        let mut any_finished = false;
+        for (&id, slot) in &mut self.tabs {
+            if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
+                continue;
+            }
+            let Some(doc) = slot.tab.document.as_mut() else {
+                continue;
+            };
+            if doc.search_job.is_none() {
+                continue;
+            }
+            match doc.poll_search() {
+                Ok(()) => {
+                    if doc.search_job.is_none() {
+                        any_finished = true;
+                        let revealed = doc.reveal_cell.take();
+                        results.push(SearchCompletion {
+                            document_id: id,
+                            result: Ok(revealed),
+                        });
+                    }
+                }
+                Err(error) => {
+                    any_finished = true;
+                    results.push(SearchCompletion {
+                        document_id: id,
+                        result: Err(error),
+                    });
+                }
+            }
+        }
+        if any_finished {
+            let _ = self.sync_fd_leases();
+        }
+        results
+    }
+
+    /// Polls active filtered-export jobs across all hydrated tabs, clearing write reservations.
+    pub fn poll_filtered_exports(&mut self) -> Vec<ExportCompletion> {
+        let mut results = Vec::new();
+        let mut any_finished = false;
+        for (&id, slot) in &mut self.tabs {
+            if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
+                continue;
+            }
+            let Some(doc) = slot.tab.document.as_mut() else {
+                continue;
+            };
+            if doc.export_job.is_none() {
+                continue;
+            }
+            match doc.poll_filtered_export() {
+                Ok(()) => {
+                    if doc.export_job.is_none() {
+                        any_finished = true;
+                        slot.tab.write_destination = None;
+                        results.push(ExportCompletion {
+                            document_id: id,
+                            result: Ok(doc.export_status.clone()),
+                        });
+                    }
+                }
+                Err(error) => {
+                    any_finished = true;
+                    slot.tab.write_destination = None;
+                    results.push(ExportCompletion {
+                        document_id: id,
+                        result: Err(error),
+                    });
+                }
+            }
+        }
+        if any_finished {
+            let _ = self.sync_fd_leases();
+        }
+        results
+    }
+
+    fn prepare_materialized_document(
+        &self,
+        path: &Path,
+        options: OpenOptions,
+        encoding: Encoding,
+        output_index: Option<CompletedIndex>,
+    ) -> Result<Document, String> {
+        let mut replacement = Document::prepare_with_encoding(path, options, Some(encoding))?;
+        replacement.working_directory = self.config.working_directory.clone();
+        replacement.custom_working_directory = self.config.custom_working_directory;
+        replacement.index_cache_enabled = self.config.index_cache_enabled;
+        replacement.working_cleanup = self.working_cleanup.clone();
+        replacement.decompression_slots = self.decompression_slots.clone();
+        if let Some(index) = output_index {
+            let index = replacement
+                .session
+                .adopt_completed_index(index)
+                .map_err(|error| error.to_string())?;
+            replacement.progress.bytes_scanned = index.indexed_bytes();
+            replacement.progress.rows_scanned = index.indexed_rows();
+            replacement.progress.done = true;
+            replacement.progress.columns_found = index.maximum_width();
+            replacement.apply_indexed_width(index.maximum_width());
+            replacement.index = Some(index);
+            replacement.load_buffer(replacement.viewport_start)?;
+        } else {
+            replacement.start_indexing()?;
+        }
+        Ok(replacement)
+    }
+
+    fn install_prepared_working_copy(
+        &mut self,
+        id: DocumentId,
+        mut replacement: Document,
+        ready: MaterializedWorkingCopy,
+        index_job_fd: Option<FdLease>,
+    ) {
+        let Some(slot) = self.tabs.get_mut(&id) else {
+            replacement.shutdown();
+            return;
+        };
+        let Some(current) = slot.tab.document.as_mut() else {
+            replacement.shutdown();
+            return;
+        };
+        current.accept_materialized_change(ready.undo);
+        replacement.logical_path = current.logical_path.clone();
+        replacement.original_session = current.original_session.take();
+        replacement.working_copy = current.working_copy.take();
+        replacement.working_directory = self.config.working_directory.clone();
+        replacement.custom_working_directory = self.config.custom_working_directory;
+        replacement.working_cleanup = self.working_cleanup.clone();
+        replacement.decompression_slots = self.decompression_slots.clone();
+        replacement.selected_columns = ready.selected_columns;
+        let first_selected = replacement.selected_columns.iter().next().copied();
+        replacement.column_selection_anchor = first_selected;
+        if let Some(first_selected) = first_selected
+            && replacement.columns.view(first_selected)
+        {
+            replacement.refresh_column_headers();
+        }
+        current.shutdown();
+        slot.tab.document = Some(replacement);
+        if let Some(lease) = index_job_fd
+            && let SlotResidency::Hydrated { job_fd_lease, .. } = &mut slot.residency
+        {
+            *job_fd_lease = Some(lease);
+        }
+        slot.tab.format_draft = None;
+        slot.tab.columns_open = false;
+        slot.tab.structural_dialog = None;
+        slot.tab.notice = None;
+        slot.tab.footer_status = Some(AppMessage::status(ready.notice));
+        self.close_approved.remove(&id);
+    }
+
+    /// Polls active structural edit jobs (Sort, Replace All, Cleanup, Split, Combine, Insert/Delete
+    /// Rows/Columns, Find Duplicates) across all hydrated tabs, installing materialized working
+    /// copies with pre-reserved FD leases.
+    pub fn poll_structural_edits(&mut self) -> Vec<StructuralCompletion> {
+        let mut results = Vec::new();
+        let mut ready_to_install: Vec<(DocumentId, MaterializedWorkingCopy)> = Vec::new();
+        let mut any_finished = false;
+        let fd_budget = self.fd_budget.clone();
+        let ids: Vec<DocumentId> = self.tabs.keys().copied().collect();
+        for id in ids {
+            let Some(slot) = self.tabs.get_mut(&id) else {
+                continue;
+            };
+            let SlotResidency::Hydrated {
+                fd_lease,
+                temp_dir_fd_lease,
+                job_fd_lease,
+                ..
+            } = &mut slot.residency
+            else {
+                continue;
+            };
+            let Some(doc) = slot.tab.document.as_mut() else {
+                continue;
+            };
+            if doc.structural_job.is_none()
+                || matches!(
+                    doc.structural_job,
+                    Some(StructuralJob::DuplicatePreview { .. })
+                )
+            {
+                continue;
+            }
+            let advancing_split_analysis = matches!(
+                doc.structural_job,
+                Some(StructuralJob::AnalyzingSplit { .. })
+            ) && !doc.structural_cancel_requested;
+            if advancing_split_analysis {
+                // `poll_structural_edit()` can transition a completed split analysis directly into
+                // `begin_materialization()`, which allocates `original_session` and working-copy
+                // storage. Pre-reserve those descriptors before polling, or defer until capacity
+                // is available so the transition can never bypass the scheduler's FD cap.
+                let base_doc_fds = doc_active_document_fds(doc);
+                let base_dir_fds = doc_retained_dir_fds(doc);
+                let base_job_fds = doc_active_job_fds(doc);
+                let target_doc_fds = base_doc_fds.max(2);
+                let target_dir_fds = base_dir_fds + usize::from(doc.working_copy.is_none());
+                let target_job_fds = base_job_fds.max(2);
+                let reserve_result = (|| -> Result<(), SchedulerError> {
+                    fd_lease.try_resize(target_doc_fds)?;
+                    try_sync_optional_lease(
+                        &fd_budget,
+                        temp_dir_fd_lease,
+                        FdCategory::TempDirectory,
+                        target_dir_fds,
+                    )?;
+                    try_sync_optional_lease(
+                        &fd_budget,
+                        job_fd_lease,
+                        FdCategory::BackgroundJob,
+                        target_job_fds,
+                    )?;
+                    Ok(())
+                })();
+                if reserve_result.is_err() {
+                    let _ = fd_lease.try_resize(base_doc_fds);
+                    let _ = try_sync_optional_lease(
+                        &fd_budget,
+                        temp_dir_fd_lease,
+                        FdCategory::TempDirectory,
+                        base_dir_fds,
+                    );
+                    let _ = try_sync_optional_lease(
+                        &fd_budget,
+                        job_fd_lease,
+                        FdCategory::BackgroundJob,
+                        base_job_fds,
+                    );
+                    continue;
+                }
+            }
+            match doc.poll_structural_edit() {
+                Ok(Some(ready)) => {
+                    any_finished = true;
+                    ready_to_install.push((id, ready));
+                }
+                Ok(None) => {
+                    if doc.structural_job.is_none()
+                        || matches!(
+                            doc.structural_job,
+                            Some(StructuralJob::DuplicatePreview { .. })
+                        )
+                    {
+                        any_finished = true;
+                        results.push(StructuralCompletion {
+                            document_id: id,
+                            result: Ok(doc.structural_status.clone()),
+                        });
+                    }
+                }
+                Err(error) => {
+                    any_finished = true;
+                    results.push(StructuralCompletion {
+                        document_id: id,
+                        result: Err(error),
+                    });
+                }
+            }
+            let _ = fd_lease.try_resize(doc_active_document_fds(doc));
+            let _ = try_sync_optional_lease(
+                &fd_budget,
+                temp_dir_fd_lease,
+                FdCategory::TempDirectory,
+                doc_retained_dir_fds(doc),
+            );
+            let _ = try_sync_optional_lease(
+                &fd_budget,
+                job_fd_lease,
+                FdCategory::BackgroundJob,
+                doc_active_job_fds(doc),
+            );
+        }
+
+        for (id, mut ready) in ready_to_install {
+            let Some((options, encoding)) = self.tabs.get(&id).and_then(|slot| {
+                slot.tab
+                    .document
+                    .as_ref()
+                    .map(|doc| (doc.current_open_options(), doc.session.encoding()))
+            }) else {
+                continue;
+            };
+            let needs_index_worker = ready.output_index.is_none();
+            let temp_open_fd = match self.fd_budget.try_reserve(FdCategory::ActiveDocument, 1) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.cleanup_abandoned_working_copy_path(id, &ready.path);
+                    results.push(StructuralCompletion {
+                        document_id: id,
+                        result: Err(AppMessage::warning(error.to_string())),
+                    });
+                    continue;
+                }
+            };
+            let index_job_fd = if needs_index_worker {
+                match self.fd_budget.try_reserve(FdCategory::BackgroundJob, 1) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        drop(temp_open_fd);
+                        self.cleanup_abandoned_working_copy_path(id, &ready.path);
+                        results.push(StructuralCompletion {
+                            document_id: id,
+                            result: Err(AppMessage::warning(error.to_string())),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let output_index = ready.output_index.take();
+            match self.prepare_materialized_document(&ready.path, options, encoding, output_index) {
+                Ok(replacement) => {
+                    let notice = ready.notice.clone();
+                    self.install_prepared_working_copy(id, replacement, ready, index_job_fd);
+                    drop(temp_open_fd);
+                    results.push(StructuralCompletion {
+                        document_id: id,
+                        result: Ok(Some(notice)),
+                    });
+                }
+                Err(error) => {
+                    drop(index_job_fd);
+                    drop(temp_open_fd);
+                    self.cleanup_abandoned_working_copy_path(id, &ready.path);
+                    results.push(StructuralCompletion {
+                        document_id: id,
+                        result: Err(AppMessage::error(error)),
+                    });
+                }
+            }
+        }
+
+        if any_finished {
+            let _ = self.sync_fd_leases();
+        }
+        results
+    }
+
+    fn cleanup_abandoned_working_copy_path(&mut self, id: DocumentId, path: &Path) {
+        if let Some(doc) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+            && let Some(wc) = doc.working_copy.as_ref()
+            && wc.owns(path)
+            && let Err(error) = wc.remove(path)
+        {
+            doc.working_cleanup.report(error);
+        }
+    }
+
+    /// Confirms removal of duplicates from a completed `StructuralJob::DuplicatePreview`, adopting
+    /// its pre-built working copy and completed index cleanly with FD pre-reservation.
+    pub fn confirm_duplicate_removal(&mut self, id: DocumentId) -> Result<String, AppMessage> {
+        let (destination, options, encoding, output_index) = {
+            let Some(slot) = self.tabs.get(&id) else {
+                return Err(AppMessage::warning("Open a file first."));
+            };
+            let Some(doc) = slot.tab.document.as_ref() else {
+                return Err(AppMessage::warning("Open a file first."));
+            };
+            let Some(StructuralJob::DuplicatePreview { summary, .. }) = &doc.structural_job else {
+                return Err(AppMessage::warning(
+                    "No duplicate preview is awaiting confirmation.",
+                ));
+            };
+            (
+                summary.destination.clone(),
+                doc.current_open_options(),
+                doc.session.encoding(),
+                summary.output_index.clone(),
+            )
+        };
+        {
+            let doc = self
+                .tabs
+                .get_mut(&id)
+                .and_then(|slot| slot.tab.document.as_mut())
+                .ok_or_else(|| AppMessage::warning("Open a file first."))?;
+            if doc.session.ensure_source_unchanged().is_err()
+                || doc
+                    .original_session
+                    .as_ref()
+                    .is_some_and(|source| source.ensure_source_unchanged().is_err())
+            {
+                doc.cancel_structural_edit();
+                doc.invalidate_changed_source();
+                let _ = self.sync_fd_leases();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+        }
+        let temp_open_fd = self
+            .fd_budget
+            .try_reserve(FdCategory::ActiveDocument, 1)
+            .map_err(|error| AppMessage::warning(error.to_string()))?;
+        let index_job_fd = if output_index.is_none() {
+            Some(
+                self.fd_budget
+                    .try_reserve(FdCategory::BackgroundJob, 1)
+                    .map_err(|error| AppMessage::warning(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let replacement = self
+            .prepare_materialized_document(&destination, options, encoding, output_index)
+            .map_err(AppMessage::error)?;
+        let Some(StructuralJob::DuplicatePreview {
+            summary,
+            selected_columns,
+            undo,
+        }) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+            .and_then(|doc| doc.structural_job.take())
+        else {
+            return Err(AppMessage::warning(
+                "No duplicate preview is awaiting confirmation.",
+            ));
+        };
+        let notice = format!(
+            "Removed {} extra duplicate row{}. Save to keep the change, or discard changes.",
+            summary.duplicate_rows,
+            if summary.duplicate_rows == 1 { "" } else { "s" }
+        );
+        self.install_prepared_working_copy(
+            id,
+            replacement,
+            MaterializedWorkingCopy {
+                path: summary.destination,
+                output_index: None,
+                undo,
+                selected_columns,
+                notice: notice.clone(),
+            },
+            index_job_fd,
+        );
+        drop(temp_open_fd);
+        let _ = self.sync_fd_leases();
+        Ok(notice)
+    }
+
+    /// Cancels a pending `DuplicatePreview` or active structural job on tab `id`.
+    pub fn cancel_structural_edit(&mut self, id: DocumentId) {
+        if let Some(doc) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+        {
+            doc.cancel_structural_edit();
+        }
+        let _ = self.sync_fd_leases();
+    }
+
+    /// Confirms a deferred split materialization whose temporary storage estimate exceeded the
+    /// storage-review threshold.
+    pub fn confirm_pending_materialization(&mut self, id: DocumentId) -> Result<(), AppMessage> {
+        {
+            let Some(doc) = self
+                .tabs
+                .get(&id)
+                .and_then(|slot| slot.tab.document.as_ref())
+            else {
+                return Err(AppMessage::warning("Open a file first."));
+            };
+            if doc.pending_materialization.is_none() {
+                return Ok(());
+            }
+            if let Some(reason) = doc.pending_materialization_confirm_disabled_reason() {
+                return Err(AppMessage::warning(reason));
+            }
+        }
+        self.with_reserved_job_fds(
+            id,
+            2,
+            true,
+            |doc| {
+                let Some((transformation, selected_columns, records)) =
+                    doc.pending_materialization.take()
+                else {
+                    return Ok(());
+                };
+                let retry_backup = (transformation.clone(), selected_columns.clone(), records);
+                match doc.begin_materialization(transformation, selected_columns) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        // Restore the pending split request on retryable failures (for example,
+                        // insufficient scratch space); leave cleared when the source changed and
+                        // `begin_materialization` invalidated the document.
+                        if !doc.source_changed {
+                            doc.pending_materialization = Some(retry_backup);
+                        }
+                        Err(error)
+                    }
+                }
+            },
+            |err| AppMessage::warning(err.to_string()),
+        )
+    }
+
+    /// Dismisses a deferred split materialization without modifying the document.
+    pub fn cancel_pending_materialization(&mut self, id: DocumentId) {
+        if let Some(doc) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+        {
+            doc.pending_materialization = None;
+            doc.structural_status = Some("Split cancelled. The document was not changed.".into());
+        }
+    }
+
     fn assign_tab_to_window_list(&mut self, target_window: WindowId, id: DocumentId) {
         for (&win, ids) in &mut self.window_tabs {
             if win != target_window {
@@ -2274,6 +2931,10 @@ fn slot_edit_revision(slot: &ManagedTab) -> u64 {
     hasher.finish()
 }
 
+fn doc_active_document_fds(doc: &Document) -> usize {
+    1 + usize::from(doc.original_session.is_some())
+}
+
 fn doc_retained_dir_fds(doc: &Document) -> usize {
     doc.working_copy
         .as_ref()
@@ -2287,10 +2948,22 @@ fn doc_retained_dir_fds(doc: &Document) -> usize {
 /// filtered-read worker (1 FD) while scanning, so a running filter reserves 3 FDs upfront.
 const FILTER_JOB_AND_READ_FDS: usize = 3;
 
-fn doc_active_job_fds(doc: &Document) -> usize {
-    // Index holds 1 file descriptor; an active filter reserves 3 FDs (2 for scan + 1 pre-reserved
-    // for its concurrent filtered-read worker); a standalone filtered read holds 1 descriptor.
+fn doc_non_filter_job_fds(doc: &Document) -> usize {
+    // Index holds 1 FD; search holds 1 FD; filtered export, save, and running structural workers
+    // each hold up to 2 FDs (source + destination); DuplicatePreview holds no running worker FDs.
     usize::from(doc.job.is_some())
+        + usize::from(doc.search_job.is_some())
+        + usize::from(doc.export_job.is_some()) * 2
+        + usize::from(doc.save_job.is_some()) * 2
+        + usize::from(
+            doc.structural_job
+                .as_ref()
+                .is_some_and(|job| !matches!(job, StructuralJob::DuplicatePreview { .. })),
+        ) * 2
+}
+
+fn doc_active_job_fds(doc: &Document) -> usize {
+    doc_non_filter_job_fds(doc)
         + if doc.filter_job.is_some() {
             FILTER_JOB_AND_READ_FDS
         } else {

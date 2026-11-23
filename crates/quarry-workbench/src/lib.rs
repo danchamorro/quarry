@@ -17,9 +17,10 @@ pub use command::{
 pub use compressed::CompressedDormancyPolicy;
 pub use dormancy::{
     DEFAULT_MAX_DIRTY_OVERLAY_BYTES, DEFAULT_MAX_HYDRATED_TABS, DEFAULT_NOFILE_TARGET,
-    FdBudgetLedger, FdBudgetSnapshot, FdCategory, FdLease, LazyDocumentStub, MAX_PROCESS_FD_BUDGET,
-    MIN_DORMANT_SCRATCH_HEADROOM_BYTES, PinReason, ResidencyState, SaveCompletion, SchedulerError,
-    WakeKind, WakeOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig, document_overlay_bytes,
+    ExportCompletion, FdBudgetLedger, FdBudgetSnapshot, FdCategory, FdLease, LazyDocumentStub,
+    MAX_PROCESS_FD_BUDGET, MIN_DORMANT_SCRATCH_HEADROOM_BYTES, PinReason, ResidencyState,
+    SaveCompletion, SchedulerError, SearchCompletion, StructuralCompletion, WakeKind, WakeOutcome,
+    WorkbenchScheduler, WorkbenchSchedulerConfig, document_overlay_bytes,
 };
 
 pub use document::{

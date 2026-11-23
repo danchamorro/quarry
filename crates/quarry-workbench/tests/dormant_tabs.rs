@@ -1964,3 +1964,432 @@ fn quit_approval_is_invalidated_when_approved_tab_is_edited_again() {
     scheduler.finalize_quit().unwrap();
     assert_eq!(scheduler.total_tabs(), 0);
 }
+
+#[test]
+fn scheduler_polls_search_filtered_export_sort_cleanup_and_duplicate_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("ops.csv");
+    fs::write(
+        &csv,
+        "name,score,note\n  zebra  ,30,hi\nalpha,10,dup\nalpha,10,dup\nbeta,20,world\n",
+    )
+    .unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // 1. Async search via poll_searches reveals exact cell.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_find_next_with_case(b"beta", CaseSensitivity::Insensitive)
+        .unwrap();
+    let mut found = None;
+    for _ in 0..400 {
+        let done = scheduler.poll_searches();
+        if !done.is_empty() {
+            found = done[0].result.as_ref().unwrap().to_owned();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(found, Some((4, 0)));
+
+    // 2. Numeric filter + filtered export via poll_filtered_exports.
+    let export_dest = dir.path().join("filtered-out.csv");
+    let query = FilterQuery::single(1, FilterOperator::GreaterThanOrEqual, b"20".to_vec());
+    scheduler.start_filter(ids[0], query).unwrap();
+    finish_active_filter(&mut scheduler, ids[0]);
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filtered_export(export_dest.clone())
+        .unwrap();
+    let mut export_done = false;
+    for _ in 0..400 {
+        let done = scheduler.poll_filtered_exports();
+        if !done.is_empty() {
+            assert!(done[0].result.is_ok());
+            export_done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(export_done);
+    let exported = fs::read_to_string(&export_dest).unwrap();
+    assert!(exported.contains("zebra") && exported.contains("beta") && !exported.contains("alpha"));
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .clear_filter()
+        .unwrap();
+
+    // 3. Cleanup Trim via poll_structural_edits installs materialized working copy.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_cleanup(quarry_core::ColumnCleanup {
+            columns: vec![0],
+            operation: quarry_core::CleanupOperation::Trim,
+        })
+        .unwrap();
+    let mut cleaned = false;
+    for _ in 0..400 {
+        let done = scheduler.poll_structural_edits();
+        if !done.is_empty() {
+            assert!(done[0].result.is_ok());
+            cleaned = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(cleaned);
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .effective_cell(1, 0),
+        Some(b"zebra".as_slice())
+    );
+
+    // 4. Find & Remove Duplicates via poll_structural_edits + confirm_duplicate_removal.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_find_duplicates_target(DuplicateTarget::AllFields, CaseSensitivity::Sensitive)
+        .unwrap();
+    let mut dup_preview_ready = false;
+    for _ in 0..400 {
+        let done = scheduler.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == ids[0]) {
+            assert!(comp.result.is_ok());
+            dup_preview_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(dup_preview_ready, "duplicate preview must complete");
+    let notice = scheduler.confirm_duplicate_removal(ids[0]).unwrap();
+    assert!(notice.contains("Removed 1 extra duplicate"));
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .available_data_rows(),
+        3
+    );
+
+    // 5. Numeric Sort (Descending) via poll_structural_edits reorders rows to (30, 20, 10)
+    // and we assert explicit completion for `ids[0]` before checking the output cells.
+    let plan = quarry_core::SortPlan::from(quarry_core::SortSpec {
+        column: 1,
+        direction: quarry_core::SortDirection::Descending,
+        mode: quarry_core::SortMode::Number,
+        case_sensitivity: CaseSensitivity::Insensitive,
+    });
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_sort_plan(plan)
+        .unwrap();
+    let mut sort_completed = false;
+    for _ in 0..400 {
+        let done = scheduler.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == ids[0]) {
+            assert!(comp.result.is_ok());
+            sort_completed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        sort_completed,
+        "sort must complete before asserting row order"
+    );
+    let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert_eq!(doc.effective_cell(1, 0), Some(b"zebra".as_slice()));
+    assert_eq!(doc.effective_cell(2, 0), Some(b"beta".as_slice()));
+    assert_eq!(doc.effective_cell(3, 0), Some(b"alpha".as_slice()));
+}
+
+#[test]
+fn pending_split_blocks_concurrent_edits_and_workers_enforce_fd_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let path = dir.path().join("split-fd.csv");
+    fs::write(&path, "a,b\n1-2,x\n3-4,y\n").unwrap();
+
+    // Cap of 3 FDs => at most 2 simultaneous FDs (1 active doc + 1 free).
+    // Starting a structural edit (needs +1 doc for original_session, +1 temp dir, +2 job)
+    // must fail cleanly before spawning a worker or modifying document state.
+    let mut tight = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_process_fds: 3,
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    let ids = tight
+        .open_many_lazy(WindowId::PRIMARY, [path.clone()], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut tight, ids[0]);
+    assert_eq!(tight.fd_budget().snapshot().total_reserved, 1);
+
+    let err = tight.with_reserved_job_fds(
+        ids[0],
+        2,
+        true,
+        |doc| doc.start_split(0, b"-".to_vec()),
+        |e| quarry_workbench::AppMessage::warning(e.to_string()),
+    );
+    assert!(
+        err.is_err(),
+        "tight FD budget must reject structural worker"
+    );
+    assert_eq!(tight.fd_budget().snapshot().total_reserved, 1);
+    assert!(
+        tight
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .structural_job
+            .is_none()
+    );
+
+    // Now test pending Split materialization isolation with ample FD budget.
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [path], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Simulate Split awaiting storage confirmation.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.pending_materialization = Some((
+            ColumnTransformation::Split {
+                source_column: 0,
+                separator: b"-".to_vec(),
+                output_count: 2,
+                output_headers: None,
+            },
+            std::collections::BTreeSet::from([0]),
+            3,
+        ));
+    }
+
+    // Starting Sort while Split awaits confirmation must be blocked.
+    let plan = quarry_core::SortPlan::from(quarry_core::SortSpec {
+        column: 0,
+        direction: quarry_core::SortDirection::Ascending,
+        mode: quarry_core::SortMode::Text,
+        case_sensitivity: CaseSensitivity::Insensitive,
+    });
+    let sort_err = scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_sort_plan(plan)
+        .unwrap_err();
+    assert!(sort_err.text.contains("pending split"));
+
+    // Confirming Split while a filter is active must reject WITHOUT consuming pending_materialization.
+    let query = FilterQuery::single(1, FilterOperator::Contains, b"x".to_vec());
+    scheduler.start_filter(ids[0], query).unwrap();
+    finish_active_filter(&mut scheduler, ids[0]);
+    let confirm_err = scheduler.confirm_pending_materialization(ids[0]);
+    assert!(confirm_err.is_err());
+    assert!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .pending_materialization
+            .is_some(),
+        "rejected confirmation must preserve pending_materialization"
+    );
+
+    // Clear pending split & filter, then verify split analysis->materialization defers
+    // when the FD budget is temporarily full and resumes once descriptors are released.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .clear_filter()
+        .unwrap();
+    scheduler.cancel_pending_materialization(ids[0]);
+    let mut split_sched = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_process_fds: 8,
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    let sids = split_sched
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [dir.path().join("split-fd.csv")],
+            open_options(),
+            None,
+        )
+        .unwrap();
+    finish_active_indexing(&mut split_sched, sids[0]);
+    split_sched
+        .with_reserved_job_fds(
+            sids[0],
+            2,
+            true,
+            |doc| doc.start_split(0, b"-".to_vec()),
+            |e| quarry_workbench::AppMessage::warning(e.to_string()),
+        )
+        .unwrap();
+    // 1 active doc + 2 analysis job = 3 reserved; hold 4 more so 7/8 are used (< 8 cap, 0 free).
+    let blocker = split_sched
+        .fd_budget()
+        .try_reserve(FdCategory::BackgroundJob, 4)
+        .unwrap();
+    assert_eq!(split_sched.fd_budget().snapshot().total_reserved, 7);
+    // Give the tiny split analysis plenty of time to finish on its worker thread, then poll.
+    std::thread::sleep(Duration::from_millis(50));
+    let deferred = split_sched.poll_structural_edits();
+    assert!(deferred.is_empty());
+    assert!(
+        split_sched.sync_fd_leases().is_ok(),
+        "polling while full must defer materialization rather than exceeding FD budget"
+    );
+    assert!(
+        split_sched
+            .tab(sids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .working_copy
+            .is_none(),
+        "materialization must not open working-copy storage while FD budget is full"
+    );
+
+    // Release the blocker lease; polling must now reserve FDs, materialize, and install the split.
+    drop(blocker);
+    let mut split_done = false;
+    for _ in 0..400 {
+        let done = split_sched.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == sids[0]) {
+            assert!(
+                comp.result.is_ok(),
+                "unexpected split error: {:?}",
+                comp.result
+            );
+            split_done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        split_done,
+        "deferred split must complete once FDs are available"
+    );
+    assert!(split_sched.fd_budget().snapshot().peak_reserved < 8);
+
+    // Also verify a cancelled split analysis collects cleanly without reserving materialization FDs.
+    let mut cancel_sched = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_process_fds: 8,
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    let cids = cancel_sched
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [dir.path().join("split-fd.csv")],
+            open_options(),
+            None,
+        )
+        .unwrap();
+    finish_active_indexing(&mut cancel_sched, cids[0]);
+    cancel_sched
+        .with_reserved_job_fds(
+            cids[0],
+            2,
+            true,
+            |doc| doc.start_split(0, b"-".to_vec()),
+            |e| quarry_workbench::AppMessage::warning(e.to_string()),
+        )
+        .unwrap();
+    let cancel_blocker = cancel_sched
+        .fd_budget()
+        .try_reserve(FdCategory::BackgroundJob, 4)
+        .unwrap();
+    assert_eq!(cancel_sched.fd_budget().snapshot().total_reserved, 7);
+    cancel_sched.cancel_structural_edit(cids[0]);
+    let mut cancel_collected = false;
+    for _ in 0..400 {
+        let done = cancel_sched.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == cids[0]) {
+            assert!(comp.result.is_ok());
+            cancel_collected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        cancel_collected,
+        "cancelled split analysis must finish without reserving materialization FDs"
+    );
+    drop(cancel_blocker);
+}
