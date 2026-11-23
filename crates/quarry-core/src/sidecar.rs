@@ -1254,18 +1254,16 @@ fn verify_existing_private_cache_dir(dir: &Path) -> bool {
             return false;
         };
         let uid = rustix::process::getuid().as_raw();
-        if !fmeta.is_dir()
-            || fmeta.uid() != uid
-            || (fmeta.mode() & 0o077) != 0
-            || !is_eligible_local_filesystem(&dir_file)
-        {
-            return false;
-        }
+        let valid_unix = fmeta.is_dir()
+            && fmeta.uid() == uid
+            && (fmeta.mode() & 0o077) == 0
+            && is_eligible_local_filesystem(&dir_file);
         #[cfg(target_os = "macos")]
-        if !macos_has_empty_acl(&dir_file) {
-            return false;
+        {
+            valid_unix && macos_has_empty_acl(&dir_file)
         }
-        true
+        #[cfg(not(target_os = "macos"))]
+        valid_unix
     }
 
     #[cfg(windows)]

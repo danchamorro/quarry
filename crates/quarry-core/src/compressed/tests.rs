@@ -495,7 +495,7 @@ fn bootstrap_reads_first_rows_and_verifies_a_small_stream_in_memory() {
     assert_eq!(bootstrap.first_rows[2].fields[1], b"say \"hi\"");
     assert_eq!(bootstrap.first_rows[3].fields, [b"ragged".to_vec()]);
     // Only the source exists: bootstrapping writes nothing to disk.
-    assert_eq!(entries(dir.path()), [path.clone()]);
+    assert_eq!(entries(dir.path()), std::slice::from_ref(&path));
 
     for (name, bytes) in [
         ("bad-crc.gz", {

@@ -741,15 +741,14 @@ impl Session {
 
     fn check_filter_index(&self, index: &FilterIndex) -> Result<(), QuarryError> {
         self.ensure_source_unchanged()?;
-        if let Some(source) = &index.source {
-            if source.path != self.path
+        if let Some(source) = &index.source
+            && (source.path != self.path
                 || source.stamp != self.source_stamp
                 || source.delimiter != self.dialect.delimiter
                 || source.data_start != u64::from(self.dialect.has_header)
-                || source.encoding != self.encoding
-            {
-                return Err(QuarryError::SourceChanged);
-            }
+                || source.encoding != self.encoding)
+        {
+            return Err(QuarryError::SourceChanged);
         }
         Ok(())
     }

@@ -323,8 +323,12 @@ impl CombineDialog {
                         });
                     if let Some((from, to)) = move_row { self.paths.swap(from, to); self.invalidate(); }
                     if let Some(index) = remove_row { self.paths.remove(index); self.invalidate(); }
-                    if ui.button("Add Files…").clicked() {
-                        if let Some(paths) = rfd::FileDialog::new().set_title("Choose files to combine").pick_files() { self.add_paths(paths); }
+                    if ui.button("Add Files…").clicked()
+                        && let Some(paths) = rfd::FileDialog::new()
+                            .set_title("Choose files to combine")
+                            .pick_files()
+                    {
+                        self.add_paths(paths);
                     }
                     let header_changed = ui.checkbox(&mut self.has_header, "Files have a header row").changed();
                     let previous = (self.delimiter, self.encoding);

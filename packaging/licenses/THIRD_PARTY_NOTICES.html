@@ -3,12 +3,12 @@
 <style>body{font:16px system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 24px;line-height:1.5}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f5f5;padding:18px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid #ddd}</style>
 <body><h1>Quarry third-party notices</h1>
 <p>This inventory preserves collected license terms and upstream notices. The source repository's packaging/licenses/AUDIT.md records the review scope and evidence. Inventory generation does not authorize a release.</p>
-<p>Target: aarch64-apple-darwin. cargo-about 0.9.2. 143 locked packages, including Quarry packages. Build and development dependencies excluded. Quarry licenses are provided separately.</p>
+<p>Target: aarch64-apple-darwin. cargo-about 0.9.2. 144 locked packages, including Quarry packages. Build and development dependencies excluded. Quarry licenses are provided separately.</p>
 <h2>Tool fallback inventory</h2><p>The following tool-selected notices had no source file or contained a generic placeholder. Placeholder texts have been omitted. The supplemental section preserves source permissions and copyright statements collected during review; packaging/licenses/AUDIT.md records their coverage and remaining questions.</p><ul>
 <li>ab_glyph@0.2.32, ab_glyph_rasterizer@0.1.10, accesskit_winit@0.29.2, owned_ttf_parser@0.25.1: Apache-2.0. No source notice file supplied by cargo-about.</li>
 <li>accesskit@0.21.1, accesskit_consumer@0.31.0, accesskit_macos@0.22.2, block2@0.5.1, block2@0.6.2, dispatch@0.2.0, dpi@0.1.2, ecolor@0.33.3, eframe@0.33.3, egui-winit@0.33.3, egui@0.33.3, egui_extras@0.33.3, egui_glow@0.33.3, emath@0.33.3, epaint@0.33.3, objc-sys@0.3.5, objc2-app-kit@0.2.2, objc2-encode@4.1.0, objc2-foundation@0.2.2, objc2-foundation@0.3.2, objc2@0.5.2, objc2@0.6.4, profiling@1.0.18: MIT. No source notice file supplied by cargo-about.</li>
 <li>enum-map-derive@0.17.0, enum-map@2.7.3: MIT. Source file contains a generic copyright placeholder.</li>
-</ul><p>Rust 1.88.0 standard-library and compiler-runtime notices are provided separately in the adjacent Rust directory, including upstream copyright, license, and backtrace notices. Other toolchains, architectures, and operating systems need their own inventories. See packaging/licenses/AUDIT.md in the source repository for the review evidence.</p>
+</ul><p>Rust 1.100.0 standard-library and compiler-runtime notices are provided separately in the adjacent Rust directory, including upstream copyright, license, and backtrace notices. Other toolchains, architectures, and operating systems need their own inventories. See packaging/licenses/AUDIT.md in the source repository for the review evidence.</p>
 <h2>Collected source notices</h2>
 <h3>Apache-2.0: dpi@0.1.2, winit@0.30.13</h3><p>Source: dpi@0.1.2/LICENSE</p><pre>Apache License
                            Version 2.0, January 2004
@@ -1582,7 +1582,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 </pre>
-<h3>MIT: synstructure@0.13.2</h3><p>Source: synstructure@0.13.2/LICENSE</p><pre>Copyright 2016 Nika Layzell
+<h3>MIT: synstructure@0.13.2, synstructure@0.14.0</h3><p>Source: synstructure@0.13.2/LICENSE</p><pre>Copyright 2016 Nika Layzell
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
@@ -2071,7 +2071,7 @@ DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER
 DEALINGS IN THE FONT SOFTWARE.
 </pre>
-<h3>Unicode-3.0: icu_collections@2.3.0, icu_locale_core@2.3.0, icu_normalizer@2.3.0, icu_normalizer_data@2.3.0, icu_properties@2.3.0, icu_properties_data@2.3.0, icu_provider@2.3.0, litemap@0.8.3, potential_utf@0.1.6, tinystr@0.8.4, writeable@0.6.4, yoke-derive@0.8.2, yoke@0.8.3, zerofrom-derive@0.1.7, zerofrom@0.1.8, zerotrie@0.2.5, zerovec-derive@0.11.4, zerovec@0.11.7</h3><p>Source: icu_collections@2.3.0/LICENSE</p><pre>UNICODE LICENSE V3
+<h3>Unicode-3.0: icu_collections@2.4.0, icu_locale_core@2.4.0, icu_normalizer@2.4.0, icu_normalizer_data@2.4.0, icu_properties@2.4.0, icu_properties_data@2.4.0, icu_provider@2.4.0, litemap@0.8.3, potential_utf@0.1.6, tinystr@0.8.5, writeable@0.6.4, yoke-derive@0.8.4, yoke@0.8.4, zerofrom-derive@0.1.7, zerofrom@0.1.8, zerotrie@0.2.5, zerovec-derive@0.11.7, zerovec@0.11.9</h3><p>Source: icu_collections@2.4.0/LICENSE</p><pre>UNICODE LICENSE V3
 
 COPYRIGHT AND PERMISSION NOTICE
 
@@ -3701,13 +3701,13 @@ Permission is granted to anyone to use this software for any purpose, including 
 <tr><td>glutin@0.32.3</td><td>Apache-2.0</td></tr>
 <tr><td>half@2.7.1</td><td>MIT OR Apache-2.0</td></tr>
 <tr><td>hashbrown@0.15.5</td><td>MIT OR Apache-2.0</td></tr>
-<tr><td>icu_collections@2.3.0</td><td>Unicode-3.0</td></tr>
-<tr><td>icu_locale_core@2.3.0</td><td>Unicode-3.0</td></tr>
-<tr><td>icu_normalizer@2.3.0</td><td>Unicode-3.0</td></tr>
-<tr><td>icu_normalizer_data@2.3.0</td><td>Unicode-3.0</td></tr>
-<tr><td>icu_properties@2.3.0</td><td>Unicode-3.0</td></tr>
-<tr><td>icu_properties_data@2.3.0</td><td>Unicode-3.0</td></tr>
-<tr><td>icu_provider@2.3.0</td><td>Unicode-3.0</td></tr>
+<tr><td>icu_collections@2.4.0</td><td>Unicode-3.0</td></tr>
+<tr><td>icu_locale_core@2.4.0</td><td>Unicode-3.0</td></tr>
+<tr><td>icu_normalizer@2.4.0</td><td>Unicode-3.0</td></tr>
+<tr><td>icu_normalizer_data@2.4.0</td><td>Unicode-3.0</td></tr>
+<tr><td>icu_properties@2.4.0</td><td>Unicode-3.0</td></tr>
+<tr><td>icu_properties_data@2.4.0</td><td>Unicode-3.0</td></tr>
+<tr><td>icu_provider@2.4.0</td><td>Unicode-3.0</td></tr>
 <tr><td>idna@1.1.0</td><td>MIT OR Apache-2.0</td></tr>
 <tr><td>idna_adapter@1.2.2</td><td>Apache-2.0 OR MIT</td></tr>
 <tr><td>image@0.25.10</td><td>MIT OR Apache-2.0</td></tr>
@@ -3762,9 +3762,10 @@ Permission is granted to anyone to use this software for any purpose, including 
 <tr><td>syn@2.0.119</td><td>MIT OR Apache-2.0</td></tr>
 <tr><td>syn@3.0.3</td><td>MIT OR Apache-2.0</td></tr>
 <tr><td>synstructure@0.13.2</td><td>MIT</td></tr>
+<tr><td>synstructure@0.14.0</td><td>MIT</td></tr>
 <tr><td>tempfile@3.27.0</td><td>MIT OR Apache-2.0</td></tr>
 <tr><td>tiff@0.11.3</td><td>MIT</td></tr>
-<tr><td>tinystr@0.8.4</td><td>Unicode-3.0</td></tr>
+<tr><td>tinystr@0.8.5</td><td>Unicode-3.0</td></tr>
 <tr><td>tracing-core@0.1.36</td><td>MIT</td></tr>
 <tr><td>tracing@0.1.44</td><td>MIT</td></tr>
 <tr><td>ttf-parser@0.25.1</td><td>MIT OR Apache-2.0</td></tr>
@@ -3777,15 +3778,15 @@ Permission is granted to anyone to use this software for any purpose, including 
 <tr><td>weezl@0.1.12</td><td>MIT OR Apache-2.0</td></tr>
 <tr><td>winit@0.30.13</td><td>Apache-2.0</td></tr>
 <tr><td>writeable@0.6.4</td><td>Unicode-3.0</td></tr>
-<tr><td>yoke-derive@0.8.2</td><td>Unicode-3.0</td></tr>
-<tr><td>yoke@0.8.3</td><td>Unicode-3.0</td></tr>
+<tr><td>yoke-derive@0.8.4</td><td>Unicode-3.0</td></tr>
+<tr><td>yoke@0.8.4</td><td>Unicode-3.0</td></tr>
 <tr><td>zerocopy-derive@0.8.56</td><td>BSD-2-Clause OR Apache-2.0 OR MIT</td></tr>
 <tr><td>zerocopy@0.8.56</td><td>BSD-2-Clause OR Apache-2.0 OR MIT</td></tr>
 <tr><td>zerofrom-derive@0.1.7</td><td>Unicode-3.0</td></tr>
 <tr><td>zerofrom@0.1.8</td><td>Unicode-3.0</td></tr>
 <tr><td>zerotrie@0.2.5</td><td>Unicode-3.0</td></tr>
-<tr><td>zerovec-derive@0.11.4</td><td>Unicode-3.0</td></tr>
-<tr><td>zerovec@0.11.7</td><td>Unicode-3.0</td></tr>
+<tr><td>zerovec-derive@0.11.7</td><td>Unicode-3.0</td></tr>
+<tr><td>zerovec@0.11.9</td><td>Unicode-3.0</td></tr>
 <tr><td>zune-core@0.5.3</td><td>MIT OR Apache-2.0 OR Zlib</td></tr>
 <tr><td>zune-jpeg@0.5.15</td><td>MIT OR Apache-2.0 OR Zlib</td></tr>
 </table></body></html>

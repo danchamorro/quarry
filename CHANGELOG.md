@@ -8,6 +8,12 @@ Tagged beta releases are noted on the day they were published, with exact
 checksums and verification details under `docs/releases/`. Numbers in
 parentheses are GitHub pull requests.
 
+## [2026-11-23]
+
+### Changed
+
+- Unified `apps/quarry-gpui` into the root Cargo workspace and lockfile on `gpui-kit = "=0.10.0"` (removing `/apps/quarry-gpui/` from `.gitignore` and deleting the standalone prototype lockfile and toolchain override), adapted its window root and Light theme to `gpui-component 0.10.0` and `quarry_workbench::theme`, enabled platform-native `cmd-*` / `ctrl-*` shortcuts across macOS and Linux, and verified zero HTTP/TLS/socket transport crates (`gpui-pre-reqwest`, `reqwest`, `hyper`, `rustls`, `quinn`, `native-tls`, `libcurl`) in both `cargo tree` target graphs (macOS and Linux ARM64/x86_64) and linked `quarry-gpui` release binaries (`otool -L` / `ldd` / `nm` / `strings`); upgraded the workspace MSRV and pinned toolchain to Rust `1.100.0` (`rust-toolchain.toml`, `Cargo.toml`, `.github/workflows/ci.yml`), resolved Rust `1.100.0` deprecations and Clippy lints across all workspace crates, and refreshed the Rust `1.100.0` runtime notices and third-party notice inventory (`packaging/licenses/{generate.py,rust/COPYRIGHT-library.html,rust/COPYRIGHT-backtrace.html,THIRD_PARTY_NOTICES.html,manifest.json,reviewed.sha256,AUDIT.md}`) while keeping `apps/quarry-egui` as the active macOS `.app` packaging target until Phase 4B-3. (#191)
+
 ## [2026-11-22]
 
 ### Added

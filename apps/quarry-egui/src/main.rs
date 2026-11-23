@@ -1319,10 +1319,10 @@ impl QuarryApp {
             });
         match result {
             Ok(()) => {
-                if dialog.request.is_cleanup() {
-                    if let Some(document) = self.active.document.as_mut() {
-                        document.commit_edits();
-                    }
+                if dialog.request.is_cleanup()
+                    && let Some(document) = self.active.document.as_mut()
+                {
+                    document.commit_edits();
                 }
                 self.active.structural_dialog = Some(dialog);
                 self.active.notice = None;
@@ -2231,7 +2231,7 @@ impl eframe::App for QuarryApp {
                         ui.painter().rect_stroke(
                             filters.rect,
                             theme::CONTROL_RADIUS,
-                            egui::Stroke::new(1.0, palette.selection_strong),
+                            egui::Stroke::new(1.0_f32, palette.selection_strong),
                             egui::StrokeKind::Inside,
                         );
                     }
@@ -3668,12 +3668,12 @@ fn empty_state_colors(palette: &theme::Palette, hovered: bool) -> (Color32, egui
     if hovered {
         (
             palette.selection,
-            egui::Stroke::new(2.0, palette.selection_strong),
+            egui::Stroke::new(2.0_f32, palette.selection_strong),
         )
     } else {
         (
             palette.zebra,
-            egui::Stroke::new(1.0, palette.control_border),
+            egui::Stroke::new(1.0_f32, palette.control_border),
         )
     }
 }
@@ -4968,7 +4968,7 @@ fn tool_dialog_frame(ctx: &egui::Context) -> egui::Frame {
         .fill(palette.canvas)
         .inner_margin(20)
         .corner_radius(theme::WINDOW_RADIUS + 2)
-        .stroke(egui::Stroke::new(1.0, palette.control_border))
+        .stroke(egui::Stroke::new(1.0_f32, palette.control_border))
 }
 
 fn tool_dialog_style(style: &mut egui::Style) {
@@ -4981,7 +4981,7 @@ fn tool_dialog_style(style: &mut egui::Style) {
     visuals.text_edit_bg_color = Some(palette.control);
     visuals.widgets.inactive.bg_fill = palette.control;
     visuals.widgets.inactive.weak_bg_fill = palette.control;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.control_border);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, palette.control_border);
     visuals.widgets.hovered.bg_fill = palette.hover;
     visuals.widgets.hovered.weak_bg_fill = palette.hover;
 }
@@ -5621,7 +5621,7 @@ fn grid_style(style: &mut egui::Style) {
     widgets.hovered.bg_fill = widgets.hovered.weak_bg_fill;
     widgets.active.weak_bg_fill = palette.selection;
     widgets.active.bg_fill = palette.selection;
-    widgets.active.bg_stroke = egui::Stroke::new(1.5, palette.selection_strong);
+    widgets.active.bg_stroke = egui::Stroke::new(1.5_f32, palette.selection_strong);
 }
 
 fn paint_header_fill(ui: &egui::Ui, palette: &theme::Palette) {
@@ -7075,7 +7075,7 @@ fn toolbar_separator(ui: &mut egui::Ui) {
     ui.painter().vline(
         rect.center().x,
         rect.y_range(),
-        egui::Stroke::new(1.0, palette.separator),
+        egui::Stroke::new(1.0_f32, palette.separator),
     );
 }
 
@@ -15350,7 +15350,12 @@ mod tests {
                 });
             },
         );
-        assert_eq!(request, Some(GridColumnRequest::DeleteRows(vec![1..=2])));
+        assert_eq!(
+            request,
+            Some(GridColumnRequest::DeleteRows(
+                std::iter::once(1..=2).collect()
+            ))
+        );
     }
 
     #[test]

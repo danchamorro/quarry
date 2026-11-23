@@ -1036,17 +1036,18 @@ fn scan_outcome(
         offset = slice_end;
     }
 
-    if error.is_none() && is_last {
-        if let Err(err) = scanner.finish(end, |record_end| {
+    if error.is_none()
+        && is_last
+        && let Err(err) = scanner.finish(end, |record_end| {
             rows += 1;
             if record_end >= next_target {
                 checkpoints.push((rows, record_end));
                 next_target =
                     ((record_end / byte_stride).saturating_add(1)).saturating_mul(byte_stride);
             }
-        }) {
-            error = Some(err);
-        }
+        })
+    {
+        error = Some(err);
     }
 
     let first_record_extra_seps = if rows > 0 {

@@ -1823,10 +1823,8 @@ mod tests {
                             .unwrap();
                         assert_eq!(adopted, fresh, "{mode} w={workers} output_index mismatch");
                     } else {
-                        assert!(
-                            !cfg!(target_os = "macos"),
-                            "local macOS publication must retain duplicate index provenance"
-                        );
+                        #[cfg(target_os = "macos")]
+                        panic!("local macOS publication must retain duplicate index provenance");
                     }
                     assert!(fixture.artifacts().is_empty());
 
@@ -2002,7 +2000,8 @@ mod tests {
                 assert_eq!(adopted.maximum_width(), 2, "{label} width inflated");
                 assert_eq!(adopted, fresh, "{label} output index mismatch");
             } else {
-                assert!(!cfg!(target_os = "macos"));
+                #[cfg(target_os = "macos")]
+                panic!("local macOS publication must retain duplicate index provenance");
             }
         }
     }

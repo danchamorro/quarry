@@ -3177,22 +3177,22 @@ pub(crate) fn source_matches_stamp(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    if !expected.matches_metadata(&path_metadata)
-        || !expected.matches(&SourceStamp::from_file(source)?)
-    {
-        return Ok(false);
-    }
+    let matches_open = expected.matches_metadata(&path_metadata)
+        && expected.matches(&SourceStamp::from_file(source)?);
     #[cfg(windows)]
     {
+        if !matches_open {
+            return Ok(false);
+        }
         let named = match File::open(source_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        return Ok(expected.matches(&SourceStamp::from_file(&named)?));
+        Ok(expected.matches(&SourceStamp::from_file(&named)?))
     }
     #[cfg(not(windows))]
-    Ok(true)
+    Ok(matches_open)
 }
 
 fn validate_destination(source: &Path, destination: &Path) -> Result<(), QuarryError> {
@@ -3297,7 +3297,6 @@ enum ScanOutcome {
     Cancelled,
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn run_export(
     mut source: File,
@@ -6243,7 +6242,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                vec![0..=0],
+                std::iter::once(0..=0).collect(),
                 &working_path,
             )
             .unwrap();
@@ -6263,7 +6262,7 @@ mod tests {
             headered.start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                vec![0..=0],
+                std::iter::once(0..=0).collect(),
                 &invalid_path,
             ),
             Err(QuarryError::InvalidOption(_))
@@ -6275,7 +6274,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                vec![9..=9],
+                std::iter::once(9..=9).collect(),
                 &out_of_range_path,
             )
             .unwrap();
@@ -6299,7 +6298,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                vec![0..=0],
+                std::iter::once(0..=0).collect(),
                 &working_path,
             )
             .unwrap();
@@ -6331,7 +6330,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6380,7 +6379,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6425,7 +6424,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6466,7 +6465,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 3,
@@ -6505,7 +6504,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6545,7 +6544,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -10441,10 +10440,8 @@ mod tests {
                         .unwrap();
                     assert_eq!(adopted, fresh, "{label} w={workers} output_index mismatch");
                 } else {
-                    assert!(
-                        !cfg!(target_os = "macos"),
-                        "local macOS publication must retain replace index provenance"
-                    );
+                    #[cfg(target_os = "macos")]
+                    panic!("local macOS publication must retain replace index provenance");
                 }
                 let bytes = fs::read(&dest).unwrap();
                 if let Some((ref expected_bytes, expected_count)) = baseline {

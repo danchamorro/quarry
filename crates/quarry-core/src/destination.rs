@@ -386,15 +386,12 @@ impl UnixStage {
                 Err(error) => return Err(error.into()),
             }
             // Search/event-only handles permit file-only drop folders on macOS.
-            let directory = match rustix::fs::openat(
+            let directory = File::from(rustix::fs::openat(
                 &root.file,
                 &name,
                 directory_flags() | OFlags::NOFOLLOW,
                 Mode::empty(),
-            ) {
-                Ok(fd) => File::from(fd),
-                Err(error) => return Err(error.into()),
-            };
+            )?);
             let stage = Self {
                 root,
                 name,

@@ -703,7 +703,7 @@ impl Progress {
         let mut overflow = false;
         let updated = self
             .temporary
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| match current
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| match current
                 .checked_add(bytes)
             {
                 Some(next) => Some(next),
@@ -730,7 +730,7 @@ impl Progress {
         }
         let _ = self
             .temporary
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(bytes))
             });
     }

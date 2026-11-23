@@ -21,7 +21,7 @@ These are recorded audit inputs, not evidence for a future release candidate.
 
 ```sh
 ./scripts/generate-notices.sh --cargo-about /path/to/cargo-about
-./scripts/generate-notices.sh --check --target aarch64-apple-darwin --rust-release 1.88.0
+./scripts/generate-notices.sh --check --target aarch64-apple-darwin --rust-release 1.100.0
 ./scripts/generate-notices.sh --release-check
 python3 packaging/licenses/test_generate.py
 ```
@@ -59,7 +59,7 @@ even when freshness passes. Neither command publishes files.
 Pass `--target <triple>` to assert the package target; targets other than
 `aarch64-apple-darwin` fail until a corresponding inventory is implemented.
 Packaging also checks `--rust-release` against the runtime notices, currently
-1.88.0. It queries the compiler inside the build checkout and honors `RUSTC`.
+1.100.0. It queries the compiler inside the build checkout and honors `RUSTC`.
 
 The generator uses genuine source files selected by cargo-about. It omits
 source-less fallback text and the detected MIT placeholder from the HTML, listing
@@ -245,3 +245,48 @@ unchanged. The affected inputs are `Cargo.toml`, `Cargo.lock`,
 `apps/quarry-egui/Cargo.toml`, `crates/quarry-workbench/Cargo.toml`, and this
 audit record. The regenerated manifest hash records this bounded review; it is
 not a change of license terms or release approval.
+
+## 2026-11-22 Rust 1.100.0 runtime notices and GPUI workspace unification
+
+Unifying `apps/quarry-gpui` (on `gpui-kit = "=0.10.0"`) into the root Cargo
+workspace requires upgrading the pinned workspace toolchain from Rust 1.88.0 to
+Rust 1.100.0 (`0ef1bc386059596dada8fb65b50425aab2ea637a`, LLVM 23.1.5, release
+dated 2026-11-12). `apps/quarry-egui` remains the packaged macOS `.app` target
+until the Phase 4B-3 cutover, so `THIRD_PARTY_NOTICES.html` continues to
+inventory `apps/quarry-egui/Cargo.toml` for `aarch64-apple-darwin`.
+
+Updated Rust 1.100.0 runtime resources in `packaging/licenses/rust/`:
+
+| Resource | Provenance |
+|---|---|
+| `COPYRIGHT-library.html` | Exact Rust 1.100.0 installed library notice, 1,512,515 bytes; SHA-256 `626556344c12679d7cab2c1aa2ce80de01937b62c2c88c62f0650a469be18799`. |
+| `COPYRIGHT-backtrace.html` | Five unmodified sections from Rust 1.100.0's full `COPYRIGHT.html` (SHA-256 `d5a611d33c23248dec086ca86ce6123ecfc26b2b9666e34beaa4dda012d53e4b`, 58,597 bytes, SHA-256 `3f75bc40ac42851491dcb65fd6f18c258325578e9f3efa63391a9eb682628461`): `addr2line-0.25.1`, `adler2-2.0.1`, `memchr-2.8.2`, `miniz_oxide-0.8.9`, and `object-0.39.1`. `library/Cargo.lock` at `0ef1bc386059596dada8fb65b50425aab2ea637a` pins `addr2line@0.27.1`, `adler2@2.0.1`, `memchr@2.8.3`, `miniz_oxide@0.9.1`, and `object@0.39.1`; the license files in the checksum-verified crates.io archives for `0.27.1`, `2.8.3`, and `0.9.1` were compared byte-for-byte against those extracted sections and match identically. |
+| `LICENSE-MIT`, `LICENSE-APACHE`, `Unicode-3.0.txt`, `compiler-builtins-libm-LICENSE.txt`, `compiler-rt-CREDITS.TXT` | Verified byte-for-byte unchanged against Rust 1.100.0 (`0ef1bc386059596dada8fb65b50425aab2ea637a`), `library/compiler-builtins/libm/LICENSE.txt`, and LLVM 23.1.5 submodule `0a5579eb649d3634a9c30ac873300cc2944fa070`. |
+
+Regenerating `THIRD_PARTY_NOTICES.html` with the checksum-verified cargo-about
+0.9.2 ARM64 binary updates the runtime notice prose from Rust 1.88.0 to Rust
+1.100.0 and reflects the unified workspace lockfile resolution in the
+`quarry-egui` graph (143 to 144 locked packages: adding `synstructure@0.14.0`
+under `MIT`, and minor/patch bumps across the `Unicode-3.0`-licensed ICU4X
+crates `icu_*@2.4.0`, `tinystr@0.8.5`, `yoke@0.8.4`, `yoke-derive@0.8.4`,
+`zerovec@0.11.9`, and `zerovec-derive@0.11.7`). Selected third-party license
+terms and supplemental text/font hashes are unchanged.
+
+Read-only pre-audit of `apps/quarry-gpui/Cargo.toml` for `aarch64-apple-darwin`
+against the current `about.toml` (ahead of the Phase 4B-3 packaging switch)
+flagged 11 crates using five OSI-approved licenses not yet listed in the
+`quarry-egui` allowlist: `0BSD` (`enum-iterator@2.3.0`,
+`enum-iterator-derive@1.5.0`), `BSD-2-Clause` (`arrayref@0.3.9`),
+`BSD-3-Clause` (`encoding_rs@0.8.44`, `exr@1.74.3`, `instant@0.1.13`,
+`lebe@0.5.3`, `tiny-skia@0.11.4`, `tiny-skia-path@0.11.4`), `CC0-1.0`
+(`notify@8.2.2`), and weak file-level copyleft `MPL-2.0` (`option-ext@0.2.0`
+via `dirs-sys`/`zed-font-kit`). Zero GPL, LGPL, AGPL, or non-OSI dependencies
+were found. A full `quarry-gpui` notice inventory and supplemental review will
+be generated before the Phase 4B-3 packaging cutover.
+
+The affected inputs are `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`,
+`apps/quarry-gpui/Cargo.toml`, `packaging/licenses/generate.py`,
+`packaging/licenses/rust/COPYRIGHT-library.html`,
+`packaging/licenses/rust/COPYRIGHT-backtrace.html`, and this audit record. The
+regenerated manifest hash records this bounded review; it is not a change of
+license terms or release approval.

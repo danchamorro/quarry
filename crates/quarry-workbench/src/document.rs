@@ -1399,10 +1399,11 @@ impl Document {
             .expect("materialization owns a working-copy directory");
         let current_path = self.session.path().to_path_buf();
         for obsolete in [state.undo.take(), state.redo.take()].into_iter().flatten() {
-            if obsolete.path != current_path && state.owns(&obsolete.path) {
-                if let Err(error) = state.remove(&obsolete.path) {
-                    self.working_cleanup.report(error);
-                }
+            if obsolete.path != current_path
+                && state.owns(&obsolete.path)
+                && let Err(error) = state.remove(&obsolete.path)
+            {
+                self.working_cleanup.report(error);
             }
         }
         debug_assert_eq!(undo.path, current_path);
@@ -1897,10 +1898,11 @@ impl Document {
         let Some(redo) = state.redo.take() else {
             return;
         };
-        if redo.path != self.session.path() && state.owns(&redo.path) {
-            if let Err(error) = state.remove(&redo.path) {
-                self.working_cleanup.report(error);
-            }
+        if redo.path != self.session.path()
+            && state.owns(&redo.path)
+            && let Err(error) = state.remove(&redo.path)
+        {
+            self.working_cleanup.report(error);
         }
         state.prune_directories(self.session.path());
     }
@@ -5116,7 +5118,9 @@ mod tests {
         assert!(document.selected_rows.is_empty());
         assert!(document.selection.is_none());
         assert_eq!(
-            document.start_delete_rows(vec![1..=1]).unwrap_err(),
+            document
+                .start_delete_rows(std::iter::once(1..=1).collect())
+                .unwrap_err(),
             "Clear the filter before editing the document."
         );
         assert!(document.structural_job.is_none());

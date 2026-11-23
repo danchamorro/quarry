@@ -279,11 +279,11 @@ fn style(palette: &Palette) -> egui::Style {
     visuals.weak_text_color = Some(palette.text_secondary);
     visuals.hyperlink_color = palette.accent_text;
     visuals.selection.bg_fill = palette.selection;
-    visuals.selection.stroke = Stroke::new(1.0, palette.text);
-    visuals.text_cursor.stroke = Stroke::new(2.0, palette.selection_strong);
+    visuals.selection.stroke = Stroke::new(1.0_f32, palette.text);
+    visuals.text_cursor.stroke = Stroke::new(2.0_f32, palette.selection_strong);
     visuals.panel_fill = palette.chrome;
     visuals.window_fill = palette.canvas;
-    visuals.window_stroke = Stroke::new(1.0, palette.control_border);
+    visuals.window_stroke = Stroke::new(1.0_f32, palette.control_border);
     visuals.window_corner_radius = CornerRadius::same(WINDOW_RADIUS);
     visuals.window_shadow = egui::epaint::Shadow {
         offset: [0, 10],
@@ -311,34 +311,34 @@ fn style(palette: &Palette) -> egui::Style {
     let widgets = &mut visuals.widgets;
     widgets.noninteractive.bg_fill = palette.canvas;
     widgets.noninteractive.weak_bg_fill = palette.canvas;
-    widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.grid_line);
-    widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, palette.grid_line);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, palette.text);
     widgets.noninteractive.corner_radius = radius;
 
     widgets.inactive.bg_fill = palette.control;
     widgets.inactive.weak_bg_fill = palette.control;
-    widgets.inactive.bg_stroke = Stroke::new(1.0, palette.control_border);
-    widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
+    widgets.inactive.bg_stroke = Stroke::new(1.0_f32, palette.control_border);
+    widgets.inactive.fg_stroke = Stroke::new(1.0_f32, palette.text);
     widgets.inactive.corner_radius = radius;
 
     widgets.hovered.bg_fill = palette.hover;
     widgets.hovered.weak_bg_fill = palette.hover;
-    widgets.hovered.bg_stroke = Stroke::new(1.0, palette.control_border);
-    widgets.hovered.fg_stroke = Stroke::new(1.5, palette.text);
+    widgets.hovered.bg_stroke = Stroke::new(1.0_f32, palette.control_border);
+    widgets.hovered.fg_stroke = Stroke::new(1.5_f32, palette.text);
     widgets.hovered.corner_radius = radius;
     widgets.hovered.expansion = 0.0;
 
     widgets.active.bg_fill = palette.pressed;
     widgets.active.weak_bg_fill = palette.pressed;
-    widgets.active.bg_stroke = Stroke::new(1.0, palette.selection_strong);
-    widgets.active.fg_stroke = Stroke::new(1.5, palette.text);
+    widgets.active.bg_stroke = Stroke::new(1.0_f32, palette.selection_strong);
+    widgets.active.fg_stroke = Stroke::new(1.5_f32, palette.text);
     widgets.active.corner_radius = radius;
     widgets.active.expansion = 0.0;
 
     widgets.open.bg_fill = palette.hover;
     widgets.open.weak_bg_fill = palette.hover;
-    widgets.open.bg_stroke = Stroke::new(1.0, palette.control_border);
-    widgets.open.fg_stroke = Stroke::new(1.0, palette.text);
+    widgets.open.bg_stroke = Stroke::new(1.0_f32, palette.control_border);
+    widgets.open.fg_stroke = Stroke::new(1.0_f32, palette.text);
     widgets.open.corner_radius = radius;
     style
 }
@@ -353,7 +353,7 @@ pub(super) fn chrome_controls(style: &mut egui::Style) {
     widgets.hovered.bg_stroke = Stroke::NONE;
     widgets.active.bg_stroke = Stroke::NONE;
     widgets.open.bg_stroke = Stroke::NONE;
-    widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.separator);
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, palette.separator);
     style.visuals.text_edit_bg_color = Some(palette.control);
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
 }
@@ -377,7 +377,7 @@ pub(super) fn hairline(painter: &egui::Painter, rect: egui::Rect, bottom: bool, 
     } else {
         rect.top() + 0.5
     };
-    painter.hline(rect.x_range(), y, Stroke::new(1.0, color));
+    painter.hline(rect.x_range(), y, Stroke::new(1.0_f32, color));
 }
 
 /// A segmented control: mutually exclusive options in one framed group.
@@ -392,7 +392,7 @@ pub(super) fn segmented<T: PartialEq + Copy>(
     let count = options.len().max(1) as f32;
     egui::Frame::new()
         .fill(palette.header_fill)
-        .stroke(Stroke::new(1.0, palette.control_border))
+        .stroke(Stroke::new(1.0_f32, palette.control_border))
         .corner_radius(CornerRadius::same(CONTROL_RADIUS + 1))
         .inner_margin(egui::Margin::same(2))
         .show(ui, |ui| {
@@ -408,7 +408,7 @@ pub(super) fn segmented<T: PartialEq + Copy>(
                             egui::Button::selectable(selected, *label)
                                 .corner_radius(CONTROL_RADIUS)
                                 .stroke(if selected {
-                                    Stroke::new(1.0, palette.selection_strong)
+                                    Stroke::new(1.0_f32, palette.selection_strong)
                                 } else {
                                     Stroke::NONE
                                 }),
@@ -437,7 +437,7 @@ pub(super) fn inset_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut eg
     let inner_width = (ui.available_width() - 22.0).max(0.0);
     egui::Frame::new()
         .fill(palette.zebra)
-        .stroke(Stroke::new(1.0, palette.grid_line))
+        .stroke(Stroke::new(1.0_f32, palette.grid_line))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
@@ -478,7 +478,7 @@ pub(super) fn stat(ui: &mut egui::Ui, value: String, caption: &str) {
     let palette = ui_palette(ui);
     egui::Frame::new()
         .fill(palette.canvas)
-        .stroke(Stroke::new(1.0, palette.grid_line))
+        .stroke(Stroke::new(1.0_f32, palette.grid_line))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {

@@ -380,7 +380,7 @@ impl XorShift64 {
 fn scalar_oracle_matches_seeded_random_streams_and_error_offsets() {
     let mut rng = XorShift64(0x51A4_2026_1121_0001);
     let alphabet: &[u8] = b"ab,\"\r\n\t;| \xEF\xBB\xBF";
-    let delimiters = [b',', b'\t', b';', b'|'];
+    let delimiters = *b",\t;|";
 
     for case_idx in 0..300 {
         let delimiter = delimiters[case_idx % delimiters.len()];

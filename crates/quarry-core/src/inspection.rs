@@ -694,7 +694,9 @@ fn append_bounded(out: &mut Vec<u8>, bytes: &[u8], limit: usize) {
 fn count_lines(bytes: &[u8], encoding: Encoding) -> u64 {
     if encoding.is_utf16() {
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter(|b| {
                 if encoding == Encoding::Utf16Le {
                     b[0] == b'\n' && b[1] == 0

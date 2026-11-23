@@ -1,0 +1,16 @@
+[package]
+name = "quarry-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+gpui-kit = "=0.10.0"
+quarry-core = { path = "../../crates/quarry-core" }
+quarry-workbench = { path = "../../crates/quarry-workbench" }
+
+[dev-dependencies]
+gpui-kit = { version = "=0.10.0", features = ["test-support"] }
+tempfile = "3.27.0"

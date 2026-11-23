@@ -1854,7 +1854,7 @@ fn create_initial_runs_parallel(
                     arena.clear_for_reuse(0);
                     budget_guard.take();
                 }
-                if !spill_collected_arenas(
+                spill_collected_arenas(
                     &collector,
                     direction,
                     dedup,
@@ -1862,10 +1862,7 @@ fn create_initial_runs_parallel(
                     early_duplicates.as_deref(),
                     &workspace,
                     &shared,
-                )? {
-                    return Ok(false);
-                }
-                Ok(true)
+                )
             };
 
             'worker: loop {
@@ -2878,11 +2875,9 @@ pub(super) fn compute_merge_concurrency(
                 .saturating_add(1)
                 .saturating_mul(MERGE_STREAM_BUFFER_BYTES),
         );
-    let max_by_mem = if group_mem == 0 {
-        max_by_work
-    } else {
-        (MERGE_MEMORY_BUDGET_BYTES / group_mem).max(1)
-    };
+    let max_by_mem = MERGE_MEMORY_BUDGET_BYTES
+        .checked_div(group_mem)
+        .map_or(max_by_work, |groups| groups.max(1));
     let fds_per_group = max_group_len.saturating_add(1).max(1);
     let max_by_fd = (fd_budget_limit / fds_per_group).max(1);
     max_by_work.min(max_by_mem).min(max_by_fd).max(1)
