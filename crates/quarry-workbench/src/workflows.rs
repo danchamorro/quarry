@@ -1392,6 +1392,12 @@ impl InspectWorkflow {
             self.path = Some(raw_gz.to_path_buf());
             self.display_path = Some(raw_gz.to_path_buf());
             self.session_for_compressed_guard = None;
+        } else if doc.is_compressed() && doc.session.path().as_os_str().is_empty() {
+            // Pending, preview-only, cancelled, or in-progress gzip tabs have no completed
+            // private decompressed file yet; inspect the gzip source via raw decompression.
+            self.path = Some(doc.logical_path.clone());
+            self.display_path = Some(doc.logical_path.clone());
+            self.session_for_compressed_guard = None;
         } else {
             self.path = Some(doc.session.path().to_path_buf());
             self.display_path = Some(doc.logical_path.clone());
@@ -1964,15 +1970,29 @@ mod tests {
             "a,b\n1,2\n6,7\n"
         );
 
-        // Also test raw gzip inspection end to end.
+        // Also test raw gzip inspection end to end, both by path and via a pending gzip Document
+        // whose preview session has an empty backing path.
         let gz_path = dir.path().join("uneven.csv.gz");
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(b"a,b\n1,2\n3,4,5\n").unwrap();
         std::fs::write(&gz_path, enc.finish().unwrap()).unwrap();
-        wf.configure_for_path(gz_path);
+        wf.configure_for_path(gz_path.clone());
         wf.start_inspect(true);
         wait_inspect(&mut wf);
         assert!(!wf.report.as_ref().unwrap().findings.is_empty());
+
+        let pending_gz_doc =
+            Document::prepare_with_encoding(&gz_path, OpenOptions::default(), None).unwrap();
+        assert!(pending_gz_doc.awaiting_decompression());
+        assert!(pending_gz_doc.session.path().as_os_str().is_empty());
+        wf.configure_for_document(DocumentId::new(1), &pending_gz_doc);
+        assert_eq!(wf.path.as_deref(), Some(gz_path.as_path()));
+        wf.start_inspect(true);
+        wait_inspect(&mut wf);
+        assert!(
+            !wf.report.as_ref().unwrap().findings.is_empty(),
+            "inspecting a pending gzip tab must decompress and inspect logical_path"
+        );
 
         // Reconfiguring target while an inspection job is in flight must discard the old worker
         // so poll() never installs the old file's report under the new target.
