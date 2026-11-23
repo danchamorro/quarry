@@ -407,8 +407,16 @@ pub fn open_combine_dialog(
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().w(px(140.)).child(Select::new(&delim_ent).small()))
-                            .child(div().w(px(150.)).child(Select::new(&enc_ent).small()))
+                            .child(
+                                div()
+                                    .w(px(140.))
+                                    .child(Select::new(&delim_ent).small().disabled(busy)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(150.))
+                                    .child(Select::new(&enc_ent).small().disabled(busy)),
+                            )
                             .child(
                                 Checkbox::new("combine-has-header")
                                     .label("First row is header")
@@ -630,6 +638,11 @@ pub fn open_join_dialog(
                 let mode = wf.mode;
                 let ignore_case = wf.ignore_ascii_case;
                 let req_unique = wf.require_unique;
+                let side_has_header = [wf.formats[0].has_header, wf.formats[1].has_header];
+                let side_is_open_tab = [
+                    matches!(wf.sides[0], Some(JoinSideSource::OpenTab { .. })),
+                    matches!(wf.sides[1], Some(JoinSideSource::OpenTab { .. })),
+                ];
                 let keys = wf.keys.clone();
                 let out_cols = wf.output_columns.clone();
                 let side_labels: [String; 2] = [0, 1].map(|s| match wf.sides[s].as_ref() {
@@ -751,7 +764,7 @@ pub fn open_join_dialog(
                                                     {
                                                         cx.update(|cx| {
                                                             c_browse.update(cx, |c, cx| {
-                                                                c.join_set_file_side(side, path, cx);
+                                                                let _ = c.join_set_file_side(side, path, cx);
                                                             });
                                                         });
                                                     }
@@ -775,17 +788,20 @@ pub fn open_join_dialog(
                             .when(!tabs_for_side.is_empty(), |row| {
                                 row.child(
                                     div()
+                                        .id(("join-open-tabs-scroll", side))
                                         .flex()
                                         .flex_wrap()
                                         .items_center()
                                         .gap_1()
+                                        .max_h(px(68.))
+                                        .overflow_y_scroll()
                                         .child(
                                             div()
                                                 .text_size(px(11.))
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child("Use open tab:"),
                                         )
-                                        .children(tabs_for_side.into_iter().take(6).map(
+                                        .children(tabs_for_side.into_iter().map(
                                             |(doc_id, label, _)| {
                                                 let c_tab = c_body.clone();
                                                 Button::new((
@@ -808,15 +824,35 @@ pub fn open_join_dialog(
                                 )
                             })
                             .child(
-                                Checkbox::new(("join-unique", side))
-                                    .label("Require unique keys on this input")
-                                    .checked(req_unique[side])
-                                    .disabled(busy)
-                                    .on_click(move |checked, _, cx| {
-                                        c_unique.update(cx, |c, cx| {
-                                            c.join_set_require_unique(side, *checked, cx);
-                                        });
-                                    }),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child({
+                                        let c_hdr = c_body.clone();
+                                        Checkbox::new(("join-has-header", side))
+                                            .label("First row is header")
+                                            .checked(side_has_header[side])
+                                            .disabled(busy || side_is_open_tab[side])
+                                            .on_click(move |checked, _, cx| {
+                                                c_hdr.update(cx, |c, cx| {
+                                                    let _ = c.join_set_side_has_header(
+                                                        side, *checked, cx,
+                                                    );
+                                                });
+                                            })
+                                    })
+                                    .child(
+                                        Checkbox::new(("join-unique", side))
+                                            .label("Require unique keys on this input")
+                                            .checked(req_unique[side])
+                                            .disabled(busy)
+                                            .on_click(move |checked, _, cx| {
+                                                c_unique.update(cx, |c, cx| {
+                                                    c.join_set_require_unique(side, *checked, cx);
+                                                });
+                                            }),
+                                    ),
                             )
                     }))
                     // Join mode selector & case sensitivity
@@ -1365,7 +1401,6 @@ pub fn open_inspect_dialog(
                         r.findings
                             .iter()
                             .enumerate()
-                            .take(100)
                             .map(|(ix, d)| {
                                 (ix, d.details(), r.can_omit(ix), wf.selected.contains(&ix))
                             })
@@ -1433,26 +1468,50 @@ pub fn open_inspect_dialog(
                                     .label("Choose File…")
                                     .small()
                                     .disabled(busy)
-                                    .on_click(move |_, _, cx| {
-                                        let sel = cx.prompt_for_paths(PathPromptOptions {
-                                            files: true,
-                                            directories: false,
-                                            multiple: false,
-                                            prompt: Some("Select file to inspect".into()),
-                                        });
-                                        let c_browse = c_browse.clone();
-                                        cx.spawn(async move |cx| {
-                                            if let Ok(Ok(Some(paths))) = sel.await
-                                                && let Some(path) = paths.into_iter().next()
-                                            {
-                                                cx.update(|cx| {
-                                                    c_browse.update(cx, |c, cx| {
-                                                        c.inspect_configure_path(path, cx);
+                                    .on_click({
+                                        let delim_reset = delim_ent.clone();
+                                        let hdr_reset = hdr_ent.clone();
+                                        let enc_reset = enc_ent.clone();
+                                        move |_, window, cx| {
+                                            let sel = cx.prompt_for_paths(PathPromptOptions {
+                                                files: true,
+                                                directories: false,
+                                                multiple: false,
+                                                prompt: Some("Select file to inspect".into()),
+                                            });
+                                            let c_browse = c_browse.clone();
+                                            let wh = window.window_handle();
+                                            let delim_reset = delim_reset.clone();
+                                            let hdr_reset = hdr_reset.clone();
+                                            let enc_reset = enc_reset.clone();
+                                            cx.spawn(async move |cx| {
+                                                if let Ok(Ok(Some(paths))) = sel.await
+                                                    && let Some(path) = paths.into_iter().next()
+                                                {
+                                                    let _ = wh.update(cx, |_, window, cx| {
+                                                        c_browse.update(cx, |c, cx| {
+                                                            c.inspect_configure_path(path, cx);
+                                                        });
+                                                        delim_reset.update(cx, |s, cx| {
+                                                            s.set_selected_value(
+                                                                &0usize, window, cx,
+                                                            );
+                                                        });
+                                                        hdr_reset.update(cx, |s, cx| {
+                                                            s.set_selected_value(
+                                                                &0usize, window, cx,
+                                                            );
+                                                        });
+                                                        enc_reset.update(cx, |s, cx| {
+                                                            s.set_selected_value(
+                                                                &0usize, window, cx,
+                                                            );
+                                                        });
                                                     });
-                                                });
-                                            }
-                                        })
-                                        .detach();
+                                                }
+                                            })
+                                            .detach();
+                                        }
                                     }),
                             ),
                     )
@@ -1461,9 +1520,21 @@ pub fn open_inspect_dialog(
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().w(px(140.)).child(Select::new(&delim_ent).small()))
-                            .child(div().w(px(180.)).child(Select::new(&hdr_ent).small()))
-                            .child(div().w(px(150.)).child(Select::new(&enc_ent).small())),
+                            .child(
+                                div()
+                                    .w(px(140.))
+                                    .child(Select::new(&delim_ent).small().disabled(busy)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(180.))
+                                    .child(Select::new(&hdr_ent).small().disabled(busy)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(150.))
+                                    .child(Select::new(&enc_ent).small().disabled(busy)),
+                            ),
                     )
                     .when_some(progress_text, |el, text| {
                         el.child(

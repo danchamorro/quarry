@@ -158,17 +158,20 @@ struct WorkbenchGlobal(Entity<WorkbenchController>);
 
 impl Global for WorkbenchGlobal {}
 
+type StorageCheckOutcome = Result<(StorageSpace, u64), String>;
+type StorageCheckWorker = (u64, JoinHandle<StorageCheckOutcome>);
+
 pub struct WorkbenchController {
     scheduler: WorkbenchScheduler,
     storage_prefs: StoragePreferences,
     combine: Box<CombineWorkflow>,
     join: Box<JoinWorkflow>,
     inspect: Box<InspectWorkflow>,
-    failed_opens: BTreeMap<WindowId, FailedOpen>,
     cache_clear_worker: Option<JoinHandle<Result<String, String>>>,
     cache_clear_status: Option<Result<String, String>>,
-    storage_check_worker: Option<JoinHandle<Result<(StorageSpace, u64), String>>>,
-    storage_check_result: Option<Result<(StorageSpace, u64), String>>,
+    storage_check_gen: u64,
+    storage_check_worker: Option<StorageCheckWorker>,
+    storage_check_result: Option<StorageCheckOutcome>,
     next_window_id: u64,
     next_review_token: u64,
     windows: BTreeMap<WindowId, WindowHandle<Root>>,
@@ -217,9 +220,9 @@ impl WorkbenchController {
                 cleanup,
                 slots,
             )),
-            failed_opens: BTreeMap::new(),
             cache_clear_worker: None,
             cache_clear_status: None,
+            storage_check_gen: 0,
             storage_check_worker: None,
             storage_check_result: None,
             next_window_id: 1,
@@ -318,35 +321,17 @@ impl WorkbenchController {
         self.windows.remove(&id);
         self.editing_windows.remove(&id);
         self.window_messages.remove(&id);
-        self.failed_opens.remove(&id);
     }
 
     pub fn write_slot_available(&self) -> bool {
         let workflow_ops = usize::from(self.combine.running_writer())
-            + usize::from(self.join.running_operation())
-            + usize::from(self.inspect.recovering());
+            + self.join.active_operation_count()
+            + self.inspect.active_recovery_count();
         self.scheduler.active_write_operations() + workflow_ops < MAX_GLOBAL_WRITE_OPERATIONS
     }
 
     pub fn path_reserved(&self, path: &Path) -> bool {
-        if self.scheduler.path_reserved(path) {
-            return true;
-        }
-        let matches_reserved = |reserved: Option<&Path>| -> bool {
-            let Some(res) = reserved else {
-                return false;
-            };
-            if res == path {
-                return true;
-            }
-            match (std::fs::canonicalize(res), std::fs::canonicalize(path)) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => false,
-            }
-        };
-        matches_reserved(self.combine.reserved_output())
-            || matches_reserved(self.join.reserved_output())
-            || matches_reserved(self.inspect.reserved_output())
+        self.path_reserved_excluding(path, false, false, false)
     }
 
     pub fn set_window_editing(&mut self, id: WindowId, editing: bool, cx: &mut Context<Self>) {
@@ -656,9 +641,9 @@ impl WorkbenchController {
         options: OpenOptions,
         encoding: Option<Encoding>,
         cx: &mut Context<Self>,
-    ) -> Result<(WindowId, DocumentId), String> {
+    ) -> Result<(WindowId, DocumentId), AppMessage> {
         if paths.is_empty() {
-            return Err("No file selected.".into());
+            return Err(AppMessage::warning("No file selected."));
         }
         if paths.len() == 1 {
             let path = paths.into_iter().next().unwrap();
@@ -670,15 +655,19 @@ impl WorkbenchController {
                 if let Some(handle) = self.window_handle(owner_win) {
                     let _ = handle.update(cx, |_, window, _| window.activate_window());
                 }
-                return Err(
-                    "Apply or cancel the open edit in the owning window before switching tabs."
-                        .into(),
-                );
+                return Err(AppMessage::warning(
+                    "Apply or cancel the open edit in the owning window before switching tabs.",
+                ));
             }
             let outcome = self
                 .scheduler
-                .open_path(target_window, path, options, encoding)
-                .map_err(|e| e.to_string())?;
+                .open_path(target_window, path.clone(), options, encoding)
+                .map_err(|err| match err {
+                    SchedulerError::OpenFailed(message) => {
+                        AppMessage::file_open_error(path, options, encoding, message)
+                    }
+                    other => AppMessage::warning(other.to_string()),
+                })?;
             let (doc_id, owner_window) = match outcome {
                 WakeOutcome::Ready { document_id, .. }
                 | WakeOutcome::SourceChangedConflict { document_id, .. } => {
@@ -702,7 +691,7 @@ impl WorkbenchController {
         let ids = self
             .scheduler
             .open_many_lazy(target_window, paths, options, encoding)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| AppMessage::error(e.to_string()))?;
         let local_active = self
             .scheduler
             .active_document(target_window)
@@ -713,7 +702,7 @@ impl WorkbenchController {
             let first_id = ids
                 .first()
                 .copied()
-                .ok_or_else(|| "No files were opened.".to_string())?;
+                .ok_or_else(|| AppMessage::warning("No files were opened."))?;
             let owner = self.scheduler.window_of(first_id).unwrap_or(target_window);
             let _ = self.scheduler.activate_tab(owner, first_id);
             if owner != target_window
@@ -2384,6 +2373,52 @@ impl WorkbenchController {
         cx.notify();
     }
 
+    fn normalize_output_alias(path: &Path) -> PathBuf {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        if let Ok(canon) = std::fs::canonicalize(&abs) {
+            return canon;
+        }
+        // Normalize lexical `.` and `..` components, then canonicalize the deepest existing
+        // ancestor so aliases like `/data/out.csv` and `/data/sub/../out.csv` match before creation.
+        let mut lexical = PathBuf::new();
+        for component in abs.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    lexical.pop();
+                }
+                other => lexical.push(other.as_os_str()),
+            }
+        }
+        if let Ok(canon) = std::fs::canonicalize(&lexical) {
+            return canon;
+        }
+        let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+        let mut current = lexical.as_path();
+        while let Some(parent) = current.parent() {
+            if let Some(name) = current.file_name() {
+                suffix.push(name.to_os_string());
+            }
+            if let Ok(mut resolved) = std::fs::canonicalize(parent) {
+                for seg in suffix.into_iter().rev() {
+                    resolved.push(seg);
+                }
+                return resolved;
+            }
+            if parent == current {
+                break;
+            }
+            current = parent;
+        }
+        lexical
+    }
+
     fn path_reserved_excluding(
         &self,
         path: &Path,
@@ -2394,21 +2429,18 @@ impl WorkbenchController {
         if self.scheduler.path_reserved(path) {
             return true;
         }
-        let matches_opt = |reserved: Option<&Path>| -> bool {
-            let Some(res) = reserved else {
-                return false;
-            };
-            if res == path {
-                return true;
-            }
-            match (std::fs::canonicalize(res), std::fs::canonicalize(path)) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => false,
-            }
+        let target_norm = Self::normalize_output_alias(path);
+        let matches_path = |res: &Path| -> bool {
+            res == path || Self::normalize_output_alias(res) == target_norm
         };
-        (!exclude_combine && matches_opt(self.combine.reserved_output()))
-            || (!exclude_join && matches_opt(self.join.reserved_output()))
-            || (!exclude_inspect && matches_opt(self.inspect.reserved_output()))
+        (!exclude_combine && self.combine.reserved_output().is_some_and(matches_path))
+            || (!exclude_join && self.join.reserved_outputs().into_iter().any(matches_path))
+            || (!exclude_inspect
+                && self
+                    .inspect
+                    .reserved_outputs()
+                    .into_iter()
+                    .any(matches_path))
     }
 
     pub fn combine_prepare_destination(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
@@ -2442,9 +2474,28 @@ impl WorkbenchController {
         self.scheduler.hydrated_join_choices()
     }
 
-    pub fn join_set_file_side(&mut self, side: usize, path: PathBuf, cx: &mut Context<Self>) {
-        self.join.set_file_side(side, path);
+    pub fn join_set_file_side(
+        &mut self,
+        side: usize,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let slot = self.write_slot_available();
+        let res = self.join.set_file_side(side, path, slot);
         cx.notify();
+        res
+    }
+
+    pub fn join_set_side_has_header(
+        &mut self,
+        side: usize,
+        has_header: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let slot = self.write_slot_available();
+        let res = self.join.set_side_has_header(side, has_header, slot);
+        cx.notify();
+        res
     }
 
     pub fn join_set_open_tab_side(
@@ -2453,6 +2504,7 @@ impl WorkbenchController {
         doc_id: DocumentId,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        let slot = self.write_slot_available();
         let label = self
             .scheduler
             .tab_display_name(doc_id)
@@ -2464,7 +2516,7 @@ impl WorkbenchController {
         else {
             return Err("That tab is no longer open.".into());
         };
-        let res = self.join.set_open_tab_side(side, doc_id, label, doc);
+        let res = self.join.set_open_tab_side(side, doc_id, label, doc, slot);
         cx.notify();
         res
     }
@@ -2569,7 +2621,7 @@ impl WorkbenchController {
     }
 
     pub fn join_release_all(&mut self, cx: &mut Context<Self>) {
-        self.join.release_all();
+        self.join.release_all_async();
         let _ = self.scheduler.sync_fd_leases();
         cx.notify();
     }
@@ -2580,28 +2632,8 @@ impl WorkbenchController {
         &self.inspect
     }
 
-    pub fn record_failed_open(
-        &mut self,
-        window: WindowId,
-        failed: FailedOpen,
-        cx: &mut Context<Self>,
-    ) {
-        self.failed_opens.insert(window, failed);
-        cx.notify();
-    }
-
-    pub fn clear_failed_open(&mut self, window: WindowId) {
-        self.failed_opens.remove(&window);
-    }
-
-    pub fn failed_open(&self, window: WindowId) -> Option<&FailedOpen> {
-        self.failed_opens.get(&window)
-    }
-
-    pub fn inspect_configure_active_or_failed(&mut self, window: WindowId, cx: &mut Context<Self>) {
-        if let Some(failed) = self.failed_opens.get(&window).cloned() {
-            self.inspect.configure_for_failed_open(&failed);
-        } else if let Some(doc_id) = self.scheduler.active_document(window)
+    pub fn inspect_configure_for_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(doc_id) = self.scheduler.active_document(window)
             && let Some(doc) = self
                 .scheduler
                 .tab(doc_id)
@@ -2609,6 +2641,11 @@ impl WorkbenchController {
         {
             self.inspect.configure_for_document(doc_id, doc);
         }
+        cx.notify();
+    }
+
+    pub fn inspect_configure_failed_open(&mut self, failed: &FailedOpen, cx: &mut Context<Self>) {
+        self.inspect.configure_for_failed_open(failed);
         cx.notify();
     }
 
@@ -2624,10 +2661,15 @@ impl WorkbenchController {
         encoding: Option<Encoding>,
         cx: &mut Context<Self>,
     ) {
-        if !self.inspect.busy() {
+        if !self.inspect.busy()
+            && (self.inspect.delimiter != delimiter
+                || self.inspect.header_mode != header_mode
+                || self.inspect.encoding != encoding)
+        {
             self.inspect.delimiter = delimiter;
             self.inspect.header_mode = header_mode;
             self.inspect.encoding = encoding;
+            self.inspect.clear_report();
             cx.notify();
         }
     }
@@ -2687,8 +2729,24 @@ impl WorkbenchController {
         if self.scheduler.window_of(target_doc) == Some(window)
             && self.scheduler.activate_tab(window, target_doc).is_ok()
         {
+            let visible_col = self
+                .scheduler
+                .tab(target_doc)
+                .and_then(|tab| tab.document.as_ref())
+                .and_then(|doc| {
+                    if let Some(col) = opt_col
+                        && doc.columns.visible.contains(&col)
+                    {
+                        Some(col)
+                    } else {
+                        doc.columns.visible.first().copied()
+                    }
+                });
+            let Some(col) = visible_col else {
+                return false;
+            };
             self.pending_reveal_cells
-                .insert(target_doc, (source_row, opt_col.unwrap_or(0)));
+                .insert(target_doc, (source_row, col));
             cx.notify();
             return true;
         }
@@ -2733,12 +2791,14 @@ impl WorkbenchController {
         if self.storage_check_worker.is_some() {
             return;
         }
+        let gen_id = self.storage_check_gen;
         let dir = self.scheduler.working_directory().to_path_buf();
         let custom = self.scheduler.custom_working_directory();
         let retained = self.scheduler.retained_storage_paths();
-        self.storage_check_worker = Some(thread::spawn(move || {
-            inspect_temporary_storage(&dir, custom, &retained)
-        }));
+        self.storage_check_worker = Some((
+            gen_id,
+            thread::spawn(move || inspect_temporary_storage(&dir, custom, &retained)),
+        ));
         cx.notify();
     }
 
@@ -2755,6 +2815,7 @@ impl WorkbenchController {
             .set_working_directory(directory.clone(), true);
         self.join.temporary = directory.clone();
         self.inspect.set_working_directory(directory, true);
+        self.storage_check_gen = self.storage_check_gen.wrapping_add(1);
         self.storage_check_result = None;
         self.start_storage_inspection(cx);
         cx.notify();
@@ -2770,6 +2831,7 @@ impl WorkbenchController {
             .set_working_directory(default_dir.clone(), false);
         self.join.temporary = default_dir.clone();
         self.inspect.set_working_directory(default_dir, false);
+        self.storage_check_gen = self.storage_check_gen.wrapping_add(1);
         self.storage_check_result = None;
         self.start_storage_inspection(cx);
         cx.notify();
@@ -2800,8 +2862,9 @@ impl WorkbenchController {
 
     fn any_hydrated_tab_busy(&self) -> bool {
         self.combine.busy()
-            || self.join.busy()
+            || self.join.running_operation()
             || self.inspect.busy()
+            || self.inspect.recovering()
             || self.cache_clear_worker.is_some()
             || self.storage_check_worker.is_some()
             || self.scheduler.windows().into_iter().any(|window| {
@@ -2842,14 +2905,20 @@ impl WorkbenchController {
         if self
             .storage_check_worker
             .as_ref()
-            .is_some_and(JoinHandle::is_finished)
+            .is_some_and(|(_, handle)| handle.is_finished())
         {
             changed = true;
-            let outcome = match self.storage_check_worker.take().unwrap().join() {
+            let (worker_gen, handle) = self.storage_check_worker.take().unwrap();
+            let outcome = match handle.join() {
                 Ok(res) => res,
                 Err(_) => Err("Checking temporary storage failed unexpectedly.".into()),
             };
-            self.storage_check_result = Some(outcome);
+            if worker_gen == self.storage_check_gen {
+                self.storage_check_result = Some(outcome);
+            } else {
+                // Discard stale result for the previous folder and immediately re-inspect current.
+                self.start_storage_inspection(cx);
+            }
         }
         let poll_errors = self.scheduler.poll_all();
         if !poll_errors.is_empty() {

@@ -404,30 +404,12 @@ impl QuarryWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let first_path = paths.first().cloned();
         let result = self.controller.update(cx, |controller, cx| {
             controller.open_paths(self.window_id, paths, options, encoding, cx)
         });
-        if let Err(error) = result {
-            if let Some(path) = first_path {
-                self.controller.update(cx, |controller, cx| {
-                    controller.record_failed_open(
-                        self.window_id,
-                        FailedOpen {
-                            path,
-                            options,
-                            encoding,
-                            message: error.clone(),
-                        },
-                        cx,
-                    );
-                });
-            }
-            self.set_message(AppMessage::error(error), cx);
+        if let Err(message) = result {
+            self.set_message(message, cx);
         } else {
-            self.controller.update(cx, |controller, _| {
-                controller.clear_failed_open(self.window_id);
-            });
             self.sync_from_controller(window, cx);
         }
     }
@@ -1818,13 +1800,26 @@ impl QuarryWindow {
     }
 
     fn open_inspect_dialog_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_inspect_dialog_for_target(None, window, cx);
+    }
+
+    fn open_inspect_dialog_for_target(
+        &mut self,
+        failed_target: Option<Box<FailedOpen>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.editing || self.confirming {
             return;
         }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         self.controller.update(cx, |c, cx| {
-            c.inspect_configure_active_or_failed(self.window_id, cx);
+            if let Some(failed) = failed_target {
+                c.inspect_configure_failed_open(&failed, cx);
+            } else {
+                c.inspect_configure_for_active(self.window_id, cx);
+            }
         });
         let on_open = self.open_output_path_callback(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -2661,13 +2656,11 @@ impl Render for QuarryWindow {
         if let Some(msg) = message {
             let is_error = msg.severity == MessageSeverity::Error;
             let is_warning = msg.severity == MessageSeverity::Warning;
-            let can_inspect_banner = (is_error || is_warning)
-                && (self
-                    .controller
-                    .read(cx)
-                    .failed_open(self.window_id)
-                    .is_some()
-                    || info.as_ref().is_some_and(|i| i.has_diagnostic));
+            let inspect_target = msg.inspection_target.clone();
+            let can_inspect_banner = inspect_target.is_some()
+                || ((is_error || is_warning)
+                    && (msg.diagnostic.is_some()
+                        || info.as_ref().is_some_and(|i| i.has_diagnostic)));
             body = body.child(
                 div()
                     .id("status-banner")
@@ -2700,12 +2693,13 @@ impl Render for QuarryWindow {
                     })
                     .child(div().flex_1().min_w_0().child(msg.text))
                     .when(can_inspect_banner, |bar| {
+                        let target = inspect_target.clone();
                         bar.child(
                             Button::new("banner-inspect")
                                 .label("Inspect…")
                                 .small()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_inspect_dialog_now(window, cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_inspect_dialog_for_target(target.clone(), window, cx);
                                 })),
                         )
                     })

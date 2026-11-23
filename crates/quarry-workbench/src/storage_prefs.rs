@@ -188,11 +188,11 @@ impl StoragePreferences {
         }
         let previous = self.scratch_directory.clone();
         self.scratch_directory = directory.map(Path::to_path_buf);
-        self.load_error = None;
         if let Err(error) = self.persist_current() {
             self.scratch_directory = previous;
             return Err(error);
         }
+        self.load_error = None;
         Ok(())
     }
 
@@ -200,11 +200,11 @@ impl StoragePreferences {
     pub fn set_index_cache_enabled(&mut self, enabled: bool) -> std::io::Result<()> {
         let previous = self.index_cache_enabled;
         self.index_cache_enabled = Some(enabled);
-        self.load_error = None;
         if let Err(error) = self.persist_current() {
             self.index_cache_enabled = previous;
             return Err(error);
         }
+        self.load_error = None;
         Ok(())
     }
 }

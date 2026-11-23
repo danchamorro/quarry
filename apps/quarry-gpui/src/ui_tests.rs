@@ -1380,11 +1380,19 @@ fn combine_and_four_mode_join_with_open_tab_lease_work_through_gpui_ui(cx: &mut 
     assert!(cx.update(|cx| controller.read(cx).combine().destination.is_none()));
 
     let combined_out = dir.path().join("combined.csv");
+    let sub_dir = dir.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
     cx.update(|cx| {
         controller.update(cx, |c, cx| {
             c.combine_prepare_destination(combined_out.clone(), cx);
         });
     });
+    // Non-existent alias `/dir/sub/../combined.csv` must be detected as reserved before creation.
+    assert!(cx.update(|cx| {
+        controller
+            .read(cx)
+            .path_reserved(&sub_dir.join("../combined.csv"))
+    }));
     wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
         let wf = controller.read(cx).combine();
         !wf.busy() && wf.space.is_some()
@@ -1444,7 +1452,7 @@ fn combine_and_four_mode_join_with_open_tab_lease_work_through_gpui_ui(cx: &mut 
     cx.update(|cx| {
         controller.update(cx, |c, cx| {
             c.join_set_open_tab_side(0, doc_id, cx).unwrap();
-            c.join_set_file_side(1, extra_path.clone(), cx);
+            c.join_set_file_side(1, extra_path.clone(), cx).unwrap();
         });
     });
     wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
@@ -1710,6 +1718,20 @@ fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
         std::fs::read_to_string(&recovered).unwrap(),
         "a,b\n1,2\n6,7\n"
     );
+
+    // Changing parsing options must invalidate the completed report so stale recovery cannot run.
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.inspect_set_options(
+                quarry_workbench::DelimiterMode::Tab,
+                HeaderMode::FirstRow,
+                None,
+                cx,
+            );
+            assert!(c.inspect().report.is_none());
+            assert!(c.inspect().selected.is_empty());
+        });
+    });
 
     cx.update_window(handle.into(), |_, window, cx| {
         window.click("inspect-close", cx);

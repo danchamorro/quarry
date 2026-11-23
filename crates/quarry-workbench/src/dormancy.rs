@@ -2733,7 +2733,7 @@ impl WorkbenchScheduler {
         }
         self.with_reserved_job_fds(
             id,
-            2,
+            4,
             false,
             |doc| doc.start_decompression(),
             |err| err.to_string(),
@@ -3112,7 +3112,7 @@ fn doc_non_filter_job_fds(doc: &Document) -> usize {
         + usize::from(doc.search_job.is_some())
         + usize::from(doc.export_job.is_some()) * 2
         + usize::from(doc.save_job.is_some()) * 2
-        + usize::from(doc.decompression_running()) * 2
+        + usize::from(doc.decompression_running()) * 4
         + usize::from(
             doc.structural_job
                 .as_ref()

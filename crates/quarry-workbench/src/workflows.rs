@@ -294,8 +294,12 @@ impl CombineWorkflow {
             changed = true;
             match self.storage_check.take().unwrap().join() {
                 Ok(Ok(space)) => self.space = Some(space),
-                Ok(Err(error)) => self.message = Some(error),
+                Ok(Err(error)) => {
+                    self.destination = None;
+                    self.message = Some(error);
+                }
                 Err(_) => {
+                    self.destination = None;
                     self.message =
                         Some("The storage check failed. Choose the output again.".into());
                 }
@@ -364,6 +368,7 @@ pub struct JoinWorkflow {
     checking: Option<JoinJob<JoinPlan>>,
     writing: Option<JoinJob<JoinSummary>>,
     cleanups: Vec<JoinHandle<Result<(), String>>>,
+    retired_ops: Vec<(JoinHandle<()>, Option<PathBuf>, usize)>,
     pub plan: Option<JoinPlan>,
     pub result: Option<JoinSummary>,
     pub destination: Option<PathBuf>,
@@ -393,6 +398,7 @@ impl JoinWorkflow {
             checking: None,
             writing: None,
             cleanups: Vec::new(),
+            retired_ops: Vec::new(),
             plan: None,
             result: None,
             destination: None,
@@ -402,18 +408,38 @@ impl JoinWorkflow {
         }
     }
 
+    pub fn active_operation_count(&self) -> usize {
+        self.header_jobs.iter().filter(|j| j.is_some()).count()
+            + usize::from(self.checking.is_some())
+            + usize::from(self.writing.is_some())
+            + self.retired_ops.iter().map(|(_, _, n)| *n).sum::<usize>()
+    }
+
     pub fn running_operation(&self) -> bool {
+        self.active_operation_count() > 0
+    }
+
+    pub fn busy(&self) -> bool {
         self.header_jobs.iter().any(Option::is_some)
             || self.checking.is_some()
             || self.writing.is_some()
     }
 
-    pub fn busy(&self) -> bool {
-        self.running_operation()
-    }
-
     pub fn reserved_output(&self) -> Option<&Path> {
         self.destination.as_deref()
+    }
+
+    pub fn reserved_outputs(&self) -> Vec<&Path> {
+        let mut out = Vec::new();
+        if let Some(dest) = self.destination.as_deref() {
+            out.push(dest);
+        }
+        for (_, dest, _) in &self.retired_ops {
+            if let Some(d) = dest.as_deref() {
+                out.push(d);
+            }
+        }
+        out
     }
 
     pub fn analysis_progress(&self) -> Option<JoinProgress> {
@@ -470,18 +496,82 @@ impl JoinWorkflow {
         self.rebuild_output_columns();
     }
 
-    pub fn set_file_side(&mut self, side: usize, path: PathBuf) {
-        if side >= 2 || self.side_busy(side) {
-            return;
+    pub fn set_file_side(
+        &mut self,
+        side: usize,
+        path: PathBuf,
+        write_slot_available: bool,
+    ) -> Result<(), String> {
+        if side >= 2 {
+            return Err("Invalid join side.".into());
         }
-        self.invalidate_plan();
-        self.captured[side] = None;
-        self.probes[side] = None;
-        self.headers[side] = None;
-        self.sides[side] = Some(JoinSideSource::File(path.clone()));
-        match read_join_header_with_format(path, self.formats[side]) {
-            Ok(job) => self.header_jobs[side] = Some(job),
-            Err(error) => self.message = Some(Diagnostic::from_error(&error).details()),
+        if self.side_busy(side) {
+            return Err("Wait for the active join step to finish.".into());
+        }
+        if !write_slot_available {
+            let msg = "Two file operations are already running.".to_owned();
+            self.message = Some(msg.clone());
+            return Err(msg);
+        }
+        match read_join_header_with_format(path.clone(), self.formats[side]) {
+            Ok(job) => {
+                self.invalidate_plan();
+                self.captured[side] = None;
+                self.probes[side] = None;
+                self.headers[side] = None;
+                self.sides[side] = Some(JoinSideSource::File(path));
+                self.header_jobs[side] = Some(job);
+                Ok(())
+            }
+            Err(error) => {
+                let msg = Diagnostic::from_error(&error).details();
+                self.message = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Toggles whether a file-backed input on `side` has a header row and reloads its columns.
+    pub fn set_side_has_header(
+        &mut self,
+        side: usize,
+        has_header: bool,
+        write_slot_available: bool,
+    ) -> Result<(), String> {
+        if side >= 2 {
+            return Err("Invalid join side.".into());
+        }
+        if self.side_busy(side) {
+            return Err("Wait for the active join step to finish.".into());
+        }
+        if self.formats[side].has_header == has_header {
+            return Ok(());
+        }
+        if let Some(JoinSideSource::File(path)) = self.sides[side].clone() {
+            if !write_slot_available {
+                let msg = "Two file operations are already running.".to_owned();
+                self.message = Some(msg.clone());
+                return Err(msg);
+            }
+            let mut next_format = self.formats[side];
+            next_format.has_header = has_header;
+            match read_join_header_with_format(path, next_format) {
+                Ok(job) => {
+                    self.formats[side] = next_format;
+                    self.invalidate_plan();
+                    self.headers[side] = None;
+                    self.header_jobs[side] = Some(job);
+                    Ok(())
+                }
+                Err(error) => {
+                    let msg = Diagnostic::from_error(&error).details();
+                    self.message = Some(msg.clone());
+                    Err(msg)
+                }
+            }
+        } else {
+            self.formats[side].has_header = has_header;
+            Ok(())
         }
     }
 
@@ -493,6 +583,7 @@ impl JoinWorkflow {
         doc_id: DocumentId,
         label: String,
         doc: &mut Document,
+        write_slot_available: bool,
     ) -> Result<(), String> {
         if side >= 2 {
             return Err("Invalid join side.".into());
@@ -500,33 +591,57 @@ impl JoinWorkflow {
         if self.side_busy(side) {
             return Err("Wait for the active join step to finish.".into());
         }
-        // Release an existing reservation on the same side before capturing a replacement so
-        // selecting the same tab again or switching tabs never deadlocks on itself.
-        self.invalidate_plan();
-        self.captured[side] = None;
-        self.probes[side] = None;
-        self.headers[side] = None;
-        let captured = doc.capture_join_document(doc_id.raw())?;
+        if !write_slot_available {
+            let msg = "Two file operations are already running.".to_owned();
+            self.message = Some(msg.clone());
+            return Err(msg);
+        }
+        let replacing_same_tab = matches!(
+            self.sides[side],
+            Some(JoinSideSource::OpenTab { doc_id: existing, .. }) if existing == doc_id
+        );
+        if replacing_same_tab {
+            // Release our own reservation on the same tab before re-capturing it.
+            self.invalidate_plan();
+            self.captured[side] = None;
+            self.probes[side] = None;
+            self.headers[side] = None;
+            self.sides[side] = None;
+        }
+        let captured = match doc.capture_join_document(doc_id.raw()) {
+            Ok(captured) => captured,
+            Err(error) => {
+                if replacing_same_tab {
+                    self.rebuild_output_columns();
+                }
+                self.message = Some(error.clone());
+                return Err(error);
+            }
+        };
         let path = captured.path.clone();
         let probe = DocumentProbe::capture(doc_id.raw(), doc);
         let working = captured.source.clone();
         let known_cols = captured.columns;
-        self.sides[side] = Some(JoinSideSource::OpenTab {
-            doc_id,
-            label,
-            path,
-        });
-        self.captured[side] = Some(captured);
-        self.probes[side] = Some(probe);
         match read_join_working_header(working, known_cols) {
             Ok(job) => {
+                self.invalidate_plan();
+                self.headers[side] = None;
+                self.sides[side] = Some(JoinSideSource::OpenTab {
+                    doc_id,
+                    label,
+                    path,
+                });
+                self.captured[side] = Some(captured);
+                self.probes[side] = Some(probe);
                 self.header_jobs[side] = Some(job);
                 Ok(())
             }
             Err(error) => {
-                self.captured[side] = None;
-                self.probes[side] = None;
-                self.sides[side] = None;
+                drop(captured);
+                drop(probe);
+                if replacing_same_tab {
+                    self.rebuild_output_columns();
+                }
                 let msg = Diagnostic::from_error(&error).details();
                 self.message = Some(msg.clone());
                 Err(msg)
@@ -880,7 +995,72 @@ impl JoinWorkflow {
         }
     }
 
-    /// Releases all open-tab `DocumentLease`s and any analyzed join workspace.
+    /// Non-blocking release used by UI dialog close handlers: signals cancellation and detaches
+    /// any active workers, plan cleanup, and open-tab leases onto a background reaper thread so
+    /// closing Join Files never blocks the UI thread while preserving write-slot and output
+    /// reservations until the workers exit.
+    pub fn release_all_async(&mut self) {
+        self.cancel();
+        let h0 = self.header_jobs[0].take();
+        let h1 = self.header_jobs[1].take();
+        let checking = self.checking.take();
+        let writing = self.writing.take();
+        let plan = self.plan.take();
+        let cleanups = std::mem::take(&mut self.cleanups);
+        let op_count = usize::from(h0.is_some())
+            + usize::from(h1.is_some())
+            + usize::from(checking.is_some())
+            + usize::from(writing.is_some());
+        let reserved_dest = writing.is_some().then(|| self.destination.take()).flatten();
+        if reserved_dest.is_none() {
+            self.destination = None;
+        }
+        // Keep captures alive until active workers exit; clear open-tab side selections immediately
+        // so reopening Join cannot silently fall back to unedited disk files.
+        let mut cleared_any = false;
+        for side in 0..2 {
+            if matches!(self.sides[side], Some(JoinSideSource::OpenTab { .. })) {
+                self.sides[side] = None;
+                self.headers[side] = None;
+                cleared_any = true;
+            }
+        }
+        let cap0 = self.captured[0].take();
+        let cap1 = self.captured[1].take();
+        let probe0 = self.probes[0].take();
+        let probe1 = self.probes[1].take();
+        if cleared_any {
+            self.rebuild_output_columns();
+        }
+        if op_count > 0 || plan.is_some() || !cleanups.is_empty() {
+            let handle = thread::spawn(move || {
+                if let Some(job) = h0 {
+                    let _ = job.wait();
+                }
+                if let Some(job) = h1 {
+                    let _ = job.wait();
+                }
+                if let Some(job) = checking
+                    && let Ok(Some(p)) = job.wait()
+                {
+                    let _ = p.release();
+                }
+                if let Some(job) = writing {
+                    let _ = job.wait();
+                }
+                if let Some(p) = plan {
+                    let _ = p.release();
+                }
+                for cleanup in cleanups {
+                    let _ = cleanup.join();
+                }
+                drop((cap0, cap1, probe0, probe1));
+            });
+            self.retired_ops.push((handle, reserved_dest, op_count));
+        }
+    }
+
+    /// Synchronously releases all open-tab `DocumentLease`s, workers, and analyzed workspaces.
     pub fn release_all(&mut self) {
         self.cancel();
         for slot in &mut self.header_jobs {
@@ -901,6 +1081,9 @@ impl JoinWorkflow {
         }
         for cleanup in self.cleanups.drain(..) {
             let _ = cleanup.join();
+        }
+        for (handle, _, _) in self.retired_ops.drain(..) {
+            let _ = handle.join();
         }
         self.clear_open_tab_sides();
         self.destination = None;
@@ -979,6 +1162,16 @@ impl JoinWorkflow {
             }
         }
         self.cleanups = remaining;
+        let mut remaining_retired = Vec::with_capacity(self.retired_ops.len());
+        for (handle, dest, ops) in self.retired_ops.drain(..) {
+            if handle.is_finished() {
+                changed = true;
+                let _ = handle.join();
+            } else {
+                remaining_retired.push((handle, dest, ops));
+            }
+        }
+        self.retired_ops = remaining_retired;
         changed
     }
 }
@@ -1013,7 +1206,7 @@ pub struct InspectWorkflow {
     job: Option<InspectionJob>,
     recovery: Option<RecoveryJob>,
     raw_decompression: Option<RawGzipDecompression>,
-    retired_jobs: Vec<JoinHandle<()>>,
+    retired_jobs: Vec<(JoinHandle<()>, Option<PathBuf>, bool)>,
     pub report: Option<InspectionReport>,
     pub selected: BTreeSet<usize>,
     pub focused: usize,
@@ -1076,12 +1269,34 @@ impl InspectWorkflow {
         self.job.is_some() || self.recovery.is_some() || self.raw_decompression.is_some()
     }
 
+    pub fn active_recovery_count(&self) -> usize {
+        usize::from(self.recovery.is_some())
+            + self
+                .retired_jobs
+                .iter()
+                .filter(|(_, _, is_recovery)| *is_recovery)
+                .count()
+    }
+
     pub fn recovering(&self) -> bool {
-        self.recovery.is_some()
+        self.active_recovery_count() > 0
     }
 
     pub fn reserved_output(&self) -> Option<&Path> {
         self.recovery_destination.as_deref()
+    }
+
+    pub fn reserved_outputs(&self) -> Vec<&Path> {
+        let mut out = Vec::new();
+        if let Some(dest) = self.recovery_destination.as_deref() {
+            out.push(dest);
+        }
+        for (_, dest, _) in &self.retired_jobs {
+            if let Some(d) = dest.as_deref() {
+                out.push(d);
+            }
+        }
+        out
     }
 
     pub fn progress(&self) -> Option<InspectionProgress> {
@@ -1097,22 +1312,30 @@ impl InspectWorkflow {
         self.focused = 0;
         self.preview = None;
         self.recovery_result = None;
-        self.recovery_destination = None;
+        if self.recovery.is_none() {
+            self.recovery_destination = None;
+        }
         self.message = None;
     }
 
     /// Cancels and detaches any in-flight inspection, recovery, or raw decompression job so
     /// stale completions can never populate a newly configured target while keeping private
-    /// copies and decompression slots alive until the cancelled worker exits.
+    /// copies, decompression slots, and recovery output reservations alive until exit.
     pub fn discard_in_flight(&mut self) {
         self.cancel();
         let job = self.job.take();
         let recovery = self.recovery.take();
         let raw = self.raw_decompression.take();
         let private_copy = self.private_copy.take();
-        self.recovery_destination = None;
-        if job.is_some() || recovery.is_some() || raw.is_some() {
-            self.retired_jobs.push(thread::spawn(move || {
+        let is_recovery = recovery.is_some();
+        let reserved_dest = is_recovery
+            .then(|| self.recovery_destination.take())
+            .flatten();
+        if !is_recovery {
+            self.recovery_destination = None;
+        }
+        if job.is_some() || is_recovery || raw.is_some() {
+            let handle = thread::spawn(move || {
                 if let Some(j) = job {
                     let _ = j.wait();
                 }
@@ -1124,7 +1347,8 @@ impl InspectWorkflow {
                     drop(raw_decomp._slot);
                 }
                 drop(private_copy);
-            }));
+            });
+            self.retired_jobs.push((handle, reserved_dest, is_recovery));
         }
     }
 
@@ -1459,11 +1683,12 @@ impl InspectWorkflow {
             }
         }
         let mut remaining = Vec::with_capacity(self.retired_jobs.len());
-        for handle in self.retired_jobs.drain(..) {
+        for (handle, dest, is_rec) in self.retired_jobs.drain(..) {
             if handle.is_finished() {
+                changed = true;
                 let _ = handle.join();
             } else {
-                remaining.push(handle);
+                remaining.push((handle, dest, is_rec));
             }
         }
         self.retired_jobs = remaining;
@@ -1474,7 +1699,7 @@ impl InspectWorkflow {
 impl Drop for InspectWorkflow {
     fn drop(&mut self) {
         self.discard_in_flight();
-        for handle in self.retired_jobs.drain(..) {
+        for (handle, _, _) in self.retired_jobs.drain(..) {
             let _ = handle.join();
         }
     }
@@ -1541,6 +1766,12 @@ mod tests {
         assert!(wf.destination.is_none());
         assert!(wf.message.as_deref().unwrap_or("").contains(".gz"));
 
+        // Existing destination fails preflight and must clear `destination` while keeping `plan`.
+        wf.prepare_destination(dir.path().join("a.csv"), |_| false);
+        wait_combine(&mut wf);
+        assert!(wf.destination.is_none());
+        assert!(wf.plan.is_some());
+
         let out = dir.path().join("combined.csv");
         wf.prepare_destination(out.clone(), |_| false);
         wait_combine(&mut wf);
@@ -1605,14 +1836,16 @@ mod tests {
                 .document
                 .as_mut()
                 .unwrap();
-            wf.set_open_tab_side(0, ids[0], "main.csv".into(), doc)
+            wf.set_open_tab_side(0, ids[0], "main.csv".into(), doc, true)
                 .unwrap();
             assert!(
                 doc.join_reserved(),
                 "open tab must hold DocumentLease while in join"
             );
         }
-        wf.set_file_side(1, add_path);
+        // Reject when global write cap is full.
+        assert!(wf.set_file_side(1, add_path.clone(), false).is_err());
+        wf.set_file_side(1, add_path.clone(), true).unwrap();
         wait_join(&mut wf);
         assert!(wf.headers[0].is_some() && wf.headers[1].is_some());
 
@@ -1659,15 +1892,37 @@ mod tests {
                 .document
                 .as_mut()
                 .unwrap();
-            wf.set_open_tab_side(0, ids[0], "main.csv".into(), doc)
+            wf.set_open_tab_side(0, ids[0], "main.csv".into(), doc, true)
                 .unwrap();
         }
         wait_join(&mut wf);
         assert!(wf.ready_to_analyze());
-        wf.release_all();
+        wf.release_all_async();
         assert!(wf.sides[0].is_none());
         assert!(wf.headers[0].is_none());
         assert!(!wf.ready_to_analyze());
+        wf.release_all();
+
+        // Headerless file input retains record 0 when `has_header` is toggled off.
+        let headless_main = dir.path().join("headless_main.csv");
+        let headless_add = dir.path().join("headless_add.csv");
+        std::fs::write(&headless_main, "1,alpha\n2,beta\n").unwrap();
+        std::fs::write(&headless_add, "1,first\n").unwrap();
+        let mut hwf = JoinWorkflow::new(scratch.path().to_path_buf());
+        hwf.set_file_side(0, headless_main, true).unwrap();
+        hwf.set_file_side(1, headless_add, true).unwrap();
+        wait_join(&mut hwf);
+        hwf.set_side_has_header(0, false, true).unwrap();
+        hwf.set_side_has_header(1, false, true).unwrap();
+        wait_join(&mut hwf);
+        hwf.set_mode(JoinMode::Left);
+        hwf.start_analysis(true);
+        wait_join(&mut hwf);
+        assert_eq!(
+            hwf.plan.as_ref().unwrap().analysis().output_rows,
+            2,
+            "headerless join must retain record 0 from both inputs"
+        );
     }
 
     #[test]
