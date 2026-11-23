@@ -227,6 +227,15 @@ impl Quarry {
                         self.editor_status = None;
                         self.editing = false;
                         window.close_dialog(cx);
+                        let table_focus = self.info.is_some().then(|| self.table.focus_handle(cx));
+                        let root_focus = self.focus_handle.clone();
+                        window.defer(cx, move |window, cx| {
+                            if let Some(table_focus) = table_focus {
+                                table_focus.focus(window, cx);
+                            } else {
+                                root_focus.focus(window, cx);
+                            }
+                        });
                     }
                 }
                 Response::Error(error) => {
@@ -513,11 +522,15 @@ impl Quarry {
                     let _ = close.update(cx, |this, cx| {
                         this.editing = false;
                         this.editor_status = None;
-                        if this.info.is_some() {
-                            this.table.focus_handle(cx).focus(window, cx);
-                        } else {
-                            this.focus_handle.focus(window, cx);
-                        }
+                        let table_focus = this.info.is_some().then(|| this.table.focus_handle(cx));
+                        let root_focus = this.focus_handle.clone();
+                        window.defer(cx, move |window, cx| {
+                            if let Some(table_focus) = table_focus {
+                                table_focus.focus(window, cx);
+                            } else {
+                                root_focus.focus(window, cx);
+                            }
+                        });
                         cx.notify();
                     });
                 })
