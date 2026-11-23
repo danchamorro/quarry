@@ -104,10 +104,13 @@ scheduler in `crates/quarry-workbench` (`dormancy.rs`) while keeping the global 
 ### Amended decision
 
 1. **Hydration ceiling with multi-window guarantee:** `WorkbenchScheduler` replaces the fixed
-   8-open-tab rejection cap with a bounded hydrated-tab ceiling (`DEFAULT_MAX_HYDRATED_TABS = 8`,
-   automatically raised to at least the number of open windows so every window retains `>= 1`
-   hydrated active tab). Unpinned idle hydrated tabs are evicted LRU (preferring clean tabs
-   before dirty tabs) into dormant state rather than rejecting new opens.
+   8-open-tab rejection cap at the frontend-neutral workbench layer with a bounded hydrated-tab
+   ceiling (`DEFAULT_MAX_HYDRATED_TABS = 8`, automatically raised to at least the number of open
+   windows so every window retains `>= 1` hydrated active tab). Unpinned idle hydrated tabs are
+   evicted LRU (preferring clean tabs before dirty tabs) into dormant state rather than rejecting
+   new opens. In this initial Phase 4A-2 delivery, `apps/quarry-egui` raises `RLIMIT_NOFILE` at
+   startup while retaining its legacy 8-document open cap until frontend tab-manager integration
+   adopts `WorkbenchScheduler`.
 2. **Lazy 200-file open:** Bulk opens (`open_many_lazy`) register lightweight `LazyDocumentStub`
    entries holding canonical path, OS `FileIdentity` (`(dev, ino)` on Unix, `(volume_serial,
    file_id)` on Windows), and open options without holding open file handles or eagerly indexing

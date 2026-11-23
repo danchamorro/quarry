@@ -531,7 +531,7 @@ impl Session {
 
         let started = Instant::now();
         let open_started = Instant::now();
-        let mut file = File::open(path)?;
+        let mut file = crate::source_stamp::open_regular_file(path)?;
         let file_open = open_started.elapsed();
         if reject_compressed && let Some(format) = compressed::compression_of(&mut file, path)? {
             return Err(QuarryError::CompressedFile {

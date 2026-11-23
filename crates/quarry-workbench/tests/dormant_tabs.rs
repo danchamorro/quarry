@@ -237,7 +237,7 @@ fn opening_200_files_lazily_keeps_fd_budget_under_128_and_evicts_clean_tabs() {
     }
 
     // Completed quit cleans up cleanly with zero errors.
-    let errors = scheduler.finalize_quit();
+    let errors = scheduler.finalize_quit().unwrap();
     assert!(errors.is_empty());
     assert_eq!(scheduler.total_tabs(), 0);
 }
@@ -412,8 +412,21 @@ fn dirty_tab_dormancy_preserves_edits_and_working_copies_and_enforces_overlay_an
     );
     assert!(doc.working_copy.is_some());
 
-    // 6. Completed quit removes Quarry's private working copy directory with zero orphans.
-    let cleanup_errors = scheduler.finalize_quit();
+    // 6. Calling finalize_quit before approving the dirty tab refuses and preserves everything.
+    let unapproved_err = scheduler.finalize_quit().unwrap_err();
+    assert!(matches!(
+        unapproved_err,
+        SchedulerError::UnapprovedDirtyTabs(ref unapproved) if unapproved == &vec![ids[0]]
+    ));
+    assert!(
+        working_root.exists(),
+        "unapproved finalize_quit must leave private working dir intact"
+    );
+
+    // Approving the dirty tab allows finalize_quit to remove Quarry's private working dir cleanly.
+    scheduler.begin_quit_review();
+    scheduler.approve_tab_for_quit(ids[0]).unwrap();
+    let cleanup_errors = scheduler.finalize_quit().unwrap();
     assert!(cleanup_errors.is_empty());
     assert!(
         !working_root.exists(),
@@ -604,7 +617,7 @@ fn gzip_tabs_honor_phase_rules_and_preview_never_restarts_decompression_on_wake(
     );
 
     // Wake `gz_complete`: restores from the retained private copy without re-decompressing
-    // and releases its dormant TempDirectory lease.
+    // and keeps its TempDirectory lease active while the compressed workspace owner lives.
     let woke_complete = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
     assert_eq!(
         scheduler
@@ -612,7 +625,7 @@ fn gzip_tabs_honor_phase_rules_and_preview_never_restarts_decompression_on_wake(
             .snapshot()
             .by_category
             .get(&FdCategory::TempDirectory),
-        None
+        Some(&1)
     );
     assert!(matches!(
         woke_complete,
@@ -911,10 +924,22 @@ fn dormant_working_directories_remain_charged_against_fd_budget() {
     let snap = scheduler.fd_budget().snapshot();
     assert_eq!(snap.by_category.get(&FdCategory::TempDirectory), Some(&1));
 
-    // Waking `a` releases the dormant TempDirectory lease cleanly.
+    // Waking `a` transfers the TempDirectory lease to the hydrated tab (directory owner is still live).
     scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
     let snap_after = scheduler.fd_budget().snapshot();
-    assert_eq!(snap_after.by_category.get(&FdCategory::TempDirectory), None);
+    assert_eq!(
+        snap_after.by_category.get(&FdCategory::TempDirectory),
+        Some(&1)
+    );
+
+    // Dropping the directory owner (via quit cleanup) releases the TempDirectory lease.
+    scheduler.finalize_quit().unwrap();
+    let snap_closed = scheduler.fd_budget().snapshot();
+    assert_eq!(
+        snap_closed.by_category.get(&FdCategory::TempDirectory),
+        None
+    );
 }
 
 #[test]
@@ -1339,4 +1364,91 @@ fn completed_duplicate_preview_pins_tab_until_confirmed_or_cancelled() {
         scheduler.residency(ids[0]),
         Some(ResidencyState::DormantClean)
     );
+}
+
+#[test]
+fn pending_nonexistent_output_aliases_and_rollback_and_eviction_fallback_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "fb-a.csv", 10);
+    let b = write_csv(dir.path(), "fb-b.csv", 10);
+    let c = write_csv(dir.path(), "fb-c.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 2,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a, b, c], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // 1. Pending non-existent output path alias `dir/sub/../result.csv` must match `dir/result.csv`.
+    let pending_dest = dir.path().join("result.csv");
+    let alias_dest = dir.path().join("sub").join("..").join("result.csv");
+    scheduler.tab_mut(ids[0]).unwrap().write_destination = Some(pending_dest);
+    assert!(scheduler.path_reserved(&alias_dest));
+    scheduler.tab_mut(ids[0]).unwrap().write_destination = None;
+
+    // 2. Multi-eviction rollback: hydrate clean A (active) and dirty B (inactive), shrink cap to 1
+    //    while scratch disk is full -> evicting B fails and clean A must remain active/hydrated!
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    std::sync::Arc::make_mut(
+        &mut scheduler
+            .tab_mut(ids[1])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap()
+            .cell_edits,
+    )
+    .insert((1, 0), std::sync::Arc::new(b"dirty-b".to_vec()));
+    scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert_eq!(scheduler.active_document(WindowId::PRIMARY), Some(ids[0]));
+
+    scheduler.config_mut().max_hydrated_tabs = 1;
+    scheduler.config_mut().simulated_scratch_available_bytes = Some(0);
+    let err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[2])
+        .unwrap_err();
+    assert!(matches!(err, SchedulerError::ScratchDiskFull { .. }));
+    assert_eq!(
+        scheduler.active_document(WindowId::PRIMARY),
+        Some(ids[0]),
+        "failed multi-eviction must roll back previously evicted active tab"
+    );
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+
+    // 3. Overlay admission failure must reject BEFORE evicting the active clean tab.
+    scheduler.config_mut().simulated_scratch_available_bytes = None;
+    scheduler.config_mut().max_dirty_overlay_bytes = 1;
+    let overlay_err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[2])
+        .unwrap_err();
+    assert!(matches!(
+        overlay_err,
+        SchedulerError::OverlayBudgetExceeded { .. }
+    ));
+    assert_eq!(scheduler.active_document(WindowId::PRIMARY), Some(ids[0]));
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+
+    // 4. Filter started through scheduler reserves BackgroundJob FDs and releases on completion.
+    scheduler.config_mut().max_dirty_overlay_bytes = 1024 * 1024;
+    let query = FilterQuery::single(1, FilterOperator::Equals, b"alpha".to_vec());
+    scheduler.start_filter(ids[0], query).unwrap();
+    let snap_filtering = scheduler.fd_budget().snapshot();
+    assert!(
+        snap_filtering
+            .by_category
+            .get(&FdCategory::BackgroundJob)
+            .copied()
+            .unwrap_or(0)
+            >= 2
+    );
+    finish_active_filter(&mut scheduler, ids[0]);
+    let snap_done = scheduler.fd_budget().snapshot();
+    assert_eq!(snap_done.by_category.get(&FdCategory::BackgroundJob), None);
 }
