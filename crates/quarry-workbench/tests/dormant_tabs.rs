@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use quarry_core::{FilterOperator, FilterQuery, HeaderMode, OpenOptions};
+use quarry_core::{ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, OpenOptions};
 use quarry_workbench::{
-    CompressedDormancyPolicy, DocumentId, FdCategory, MAX_PROCESS_FD_BUDGET, PinReason,
-    ResidencyState, SOURCE_CHANGED_NOTICE, SchedulerError, WakeKind, WakeOutcome, WindowId,
-    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkingCopyState,
+    CompressedDormancyPolicy, DocumentId, FdCategory, GridSelection, MAX_PROCESS_FD_BUDGET,
+    PinReason, ResidencyState, SOURCE_CHANGED_NOTICE, SchedulerError, WakeKind, WakeOutcome,
+    WindowId, WorkbenchScheduler, WorkbenchSchedulerConfig, WorkingCopyState, compressed,
 };
 
 fn write_csv(dir: &Path, name: &str, rows: usize) -> PathBuf {
@@ -848,4 +848,240 @@ fn clean_document_dormancy_preserves_redo_history_across_wake() {
         doc.cell_edits.get(&(1, 1)).map(|v| v.as_slice()),
         Some(b"redo-me".as_slice())
     );
+}
+
+#[test]
+fn dormant_working_directories_remain_charged_against_fd_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "wc-a.csv", 10);
+    let b = write_csv(dir.path(), "wc-b.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a, b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let wc = WorkingCopyState::new_in_with_cleanup(scratch.path(), doc.working_cleanup.clone())
+            .unwrap();
+        doc.working_copy = Some(wc);
+    }
+
+    // Demoting `a` must keep a TempDirectory FD lease reserved for its retained WorkingCopyStorage.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantDirty)
+    );
+    let snap = scheduler.fd_budget().snapshot();
+    assert_eq!(snap.by_category.get(&FdCategory::TempDirectory), Some(&1));
+
+    // Waking `a` releases the dormant TempDirectory lease cleanly.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    let snap_after = scheduler.fd_budget().snapshot();
+    assert_eq!(snap_after.by_category.get(&FdCategory::TempDirectory), None);
+}
+
+#[test]
+fn third_concurrent_gzip_decompression_is_rejected_by_write_slot_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let gz = write_gzip_csv(dir.path(), "third.csv.gz", 20);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let _slot1 = scheduler.decompression_slots().claim();
+    let _slot2 = scheduler.decompression_slots().claim();
+    assert!(!scheduler.write_slot_available());
+
+    let err = scheduler
+        .open_path(WindowId::PRIMARY, gz, open_options(), None)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SchedulerError::OpenFailed(ref msg) if msg == compressed::WRITE_SLOTS_FULL
+    ));
+}
+
+#[test]
+fn moving_tab_between_windows_detaches_old_window_and_duplicate_lazy_open_keeps_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "win-a.csv", 10);
+    let b = write_csv(dir.path(), "win-b.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let win1 = WindowId::new(1);
+    let win2 = WindowId::new(2);
+    let ids1 = scheduler
+        .open_many_lazy(win1, [a.clone()], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids1[0]);
+    assert_eq!(scheduler.active_document(win1), Some(ids1[0]));
+
+    // Calling open_many_lazy on win2 with `[a, b]` must NOT steal `a` from win1; win2 activates `b`.
+    let ids2 = scheduler
+        .open_many_lazy(win2, [a, b], open_options(), None)
+        .unwrap();
+    assert_eq!(ids2[0], ids1[0]);
+    assert_eq!(scheduler.active_document(win1), Some(ids1[0]));
+    assert_eq!(scheduler.active_document(win2), Some(ids2[1]));
+
+    // Explicitly moving `ids1[0]` into win2 detaches it from win1 (no phantom shared active tab).
+    scheduler.activate_tab(win2, ids1[0]).unwrap();
+    assert_eq!(scheduler.active_document(win2), Some(ids1[0]));
+    assert_ne!(scheduler.active_document(win1), Some(ids1[0]));
+}
+
+#[test]
+fn unresolved_source_conflict_survives_repeated_dormancy_cycles() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "conflict-repeat-a.csv", 15);
+    let b = write_csv(dir.path(), "conflict-repeat-b.csv", 15);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a.clone(), b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // First dormancy + external mutation -> SourceChangedConflict.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    fs::write(&a, b"id,category,amount,notes\n999,changed,1,external\n").unwrap();
+    let first_wake = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert!(matches!(
+        first_wake,
+        WakeOutcome::SourceChangedConflict { .. }
+    ));
+
+    // Second dormancy cycle without explicit reload must STILL surface SourceChangedConflict!
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    let second_wake = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert!(matches!(
+        second_wake,
+        WakeOutcome::SourceChangedConflict { .. }
+    ));
+    assert!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .source_changed
+    );
+}
+
+#[test]
+fn filtered_wake_preserves_selection_and_pending_materialization_pins_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "sel-filter-a.csv", 30);
+    let b = write_csv(dir.path(), "sel-filter-b.csv", 15);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a, b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // 1. Verify pending_materialization pins the tab so Split storage review cannot be lost.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.pending_materialization = Some((
+            ColumnTransformation::Split {
+                source_column: 0,
+                separator: b"-".to_vec(),
+                output_count: 2,
+                output_headers: None,
+            },
+            std::collections::BTreeSet::from([0]),
+            64,
+        ));
+    }
+    let pin_err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[1])
+        .unwrap_err();
+    assert!(matches!(pin_err, SchedulerError::AllTabsPinned { .. }));
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.pending_materialization = None;
+    }
+
+    // 2. Verify active filter wake preserves selection and scroll_points after start_filter.
+    let query = FilterQuery::single(1, FilterOperator::Equals, b"alpha".to_vec());
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.start_filter(query).unwrap();
+    }
+    finish_active_filter(&mut scheduler, ids[0]);
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.selection = Some(GridSelection::Cell { row: 4, column: 1 });
+        doc.scroll_points = 42.5;
+    }
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert_eq!(
+        doc.selection,
+        Some(GridSelection::Cell { row: 4, column: 1 })
+    );
+    assert_eq!(doc.scroll_points, 42.5);
 }

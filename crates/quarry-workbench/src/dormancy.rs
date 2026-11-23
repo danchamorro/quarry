@@ -178,6 +178,7 @@ impl Drop for FdLease {
 pub enum PinReason {
     ActiveInWindow(WindowId),
     ActiveWriteJob,
+    PendingMaterialization,
     CompressedDecompressing,
     CompressedPendingStorage,
     JoinReserved,
@@ -337,6 +338,8 @@ struct DormantDirtyState {
     header_renames: Arc<BTreeMap<usize, Arc<String>>>,
     cell_edits: SharedCellEdits,
     overlay_bytes: usize,
+    /// Retains code-counted directory FD reservations for any live `WorkingCopyStorage`.
+    _working_dir_fd_lease: Option<FdLease>,
 }
 
 enum DormantKind {
@@ -366,6 +369,7 @@ struct DormantDocument {
     canonical_path: PathBuf,
     file_identity: Option<FileIdentity>,
     source_guard: SourceGuard,
+    source_changed: bool,
     view: DormantViewSnapshot,
     kind: DormantKind,
 }
@@ -606,6 +610,9 @@ impl WorkbenchScheduler {
         if slot.tab.document_writing() {
             return Some(PinReason::ActiveWriteJob);
         }
+        if doc.pending_materialization.is_some() {
+            return Some(PinReason::PendingMaterialization);
+        }
         if let Some(compressed) = doc.compressed.as_ref() {
             match compressed.dormancy_policy() {
                 CompressedDormancyPolicy::PinnedPendingStorage => {
@@ -621,9 +628,22 @@ impl WorkbenchScheduler {
         None
     }
 
+    /// True when the shared global two-write limit (`MAX_WRITE_JOBS`) has a free slot.
+    pub fn write_slot_available(&self) -> bool {
+        let in_use: usize = self
+            .tabs
+            .values()
+            .filter(|slot| matches!(slot.residency, SlotResidency::Hydrated { .. }))
+            .map(|slot| slot.tab.unslotted_document_operations(false))
+            .sum::<usize>()
+            + self.decompression_slots.active();
+        in_use < MAX_WRITE_JOBS
+    }
+
     /// Lazily registers a batch of paths (e.g. 200 files) as lightweight stubs without
-    /// opening file descriptors or indexing them eagerly. Duplicates select their owner.
-    /// The first registered stub in `window` is hydrated if the window has no active tab yet.
+    /// opening file descriptors or indexing them eagerly. Duplicates select their owner
+    /// without stealing tabs owned by another window.
+    /// The first stub belonging to `window` is hydrated if the window has no active tab yet.
     pub fn open_many_lazy(
         &mut self,
         window: WindowId,
@@ -632,8 +652,12 @@ impl WorkbenchScheduler {
         encoding: Option<Encoding>,
     ) -> Result<Vec<DocumentId>, SchedulerError> {
         let mut ids = Vec::new();
+        let mut first_in_window = None;
         for path in paths {
-            if let Some((_, existing_id)) = self.find_owner_for_path(&path) {
+            if let Some((owner_window, existing_id)) = self.find_owner_for_path(&path) {
+                if owner_window == window && first_in_window.is_none() {
+                    first_in_window = Some(existing_id);
+                }
                 ids.push(existing_id);
                 continue;
             }
@@ -660,11 +684,14 @@ impl WorkbenchScheduler {
                     last_used_tick: tick,
                 },
             );
+            if first_in_window.is_none() {
+                first_in_window = Some(id);
+            }
             ids.push(id);
         }
 
         if !self.active_by_window.contains_key(&window)
-            && let Some(&first_id) = ids.first()
+            && let Some(first_id) = first_in_window
         {
             let _ = self.activate_tab(window, first_id)?;
         }
@@ -737,6 +764,7 @@ impl WorkbenchScheduler {
                 slot.window = window;
                 slot.last_used_tick = tick;
             }
+            self.detach_from_other_windows(window, id);
             self.active_by_window.insert(window, id);
             return Ok(WakeOutcome::Ready {
                 document_id: id,
@@ -779,6 +807,7 @@ impl WorkbenchScheduler {
             }
         }
 
+        let write_slot_available = self.write_slot_available();
         let tick = self.next_tick();
         let slot = self.tabs.get_mut(&id).unwrap();
         let previous_residency = std::mem::replace(
@@ -796,6 +825,7 @@ impl WorkbenchScheduler {
                         &self.config,
                         &self.working_cleanup,
                         &self.decompression_slots,
+                        write_slot_available,
                     ) {
                         Ok(doc) => {
                             slot.tab.document = Some(doc);
@@ -827,9 +857,13 @@ impl WorkbenchScheduler {
             Ok((kind, conflict_notice)) => {
                 slot.window = window;
                 slot.last_used_tick = tick;
-                self.active_by_window.insert(window, id);
+                let notice_out = conflict_notice.clone();
                 if let Some(notice) = conflict_notice {
-                    slot.tab.notice = Some(AppMessage::warning(notice.clone()));
+                    slot.tab.notice = Some(AppMessage::warning(notice));
+                }
+                self.detach_from_other_windows(window, id);
+                self.active_by_window.insert(window, id);
+                if let Some(notice) = notice_out {
                     Ok(WakeOutcome::SourceChangedConflict {
                         document_id: id,
                         notice,
@@ -849,6 +883,33 @@ impl WorkbenchScheduler {
                 slot.residency = restored;
                 self.restore_previous_active_on_failure(window, previous_active, &evicted);
                 Err(error)
+            }
+        }
+    }
+
+    fn detach_from_other_windows(&mut self, target_window: WindowId, moved_id: DocumentId) {
+        let stale_windows: Vec<WindowId> = self
+            .active_by_window
+            .iter()
+            .filter_map(|(&win, &active)| {
+                (win != target_window && active == moved_id).then_some(win)
+            })
+            .collect();
+        for old_window in stale_windows {
+            let replacement = self
+                .tabs
+                .iter()
+                .filter(|&(&doc_id, slot)| {
+                    doc_id != moved_id
+                        && slot.window == old_window
+                        && matches!(slot.residency, SlotResidency::Hydrated { .. })
+                })
+                .max_by_key(|(_, slot)| slot.last_used_tick)
+                .map(|(&doc_id, _)| doc_id);
+            if let Some(next_id) = replacement {
+                self.active_by_window.insert(old_window, next_id);
+            } else {
+                self.active_by_window.remove(&old_window);
             }
         }
     }
@@ -1017,7 +1078,10 @@ impl WorkbenchScheduler {
         let Some(doc) = slot.tab.document.as_ref() else {
             return false;
         };
-        if doc.join_reserved() || slot.tab.document_writing() {
+        if doc.join_reserved()
+            || slot.tab.document_writing()
+            || doc.pending_materialization.is_some()
+        {
             return true;
         }
         doc.compressed.as_ref().is_some_and(|compressed| {
@@ -1071,8 +1135,20 @@ impl WorkbenchScheduler {
             }
         }
 
+        // Reserve persistent directory FD leases for any retained WorkingCopyStorage
+        // BEFORE demoting so dormant working directories cannot exceed the < 128 FD cap.
+        let working_dir_fd_lease = if let Some(wc) = doc.working_copy.as_ref() {
+            let dir_fds = 1 + wc.previous_directories.len();
+            Some(
+                self.fd_budget
+                    .try_reserve(FdCategory::TempDirectory, dir_fds)?,
+            )
+        } else {
+            None
+        };
+
         let mut doc = slot.tab.document.take().unwrap();
-        let dormant = demote_document(doc_into_dormant_parts(&mut doc), doc)?;
+        let dormant = demote_document(doc_into_dormant_parts(&mut doc), doc, working_dir_fd_lease)?;
         // Replacing `Hydrated { _fd_lease }` drops `_fd_lease`, freeing the FD budget slot.
         slot.residency = SlotResidency::Dormant(Box::new(dormant));
         if self.active_by_window.get(&slot.window) == Some(&id) {
@@ -1265,8 +1341,10 @@ fn doc_into_dormant_parts(doc: &mut Document) -> Result<DormantPrep, SchedulerEr
 fn demote_document(
     prep: Result<DormantPrep, SchedulerError>,
     mut doc: Document,
+    working_dir_fd_lease: Option<FdLease>,
 ) -> Result<DormantDocument, SchedulerError> {
     let prep = prep?;
+    let source_changed = doc.source_changed;
     // Evict heavy index, row buffers, filter index, and whitespace cache.
     doc.index = None;
     doc.buffered_rows.clear();
@@ -1308,7 +1386,7 @@ fn demote_document(
                 unreachable!("pinned compressed tabs are never demoted");
             }
         }
-    } else if doc.is_dirty() {
+    } else if doc.is_dirty() || doc.working_copy.is_some() {
         DormantKind::Dirty(Box::new(DormantDirtyState {
             session: Arc::clone(&doc.session),
             original_session: doc.original_session.take(),
@@ -1316,6 +1394,7 @@ fn demote_document(
             header_renames: Arc::clone(&doc.header_renames),
             cell_edits: Arc::clone(&doc.cell_edits),
             overlay_bytes: prep.overlay_bytes,
+            _working_dir_fd_lease: working_dir_fd_lease,
         }))
     } else {
         // Clean plain document: drop `Document` (including `Session`, `StructuralIndex`, buffers).
@@ -1332,6 +1411,7 @@ fn demote_document(
         canonical_path: prep.canonical_path,
         file_identity: prep.file_identity,
         source_guard: prep.source_guard,
+        source_changed,
         view,
         kind,
     })
@@ -1342,10 +1422,16 @@ fn hydrate_from_stub(
     config: &WorkbenchSchedulerConfig,
     working_cleanup: &WorkingCopyCleanup,
     decompression_slots: &compressed::DecompressionSlots,
+    write_slot_available: bool,
 ) -> Result<Document, SchedulerError> {
     let mut doc =
         Document::prepare_with_encoding(&stub.logical_path, stub.open_options, stub.encoding)
             .map_err(SchedulerError::OpenFailed)?;
+    if doc.awaiting_decompression() && !write_slot_available {
+        return Err(SchedulerError::OpenFailed(
+            compressed::WRITE_SLOTS_FULL.to_owned(),
+        ));
+    }
     doc.working_directory = config.working_directory.clone();
     doc.custom_working_directory = config.custom_working_directory;
     doc.index_cache_enabled = config.index_cache_enabled;
@@ -1365,10 +1451,11 @@ fn wake_dormant_document(
     decompression_slots: &compressed::DecompressionSlots,
 ) -> WakeResult {
     let dormant = *dormant;
-    let source_unchanged = dormant
-        .source_guard
-        .matches_path(&dormant.logical_path)
-        .unwrap_or(false);
+    let source_unchanged = !dormant.source_changed
+        && dormant
+            .source_guard
+            .matches_path(&dormant.logical_path)
+            .unwrap_or(false);
 
     match dormant.kind {
         DormantKind::CleanPlain {
@@ -1390,6 +1477,7 @@ fn wake_dormant_document(
                             canonical_path: dormant.canonical_path,
                             file_identity: dormant.file_identity,
                             source_guard: dormant.source_guard,
+                            source_changed: dormant.source_changed,
                             view: dormant.view,
                             kind: DormantKind::CleanPlain {
                                 open_options,
@@ -1431,6 +1519,7 @@ fn wake_dormant_document(
                         canonical_path: dormant.canonical_path,
                         file_identity: dormant.file_identity,
                         source_guard: dormant.source_guard,
+                        source_changed: dormant.source_changed,
                         view: dormant.view,
                         kind: DormantKind::CleanPlain {
                             open_options,
@@ -1454,6 +1543,7 @@ fn wake_dormant_document(
                     canonical_path: dormant.canonical_path,
                     file_identity: dormant.file_identity,
                     source_guard: dormant.source_guard,
+                    source_changed: dormant.source_changed,
                     view: dormant.view,
                     kind: DormantKind::CleanPlain {
                         open_options,
@@ -1464,7 +1554,7 @@ fn wake_dormant_document(
             }
             let kind = if let Some(query) = dormant.view.filter_query.clone() {
                 let _ = doc.start_filter(query);
-                doc.filter_viewport_start = dormant.view.filter_viewport_start;
+                restore_filtered_view_state(&mut doc, &dormant.view);
                 WakeKind::FilteredRebuilding
             } else {
                 WakeKind::CleanCold
@@ -1496,7 +1586,7 @@ fn wake_dormant_document(
             let _ = doc.start_indexing();
             if let Some(query) = dormant.view.filter_query.clone() {
                 let _ = doc.start_filter(query);
-                doc.filter_viewport_start = dormant.view.filter_viewport_start;
+                restore_filtered_view_state(&mut doc, &dormant.view);
             }
             Ok((doc, WakeKind::DirtyRehydrated, None))
         }
@@ -1525,7 +1615,7 @@ fn wake_dormant_document(
             let _ = doc.start_indexing();
             if let Some(query) = dormant.view.filter_query.clone() {
                 let _ = doc.start_filter(query);
-                doc.filter_viewport_start = dormant.view.filter_viewport_start;
+                restore_filtered_view_state(&mut doc, &dormant.view);
             }
             Ok((doc, WakeKind::CompressedCompleteRehydrated, None))
         }
@@ -1556,6 +1646,16 @@ fn wake_dormant_document(
             Ok((doc, WakeKind::CompressedPreviewRestored, None))
         }
     }
+}
+
+fn restore_filtered_view_state(doc: &mut Document, view: &DormantViewSnapshot) {
+    doc.filter_viewport_start = view.filter_viewport_start;
+    doc.scroll_points = view.scroll_points;
+    doc.selection = view.selection;
+    doc.cursor = view.cursor.clone();
+    doc.selected_rows = view.selected_rows.clone();
+    doc.selected_columns = view.selected_columns.clone();
+    doc.column_selection_anchor = view.column_selection_anchor;
 }
 
 fn apply_view_snapshot(
