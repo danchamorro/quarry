@@ -4,6 +4,7 @@ mod menus;
 mod operations;
 mod panels;
 mod workbench;
+mod workflows_ui;
 
 #[cfg(test)]
 mod ui_tests;
@@ -25,22 +26,26 @@ use gpui_kit::{
 };
 use quarry_core::{Encoding, OpenOptions};
 use quarry_workbench::{
-    AppMessage, CommandId, DocumentId, MessageSeverity, ResidencyState, WindowId, format_bytes,
+    AppMessage, CommandId, DocumentId, FailedOpen, MessageSeverity, ResidencyState, WindowId,
+    compressed::uncompressed_name, format_bytes,
 };
 
 use find_bar::{FindBar, FindBarEvent};
 use grid::Grid;
 use menus::{
-    CleanupColumns, CloseTab, CloseWindow, CombineColumns, CopySelection, DeleteSelectedColumns,
-    DeleteSelectedRows, DiscardChanges, EditCell, ExportFiltered, FindDuplicates, FindNext,
-    FindPrevious, FindText, InsertColumns, InsertRows, MoveColumns, MoveTabToNewWindow, NewWindow,
-    NextTab, OpenFile, OpenIso88591, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252,
-    PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText,
-    SaveAsFile, SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, ToggleColumns,
-    ToggleFilters, UndoEdit, bind_shortcuts, encoding_label, install_menus,
+    AboutQuarry, CleanupColumns, CloseTab, CloseWindow, CombineColumns, CombineFiles,
+    CopySelection, DeleteSelectedColumns, DeleteSelectedRows, DiscardChanges, EditCell,
+    ExportFiltered, FindDuplicates, FindNext, FindPrevious, FindText, InsertColumns, InsertRows,
+    InspectFile, JoinFiles, MoveColumns, MoveTabToNewWindow, NewWindow, NextTab, OpenFile,
+    OpenIso88591, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252, PreviousTab,
+    QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText, SaveAsFile,
+    SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage,
+    ToggleColumns, ToggleFilters, UndoEdit, bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
-use workbench::{CloseReviewAction, DocumentSnapshot, MAX_EDIT_BYTES, WorkbenchController};
+use workbench::{
+    CloseReviewAction, DocumentSnapshot, MAX_EDIT_BYTES, WorkbenchController, WorkflowDialogKind,
+};
 
 pub struct QuarryWindow {
     window_id: WindowId,
@@ -404,8 +409,8 @@ impl QuarryWindow {
         let result = self.controller.update(cx, |controller, cx| {
             controller.open_paths(self.window_id, paths, options, encoding, cx)
         });
-        if let Err(error) = result {
-            self.set_message(AppMessage::error(error), cx);
+        if let Err(message) = result {
+            self.set_message(message, cx);
         } else {
             self.sync_from_controller(window, cx);
         }
@@ -458,8 +463,8 @@ impl QuarryWindow {
             return;
         };
         let target_doc_id = info.document_id;
-        let directory = info
-            .path
+        let suggested_base = uncompressed_name(&info.path);
+        let directory = suggested_base
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_path_buf();
@@ -470,9 +475,12 @@ impl QuarryWindow {
         };
         let name = format!(
             "{}{}.{}",
-            info.path.file_stem().unwrap_or_default().to_string_lossy(),
+            suggested_base
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy(),
             suffix,
-            info.path
+            suggested_base
                 .extension()
                 .unwrap_or_else(|| std::ffi::OsStr::new("csv"))
                 .to_string_lossy()
@@ -1328,15 +1336,18 @@ impl QuarryWindow {
             return;
         }
         let target_doc_id = info.document_id;
-        let directory = info
-            .path
+        let suggested_base = uncompressed_name(&info.path);
+        let directory = suggested_base
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_path_buf();
         let name = format!(
             "{}-filtered.{}",
-            info.path.file_stem().unwrap_or_default().to_string_lossy(),
-            info.path
+            suggested_base
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            suggested_base
                 .extension()
                 .unwrap_or_else(|| std::ffi::OsStr::new("csv"))
                 .to_string_lossy()
@@ -1755,6 +1766,457 @@ impl QuarryWindow {
             cx,
         );
     }
+
+    fn open_output_path_callback(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PathBuf, &mut Window, &mut App) + 'static {
+        let weak = cx.weak_entity();
+        move |path, window, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                this.open_paths_direct(vec![path], OpenOptions::default(), None, window, cx);
+            });
+        }
+    }
+
+    fn workflow_dialog_closed_callback(
+        &self,
+        kind: WorkflowDialogKind,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let controller = self.controller.clone();
+        let window_id = self.window_id;
+        let restore = self.restore_grid_focus_callback(cx);
+        move |window, cx| {
+            controller.update(cx, |c, _| c.release_workflow_dialog(kind, window_id));
+            restore(window, cx);
+        }
+    }
+
+    fn open_combine_dialog_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing || self.confirming {
+            return;
+        }
+        if !self.controller.update(cx, |c, cx| {
+            c.claim_workflow_dialog(WorkflowDialogKind::Combine, self.window_id, cx)
+        }) {
+            return;
+        }
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let on_open = self.open_output_path_callback(cx);
+        let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Combine, cx);
+        workflows_ui::open_combine_dialog(self.controller.clone(), on_open, on_closed, window, cx);
+    }
+
+    fn open_join_dialog_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing || self.confirming {
+            return;
+        }
+        if !self.controller.update(cx, |c, cx| {
+            c.claim_workflow_dialog(WorkflowDialogKind::Join, self.window_id, cx)
+        }) {
+            return;
+        }
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let on_open = self.open_output_path_callback(cx);
+        let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Join, cx);
+        workflows_ui::open_join_dialog(self.controller.clone(), on_open, on_closed, window, cx);
+    }
+
+    fn open_inspect_dialog_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_inspect_dialog_for_target(None, window, cx);
+    }
+
+    fn open_inspect_dialog_for_target(
+        &mut self,
+        failed_target: Option<Box<FailedOpen>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        if !self.controller.update(cx, |c, cx| {
+            c.claim_workflow_dialog(WorkflowDialogKind::Inspect, self.window_id, cx)
+        }) {
+            return;
+        }
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        self.controller.update(cx, |c, cx| {
+            if let Some(failed) = failed_target {
+                c.inspect_configure_failed_open(&failed, cx);
+            } else {
+                c.inspect_configure_for_active(self.window_id, cx);
+            }
+        });
+        let on_open = self.open_output_path_callback(cx);
+        let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Inspect, cx);
+        workflows_ui::open_inspect_dialog(
+            self.controller.clone(),
+            self.window_id,
+            on_open,
+            on_closed,
+            window,
+            cx,
+        );
+    }
+
+    fn combine_files_action(
+        &mut self,
+        _: &CombineFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_combine_dialog_now(window, cx);
+    }
+
+    fn join_files_action(&mut self, _: &JoinFiles, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_join_dialog_now(window, cx);
+    }
+
+    fn inspect_file_action(
+        &mut self,
+        _: &InspectFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_inspect_dialog_now(window, cx);
+    }
+
+    fn temporary_storage_action(
+        &mut self,
+        _: &TemporaryStorage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let on_closed = self.restore_grid_focus_callback(cx);
+        workflows_ui::open_temporary_storage_dialog(self.controller.clone(), on_closed, window, cx);
+    }
+
+    fn about_quarry_action(
+        &mut self,
+        _: &AboutQuarry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let on_closed = self.restore_grid_focus_callback(cx);
+        workflows_ui::open_about_dialog(on_closed, window, cx);
+    }
+    #[inline(never)]
+    fn render_gzip_banner(
+        &self,
+        snap: &DocumentSnapshot,
+        tokens: &quarry_workbench::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if snap.compressed_pending {
+            Some(
+                div()
+                    .id("gzip-pending-banner")
+                    .role(Role::Alert)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().flex_1().min_w_0().child(
+                        "Showing initial preview rows of this compressed file. Decompress the full file into temporary storage to inspect all rows, search, filter, or save an uncompressed copy.",
+                    ))
+                    .child(
+                        Button::new("gzip-start-decompress")
+                            .label("Decompress Full File")
+                            .primary()
+                            .small()
+                            .flex_shrink_0()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let res = this.controller.update(cx, |c, cx| {
+                                    c.start_pending_decompression_active(this.window_id, cx)
+                                });
+                                if let Err(error) = res {
+                                    this.set_message(AppMessage::warning(error), cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("gzip-preview-only")
+                            .label("Preview Only")
+                            .small()
+                            .flex_shrink_0()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let res = this.controller.update(cx, |c, cx| {
+                                    c.stay_in_compressed_preview_active(this.window_id, cx)
+                                });
+                                if let Err(error) = res {
+                                    this.set_message(AppMessage::warning(error), cx);
+                                }
+                            })),
+                    )
+                    .into_any_element(),
+            )
+        } else if let Some(ref decomp) = snap.decompression_status {
+            Some(
+                div()
+                    .id("gzip-decompressing-banner")
+                    .role(Role::Status)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .bg(cx.theme().secondary)
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(decomp.label.clone()),
+                    )
+                    .when(decomp.cancel_enabled, |bar| {
+                        bar.child(
+                            Button::new("gzip-cancel-decompress")
+                                .label("Cancel")
+                                .danger()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| {
+                                        c.cancel_decompression_active(this.window_id, cx);
+                                    });
+                                })),
+                        )
+                    })
+                    .into_any_element(),
+            )
+        } else if snap.compressed_preview {
+            let unreadable = snap.compressed_unreadable_text;
+            let preview_msg = if unreadable {
+                "Showing initial preview rows only because later rows contain unreadable delimited text."
+            } else {
+                "Showing initial preview rows only (read-only). Reload from Disk to decompress the full file."
+            };
+            Some(
+                div()
+                    .id("gzip-preview-banner")
+                    .role(Role::Status)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .bg(cx.theme().secondary)
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(preview_msg),
+                    )
+                    .when(unreadable, |bar| {
+                        bar.child(
+                            Button::new("gzip-preview-inspect")
+                                .label("Inspect File…")
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_inspect_dialog_now(window, cx);
+                                })),
+                        )
+                    })
+                    .when(!unreadable, |bar| {
+                        bar.child(
+                            Button::new("gzip-preview-reload")
+                                .label("Reload from Disk")
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.reload_action(&ReloadFromDisk, window, cx);
+                                })),
+                        )
+                    })
+                    .into_any_element(),
+            )
+        } else {
+            None
+        }
+    }
+
+    #[inline(never)]
+    fn render_operation_banner(
+        &self,
+        snap: &DocumentSnapshot,
+        tokens: &quarry_workbench::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if let Some(preview) = &snap.duplicate_preview {
+            Some(
+                div()
+                    .id("duplicate-preview-banner")
+                    .role(Role::Alert)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().flex_1().child(format!(
+                        "Found {} extra duplicate row{} ({} unique of {} total).",
+                        preview.duplicate_rows,
+                        if preview.duplicate_rows == 1 { "" } else { "s" },
+                        preview.unique_rows,
+                        preview.total_rows
+                    )))
+                    .child(
+                        Button::new("confirm-remove-duplicates")
+                            .label("Remove Duplicates")
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let res = this.controller.update(cx, |c, cx| {
+                                    c.confirm_duplicate_removal_active(this.window_id, cx)
+                                });
+                                match res {
+                                    Ok(notice) => {
+                                        this.set_message(AppMessage::status(notice), cx);
+                                    }
+                                    Err(error) => this.set_message(error, cx),
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("cancel-duplicate-preview")
+                            .label("Cancel")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.controller.update(cx, |c, cx| {
+                                    c.cancel_structural_edit_active(this.window_id, cx);
+                                });
+                            })),
+                    )
+                    .into_any_element(),
+            )
+        } else if let Some(bytes) = snap.pending_split_confirm_bytes {
+            Some(
+                div()
+                    .id("split-confirm-banner")
+                    .role(Role::Alert)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().flex_1().child(format!(
+                        "Split will create a temporary working copy (~{}). Continue?",
+                        format_bytes(bytes)
+                    )))
+                    .child(
+                        Button::new("confirm-split-materialization")
+                            .label("Continue Split")
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let res = this.controller.update(cx, |c, cx| {
+                                    c.confirm_pending_materialization_active(this.window_id, cx)
+                                });
+                                if let Err(error) = res {
+                                    this.set_message(error, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("cancel-split-materialization")
+                            .label("Cancel")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.controller.update(cx, |c, cx| {
+                                    c.cancel_pending_materialization_active(this.window_id, cx);
+                                });
+                            })),
+                    )
+                    .into_any_element(),
+            )
+        } else if snap.structural_running || snap.export_running || snap.filter_running {
+            let op_label = if snap.structural_running {
+                let base = snap
+                    .structural_status
+                    .clone()
+                    .unwrap_or_else(|| "Applying operation…".into());
+                match snap.structural_progress {
+                    Some(frac) => format!("{base} ({:.0}%)", (frac * 100.0).clamp(0.0, 100.0)),
+                    None => base,
+                }
+            } else if snap.export_running {
+                snap.export_status
+                    .clone()
+                    .unwrap_or_else(|| "Exporting filtered rows…".into())
+            } else {
+                snap.filter_status
+                    .clone()
+                    .unwrap_or_else(|| "Filtering rows…".into())
+            };
+            let is_structural = snap.structural_running;
+            Some(
+                div()
+                    .id("operation-progress-banner")
+                    .role(Role::Status)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .bg(cx.theme().secondary)
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(op_label),
+                    )
+                    .child(
+                        Button::new("cancel-operation")
+                            .label("Cancel")
+                            .small()
+                            .danger()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.controller.update(cx, |c, cx| {
+                                    if is_structural {
+                                        c.cancel_structural_edit_active(this.window_id, cx);
+                                    } else {
+                                        c.cancel_filter_or_export_active(this.window_id, cx);
+                                    }
+                                });
+                            })),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        }
+    }
 }
 
 impl Render for QuarryWindow {
@@ -1841,6 +2303,11 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::toggle_whitespace_action))
             .on_action(cx.listener(Self::toggle_columns_action))
             .on_action(cx.listener(Self::toggle_filters_action))
+            .on_action(cx.listener(Self::combine_files_action))
+            .on_action(cx.listener(Self::join_files_action))
+            .on_action(cx.listener(Self::inspect_file_action))
+            .on_action(cx.listener(Self::temporary_storage_action))
+            .on_action(cx.listener(Self::about_quarry_action))
             .on_action(cx.listener(Self::quit_action));
 
         #[cfg(not(target_os = "macos"))]
@@ -2111,151 +2578,11 @@ impl Render for QuarryWindow {
         }
 
         if let Some(ref snap) = info {
-            if let Some(preview) = &snap.duplicate_preview {
-                body = body.child(
-                    div()
-                        .id("duplicate-preview-banner")
-                        .role(Role::Alert)
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1p5()
-                        .bg(rgb(tokens.warning_fill.to_rgb_hex()))
-                        .border_b_1()
-                        .border_color(cx.theme().border)
-                        .child(div().flex_1().child(format!(
-                            "Found {} extra duplicate row{} ({} unique of {} total).",
-                            preview.duplicate_rows,
-                            if preview.duplicate_rows == 1 { "" } else { "s" },
-                            preview.unique_rows,
-                            preview.total_rows
-                        )))
-                        .child(
-                            Button::new("confirm-remove-duplicates")
-                                .label("Remove Duplicates")
-                                .primary()
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let res = this.controller.update(cx, |c, cx| {
-                                        c.confirm_duplicate_removal_active(this.window_id, cx)
-                                    });
-                                    match res {
-                                        Ok(notice) => {
-                                            this.set_message(AppMessage::status(notice), cx);
-                                        }
-                                        Err(error) => this.set_message(error, cx),
-                                    }
-                                })),
-                        )
-                        .child(
-                            Button::new("cancel-duplicate-preview")
-                                .label("Cancel")
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.controller.update(cx, |c, cx| {
-                                        c.cancel_structural_edit_active(this.window_id, cx);
-                                    });
-                                })),
-                        ),
-                );
-            } else if let Some(bytes) = snap.pending_split_confirm_bytes {
-                body = body.child(
-                    div()
-                        .id("split-confirm-banner")
-                        .role(Role::Alert)
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1p5()
-                        .bg(rgb(tokens.warning_fill.to_rgb_hex()))
-                        .border_b_1()
-                        .border_color(cx.theme().border)
-                        .child(div().flex_1().child(format!(
-                            "Split will create a temporary working copy (~{}). Continue?",
-                            format_bytes(bytes)
-                        )))
-                        .child(
-                            Button::new("confirm-split-materialization")
-                                .label("Continue Split")
-                                .primary()
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let res = this.controller.update(cx, |c, cx| {
-                                        c.confirm_pending_materialization_active(this.window_id, cx)
-                                    });
-                                    if let Err(error) = res {
-                                        this.set_message(error, cx);
-                                    }
-                                })),
-                        )
-                        .child(
-                            Button::new("cancel-split-materialization")
-                                .label("Cancel")
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.controller.update(cx, |c, cx| {
-                                        c.cancel_pending_materialization_active(this.window_id, cx);
-                                    });
-                                })),
-                        ),
-                );
-            } else if snap.structural_running || snap.export_running || snap.filter_running {
-                let op_label = if snap.structural_running {
-                    let base = snap
-                        .structural_status
-                        .clone()
-                        .unwrap_or_else(|| "Applying operation…".into());
-                    match snap.structural_progress {
-                        Some(frac) => format!("{base} ({:.0}%)", (frac * 100.0).clamp(0.0, 100.0)),
-                        None => base,
-                    }
-                } else if snap.export_running {
-                    snap.export_status
-                        .clone()
-                        .unwrap_or_else(|| "Exporting filtered rows…".into())
-                } else {
-                    snap.filter_status
-                        .clone()
-                        .unwrap_or_else(|| "Filtering rows…".into())
-                };
-                let is_structural = snap.structural_running;
-                body = body.child(
-                    div()
-                        .id("operation-progress-banner")
-                        .role(Role::Status)
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1()
-                        .bg(cx.theme().secondary)
-                        .border_b_1()
-                        .border_color(cx.theme().border)
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(12.))
-                                .text_color(cx.theme().muted_foreground)
-                                .child(op_label),
-                        )
-                        .child(
-                            Button::new("cancel-operation")
-                                .label("Cancel")
-                                .small()
-                                .danger()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.controller.update(cx, |c, cx| {
-                                        if is_structural {
-                                            c.cancel_structural_edit_active(this.window_id, cx);
-                                        } else {
-                                            c.cancel_filter_or_export_active(this.window_id, cx);
-                                        }
-                                    });
-                                })),
-                        ),
-                );
+            if let Some(banner) = self.render_gzip_banner(snap, tokens, cx) {
+                body = body.child(banner);
+            }
+            if let Some(banner) = self.render_operation_banner(snap, tokens, cx) {
+                body = body.child(banner);
             }
         }
 
@@ -2324,12 +2651,35 @@ impl Render for QuarryWindow {
                             .child("Open a delimited file to begin."),
                     )
                     .child(
-                        Button::new("open-empty")
-                            .label("Open file…")
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.choose_open_with_encoding(None, window, cx)
-                            })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("open-empty")
+                                    .label("Open file…")
+                                    .primary()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.choose_open_with_encoding(None, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("welcome-combine")
+                                    .label("Combine Files…")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_combine_dialog_now(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("welcome-join")
+                                    .label("Join Files…")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_join_dialog_now(window, cx);
+                                    })),
+                            ),
                     ),
             );
         }
@@ -2337,6 +2687,11 @@ impl Render for QuarryWindow {
         if let Some(msg) = message {
             let is_error = msg.severity == MessageSeverity::Error;
             let is_warning = msg.severity == MessageSeverity::Warning;
+            let inspect_target = msg.inspection_target.clone();
+            let can_inspect_banner = inspect_target.is_some()
+                || ((is_error || is_warning)
+                    && (msg.diagnostic.is_some()
+                        || info.as_ref().is_some_and(|i| i.has_diagnostic)));
             body = body.child(
                 div()
                     .id("status-banner")
@@ -2368,6 +2723,17 @@ impl Render for QuarryWindow {
                         cx.theme().foreground
                     })
                     .child(div().flex_1().min_w_0().child(msg.text))
+                    .when(can_inspect_banner, |bar| {
+                        let target = inspect_target.clone();
+                        bar.child(
+                            Button::new("banner-inspect")
+                                .label("Inspect…")
+                                .small()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_inspect_dialog_for_target(target.clone(), window, cx);
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("dismiss-message")
                             .label("×")
@@ -2395,13 +2761,25 @@ impl Render for QuarryWindow {
                 } else {
                     format!("{} rows", number(info.total_rows))
                 };
+                let compressed_suffix = info
+                    .compressed_label
+                    .as_ref()
+                    .map(|l| format!("   ·   {l}"))
+                    .unwrap_or_default();
+                let join_suffix = if info.join_reserved {
+                    "   ·   Reserved by Join"
+                } else {
+                    ""
+                };
                 format!(
-                    "{}   ·   {:.2} MiB   ·   {} of {} columns   ·   {}{}",
+                    "{}   ·   {:.2} MiB   ·   {} of {} columns   ·   {}{}{}{}",
                     rows,
                     info.file_size as f64 / 1_048_576.,
                     info.shown_columns.len(),
                     info.headers.len(),
                     encoding_label(info.encoding),
+                    compressed_suffix,
+                    join_suffix,
                     if info.dirty {
                         "   ·   Unsaved edits"
                     } else {
@@ -2412,7 +2790,9 @@ impl Render for QuarryWindow {
             .unwrap_or_else(|| "Ready".into());
 
         let progress = if let Some(info) = &info {
-            if info.saving {
+            if let Some(ref decomp) = info.decompression_status {
+                decomp.label.clone()
+            } else if info.saving {
                 "Saving…".into()
             } else if info.filter_active {
                 if info.filter_done {

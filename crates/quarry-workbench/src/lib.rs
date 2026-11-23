@@ -6,9 +6,11 @@ pub mod document;
 pub mod dormancy;
 pub mod history;
 pub mod selection;
+pub mod storage_prefs;
 pub mod tab;
 pub mod theme;
 pub mod whitespace;
+pub mod workflows;
 
 pub use command::{
     CloseCommandOutcome, CommandContext, CommandId, CommandResolution, CommandTarget, DocumentId,
@@ -21,6 +23,13 @@ pub use dormancy::{
     MAX_PROCESS_FD_BUDGET, MIN_DORMANT_SCRATCH_HEADROOM_BYTES, PinReason, ResidencyState,
     SaveCompletion, SchedulerError, SearchCompletion, StructuralCompletion, WakeKind, WakeOutcome,
     WorkbenchScheduler, WorkbenchSchedulerConfig, document_overlay_bytes,
+};
+pub use storage_prefs::{
+    ADAPTIVE_MEMORY_BUDGET_BYTES, StoragePreferences, clear_index_cache_summary,
+    inspect_temporary_storage,
+};
+pub use workflows::{
+    CombineWorkflow, InspectWorkflow, JoinOutputColumnDraft, JoinSideSource, JoinWorkflow,
 };
 
 pub use document::{
