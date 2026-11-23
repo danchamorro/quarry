@@ -607,10 +607,7 @@ fn canonical_omarchy_roots(home: &Path) -> Vec<PathBuf> {
             let resolved = std::fs::canonicalize(&root).ok()?;
             // Accept a configured root only when it resolves to one of the three canonical
             // allowlisted Omarchy directories beneath `canon_home`, rejecting symlink escapes.
-            expected
-                .iter()
-                .any(|allowed| resolved == *allowed)
-                .then_some(resolved)
+            expected.contains(&resolved).then_some(resolved)
         })
         .collect()
 }
