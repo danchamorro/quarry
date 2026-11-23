@@ -3,16 +3,25 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::{
-    App, Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
-    SharedString, Styled, Window, div, px, rgb,
+    App, Context, Entity, FontFeatures, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
 };
-use quarry_workbench::{Document, MAX_GRID_TEXT_CHARS, WindowId, field_preview, whitespace};
+use quarry_workbench::{
+    Document, MAX_GRID_TEXT_CHARS, WindowId, field_preview, source_looks_numeric, whitespace,
+};
 
 use crate::workbench::WorkbenchController;
+
+/// OpenType `tnum` (tabular figures) font feature configuration for native CoreText
+/// and `cosmic-text` shaping so numeric columns and row numbers stay vertically aligned.
+pub fn tabular_font_features() -> FontFeatures {
+    FontFeatures(Arc::new(vec![("tnum".to_owned(), 1)]))
+}
 
 pub struct Grid {
     controller: Entity<WorkbenchController>,
@@ -317,20 +326,22 @@ impl TableDelegate for Grid {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let text = self.display_loaded(row, column, cx).unwrap_or_default();
-        let has_whitespace_mark = if column > 0 {
+        let (has_whitespace_mark, numeric_cell) = if column > 0 {
             let show_all = self.controller.read(cx).show_all_whitespace();
             let raw = self.display_raw_loaded(row, column, cx).unwrap_or_default();
-            if raw.is_empty() {
+            let is_numeric = source_looks_numeric(raw.as_bytes());
+            let has_ws = if raw.is_empty() {
                 false
             } else {
                 let summary =
                     whitespace::analyze(raw.as_bytes(), &std::sync::atomic::AtomicBool::new(false));
                 summary.is_some_and(|s| s.indicated(show_all))
-            }
+            };
+            (has_ws, is_numeric)
         } else {
-            false
+            (false, true)
         };
-        let tokens = &quarry_workbench::theme::LIGHT;
+        let tokens = self.controller.read(cx).active_palette();
         let row_selected = if column == 0 {
             self.source_row_at(row, cx).is_some_and(|src_row| {
                 self.controller
@@ -350,19 +361,19 @@ impl TableDelegate for Grid {
             .overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
-            .text_size(px(12.))
-            .font_family("Menlo")
+            .text_size(px(quarry_workbench::GRID_FONT_SIZE))
+            .font_features(tabular_font_features())
             .text_color(if column == 0 {
                 if row_selected {
-                    cx.theme().primary
+                    rgb(tokens.on_accent.to_rgb_hex()).into()
                 } else {
-                    rgb(0x9b7624).into()
+                    rgb(tokens.accent_text.to_rgb_hex()).into()
                 }
             } else {
                 cx.theme().foreground
             });
         if row_selected {
-            cell = cell.bg(cx.theme().accent);
+            cell = cell.bg(rgb(tokens.selection_strong.to_rgb_hex()));
         }
         if column == 0
             && let Some(src_row) = self.source_row_at(row, cx)
@@ -379,14 +390,11 @@ impl TableDelegate for Grid {
                     });
                 });
         }
-        cell = cell.child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(text),
-        );
+        let mut text_div = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
+        if numeric_cell {
+            text_div = text_div.text_right();
+        }
+        cell = cell.child(text_div.child(text));
         if has_whitespace_mark {
             cell = cell.child(
                 div()

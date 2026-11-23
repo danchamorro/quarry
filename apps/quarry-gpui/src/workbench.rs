@@ -18,11 +18,12 @@ use quarry_workbench::compressed::{
 use quarry_workbench::{
     AppMessage, CombineWorkflow, CommandContext, CommandId, CommandResolution,
     DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, FailedOpen, InspectWorkflow,
-    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, ResidencyState, SchedulerError,
-    SelectionModifiers, StoragePreferences, StructuralDialog, StructuralJob, WakeOutcome, WindowId,
-    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary,
-    evaluate_command, inspect_temporary_storage, materialization_progress, select_column,
-    sort_progress,
+    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, Palette, ResidencyState, ResolvedTheme,
+    SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog, StructuralJob,
+    ThemeAppearance, ThemePreference, ThemePreferences, WakeOutcome, WindowId, WorkbenchScheduler,
+    WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary, evaluate_command,
+    inspect_temporary_storage, materialization_progress, omarchy_theme_fingerprint, resolve_theme,
+    select_column, sort_progress,
 };
 
 /// Shared global concurrency cap across document saves, exports, structural edits, decompressions,
@@ -171,6 +172,12 @@ pub enum WorkflowDialogKind {
 pub struct WorkbenchController {
     scheduler: WorkbenchScheduler,
     storage_prefs: StoragePreferences,
+    theme_prefs: ThemePreferences,
+    theme_home: Option<PathBuf>,
+    system_appearance: ThemeAppearance,
+    resolved_theme: ResolvedTheme,
+    omarchy_last_check: Instant,
+    omarchy_fingerprint: Option<String>,
     combine: Box<CombineWorkflow>,
     join: Box<JoinWorkflow>,
     inspect: Box<InspectWorkflow>,
@@ -203,9 +210,24 @@ impl WorkbenchController {
         Self::new_with_prefs(config, StoragePreferences::default())
     }
 
+    #[cfg(test)]
     pub fn new_with_prefs(
+        config: WorkbenchSchedulerConfig,
+        storage_prefs: StoragePreferences,
+    ) -> Self {
+        Self::new_with_all_prefs(
+            config,
+            storage_prefs,
+            ThemePreferences::load_from(None, false),
+            None,
+        )
+    }
+
+    pub fn new_with_all_prefs(
         mut config: WorkbenchSchedulerConfig,
         storage_prefs: StoragePreferences,
+        theme_prefs: ThemePreferences,
+        theme_home: Option<PathBuf>,
     ) -> Self {
         if let Some(dir) = storage_prefs.scratch_directory.clone() {
             config.working_directory = dir;
@@ -214,6 +236,17 @@ impl WorkbenchController {
         if let Some(enabled) = storage_prefs.index_cache_enabled {
             config.index_cache_enabled = enabled;
         }
+        let system_appearance = ThemeAppearance::Light;
+        let resolved_theme = resolve_theme(
+            theme_prefs.preference,
+            system_appearance,
+            theme_home.as_deref(),
+        );
+        let omarchy_fingerprint = if theme_prefs.preference == ThemePreference::Omarchy {
+            theme_home.as_deref().and_then(omarchy_theme_fingerprint)
+        } else {
+            None
+        };
         let scheduler = WorkbenchScheduler::new(config);
         let working_dir = scheduler.working_directory().to_path_buf();
         let custom_dir = scheduler.custom_working_directory();
@@ -222,6 +255,12 @@ impl WorkbenchController {
         Self {
             scheduler,
             storage_prefs,
+            theme_prefs,
+            theme_home,
+            system_appearance,
+            resolved_theme,
+            omarchy_last_check: Instant::now(),
+            omarchy_fingerprint,
             combine: Box::default(),
             join: Box::new(JoinWorkflow::new(working_dir.clone())),
             inspect: Box::new(InspectWorkflow::new(
@@ -264,11 +303,14 @@ impl WorkbenchController {
         }
         let _ = raise_nofile_limit(DEFAULT_NOFILE_TARGET);
         let storage_prefs = StoragePreferences::application();
+        let theme_prefs = ThemePreferences::load_default();
+        let theme_home = std::env::var_os("HOME").map(PathBuf::from);
         let config = WorkbenchSchedulerConfig {
             defer_gzip_decompression: true,
             ..WorkbenchSchedulerConfig::default()
         };
-        let entity = cx.new(|_| Self::new_with_prefs(config, storage_prefs));
+        let entity =
+            cx.new(|_| Self::new_with_all_prefs(config, storage_prefs, theme_prefs, theme_home));
         cx.set_global(WorkbenchGlobal(entity.clone()));
 
         let poll_entity = entity.clone();
@@ -281,9 +323,14 @@ impl WorkbenchController {
                     if Self::try_global(cx).is_none() {
                         return false;
                     }
-                    poll_entity.update(cx, |this, cx| {
+                    let omarchy_update = poll_entity.update(cx, |this, cx| {
                         this.poll_background(cx);
+                        this.poll_omarchy_theme(cx)
                     });
+                    if let Some(resolved) = omarchy_update {
+                        crate::apply_resolved_theme(&resolved, cx);
+                        cx.refresh_windows();
+                    }
                     true
                 });
                 if !keep_going {
@@ -312,6 +359,119 @@ impl WorkbenchController {
         let entity = cx.new(|_| Self::new_with_prefs(config, prefs));
         cx.set_global(WorkbenchGlobal(entity.clone()));
         entity
+    }
+
+    #[cfg(test)]
+    pub fn reset_for_test_with_theme(
+        cx: &mut App,
+        config: WorkbenchSchedulerConfig,
+        theme_prefs: ThemePreferences,
+        theme_home: Option<PathBuf>,
+    ) -> Entity<Self> {
+        let entity = cx.new(|_| {
+            Self::new_with_all_prefs(
+                config,
+                StoragePreferences::default(),
+                theme_prefs,
+                theme_home,
+            )
+        });
+        cx.set_global(WorkbenchGlobal(entity.clone()));
+        entity
+    }
+
+    // --- Theme management (Light / Dark / System / Omarchy) ---
+
+    pub fn active_palette(&self) -> Palette {
+        self.resolved_theme.palette
+    }
+
+    pub fn resolved_theme(&self) -> &ResolvedTheme {
+        &self.resolved_theme
+    }
+
+    pub fn set_theme_preference(
+        &mut self,
+        preference: ThemePreference,
+        cx: &mut Context<Self>,
+    ) -> Result<ResolvedTheme, String> {
+        self.theme_prefs.set_preference(preference)?;
+        let resolved = resolve_theme(
+            preference,
+            self.system_appearance,
+            self.theme_home.as_deref(),
+        );
+        self.resolved_theme = resolved.clone();
+        self.omarchy_last_check = Instant::now();
+        self.omarchy_fingerprint = if preference == ThemePreference::Omarchy {
+            self.theme_home
+                .as_deref()
+                .and_then(omarchy_theme_fingerprint)
+        } else {
+            None
+        };
+        cx.notify();
+        Ok(resolved)
+    }
+
+    pub fn sync_system_appearance(
+        &mut self,
+        appearance: ThemeAppearance,
+        cx: &mut Context<Self>,
+    ) -> Option<ResolvedTheme> {
+        if self.system_appearance == appearance {
+            return None;
+        }
+        self.system_appearance = appearance;
+        let resolved = resolve_theme(
+            self.theme_prefs.preference,
+            self.system_appearance,
+            self.theme_home.as_deref(),
+        );
+        if resolved != self.resolved_theme {
+            self.resolved_theme = resolved.clone();
+            cx.notify();
+            Some(resolved)
+        } else {
+            None
+        }
+    }
+
+    pub fn poll_omarchy_theme(&mut self, cx: &mut Context<Self>) -> Option<ResolvedTheme> {
+        if self.theme_prefs.preference != ThemePreference::Omarchy {
+            return None;
+        }
+        if self.omarchy_last_check.elapsed() < Duration::from_secs(1) {
+            return None;
+        }
+        self.reload_omarchy_theme_now(cx)
+    }
+
+    pub fn reload_omarchy_theme_now(&mut self, cx: &mut Context<Self>) -> Option<ResolvedTheme> {
+        if self.theme_prefs.preference != ThemePreference::Omarchy {
+            return None;
+        }
+        self.omarchy_last_check = Instant::now();
+        let next_fp = self
+            .theme_home
+            .as_deref()
+            .and_then(omarchy_theme_fingerprint);
+        if next_fp == self.omarchy_fingerprint {
+            return None;
+        }
+        self.omarchy_fingerprint = next_fp;
+        let resolved = resolve_theme(
+            ThemePreference::Omarchy,
+            self.system_appearance,
+            self.theme_home.as_deref(),
+        );
+        if resolved != self.resolved_theme {
+            self.resolved_theme = resolved.clone();
+            cx.notify();
+            Some(resolved)
+        } else {
+            None
+        }
     }
 
     pub fn scheduler(&self) -> &WorkbenchScheduler {

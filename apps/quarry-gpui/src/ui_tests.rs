@@ -1829,3 +1829,277 @@ fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn themes_dark_omarchy_persistence_and_tabular_figures_work_through_gpui_ui(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    // 1. Verify OpenType `tnum` tabular figures are configured for grid cells.
+    let features = crate::grid::tabular_font_features();
+    assert_eq!(features.tag_value_list(), &[("tnum".to_owned(), 1)]);
+
+    let home = tempfile::tempdir().unwrap();
+    let pref_file = home.path().join("quarry-config/theme-preferences");
+    let omarchy_dir = home.path().join(".local/state/omarchy/current/theme");
+    std::fs::create_dir_all(&omarchy_dir).unwrap();
+    std::fs::write(
+        home.path().join(".local/state/omarchy/current/theme.name"),
+        "tokyo-night\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path()
+            .join(".local/state/omarchy/current/theme.generation"),
+        "gen-1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        omarchy_dir.join("colors.toml"),
+        r##"
+mode = "dark"
+accent = "#7aa2f7"
+selection = "#292e42"
+muted = "#414868"
+background = "#1a1b26"
+dark_background = "#13141c"
+lighter_background = "#24283b"
+foreground = "#a9b1d6"
+dark_foreground = "#565f89"
+bright_foreground = "#c0caf5"
+red = "#f7768e"
+yellow = "#e0af68"
+green = "#9ece6a"
+cyan = "#449dab"
+"##,
+    )
+    .unwrap();
+
+    let csv_dir = tempfile::tempdir().unwrap();
+    let sample = csv_dir.path().join("numbers.csv");
+    std::fs::write(
+        &sample,
+        "item,amount,pct\nalpha,1234.50,12.5%\nbeta,9.00,100%\n",
+    )
+    .unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test_with_theme(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+            quarry_workbench::ThemePreferences::load_from(Some(pref_file.clone()), true),
+            Some(home.path().to_path_buf()),
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![sample.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+
+    // 2. Switch to Dark mode via action and verify GPUI ThemeMode + persisted preference.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.theme_dark_action(&crate::menus::ThemeDark, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(gpui_kit::component::Theme::global(cx).mode.is_dark());
+        assert_eq!(controller.read(cx).active_palette(), quarry_workbench::DARK);
+    })
+    .unwrap();
+    let persisted = quarry_workbench::ThemePreferences::load_from(Some(pref_file.clone()), true);
+    assert_eq!(
+        persisted.preference,
+        quarry_workbench::ThemePreference::Dark
+    );
+
+    // 3. Switch to Light mode via action.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.theme_light_action(&crate::menus::ThemeLight, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(!gpui_kit::component::Theme::global(cx).mode.is_dark());
+        assert_eq!(
+            controller.read(cx).active_palette(),
+            quarry_workbench::LIGHT
+        );
+    })
+    .unwrap();
+
+    // 4. Switch to Omarchy sync and verify live Tokyo Night palette + live generation reload.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.theme_omarchy_action(&crate::menus::ThemeOmarchy, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(gpui_kit::component::Theme::global(cx).mode.is_dark());
+        assert_eq!(
+            controller.read(cx).resolved_theme().source_label,
+            "Omarchy (tokyo-night)"
+        );
+        assert_eq!(
+            controller.read(cx).active_palette().canvas,
+            quarry_workbench::Rgba::rgb(0x1a, 0x1b, 0x26)
+        );
+    })
+    .unwrap();
+
+    // Update Omarchy generation + light theme on disk and verify live reload detects it.
+    std::fs::write(
+        home.path().join(".local/state/omarchy/current/theme.name"),
+        "rose-pine-dawn\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path()
+            .join(".local/state/omarchy/current/theme.generation"),
+        "gen-2\n",
+    )
+    .unwrap();
+    std::fs::write(
+        omarchy_dir.join("colors.toml"),
+        "mode = \"light\"\nbackground = \"#faf4ed\"\nforeground = \"#575279\"\naccent = \"#286983\"\n",
+    )
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        let updated = controller
+            .update(cx, |c, cx| c.reload_omarchy_theme_now(cx))
+            .expect("omarchy generation change should trigger reload");
+        crate::apply_resolved_theme(&updated, cx);
+        window.render_frame(cx);
+        assert!(!gpui_kit::component::Theme::global(cx).mode.is_dark());
+        assert_eq!(updated.source_label, "Omarchy (rose-pine-dawn)");
+        assert!(quarry_workbench::palette_meets_wcag_aa(&updated.palette));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn two_hundred_tabs_across_four_windows_stay_bounded_and_preserve_dirty_work(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = Vec::with_capacity(200);
+    for idx in 0..200 {
+        let p = dir.path().join(format!("table_{idx:03}.csv"));
+        std::fs::write(
+            &p,
+            format!(
+                "id,category,amount\n1,alpha,{}\n2,beta,{}\n",
+                idx * 10,
+                idx * 20
+            ),
+        )
+        .unwrap();
+        paths.push(p);
+    }
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+
+    // Open 4 windows and distribute 50 files lazily into each window (200 total tabs).
+    let mut windows = Vec::new();
+    for win_idx in 0..4 {
+        let (handle, view) = open_test_window(cx, &controller);
+        let chunk = paths[win_idx * 50..(win_idx + 1) * 50].to_vec();
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.update(cx, |q, cx| {
+                q.open_paths_direct(chunk, OpenOptions::default(), None, window, cx);
+            });
+        })
+        .unwrap();
+        windows.push((handle, view));
+    }
+
+    for (handle, view) in &windows {
+        wait_for_ui(cx, *handle, &controller, view, |q, _, cx| {
+            q.snapshot(cx).is_some_and(|i| i.index_done)
+        });
+    }
+
+    // Verify 200 total tabs, >= 1 hydrated tab per window, and internal FD budget < 128.
+    cx.update(|cx| {
+        let sched = controller.read(cx).scheduler();
+        assert_eq!(sched.total_tabs(), 200);
+        assert!(sched.hydrated_count() >= 4);
+        assert!(sched.hydrated_count() <= 8);
+        assert!(sched.fd_budget().snapshot().peak_reserved < 128);
+        assert!(sched.fd_budget().snapshot().total_reserved < 128);
+    });
+
+    // Make one tab in Window 1 dirty, switch through 12 other tabs in Window 1 to trigger
+    // dormancy eviction, then switch back and confirm the unsaved edit survived intact.
+    let (w1_handle, w1_view) = windows[0].clone();
+    let w1_id = cx.update(|cx| w1_view.read(cx).window_id);
+    let w1_tabs = cx.update(|cx| controller.read(cx).scheduler().tabs_in_window(w1_id));
+    assert_eq!(w1_tabs.len(), 50);
+    let dirty_doc = w1_tabs[0];
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.apply_cell_edit(w1_id, dirty_doc, 1, 1, "EDITED_200".into(), cx)
+                .unwrap();
+        });
+    });
+    for &tab_id in &w1_tabs[1..12] {
+        cx.update(|cx| {
+            controller.update(cx, |c, cx| {
+                c.activate_tab(w1_id, tab_id, cx).unwrap();
+            });
+        });
+        wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, cx| {
+            q.snapshot(cx)
+                .is_some_and(|i| i.document_id == tab_id && i.index_done)
+        });
+    }
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(w1_id, dirty_doc, cx).unwrap();
+        });
+    });
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.document_id == dirty_doc && i.dirty && i.index_done)
+    });
+    cx.update(|cx| {
+        let sched = controller.read(cx).scheduler();
+        assert_eq!(sched.total_tabs(), 200);
+        assert!(sched.fd_budget().snapshot().peak_reserved < 128);
+        let tab = sched.tab(dirty_doc).unwrap();
+        let doc = tab.document.as_ref().unwrap();
+        assert!(doc.is_dirty());
+        assert_eq!(
+            doc.cell_edits.get(&(1, 1)).map(|v| v.as_slice()),
+            Some(b"EDITED_200".as_slice())
+        );
+    });
+}
