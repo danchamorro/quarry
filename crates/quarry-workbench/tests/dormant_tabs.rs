@@ -1941,6 +1941,25 @@ fn quit_approval_is_invalidated_when_approved_tab_is_edited_again() {
     tight.finalize_quit().unwrap();
     assert_eq!(tight.total_tabs(), 0);
 
+    // Window-close approval must also invalidate when the approved tab is edited again.
+    scheduler.approve_tab_for_close(ids[0]).unwrap();
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "third_edit".into();
+        doc.commit_cell_edit();
+    }
+    let close_err = scheduler.close_window(w1).unwrap_err();
+    assert!(matches!(
+        close_err,
+        SchedulerError::UnapprovedDirtyTabs(ref unapproved) if unapproved == &vec![ids[0]]
+    ));
+
     scheduler.approve_tab_for_quit(ids[0]).unwrap();
     scheduler.finalize_quit().unwrap();
     assert_eq!(scheduler.total_tabs(), 0);

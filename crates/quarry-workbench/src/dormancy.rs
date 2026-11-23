@@ -529,6 +529,7 @@ pub struct WorkbenchScheduler {
     active_by_window: BTreeMap<WindowId, DocumentId>,
     quit_pending: bool,
     quit_approved: BTreeMap<DocumentId, u64>,
+    close_approved: BTreeMap<DocumentId, u64>,
 }
 
 impl WorkbenchScheduler {
@@ -546,6 +547,7 @@ impl WorkbenchScheduler {
             active_by_window: BTreeMap::new(),
             quit_pending: false,
             quit_approved: BTreeMap::new(),
+            close_approved: BTreeMap::new(),
         }
     }
 
@@ -1359,6 +1361,34 @@ impl WorkbenchScheduler {
         }
     }
 
+    /// Approves one tab for window/tab close at its current edit revision. Any subsequent edit
+    /// changes its revision and automatically invalidates this approval in [`Self::close_window`].
+    pub fn approve_tab_for_close(&mut self, id: DocumentId) -> Result<(), SchedulerError> {
+        let Some(slot) = self.tabs.get_mut(&id) else {
+            return Err(SchedulerError::NotFound(id));
+        };
+        slot.tab.approve_discard_and_close();
+        let revision = slot_edit_revision(slot);
+        self.close_approved.insert(id, revision);
+        Ok(())
+    }
+
+    /// Revokes any pending window/tab close approval on `id`.
+    pub fn revoke_tab_close_approval(&mut self, id: DocumentId) {
+        self.close_approved.remove(&id);
+        if let Some(slot) = self.tabs.get_mut(&id) {
+            slot.tab.cancel_close();
+        }
+    }
+
+    fn tab_is_close_approved(&self, id: DocumentId, slot: &ManagedTab) -> bool {
+        slot.tab.close_ready
+            && self
+                .close_approved
+                .get(&id)
+                .is_some_and(|&approved_rev| approved_rev == slot_edit_revision(slot))
+    }
+
     /// Approves one tab for quit at its current edit revision without releasing it yet
     /// (cancelled quit stays lossless; any subsequent edit invalidates this approval).
     pub fn approve_tab_for_quit(&mut self, id: DocumentId) -> Result<(), SchedulerError> {
@@ -1395,6 +1425,7 @@ impl WorkbenchScheduler {
         }
         self.quit_pending = false;
         self.quit_approved.clear();
+        self.close_approved.clear();
         self.active_by_window.clear();
         self.window_tabs.clear();
         let tabs = std::mem::take(&mut self.tabs);
@@ -1454,6 +1485,7 @@ impl WorkbenchScheduler {
             drop(slot);
         }
         self.quit_approved.remove(&id);
+        self.close_approved.remove(&id);
         self.remove_tab_from_window_lists(id);
         if was_active {
             self.active_by_window.remove(&old_window);
@@ -1490,7 +1522,7 @@ impl WorkbenchScheduler {
             .filter(|&id| {
                 self.tabs.get(&id).is_some_and(|slot| {
                     slot_is_dirty(slot)
-                        && !slot.tab.close_ready
+                        && !self.tab_is_close_approved(id, slot)
                         && !self.tab_is_quit_approved(id, slot)
                 })
             })
@@ -1506,6 +1538,7 @@ impl WorkbenchScheduler {
                 drop(slot);
             }
             self.quit_approved.remove(&id);
+            self.close_approved.remove(&id);
         }
         self.window_tabs.remove(&window);
         self.active_by_window.remove(&window);

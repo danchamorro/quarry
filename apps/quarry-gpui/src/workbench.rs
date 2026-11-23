@@ -756,6 +756,7 @@ impl WorkbenchController {
         if let Some(tab) = self.scheduler.tab_mut(expected_doc_id) {
             tab.notice = None;
         }
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
         let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
@@ -779,6 +780,7 @@ impl WorkbenchController {
             return Err("Open a file first.".into());
         };
         doc.rename_header(source_col, name)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
         let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
@@ -1079,9 +1081,7 @@ impl WorkbenchController {
         if let Some(review) = self.pending_review.take() {
             match review {
                 PendingReviewScope::SingleTab { document_id, .. } => {
-                    if let Some(tab) = self.scheduler.tab_mut(document_id) {
-                        tab.cancel_close();
-                    }
+                    self.scheduler.revoke_tab_close_approval(document_id);
                 }
                 PendingReviewScope::Window {
                     remaining_dirty,
@@ -1089,9 +1089,7 @@ impl WorkbenchController {
                     ..
                 } => {
                     for id in remaining_dirty.into_iter().chain(approved_dirty) {
-                        if let Some(tab) = self.scheduler.tab_mut(id) {
-                            tab.cancel_close();
-                        }
+                        self.scheduler.revoke_tab_close_approval(id);
                     }
                 }
                 PendingReviewScope::Quit { .. } => {
@@ -1122,9 +1120,16 @@ impl WorkbenchController {
                 document_id,
                 close_window_if_last,
             } => {
-                if let Some(tab) = self.scheduler.tab_mut(document_id) {
-                    tab.approve_discard_and_close();
+                if self.editing_windows.contains(&window_id)
+                    && self.scheduler.active_document(window_id) == Some(document_id)
+                {
+                    self.scheduler.revoke_tab_close_approval(document_id);
+                    cx.notify();
+                    return CloseReviewAction::Wait {
+                        message: "Apply or cancel the open edit before closing this tab.".into(),
+                    };
                 }
+                let _ = self.scheduler.approve_tab_for_close(document_id);
                 let _ = self.scheduler.close_tab(document_id);
                 self.viewport_read_seq.remove(&document_id);
                 if close_window_if_last
@@ -1143,17 +1148,13 @@ impl WorkbenchController {
             } => {
                 if !remaining_dirty.is_empty() {
                     let approved = remaining_dirty.remove(0);
-                    if let Some(tab) = self.scheduler.tab_mut(approved) {
-                        tab.approve_discard_and_close();
-                    }
+                    let _ = self.scheduler.approve_tab_for_close(approved);
                     approved_dirty.push(approved);
                 }
                 if let Some(&next_id) = remaining_dirty.first() {
                     if let Err(error) = self.scheduler.activate_tab(window_id, next_id) {
                         for id in remaining_dirty.into_iter().chain(approved_dirty) {
-                            if let Some(tab) = self.scheduler.tab_mut(id) {
-                                tab.cancel_close();
-                            }
+                            self.scheduler.revoke_tab_close_approval(id);
                         }
                         cx.notify();
                         return CloseReviewAction::Wait {
@@ -1183,9 +1184,7 @@ impl WorkbenchController {
                 } else {
                     if self.editing_windows.contains(&window_id) {
                         for id in approved_dirty {
-                            if let Some(tab) = self.scheduler.tab_mut(id) {
-                                tab.cancel_close();
-                            }
+                            self.scheduler.revoke_tab_close_approval(id);
                         }
                         cx.notify();
                         return CloseReviewAction::Wait {
@@ -1204,9 +1203,7 @@ impl WorkbenchController {
                                 if let Err(error) = self.scheduler.activate_tab(window_id, next_id)
                                 {
                                     for id in newly_dirty.into_iter().chain(approved_dirty) {
-                                        if let Some(tab) = self.scheduler.tab_mut(id) {
-                                            tab.cancel_close();
-                                        }
+                                        self.scheduler.revoke_tab_close_approval(id);
                                     }
                                     cx.notify();
                                     return CloseReviewAction::Wait {
@@ -1235,9 +1232,7 @@ impl WorkbenchController {
                                 }
                             } else {
                                 for id in approved_dirty {
-                                    if let Some(tab) = self.scheduler.tab_mut(id) {
-                                        tab.cancel_close();
-                                    }
+                                    self.scheduler.revoke_tab_close_approval(id);
                                 }
                                 cx.notify();
                                 CloseReviewAction::Wait {
@@ -1247,9 +1242,7 @@ impl WorkbenchController {
                         }
                         Err(error) => {
                             for id in approved_dirty {
-                                if let Some(tab) = self.scheduler.tab_mut(id) {
-                                    tab.cancel_close();
-                                }
+                                self.scheduler.revoke_tab_close_approval(id);
                             }
                             cx.notify();
                             CloseReviewAction::Wait {
@@ -1293,6 +1286,33 @@ impl WorkbenchController {
                         filename,
                     }
                 } else {
+                    if let Some(&editing_window) = self.editing_windows.first() {
+                        self.scheduler.cancel_quit();
+                        if let Some(handle) = self.window_handle(editing_window) {
+                            let _ = handle.update(cx, |_, window, _| window.activate_window());
+                        }
+                        cx.notify();
+                        return CloseReviewAction::Wait {
+                            message: "Apply or cancel open edits before quitting Quarry.".into(),
+                        };
+                    }
+                    for win in self.scheduler.windows() {
+                        for id in self.scheduler.tabs_in_window(win) {
+                            if self
+                                .scheduler
+                                .tab(id)
+                                .is_some_and(WorkbenchTab::document_writing)
+                            {
+                                self.scheduler.cancel_quit();
+                                cx.notify();
+                                return CloseReviewAction::Wait {
+                                    message:
+                                        "Wait for active file operations to finish before quitting."
+                                            .into(),
+                                };
+                            }
+                        }
+                    }
                     match self.scheduler.finalize_quit() {
                         Ok(_) => {
                             self.quit_requested_complete = true;
