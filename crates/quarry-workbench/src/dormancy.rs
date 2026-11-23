@@ -1095,7 +1095,8 @@ impl WorkbenchScheduler {
     }
 
     /// Starts a filter on hydrated tab `id` while reserving its `BackgroundJob` descriptors
-    /// (2 FDs for the scan file + cloned guard handle) against the process `< 128` FD budget.
+    /// (2 FDs for the scan file + cloned guard handle plus 1 pre-reserved FD for the concurrent
+    /// filtered-read worker) against the process `< 128` FD budget.
     pub fn start_filter(
         &mut self,
         id: DocumentId,
@@ -1113,8 +1114,7 @@ impl WorkbenchScheduler {
         let Some(doc) = slot.tab.document.as_mut() else {
             return Err(SchedulerError::OpenFailed("Document is not loaded.".into()));
         };
-        let current_jobs = doc_active_job_fds(doc);
-        let needed_jobs = current_jobs.saturating_add(2);
+        let needed_jobs = usize::from(doc.job.is_some()) + FILTER_JOB_AND_READ_FDS;
         try_sync_optional_lease(
             &fd_budget,
             job_fd_lease,
@@ -1195,11 +1195,36 @@ impl WorkbenchScheduler {
             if let Err(err) = doc.poll() {
                 errors.push((id, err));
             }
-            if let Err(err) = doc.poll_filter() {
-                errors.push((id, err));
-            }
-            if let Err(err) = doc.poll_filter_read() {
-                errors.push((id, err));
+            // Reserve descriptors BEFORE polling filter/read workers so `poll_filter()` or
+            // `poll_filter_read()` cannot start a filtered-read worker without an FD lease.
+            let can_run_filter_read = if doc.filter_job.is_some() || doc.filter_read.is_some() {
+                try_sync_optional_lease(
+                    &fd_budget,
+                    job_fd_lease,
+                    FdCategory::BackgroundJob,
+                    doc_active_job_fds(doc),
+                )
+                .is_ok()
+            } else if doc.pending_filter_read.is_some() {
+                let needed = usize::from(doc.job.is_some()) + 1;
+                try_sync_optional_lease(&fd_budget, job_fd_lease, FdCategory::BackgroundJob, needed)
+                    .is_ok()
+            } else {
+                true
+            };
+            if can_run_filter_read {
+                if let Err(err) = doc.poll_filter() {
+                    errors.push((id, err));
+                }
+                if let Err(err) = doc.poll_filter_read() {
+                    errors.push((id, err));
+                }
+            } else if doc.filter_job.is_some() {
+                // If an external caller started a filter directly without reserving its 3 FDs,
+                // keep the scan progressing without launching an unreserved filtered read.
+                if let Err(err) = doc.poll_filter_scan() {
+                    errors.push((id, err));
+                }
             }
             if pending_filter_restore.is_some() {
                 if doc.filter_query.is_none() {
@@ -1515,12 +1540,19 @@ fn doc_retained_dir_fds(doc: &Document) -> usize {
         }))
 }
 
+/// Filter scan opens source + cloned guard handle (2 FDs) and may concurrently spawn a
+/// filtered-read worker (1 FD) while scanning, so a running filter reserves 3 FDs upfront.
+const FILTER_JOB_AND_READ_FDS: usize = 3;
+
 fn doc_active_job_fds(doc: &Document) -> usize {
-    // Index holds 1 file descriptor; filter opens source + cloned guard handle (2 FDs);
-    // filtered read holds 1 descriptor.
+    // Index holds 1 file descriptor; an active filter reserves 3 FDs (2 for scan + 1 pre-reserved
+    // for its concurrent filtered-read worker); a standalone filtered read holds 1 descriptor.
     usize::from(doc.job.is_some())
-        + if doc.filter_job.is_some() { 2 } else { 0 }
-        + usize::from(doc.filter_read.is_some())
+        + if doc.filter_job.is_some() {
+            FILTER_JOB_AND_READ_FDS
+        } else {
+            usize::from(doc.filter_read.is_some())
+        }
 }
 
 fn try_sync_optional_lease(
@@ -2050,7 +2082,7 @@ fn wake_dormant_document(
             }
 
             let needed_job_fds = 1 + if dormant.view.filter_query.is_some() {
-                2
+                FILTER_JOB_AND_READ_FDS
             } else {
                 0
             };
@@ -2161,7 +2193,7 @@ fn wake_dormant_document(
                 ));
             }
             let needed_job_fds = 1 + if dormant.view.filter_query.is_some() {
-                2
+                FILTER_JOB_AND_READ_FDS
             } else {
                 0
             };
@@ -2274,7 +2306,7 @@ fn wake_dormant_document(
                 ));
             }
             let needed_job_fds = 1 + if dormant.view.filter_query.is_some() {
-                2
+                FILTER_JOB_AND_READ_FDS
             } else {
                 0
             };

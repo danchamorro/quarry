@@ -1504,3 +1504,59 @@ fn completed_gzip_tab_matches_hard_link_to_compressed_source_while_hydrated_and_
     );
     assert!(scheduler.path_reserved(&gz_alias));
 }
+
+#[test]
+fn filter_and_filtered_read_descriptors_are_pre_reserved_under_tight_fd_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let csv = write_csv(dir.path(), "tight-fd.csv", 40);
+
+    // `max_process_fds = 4` enforces `total_reserved < 4` (at most 3 simultaneous FDs).
+    // Active doc takes 1 FD, while filter + concurrent filtered-read requires 3 FDs (total 4),
+    // so starting a filter must fail upfront with FdBudgetExhausted instead of running unreserved.
+    let mut tight = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        max_process_fds: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids_tight = tight
+        .open_many_lazy(WindowId::PRIMARY, [csv.clone()], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut tight, ids_tight[0]);
+    let query = FilterQuery::single(1, FilterOperator::Equals, b"alpha".to_vec());
+    let err = tight.start_filter(ids_tight[0], query.clone()).unwrap_err();
+    assert!(matches!(
+        err,
+        SchedulerError::FdBudgetExhausted {
+            cap: 4,
+            category: FdCategory::BackgroundJob,
+            ..
+        }
+    ));
+
+    // With `max_process_fds = 5` (up to 4 simultaneous FDs), 1 active + 3 filter/read fits,
+    // all 3 BackgroundJob FDs are reserved immediately before polling, and all release cleanly.
+    let mut roomy = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        max_process_fds: 5,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = roomy
+        .open_many_lazy(WindowId::PRIMARY, [csv], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut roomy, ids[0]);
+    roomy.start_filter(ids[0], query).unwrap();
+    let snap = roomy.fd_budget().snapshot();
+    assert_eq!(snap.by_category.get(&FdCategory::BackgroundJob), Some(&3));
+    assert_eq!(snap.total_reserved, 4);
+    assert!(snap.total_reserved < 5);
+
+    finish_active_filter(&mut roomy, ids[0]);
+    let snap_after = roomy.fd_budget().snapshot();
+    assert_eq!(snap_after.by_category.get(&FdCategory::BackgroundJob), None);
+    assert!(snap_after.peak_reserved < 5);
+}
