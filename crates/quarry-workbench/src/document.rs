@@ -225,7 +225,11 @@ pub struct ViewportReadPlan {
     pub count: usize,
 }
 
+static NEXT_DOCUMENT_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 pub struct Document {
+    pub instance_id: u64,
     pub join_reservations: Arc<std::sync::atomic::AtomicUsize>,
     pub pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
     pub pending_diagnostic_message: Option<String>,
@@ -429,6 +433,8 @@ impl Document {
             index_cache_enabled: true,
             working_cleanup: quarry_core::WorkingCopyCleanup::default(),
             decompression_slots: compressed::DecompressionSlots::default(),
+            instance_id: NEXT_DOCUMENT_INSTANCE_ID
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             join_reservations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_materialization: None,
             original_session: None,

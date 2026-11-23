@@ -21,6 +21,7 @@ pub const MAX_EDIT_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentSnapshot {
     pub document_id: DocumentId,
+    pub instance_id: u64,
     pub path: PathBuf,
     pub filename: String,
     pub file_size: u64,
@@ -411,6 +412,7 @@ impl WorkbenchController {
         let filter_done = doc.filter_job.is_none() && !doc.filter_rows_loading();
         Some(DocumentSnapshot {
             document_id: doc_id,
+            instance_id: doc.instance_id,
             path: doc.logical_path.clone(),
             filename,
             file_size: doc.session.file_size,

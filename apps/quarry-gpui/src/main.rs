@@ -46,7 +46,7 @@ pub struct QuarryWindow {
     table: Entity<TableState<Grid>>,
     panels: Entity<Panels>,
     row_input: Entity<InputState>,
-    last_synced_doc: Option<DocumentId>,
+    last_synced_doc: Option<(DocumentId, u64)>,
     last_headers: Vec<String>,
     last_shown_columns: Vec<usize>,
     confirming: bool,
@@ -276,7 +276,8 @@ impl QuarryWindow {
         }
 
         if let Some(info) = self.snapshot(cx) {
-            let doc_changed = self.last_synced_doc != Some(info.document_id);
+            let doc_key = (info.document_id, info.instance_id);
+            let doc_changed = self.last_synced_doc != Some(doc_key);
             let schema_changed = doc_changed
                 || self.last_headers != info.headers
                 || self.last_shown_columns != info.shown_columns;
@@ -288,7 +289,7 @@ impl QuarryWindow {
             self.panels
                 .update(cx, |panels, cx| panels.sync_document(&info, window, cx));
             if schema_changed {
-                self.last_synced_doc = Some(info.document_id);
+                self.last_synced_doc = Some(doc_key);
                 self.last_headers = info.headers.clone();
                 self.last_shown_columns = info.shown_columns.clone();
                 self.table.update(cx, |table, cx| {
