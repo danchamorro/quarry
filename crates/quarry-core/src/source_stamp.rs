@@ -183,6 +183,57 @@ pub fn open_contained_regular_file(root: &Path, relative: &Path) -> io::Result<F
     ContainedDir::open_directory(root)?.open_regular_file(relative)
 }
 
+/// Acquires a non-blocking shared `flock` on the given macOS installer lock file so
+/// `scripts/macos-app.sh install` refuses to replace a running application and Quarry
+/// refuses to launch while an exclusive installer lock is held.
+#[cfg(target_os = "macos")]
+pub fn acquire_macos_install_lock_at(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Install lock path is not a regular file.",
+        ));
+    }
+    // SAFETY: `flock` only inspects the open file descriptor owned by `file`.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        Ok(file)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Acquires the standard per-user macOS shared installer lock at
+/// `/private/tmp/{app_id}.{euid}.install.lock`.
+#[cfg(target_os = "macos")]
+pub fn acquire_macos_install_lock(app_id: &str) -> io::Result<File> {
+    if app_id.is_empty()
+        || app_id.contains("..")
+        || !app_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid application identifier for macOS install lock.",
+        ));
+    }
+    // SAFETY: `geteuid` has no preconditions and returns the calling process's effective UID.
+    let user_id = unsafe { libc::geteuid() };
+    acquire_macos_install_lock_at(Path::new(&format!(
+        "/private/tmp/{app_id}.{user_id}.install.lock"
+    )))
+}
+
 /// OS-level file identity (`(dev, ino)` on Unix, `(volume_serial, file_id)` on Windows)
 /// retained by dormant tab stubs without keeping an open file descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -732,5 +783,44 @@ mod tests {
         assert_eq!(stamp.modified, observed.modified);
         assert!(!stamp.matches(&observed));
         assert!(!crate::export::source_matches_stamp(&original, &path, &stamp).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_install_lock_shares_between_app_instances_and_blocks_exclusive_installer() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("install.lock");
+
+        let lock_a = acquire_macos_install_lock_at(&lock_path).unwrap();
+        let lock_b = acquire_macos_install_lock_at(&lock_path).unwrap();
+        drop(lock_a);
+        drop(lock_b);
+
+        // Simulate `scripts/macos-app.sh install` holding an exclusive flock.
+        let installer = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let rc = unsafe { libc::flock(installer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "installer exclusive lock should succeed");
+
+        let blocked = acquire_macos_install_lock_at(&lock_path);
+        assert!(
+            blocked.is_err(),
+            "shared app lock must fail while exclusive installer lock is held"
+        );
+        drop(installer);
+
+        // Once installer releases lock, app lock succeeds again.
+        let recovered = acquire_macos_install_lock_at(&lock_path).unwrap();
+        drop(recovered);
+
+        // Invalid app IDs are rejected.
+        assert!(acquire_macos_install_lock("").is_err());
+        assert!(acquire_macos_install_lock("../escape").is_err());
+        assert!(acquire_macos_install_lock("a/b").is_err());
     }
 }

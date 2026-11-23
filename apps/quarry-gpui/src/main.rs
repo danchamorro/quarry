@@ -9,7 +9,13 @@ mod workflows_ui;
 #[cfg(test)]
 mod ui_tests;
 
+use std::cell::RefCell;
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::rc::Rc;
+
+#[cfg(target_os = "macos")]
+const APP_ID: &str = "io.github.danchamorro.quarry";
 
 #[cfg(not(target_os = "macos"))]
 use gpui_kit::component::menu::AppMenuBar;
@@ -289,6 +295,14 @@ impl QuarryWindow {
     fn set_message(&mut self, message: AppMessage, cx: &mut Context<Self>) {
         self.controller.update(cx, |controller, cx| {
             controller.set_window_message(self.window_id, Some(message), cx);
+        });
+    }
+
+    fn set_editing(&mut self, editing: bool, cx: &mut Context<Self>) {
+        self.editing = editing;
+        let window_id = self.window_id;
+        self.controller.update(cx, |controller, cx| {
+            controller.set_window_editing(window_id, editing, cx);
         });
     }
 
@@ -835,10 +849,7 @@ impl QuarryWindow {
         let input = cx.new(|cx| TextareaState::new(window, cx).default_value(value));
         self.panels
             .update(cx, |panels, cx| panels.close(window, cx));
-        self.editing = true;
-        self.controller.update(cx, |controller, cx| {
-            controller.set_window_editing(self.window_id, true, cx);
-        });
+        self.set_editing(true, cx);
         let status = cx.new(|_| CellEditStatus::default());
         self.editor_status = Some(status.clone());
         let focus_input = input.clone();
@@ -943,11 +954,8 @@ impl QuarryWindow {
                 })
                 .on_close(move |_, window, cx| {
                     let _ = close.update(cx, |this, cx| {
-                        this.editing = false;
                         this.editor_status = None;
-                        this.controller.update(cx, |controller, cx| {
-                            controller.set_window_editing(this.window_id, false, cx);
-                        });
+                        this.set_editing(false, cx);
                         let table_focus = this
                             .snapshot(cx)
                             .is_some()
@@ -1002,10 +1010,7 @@ impl QuarryWindow {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).default_value(current_name.clone()));
-        self.editing = true;
-        self.controller.update(cx, |controller, cx| {
-            controller.set_window_editing(self.window_id, true, cx);
-        });
+        self.set_editing(true, cx);
         let focus_input = input.clone();
         let apply = cx.weak_entity();
         let close = cx.weak_entity();
@@ -1091,10 +1096,7 @@ impl QuarryWindow {
                 })
                 .on_close(move |_, window, cx| {
                     let _ = close.update(cx, |this, cx| {
-                        this.editing = false;
-                        this.controller.update(cx, |controller, cx| {
-                            controller.set_window_editing(this.window_id, false, cx);
-                        });
+                        this.set_editing(false, cx);
                         let table_focus = this
                             .snapshot(cx)
                             .is_some()
@@ -1427,7 +1429,7 @@ impl QuarryWindow {
         let weak = cx.weak_entity();
         move |window, cx| {
             let _ = weak.update(cx, |this, cx| {
-                this.editing = false;
+                this.set_editing(false, cx);
                 let table_focus = this
                     .snapshot(cx)
                     .is_some()
@@ -1533,7 +1535,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let initial_col = self.active_selected_column(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1562,7 +1564,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = info.selected_columns;
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1591,7 +1593,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1615,7 +1617,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let default_pos = self
             .table
@@ -1648,7 +1650,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let default_pos = (self.active_selected_column(cx) as u64).saturating_add(1);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1712,7 +1714,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1741,7 +1743,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let initial_col = self.active_selected_column(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1770,7 +1772,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1791,7 +1793,14 @@ impl QuarryWindow {
         let weak = cx.weak_entity();
         move |path, window, cx| {
             let _ = weak.update(cx, |this, cx| {
+                let was_editing = this.editing;
+                if was_editing {
+                    this.set_editing(false, cx);
+                }
                 this.open_paths_direct(vec![path], OpenOptions::default(), None, window, cx);
+                if was_editing {
+                    this.set_editing(true, cx);
+                }
             });
         }
     }
@@ -1819,7 +1828,7 @@ impl QuarryWindow {
         }) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_open = self.open_output_path_callback(cx);
         let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Combine, cx);
@@ -1835,7 +1844,7 @@ impl QuarryWindow {
         }) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_open = self.open_output_path_callback(cx);
         let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Join, cx);
@@ -1860,7 +1869,7 @@ impl QuarryWindow {
         }) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         self.controller.update(cx, |c, cx| {
             if let Some(failed) = failed_target {
@@ -1912,7 +1921,7 @@ impl QuarryWindow {
         if self.editing || self.confirming {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_closed = self.restore_grid_focus_callback(cx);
         workflows_ui::open_temporary_storage_dialog(self.controller.clone(), on_closed, window, cx);
@@ -1992,7 +2001,7 @@ impl QuarryWindow {
         if self.editing || self.confirming {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_closed = self.restore_grid_focus_callback(cx);
         workflows_ui::open_about_dialog(on_closed, window, cx);
@@ -2910,7 +2919,7 @@ impl Render for QuarryWindow {
                 self.controller.read(cx).scheduler().hydrated_count()
             )
         } else {
-            "Quarry GPUI".into()
+            "Quarry".into()
         };
 
         body.child(
@@ -3087,6 +3096,118 @@ fn apply_light_theme(cx: &mut App) {
     apply_resolved_theme(&light, cx);
 }
 
+fn filter_launch_paths<I>(args: I) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    args.into_iter()
+        .filter(|arg| !arg.to_string_lossy().starts_with("-psn_"))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parses a local `file://` URL delivered by the OS (for example macOS Finder
+/// `application:openURLs:`) into a local filesystem `PathBuf`. Rejects non-`file`
+/// schemes, remote authorities, malformed percent escapes, and NUL bytes.
+fn file_url_to_path(raw: &str) -> Option<PathBuf> {
+    let raw_bytes = raw.as_bytes();
+    if !raw_bytes
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file://"))
+    {
+        return None;
+    }
+    let rest = &raw_bytes[7..];
+    let rest = rest
+        .split(|&b| b == b'?' || b == b'#')
+        .next()
+        .unwrap_or(rest);
+    let bytes = if rest.starts_with(b"/") {
+        rest
+    } else if rest
+        .get(..10)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"localhost/"))
+    {
+        &rest[9..]
+    } else {
+        return None;
+    };
+
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = decode_hex_nibble(bytes[i + 1])?;
+            let lo = decode_hex_nibble(bytes[i + 2])?;
+            let value = (hi << 4) | lo;
+            if value == 0 {
+                return None;
+            }
+            decoded.push(value);
+            i += 3;
+        } else if bytes[i] == 0 {
+            return None;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    if decoded.is_empty() {
+        return None;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(OsString::from_vec(decoded)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(decoded).ok().map(PathBuf::from)
+    }
+}
+
+pub(crate) fn open_external_paths_in_app(
+    controller: &Entity<WorkbenchController>,
+    paths: Vec<PathBuf>,
+    cx: &mut App,
+) -> Option<Result<(WindowId, DocumentId), AppMessage>> {
+    if paths.is_empty() {
+        return None;
+    }
+    let preferred_window = controller
+        .read(cx)
+        .preferred_window_for_external_open(cx.active_window());
+    if preferred_window.is_none() {
+        open_quarry_window(controller.clone(), paths, None, cx);
+        cx.activate(true);
+        return None;
+    }
+    let outcome = controller.update(cx, |controller, cx| {
+        controller.open_external_paths(preferred_window, paths, cx)
+    });
+    cx.activate(true);
+    outcome
+}
+
+#[derive(Default)]
+struct ExternalOpenState {
+    queued: Vec<PathBuf>,
+    ready: Option<(AsyncApp, Entity<WorkbenchController>)>,
+}
+
 fn open_quarry_window(
     controller: Entity<WorkbenchController>,
     initial_paths: Vec<PathBuf>,
@@ -3127,28 +3248,91 @@ fn open_quarry_window(
 }
 
 fn main() {
-    let initial_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(move |cx| {
-            gpui_kit::init(cx);
-            bind_shortcuts(cx);
-            install_menus(cx);
-            let controller = WorkbenchController::init(cx);
-            let initial_theme = controller.read(cx).resolved_theme().clone();
-            apply_resolved_theme(&initial_theme, cx);
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            cx.spawn(async move |cx| {
-                cx.update(|cx| {
-                    open_quarry_window(controller, initial_paths, None, cx);
-                });
-            })
-            .detach();
+    #[cfg(target_os = "macos")]
+    let _install_lock = match quarry_core::acquire_macos_install_lock(APP_ID) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("Quarry cannot start while an update is in progress: {error}");
+            return;
+        }
+    };
+
+    let _nofile_status = quarry_core::raise_nofile_limit(quarry_workbench::DEFAULT_NOFILE_TARGET);
+    let initial_paths = filter_launch_paths(std::env::args_os().skip(1));
+    let external_open = Rc::new(RefCell::new(ExternalOpenState::default()));
+    let external_open_for_urls = Rc::clone(&external_open);
+
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    application.on_open_urls(move |urls| {
+        let paths: Vec<PathBuf> = urls.iter().filter_map(|u| file_url_to_path(u)).collect();
+        if paths.is_empty() {
+            return;
+        }
+        let dispatch = {
+            let mut state = external_open_for_urls.borrow_mut();
+            if let Some((async_app, controller)) = state.ready.clone() {
+                Some((async_app, controller))
+            } else {
+                state.queued.extend(paths.clone());
+                None
+            }
+        };
+        if let Some((async_app, controller)) = dispatch {
+            async_app
+                .spawn(async move |cx| {
+                    cx.update(|cx| {
+                        let _ = open_external_paths_in_app(&controller, paths, cx);
+                    });
+                })
+                .detach();
+        }
+    });
+    application.on_reopen(|cx| {
+        if cx.windows().is_empty()
+            && let Some(controller) = WorkbenchController::try_global(cx)
+        {
+            open_quarry_window(controller, Vec::new(), None, cx);
             cx.activate(true);
-        });
+        }
+    });
+    application.run(move |cx| {
+        gpui_kit::init(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        let controller = WorkbenchController::init(cx);
+        let initial_theme = controller.read(cx).resolved_theme().clone();
+        apply_resolved_theme(&initial_theme, cx);
+        let quit_controller = controller.clone();
+        cx.on_app_quit(move |cx| {
+            quit_controller.update(cx, |controller, _| controller.shutdown_cleanup());
+            async {}
+        })
+        .detach();
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.spawn(async move |cx| {
+            cx.update(|cx| {
+                let mut open_paths = initial_paths;
+                {
+                    let mut state = external_open.borrow_mut();
+                    open_paths.append(&mut state.queued);
+                }
+                open_quarry_window(controller.clone(), open_paths, None, cx);
+                let late_paths = {
+                    let mut state = external_open.borrow_mut();
+                    state.ready = Some((cx.to_async(), controller.clone()));
+                    std::mem::take(&mut state.queued)
+                };
+                if !late_paths.is_empty() {
+                    let _ = open_external_paths_in_app(&controller, late_paths, cx);
+                }
+            });
+        })
+        .detach();
+        cx.activate(true);
+    });
 }

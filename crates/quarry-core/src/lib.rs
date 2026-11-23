@@ -116,6 +116,8 @@ pub use source_stamp::{
     ContainedDir, FileIdentity, SourceGuard, open_contained_regular_file,
     open_regular_file_nofollow,
 };
+#[cfg(target_os = "macos")]
+pub use source_stamp::{acquire_macos_install_lock, acquire_macos_install_lock_at};
 pub use storage::{
     StorageSpace, check_storage, estimate_duplicate_target_temporary_bytes,
     estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,

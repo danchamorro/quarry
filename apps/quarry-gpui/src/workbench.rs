@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::Root;
-use gpui_kit::{App, AppContext, Context, Entity, Global, WindowHandle};
+use gpui_kit::{AnyWindowHandle, App, AppContext, Context, Entity, Global, WindowHandle};
 use quarry_core::{
     CaseSensitivity, ColumnCleanup, DateFormatSuggestion, DuplicateTarget, Encoding, FilterQuery,
     HeaderMode, JoinMode, OpenOptions, SortPlan, StorageSpace, raise_nofile_limit,
@@ -682,6 +682,85 @@ impl WorkbenchController {
         self.windows.get(&id).copied()
     }
 
+    /// Selects the window that should receive an externally opened document (such as a Finder
+    /// `application:openURLs:` request): prefers the active GPUI window if it does not have an
+    /// unapplied cell editor open, otherwise prefers another non-editing window, falling back to
+    /// the active or first open window.
+    pub fn preferred_window_for_external_open(
+        &self,
+        active_window: Option<AnyWindowHandle>,
+    ) -> Option<WindowId> {
+        let active_id = active_window.and_then(|active| {
+            self.windows
+                .iter()
+                .find(|(_, handle)| AnyWindowHandle::from(**handle) == active)
+                .map(|(&window_id, _)| window_id)
+        });
+        if let Some(window_id) = active_id
+            && !self.editing_windows.contains(&window_id)
+        {
+            return Some(window_id);
+        }
+        if let Some(&non_editing) = self
+            .windows
+            .keys()
+            .find(|window_id| !self.editing_windows.contains(window_id))
+        {
+            return Some(non_editing);
+        }
+        active_id.or_else(|| self.windows.keys().next().copied())
+    }
+
+    /// Handles an OS-level document open request (e.g., macOS Finder double-click or `open -a`).
+    /// Returns `None` when `paths` is empty or no window is open yet so the caller can open a new
+    /// window. Existing documents (including hard-link aliases owned by another window) route to
+    /// and activate their owning window rather than opening a duplicate tab.
+    pub fn open_external_paths(
+        &mut self,
+        preferred_window: Option<WindowId>,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(WindowId, DocumentId), AppMessage>> {
+        if paths.is_empty() {
+            return None;
+        }
+        let target_window = preferred_window.or_else(|| self.windows.keys().next().copied())?;
+        let conflict_owner = if paths.len() == 1 {
+            self.scheduler
+                .find_owner_for_path(&paths[0])
+                .and_then(|(owner_win, doc_id)| {
+                    (self.editing_windows.contains(&owner_win)
+                        && self.scheduler.active_document(owner_win) != Some(doc_id))
+                    .then_some(owner_win)
+                })
+        } else {
+            None
+        };
+        let result = self.open_paths(target_window, paths, OpenOptions::default(), None, cx);
+        match &result {
+            Ok((owner_window, _)) => {
+                if let Some(handle) = self.window_handle(*owner_window) {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                }
+            }
+            Err(message) => {
+                let notice_window = conflict_owner.unwrap_or(target_window);
+                self.set_window_message(notice_window, Some(message.clone()), cx);
+                if conflict_owner.is_none()
+                    && let Some(handle) = self.window_handle(target_window)
+                {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                }
+            }
+        }
+        Some(result)
+    }
+
+    /// Best-effort non-blocking cleanup invoked when GPUI notifies `on_app_quit`.
+    pub fn shutdown_cleanup(&mut self) {
+        self.join.release_all_async();
+    }
+
     pub fn show_all_whitespace(&self) -> bool {
         self.show_all_whitespace
     }
@@ -906,15 +985,20 @@ impl WorkbenchController {
         if paths.len() == 1 {
             let path = paths.into_iter().next().unwrap();
             let existing_owner = self.scheduler.find_owner_for_path(&path);
-            if let Some((owner_win, doc_id)) = existing_owner
-                && self.editing_windows.contains(&owner_win)
-                && self.scheduler.active_document(owner_win) != Some(doc_id)
-            {
-                if let Some(handle) = self.window_handle(owner_win) {
-                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+            if let Some((owner_win, doc_id)) = existing_owner {
+                if self.editing_windows.contains(&owner_win)
+                    && self.scheduler.active_document(owner_win) != Some(doc_id)
+                {
+                    if let Some(handle) = self.window_handle(owner_win) {
+                        let _ = handle.update(cx, |_, window, _| window.activate_window());
+                    }
+                    return Err(AppMessage::warning(
+                        "Apply or cancel the open edit in the owning window before switching tabs.",
+                    ));
                 }
+            } else if self.editing_windows.contains(&target_window) {
                 return Err(AppMessage::warning(
-                    "Apply or cancel the open edit in the owning window before switching tabs.",
+                    "Apply or cancel the open edit before opening another file in this window.",
                 ));
             }
             let outcome = self
@@ -944,6 +1028,12 @@ impl WorkbenchController {
             }
             cx.notify();
             return Ok((owner_window, doc_id));
+        }
+
+        if self.editing_windows.contains(&target_window) {
+            return Err(AppMessage::warning(
+                "Apply or cancel the open edit before opening additional files in this window.",
+            ));
         }
 
         let first_local_path = paths
@@ -979,7 +1069,9 @@ impl WorkbenchController {
                 .copied()
                 .ok_or_else(|| AppMessage::warning("No files were opened."))?;
             let owner = self.scheduler.window_of(first_id).unwrap_or(target_window);
-            let _ = self.scheduler.activate_tab(owner, first_id);
+            if !self.editing_windows.contains(&owner) {
+                let _ = self.scheduler.activate_tab(owner, first_id);
+            }
             if owner != target_window
                 && let Some(handle) = self.window_handle(owner)
             {

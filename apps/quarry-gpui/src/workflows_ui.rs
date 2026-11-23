@@ -2008,24 +2008,121 @@ pub fn open_temporary_storage_dialog(
 // 5. About Quarry Dialog
 // =============================================================================
 
+#[cfg(target_os = "macos")]
+const QUARRY_BUNDLE_ID: &str = "io.github.danchamorro.quarry";
+#[cfg(target_os = "macos")]
+const MAX_INFO_PLIST_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BundleBuildInfo {
+    pub version: Option<String>,
+    pub build: Option<String>,
+    pub architecture: Option<String>,
+    pub revision: Option<String>,
+    pub source_status: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn unescape_xml_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn plist_string_value(xml: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let (_, after_key) = xml.split_once(&needle)?;
+    let trimmed = after_key.trim_start();
+    let rest = trimmed.strip_prefix("<string>")?;
+    let (value, _) = rest.split_once("</string>")?;
+    let decoded = unescape_xml_entities(value.trim());
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_info_plist(xml: &str, expected_bundle_id: &str) -> Option<BundleBuildInfo> {
+    if plist_string_value(xml, "CFBundleIdentifier").as_deref() != Some(expected_bundle_id) {
+        return None;
+    }
+    Some(BundleBuildInfo {
+        version: plist_string_value(xml, "CFBundleShortVersionString"),
+        build: plist_string_value(xml, "CFBundleVersion"),
+        architecture: plist_string_value(xml, "QuarryArchitecture"),
+        revision: plist_string_value(xml, "QuarryGitRevision"),
+        source_status: plist_string_value(xml, "QuarrySourceStatus"),
+    })
+}
+
+fn read_bundle_build_info() -> BundleBuildInfo {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Read;
+
+        let Some(plist_path) = std::env::current_exe().ok().and_then(|exe| {
+            exe.parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("Info.plist"))
+        }) else {
+            return BundleBuildInfo::default();
+        };
+        let Ok(file) = quarry_core::open_regular_file_nofollow(&plist_path) else {
+            return BundleBuildInfo::default();
+        };
+        let mut xml = String::new();
+        if file
+            .take(MAX_INFO_PLIST_BYTES.saturating_add(1))
+            .read_to_string(&mut xml)
+            .is_err()
+            || xml.len() as u64 > MAX_INFO_PLIST_BYTES
+        {
+            return BundleBuildInfo::default();
+        }
+        parse_info_plist(&xml, QUARRY_BUNDLE_ID).unwrap_or_default()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        BundleBuildInfo::default()
+    }
+}
+
+pub(crate) fn format_build_details(info: &BundleBuildInfo) -> String {
+    let version = info.version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"));
+    let arch = info
+        .architecture
+        .as_deref()
+        .unwrap_or(std::env::consts::ARCH);
+    format!(
+        "Quarry {version}\nBuild: {}\nRevision: {}\nSource status: {}\nPlatform: {} / {}\nOffline-only local desktop workbench — zero telemetry or network requests.",
+        info.build.as_deref().unwrap_or("source build"),
+        info.revision.as_deref().unwrap_or("not recorded"),
+        info.source_status.as_deref().unwrap_or("not recorded"),
+        std::env::consts::OS,
+        arch,
+    )
+}
+
 pub fn open_about_dialog(
     on_closed: impl Fn(&mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) {
     let copied = cx.new(|_| false);
-    let version = env!("CARGO_PKG_VERSION");
-    let details = format!(
-        "Quarry {} (GPUI preview)\nPlatform: {} ({})\nOffline-only local desktop workbench — zero telemetry or network requests.",
-        version,
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
+    let build_info = read_bundle_build_info();
+    let version = build_info
+        .version
+        .clone()
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let details = format_build_details(&build_info);
     let on_closed = std::rc::Rc::new(on_closed);
 
     window.open_dialog(cx, move |dialog, _, cx| {
         let on_closed = on_closed.clone();
         let details_copy = details.clone();
+        let version_copy = version.clone();
         let copied_state = copied.clone();
         let copied_now = *copied.read(cx);
 
@@ -2046,7 +2143,7 @@ pub fn open_about_dialog(
                                 .id("about-title")
                                 .text_size(px(18.))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(format!("Quarry {version}")),
+                                .child(format!("Quarry {version_copy}")),
                         )
                         .child(
                             div()
