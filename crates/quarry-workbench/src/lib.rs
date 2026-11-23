@@ -1,11 +1,17 @@
 //! Frontend-neutral document, selection, edit history, and workbench state for Quarry.
 
+pub mod command;
 pub mod compressed;
 pub mod document;
 pub mod history;
 pub mod selection;
 pub mod tab;
 pub mod whitespace;
+
+pub use command::{
+    CloseCommandOutcome, CommandContext, CommandId, CommandResolution, CommandTarget, DocumentId,
+    FileCommands, WindowId, evaluate_command,
+};
 
 pub use document::{
     ActiveFilterRead, CapturedDocument, CellEdit, Document, DocumentLease, DocumentProbe,

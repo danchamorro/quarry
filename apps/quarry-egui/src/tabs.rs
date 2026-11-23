@@ -708,42 +708,25 @@ impl QuarryApp {
 
     /// Commits drafts, waits for file operations, then prompts for unsaved changes.
     fn review_document_close(&mut self, ctx: &egui::Context) {
-        if self.document_cleanup.is_some() {
-            if !self.quitting_cleanup() {
-                self.active.close_after_jobs = true;
-            }
-            return;
+        let extra_writing = self.active.inspection.recovering();
+        let cleanup_busy = self.document_cleanup.is_some();
+        let quitting_cleanup = self.quitting_cleanup();
+        match self.active.state.dispatch_close_command(
+            CommandId::CloseTab,
+            extra_writing,
+            cleanup_busy,
+            quitting_cleanup,
+        ) {
+            Ok(CloseCommandOutcome::ReadyToClose) => self.finish_document_close(ctx),
+            Ok(
+                CloseCommandOutcome::ConfirmUnsaved
+                | CloseCommandOutcome::WaitForSave
+                | CloseCommandOutcome::WaitForJobs
+                | CloseCommandOutcome::KeptEditing
+                | CloseCommandOutcome::Ignored,
+            ) => {}
+            Err(notice) => self.active.notice = Some(notice),
         }
-        if self
-            .active
-            .document
-            .as_ref()
-            .is_some_and(Document::join_reserved)
-        {
-            self.active.notice = Some(AppMessage::warning(join_files::INPUT_RESERVED));
-            return;
-        }
-        if let Some(document) = self.active.document.as_mut() {
-            document.commit_edits();
-            if document.save_job.is_some() {
-                self.active.close_after_save = true;
-                return;
-            }
-        }
-        if self.active.writing() {
-            self.active.close_after_jobs = true;
-            return;
-        }
-        if self
-            .active
-            .document
-            .as_ref()
-            .is_some_and(Document::is_dirty)
-        {
-            self.active.close_confirmation_open = true;
-            return;
-        }
-        self.finish_document_close(ctx);
     }
 
     /// Removes an approved tab, or records a quit approval while retaining every tab.
@@ -993,15 +976,19 @@ impl QuarryApp {
 
     /// Cancels close/quit intentions and clears approvals without discarding documents.
     pub(super) fn keep_editing(&mut self) {
-        if self.quitting_cleanup() {
-            return;
+        let quitting_cleanup = self.quitting_cleanup();
+        if matches!(
+            self.active.state.dispatch_close_command(
+                CommandId::KeepEditing,
+                false,
+                false,
+                quitting_cleanup,
+            ),
+            Ok(CloseCommandOutcome::KeptEditing)
+        ) {
+            self.quit_pending = false;
+            self.quit_approved.clear();
         }
-        self.active.close_confirmation_open = false;
-        self.active.close_after_save = false;
-        self.active.close_after_jobs = false;
-        self.active.close_ready = false;
-        self.quit_pending = false;
-        self.quit_approved.clear();
     }
 
     /// Approves the current close; quit keeps the document until all approvals finish.

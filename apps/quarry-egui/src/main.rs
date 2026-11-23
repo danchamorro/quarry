@@ -38,10 +38,11 @@ use quarry_core::{
 #[cfg(test)]
 use quarry_core::{CleanupOutcome, FilterProgress, IndexConfig, SearchMatch};
 use quarry_workbench::{
-    AppMessage, ColumnView, DelimiterMode, Document, FilterRuleDraft, GridSelection,
-    MAX_GRID_TEXT_CHARS, MaterializedWorkingCopy, MessageSeverity, POLL_INTERVAL, RowSelection,
-    SOURCE_CHANGED_NOTICE, SelectionModifiers, StructuralDialog, StructuralJob, StructuralOverlay,
-    StructuralRequest, WorkbenchTab, WorkingCopySnapshot, case_sensitivity, field_preview,
+    AppMessage, CloseCommandOutcome, ColumnView, CommandContext, CommandId, DelimiterMode,
+    Document, FileCommands, FilterRuleDraft, GridSelection, MAX_GRID_TEXT_CHARS,
+    MaterializedWorkingCopy, MessageSeverity, POLL_INTERVAL, RowSelection, SOURCE_CHANGED_NOTICE,
+    SelectionModifiers, StructuralDialog, StructuralJob, StructuralOverlay, StructuralRequest,
+    WindowId, WorkbenchTab, WorkingCopySnapshot, case_sensitivity, evaluate_command, field_preview,
     field_text, filter_predicate_from_rule, filter_query_from_rules, footer_range_text,
     format_bytes, grid_field_text, group_digits, open_failure_line, parse_data_row,
     parse_file_column, parse_move_position, progress_fraction, row_for_scroll_fraction,
@@ -421,63 +422,28 @@ impl QuarryApp {
 
     /// Menu availability follows the same blocking rules as the toolbar.
     fn menu_state(&self, text_field_focused: bool) -> menu::MenuState {
-        use menu::MenuCommand as M;
-        let document = self.active.document.as_ref();
-        let blocked = self.quitting_cleanup()
+        let external_modal_blocked = self.quitting_cleanup()
             || self.active.inspection.recovering()
             || self.active.storage_review.is_some()
             || self.about.open
-            || self.combine_files.is_some()
-            || self.active.close_after_save
-            || self.active.close_after_jobs
-            || self.active.close_confirmation_open
-            || self.active.structural_dialog.is_some();
-        let files = FileCommands::new(document, self.write_slot_available());
-        let open = document.is_some();
-        let filter_active = document.is_some_and(Document::filter_active);
-        let insertion = |rows| {
-            document.is_some_and(|document| document.insertion_disabled_reason(rows).is_none())
-        };
-        let tabs = self
+            || self.combine_files.is_some();
+        let open_document_count = self
             .document_tabs()
             .filter(|tab| tab.document.is_some())
             .count();
-        let available = [
-            (M::About, true),
-            (M::Open, true),
-            (M::CombineFiles, files.combine),
-            (M::JoinFiles, true),
-            (M::CloseTab, open),
-            (M::ReloadFromDisk, files.reload),
-            (M::Save, files.save),
-            (M::SaveAs, files.save_as),
-            (M::SaveAsUtf8, files.save_as_utf8),
-            (M::DiscardChanges, files.discard),
-            (M::InspectFile, files.inspect),
-            (M::TemporaryStorage, files.temporary_storage),
-            (
-                M::Undo,
-                text_field_focused || document.is_some_and(Document::can_undo),
-            ),
-            (
-                M::Redo,
-                text_field_focused || document.is_some_and(Document::can_redo),
-            ),
-            (M::Find, open && !filter_active),
-            (M::InsertRows, insertion(true)),
-            (M::InsertColumns, insertion(false)),
-            (M::Columns, open),
-            (M::Filters, open),
-            (M::NextTab, tabs > 1),
-            (M::PreviousTab, tabs > 1),
-        ];
-        // Text-field history is safe to route even while a dialog blocks document commands.
-        let text_history = |command| text_field_focused && matches!(command, M::Undo | M::Redo);
+        let ctx = CommandContext {
+            window: WindowId::PRIMARY,
+            active_tab: &self.active.state,
+            open_document_count,
+            write_slot_available: self.write_slot_available(),
+            external_modal_blocked,
+            text_field_focused,
+            show_all_whitespace: self.whitespace_preferences.show_all,
+        };
         menu::MenuState {
-            disabled: available
+            disabled: menu::MenuCommand::EVALUATED
                 .into_iter()
-                .filter(|(command, available)| !text_history(*command) && (blocked || !available))
-                .map(|(command, _)| command)
+                .filter(|command| !evaluate_command(command.command_id(), &ctx).enabled)
                 .collect(),
             show_all_whitespace: self.whitespace_preferences.show_all,
         }
@@ -3504,46 +3470,6 @@ fn format_menu(
         *draft = None;
     }
     menu.and_then(|inner| inner.inner)
-}
-
-/// Which File commands are available; shared by the toolbar File menu and the menu bar.
-struct FileCommands {
-    combine: bool,
-    reload: bool,
-    save: bool,
-    save_as: bool,
-    save_as_utf8: bool,
-    discard: bool,
-    temporary_storage: bool,
-    inspect: bool,
-}
-
-impl FileCommands {
-    /// `write_slot_available` is false when the app-wide limit on concurrent
-    /// file writes is already reached.
-    fn new(document: Option<&Document>, write_slot_available: bool) -> Self {
-        let open = document.is_some();
-        let dirty = document.is_some_and(Document::is_dirty);
-        let file_operation_active = document.is_some_and(|document| {
-            document.export_job.is_some()
-                || document.save_job.is_some()
-                || document.structural_job.is_some()
-        });
-        let join_reserved = document.is_some_and(Document::join_reserved);
-        Self {
-            // Combining writes a new file, so it needs only a free write slot.
-            combine: write_slot_available,
-            reload: open && !file_operation_active && !dirty && !join_reserved,
-            save: document.is_some_and(Document::is_save_ready),
-            save_as: document.is_some_and(Document::is_save_as_ready),
-            save_as_utf8: document.is_some_and(|document| {
-                document.session.encoding() != Encoding::Utf8 && document.save_operations_ready()
-            }),
-            discard: dirty && !file_operation_active && !join_reserved,
-            temporary_storage: !file_operation_active,
-            inspect: !file_operation_active,
-        }
-    }
 }
 
 fn document_menu(
