@@ -581,7 +581,7 @@ impl SharedState {
     fn add_temporary_bytes(&self, bytes: u64) {
         let current = self
             .temporary_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(bytes))
             })
             .expect("temporary byte update cannot fail")
@@ -593,7 +593,7 @@ impl SharedState {
     fn remove_temporary_bytes(&self, bytes: u64) {
         let _ = self
             .temporary_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(bytes))
             });
     }

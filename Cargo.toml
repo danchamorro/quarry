@@ -14,7 +14,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.100"
 
 [workspace.dependencies]
 eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow"] }

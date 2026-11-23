@@ -786,7 +786,7 @@ impl Render for Quarry {
                 .gap_4()
                 .border_t_1()
                 .border_color(cx.theme().border)
-                .bg(rgb(0xeaf0f2))
+                .bg(rgb(quarry_workbench::theme::LIGHT.chrome.to_rgb_hex()))
                 .text_size(px(12.))
                 .text_color(cx.theme().muted_foreground)
                 .child(status)
@@ -794,7 +794,6 @@ impl Render for Quarry {
                 .child(progress)
                 .child(div().child("GPUI comparison")),
         )
-        .children(Root::render_dialog_layer(window, cx))
     }
 }
 
@@ -829,26 +828,27 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Light, None, cx);
+            let tokens = &quarry_workbench::theme::LIGHT;
             let theme = Theme::global_mut(cx);
-            theme.font_size = px(13.);
-            theme.radius = px(6.);
-            theme.radius_lg = px(8.);
-            theme.colors.background = rgb(0xf5f8f9).into();
-            theme.colors.foreground = rgb(0x35454e).into();
-            theme.colors.border = rgb(0xd6e0e5).into();
-            theme.colors.muted_foreground = rgb(0x768792).into();
-            theme.colors.primary = rgb(0xeebf4e).into();
+            theme.font_size = px(quarry_workbench::theme::GRID_FONT_SIZE);
+            theme.radius = px(f32::from(quarry_workbench::theme::CONTROL_RADIUS));
+            theme.radius_lg = px(f32::from(quarry_workbench::theme::WINDOW_RADIUS));
+            theme.colors.background = rgb(tokens.chrome.to_rgb_hex()).into();
+            theme.colors.foreground = rgb(tokens.text.to_rgb_hex()).into();
+            theme.colors.border = rgb(tokens.separator.to_rgb_hex()).into();
+            theme.colors.muted_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
+            theme.colors.primary = rgb(quarry_workbench::theme::ACCENT.to_rgb_hex()).into();
             theme.colors.primary_hover = rgb(0xe4b23c).into();
             theme.colors.primary_active = rgb(0xd8a32e).into();
-            theme.colors.primary_foreground = rgb(0x3f3420).into();
-            theme.colors.table = rgb(0xf9fbfc).into();
-            theme.colors.table_even = rgb(0xf0f5f7).into();
-            theme.colors.table_head = rgb(0xeaf0f2).into();
-            theme.colors.table_head_foreground = rgb(0x566872).into();
-            theme.colors.table_row_border = rgb(0xe5ecef).into();
-            theme.colors.table_active = rgb(0xd8effa).into();
-            theme.colors.table_active_border = rgb(0x63b6df).into();
-            theme.colors.popover = rgb(0xf9fbfc).into();
+            theme.colors.primary_foreground = rgb(tokens.on_accent.to_rgb_hex()).into();
+            theme.colors.table = rgb(tokens.canvas.to_rgb_hex()).into();
+            theme.colors.table_even = rgb(tokens.zebra.to_rgb_hex()).into();
+            theme.colors.table_head = rgb(tokens.header_fill.to_rgb_hex()).into();
+            theme.colors.table_head_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
+            theme.colors.table_row_border = rgb(tokens.grid_line.to_rgb_hex()).into();
+            theme.colors.table_active = rgb(tokens.selection.to_rgb_hex()).into();
+            theme.colors.table_active_border = rgb(tokens.selection_strong.to_rgb_hex()).into();
+            theme.colors.popover = rgb(tokens.canvas.to_rgb_hex()).into();
             theme.colors.button_primary = theme.colors.primary;
             theme.colors.button_primary_hover = theme.colors.primary_hover;
             theme.colors.button_primary_active = theme.colors.primary_active;
