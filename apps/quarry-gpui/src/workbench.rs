@@ -1,23 +1,33 @@
 //! Process-wide multi-window workbench controller backed by `quarry_workbench::WorkbenchScheduler`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::Root;
 use gpui_kit::{App, AppContext, Context, Entity, Global, WindowHandle};
 use quarry_core::{
     CaseSensitivity, ColumnCleanup, DateFormatSuggestion, DuplicateTarget, Encoding, FilterQuery,
-    HeaderMode, OpenOptions, SortPlan, raise_nofile_limit,
+    HeaderMode, JoinMode, OpenOptions, SortPlan, StorageSpace, raise_nofile_limit,
+};
+use quarry_workbench::compressed::{
+    DecompressionStatus, decompression_status, gzip_destination_warning,
 };
 use quarry_workbench::{
-    AppMessage, CommandContext, CommandId, CommandResolution, DEFAULT_NOFILE_TARGET, Document,
-    DocumentId, MessageSeverity, ResidencyState, SchedulerError, SelectionModifiers,
-    StructuralDialog, StructuralJob, WakeOutcome, WindowId, WorkbenchScheduler,
-    WorkbenchSchedulerConfig, WorkbenchTab, evaluate_command, materialization_progress,
-    select_column, sort_progress,
+    AppMessage, CombineWorkflow, CommandContext, CommandId, CommandResolution,
+    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, FailedOpen, InspectWorkflow,
+    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, ResidencyState, SchedulerError,
+    SelectionModifiers, StoragePreferences, StructuralDialog, StructuralJob, WakeOutcome, WindowId,
+    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary,
+    evaluate_command, inspect_temporary_storage, materialization_progress, select_column,
+    sort_progress,
 };
+
+/// Shared global concurrency cap across document saves, exports, structural edits, decompressions,
+/// Combine Files, Join Files, and Recovery copies.
+const MAX_GLOBAL_WRITE_OPERATIONS: usize = 2;
 
 /// Maximum single-cell edit payload accepted by the modal cell editor (1 MiB).
 pub const MAX_EDIT_BYTES: usize = 1024 * 1024;
@@ -72,6 +82,14 @@ pub struct DocumentSnapshot {
     pub applied_delimiter: Option<u8>,
     pub applied_header_mode: HeaderMode,
     pub applied_encoding: Option<Encoding>,
+    pub is_compressed: bool,
+    pub compressed_label: Option<String>,
+    pub decompression_status: Option<DecompressionStatus>,
+    pub compressed_pending: bool,
+    pub compressed_preview: bool,
+    pub compressed_unreadable_text: bool,
+    pub join_reserved: bool,
+    pub has_diagnostic: bool,
 }
 
 /// Summary of a tab rendered inside a window's tab bar (works for Stub, Dormant, and Hydrated).
@@ -142,6 +160,15 @@ impl Global for WorkbenchGlobal {}
 
 pub struct WorkbenchController {
     scheduler: WorkbenchScheduler,
+    storage_prefs: StoragePreferences,
+    combine: Box<CombineWorkflow>,
+    join: Box<JoinWorkflow>,
+    inspect: Box<InspectWorkflow>,
+    failed_opens: BTreeMap<WindowId, FailedOpen>,
+    cache_clear_worker: Option<JoinHandle<Result<String, String>>>,
+    cache_clear_status: Option<Result<String, String>>,
+    storage_check_worker: Option<JoinHandle<Result<(StorageSpace, u64), String>>>,
+    storage_check_result: Option<Result<(StorageSpace, u64), String>>,
     next_window_id: u64,
     next_review_token: u64,
     windows: BTreeMap<WindowId, WindowHandle<Root>>,
@@ -158,9 +185,40 @@ pub struct WorkbenchController {
 }
 
 impl WorkbenchController {
+    #[cfg(test)]
     pub fn new(config: WorkbenchSchedulerConfig) -> Self {
+        Self::new_with_prefs(config, StoragePreferences::default())
+    }
+
+    pub fn new_with_prefs(
+        mut config: WorkbenchSchedulerConfig,
+        storage_prefs: StoragePreferences,
+    ) -> Self {
+        if let Some(dir) = storage_prefs.scratch_directory.clone() {
+            config.working_directory = dir;
+            config.custom_working_directory = true;
+        }
+        let scheduler = WorkbenchScheduler::new(config);
+        let working_dir = scheduler.working_directory().to_path_buf();
+        let custom_dir = scheduler.custom_working_directory();
+        let cleanup = scheduler.working_cleanup();
+        let slots = scheduler.decompression_slots().clone();
         Self {
-            scheduler: WorkbenchScheduler::new(config),
+            scheduler,
+            storage_prefs,
+            combine: Box::default(),
+            join: Box::new(JoinWorkflow::new(working_dir.clone())),
+            inspect: Box::new(InspectWorkflow::new(
+                working_dir,
+                custom_dir,
+                cleanup,
+                slots,
+            )),
+            failed_opens: BTreeMap::new(),
+            cache_clear_worker: None,
+            cache_clear_status: None,
+            storage_check_worker: None,
+            storage_check_result: None,
             next_window_id: 1,
             next_review_token: 1,
             windows: BTreeMap::new(),
@@ -186,7 +244,12 @@ impl WorkbenchController {
             return existing;
         }
         let _ = raise_nofile_limit(DEFAULT_NOFILE_TARGET);
-        let entity = cx.new(|_| Self::new(WorkbenchSchedulerConfig::default()));
+        let storage_prefs = StoragePreferences::application();
+        let config = WorkbenchSchedulerConfig {
+            defer_gzip_decompression: true,
+            ..WorkbenchSchedulerConfig::default()
+        };
+        let entity = cx.new(|_| Self::new_with_prefs(config, storage_prefs));
         cx.set_global(WorkbenchGlobal(entity.clone()));
 
         let poll_entity = entity.clone();
@@ -221,6 +284,17 @@ impl WorkbenchController {
         entity
     }
 
+    #[cfg(test)]
+    pub fn reset_for_test_with_prefs(
+        cx: &mut App,
+        config: WorkbenchSchedulerConfig,
+        prefs: StoragePreferences,
+    ) -> Entity<Self> {
+        let entity = cx.new(|_| Self::new_with_prefs(config, prefs));
+        cx.set_global(WorkbenchGlobal(entity.clone()));
+        entity
+    }
+
     pub fn scheduler(&self) -> &WorkbenchScheduler {
         &self.scheduler
     }
@@ -241,6 +315,35 @@ impl WorkbenchController {
         self.windows.remove(&id);
         self.editing_windows.remove(&id);
         self.window_messages.remove(&id);
+        self.failed_opens.remove(&id);
+    }
+
+    pub fn write_slot_available(&self) -> bool {
+        let workflow_ops = usize::from(self.combine.running_writer())
+            + usize::from(self.join.running_operation())
+            + usize::from(self.inspect.recovering());
+        self.scheduler.active_write_operations() + workflow_ops < MAX_GLOBAL_WRITE_OPERATIONS
+    }
+
+    pub fn path_reserved(&self, path: &Path) -> bool {
+        if self.scheduler.path_reserved(path) {
+            return true;
+        }
+        let matches_reserved = |reserved: Option<&Path>| -> bool {
+            let Some(res) = reserved else {
+                return false;
+            };
+            if res == path {
+                return true;
+            }
+            match (std::fs::canonicalize(res), std::fs::canonicalize(path)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        };
+        matches_reserved(self.combine.reserved_output())
+            || matches_reserved(self.join.reserved_output())
+            || matches_reserved(self.inspect.reserved_output())
     }
 
     pub fn set_window_editing(&mut self, id: WindowId, editing: bool, cx: &mut Context<Self>) {
@@ -416,7 +519,7 @@ impl WorkbenchController {
             window,
             active_tab,
             open_document_count: self.scheduler.tabs_in_window(window).len(),
-            write_slot_available: self.scheduler.write_slot_available(),
+            write_slot_available: self.write_slot_available(),
             external_modal_blocked,
             text_field_focused,
             show_all_whitespace: self.show_all_whitespace,
@@ -530,6 +633,14 @@ impl WorkbenchController {
             applied_delimiter: tab.delimiter_mode.delimiter(),
             applied_header_mode: tab.header_mode,
             applied_encoding: tab.encoding_mode,
+            is_compressed: doc.is_compressed(),
+            compressed_label: doc.compressed_label(),
+            decompression_status: decompression_status(doc),
+            compressed_pending: doc.awaiting_decompression(),
+            compressed_preview: doc.compressed_is_preview(),
+            compressed_unreadable_text: doc.compressed_unreadable_text(),
+            join_reserved: doc.join_reserved(),
+            has_diagnostic: doc.pending_diagnostic.is_some(),
         })
     }
 
@@ -920,15 +1031,18 @@ impl WorkbenchController {
         encoding: Option<Encoding>,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
         }
         if let Some(dest) = destination.as_ref() {
+            if let Some(warning) = gzip_destination_warning(dest) {
+                return Err(warning);
+            }
             let doc_path = self.scheduler.tab_logical_path(id);
             let aliases_other =
-                self.scheduler.path_reserved(dest) && doc_path.as_ref().is_none_or(|p| p != dest);
+                self.path_reserved(dest) && doc_path.as_ref().is_none_or(|p| p != dest);
             if aliases_other {
                 return Err(AppMessage::warning(
                     "That destination is already open or reserved in another tab.",
@@ -999,6 +1113,13 @@ impl WorkbenchController {
             };
         }
         if let Some(tab) = self.scheduler.tab(id)
+            && tab.document.as_ref().is_some_and(Document::join_reserved)
+        {
+            return CloseReviewAction::Wait {
+                message: JOIN_INPUT_RESERVED.into(),
+            };
+        }
+        if let Some(tab) = self.scheduler.tab(id)
             && tab.document_writing()
         {
             return CloseReviewAction::Wait {
@@ -1062,6 +1183,16 @@ impl WorkbenchController {
         if ids.iter().any(|&id| {
             self.scheduler
                 .tab(id)
+                .and_then(|t| t.document.as_ref())
+                .is_some_and(Document::join_reserved)
+        }) {
+            return CloseReviewAction::Wait {
+                message: JOIN_INPUT_RESERVED.into(),
+            };
+        }
+        if ids.iter().any(|&id| {
+            self.scheduler
+                .tab(id)
                 .is_some_and(WorkbenchTab::document_writing)
         }) {
             return CloseReviewAction::Wait {
@@ -1119,6 +1250,12 @@ impl WorkbenchController {
             }
             return CloseReviewAction::Wait {
                 message: "Apply or cancel open edits before quitting Quarry.".into(),
+            };
+        }
+        if self.combine.busy() || self.join.busy() || self.inspect.busy() {
+            return CloseReviewAction::Wait {
+                message: "Wait for active Combine, Join, or Inspect operations to finish before quitting."
+                    .into(),
             };
         }
         for window in self.scheduler.windows() {
@@ -1698,7 +1835,7 @@ impl WorkbenchController {
         case_sensitivity: CaseSensitivity,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -1735,7 +1872,7 @@ impl WorkbenchController {
         destination: PathBuf,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -1745,7 +1882,10 @@ impl WorkbenchController {
                 "The active document changed before Export Filtered started.",
             ));
         }
-        if self.scheduler.path_reserved(&destination) {
+        if let Some(warning) = gzip_destination_warning(&destination) {
+            return Err(warning);
+        }
+        if self.path_reserved(&destination) {
             return Err(AppMessage::warning(
                 "That destination is already open or reserved in another tab.",
             ));
@@ -1798,7 +1938,7 @@ impl WorkbenchController {
         plan: SortPlan,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -1828,7 +1968,7 @@ impl WorkbenchController {
         case_sensitivity: CaseSensitivity,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -1876,7 +2016,7 @@ impl WorkbenchController {
         window: WindowId,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -1907,7 +2047,7 @@ impl WorkbenchController {
         cleanup: ColumnCleanup,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -1936,7 +2076,7 @@ impl WorkbenchController {
         dialog: &StructuralDialog,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -1965,7 +2105,7 @@ impl WorkbenchController {
         dialog: &StructuralDialog,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -1992,7 +2132,7 @@ impl WorkbenchController {
         window: WindowId,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -2021,7 +2161,7 @@ impl WorkbenchController {
         columns: Vec<usize>,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -2049,7 +2189,7 @@ impl WorkbenchController {
         position: usize,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -2079,7 +2219,7 @@ impl WorkbenchController {
         separator: Vec<u8>,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -2109,7 +2249,7 @@ impl WorkbenchController {
         separator: Vec<u8>,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
-        if !self.scheduler.write_slot_available() {
+        if !self.write_slot_available() {
             return Err(AppMessage::warning(
                 "Two file operations are already running. Wait for one to finish.",
             ));
@@ -2131,20 +2271,555 @@ impl WorkbenchController {
         Ok(())
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 4B-2c operations: .gz streaming lifecycle, Combine Files,
+    // 4-mode Join Files, Inspect File & Recovery, Temporary Storage & Cache
+    // -------------------------------------------------------------------------
+
+    pub fn start_pending_decompression_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return Err("Open a file first.".into());
+        };
+        let extra_available = self.write_slot_available();
+        self.scheduler
+            .start_pending_decompression(doc_id, extra_available)?;
+        if let Some(tab) = self.scheduler.tab_mut(doc_id) {
+            tab.notice = None;
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn stay_in_compressed_preview_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return Err("Open a file first.".into());
+        };
+        self.scheduler.stay_in_compressed_preview(doc_id)?;
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn cancel_decompression_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return;
+        };
+        if let Some(result) = self.scheduler.cancel_decompression(doc_id) {
+            let msg = match result {
+                Ok(text) => AppMessage::status(text),
+                Err(err) => AppMessage::error(err),
+            };
+            if let Some(tab) = self.scheduler.tab_mut(doc_id) {
+                tab.notice = Some(msg);
+            }
+            cx.notify();
+        }
+    }
+
+    // --- Combine Files ---
+
+    pub fn combine(&self) -> &CombineWorkflow {
+        &self.combine
+    }
+
+    pub fn combine_add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.combine.add_paths(paths);
+        cx.notify();
+    }
+
+    pub fn combine_remove_path(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.combine.remove_path(index);
+        cx.notify();
+    }
+
+    pub fn combine_move_path(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        self.combine.move_path(from, to);
+        cx.notify();
+    }
+
+    pub fn combine_set_options(
+        &mut self,
+        delimiter: DelimiterMode,
+        has_header: bool,
+        encoding: Option<Encoding>,
+        cx: &mut Context<Self>,
+    ) {
+        self.combine.set_options(delimiter, has_header, encoding);
+        cx.notify();
+    }
+
+    pub fn combine_start_check(&mut self, cx: &mut Context<Self>) {
+        let slot = self.write_slot_available();
+        self.combine.start_check(slot);
+        cx.notify();
+    }
+
+    fn path_reserved_excluding(
+        &self,
+        path: &Path,
+        exclude_combine: bool,
+        exclude_join: bool,
+        exclude_inspect: bool,
+    ) -> bool {
+        if self.scheduler.path_reserved(path) {
+            return true;
+        }
+        let matches_opt = |reserved: Option<&Path>| -> bool {
+            let Some(res) = reserved else {
+                return false;
+            };
+            if res == path {
+                return true;
+            }
+            match (std::fs::canonicalize(res), std::fs::canonicalize(path)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        };
+        (!exclude_combine && matches_opt(self.combine.reserved_output()))
+            || (!exclude_join && matches_opt(self.join.reserved_output()))
+            || (!exclude_inspect && matches_opt(self.inspect.reserved_output()))
+    }
+
+    pub fn combine_prepare_destination(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
+        let protected = self.path_reserved_excluding(&destination, true, false, false);
+        self.combine.prepare_destination(destination, |_| protected);
+        cx.notify();
+    }
+
+    pub fn combine_start_write(&mut self, cx: &mut Context<Self>) {
+        let slot = self.write_slot_available();
+        let protected = self
+            .combine
+            .reserved_output()
+            .is_some_and(|p| self.path_reserved_excluding(p, true, false, false));
+        self.combine.start_write(slot, |_| protected);
+        cx.notify();
+    }
+
+    pub fn combine_cancel(&mut self, cx: &mut Context<Self>) {
+        self.combine.cancel();
+        cx.notify();
+    }
+
+    // --- Join Files ---
+
+    pub fn join(&self) -> &JoinWorkflow {
+        &self.join
+    }
+
+    pub fn join_open_tab_choices(&self) -> Vec<(DocumentId, String, PathBuf)> {
+        self.scheduler.hydrated_join_choices()
+    }
+
+    pub fn join_set_file_side(&mut self, side: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.join.set_file_side(side, path);
+        cx.notify();
+    }
+
+    pub fn join_set_open_tab_side(
+        &mut self,
+        side: usize,
+        doc_id: DocumentId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let label = self
+            .scheduler
+            .tab_display_name(doc_id)
+            .unwrap_or_else(|| "Untitled".into());
+        let Some(doc) = self
+            .scheduler
+            .tab_mut(doc_id)
+            .and_then(|tab| tab.document.as_mut())
+        else {
+            return Err("That tab is no longer open.".into());
+        };
+        let res = self.join.set_open_tab_side(side, doc_id, label, doc);
+        cx.notify();
+        res
+    }
+
+    pub fn join_clear_side(&mut self, side: usize, cx: &mut Context<Self>) {
+        self.join.clear_side(side);
+        cx.notify();
+    }
+
+    pub fn join_set_mode(&mut self, mode: JoinMode, cx: &mut Context<Self>) {
+        self.join.set_mode(mode);
+        cx.notify();
+    }
+
+    pub fn join_set_ignore_ascii_case(&mut self, ignore: bool, cx: &mut Context<Self>) {
+        self.join.set_ignore_ascii_case(ignore);
+        cx.notify();
+    }
+
+    pub fn join_set_require_unique(&mut self, side: usize, required: bool, cx: &mut Context<Self>) {
+        self.join.set_require_unique(side, required);
+        cx.notify();
+    }
+
+    pub fn join_add_key_pair(&mut self, cx: &mut Context<Self>) {
+        self.join.add_key_pair();
+        cx.notify();
+    }
+
+    pub fn join_remove_key_pair(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.join.remove_key_pair(index);
+        cx.notify();
+    }
+
+    pub fn join_set_key_column(
+        &mut self,
+        pair_index: usize,
+        side: usize,
+        column: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.join.set_key_column(pair_index, side, column);
+        cx.notify();
+    }
+
+    pub fn join_toggle_output_column(
+        &mut self,
+        index: usize,
+        included: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.join.toggle_output_column(index, included);
+        cx.notify();
+    }
+
+    pub fn join_move_output_column(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        self.join.move_output_column(from, to);
+        cx.notify();
+    }
+
+    pub fn join_set_acknowledge_expansion(&mut self, ack: bool, cx: &mut Context<Self>) {
+        self.join.acknowledge_expansion = ack;
+        cx.notify();
+    }
+
+    pub fn join_set_acknowledge_layout(&mut self, ack: bool, cx: &mut Context<Self>) {
+        self.join.acknowledge_layout = ack;
+        cx.notify();
+    }
+
+    pub fn join_start_analysis(&mut self, cx: &mut Context<Self>) {
+        let slot = self.write_slot_available();
+        self.join.start_analysis(slot);
+        cx.notify();
+    }
+
+    pub fn join_prepare_destination(
+        &mut self,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let protected = self.path_reserved_excluding(&destination, false, true, false);
+        let res = self.join.prepare_destination(destination, |_| protected);
+        cx.notify();
+        res
+    }
+
+    pub fn join_start_write(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let slot = self.write_slot_available();
+        let protected = self
+            .join
+            .reserved_output()
+            .is_some_and(|p| self.path_reserved_excluding(p, false, true, false));
+        let res = self.join.start_write(slot, |_| protected);
+        cx.notify();
+        res
+    }
+
+    pub fn join_cancel(&mut self, cx: &mut Context<Self>) {
+        self.join.cancel();
+        cx.notify();
+    }
+
+    pub fn join_release_all(&mut self, cx: &mut Context<Self>) {
+        self.join.release_all();
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+    }
+
+    // --- Inspect File & Recovery ---
+
+    pub fn inspect(&self) -> &InspectWorkflow {
+        &self.inspect
+    }
+
+    pub fn record_failed_open(
+        &mut self,
+        window: WindowId,
+        failed: FailedOpen,
+        cx: &mut Context<Self>,
+    ) {
+        self.failed_opens.insert(window, failed);
+        cx.notify();
+    }
+
+    pub fn clear_failed_open(&mut self, window: WindowId) {
+        self.failed_opens.remove(&window);
+    }
+
+    pub fn failed_open(&self, window: WindowId) -> Option<&FailedOpen> {
+        self.failed_opens.get(&window)
+    }
+
+    pub fn inspect_configure_active_or_failed(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(failed) = self.failed_opens.get(&window).cloned() {
+            self.inspect.configure_for_failed_open(&failed);
+        } else if let Some(doc_id) = self.scheduler.active_document(window)
+            && let Some(doc) = self
+                .scheduler
+                .tab(doc_id)
+                .and_then(|tab| tab.document.as_ref())
+        {
+            self.inspect.configure_for_document(doc_id, doc);
+        }
+        cx.notify();
+    }
+
+    pub fn inspect_configure_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.inspect.configure_for_path(path);
+        cx.notify();
+    }
+
+    pub fn inspect_set_options(
+        &mut self,
+        delimiter: DelimiterMode,
+        header_mode: HeaderMode,
+        encoding: Option<Encoding>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.inspect.busy() {
+            self.inspect.delimiter = delimiter;
+            self.inspect.header_mode = header_mode;
+            self.inspect.encoding = encoding;
+            cx.notify();
+        }
+    }
+
+    pub fn inspect_start(&mut self, cx: &mut Context<Self>) {
+        let slot = self.write_slot_available();
+        self.inspect.start_inspect(slot);
+        cx.notify();
+    }
+
+    pub fn inspect_focus_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.inspect.focus_finding(index);
+        cx.notify();
+    }
+
+    pub fn inspect_toggle_finding(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.inspect.toggle_finding(index);
+        cx.notify();
+    }
+
+    pub fn inspect_select_all_eligible(&mut self, cx: &mut Context<Self>) {
+        self.inspect.select_all_eligible();
+        cx.notify();
+    }
+
+    pub fn inspect_start_recovery(
+        &mut self,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let slot = self.write_slot_available();
+        let protected = self.path_reserved_excluding(&destination, false, false, true);
+        let res = self
+            .inspect
+            .start_recovery(destination, slot, |_| protected);
+        cx.notify();
+        res
+    }
+
+    pub fn inspect_cancel(&mut self, cx: &mut Context<Self>) {
+        self.inspect.cancel();
+        cx.notify();
+    }
+
+    pub fn inspect_jump_to_finding(
+        &mut self,
+        window: WindowId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target_doc) = self.inspect.target_doc_id else {
+            return false;
+        };
+        let Some((source_row, opt_col)) = self.inspect.finding_jump_target(index) else {
+            return false;
+        };
+        if self.scheduler.window_of(target_doc) == Some(window)
+            && self.scheduler.activate_tab(window, target_doc).is_ok()
+        {
+            self.pending_reveal_cells
+                .insert(target_doc, (source_row, opt_col.unwrap_or(0)));
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    // --- Temporary Storage & Sidecar Index Cache ---
+
+    pub fn working_directory(&self) -> &Path {
+        self.scheduler.working_directory()
+    }
+
+    pub fn custom_working_directory(&self) -> bool {
+        self.scheduler.custom_working_directory()
+    }
+
+    pub fn storage_load_error(&self) -> Option<&str> {
+        self.storage_prefs.load_error.as_deref()
+    }
+
+    pub fn storage_check_running(&self) -> bool {
+        self.storage_check_worker.is_some()
+    }
+
+    pub fn storage_check_result(&self) -> Option<&Result<(StorageSpace, u64), String>> {
+        self.storage_check_result.as_ref()
+    }
+
+    pub fn cache_clear_running(&self) -> bool {
+        self.cache_clear_worker.is_some()
+    }
+
+    pub fn cache_clear_status(&self) -> Option<&Result<String, String>> {
+        self.cache_clear_status.as_ref()
+    }
+
+    pub fn index_cache_enabled(&self) -> bool {
+        self.scheduler.index_cache_enabled()
+    }
+
+    pub fn start_storage_inspection(&mut self, cx: &mut Context<Self>) {
+        if self.storage_check_worker.is_some() {
+            return;
+        }
+        let dir = self.scheduler.working_directory().to_path_buf();
+        let custom = self.scheduler.custom_working_directory();
+        let retained = self.scheduler.retained_storage_paths();
+        self.storage_check_worker = Some(thread::spawn(move || {
+            inspect_temporary_storage(&dir, custom, &retained)
+        }));
+        cx.notify();
+    }
+
+    pub fn set_scratch_directory(
+        &mut self,
+        directory: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        quarry_core::validate_scratch_directory(&directory).map_err(|e| e.to_string())?;
+        self.storage_prefs
+            .set_scratch_directory(Some(&directory))
+            .map_err(|e| e.to_string())?;
+        self.scheduler
+            .set_working_directory(directory.clone(), true);
+        self.join.temporary = directory.clone();
+        self.inspect.set_working_directory(directory, true);
+        self.storage_check_result = None;
+        self.start_storage_inspection(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn reset_scratch_directory(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        self.storage_prefs
+            .set_scratch_directory(None)
+            .map_err(|e| e.to_string())?;
+        let default_dir = std::env::temp_dir();
+        self.scheduler
+            .set_working_directory(default_dir.clone(), false);
+        self.join.temporary = default_dir.clone();
+        self.inspect.set_working_directory(default_dir, false);
+        self.storage_check_result = None;
+        self.start_storage_inspection(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn set_index_cache_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.scheduler.set_index_cache_enabled(enabled);
+        cx.notify();
+    }
+
+    pub fn start_clear_index_cache(&mut self, cx: &mut Context<Self>) {
+        if self.cache_clear_worker.is_some() {
+            return;
+        }
+        self.cache_clear_status = None;
+        self.cache_clear_worker = Some(thread::spawn(clear_index_cache_summary));
+        cx.notify();
+    }
+
     fn any_hydrated_tab_busy(&self) -> bool {
-        self.scheduler.windows().into_iter().any(|window| {
-            self.scheduler.tabs_in_window(window).into_iter().any(|id| {
-                self.scheduler
-                    .tab(id)
-                    .is_some_and(WorkbenchTab::document_busy)
+        self.combine.busy()
+            || self.join.busy()
+            || self.inspect.busy()
+            || self.cache_clear_worker.is_some()
+            || self.storage_check_worker.is_some()
+            || self.scheduler.windows().into_iter().any(|window| {
+                self.scheduler.tabs_in_window(window).into_iter().any(|id| {
+                    self.scheduler
+                        .tab(id)
+                        .is_some_and(WorkbenchTab::document_busy)
+                })
             })
-        })
     }
 
     pub fn poll_background(&mut self, cx: &mut Context<Self>) {
         // Track whether any hydrated tab had an active background job BEFORE polling so
         // the exact tick a job finishes cleanly still notifies observers.
         let mut changed = self.any_hydrated_tab_busy();
+        if self.combine.poll() {
+            changed = true;
+        }
+        if self.join.poll() {
+            let _ = self.scheduler.sync_fd_leases();
+            changed = true;
+        }
+        if self.inspect.poll() {
+            changed = true;
+        }
+        if self
+            .cache_clear_worker
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            changed = true;
+            let outcome = match self.cache_clear_worker.take().unwrap().join() {
+                Ok(res) => res,
+                Err(_) => Err("Clearing the index cache failed unexpectedly.".into()),
+            };
+            self.cache_clear_status = Some(outcome);
+        }
+        if self
+            .storage_check_worker
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            changed = true;
+            let outcome = match self.storage_check_worker.take().unwrap().join() {
+                Ok(res) => res,
+                Err(_) => Err("Checking temporary storage failed unexpectedly.".into()),
+            };
+            self.storage_check_result = Some(outcome);
+        }
         let poll_errors = self.scheduler.poll_all();
         if !poll_errors.is_empty() {
             for (doc_id, error) in poll_errors {

@@ -347,6 +347,34 @@ impl Document {
         }
     }
 
+    /// Transitions a pending compressed document directly into read-only preview without
+    /// decompressing the full archive.
+    pub fn stay_in_compressed_preview(&mut self) -> Result<bool, String> {
+        let Some(compressed) = self.compressed.as_mut() else {
+            return Ok(false);
+        };
+        if !matches!(compressed.phase, Phase::Pending(_)) {
+            return Ok(false);
+        }
+        compressed.phase = Phase::Preview;
+        self.show_preview()?;
+        Ok(true)
+    }
+
+    /// True when the compressed document is currently showing only its bounded preview rows.
+    pub fn compressed_is_preview(&self) -> bool {
+        self.compressed
+            .as_ref()
+            .is_some_and(|compressed| matches!(compressed.phase, Phase::Preview))
+    }
+
+    /// True when the background decompression pass failed on malformed text.
+    pub fn compressed_unreadable_text(&self) -> bool {
+        self.compressed
+            .as_ref()
+            .is_some_and(|compressed| compressed.unreadable_text)
+    }
+
     /// Starts the single pass that writes the private copy and its index. Returns false
     /// when this document is not waiting to decompress.
     pub fn start_decompression(&mut self) -> Result<bool, String> {

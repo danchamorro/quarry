@@ -1295,3 +1295,451 @@ fn find_escape_header_column_default_and_cross_tab_reveal_isolation(cx: &mut Tes
             && q.table.read(cx).selected_cell() == Some((1, 2))
     });
 }
+
+/// Minimal RFC 1952 gzip encoder using uncompressed DEFLATE stored blocks (BTYPE=00)
+/// so UI tests can exercise real `.gz` streaming without adding `flate2` to `quarry-gpui`.
+fn encode_stored_gzip(data: &[u8]) -> Vec<u8> {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if (crc & 1) != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^= 0xffff_ffff;
+
+    let mut out = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+    let mut offset = 0;
+    loop {
+        let remaining = data.len().saturating_sub(offset);
+        let chunk_len = remaining.min(65_535);
+        let is_final = offset + chunk_len >= data.len();
+        out.push(u8::from(is_final));
+        let len = chunk_len as u16;
+        let nlen = !len;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&nlen.to_le_bytes());
+        out.extend_from_slice(&data[offset..offset + chunk_len]);
+        offset += chunk_len;
+        if is_final {
+            break;
+        }
+    }
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
+}
+
+#[gpui_kit::test]
+fn combine_and_four_mode_join_with_open_tab_lease_work_through_gpui_ui(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let part_a = dir.path().join("part_a.csv");
+    let part_b = dir.path().join("part_b.csv");
+    std::fs::write(&part_a, "id,k2,name\n1,a,Alice\n2,b,Bob\n").unwrap();
+    std::fs::write(&part_b, "id,k2,name\n3,c,Cara\n").unwrap();
+
+    let extra_path = dir.path().join("extra.csv");
+    std::fs::write(&extra_path, "id,k2,score\n1,a,95\n4,d,80\n").unwrap();
+
+    let controller = init_test_app(cx);
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // 1. Combine Files dialog via welcome button -> check -> reject .gz -> write combined CSV.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("welcome-combine").visible());
+        assert!(window.find("welcome-join").visible());
+        window.click("welcome-combine", cx);
+        window.render_frame(cx);
+        assert!(window.find("combine-check").visible());
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.combine_add_paths(vec![part_a.clone(), part_b.clone()], cx);
+            c.combine_start_check(cx);
+        });
+    });
+    wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+        let wf = controller.read(cx).combine();
+        !wf.busy() && wf.plan.is_some()
+    });
+
+    // Reject .gz destination early.
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.combine_prepare_destination(dir.path().join("bad.csv.gz"), cx);
+        });
+    });
+    assert!(cx.update(|cx| controller.read(cx).combine().destination.is_none()));
+
+    let combined_out = dir.path().join("combined.csv");
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.combine_prepare_destination(combined_out.clone(), cx);
+        });
+    });
+    wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+        let wf = controller.read(cx).combine();
+        !wf.busy() && wf.space.is_some()
+    });
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| c.combine_start_write(cx));
+    });
+    wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+        let wf = controller.read(cx).combine();
+        !wf.busy() && wf.result.is_some()
+    });
+    assert_eq!(
+        std::fs::read_to_string(&combined_out).unwrap(),
+        "id,k2,name\n1,a,Alice\n2,b,Bob\n3,c,Cara\n"
+    );
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("combine-close", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 2. Open part_a in a tab, open Join Files, bind open tab -> verify DocumentLease blocks close.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![part_a.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+    let doc_id = cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .active_document(win_id)
+            .unwrap()
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| q.open_join_dialog_now(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("join-preview").visible());
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.join_set_open_tab_side(0, doc_id, cx).unwrap();
+            c.join_set_file_side(1, extra_path.clone(), cx);
+        });
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        let wf = controller.read(cx).join();
+        !wf.busy()
+            && wf.headers[0].is_some()
+            && wf.headers[1].is_some()
+            && q.snapshot(cx).is_some_and(|i| i.join_reserved)
+    });
+
+    // Closing the leased tab must be rejected while Join holds its DocumentLease.
+    let close_attempt = cx
+        .update(|cx| controller.update(cx, |c, cx| c.request_close_tab(win_id, doc_id, false, cx)));
+    assert!(matches!(close_attempt, CloseReviewAction::Wait { .. }));
+
+    // Configure composite key (id, k2) and verify all 4 join modes.
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.join_add_key_pair(cx);
+            c.join_set_key_column(0, 0, 0, cx);
+            c.join_set_key_column(0, 1, 0, cx);
+            c.join_set_key_column(1, 0, 1, cx);
+            c.join_set_key_column(1, 1, 1, cx);
+        });
+    });
+
+    for (mode, expected_rows) in [
+        (quarry_core::JoinMode::Inner, 1u64),
+        (quarry_core::JoinMode::Left, 2),
+        (quarry_core::JoinMode::Right, 2),
+        (quarry_core::JoinMode::Full, 3),
+    ] {
+        cx.update(|cx| {
+            controller.update(cx, |c, cx| {
+                c.join_set_mode(mode, cx);
+                c.join_start_analysis(cx);
+            });
+        });
+        wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+            let wf = controller.read(cx).join();
+            !wf.busy() && wf.plan.is_some()
+        });
+        let rows = cx.update(|cx| {
+            controller
+                .read(cx)
+                .join()
+                .plan
+                .as_ref()
+                .unwrap()
+                .analysis()
+                .output_rows
+        });
+        assert_eq!(rows, expected_rows, "mode {mode:?}");
+    }
+
+    let joined_out = dir.path().join("joined.csv");
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.join_prepare_destination(joined_out.clone(), cx).unwrap();
+            c.join_start_write(cx).unwrap();
+        });
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        let wf = controller.read(cx).join();
+        !wf.busy() && wf.result.is_some() && q.snapshot(cx).is_some_and(|i| !i.join_reserved)
+    });
+    assert!(joined_out.exists());
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("join-close", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let close_after = cx
+        .update(|cx| controller.update(cx, |c, cx| c.request_close_tab(win_id, doc_id, false, cx)));
+    assert_eq!(close_after, CloseReviewAction::Proceed);
+}
+
+#[gpui_kit::test]
+fn gzip_streaming_lifecycle_preview_decompress_and_save_as_uncompressed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let gz_path = dir.path().join("sales.csv.gz");
+    let payload = b"id,amount\n1,100\n2,200\n3,300\n";
+    std::fs::write(&gz_path, encode_stored_gzip(payload)).unwrap();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                working_directory: scratch.path().to_path_buf(),
+                custom_working_directory: true,
+                index_cache_enabled: false,
+                defer_gzip_decompression: true,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![gz_path.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert!(window.find("gzip-start-decompress").visible());
+        assert!(window.find("gzip-preview-only").visible());
+        // Switch to Preview Only first.
+        window.click("gzip-preview-only", cx);
+        window.render_frame(cx);
+        assert!(window.find("gzip-preview-reload").visible());
+        // Reload from Disk triggers full decompression.
+        window.click("gzip-preview-reload", cx);
+    })
+    .unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| {
+            i.is_compressed && !i.compressed_pending && !i.compressed_preview && i.index_done
+        })
+    });
+
+    // Compressed documents are read-only (Save disabled) but Save As is enabled.
+    cx.update(|cx| {
+        let q = view.read(cx);
+        assert!(!q.command_enabled(quarry_workbench::CommandId::Save, cx));
+        assert!(q.command_enabled(quarry_workbench::CommandId::SaveAs, cx));
+    });
+
+    // Reject .gz Save As destination, then write uncompressed copy.
+    let bad_save = cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.start_save_active(win_id, None, Some(dir.path().join("out.csv.gz")), None, cx)
+        })
+    });
+    assert!(bad_save.is_err());
+
+    let uncompressed_copy = dir.path().join("sales.csv");
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_save_active(win_id, None, Some(uncompressed_copy.clone()), None, cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| !i.saving) && uncompressed_copy.exists()
+    });
+    assert_eq!(
+        std::fs::read_to_string(&uncompressed_copy).unwrap(),
+        "id,amount\n1,100\n2,200\n3,300\n"
+    );
+}
+
+#[gpui_kit::test]
+fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let uneven = dir.path().join("uneven.csv");
+    std::fs::write(&uneven, "a,b\n1,2\n3,4,5\n6,7\n").unwrap();
+    let pref_file = dir.path().join("prefs/storage-preferences");
+    let custom_scratch = dir.path().join("custom-scratch");
+    std::fs::create_dir_all(&custom_scratch).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test_with_prefs(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+            quarry_workbench::StoragePreferences::load_from(Some(pref_file.clone()), true),
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![uneven.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+
+    // 1. Inspect File & Recovery dialog -> inspect -> select eligible -> jump & recover.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| q.open_inspect_dialog_now(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("inspect-run").visible());
+        window.click("inspect-run", cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+        let wf = controller.read(cx).inspect();
+        !wf.busy() && wf.report.as_ref().is_some_and(|r| !r.findings.is_empty())
+    });
+
+    let recovered = dir.path().join("recovered.csv");
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.inspect_select_all_eligible(cx);
+            assert!(c.inspect_jump_to_finding(win_id, 0, cx));
+            c.inspect_start_recovery(recovered.clone(), cx).unwrap();
+        });
+    });
+    wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+        let wf = controller.read(cx).inspect();
+        !wf.busy() && wf.recovery_result.is_some()
+    });
+    assert_eq!(
+        std::fs::read_to_string(&recovered).unwrap(),
+        "a,b\n1,2\n6,7\n"
+    );
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("inspect-close", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 2. Temporary Storage & Index Cache dialog -> set custom folder (persisted) -> toggle cache.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.temporary_storage_action(&crate::menus::TemporaryStorage, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(window.find("storage-choose-folder").visible());
+        assert!(window.find("storage-clear-cache").visible());
+    })
+    .unwrap();
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.set_scratch_directory(custom_scratch.clone(), cx).unwrap();
+            c.set_index_cache_enabled(true, cx);
+            assert!(c.index_cache_enabled());
+        });
+    });
+    let reloaded = quarry_workbench::StoragePreferences::load_from(Some(pref_file), true);
+    assert_eq!(
+        reloaded.scratch_directory.as_deref(),
+        Some(custom_scratch.as_path())
+    );
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.reset_scratch_directory(cx).unwrap();
+            assert!(!c.custom_working_directory());
+        });
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("storage-close", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 3. About Quarry dialog -> verify title and Copy Build Details.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.about_quarry_action(&crate::menus::AboutQuarry, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(window.find("about-copy-details").visible());
+        window.click("about-copy-details", cx);
+        window.click("about-close", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+}

@@ -523,6 +523,9 @@ pub struct WorkbenchSchedulerConfig {
     pub working_directory: PathBuf,
     pub custom_working_directory: bool,
     pub index_cache_enabled: bool,
+    /// When true, opening a `.gz` file pauses in `Phase::Pending` after loading bootstrap preview
+    /// rows so the user can choose between decompressing the full file or staying in preview.
+    pub defer_gzip_decompression: bool,
     /// Optional test hook simulating available scratch bytes (None uses OS `check_storage`).
     pub simulated_scratch_available_bytes: Option<u64>,
 }
@@ -536,6 +539,7 @@ impl Default for WorkbenchSchedulerConfig {
             working_directory: std::env::temp_dir(),
             custom_working_directory: false,
             index_cache_enabled: true,
+            defer_gzip_decompression: false,
             simulated_scratch_available_bytes: None,
         }
     }
@@ -836,16 +840,19 @@ impl WorkbenchScheduler {
         None
     }
 
-    /// True when the shared global two-write limit (`MAX_WRITE_JOBS`) has a free slot.
-    pub fn write_slot_available(&self) -> bool {
-        let in_use: usize = self
-            .tabs
+    /// Number of active file operations currently counted toward the global `MAX_WRITE_JOBS` cap.
+    pub fn active_write_operations(&self) -> usize {
+        self.tabs
             .values()
             .filter(|slot| matches!(slot.residency, SlotResidency::Hydrated { .. }))
             .map(|slot| slot.tab.unslotted_document_operations(false))
             .sum::<usize>()
-            + self.decompression_slots.active();
-        in_use < MAX_WRITE_JOBS
+            + self.decompression_slots.active()
+    }
+
+    /// True when the shared global two-write limit (`MAX_WRITE_JOBS`) has a free slot.
+    pub fn write_slot_available(&self) -> bool {
+        self.active_write_operations() < MAX_WRITE_JOBS
     }
 
     /// Lazily registers a batch of paths (e.g. 200 files) as lightweight stubs without
@@ -2629,6 +2636,136 @@ impl WorkbenchScheduler {
         }
     }
 
+    pub fn working_directory(&self) -> &Path {
+        &self.config.working_directory
+    }
+
+    pub fn custom_working_directory(&self) -> bool {
+        self.config.custom_working_directory
+    }
+
+    /// Updates the scratch working directory on the scheduler and every hydrated tab.
+    pub fn set_working_directory(&mut self, directory: PathBuf, custom: bool) {
+        self.config.working_directory = directory.clone();
+        self.config.custom_working_directory = custom;
+        for slot in self.tabs.values_mut() {
+            if let Some(doc) = slot.tab.document.as_mut() {
+                doc.working_directory = directory.clone();
+                doc.custom_working_directory = custom;
+            }
+        }
+    }
+
+    pub fn index_cache_enabled(&self) -> bool {
+        self.config.index_cache_enabled
+    }
+
+    /// Applies the persistent sidecar index cache toggle across the scheduler and hydrated tabs.
+    pub fn set_index_cache_enabled(&mut self, enabled: bool) {
+        self.config.index_cache_enabled = enabled;
+        for slot in self.tabs.values_mut() {
+            if let Some(doc) = slot.tab.document.as_mut() {
+                doc.index_cache_enabled = enabled;
+            }
+        }
+    }
+
+    pub fn working_cleanup(&self) -> WorkingCopyCleanup {
+        self.working_cleanup.clone()
+    }
+
+    /// Lists all retained working-copy files across hydrated and dormant tabs for storage review.
+    pub fn retained_storage_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for slot in self.tabs.values() {
+            if let Some(doc) = slot.tab.document.as_ref() {
+                paths.extend(doc.retained_storage_paths());
+            } else if let SlotResidency::Dormant(dormant) = &slot.residency
+                && let DormantKind::Dirty(dirty) = &dormant.kind
+                && let Some(wc) = dirty.working_copy.as_ref()
+            {
+                if wc.owns(dirty.session.path()) {
+                    paths.push(dirty.session.path().to_path_buf());
+                }
+                if let Some(u) = wc.undo.as_ref()
+                    && wc.owns(&u.path)
+                {
+                    paths.push(u.path.clone());
+                }
+                if let Some(r) = wc.redo.as_ref()
+                    && wc.owns(&r.path)
+                {
+                    paths.push(r.path.clone());
+                }
+            }
+        }
+        paths
+    }
+
+    /// Starts background decompression for a `.gz` tab paused in `Phase::Pending`, enforcing
+    /// the write-slot cap and pre-reserving its decompression job and private-copy FDs.
+    pub fn start_pending_decompression(
+        &mut self,
+        id: DocumentId,
+        extra_write_slot_available: bool,
+    ) -> Result<bool, String> {
+        if !extra_write_slot_available || !self.write_slot_available() {
+            return Err(compressed::WRITE_SLOTS_FULL.to_owned());
+        }
+        self.with_reserved_job_fds(
+            id,
+            2,
+            false,
+            |doc| doc.start_decompression(),
+            |err| err.to_string(),
+        )
+    }
+
+    /// Transitions a `.gz` tab paused in `Phase::Pending` directly into bounded `Phase::Preview`.
+    pub fn stay_in_compressed_preview(&mut self, id: DocumentId) -> Result<bool, String> {
+        let Some(doc) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+        else {
+            return Err("Open a file first.".into());
+        };
+        let result = doc.stay_in_compressed_preview();
+        let _ = self.sync_fd_leases();
+        result
+    }
+
+    /// Cancels an active `.gz` decompression pass on tab `id`, removing its private copy and
+    /// reconciling FD leases.
+    pub fn cancel_decompression(&mut self, id: DocumentId) -> Option<Result<&'static str, String>> {
+        let result = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+            .and_then(Document::cancel_decompression);
+        let _ = self.sync_fd_leases();
+        result
+    }
+
+    /// Lists hydrated non-compressed tabs eligible as open-document inputs to Join Files.
+    pub fn hydrated_join_choices(&self) -> Vec<(DocumentId, String, PathBuf)> {
+        let mut choices = Vec::new();
+        for (&id, slot) in &self.tabs {
+            if let Some(doc) = slot.tab.document.as_ref()
+                && !doc.is_compressed()
+            {
+                let label = doc
+                    .logical_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Untitled")
+                    .to_owned();
+                choices.push((id, label, doc.logical_path.clone()));
+            }
+        }
+        choices
+    }
+
     fn assign_tab_to_window_list(&mut self, target_window: WindowId, id: DocumentId) {
         for (&win, ids) in &mut self.window_tabs {
             if win != target_window {
@@ -2949,12 +3086,14 @@ fn doc_retained_dir_fds(doc: &Document) -> usize {
 const FILTER_JOB_AND_READ_FDS: usize = 3;
 
 fn doc_non_filter_job_fds(doc: &Document) -> usize {
-    // Index holds 1 FD; search holds 1 FD; filtered export, save, and running structural workers
-    // each hold up to 2 FDs (source + destination); DuplicatePreview holds no running worker FDs.
+    // Index holds 1 FD; search holds 1 FD; filtered export, save, gzip decompression, and running
+    // structural workers each hold up to 2 FDs (source + destination); DuplicatePreview holds no
+    // running worker FDs.
     usize::from(doc.job.is_some())
         + usize::from(doc.search_job.is_some())
         + usize::from(doc.export_job.is_some()) * 2
         + usize::from(doc.save_job.is_some()) * 2
+        + usize::from(doc.decompression_running()) * 2
         + usize::from(
             doc.structural_job
                 .as_ref()
@@ -3329,18 +3468,26 @@ fn hydrate_from_stub(
     let mut doc =
         Document::prepare_with_encoding(&stub.logical_path, stub.open_options, stub.encoding)
             .map_err(SchedulerError::OpenFailed)?;
-    if doc.awaiting_decompression() && !write_slot_available {
-        return Err(SchedulerError::OpenFailed(
-            compressed::WRITE_SLOTS_FULL.to_owned(),
-        ));
-    }
     doc.working_directory = config.working_directory.clone();
     doc.custom_working_directory = config.custom_working_directory;
     doc.index_cache_enabled = config.index_cache_enabled;
     doc.working_cleanup = working_cleanup.clone();
     doc.decompression_slots = decompression_slots.clone();
-    let mut job_fd_lease = Some(fd_budget.try_reserve(FdCategory::BackgroundJob, 1)?);
-    doc.start_indexing().map_err(SchedulerError::OpenFailed)?;
+    let mut job_fd_lease = None;
+    if doc.awaiting_decompression() {
+        if !config.defer_gzip_decompression {
+            if !write_slot_available {
+                return Err(SchedulerError::OpenFailed(
+                    compressed::WRITE_SLOTS_FULL.to_owned(),
+                ));
+            }
+            job_fd_lease = Some(fd_budget.try_reserve(FdCategory::BackgroundJob, 2)?);
+            doc.start_indexing().map_err(SchedulerError::OpenFailed)?;
+        }
+    } else {
+        job_fd_lease = Some(fd_budget.try_reserve(FdCategory::BackgroundJob, 1)?);
+        doc.start_indexing().map_err(SchedulerError::OpenFailed)?;
+    }
     let _ = try_sync_optional_lease(
         fd_budget,
         &mut job_fd_lease,
