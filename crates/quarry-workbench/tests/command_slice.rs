@@ -168,7 +168,28 @@ fn dirty_tab_close_and_keep_editing_vertical_slice_runs_headlessly() {
     assert!(evaluate_command(CommandId::Undo, &resumed_ctx).enabled);
     assert!(!evaluate_command(CommandId::ReloadFromDisk, &resumed_ctx).enabled);
 
-    // 3. Re-close and confirm DiscardAndClose transitions cleanly to ReadyToClose.
+    // 3. Stale DiscardAndClose without confirmation is ignored, active writers defer close,
+    // and confirmed DiscardAndClose transitions cleanly to ReadyToClose.
+    assert_eq!(
+        tab.dispatch_close_command(CommandId::DiscardAndClose, false, false, false)
+            .unwrap(),
+        CloseCommandOutcome::Ignored
+    );
+    assert!(!tab.close_ready);
+
+    assert_eq!(
+        tab.dispatch_close_command(CommandId::CloseTab, false, false, false)
+            .unwrap(),
+        CloseCommandOutcome::ConfirmUnsaved
+    );
+    assert_eq!(
+        tab.dispatch_close_command(CommandId::DiscardAndClose, true, false, false)
+            .unwrap(),
+        CloseCommandOutcome::WaitForJobs
+    );
+    assert!(tab.close_after_jobs);
+    assert!(!tab.close_ready);
+
     assert_eq!(
         tab.dispatch_close_command(CommandId::CloseTab, false, false, false)
             .unwrap(),
@@ -225,7 +246,8 @@ fn command_enablement_respects_targets_filters_text_focus_and_write_slots() {
     );
     assert!(evaluate_command(CommandId::OpenWithEncoding(Encoding::Utf8), &ctx).enabled);
 
-    // Focused text fields keep Undo/Redo enabled even while a modal blocks document commands.
+    // Focused text fields keep Undo/Redo enabled and route them to the window target
+    // even while a modal blocks document commands.
     let blocked_text_ctx = CommandContext {
         window: WindowId::PRIMARY,
         active_tab: &tab,
@@ -235,8 +257,18 @@ fn command_enablement_respects_targets_filters_text_focus_and_write_slots() {
         text_field_focused: true,
         show_all_whitespace: false,
     };
-    assert!(evaluate_command(CommandId::Undo, &blocked_text_ctx).enabled);
-    assert!(evaluate_command(CommandId::Redo, &blocked_text_ctx).enabled);
+    let undo_res = evaluate_command(CommandId::Undo, &blocked_text_ctx);
+    let redo_res = evaluate_command(CommandId::Redo, &blocked_text_ctx);
+    assert!(undo_res.enabled);
+    assert_eq!(
+        undo_res.target,
+        Some(CommandTarget::Window(WindowId::PRIMARY))
+    );
+    assert!(redo_res.enabled);
+    assert_eq!(
+        redo_res.target,
+        Some(CommandTarget::Window(WindowId::PRIMARY))
+    );
     assert!(!evaluate_command(CommandId::Open, &blocked_text_ctx).enabled);
     assert!(
         !evaluate_command(
@@ -246,5 +278,29 @@ fn command_enablement_respects_targets_filters_text_focus_and_write_slots() {
         .enabled
     );
     assert!(!evaluate_command(CommandId::NextTab, &blocked_text_ctx).enabled);
+
+    // KeepEditing stays enabled and window-targeted for a pending close even without a document.
+    let mut empty_waiting_tab = WorkbenchTab::new(10);
+    assert_eq!(
+        empty_waiting_tab
+            .dispatch_close_command(CommandId::CloseTab, false, true, false)
+            .unwrap(),
+        CloseCommandOutcome::WaitForJobs
+    );
+    let waiting_ctx = CommandContext {
+        window: WindowId::PRIMARY,
+        active_tab: &empty_waiting_tab,
+        open_document_count: 0,
+        write_slot_available: true,
+        external_modal_blocked: false,
+        text_field_focused: false,
+        show_all_whitespace: false,
+    };
+    let keep_waiting = evaluate_command(CommandId::KeepEditing, &waiting_ctx);
+    assert!(keep_waiting.enabled);
+    assert_eq!(
+        keep_waiting.target,
+        Some(CommandTarget::Window(WindowId::PRIMARY))
+    );
     drop(tab);
 }

@@ -5,13 +5,15 @@ Quarry must operate on files larger than available RAM. Treat it as a **large-fi
 
 ## Current design
 ```text
-egui viewer / CLI / AppKit comparator (frozen)
+egui viewer
    |
 quarry-workbench
    +-- UI-neutral Document, WorkingCopyState, EditHistory, StructuralOverlay
    +-- ColumnView, GridSelection, RowSelection, GridCursor
    +-- WorkbenchTab state, WindowId / DocumentId, CommandId enablement & targeting
    +-- CompressedDocument / DecompressionSlots & UI-neutral whitespace cache
+   |
+   +----------------+<--- CLI (`quarry-cli`) / AppKit comparator (`quarry-appkit`, frozen)
    |
 quarry-core
    +-- Session and format detection

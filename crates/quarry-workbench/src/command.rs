@@ -189,11 +189,13 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::UserGuide
         | CommandId::ReportIssue => Some(CommandTarget::Application),
         CommandId::NextTab | CommandId::PreviousTab => Some(CommandTarget::Window(ctx.window)),
-        CommandId::TemporaryStorage | CommandId::InspectFile => {
+        CommandId::TemporaryStorage | CommandId::InspectFile | CommandId::KeepEditing => {
             doc_target.or(Some(CommandTarget::Window(ctx.window)))
         }
+        CommandId::Undo | CommandId::Redo if ctx.text_field_focused => {
+            Some(CommandTarget::Window(ctx.window))
+        }
         CommandId::CloseTab
-        | CommandId::KeepEditing
         | CommandId::DiscardAndClose
         | CommandId::ReloadFromDisk
         | CommandId::Save
@@ -220,7 +222,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
                 || ctx.active_tab.close_after_save
                 || ctx.active_tab.close_after_jobs;
             return CommandResolution {
-                enabled: open && pending && !ctx.external_modal_blocked,
+                enabled: pending && !ctx.external_modal_blocked,
                 target,
             };
         }
@@ -378,6 +380,9 @@ impl WorkbenchTab {
                 Ok(CloseCommandOutcome::KeptEditing)
             }
             CommandId::DiscardAndClose => {
+                if !self.close_confirmation_open {
+                    return Ok(CloseCommandOutcome::Ignored);
+                }
                 if cleanup_busy {
                     if !quitting_cleanup {
                         self.close_after_jobs = true;
@@ -386,6 +391,20 @@ impl WorkbenchTab {
                 }
                 if self.document.as_ref().is_some_and(Document::join_reserved) {
                     return Err(AppMessage::warning(JOIN_INPUT_RESERVED));
+                }
+                if self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| document.save_job.is_some())
+                {
+                    self.close_confirmation_open = false;
+                    self.close_after_save = true;
+                    return Ok(CloseCommandOutcome::WaitForSave);
+                }
+                if extra_writing || self.document_writing() {
+                    self.close_confirmation_open = false;
+                    self.close_after_jobs = true;
+                    return Ok(CloseCommandOutcome::WaitForJobs);
                 }
                 self.approve_discard_and_close();
                 Ok(CloseCommandOutcome::ReadyToClose)
