@@ -8,6 +8,7 @@
 use super::Action;
 use eframe::egui;
 use quarry_core::Encoding;
+use quarry_workbench::CommandId;
 
 pub(super) const USER_GUIDE_URL: &str =
     "https://github.com/danchamorro/quarry/blob/main/docs/USER_GUIDE.md";
@@ -44,6 +45,73 @@ pub(super) enum MenuCommand {
     PreviousTab,
     UserGuide,
     ReportIssue,
+}
+
+impl MenuCommand {
+    /// Commands whose availability is evaluated dynamically each frame against workbench state.
+    pub(super) const EVALUATED: [Self; 21] = [
+        Self::About,
+        Self::Open,
+        Self::CombineFiles,
+        Self::JoinFiles,
+        Self::CloseTab,
+        Self::ReloadFromDisk,
+        Self::Save,
+        Self::SaveAs,
+        Self::SaveAsUtf8,
+        Self::DiscardChanges,
+        Self::InspectFile,
+        Self::TemporaryStorage,
+        Self::Undo,
+        Self::Redo,
+        Self::Find,
+        Self::InsertRows,
+        Self::InsertColumns,
+        Self::Columns,
+        Self::Filters,
+        Self::NextTab,
+        Self::PreviousTab,
+    ];
+
+    pub(super) const fn command_id(self) -> CommandId {
+        match self {
+            Self::About => CommandId::About,
+            Self::Open => CommandId::Open,
+            Self::OpenWithEncoding(encoding) => CommandId::OpenWithEncoding(encoding),
+            Self::CombineFiles => CommandId::CombineFiles,
+            Self::JoinFiles => CommandId::JoinFiles,
+            Self::CloseTab => CommandId::CloseTab,
+            Self::ReloadFromDisk => CommandId::ReloadFromDisk,
+            Self::Save => CommandId::Save,
+            Self::SaveAs => CommandId::SaveAs,
+            Self::SaveAsUtf8 => CommandId::SaveAsUtf8,
+            Self::DiscardChanges => CommandId::DiscardChanges,
+            Self::TemporaryStorage => CommandId::TemporaryStorage,
+            Self::InspectFile => CommandId::InspectFile,
+            Self::Undo => CommandId::Undo,
+            Self::Redo => CommandId::Redo,
+            Self::Cut => CommandId::Cut,
+            Self::Copy => CommandId::Copy,
+            Self::Paste => CommandId::Paste,
+            Self::SelectAll => CommandId::SelectAll,
+            Self::Find => CommandId::Find,
+            Self::InsertRows => CommandId::InsertRows,
+            Self::InsertColumns => CommandId::InsertColumns,
+            Self::ShowAllWhitespace => CommandId::ShowAllWhitespace,
+            Self::Columns => CommandId::Columns,
+            Self::Filters => CommandId::Filters,
+            Self::NextTab => CommandId::NextTab,
+            Self::PreviousTab => CommandId::PreviousTab,
+            Self::UserGuide => CommandId::UserGuide,
+            Self::ReportIssue => CommandId::ReportIssue,
+        }
+    }
+}
+
+impl From<MenuCommand> for CommandId {
+    fn from(command: MenuCommand) -> Self {
+        command.command_id()
+    }
 }
 
 /// What a menu command does inside the egui frame.

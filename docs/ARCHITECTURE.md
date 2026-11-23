@@ -5,7 +5,15 @@ Quarry must operate on files larger than available RAM. Treat it as a **large-fi
 
 ## Current design
 ```text
-egui viewer / CLI / AppKit comparator
+egui viewer
+   |
+quarry-workbench
+   +-- UI-neutral Document, WorkingCopyState, EditHistory, StructuralOverlay
+   +-- ColumnView, GridSelection, RowSelection, GridCursor
+   +-- WorkbenchTab state, WindowId / DocumentId, CommandId enablement & targeting
+   +-- CompressedDocument / DecompressionSlots & UI-neutral whitespace cache
+   |
+   +----------------+<--- CLI (`quarry-cli`) / AppKit comparator (`quarry-appkit`, frozen)
    |
 quarry-core
    +-- Session and format detection
@@ -25,10 +33,14 @@ quarry-delimited
    +-- Delimited record parser
 ```
 
-The egui app is the selected production UI. The CLI exposes the engine and
-benchmark commands, while AppKit remains a measured comparator. The Rust engine
-stays UI-independent so new filter operators, transformations, sorting, and
-export can reuse the same boundaries.
+The egui app is the active production UI. `quarry-workbench` owns the
+frontend-neutral document, tab, selection, and command-enablement model so
+frontends only render and dispatch. The CLI exposes the engine and benchmark
+commands. `apps/quarry-appkit` is **frozen as-is during Phase 4**: it stays
+building in the workspace as a historical macOS comparator and receives no new
+features. The Rust engine and workbench crates stay UI-independent so new
+filter operators, transformations, sorting, and export reuse the same
+boundaries.
 
 ## Current workspace
 ```text
@@ -36,10 +48,11 @@ quarry/
   crates/
     quarry-delimited/
     quarry-core/
+    quarry-workbench/
   apps/
     quarry-cli/
     quarry-egui/
-    quarry-appkit/
+    quarry-appkit/   # frozen comparator (no new features)
   fixtures/
   docs/
 ```
