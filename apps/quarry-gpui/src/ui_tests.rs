@@ -1690,11 +1690,18 @@ fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
     });
 
     // 1. Inspect File & Recovery dialog -> inspect -> select eligible -> jump & recover.
+    let (second_handle, second_view) = open_test_window(cx, &controller);
     cx.update_window(handle.into(), |_, window, cx| {
         view.update(cx, |q, cx| q.open_inspect_dialog_now(window, cx));
         window.render_frame(cx);
         assert!(window.find("inspect-run").visible());
         window.click("inspect-run", cx);
+    })
+    .unwrap();
+    // Opening Inspect from a second window while Window 1 owns it must NOT steal/reconfigure it.
+    cx.update_window(second_handle.into(), |_, window, cx| {
+        second_view.update(cx, |q, cx| q.open_inspect_dialog_now(window, cx));
+        assert!(!second_view.read(cx).editing);
     })
     .unwrap();
     wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {

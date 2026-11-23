@@ -43,7 +43,9 @@ use menus::{
     ToggleColumns, ToggleFilters, UndoEdit, bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
-use workbench::{CloseReviewAction, DocumentSnapshot, MAX_EDIT_BYTES, WorkbenchController};
+use workbench::{
+    CloseReviewAction, DocumentSnapshot, MAX_EDIT_BYTES, WorkbenchController, WorkflowDialogKind,
+};
 
 pub struct QuarryWindow {
     window_id: WindowId,
@@ -1777,14 +1779,33 @@ impl QuarryWindow {
         }
     }
 
+    fn workflow_dialog_closed_callback(
+        &self,
+        kind: WorkflowDialogKind,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let controller = self.controller.clone();
+        let window_id = self.window_id;
+        let restore = self.restore_grid_focus_callback(cx);
+        move |window, cx| {
+            controller.update(cx, |c, _| c.release_workflow_dialog(kind, window_id));
+            restore(window, cx);
+        }
+    }
+
     fn open_combine_dialog_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing || self.confirming {
+            return;
+        }
+        if !self.controller.update(cx, |c, cx| {
+            c.claim_workflow_dialog(WorkflowDialogKind::Combine, self.window_id, cx)
+        }) {
             return;
         }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_open = self.open_output_path_callback(cx);
-        let on_closed = self.restore_grid_focus_callback(cx);
+        let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Combine, cx);
         workflows_ui::open_combine_dialog(self.controller.clone(), on_open, on_closed, window, cx);
     }
 
@@ -1792,10 +1813,15 @@ impl QuarryWindow {
         if self.editing || self.confirming {
             return;
         }
+        if !self.controller.update(cx, |c, cx| {
+            c.claim_workflow_dialog(WorkflowDialogKind::Join, self.window_id, cx)
+        }) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_open = self.open_output_path_callback(cx);
-        let on_closed = self.restore_grid_focus_callback(cx);
+        let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Join, cx);
         workflows_ui::open_join_dialog(self.controller.clone(), on_open, on_closed, window, cx);
     }
 
@@ -1812,6 +1838,11 @@ impl QuarryWindow {
         if self.editing || self.confirming {
             return;
         }
+        if !self.controller.update(cx, |c, cx| {
+            c.claim_workflow_dialog(WorkflowDialogKind::Inspect, self.window_id, cx)
+        }) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         self.controller.update(cx, |c, cx| {
@@ -1822,7 +1853,7 @@ impl QuarryWindow {
             }
         });
         let on_open = self.open_output_path_callback(cx);
-        let on_closed = self.restore_grid_focus_callback(cx);
+        let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Inspect, cx);
         workflows_ui::open_inspect_dialog(
             self.controller.clone(),
             self.window_id,

@@ -161,12 +161,22 @@ impl Global for WorkbenchGlobal {}
 type StorageCheckOutcome = Result<(StorageSpace, u64), String>;
 type StorageCheckWorker = (u64, JoinHandle<StorageCheckOutcome>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowDialogKind {
+    Combine,
+    Join,
+    Inspect,
+}
+
 pub struct WorkbenchController {
     scheduler: WorkbenchScheduler,
     storage_prefs: StoragePreferences,
     combine: Box<CombineWorkflow>,
     join: Box<JoinWorkflow>,
     inspect: Box<InspectWorkflow>,
+    combine_dialog_owner: Option<WindowId>,
+    join_dialog_owner: Option<WindowId>,
+    inspect_dialog_owner: Option<WindowId>,
     cache_clear_worker: Option<JoinHandle<Result<String, String>>>,
     cache_clear_status: Option<Result<String, String>>,
     storage_check_gen: u64,
@@ -220,6 +230,9 @@ impl WorkbenchController {
                 cleanup,
                 slots,
             )),
+            combine_dialog_owner: None,
+            join_dialog_owner: None,
+            inspect_dialog_owner: None,
             cache_clear_worker: None,
             cache_clear_status: None,
             storage_check_gen: 0,
@@ -321,6 +334,57 @@ impl WorkbenchController {
         self.windows.remove(&id);
         self.editing_windows.remove(&id);
         self.window_messages.remove(&id);
+        if self.combine_dialog_owner == Some(id) {
+            self.combine_dialog_owner = None;
+        }
+        if self.join_dialog_owner == Some(id) {
+            self.join_dialog_owner = None;
+            self.join.release_all_async();
+        }
+        if self.inspect_dialog_owner == Some(id) {
+            self.inspect_dialog_owner = None;
+        }
+    }
+
+    /// Claims process-wide ownership of a shared workflow dialog (`Combine`, `Join`, or `Inspect`).
+    /// Returns `false` and focuses the owning window if another window already has that dialog open.
+    pub fn claim_workflow_dialog(
+        &mut self,
+        kind: WorkflowDialogKind,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let current = match kind {
+            WorkflowDialogKind::Combine => self.combine_dialog_owner,
+            WorkflowDialogKind::Join => self.join_dialog_owner,
+            WorkflowDialogKind::Inspect => self.inspect_dialog_owner,
+        };
+        if let Some(owner) = current {
+            if owner == window {
+                return false;
+            }
+            if let Some(handle) = self.window_handle(owner) {
+                let _ = handle.update(cx, |_, win, _| win.activate_window());
+                return false;
+            }
+        }
+        match kind {
+            WorkflowDialogKind::Combine => self.combine_dialog_owner = Some(window),
+            WorkflowDialogKind::Join => self.join_dialog_owner = Some(window),
+            WorkflowDialogKind::Inspect => self.inspect_dialog_owner = Some(window),
+        }
+        true
+    }
+
+    pub fn release_workflow_dialog(&mut self, kind: WorkflowDialogKind, window: WindowId) {
+        let slot = match kind {
+            WorkflowDialogKind::Combine => &mut self.combine_dialog_owner,
+            WorkflowDialogKind::Join => &mut self.join_dialog_owner,
+            WorkflowDialogKind::Inspect => &mut self.inspect_dialog_owner,
+        };
+        if *slot == Some(window) {
+            *slot = None;
+        }
     }
 
     pub fn write_slot_available(&self) -> bool {
