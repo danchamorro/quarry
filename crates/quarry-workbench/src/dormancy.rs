@@ -1625,17 +1625,26 @@ fn tab_matches_path(
                     }
                     DormantKind::CompressedComplete { session, .. } => {
                         path == session.path()
-                            || (identity.is_some() && identity == session.file_identity())
+                            || (identity.is_some()
+                                && (identity == session.file_identity()
+                                    || identity == session.compressed_source_file_identity()))
                             || (!session.path().as_os_str().is_empty()
                                 && canonical
                                     == normalize_path_with_existing_ancestor(session.path()))
+                    }
+                    DormantKind::CompressedPreview { session, .. } => {
+                        identity.is_some()
+                            && (identity == session.file_identity()
+                                || identity == session.compressed_source_file_identity())
                     }
                     _ => false,
                 }
         }
         SlotResidency::Hydrated { .. } => slot.tab.document.as_ref().is_some_and(|doc| {
             path == doc.logical_path
-                || (identity.is_some() && identity == doc.session.file_identity())
+                || (identity.is_some()
+                    && (identity == doc.session.file_identity()
+                        || identity == doc.session.compressed_source_file_identity()))
                 || (identity.is_some()
                     && doc
                         .original_session

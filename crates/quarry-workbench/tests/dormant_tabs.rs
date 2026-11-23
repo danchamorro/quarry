@@ -1454,3 +1454,53 @@ fn pending_nonexistent_output_aliases_and_rollback_and_eviction_fallback_work() 
     let snap_done = scheduler.fd_budget().snapshot();
     assert_eq!(snap_done.by_category.get(&FdCategory::BackgroundJob), None);
 }
+
+#[test]
+fn completed_gzip_tab_matches_hard_link_to_compressed_source_while_hydrated_and_dormant() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let gz = write_gzip_csv(dir.path(), "input.csv.gz", 20);
+    let gz_alias = dir.path().join("alias.csv.gz");
+    fs::hard_link(&gz, &gz_alias).unwrap();
+    let plain = write_csv(dir.path(), "other-gz.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [gz, plain], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // While hydrated after decompression completes, hard-linked alias must map to the owner tab.
+    assert_eq!(
+        scheduler.find_owner_for_path(&gz_alias),
+        Some((WindowId::PRIMARY, ids[0]))
+    );
+    assert!(scheduler.path_reserved(&gz_alias));
+    let dedup = scheduler
+        .open_path(WindowId::PRIMARY, gz_alias.clone(), open_options(), None)
+        .unwrap();
+    assert!(matches!(
+        dedup,
+        WakeOutcome::Ready { document_id, kind: WakeKind::AlreadyHydrated, .. }
+            if document_id == ids[0]
+    ));
+    assert_eq!(scheduler.total_tabs(), 2);
+
+    // After demoting to DormantCompressedComplete, the hard-linked alias still matches & reserves.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantCompressedComplete)
+    );
+    assert_eq!(
+        scheduler.find_owner_for_path(&gz_alias),
+        Some((WindowId::PRIMARY, ids[0]))
+    );
+    assert!(scheduler.path_reserved(&gz_alias));
+}
