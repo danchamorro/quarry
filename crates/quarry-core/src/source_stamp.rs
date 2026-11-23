@@ -57,73 +57,130 @@ pub fn open_regular_file_nofollow(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// A validated directory handle that keeps relative opens pinned to the originally verified
+/// directory inode (via Unix `OwnedFd` + `openat(..., O_NOFOLLOW)`) even if ancestor path
+/// components are replaced later.
+pub struct ContainedDir {
+    #[cfg(unix)]
+    fd: rustix::fd::OwnedFd,
+    path: std::path::PathBuf,
+}
+
+impl ContainedDir {
+    /// Opens an existing canonical directory with `O_DIRECTORY | O_NOFOLLOW` (on Unix) and retains
+    /// its descriptor so subsequent relative opens stay bound to this directory inode.
+    pub fn open_directory(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        let fd = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )?;
+        #[cfg(not(unix))]
+        if !std::fs::symlink_metadata(path)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "Path is not a directory.",
+            ));
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            fd,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Opens `relative` directly from this retained directory handle while enforcing `O_NOFOLLOW`
+    /// on every segment and `O_NONBLOCK` + regular-file verification on the leaf descriptor.
+    pub fn open_regular_file(&self, relative: &Path) -> io::Result<File> {
+        use std::path::Component;
+
+        let mut segments = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(seg) => segments.push(seg),
+                Component::CurDir => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Relative path escapes allowed root.",
+                    ));
+                }
+            }
+        }
+        let Some((leaf, parents)) = segments.split_last() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Path does not name a file inside the allowed root.",
+            ));
+        };
+
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+            let leaf_fd = if let Some((first, rest)) = parents.split_first() {
+                let mut dir_fd = openat(
+                    &self.fd,
+                    *first,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )?;
+                for seg in rest {
+                    dir_fd = openat(
+                        &dir_fd,
+                        *seg,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )?;
+                }
+                openat(
+                    &dir_fd,
+                    *leaf,
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )?
+            } else {
+                openat(
+                    &self.fd,
+                    *leaf,
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )?
+            };
+            let file = File::from(leaf_fd);
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Path is not a regular file.",
+                ));
+            }
+            Ok(file)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut full = self.path.clone();
+            for seg in parents {
+                full.push(seg);
+            }
+            full.push(leaf);
+            open_regular_file_nofollow(&full)
+        }
+    }
+}
+
 /// Opens `relative` beneath `root` while enforcing directory-handle-relative containment on
 /// every path segment (`O_NOFOLLOW` + `O_DIRECTORY` for intermediate dirs and `O_NOFOLLOW` +
 /// `O_NONBLOCK` for the leaf regular file on Unix).
 pub fn open_contained_regular_file(root: &Path, relative: &Path) -> io::Result<File> {
-    use std::path::Component;
-
-    let mut segments = Vec::new();
-    for component in relative.components() {
-        match component {
-            Component::Normal(seg) => segments.push(seg),
-            Component::CurDir => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Relative path escapes allowed root.",
-                ));
-            }
-        }
-    }
-    let Some((leaf, parents)) = segments.split_last() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Path does not name a file inside the allowed root.",
-        ));
-    };
-
-    #[cfg(unix)]
-    {
-        use rustix::fs::{Mode, OFlags, open, openat};
-        let mut dir_fd = open(
-            root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )?;
-        for seg in parents {
-            dir_fd = openat(
-                &dir_fd,
-                *seg,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )?;
-        }
-        let leaf_fd = openat(
-            &dir_fd,
-            *leaf,
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )?;
-        let file = File::from(leaf_fd);
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Path is not a regular file.",
-            ));
-        }
-        Ok(file)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let mut full = root.to_path_buf();
-        for seg in parents {
-            full.push(seg);
-        }
-        full.push(leaf);
-        open_regular_file_nofollow(&full)
-    }
+    ContainedDir::open_directory(root)?.open_regular_file(relative)
 }
 
 /// OS-level file identity (`(dev, ino)` on Unix, `(volume_serial, file_id)` on Windows)

@@ -113,7 +113,8 @@ pub use sort::{
     estimate_sort_temporary_bytes,
 };
 pub use source_stamp::{
-    FileIdentity, SourceGuard, open_contained_regular_file, open_regular_file_nofollow,
+    ContainedDir, FileIdentity, SourceGuard, open_contained_regular_file,
+    open_regular_file_nofollow,
 };
 pub use storage::{
     StorageSpace, check_storage, estimate_duplicate_target_temporary_bytes,

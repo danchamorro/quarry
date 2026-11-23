@@ -516,7 +516,7 @@ fn omarchy_candidate_generation_files(home: &Path) -> [PathBuf; 3] {
 /// path-swap TOCTOU races, FIFOs, and oversized files are rejected cleanly.
 fn read_allowlisted_file(
     candidate: &Path,
-    canonical_roots: &[PathBuf],
+    allowed_roots: &[quarry_core::ContainedDir],
     max_bytes: u64,
 ) -> Result<Option<String>, String> {
     if !candidate.exists() && std::fs::symlink_metadata(candidate).is_err() {
@@ -528,16 +528,18 @@ fn read_allowlisted_file(
             candidate.display()
         )
     })?;
-    let Some((root, relative)) = canonical_roots
-        .iter()
-        .find_map(|root| canonical.strip_prefix(root).ok().map(|rel| (root, rel)))
-    else {
+    let Some((root, relative)) = allowed_roots.iter().find_map(|root| {
+        canonical
+            .strip_prefix(root.path())
+            .ok()
+            .map(|rel| (root, rel))
+    }) else {
         return Err(format!(
             "Refused to read Omarchy theme file outside allowed roots ({}).",
             candidate.display()
         ));
     };
-    let file = quarry_core::open_contained_regular_file(root, relative).map_err(|error| {
+    let file = root.open_regular_file(relative).map_err(|error| {
         if error.kind() == std::io::ErrorKind::InvalidInput {
             format!(
                 "Omarchy theme path {} is not a regular file.",
@@ -593,7 +595,7 @@ fn read_allowlisted_file(
     })
 }
 
-fn canonical_omarchy_roots(home: &Path) -> Vec<PathBuf> {
+fn open_omarchy_roots(home: &Path) -> Vec<quarry_core::ContainedDir> {
     if !home.is_absolute() {
         return Vec::new();
     }
@@ -606,8 +608,13 @@ fn canonical_omarchy_roots(home: &Path) -> Vec<PathBuf> {
         .filter_map(|root| {
             let resolved = std::fs::canonicalize(&root).ok()?;
             // Accept a configured root only when it resolves to one of the three canonical
-            // allowlisted Omarchy directories beneath `canon_home`, rejecting symlink escapes.
-            expected.contains(&resolved).then_some(resolved)
+            // allowlisted Omarchy directories beneath `canon_home`, then immediately bind it to
+            // a retained directory handle so later ancestor swaps cannot escape containment.
+            if expected.contains(&resolved) {
+                quarry_core::ContainedDir::open_directory(&resolved).ok()
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -615,7 +622,7 @@ fn canonical_omarchy_roots(home: &Path) -> Vec<PathBuf> {
 /// Computes a lightweight fingerprint for the active Omarchy theme beneath `home` so a UI
 /// polling loop can detect live theme switches without extra watcher dependencies.
 pub fn omarchy_theme_fingerprint(home: &Path) -> Option<String> {
-    let roots = canonical_omarchy_roots(home);
+    let roots = open_omarchy_roots(home);
     if roots.is_empty() {
         return None;
     }
@@ -631,10 +638,13 @@ pub fn omarchy_theme_fingerprint(home: &Path) -> Option<String> {
     }
     for color_file in omarchy_candidate_color_files(home) {
         if let Ok(canonical) = std::fs::canonicalize(&color_file)
-            && let Some((root, relative)) = roots
-                .iter()
-                .find_map(|root| canonical.strip_prefix(root).ok().map(|rel| (root, rel)))
-            && let Ok(file) = quarry_core::open_contained_regular_file(root, relative)
+            && let Some((root, relative)) = roots.iter().find_map(|root| {
+                canonical
+                    .strip_prefix(root.path())
+                    .ok()
+                    .map(|rel| (root, rel))
+            })
+            && let Ok(file) = root.open_regular_file(relative)
             && let Ok(meta) = file.metadata()
             && meta.is_file()
             && meta.len() <= MAX_OMARCHY_THEME_BYTES
@@ -664,15 +674,15 @@ pub fn load_omarchy_theme_from_home(
     if !home.is_absolute() {
         return Err("Home directory is not absolute; cannot load Omarchy theme.".into());
     }
-    let canonical_roots = canonical_omarchy_roots(home);
-    if canonical_roots.is_empty() {
+    let allowed_roots = open_omarchy_roots(home);
+    if allowed_roots.is_empty() {
         return Err("No Omarchy theme directory was found.".into());
     }
 
     let mut last_error: Option<String> = None;
     let mut loaded_contents: Option<String> = None;
     for candidate in omarchy_candidate_color_files(home) {
-        match read_allowlisted_file(&candidate, &canonical_roots, MAX_OMARCHY_THEME_BYTES) {
+        match read_allowlisted_file(&candidate, &allowed_roots, MAX_OMARCHY_THEME_BYTES) {
             Ok(Some(contents)) => {
                 loaded_contents = Some(contents);
                 break;
@@ -693,7 +703,7 @@ pub fn load_omarchy_theme_from_home(
     let theme_name = omarchy_candidate_name_files(home)
         .into_iter()
         .find_map(|path| {
-            read_allowlisted_file(&path, &canonical_roots, MAX_OMARCHY_GENERATION_BYTES)
+            read_allowlisted_file(&path, &allowed_roots, MAX_OMARCHY_GENERATION_BYTES)
                 .ok()
                 .flatten()
                 .map(|s| s.trim().to_owned())
@@ -1431,5 +1441,38 @@ cyan = "#449dab"
         );
         assert!(resolved.warning.is_none());
         assert!(palette_meets_wcag_aa(&resolved.palette));
+
+        // Swapping a root's ancestor directory with a symlink to an external directory AFTER
+        // binding the allowed root handle must NOT redirect relative opens to the swapped target.
+        let home3 = tempfile::tempdir().unwrap();
+        let orig_cfg = home3.path().join(".config");
+        let orig_root = orig_cfg.join("omarchy");
+        let orig_theme = orig_root.join("current/theme");
+        std::fs::create_dir_all(&orig_theme).unwrap();
+        std::fs::write(orig_theme.join("colors.toml"), "original\n").unwrap();
+
+        let roots = open_omarchy_roots(home3.path());
+        assert_eq!(roots.len(), 1);
+        let bound_root = &roots[0];
+
+        let swapped_outside = tempfile::tempdir().unwrap();
+        let evil_theme = swapped_outside.path().join("omarchy/current/theme");
+        std::fs::create_dir_all(&evil_theme).unwrap();
+        std::fs::write(evil_theme.join("colors.toml"), "swapped-evil\n").unwrap();
+
+        let moved_cfg = home3.path().join(".config-moved");
+        std::fs::rename(&orig_cfg, &moved_cfg).unwrap();
+        symlink(swapped_outside.path(), &orig_cfg).unwrap();
+
+        let mut content = String::new();
+        bound_root
+            .open_regular_file(Path::new("current/theme/colors.toml"))
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(
+            content, "original\n",
+            "retained root directory handle must remain bound to original inode after ancestor swap"
+        );
     }
 }

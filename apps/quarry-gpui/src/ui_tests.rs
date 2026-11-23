@@ -2155,6 +2155,14 @@ fn two_hundred_tabs_across_four_windows_stay_bounded_and_preserve_dirty_work(
         });
     }
     cx.update(|cx| {
+        let sched = controller.read(cx).scheduler();
+        assert_eq!(
+            sched.residency(dirty_doc),
+            Some(quarry_workbench::ResidencyState::DormantDirty),
+            "dirty tab must have been evicted to DormantDirty before wake verification"
+        );
+    });
+    cx.update(|cx| {
         controller.update(cx, |c, cx| {
             c.activate_tab(w1_id, dirty_doc, cx).unwrap();
         });
