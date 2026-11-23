@@ -26,8 +26,8 @@ use gpui_kit::{
 };
 use quarry_core::{Encoding, OpenOptions};
 use quarry_workbench::{
-    AppMessage, CommandId, DocumentId, FailedOpen, MessageSeverity, ResidencyState, WindowId,
-    compressed::uncompressed_name, format_bytes,
+    AppMessage, CommandId, DocumentId, FailedOpen, MessageSeverity, ResidencyState, ResolvedTheme,
+    ThemeAppearance, ThemePreference, WindowId, compressed::uncompressed_name, format_bytes,
 };
 
 use find_bar::{FindBar, FindBarEvent};
@@ -39,8 +39,9 @@ use menus::{
     InspectFile, JoinFiles, MoveColumns, MoveTabToNewWindow, NewWindow, NextTab, OpenFile,
     OpenIso88591, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252, PreviousTab,
     QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText, SaveAsFile,
-    SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage,
-    ToggleColumns, ToggleFilters, UndoEdit, bind_shortcuts, encoding_label, install_menus,
+    SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage, ThemeDark,
+    ThemeLight, ThemeOmarchy, ThemeSystem, ToggleColumns, ToggleFilters, UndoEdit, bind_shortcuts,
+    encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use workbench::{
@@ -91,7 +92,23 @@ impl QuarryWindow {
         let panels = cx.new(|cx| Panels::new(window, cx));
         let find_bar = cx.new(|cx| FindBar::new(controller.clone(), window_id, window, cx));
         let row_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
+        let initial_appearance = window_appearance_to_theme(window.appearance());
+        if let Some(resolved) =
+            controller.update(cx, |c, cx| c.sync_system_appearance(initial_appearance, cx))
+        {
+            apply_resolved_theme(&resolved, cx);
+        }
         let subscriptions = vec![
+            cx.observe_window_appearance(window, |this, window, cx| {
+                let appearance = window_appearance_to_theme(window.appearance());
+                if let Some(resolved) = this
+                    .controller
+                    .update(cx, |c, cx| c.sync_system_appearance(appearance, cx))
+                {
+                    apply_resolved_theme(&resolved, cx);
+                    cx.refresh_windows();
+                }
+            }),
             cx.observe_in(&controller, window, |this, _, window, cx| {
                 this.sync_from_controller(window, cx);
             }),
@@ -1901,6 +1918,71 @@ impl QuarryWindow {
         workflows_ui::open_temporary_storage_dialog(self.controller.clone(), on_closed, window, cx);
     }
 
+    fn set_theme_preference(&mut self, preference: ThemePreference, cx: &mut Context<Self>) {
+        if let Ok(resolved) = self
+            .controller
+            .update(cx, |c, cx| c.set_theme_preference(preference, cx))
+        {
+            apply_resolved_theme(&resolved, cx);
+            cx.refresh_windows();
+        }
+    }
+
+    #[inline(never)]
+    fn render_theme_banner(
+        &self,
+        tokens: &quarry_workbench::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let text = self.controller.read(cx).theme_warning()?.to_owned();
+        let can_dismiss = self.controller.read(cx).resolved_theme().warning.is_none();
+        Some(
+            div()
+                .id("theme-warning-banner")
+                .role(Role::Status)
+                .aria_label(text.clone())
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                .text_color(rgb(tokens.warning_text.to_rgb_hex()))
+                .child(div().flex_1().min_w_0().child(text))
+                .when(can_dismiss, |bar| {
+                    bar.child(
+                        Button::new("dismiss-theme-warning")
+                            .label("×")
+                            .accessibility_label("Dismiss theme notice")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.controller.update(cx, |c, cx| c.clear_theme_error(cx));
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn theme_system_action(&mut self, _: &ThemeSystem, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme_preference(ThemePreference::System, cx);
+    }
+
+    fn theme_light_action(&mut self, _: &ThemeLight, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme_preference(ThemePreference::Light, cx);
+    }
+
+    fn theme_dark_action(&mut self, _: &ThemeDark, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme_preference(ThemePreference::Dark, cx);
+    }
+
+    fn theme_omarchy_action(&mut self, _: &ThemeOmarchy, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme_preference(ThemePreference::Omarchy, cx);
+    }
+
     fn about_quarry_action(
         &mut self,
         _: &AboutQuarry,
@@ -2247,7 +2329,7 @@ impl Render for QuarryWindow {
         let filters = self
             .panels
             .update(cx, |panels, cx| panels.render_filters(window, cx));
-        let tokens = &quarry_workbench::theme::LIGHT;
+        let tokens = self.controller.read(cx).active_palette();
         let message = self
             .controller
             .read(cx)
@@ -2301,6 +2383,10 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::split_column_action))
             .on_action(cx.listener(Self::combine_columns_action))
             .on_action(cx.listener(Self::toggle_whitespace_action))
+            .on_action(cx.listener(Self::theme_system_action))
+            .on_action(cx.listener(Self::theme_light_action))
+            .on_action(cx.listener(Self::theme_dark_action))
+            .on_action(cx.listener(Self::theme_omarchy_action))
             .on_action(cx.listener(Self::toggle_columns_action))
             .on_action(cx.listener(Self::toggle_filters_action))
             .on_action(cx.listener(Self::combine_files_action))
@@ -2578,10 +2664,10 @@ impl Render for QuarryWindow {
         }
 
         if let Some(ref snap) = info {
-            if let Some(banner) = self.render_gzip_banner(snap, tokens, cx) {
+            if let Some(banner) = self.render_gzip_banner(snap, &tokens, cx) {
                 body = body.child(banner);
             }
-            if let Some(banner) = self.render_operation_banner(snap, tokens, cx) {
+            if let Some(banner) = self.render_operation_banner(snap, &tokens, cx) {
                 body = body.child(banner);
             }
         }
@@ -2682,6 +2768,10 @@ impl Render for QuarryWindow {
                             ),
                     ),
             );
+        }
+
+        if let Some(theme_banner) = self.render_theme_banner(&tokens, cx) {
+            body = body.child(theme_banner);
         }
 
         if let Some(msg) = message {
@@ -2838,6 +2928,7 @@ impl Render for QuarryWindow {
                 .border_color(cx.theme().border)
                 .bg(rgb(tokens.chrome.to_rgb_hex()))
                 .text_size(px(12.))
+                .font_features(grid::tabular_font_features())
                 .text_color(cx.theme().muted_foreground)
                 .child(status)
                 .child(div().flex_1())
@@ -2859,9 +2950,56 @@ fn number(value: u64) -> String {
     out
 }
 
-fn apply_light_theme(cx: &mut App) {
-    Theme::change(ThemeMode::Light, None, cx);
-    let tokens = &quarry_workbench::theme::LIGHT;
+fn window_appearance_to_theme(appearance: WindowAppearance) -> ThemeAppearance {
+    match appearance {
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeAppearance::Dark,
+        WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeAppearance::Light,
+    }
+}
+
+pub(crate) fn apply_resolved_theme(resolved: &ResolvedTheme, cx: &mut App) {
+    let mode = match resolved.appearance {
+        ThemeAppearance::Light => ThemeMode::Light,
+        ThemeAppearance::Dark => ThemeMode::Dark,
+    };
+    Theme::change(mode, None, cx);
+    let tokens = &resolved.palette;
+    let is_dark = resolved.appearance == ThemeAppearance::Dark;
+    let contrast_safe_primary_variant =
+        |preferred: quarry_workbench::Rgba, alternate: quarry_workbench::Rgba| {
+            if quarry_workbench::contrast_ratio(tokens.on_accent, preferred) >= 4.5 {
+                preferred
+            } else if quarry_workbench::contrast_ratio(tokens.on_accent, alternate) >= 4.5 {
+                alternate
+            } else {
+                tokens.selection_strong
+            }
+        };
+    let primary_hover = contrast_safe_primary_variant(
+        tokens.selection_strong.blend(
+            if is_dark {
+                tokens.text
+            } else {
+                tokens.on_accent
+            },
+            0.10,
+        ),
+        tokens.selection_strong.blend(tokens.canvas, 0.10),
+    );
+    let primary_active = contrast_safe_primary_variant(
+        tokens.selection_strong.blend(
+            if is_dark {
+                tokens.canvas
+            } else {
+                tokens.on_accent
+            },
+            0.18,
+        ),
+        tokens
+            .selection_strong
+            .blend(if is_dark { tokens.text } else { tokens.canvas }, 0.16),
+    );
+
     let theme = Theme::global_mut(cx);
     theme.font_size = px(quarry_workbench::theme::GRID_FONT_SIZE);
     theme.radius = px(f32::from(quarry_workbench::theme::CONTROL_RADIUS));
@@ -2869,25 +3007,84 @@ fn apply_light_theme(cx: &mut App) {
     theme.colors.background = rgb(tokens.chrome.to_rgb_hex()).into();
     theme.colors.foreground = rgb(tokens.text.to_rgb_hex()).into();
     theme.colors.border = rgb(tokens.separator.to_rgb_hex()).into();
+    theme.colors.input = rgb(tokens.control_border.to_rgb_hex()).into();
+    theme.colors.ring = rgb(tokens.selection_strong.to_rgb_hex()).into();
+    theme.colors.muted = rgb(tokens.hover.to_rgb_hex()).into();
     theme.colors.muted_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
-    theme.colors.primary = rgb(quarry_workbench::theme::ACCENT.to_rgb_hex()).into();
-    theme.colors.primary_hover = rgb(0xe4b23c).into();
-    theme.colors.primary_active = rgb(0xd8a32e).into();
+    theme.colors.accent = rgb(tokens.hover.to_rgb_hex()).into();
+    theme.colors.accent_foreground = rgb(tokens.text.to_rgb_hex()).into();
+    theme.colors.secondary = rgb(tokens.control.to_rgb_hex()).into();
+    theme.colors.secondary_hover = rgb(tokens.hover.to_rgb_hex()).into();
+    theme.colors.secondary_active = rgb(tokens.pressed.to_rgb_hex()).into();
+    theme.colors.secondary_foreground = rgb(tokens.text.to_rgb_hex()).into();
+    theme.colors.button = rgb(tokens.control.to_rgb_hex()).into();
+    theme.colors.button_hover = rgb(tokens.hover.to_rgb_hex()).into();
+    theme.colors.button_active = rgb(tokens.pressed.to_rgb_hex()).into();
+    theme.colors.button_foreground = rgb(tokens.text.to_rgb_hex()).into();
+    theme.colors.primary = rgb(tokens.selection_strong.to_rgb_hex()).into();
+    theme.colors.primary_hover = rgb(primary_hover.to_rgb_hex()).into();
+    theme.colors.primary_active = rgb(primary_active.to_rgb_hex()).into();
     theme.colors.primary_foreground = rgb(tokens.on_accent.to_rgb_hex()).into();
+    theme.colors.button_primary = theme.colors.primary;
+    theme.colors.button_primary_hover = theme.colors.primary_hover;
+    theme.colors.button_primary_active = theme.colors.primary_active;
+    theme.colors.button_primary_foreground = theme.colors.primary_foreground;
     theme.colors.table = rgb(tokens.canvas.to_rgb_hex()).into();
     theme.colors.table_even = rgb(tokens.zebra.to_rgb_hex()).into();
     theme.colors.table_head = rgb(tokens.header_fill.to_rgb_hex()).into();
     theme.colors.table_head_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
     theme.colors.table_row_border = rgb(tokens.grid_line.to_rgb_hex()).into();
+    theme.colors.table_hover = rgb(tokens.hover.to_rgb_hex()).into();
     theme.colors.table_active = rgb(tokens.selection.to_rgb_hex()).into();
     theme.colors.table_active_border = rgb(tokens.selection_strong.to_rgb_hex()).into();
+    theme.colors.list = rgb(tokens.canvas.to_rgb_hex()).into();
+    theme.colors.list_hover = rgb(tokens.hover.to_rgb_hex()).into();
+    theme.colors.list_active = rgb(tokens.selection.to_rgb_hex()).into();
+    theme.colors.list_active_border = rgb(tokens.selection_strong.to_rgb_hex()).into();
     theme.colors.popover = rgb(tokens.canvas.to_rgb_hex()).into();
-    theme.colors.button_primary = theme.colors.primary;
-    theme.colors.button_primary_hover = theme.colors.primary_hover;
-    theme.colors.button_primary_active = theme.colors.primary_active;
-    theme.colors.button_primary_foreground = theme.colors.primary_foreground;
+    theme.colors.popover_foreground = rgb(tokens.text.to_rgb_hex()).into();
+    theme.colors.link = rgb(tokens.accent_text.to_rgb_hex()).into();
+    theme.colors.link_hover = rgb(tokens.accent_text.to_rgb_hex()).into();
+    theme.colors.link_active = rgb(tokens.accent_text.to_rgb_hex()).into();
+    theme.colors.danger = rgb(tokens.error_text.to_rgb_hex()).into();
+    theme.colors.danger_foreground = rgb(tokens.canvas.to_rgb_hex()).into();
+    theme.colors.button_danger = rgb(tokens.error_fill.to_rgb_hex()).into();
+    theme.colors.button_danger_hover = rgb(tokens
+        .error_fill
+        .blend(tokens.error_text, 0.14)
+        .to_rgb_hex())
+    .into();
+    theme.colors.button_danger_active = rgb(tokens
+        .error_fill
+        .blend(tokens.error_text, 0.24)
+        .to_rgb_hex())
+    .into();
+    theme.colors.button_danger_foreground = rgb(tokens.error_text.to_rgb_hex()).into();
+    theme.colors.warning = rgb(tokens.warning_text.to_rgb_hex()).into();
+    theme.colors.warning_foreground = rgb(tokens.canvas.to_rgb_hex()).into();
+    theme.colors.button_warning = rgb(tokens.warning_fill.to_rgb_hex()).into();
+    theme.colors.button_warning_hover = rgb(tokens
+        .warning_fill
+        .blend(tokens.warning_text, 0.14)
+        .to_rgb_hex())
+    .into();
+    theme.colors.button_warning_active = rgb(tokens
+        .warning_fill
+        .blend(tokens.warning_text, 0.24)
+        .to_rgb_hex())
+    .into();
+    theme.colors.button_warning_foreground = rgb(tokens.warning_text.to_rgb_hex()).into();
+    theme.colors.success = rgb(tokens.success_text.to_rgb_hex()).into();
+    theme.colors.success_foreground = rgb(tokens.canvas.to_rgb_hex()).into();
     theme.tokens = theme.colors.into();
     Theme::sync_base(cx);
+}
+
+#[cfg(test)]
+fn apply_light_theme(cx: &mut App) {
+    let light =
+        quarry_workbench::resolve_theme(ThemePreference::Light, ThemeAppearance::Light, None);
+    apply_resolved_theme(&light, cx);
 }
 
 fn open_quarry_window(
@@ -2935,10 +3132,11 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            apply_light_theme(cx);
             bind_shortcuts(cx);
             install_menus(cx);
             let controller = WorkbenchController::init(cx);
+            let initial_theme = controller.read(cx).resolved_theme().clone();
+            apply_resolved_theme(&initial_theme, cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

@@ -44,6 +44,10 @@ gpui_kit::actions!(
         SplitColumn,
         CombineColumns,
         ShowAllWhitespace,
+        ThemeSystem,
+        ThemeLight,
+        ThemeDark,
+        ThemeOmarchy,
         ToggleColumns,
         ToggleFilters,
         CombineFiles,
@@ -218,6 +222,17 @@ pub fn build_app_menus() -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("Show All Whitespace", ShowAllWhitespace),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu {
+                    name: "Theme".into(),
+                    disabled: false,
+                    items: vec![
+                        MenuItem::action("System", ThemeSystem),
+                        MenuItem::action("Light", ThemeLight),
+                        MenuItem::action("Dark", ThemeDark),
+                        MenuItem::action("Omarchy", ThemeOmarchy),
+                    ],
+                }),
                 MenuItem::separator(),
                 MenuItem::action("Columns…", ToggleColumns),
                 MenuItem::action("Filters…", ToggleFilters),
