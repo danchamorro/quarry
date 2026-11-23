@@ -28,7 +28,11 @@ pub enum Command {
 pub enum Response {
     Opened(DocumentInfo),
     Info(DocumentInfo),
-    Viewport(Viewport),
+    Viewport {
+        generation: u64,
+        sequence: u64,
+        viewport: Viewport,
+    },
     Cell {
         row: u64,
         column: usize,
@@ -246,7 +250,11 @@ fn worker(
                     generation,
                     Some(request.sequence),
                     result
-                        .map(Response::Viewport)
+                        .map(|viewport| Response::Viewport {
+                            generation,
+                            sequence: request.sequence,
+                            viewport,
+                        })
                         .unwrap_or_else(Response::Error),
                 ))
                 .is_err()
@@ -443,8 +451,12 @@ impl Grid {
         }
     }
 
-    pub fn set_viewport(&mut self, viewport: Viewport) {
-        self.viewport = Some(viewport);
+    pub fn set_viewport(&mut self, generation: u64, sequence: u64, viewport: Viewport) {
+        if generation == self.requester.generation.load(Ordering::Acquire)
+            && sequence == self.requester.sequence.load(Ordering::Acquire)
+        {
+            self.viewport = Some(viewport);
+        }
     }
 
     pub fn invalidate(&mut self) {
@@ -611,10 +623,19 @@ mod tests {
     use super::*;
     use crate::document::ViewportRow;
 
-    fn until(bridge: &Bridge, matches: impl Fn(&Response) -> bool) -> Vec<Response> {
+    fn until(
+        bridge: &Bridge,
+        mut grid: Option<&mut Grid>,
+        matches: impl Fn(&Response) -> bool,
+    ) -> Vec<Response> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut responses = Vec::new();
         loop {
+            if let Some(grid) = grid.as_deref_mut()
+                && grid.retry_request
+            {
+                grid.request(false);
+            }
             let batch = bridge.drain();
             for response in &batch {
                 if let Response::Error(error) = response {
@@ -647,7 +668,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        let opened = until(&bridge, |response| matches!(response, Response::Done));
+        let opened = until(&bridge, None, |response| matches!(response, Response::Done));
         assert!(
             opened
                 .iter()
@@ -662,20 +683,24 @@ mod tests {
             .unwrap();
         grid.set_info(info);
         for value in ["edited once", "edited twice"] {
-            let viewport = until(&bridge, |response| {
-                matches!(response, Response::Viewport(_))
+            let (generation, sequence, viewport) = until(&bridge, Some(&mut grid), |response| {
+                matches!(response, Response::Viewport { .. })
             })
             .into_iter()
             .find_map(|response| match response {
-                Response::Viewport(viewport) => Some(viewport),
+                Response::Viewport {
+                    generation,
+                    sequence,
+                    viewport,
+                } => Some((generation, sequence, viewport)),
                 _ => None,
             })
             .unwrap();
-            grid.set_viewport(viewport);
+            grid.set_viewport(generation, sequence, viewport);
             assert_eq!(grid.cell_at(0, 1), Some((1, 0)));
             assert_eq!(grid.display(0, 0), "1");
             bridge.send(Command::Edit(1, 0, value.into())).unwrap();
-            let replies = until(&bridge, |response| matches!(response, Response::Done));
+            let replies = until(&bridge, None, |response| matches!(response, Response::Done));
             let info = replies
                 .into_iter()
                 .find_map(|response| match response {
@@ -688,13 +713,13 @@ mod tests {
             assert!(grid.viewport.is_none(), "an edit invalidates cached cells");
         }
         bridge.send(Command::Cell(1, 0)).unwrap();
-        let replies = until(&bridge, |response| matches!(response, Response::Done));
+        let replies = until(&bridge, None, |response| matches!(response, Response::Done));
         assert!(replies.iter().any(|response| matches!(response,
             Response::Cell { value, .. } if value == "edited twice")));
         bridge
             .send(Command::SaveCopy(directory.path().join("saved.csv")))
             .unwrap();
-        let replies = until(&bridge, |response| matches!(response, Response::Done));
+        let replies = until(&bridge, None, |response| matches!(response, Response::Done));
         assert!(
             replies
                 .iter()
@@ -730,14 +755,18 @@ mod tests {
         assert_eq!(bridge.drain().len(), 1);
         let mut grid = Grid::new(requester);
         grid.columns = vec![299, 0, 150];
-        grid.set_viewport(Viewport {
+        let sample = Viewport {
             start: 900,
             columns: vec![299, 0, 150],
             rows: vec![ViewportRow {
                 source_row: 1201,
                 cells: vec!["last".into(), "first".into(), "middle".into()],
             }],
-        });
+        };
+        // Stale sequence must be rejected at installation time even if drained in the same batch.
+        grid.set_viewport(0, 1, sample.clone());
+        assert_eq!(grid.cell_at(900, 1), None);
+        grid.set_viewport(0, 2, sample);
         assert_eq!(grid.cell_at(900, 1), Some((1201, 299)));
         assert_eq!(grid.cell_at(900, 3), Some((1201, 150)));
         assert_eq!(grid.cell_at(900, 0), None);

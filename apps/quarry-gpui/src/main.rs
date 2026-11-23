@@ -172,7 +172,7 @@ impl Quarry {
             match response {
                 Response::Opened(info) => {
                     self.panels
-                        .update(cx, |panels, cx| panels.finish_reopen(true, cx));
+                        .update(cx, |panels, cx| panels.finish_reopen(true, window, cx));
                     self.table.update(cx, |table, cx| {
                         table.delegate_mut().set_info(info.clone());
                         table.delegate_mut().reset_columns();
@@ -199,8 +199,14 @@ impl Quarry {
                     });
                     self.update_info(info, window, cx);
                 }
-                Response::Viewport(viewport) => self.table.update(cx, |table, cx| {
-                    table.delegate_mut().set_viewport(viewport);
+                Response::Viewport {
+                    generation,
+                    sequence,
+                    viewport,
+                } => self.table.update(cx, |table, cx| {
+                    table
+                        .delegate_mut()
+                        .set_viewport(generation, sequence, viewport);
                     cx.notify();
                 }),
                 Response::Cell { row, column, value } => {
@@ -234,11 +240,8 @@ impl Quarry {
                         });
                     }
                     self.panels
-                        .update(cx, |panels, cx| panels.finish_reopen(false, cx));
+                        .update(cx, |panels, cx| panels.finish_reopen(false, window, cx));
                     self.message = Some((error, true));
-                    self.busy = false;
-                    self.panels
-                        .update(cx, |panels, cx| panels.set_busy(false, cx));
                 }
             }
         }
@@ -774,7 +777,11 @@ impl Render for Quarry {
                 )
             }
         } else {
-            "⌘O to open".into()
+            #[cfg(target_os = "macos")]
+            let hint = "⌘O to open";
+            #[cfg(not(target_os = "macos"))]
+            let hint = "Ctrl+O to open";
+            hint.into()
         };
         body.child(
             div()

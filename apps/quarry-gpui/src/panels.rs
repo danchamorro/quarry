@@ -215,26 +215,25 @@ impl Panels {
             }
             self.refresh_matches(cx);
         } else if self.path.as_ref() != Some(&info.path) || self.headers != info.headers {
-            let new_path = self.path.as_ref() != Some(&info.path);
             self.close(window, cx);
             self.path = Some(info.path.clone());
             self.headers = info.headers.clone();
+            let mut is_shown = vec![false; self.headers.len()];
+            for &source in &shown {
+                if let Some(flag) = is_shown.get_mut(source) {
+                    *flag = true;
+                }
+            }
             self.order = shown.clone();
             self.order
-                .extend((0..self.headers.len()).filter(|source| !shown.contains(source)));
-            self.shown = (0..self.headers.len())
-                .map(|source| shown.contains(&source))
-                .collect();
+                .extend((0..self.headers.len()).filter(|&source| !is_shown[source]));
+            self.shown = is_shown;
             self.search
                 .update(cx, |state, cx| state.set_value("", window, cx));
             self.refresh_matches(cx);
             self.rules.clear();
             self.match_case = false;
             self.add_rule(window, cx);
-            if new_path {
-                self.applied_format = (0, 0);
-                self.restore_format(window, cx);
-            }
         }
         if !self
             .order
@@ -244,17 +243,21 @@ impl Panels {
             .eq(shown.iter().copied())
         {
             // A successful reopen can reset the grid while keeping the same headers.
+            let mut is_shown = vec![false; self.headers.len()];
+            for &source in &shown {
+                if let Some(flag) = is_shown.get_mut(source) {
+                    *flag = true;
+                }
+            }
             let hidden = self
                 .order
                 .iter()
                 .copied()
-                .filter(|source| !shown.contains(source))
+                .filter(|&source| !is_shown.get(source).copied().unwrap_or(false))
                 .collect::<Vec<_>>();
             self.order = shown.clone();
             self.order.extend(hidden);
-            self.shown = (0..self.headers.len())
-                .map(|source| shown.contains(&source))
-                .collect();
+            self.shown = is_shown;
             self.refresh_matches(cx);
         }
         cx.notify();
@@ -267,11 +270,16 @@ impl Panels {
         }
     }
 
-    pub fn finish_reopen(&mut self, success: bool, cx: &mut Context<Self>) {
+    pub fn finish_reopen(&mut self, success: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(format) = self.pending_format.take() {
             if success {
                 self.applied_format = format;
+                cx.notify();
             }
+        } else if success {
+            // A successful picker or startup Open uses OpenOptions::default() (Auto).
+            self.applied_format = (0, 0);
+            self.restore_format(window, cx);
             cx.notify();
         }
     }
@@ -859,7 +867,7 @@ impl Panels {
                     div()
                         .text_size(px(12.))
                         .text_color(cx.theme().muted_foreground)
-                        .child("Save edits before changing the format."),
+                        .child("Undo all edits, or save a copy and open it, before changing the format."),
                 )
             })
             .child(

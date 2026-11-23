@@ -116,10 +116,15 @@ impl Document {
             .max(self.session.first_rows.len() as u64)
             .saturating_sub(self.data_start());
         let filter_progress = self.filter.as_ref().map(FilterJob::progress);
+        let mut headers = self.headers.clone();
+        let discovered_columns = index_progress.columns_found.min(65_536);
+        for column in headers.len()..discovered_columns {
+            headers.push(self.header_name(column));
+        }
         Ok(DocumentInfo {
             path: self.session.path().to_path_buf(),
             file_size: self.session.file_size,
-            headers: self.headers.clone(),
+            headers,
             delimiter: self.session.dialect.delimiter,
             has_header: self.session.dialect.has_header,
             total_rows,
@@ -338,11 +343,17 @@ impl Document {
 
     fn read_source_rows(&self, start: u64, count: usize) -> Result<Vec<Row>, String> {
         let snapshot = self.index.snapshot();
-        if start < snapshot.indexed_rows() {
-            return self
+        let bootstrap_len = self.session.first_rows.len() as u64;
+        if start < snapshot.indexed_rows()
+            && (snapshot.indexed_rows() >= bootstrap_len
+                || start.saturating_add(count as u64) <= snapshot.indexed_rows())
+        {
+            let rows = self
                 .session
                 .read_rows(&snapshot, start, count)
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string())?;
+            self.check_source()?;
+            return Ok(rows);
         }
         // Bootstrap rows remain usable while the progressive index catches up.
         Ok(self
@@ -376,19 +387,22 @@ impl Document {
         }
     }
 
+    fn header_name(&self, column: usize) -> String {
+        self.session
+            .first_rows
+            .first()
+            .filter(|_| self.session.dialect.has_header)
+            .and_then(|row| row.fields.get(column))
+            .map_or_else(
+                || format!("Column {}", column + 1),
+                |bytes| display_text(bytes),
+            )
+    }
+
     fn extend_headers(&mut self, count: usize) {
-        for column in self.headers.len()..count {
-            self.headers.push(
-                self.session
-                    .first_rows
-                    .first()
-                    .filter(|_| self.session.dialect.has_header)
-                    .and_then(|row| row.fields.get(column))
-                    .map_or_else(
-                        || format!("Column {}", column + 1),
-                        |bytes| display_text(bytes),
-                    ),
-            );
+        let limit = count.min(65_536);
+        for column in self.headers.len()..limit {
+            self.headers.push(self.header_name(column));
         }
     }
 }

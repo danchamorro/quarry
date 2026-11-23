@@ -1,26 +1,29 @@
 # Quarry GPUI comparison
 
-A working, local comparison of the compact Quarry design using GPUI Kit 0.6.1
-and the existing `quarry-core` engine. The production egui app remains selected;
-this is an experiment to evaluate appearance, interactions, and scrolling.
+A working comparison of the compact Quarry design using GPUI Kit 0.10.0,
+`quarry-workbench`, and the existing `quarry-core` engine. The production egui
+app (`apps/quarry-egui`) remains the default packaged macOS target until the
+Phase 4B-3 cutover; this workspace member is used for GPUI hardening,
+accessibility/platform verification, and progressive feature parity.
 
 ## Run
 
 ```sh
-cd apps/quarry-gpui
-cargo run --release --locked
+cargo run -p quarry-gpui --release --locked
 # Or open a file at startup:
-cargo run --release --locked -- /absolute/path/to/file.csv
+cargo run -p quarry-gpui --release --locked -- /absolute/path/to/file.csv
 ```
 
-This directory is an independent Cargo workspace with its own lockfile and
-Rust 1.97.1 toolchain. Run commands from this directory so rustup selects that
-toolchain. The production workspace, Rust version, lockfile, and installed
-`/Applications/Quarry.app` are unaffected.
+This crate is a member of the root Cargo workspace and shares the root
+`Cargo.lock` and pinned Rust 1.100.0 toolchain (`rust-toolchain.toml`). Commands
+can be run from the repository root (`-p quarry-gpui`) or from `apps/quarry-gpui`.
+The production macOS `.app` bundle (`scripts/macos-app.sh`) still packages
+`apps/quarry-egui` until Phase 4B-3.
 
 ## Try
 
-- Open a CSV or other delimited file through the native picker, or press Cmd+O.
+- Open a CSV or other delimited file through the native picker, or press
+  Cmd+O (macOS) / Ctrl+O (Linux and Windows).
 - Scroll vertically and horizontally. Drag column boundaries to resize.
   Home/End navigate to the first/last column. Native trackpad horizontal
   scrolling remains a manual comparison check; see `VALIDATION.md`.
@@ -33,9 +36,10 @@ toolchain. The production workspace, Rust version, lockfile, and installed
 - Double-click a data cell, or select it and press F2, to edit its full value.
   The editor supports line breaks and retains your draft if an edit fails.
   Apply the edit, then try Undo and Redo.
-- Save a copy with Cmd+S. This creates a new file containing all rows and edits;
-  it never overwrites the source or an existing destination. Open the new copy
-  to verify it. Saving a copy leaves the original session and its edits intact.
+- Save a copy with Cmd+S (macOS) / Ctrl+S (Linux and Windows). This creates a
+  new file containing all rows and edits; it never overwrites the source or an
+  existing destination. Open the new copy to verify it. Saving a copy leaves the
+  original session and its edits intact.
 
 The title and footer identify this executable as the GPUI comparison. It uses
 Kit's styled inputs, selectors, popovers, buttons, and virtual table, with
@@ -69,10 +73,10 @@ Do not use it as a replacement for the beta app.
 ## Validation
 
 ```sh
-cargo fmt -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
-cargo build --release --locked
+cargo fmt --all -- --check
+cargo clippy -p quarry-gpui --all-targets --locked -- -D warnings
+cargo test -p quarry-gpui --locked
+cargo build -p quarry-gpui --release --locked
 ```
 
 Tests exercise the real engine on wide data, bounded display requests, source
