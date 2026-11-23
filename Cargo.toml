@@ -3,6 +3,7 @@ members = [
     "apps/quarry-appkit",
     "apps/quarry-cli",
     "apps/quarry-egui",
+    "apps/quarry-gpui",
     "crates/quarry-core",
     "crates/quarry-delimited",
     "crates/quarry-workbench",
