@@ -6242,7 +6242,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                Vec::from([0..=0]),
+                std::iter::once(0..=0).collect(),
                 &working_path,
             )
             .unwrap();
@@ -6262,7 +6262,7 @@ mod tests {
             headered.start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                Vec::from([0..=0]),
+                std::iter::once(0..=0).collect(),
                 &invalid_path,
             ),
             Err(QuarryError::InvalidOption(_))
@@ -6274,7 +6274,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                Vec::from([9..=9]),
+                std::iter::once(9..=9).collect(),
                 &out_of_range_path,
             )
             .unwrap();
@@ -6298,7 +6298,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                Vec::from([0..=0]),
+                std::iter::once(0..=0).collect(),
                 &working_path,
             )
             .unwrap();
@@ -6330,7 +6330,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            Vec::from([0..=0]),
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6379,7 +6379,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            Vec::from([0..=0]),
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6424,7 +6424,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            Vec::from([0..=0]),
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6465,7 +6465,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            Vec::from([0..=0]),
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 3,
@@ -6504,7 +6504,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            Vec::from([0..=0]),
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6544,7 +6544,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            Vec::from([0..=0]),
+            std::iter::once(0..=0).collect(),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,

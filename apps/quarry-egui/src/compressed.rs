@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(document.insertion_disabled_reason(false), Some(READ_ONLY));
         assert_eq!(
             document
-                .start_delete_rows(Vec::from([1..=1]))
+                .start_delete_rows(std::iter::once(1..=1).collect())
                 .unwrap_err()
                 .text,
             READ_ONLY

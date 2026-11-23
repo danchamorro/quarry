@@ -5118,7 +5118,9 @@ mod tests {
         assert!(document.selected_rows.is_empty());
         assert!(document.selection.is_none());
         assert_eq!(
-            document.start_delete_rows(Vec::from([1..=1])).unwrap_err(),
+            document
+                .start_delete_rows(std::iter::once(1..=1).collect())
+                .unwrap_err(),
             "Clear the filter before editing the document."
         );
         assert!(document.structural_job.is_none());

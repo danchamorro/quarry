@@ -1126,7 +1126,7 @@ mod tests {
                             .start_create_working_copy_deleting_rows(
                                 BTreeMap::new(),
                                 BTreeMap::new(),
-                                Vec::from([1..=1]),
+                                std::iter::once(1..=1).collect(),
                                 &destination,
                             )
                             .unwrap()
@@ -1688,7 +1688,7 @@ mod tests {
                 .start_create_working_copy_deleting_rows(
                     BTreeMap::new(),
                     BTreeMap::new(),
-                    Vec::from([0..=1]),
+                    std::iter::once(0..=1).collect(),
                     &output,
                 )
                 .unwrap()

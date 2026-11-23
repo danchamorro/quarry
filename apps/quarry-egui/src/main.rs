@@ -15352,7 +15352,9 @@ mod tests {
         );
         assert_eq!(
             request,
-            Some(GridColumnRequest::DeleteRows(Vec::from([1..=2])))
+            Some(GridColumnRequest::DeleteRows(
+                std::iter::once(1..=2).collect()
+            ))
         );
     }
 
