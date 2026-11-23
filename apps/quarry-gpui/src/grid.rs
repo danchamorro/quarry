@@ -52,6 +52,10 @@ impl Grid {
         self.widths.clear();
     }
 
+    pub fn visible_rows_count(&self) -> usize {
+        self.visible_rows.len().max(40)
+    }
+
     pub fn auto_fit(&mut self, cx: &App) {
         let controller = self.controller.read(cx);
         let Some(doc) = controller.active_document(self.window_id) else {

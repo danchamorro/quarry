@@ -2176,16 +2176,18 @@ fn slot_is_dirty(slot: &ManagedTab) -> bool {
     }
 }
 
-/// Computes a fingerprint of a tab's unsaved edit state so quit approvals only match the
-/// exact document state reviewed by the user.
+/// Computes a residency-independent fingerprint of a tab's unsaved edit state so quit approvals
+/// survive normal hydration <-> dormancy eviction while still invalidating on any new edit.
 fn slot_edit_revision(slot: &ManagedTab) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     match &slot.residency {
         SlotResidency::Hydrated { .. } => {
-            0u8.hash(&mut hasher);
-            if let Some(doc) = slot.tab.document.as_ref() {
+            if let Some(doc) = slot.tab.document.as_ref()
+                && doc.is_dirty()
+            {
+                1u8.hash(&mut hasher);
                 doc.session.path().hash(&mut hasher);
                 doc.original_session.is_some().hash(&mut hasher);
                 doc.cell_edits.len().hash(&mut hasher);
@@ -2209,11 +2211,13 @@ fn slot_edit_revision(slot: &ManagedTab) -> u64 {
                     edit.column.hash(&mut hasher);
                     edit.draft.hash(&mut hasher);
                 }
+            } else {
+                0u8.hash(&mut hasher);
             }
         }
         SlotResidency::Dormant(dormant) => {
-            1u8.hash(&mut hasher);
             if let DormantKind::Dirty(dirty) = &dormant.kind {
+                1u8.hash(&mut hasher);
                 dirty.session.path().hash(&mut hasher);
                 dirty.original_session.is_some().hash(&mut hasher);
                 dirty.cell_edits.len().hash(&mut hasher);
@@ -2226,10 +2230,12 @@ fn slot_edit_revision(slot: &ManagedTab) -> u64 {
                     col.hash(&mut hasher);
                     name.as_str().hash(&mut hasher);
                 }
+            } else {
+                0u8.hash(&mut hasher);
             }
         }
         SlotResidency::Stub(_) => {
-            2u8.hash(&mut hasher);
+            0u8.hash(&mut hasher);
         }
     }
     hasher.finish()

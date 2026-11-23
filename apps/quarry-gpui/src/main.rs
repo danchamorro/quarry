@@ -291,6 +291,10 @@ impl QuarryWindow {
                     cx.notify();
                 });
                 if doc_changed {
+                    let visible_rows = self.table.read(cx).delegate().visible_rows_count();
+                    self.controller.update(cx, |controller, cx| {
+                        controller.request_viewport_rows(self.window_id, 0, visible_rows, cx);
+                    });
                     self.row_input
                         .update(cx, |state, cx| state.set_value("1", window, cx));
                 }
