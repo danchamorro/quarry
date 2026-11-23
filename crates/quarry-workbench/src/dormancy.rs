@@ -351,10 +351,11 @@ enum DormantKind {
     /// Dirty document: sparse edits, history, working copy, and Undo/Redo dirs retained.
     Dirty(Box<DormantDirtyState>),
     /// Completed `.gz`: private decompressed `Session` retained (keeps private copy alive),
-    /// while `StructuralIndex` and row buffers are evicted.
+    /// while `StructuralIndex` and row buffers are evicted; holds its workspace directory FD lease.
     CompressedComplete {
         session: Arc<Session>,
         compressed: compressed::CompressedDocument,
+        _workspace_fd_lease: Option<FdLease>,
     },
     /// Preview-only `.gz`: bootstrap `Session` and `Phase::Preview` retained; waking restores
     /// preview directly without restarting decompression.
@@ -1135,13 +1136,20 @@ impl WorkbenchScheduler {
             }
         }
 
-        // Reserve persistent directory FD leases for any retained WorkingCopyStorage
-        // BEFORE demoting so dormant working directories cannot exceed the < 128 FD cap.
-        let working_dir_fd_lease = if let Some(wc) = doc.working_copy.as_ref() {
-            let dir_fds = 1 + wc.previous_directories.len();
+        // Reserve persistent directory FD leases for any retained WorkingCopyStorage or
+        // completed compressed SpillWorkspace BEFORE demoting so dormant directories cannot
+        // exceed the < 128 FD cap.
+        let retained_dir_fds = doc
+            .working_copy
+            .as_ref()
+            .map_or(0, |wc| 1 + wc.previous_directories.len())
+            + usize::from(doc.compressed.as_ref().is_some_and(|compressed| {
+                compressed.dormancy_policy() == CompressedDormancyPolicy::DormantKeepPrivateCopy
+            }));
+        let working_dir_fd_lease = if retained_dir_fds > 0 {
             Some(
                 self.fd_budget
-                    .try_reserve(FdCategory::TempDirectory, dir_fds)?,
+                    .try_reserve(FdCategory::TempDirectory, retained_dir_fds)?,
             )
         } else {
             None
@@ -1255,7 +1263,8 @@ fn working_copy_reserves_path(wc: &WorkingCopyState, path: &Path) -> bool {
 }
 
 /// Computes tracked sparse-overlay memory bytes for a hydrated document, including
-/// any uncommitted inline cell or header edit drafts (and their prospective history cost).
+/// any uncommitted inline cell or header edit drafts, value edit history, and retained
+/// structural undo/redo snapshots.
 pub fn document_overlay_bytes(doc: &Document) -> usize {
     let cell_bytes: usize = doc.cell_edits.values().map(|value| value.len() + 32).sum();
     let header_bytes: usize = doc
@@ -1274,10 +1283,34 @@ pub fn document_overlay_bytes(doc: &Document) -> usize {
     let pending_header_bytes = doc.header_edit.as_ref().map_or(0, |edit| {
         edit.draft.len().saturating_mul(2).saturating_add(24)
     });
+    let snapshot_bytes: usize = doc.working_copy.as_ref().map_or(0, |wc| {
+        wc.undo
+            .iter()
+            .chain(wc.redo.iter())
+            .map(|snapshot| {
+                let cells: usize = snapshot
+                    .overlay
+                    .cell_edits
+                    .values()
+                    .map(|value| value.len() + 32)
+                    .sum();
+                let headers: usize = snapshot
+                    .overlay
+                    .header_renames
+                    .values()
+                    .map(|name| name.len() + 24)
+                    .sum();
+                cells
+                    .saturating_add(headers)
+                    .saturating_add(snapshot.edit_history.bytes)
+            })
+            .sum()
+    });
     cell_bytes
         .saturating_add(header_bytes)
         .saturating_add(pending_cell_bytes)
         .saturating_add(pending_header_bytes)
+        .saturating_add(snapshot_bytes)
         .saturating_add(doc.edit_history.bytes)
 }
 
@@ -1379,6 +1412,7 @@ fn demote_document(
             CompressedDormancyPolicy::DormantKeepPrivateCopy => DormantKind::CompressedComplete {
                 session: Arc::clone(&doc.session),
                 compressed: compressed_doc,
+                _workspace_fd_lease: working_dir_fd_lease,
             },
             CompressedDormancyPolicy::DormantPreviewOnly => DormantKind::CompressedPreview {
                 session: Arc::clone(&doc.session),
@@ -1596,6 +1630,7 @@ fn wake_dormant_document(
         DormantKind::CompressedComplete {
             session,
             compressed,
+            _workspace_fd_lease: _,
         } => {
             let compressed_unchanged =
                 source_unchanged && session.ensure_compressed_source_unchanged().is_ok();

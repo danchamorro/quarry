@@ -581,7 +581,7 @@ fn gzip_tabs_honor_phase_rules_and_preview_never_restarts_decompression_on_wake(
     assert!(private_copy_path.exists());
 
     // Switch to `plain`, demoting `gz_complete` to `DormantCompressedComplete`.
-    // The private decompressed copy must stay alive and reserved on disk.
+    // The private decompressed copy must stay alive, reserved on disk, and charged in FdBudgetLedger.
     scheduler.activate_tab(WindowId::PRIMARY, ids[2]).unwrap();
     finish_active_indexing(&mut scheduler, ids[2]);
     assert_eq!(
@@ -590,9 +590,26 @@ fn gzip_tabs_honor_phase_rules_and_preview_never_restarts_decompression_on_wake(
     );
     assert!(private_copy_path.exists());
     assert!(scheduler.path_reserved(&private_copy_path));
+    assert_eq!(
+        scheduler
+            .fd_budget()
+            .snapshot()
+            .by_category
+            .get(&FdCategory::TempDirectory),
+        Some(&1)
+    );
 
-    // Wake `gz_complete`: restores from the retained private copy without re-decompressing.
+    // Wake `gz_complete`: restores from the retained private copy without re-decompressing
+    // and releases its dormant TempDirectory lease.
     let woke_complete = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert_eq!(
+        scheduler
+            .fd_budget()
+            .snapshot()
+            .by_category
+            .get(&FdCategory::TempDirectory),
+        None
+    );
     assert!(matches!(
         woke_complete,
         WakeOutcome::Ready {
@@ -1121,4 +1138,55 @@ fn gzip_source_replaced_before_demotion_still_surfaces_conflict_on_wake() {
             .unwrap()
             .source_changed
     );
+}
+
+#[test]
+fn structural_undo_snapshot_overlay_bytes_count_toward_memory_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "snap-a.csv", 10);
+    let b = write_csv(dir.path(), "snap-b.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        max_dirty_overlay_bytes: 256,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a.clone(), b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let mut wc =
+            WorkingCopyState::new_in_with_cleanup(scratch.path(), doc.working_cleanup.clone())
+                .unwrap();
+        let mut overlay = quarry_workbench::StructuralOverlay::default();
+        overlay
+            .cell_edits
+            .insert((1, 0), std::sync::Arc::new(vec![b'z'; 512]));
+        wc.undo = Some(quarry_workbench::WorkingCopySnapshot {
+            path: a,
+            overlay,
+            edit_history: quarry_workbench::EditHistory::default(),
+        });
+        doc.working_copy = Some(wc);
+        assert!(quarry_workbench::document_overlay_bytes(doc) >= 512);
+    }
+
+    // Even with an empty current cell_edits map, the 512-byte structural undo snapshot
+    // exceeds the 256-byte cap and must reject dormancy while preserving the hydrated tab.
+    let err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[1])
+        .unwrap_err();
+    assert!(matches!(err, SchedulerError::OverlayBudgetExceeded { .. }));
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
 }
