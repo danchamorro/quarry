@@ -435,6 +435,11 @@ impl Quarry {
         let focus_input = input.clone();
         let apply = cx.weak_entity();
         let close = cx.weak_entity();
+        // Ensure the dialog records the data grid as its previous focus target so
+        // closing via Cancel, Escape, or Apply restores keyboard/screen-reader focus to the grid.
+        if self.info.is_some() {
+            self.table.focus_handle(cx).focus(window, cx);
+        }
         window.open_dialog(cx, move |dialog, _, cx| {
             let input_value = input.clone();
             let input_view = input.clone();

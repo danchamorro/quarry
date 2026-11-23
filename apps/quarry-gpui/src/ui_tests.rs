@@ -525,6 +525,11 @@ fn accessibility_exposes_grid_cell_labels_and_restores_focus_after_editor(cx: &m
     cx.update_window(handle.into(), |_, window, cx| {
         window.click("cancel-cell-edit", cx);
         window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
         let table_focus = view.read(cx).table.focus_handle(cx);
         assert!(
             table_focus.is_focused(window),
