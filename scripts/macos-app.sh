@@ -142,7 +142,8 @@ process_is_running() {
 require_app_closed() {
     if process_is_running "$EXECUTABLE" \
         || process_is_running QuarryEgui \
-        || process_is_running quarry-egui
+        || process_is_running quarry-egui \
+        || process_is_running quarry-gpui
     then
         fail "Quit Quarry before installing an update."
     fi
@@ -191,7 +192,7 @@ package_app() {
     [[ -f "$PLIST_TEMPLATE" ]] || fail "Info.plist template is missing."
     [[ -f "$ICON_SOURCE" ]] || fail "icon source is missing."
 
-    package_id="$(cd "$ROOT" && cargo pkgid --offline -p quarry-egui)"
+    package_id="$(cd "$ROOT" && cargo pkgid --offline -p quarry-gpui)"
     version="${package_id##*#}"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "app version must be numeric x.y.z: $version"
 
@@ -215,7 +216,7 @@ package_app() {
     "$ROOT/scripts/generate-notices.sh" --check --target "$host_target" --rust-release "$rust_release"
     (
         cd "$ROOT"
-        cargo build --release --locked --target "$host_target" --target-dir "$ROOT/target" -p quarry-egui
+        cargo build --release --locked --target "$host_target" --target-dir "$ROOT/target" -p quarry-gpui
     )
     post_revision="$(git -C "$ROOT" rev-parse --verify HEAD)"
     [[ "$post_revision" == "$revision" ]] || fail "source revision changed during the build."
@@ -223,7 +224,7 @@ package_app() {
         fail "could not recheck the source checkout after the build."
     fi
     [[ "$post_changes" == "$source_changes" ]] || fail "source checkout changed during the build."
-    binary="$ROOT/target/$host_target/release/quarry-egui"
+    binary="$ROOT/target/$host_target/release/quarry-gpui"
     architecture="$(/usr/bin/lipo -archs "$binary")"
 
     /bin/mkdir -p "$ROOT/target"
@@ -315,6 +316,45 @@ install_app() {
     fi
     /bin/rm -rf "$PACKAGE_APP"
     printf 'Installed and verified %s\n' "$INSTALL_APP"
+}
+
+restore_backup_app() {
+    local archive="${1:-$BACKUP_ARCHIVE}"
+    local candidate
+
+    acquire_app_install_lock
+    require_app_closed
+    [[ -d /Applications && -w /Applications ]] || fail "/Applications is not writable for this account."
+    [[ -f "$archive" ]] || fail "rollback archive not found: $archive"
+    /usr/bin/unzip -tq "$archive" >/dev/null || fail "rollback archive is corrupted: $archive"
+
+    INSTALL_STAGE="$(mktemp -d "/Applications/.quarry-install.XXXXXX")"
+    candidate="$INSTALL_STAGE/$APP_NAME.app"
+    INSTALL_PREVIOUS="$INSTALL_STAGE/previous.app"
+    /usr/bin/ditto -x -k "$archive" "$INSTALL_STAGE" || fail "could not extract rollback archive: $archive"
+    verify_app_identity "$candidate" || fail "rollback archive does not contain a valid signed Quarry.app."
+    require_app_closed
+
+    if [[ -e "$INSTALL_APP" ]]; then
+        INSTALL_REPLACED=true
+        /bin/mv "$INSTALL_APP" "$INSTALL_PREVIOUS"
+    fi
+    INSTALL_ACTIVATED=true
+    if ! /bin/mv "$candidate" "$INSTALL_APP"; then
+        fail "rollback failed; the existing app will be restored."
+    fi
+    if ! verify_app_identity "$INSTALL_APP" || ! register_app "$INSTALL_APP"; then
+        fail "rollback verification failed; the existing app will be restored."
+    fi
+
+    INSTALL_COMMITTED=true
+    /bin/rm -rf "$INSTALL_STAGE"
+    INSTALL_STAGE=""
+    INSTALL_PREVIOUS=""
+    INSTALL_ACTIVATED=false
+    INSTALL_REPLACED=false
+    INSTALL_COMMITTED=false
+    printf 'Restored and verified %s from %s\n' "$INSTALL_APP" "$archive"
 }
 
 rollback_install() {
@@ -412,7 +452,7 @@ self_test_licenses() {
 }
 
 usage() {
-    printf 'Usage: %s package|install|verify [app-path] | self-test\n' "$0"
+    printf 'Usage: %s package|install|rollback [archive-path]|verify [app-path]|self-test\n' "$0"
 }
 
 trap cleanup EXIT
@@ -421,7 +461,7 @@ trap 'exit 143' TERM
 
 require_macos
 case "${1:-package}" in
-    package | install) run_with_lock "$@" ;;
+    package | install | rollback) run_with_lock "$@" ;;
 esac
 case "${1:-package}" in
     package)
@@ -431,6 +471,10 @@ case "${1:-package}" in
     install)
         [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
         install_app
+        ;;
+    rollback)
+        [[ "$#" -le 2 ]] || { usage >&2; exit 2; }
+        restore_backup_app "${2:-$BACKUP_ARCHIVE}"
         ;;
     verify)
         [[ "$#" -le 2 ]] || { usage >&2; exit 2; }
