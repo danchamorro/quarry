@@ -123,6 +123,31 @@ enum Phase {
     Preview,
 }
 
+/// Dormancy policy enforced for a gzip-compressed document's lifecycle phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressedDormancyPolicy {
+    /// Storage review / decompression start has not run yet; cannot go dormant.
+    PinnedPendingStorage,
+    /// Decompression worker is actively running; pinned until completion or cancellation.
+    PinnedDecompressing,
+    /// Decompression finished; can go dormant while retaining the private decompressed copy.
+    DormantKeepPrivateCopy,
+    /// Cancelled or failed preview; can go dormant and must restore preview without restarting decompression.
+    DormantPreviewOnly,
+}
+
+impl CompressedDocument {
+    /// Returns the dormancy policy required by the current compressed lifecycle phase.
+    pub fn dormancy_policy(&self) -> CompressedDormancyPolicy {
+        match &self.phase {
+            Phase::Pending(_) => CompressedDormancyPolicy::PinnedPendingStorage,
+            Phase::Decompressing { .. } => CompressedDormancyPolicy::PinnedDecompressing,
+            Phase::Complete => CompressedDormancyPolicy::DormantKeepPrivateCopy,
+            Phase::Preview => CompressedDormancyPolicy::DormantPreviewOnly,
+        }
+    }
+}
+
 /// Frontend-neutral progress snapshot for an active decompression pass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecompressionStatus {

@@ -87,3 +87,79 @@ The selected tab is revealed immediately on navigation and window resize.
 [Release VM evidence](../benchmarks/2026-10-10-document-tabs.md) records simultaneous
 large documents, native cancellation/recovery, source and output hashes, and RSS
 observations separately from deterministic tests.
+
+---
+
+## Amendment (2026-11-22, Owner Decision T9): Dormant-tab scheduler, 200-file open, and internal FD budget
+
+### Context
+
+Opening large workspaces (up to 200 files across multiple windows in v1.0) cannot keep every
+document's 16 MiB checkpoint index, row buffers, and active readers resident simultaneously,
+and macOS defaults to a low soft `RLIMIT_NOFILE` of 256. Owner decision **T9** (`2026-11-22`)
+approved lifting the hard 8-tab open limit by introducing a frontend-neutral dormant-tab
+scheduler in `crates/quarry-workbench` (`dormancy.rs`) while keeping the global write cap
+(`MAX_WRITE_JOBS = 2`) intact.
+
+### Amended decision
+
+1. **Hydration ceiling with multi-window guarantee:** `WorkbenchScheduler` replaces the fixed
+   8-open-tab rejection cap with a bounded hydrated-tab ceiling (`DEFAULT_MAX_HYDRATED_TABS = 8`,
+   automatically raised to at least the number of open windows so every window retains `>= 1`
+   hydrated active tab). Unpinned idle hydrated tabs are evicted LRU (preferring clean tabs
+   before dirty tabs) into dormant state rather than rejecting new opens.
+2. **Lazy 200-file open:** Bulk opens (`open_many_lazy`) register lightweight `LazyDocumentStub`
+   entries holding canonical path, OS `FileIdentity` (`(dev, ino)` on Unix, `(volume_serial,
+   file_id)` on Windows), and open options without holding open file handles or eagerly indexing
+   all 200 files. Only the active tab(s) hydrate immediately; indexing still runs through the
+   shared `EnginePool`.
+3. **Clean tab dormancy:** Clean idle tabs cancel read workers and drop `Document`, `Session`,
+   `StructuralIndex`, row buffers, filter indexes, and whitespace caches while retaining
+   `canonical_path`, `FileIdentity`, `SourceGuard`, view/selection/column state, and any active
+   filter query. Hard-link/canonical-path deduplication and output path reservations remain
+   authoritative across active, dormant, and stub tabs.
+4. **Dirty tab dormancy & work preservation:** Dirty tabs retain sparse `cell_edits`,
+   `header_renames`, `EditHistory`, and `WorkingCopyState` (keeping private working copies and
+   Undo/Redo directories alive and reserved against scratch cleanup or overwrite) while evicting
+   the heavy `StructuralIndex` and buffers and re-indexing on wake (`WakeKind::DirtyRehydrated`).
+   An explicit sparse-overlay memory cap (`DEFAULT_MAX_DIRTY_OVERLAY_BYTES = 256 MiB`) and
+   scratch-space headroom check (`MIN_DORMANT_SCRATCH_HEADROOM_BYTES = 16 MiB`) gate dirty
+   dormancy. If all hydrated tabs are pinned, overlay memory hits its cap, or scratch space is
+   exhausted, the scheduler returns an actionable `SchedulerError` (`AllTabsPinned`,
+   `OverlayBudgetExceeded`, `ScratchDiskFull`) and **never silently drops edits or open tabs**.
+5. **Active filters:** On dormancy, filter workers and filtered read jobs cancel cleanly,
+   `FilterIndex` and `filtered_rows` are evicted, and the `FilterQuery` plus source-row anchor
+   are retained. Waking rebuilds matches deterministically against the same generation
+   (`WakeKind::FilteredRebuilding`; `< 50 ms` warm latency is never promised for filtered or
+   dirty rehydration).
+6. **Compressed (`.gz`) phase rules (`CompressedDormancyPolicy`):**
+   - `Phase::Pending` and `Phase::Decompressing` are pinned (never demoted before storage
+     decision or while decompression is running).
+   - `Phase::Complete` demotes to `DormantCompressedComplete`, evicting `StructuralIndex` and
+     buffers while keeping the private decompressed copy alive and reserved; waking re-indexes
+     that private copy without re-decompressing.
+   - `Phase::Preview` demotes to `DormantCompressedPreview` and wakes directly into preview mode
+     without ever silently restarting decompression.
+7. **External source changes while dormant:** Every wake validates its `SourceGuard` against
+   the source path on disk. Any external modification or removal surfaces
+   `WakeOutcome::SourceChangedConflict` (`source_changed = true` and `SOURCE_CHANGED_NOTICE`)
+   instead of silently reloading.
+8. **`RLIMIT_NOFILE` raise & code-counted `< 128` FD budget:** At startup, Quarry calls
+   `quarry_core::raise_nofile_limit(4096)` toward the hard limit without lowering a higher
+   existing soft limit. Internally, `FdBudgetLedger` tracks explicit RAII `FdLease` reservations
+   across `ActiveDocument`, `UndoRedo`, `SidecarCache`, `TempDirectory`, `GuiSystem`,
+   `CleanupWorker`, and `BackgroundJob` under a strict `< 128` cap (`MAX_PROCESS_FD_BUDGET`).
+9. **Quit semantics preserved:** `cancel_quit` retains every active, dormant, dirty, and stub
+   tab along with all working copies and Undo/Redo directories; `finalize_quit` shuts down and
+   drops every tab, removing all Quarry-owned private working files with zero orphans.
+10. **Write-job cap retained:** `MAX_WRITE_JOBS = 2` remains unchanged unless a later benchmark
+    explicitly justifies raising it.
+
+### Verification
+
+- Deterministic 200-file synthetic corpus generator: `scripts/generate-200-file-corpus.py`.
+- Headless workbench integration suite: `crates/quarry-workbench/tests/dormant_tabs.rs`
+  (covering 200-file lazy open with `< 128` code-counted and OS open FDs, hard-link
+  deduplication while dormant/stub, dirty dormancy + Undo/Redo protection + overlay/disk-full
+  preservation, all-pinned preservation, filtered wake rebuild, `.gz` phase rules, external
+  source-change conflict, and cancelled vs completed quit cleanup).

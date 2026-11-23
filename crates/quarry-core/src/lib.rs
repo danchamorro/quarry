@@ -91,8 +91,8 @@ pub use join::{
     read_join_header_with_format,
 };
 pub use pool::{
-    DEFAULT_SINGLE_RUN_MEMORY_BUDGET_BYTES, default_single_run_memory_budget_bytes,
-    default_worker_threads,
+    DEFAULT_SINGLE_RUN_MEMORY_BUDGET_BYTES, NofileLimitStatus,
+    default_single_run_memory_budget_bytes, default_worker_threads, raise_nofile_limit,
 };
 pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
@@ -112,6 +112,7 @@ pub use sort::{
     estimate_multi_sort_temporary_bytes, estimate_sort_plan_temporary_bytes,
     estimate_sort_temporary_bytes,
 };
+pub use source_stamp::{FileIdentity, SourceGuard};
 pub use storage::{
     StorageSpace, check_storage, estimate_duplicate_target_temporary_bytes,
     estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
@@ -610,6 +611,16 @@ impl Session {
 
     pub fn encoding(&self) -> Encoding {
         self.encoding
+    }
+
+    /// Captures a lightweight source-version guard (no open file handle) for dormancy checks.
+    pub fn source_guard(&self) -> SourceGuard {
+        SourceGuard::from_stamp(self.source_stamp.clone())
+    }
+
+    /// Returns OS-level file identity (`(dev, ino)` on Unix) without holding an open descriptor.
+    pub fn file_identity(&self) -> Option<FileIdentity> {
+        self.source_stamp.file_identity()
     }
 
     pub fn start_indexing(&self, config: IndexConfig) -> Result<IndexJob, QuarryError> {

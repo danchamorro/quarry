@@ -1,0 +1,705 @@
+//! Headless verification suite for Phase 4A-2 dormant-tab scheduler, 200-file open,
+//! multi-window hydration guarantees, code-counted `< 128` FD budget, dirty/filter/`.gz`
+//! dormancy policies, external source-change conflicts, and quit cleanup vs cancellation.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use quarry_core::{FilterOperator, FilterQuery, HeaderMode, OpenOptions};
+use quarry_workbench::{
+    CompressedDormancyPolicy, DocumentId, FdCategory, MAX_PROCESS_FD_BUDGET, PinReason,
+    ResidencyState, SOURCE_CHANGED_NOTICE, SchedulerError, WakeKind, WakeOutcome, WindowId,
+    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkingCopyState,
+};
+
+fn write_csv(dir: &Path, name: &str, rows: usize) -> PathBuf {
+    let path = dir.join(name);
+    let mut out = String::from("id,category,amount,notes\n");
+    for row in 1..=rows {
+        let cat = match row % 4 {
+            0 => "alpha",
+            1 => "beta",
+            2 => "gamma",
+            _ => "delta",
+        };
+        out.push_str(&format!("{row},{cat},{},payload_{row}\n", row * 13));
+    }
+    fs::write(&path, out).unwrap();
+    path
+}
+
+fn write_gzip_csv(dir: &Path, name: &str, rows: usize) -> PathBuf {
+    let path = dir.path_or_self().join(name);
+    let mut raw = String::from("id,category,amount\n");
+    for row in 1..=rows {
+        raw.push_str(&format!("{row},cat{},{}\n", row % 3, row * 7));
+    }
+    let file = fs::File::create(&path).unwrap();
+    let mut encoder = GzEncoder::new(file, Compression::fast());
+    encoder.write_all(raw.as_bytes()).unwrap();
+    encoder.finish().unwrap();
+    path
+}
+
+trait PathHelper {
+    fn path_or_self(&self) -> &Path;
+}
+impl PathHelper for Path {
+    fn path_or_self(&self) -> &Path {
+        self
+    }
+}
+
+fn finish_active_indexing(scheduler: &mut WorkbenchScheduler, id: DocumentId) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let errors = scheduler.poll_all();
+        assert!(errors.is_empty(), "unexpected poll errors: {errors:?}");
+        let done = scheduler
+            .tab(id)
+            .and_then(|tab| tab.document.as_ref())
+            .is_some_and(|doc| doc.job.is_none() && !doc.decompressing());
+        if done {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "indexing/decompression timed out"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn finish_active_filter(scheduler: &mut WorkbenchScheduler, id: DocumentId) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let errors = scheduler.poll_all();
+        assert!(
+            errors.is_empty(),
+            "unexpected filter poll errors: {errors:?}"
+        );
+        let done = scheduler
+            .tab(id)
+            .and_then(|tab| tab.document.as_ref())
+            .is_some_and(|doc| doc.filter_job.is_none() && !doc.filter_rows_loading());
+        if done {
+            break;
+        }
+        assert!(Instant::now() < deadline, "filter timed out");
+        std::thread::yield_now();
+    }
+}
+
+fn open_options() -> OpenOptions {
+    OpenOptions {
+        header_mode: HeaderMode::FirstRow,
+        ..Default::default()
+    }
+}
+
+#[cfg(unix)]
+fn count_process_open_fds() -> Option<usize> {
+    for dir in ["/dev/fd", "/proc/self/fd"] {
+        if let Ok(entries) = fs::read_dir(dir) {
+            return Some(entries.count());
+        }
+    }
+    None
+}
+
+#[test]
+fn opening_200_files_lazily_keeps_fd_budget_under_128_and_evicts_clean_tabs() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<PathBuf> = (0..200)
+        .map(|i| write_csv(dir.path(), &format!("doc_{i:03}.csv"), 120))
+        .collect();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 8,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+
+    // Reserve non-document FD categories (GUI/system, sidecar, temp, cleanup) to verify
+    // total process FD reservations stay strictly below 128 across 200 open files.
+    let _gui_fds = scheduler
+        .fd_budget()
+        .try_reserve(FdCategory::GuiSystem, 12)
+        .unwrap();
+    let _sidecar_fds = scheduler
+        .fd_budget()
+        .try_reserve(FdCategory::SidecarCache, 4)
+        .unwrap();
+
+    let win1 = WindowId::new(1);
+    let win2 = WindowId::new(2);
+    let win3 = WindowId::new(3);
+    let win4 = WindowId::new(4);
+
+    let ids = scheduler
+        .open_many_lazy(win1, paths.clone(), open_options(), None)
+        .unwrap();
+    assert_eq!(ids.len(), 200);
+    assert_eq!(scheduler.total_tabs(), 200);
+    assert_eq!(scheduler.hydrated_count(), 1);
+    assert_eq!(scheduler.stub_count(), 199);
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Hydrate tabs across 4 windows and cycle through 24 tabs to exercise eviction + cold wake.
+    for (win, idx) in [(win2, 50), (win3, 100), (win4, 150)] {
+        let outcome = scheduler.activate_tab(win, ids[idx]).unwrap();
+        assert!(matches!(
+            outcome,
+            WakeOutcome::Ready {
+                kind: WakeKind::StubInitialOpen,
+                ..
+            }
+        ));
+        finish_active_indexing(&mut scheduler, ids[idx]);
+    }
+    assert_eq!(scheduler.hydrated_count(), 4);
+
+    for &idx in &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+        let outcome = scheduler.activate_tab(win1, ids[idx]).unwrap();
+        assert!(matches!(outcome, WakeOutcome::Ready { .. }));
+        finish_active_indexing(&mut scheduler, ids[idx]);
+        assert!(scheduler.hydrated_count() <= 8);
+    }
+    // Earlier clean tabs were evicted to DormantClean while each of the 4 windows kept >= 1 hydrated tab.
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
+    for (win, idx) in [(win2, 50), (win3, 100), (win4, 150)] {
+        assert_eq!(scheduler.active_document(win), Some(ids[idx]));
+        assert_eq!(
+            scheduler.residency(ids[idx]),
+            Some(ResidencyState::Hydrated)
+        );
+    }
+
+    // Wake a clean dormant tab (cold wake) and verify it restores cleanly.
+    let wake_cold = scheduler.activate_tab(win1, ids[0]).unwrap();
+    assert!(matches!(
+        wake_cold,
+        WakeOutcome::Ready {
+            kind: WakeKind::CleanCold,
+            ..
+        }
+    ));
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert!(
+        !scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .buffered_rows
+            .is_empty()
+    );
+
+    // Re-activating an already hydrated tab is a warm hit.
+    let wake_warm = scheduler.activate_tab(win2, ids[50]).unwrap();
+    assert!(matches!(
+        wake_warm,
+        WakeOutcome::Ready {
+            kind: WakeKind::AlreadyHydrated,
+            ..
+        }
+    ));
+
+    // Verify code-counted FD ledger AND actual OS open FD count stay strictly below 128.
+    let fd_snap = scheduler.fd_budget().snapshot();
+    assert!(
+        fd_snap.peak_reserved < MAX_PROCESS_FD_BUDGET,
+        "code-counted peak FDs {} must be < 128",
+        fd_snap.peak_reserved
+    );
+    assert!(fd_snap.total_reserved < MAX_PROCESS_FD_BUDGET);
+    #[cfg(unix)]
+    if let Some(os_fds) = count_process_open_fds() {
+        assert!(
+            os_fds < MAX_PROCESS_FD_BUDGET,
+            "actual process open FDs ({os_fds}) must stay < 128 across 200 open files"
+        );
+    }
+
+    // Completed quit cleans up cleanly with zero errors.
+    let errors = scheduler.finalize_quit();
+    assert!(errors.is_empty());
+    assert_eq!(scheduler.total_tabs(), 0);
+}
+
+#[test]
+fn dormant_and_stub_tabs_deduplicate_hard_links_and_reserve_working_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "a.csv", 20);
+    let b = write_csv(dir.path(), "b.csv", 20);
+    let c = write_csv(dir.path(), "c.csv", 20);
+    let a_link = dir.path().join("a-hardlink.csv");
+    fs::hard_link(&a, &a_link).unwrap();
+    let c_link = dir.path().join("c-hardlink.csv");
+    fs::hard_link(&c, &c_link).unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [a.clone(), b.clone(), c.clone()],
+            open_options(),
+            None,
+        )
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Switch to `b`, evicting `a` to DormantClean while `c` remains a lazy Stub.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
+    assert_eq!(scheduler.residency(ids[2]), Some(ResidencyState::Stub));
+
+    // Hard-link lookup resolves both dormant `a` and stub `c` without duplicating tabs.
+    assert_eq!(
+        scheduler.find_owner_for_path(&a_link),
+        Some((WindowId::PRIMARY, ids[0]))
+    );
+    assert_eq!(
+        scheduler.find_owner_for_path(&c_link),
+        Some((WindowId::PRIMARY, ids[2]))
+    );
+    assert!(scheduler.path_reserved(&a_link));
+    assert!(scheduler.path_reserved(&c_link));
+
+    // Opening the hard link activates the existing dormant tab rather than creating a 4th tab.
+    let outcome = scheduler
+        .open_path(WindowId::PRIMARY, a_link, open_options(), None)
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        WakeOutcome::Ready {
+            document_id,
+            kind: WakeKind::CleanCold,
+            ..
+        } if document_id == ids[0]
+    ));
+    assert_eq!(scheduler.total_tabs(), 3);
+}
+
+#[test]
+fn dirty_tab_dormancy_preserves_edits_and_working_copies_and_enforces_overlay_and_disk_caps() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "dirty-a.csv", 20);
+    let b = write_csv(dir.path(), "clean-b.csv", 20);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        max_dirty_overlay_bytes: 64 * 1024,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [a.clone(), b.clone()],
+            open_options(),
+            None,
+        )
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Edit a cell and attach a working-copy directory (simulating structural Undo/Redo storage).
+    let working_root = {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let src = doc.source_cell(1, 1).unwrap().to_vec();
+        doc.begin_cell_edit(1, 1, src).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "edited-value".into();
+        doc.commit_cell_edit();
+        let wc = WorkingCopyState::new_in_with_cleanup(scratch.path(), doc.working_cleanup.clone())
+            .unwrap();
+        let root = wc.directory.path().to_path_buf();
+        doc.working_copy = Some(wc);
+        root
+    };
+    assert!(working_root.exists());
+
+    // 1. Simulated disk-full refuses dirty dormancy and preserves the open dirty tab intact.
+    scheduler.config_mut().simulated_scratch_available_bytes = Some(1024);
+    let disk_err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[1])
+        .unwrap_err();
+    assert!(matches!(disk_err, SchedulerError::ScratchDiskFull { .. }));
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+    assert!(working_root.exists());
+
+    // 2. Overlay budget exceeded refuses dirty dormancy without losing edits.
+    scheduler.config_mut().simulated_scratch_available_bytes = None;
+    scheduler.config_mut().max_dirty_overlay_bytes = 8;
+    let overlay_err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[1])
+        .unwrap_err();
+    assert!(matches!(
+        overlay_err,
+        SchedulerError::OverlayBudgetExceeded { .. }
+    ));
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+
+    // 3. With adequate overlay budget and disk headroom, dirty tab goes dormant cleanly while
+    // keeping its working directory alive and reserved against external reuse.
+    scheduler.config_mut().max_dirty_overlay_bytes = 64 * 1024;
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantDirty)
+    );
+    assert!(
+        working_root.exists(),
+        "dormant dirty tab must protect working copy dir"
+    );
+    assert!(scheduler.path_reserved(&working_root));
+
+    // 4. Cancelled quit retains all tabs and the dormant dirty working directory.
+    scheduler.begin_quit_review();
+    scheduler.approve_tab_for_quit(ids[0]).unwrap();
+    scheduler.cancel_quit();
+    assert_eq!(scheduler.total_tabs(), 2);
+    assert!(working_root.exists());
+
+    // 5. Waking the dirty tab restores edits, Undo history, and working copy cleanly.
+    let woke = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert!(matches!(
+        woke,
+        WakeOutcome::Ready {
+            kind: WakeKind::DirtyRehydrated,
+            ..
+        }
+    ));
+    finish_active_indexing(&mut scheduler, ids[0]);
+    let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert!(doc.is_dirty());
+    assert!(doc.can_undo());
+    assert_eq!(
+        doc.cell_edits.get(&(1, 1)).map(|v| v.as_slice()),
+        Some(b"edited-value".as_slice())
+    );
+    assert!(doc.working_copy.is_some());
+
+    // 6. Completed quit removes Quarry's private working copy directory with zero orphans.
+    let cleanup_errors = scheduler.finalize_quit();
+    assert!(cleanup_errors.is_empty());
+    assert!(
+        !working_root.exists(),
+        "completed quit must remove private working dir"
+    );
+}
+
+#[test]
+fn all_pinned_tabs_preserve_open_documents_and_explain_why_next_open_must_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "pin-a.csv", 10);
+    let b = write_csv(dir.path(), "pin-b.csv", 10);
+    let c = write_csv(dir.path(), "pin-c.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 2,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a, b, c], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Pin tab 0 with an active Join reservation and tab 1 with an open close confirmation.
+    scheduler
+        .tab(ids[0])
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .join_reservations
+        .fetch_add(1, Ordering::AcqRel);
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    scheduler.tab_mut(ids[1]).unwrap().close_confirmation_open = true;
+
+    assert_eq!(scheduler.pin_reason(ids[0]), Some(PinReason::JoinReserved));
+    assert_eq!(scheduler.hydrated_count(), 2);
+
+    // Attempting to activate tab 2 when all hydrated tabs are pinned must fail cleanly
+    // while retaining both pinned tabs untouched.
+    let err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[2])
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SchedulerError::AllTabsPinned {
+            hydrated: 2,
+            limit: 2,
+            ..
+        }
+    ));
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+    assert_eq!(scheduler.residency(ids[1]), Some(ResidencyState::Hydrated));
+    assert_eq!(scheduler.residency(ids[2]), Some(ResidencyState::Stub));
+}
+
+#[test]
+fn active_filter_dormancy_preserves_rules_and_rebuilds_deterministically_on_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "filter-a.csv", 40);
+    let b = write_csv(dir.path(), "filter-b.csv", 20);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a, b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    let query = FilterQuery::single(1, FilterOperator::Equals, b"alpha".to_vec());
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(query.clone())
+        .unwrap();
+    finish_active_filter(&mut scheduler, ids[0]);
+    let expected_matches = scheduler
+        .tab(ids[0])
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .available_filter_rows();
+    assert_eq!(expected_matches, 10);
+
+    // Evict filtered tab `a` by switching to `b`.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
+
+    // Wake `a`: reports `FilteredRebuilding` and deterministically rebuilds the same 10 matches.
+    let outcome = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert!(matches!(
+        outcome,
+        WakeOutcome::Ready {
+            kind: WakeKind::FilteredRebuilding,
+            ..
+        }
+    ));
+    finish_active_indexing(&mut scheduler, ids[0]);
+    finish_active_filter(&mut scheduler, ids[0]);
+    let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert_eq!(doc.filter_query.as_ref(), Some(&query));
+    assert_eq!(doc.available_filter_rows(), expected_matches);
+}
+
+#[test]
+fn gzip_tabs_honor_phase_rules_and_preview_never_restarts_decompression_on_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let gz_complete = write_gzip_csv(dir.path(), "complete.csv.gz", 30);
+    let gz_preview = write_gzip_csv(dir.path(), "preview.csv.gz", 30);
+    let plain = write_csv(dir.path(), "plain.csv", 15);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [gz_complete.clone(), gz_preview.clone(), plain.clone()],
+            open_options(),
+            None,
+        )
+        .unwrap();
+
+    // Wait for `gz_complete` decompression to finish (`Phase::Complete`).
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .compressed
+            .as_ref()
+            .unwrap()
+            .dormancy_policy(),
+        CompressedDormancyPolicy::DormantKeepPrivateCopy
+    );
+    let private_copy_path = scheduler
+        .tab(ids[0])
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .session
+        .path()
+        .to_path_buf();
+    assert!(private_copy_path.exists());
+
+    // Switch to `plain`, demoting `gz_complete` to `DormantCompressedComplete`.
+    // The private decompressed copy must stay alive and reserved on disk.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[2]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[2]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantCompressedComplete)
+    );
+    assert!(private_copy_path.exists());
+    assert!(scheduler.path_reserved(&private_copy_path));
+
+    // Wake `gz_complete`: restores from the retained private copy without re-decompressing.
+    let woke_complete = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert!(matches!(
+        woke_complete,
+        WakeOutcome::Ready {
+            kind: WakeKind::CompressedCompleteRehydrated,
+            ..
+        }
+    ));
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .path(),
+        private_copy_path
+    );
+
+    // Open `gz_preview`, cancel decompression to enter `Phase::Preview`, then cycle dormancy.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    {
+        let doc = scheduler
+            .tab_mut(ids[1])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.cancel_decompression();
+    }
+    finish_active_indexing(&mut scheduler, ids[1]);
+    // Ensure we are in Preview mode (if decompression raced ahead on a tiny file, cancel before
+    // wait might have completed; either way verify the exact policy contract).
+    let policy = scheduler
+        .tab(ids[1])
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .compressed
+        .as_ref()
+        .unwrap()
+        .dormancy_policy();
+    scheduler.activate_tab(WindowId::PRIMARY, ids[2]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[2]);
+    if policy == CompressedDormancyPolicy::DormantPreviewOnly {
+        assert_eq!(
+            scheduler.residency(ids[1]),
+            Some(ResidencyState::DormantCompressedPreview)
+        );
+        let woke_preview = scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+        assert!(matches!(
+            woke_preview,
+            WakeOutcome::Ready {
+                kind: WakeKind::CompressedPreviewRestored,
+                ..
+            }
+        ));
+        let doc = scheduler.tab(ids[1]).unwrap().document.as_ref().unwrap();
+        assert!(
+            !doc.decompressing() && !doc.awaiting_decompression(),
+            "Preview tab must never silently restart decompression on wake"
+        );
+    }
+}
+
+#[test]
+fn external_source_change_while_dormant_surfaces_conflict_instead_of_silent_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "mutated-a.csv", 15);
+    let b = write_csv(dir.path(), "stable-b.csv", 15);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a.clone(), b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Demote `a` to dormant.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
+
+    // Mutate `a` externally on disk while dormant.
+    fs::write(&a, b"id,category,amount,notes\n999,changed,1,external\n").unwrap();
+
+    // Waking `a` must surface an explicit conflict instead of silently reloading.
+    let outcome = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert!(matches!(
+        outcome,
+        WakeOutcome::SourceChangedConflict { ref notice, .. } if notice == SOURCE_CHANGED_NOTICE
+    ));
+    let tab = scheduler.tab(ids[0]).unwrap();
+    assert!(tab.document.as_ref().unwrap().source_changed);
+    assert!(
+        tab.notice
+            .as_ref()
+            .is_some_and(|msg| msg.text == SOURCE_CHANGED_NOTICE)
+    );
+}

@@ -3,6 +3,7 @@
 pub mod command;
 pub mod compressed;
 pub mod document;
+pub mod dormancy;
 pub mod history;
 pub mod selection;
 pub mod tab;
@@ -11,6 +12,13 @@ pub mod whitespace;
 pub use command::{
     CloseCommandOutcome, CommandContext, CommandId, CommandResolution, CommandTarget, DocumentId,
     FileCommands, WindowId, evaluate_command,
+};
+pub use compressed::CompressedDormancyPolicy;
+pub use dormancy::{
+    DEFAULT_MAX_DIRTY_OVERLAY_BYTES, DEFAULT_MAX_HYDRATED_TABS, DEFAULT_NOFILE_TARGET,
+    FdBudgetLedger, FdBudgetSnapshot, FdCategory, FdLease, LazyDocumentStub, MAX_PROCESS_FD_BUDGET,
+    MIN_DORMANT_SCRATCH_HEADROOM_BYTES, PinReason, ResidencyState, SchedulerError, WakeKind,
+    WakeOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig, document_overlay_bytes,
 };
 
 pub use document::{

@@ -287,6 +287,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let started = Instant::now();
+    let _nofile_status = quarry_core::raise_nofile_limit(quarry_workbench::DEFAULT_NOFILE_TARGET);
     let initial_paths = std::env::args_os()
         .skip(1)
         .filter(|argument| !argument.to_string_lossy().starts_with("-psn_"))
