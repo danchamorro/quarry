@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
-use gpui_kit::{App, Context, IntoElement, ParentElement, Pixels, Styled, Window, div, px, rgb};
+use gpui_kit::{
+    App, Context, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
+};
 use quarry_core::{FilterQuery, OpenOptions};
 
 use crate::document::{Document, DocumentInfo, MAX_VIEWPORT_COLUMNS, MAX_VIEWPORT_ROWS, Viewport};
@@ -558,6 +560,24 @@ impl TableDelegate for Grid {
             .width(self.widths.get(&source).copied().unwrap_or(px(124.)))
             .min_width(px(60.))
             .max_width(px(900.))
+    }
+    fn cell_label(&self, row: usize, column: usize, _: &App) -> Option<SharedString> {
+        let value = self.display(row, column);
+        if column == 0 {
+            return (!value.is_empty()).then(|| format!("Row {value}").into());
+        }
+        let source = *self.columns.get(column - 1)?;
+        let header = self
+            .info
+            .as_ref()
+            .and_then(|info| info.headers.get(source))
+            .map(String::as_str)
+            .unwrap_or("Column");
+        if value.is_empty() {
+            Some(format!("{header}: empty").into())
+        } else {
+            Some(format!("{header}: {value}").into())
+        }
     }
     fn render_td(
         &mut self,

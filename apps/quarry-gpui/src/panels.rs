@@ -402,35 +402,54 @@ impl Panels {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let panel = cx.entity();
-        Popover::new(id)
-            .anchor(Anchor::TopRight)
-            .open(self.active == Some(tool))
-            .trigger(
-                Button::new((id, 0usize))
-                    .label(label)
-                    .ghost()
-                    .small()
-                    .disabled(self.path.is_none()),
-            )
-            .on_open_change(cx.listener(move |this, open, window, cx| {
-                if *open {
-                    window.blur(cx);
-                    if tool == Tool::Format {
-                        this.restore_format(window, cx);
+        div()
+            // Switch directly to another toolbar panel in capture phase before a
+            // nested Select's bubble `on_mouse_down_out` calls `stop_propagation`.
+            .capture_any_mouse_down(
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    if event.button == MouseButton::Left
+                        && this.path.is_some()
+                        && this.active.is_some()
+                        && this.active != Some(tool)
+                    {
+                        if tool == Tool::Format {
+                            this.restore_format(window, cx);
+                        }
+                        this.active = Some(tool);
+                        cx.notify();
                     }
-                    this.active = Some(tool);
-                } else if this.active == Some(tool) {
-                    this.close(window, cx);
-                }
-                cx.notify();
-            }))
-            .content(move |_, window, cx| {
-                panel.update(cx, |this, cx| match tool {
-                    Tool::Columns => this.columns_content(window, cx),
-                    Tool::Filters => this.filters_content(window, cx),
-                    Tool::Format => this.format_content(window, cx),
-                })
-            })
+                }),
+            )
+            .child(
+                Popover::new(id)
+                    .anchor(Anchor::TopRight)
+                    .open(self.active == Some(tool))
+                    .trigger(
+                        Button::new((id, 0usize))
+                            .label(label)
+                            .ghost()
+                            .small()
+                            .disabled(self.path.is_none()),
+                    )
+                    .on_open_change(cx.listener(move |this, open, window, cx| {
+                        if *open {
+                            if tool == Tool::Format {
+                                this.restore_format(window, cx);
+                            }
+                            this.active = Some(tool);
+                        } else if this.active == Some(tool) {
+                            this.close(window, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .content(move |_, window, cx| {
+                        panel.update(cx, |this, cx| match tool {
+                            Tool::Columns => this.columns_content(window, cx),
+                            Tool::Filters => this.filters_content(window, cx),
+                            Tool::Format => this.format_content(window, cx),
+                        })
+                    }),
+            )
             .into_any_element()
     }
 
