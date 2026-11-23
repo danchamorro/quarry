@@ -934,8 +934,7 @@ impl WorkbenchController {
         let _ = self.scheduler.close_tab(id);
         self.viewport_read_seq.remove(&id);
         let empty_now = self.scheduler.tabs_in_window(window).is_empty();
-        if empty_now && close_window_if_last {
-            let _ = self.scheduler.close_window(window);
+        if empty_now && close_window_if_last && self.scheduler.close_window(window).is_ok() {
             self.pending_close_windows.push(window);
         }
         cx.notify();
@@ -995,10 +994,15 @@ impl WorkbenchController {
                 filename,
             };
         }
-        let _ = self.scheduler.close_window(window);
-        self.pending_close_windows.push(window);
+        if self.scheduler.close_window(window).is_ok() {
+            self.pending_close_windows.push(window);
+            cx.notify();
+            return CloseReviewAction::Proceed;
+        }
         cx.notify();
-        CloseReviewAction::Proceed
+        CloseReviewAction::Wait {
+            message: "Modified documents remain unapproved before closing this window.".into(),
+        }
     }
 
     /// Starts unified cross-window Quit review across every open window and dormant dirty tab.
@@ -1123,8 +1127,10 @@ impl WorkbenchController {
                 }
                 let _ = self.scheduler.close_tab(document_id);
                 self.viewport_read_seq.remove(&document_id);
-                if close_window_if_last && self.scheduler.tabs_in_window(window_id).is_empty() {
-                    let _ = self.scheduler.close_window(window_id);
+                if close_window_if_last
+                    && self.scheduler.tabs_in_window(window_id).is_empty()
+                    && self.scheduler.close_window(window_id).is_ok()
+                {
                     self.pending_close_windows.push(window_id);
                 }
                 cx.notify();
@@ -1175,10 +1181,82 @@ impl WorkbenchController {
                         filename,
                     }
                 } else {
-                    let _ = self.scheduler.close_window(window_id);
-                    self.pending_close_windows.push(window_id);
-                    cx.notify();
-                    CloseReviewAction::Proceed
+                    if self.editing_windows.contains(&window_id) {
+                        for id in approved_dirty {
+                            if let Some(tab) = self.scheduler.tab_mut(id) {
+                                tab.cancel_close();
+                            }
+                        }
+                        cx.notify();
+                        return CloseReviewAction::Wait {
+                            message: "Apply or cancel the open edit before closing this window."
+                                .into(),
+                        };
+                    }
+                    match self.scheduler.close_window(window_id) {
+                        Ok(_) => {
+                            self.pending_close_windows.push(window_id);
+                            cx.notify();
+                            CloseReviewAction::Proceed
+                        }
+                        Err(SchedulerError::UnapprovedDirtyTabs(newly_dirty)) => {
+                            if let Some(&next_id) = newly_dirty.first() {
+                                if let Err(error) = self.scheduler.activate_tab(window_id, next_id)
+                                {
+                                    for id in newly_dirty.into_iter().chain(approved_dirty) {
+                                        if let Some(tab) = self.scheduler.tab_mut(id) {
+                                            tab.cancel_close();
+                                        }
+                                    }
+                                    cx.notify();
+                                    return CloseReviewAction::Wait {
+                                        message: error.to_string(),
+                                    };
+                                }
+                                if let Some(tab) = self.scheduler.tab_mut(next_id) {
+                                    tab.close_confirmation_open = true;
+                                }
+                                let filename = self
+                                    .scheduler
+                                    .tab_display_name(next_id)
+                                    .unwrap_or_else(|| "Untitled".into());
+                                let review_token = self.allocate_review_token();
+                                self.pending_review = Some(PendingReviewScope::Window {
+                                    window_id,
+                                    remaining_dirty: newly_dirty,
+                                    approved_dirty,
+                                });
+                                cx.notify();
+                                CloseReviewAction::ConfirmTab {
+                                    review_token,
+                                    window_id,
+                                    document_id: next_id,
+                                    filename,
+                                }
+                            } else {
+                                for id in approved_dirty {
+                                    if let Some(tab) = self.scheduler.tab_mut(id) {
+                                        tab.cancel_close();
+                                    }
+                                }
+                                cx.notify();
+                                CloseReviewAction::Wait {
+                                    message: "Modified documents remain unapproved before closing this window.".into(),
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            for id in approved_dirty {
+                                if let Some(tab) = self.scheduler.tab_mut(id) {
+                                    tab.cancel_close();
+                                }
+                            }
+                            cx.notify();
+                            CloseReviewAction::Wait {
+                                message: error.to_string(),
+                            }
+                        }
+                    }
                 }
             }
             PendingReviewScope::Quit {
