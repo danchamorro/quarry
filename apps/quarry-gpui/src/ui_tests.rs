@@ -2809,4 +2809,40 @@ fn external_open_urls_routes_hardlink_alias_to_owning_window(cx: &mut gpui_kit::
         assert_eq!(sched.total_tabs(), 3);
         assert_eq!(sched.active_document(w2_id), Some(opened_doc));
     });
+
+    // While Window 2 has an unapplied cell editor open, preferred external routing skips it
+    // in favor of non-editing Window 1, and directly targeting editing Window 2 preserves its
+    // active tab instead of swapping the document out from under the open editor.
+    let blocked_path = dir.path().join("blocked_while_editing.csv");
+    std::fs::write(&blocked_path, "id,name\n4,Blocked\n").unwrap();
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| c.set_window_editing(w2_id, true, cx));
+        assert_eq!(
+            controller
+                .read(cx)
+                .preferred_window_for_external_open(Some(w2_handle.into())),
+            Some(w1_id),
+            "preferred external target should pick a non-editing window when active window is editing"
+        );
+        let blocked = controller.update(cx, |c, cx| {
+            c.open_external_paths(Some(w2_id), vec![blocked_path.clone()], cx)
+        });
+        assert!(
+            blocked.expect("outcome").is_err(),
+            "opening a new file directly into an editing window must be rejected"
+        );
+        let sched = controller.read(cx).scheduler();
+        assert_eq!(sched.total_tabs(), 3);
+        assert_eq!(
+            sched.active_document(w2_id),
+            Some(opened_doc),
+            "editing window must keep its active document untouched"
+        );
+        // Existing hard-link alias owned by non-editing Window 1 still routes cleanly.
+        let alias_routed = controller.update(cx, |c, cx| {
+            c.open_external_paths(Some(w2_id), vec![alias_path.clone()], cx)
+        });
+        assert_eq!(alias_routed.unwrap().unwrap(), (w1_id, doc_orig));
+        controller.update(cx, |c, cx| c.set_window_editing(w2_id, false, cx));
+    });
 }
