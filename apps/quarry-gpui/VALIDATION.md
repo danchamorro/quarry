@@ -15,7 +15,7 @@ Full Phase 4B-1 evidence is recorded in [docs/benchmarks/2026-11-23-phase4b1-gpu
 - **Live accessibility verification:**
   - **macOS (`macOS VM 1`, `accesskit_macos 0.26.3`):** Verified live toolbar, disabled states, editable fields, `DataTable` column headers, row numbers, per-cell `Column N: value` labels, status bar, `Format`/`Columns` popovers, and Cell Editor dialog-close focus restoration back to the grid.
   - **Linux / Omarchy (`Omarchy VM 4`, Hyprland `0.56.2`, `accesskit_unix 0.22.1`):** Verified native Wayland (`"xwayland": false`), Vulkan 1.4 surface creation (Mesa `26.2.5` Lavapipe), `cosmic-text` font resolution, `org.freedesktop.portal.FileChooser` v4 availability, and live AT-SPI tree exposure (`Application`, `Frame`, `ToolBar`, `Table`, `ColumnHeader`, `TableRow`, `TableCell`, `StatusBar`).
-- **Remaining work tracked for Phase 4B-2 / 4B-3 / 6 / 9B:** Full desktop feature parity with `apps/quarry-egui`, 200-tab / multi-window `WorkbenchScheduler` wiring, Dark and Omarchy themes, AT-SPI off-viewport row-label refinement, unlocked visual `1.25×`/`1.5×` fractional-scaling and hardware Vulkan / 120 Hz frame-pacing verification, and Phase 4B-3 packaging + `T19` shipping notice cutover.
+- **Remaining work tracked for Phase 4B-2 / 4B-3 / 6 / 9B:** Full desktop feature parity with `apps/quarry-egui`, 200-tab / multi-window `WorkbenchScheduler` wiring, Dark and Omarchy themes, unlocked visual `1.25×`/`1.5×` fractional-scaling and hardware Vulkan / 120 Hz frame-pacing verification, and Phase 4B-3 packaging + `T19` shipping notice cutover.
 
 ---
 

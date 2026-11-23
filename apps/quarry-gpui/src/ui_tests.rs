@@ -469,7 +469,28 @@ fn nested_select_switches_directly_to_another_toolbar_panel_in_one_click_with_fo
 fn accessibility_exposes_grid_cell_labels_and_restores_focus_after_editor(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("a11y.csv");
-    std::fs::write(&source, "city,population\nReno,264165\nAustin,961855\n").unwrap();
+    let mut header = vec![
+        "city".to_string(),
+        "population".to_string(),
+        "notes".to_string(),
+    ];
+    let mut row1 = vec!["Reno".to_string(), "264165".to_string(), String::new()];
+    let mut row2 = vec!["Austin".to_string(), "961855".to_string(), "TX".to_string()];
+    for column in 3..30 {
+        header.push(format!("col_{column}"));
+        row1.push(format!("r1_c{column}"));
+        row2.push(format!("r2_c{column}"));
+    }
+    std::fs::write(
+        &source,
+        format!(
+            "{}\n{}\n{}\n",
+            header.join(","),
+            row1.join(","),
+            row2.join(",")
+        ),
+    )
+    .unwrap();
     cx.update(gpui_kit::init);
     let mut view = None;
     let handle = cx.open_window(size(px(1100.), px(700.)), |window, cx| {
@@ -507,6 +528,20 @@ fn accessibility_exposes_grid_cell_labels_and_restores_focus_after_editor(cx: &m
         assert_eq!(
             table.delegate().cell_label(0, 2, cx).as_deref(),
             Some("population: 264165")
+        );
+        assert_eq!(
+            table.delegate().cell_label(0, 3, cx).as_deref(),
+            Some("notes: empty")
+        );
+        assert_eq!(
+            table.delegate().cell_label(0, 30, cx),
+            None,
+            "unloaded off-viewport columns must not be mislabeled as empty"
+        );
+        assert_eq!(
+            table.delegate().cell_label(500, 1, cx),
+            None,
+            "unloaded rows must not be mislabeled as empty"
         );
         assert!(
             snapshots(window)
