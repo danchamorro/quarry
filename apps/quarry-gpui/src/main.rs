@@ -3116,21 +3116,29 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 /// `application:openURLs:`) into a local filesystem `PathBuf`. Rejects non-`file`
 /// schemes, remote authorities, malformed percent escapes, and NUL bytes.
 fn file_url_to_path(raw: &str) -> Option<PathBuf> {
-    let rest = if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("file://") {
-        &raw[7..]
-    } else {
+    let raw_bytes = raw.as_bytes();
+    if !raw_bytes
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file://"))
+    {
         return None;
-    };
-    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
-    let path_part = if rest.starts_with('/') {
+    }
+    let rest = &raw_bytes[7..];
+    let rest = rest
+        .split(|&b| b == b'?' || b == b'#')
+        .next()
+        .unwrap_or(rest);
+    let bytes = if rest.starts_with(b"/") {
         rest
-    } else if rest.len() >= 10 && rest[..10].eq_ignore_ascii_case("localhost/") {
+    } else if rest
+        .get(..10)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"localhost/"))
+    {
         &rest[9..]
     } else {
         return None;
     };
 
-    let bytes = path_part.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {

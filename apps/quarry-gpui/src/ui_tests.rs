@@ -2207,6 +2207,8 @@ fn file_url_and_launch_arg_parsing_handles_finder_paths_and_rejects_remote_urls(
         crate::file_url_to_path("file://evil.example/data.csv"),
         None
     );
+    assert_eq!(crate::file_url_to_path("file://aééééé/data.csv"), None);
+    assert_eq!(crate::file_url_to_path("ééééééé"), None);
     assert_eq!(crate::file_url_to_path("file:///tmp/bad%2"), None);
     assert_eq!(crate::file_url_to_path("file:///tmp/bad%ZZ.csv"), None);
     assert_eq!(crate::file_url_to_path("file:///tmp/null%00.csv"), None);
@@ -2661,8 +2663,17 @@ fn save_as_targets_originating_document_across_focus_change(cx: &mut gpui_kit::T
         });
     });
 
-    // 1. Focus shifts to Window 2 while Window 1's Save As sheet for `doc_a` is open.
-    // Completing Save As still targets `w1_id`/`doc_a` and writes `doc_a`'s edited rows.
+    // 1. Open the real Save As picker on Window 1 (`doc_a`), shift OS focus to Window 2
+    // while the picker is still pending, then complete the picker and verify the callback
+    // writes `doc_a`'s edited rows (not Window 2's document).
+    cx.update_window(w1_handle.into(), |_, window, cx| {
+        w1_view.update(cx, |q, cx| q.choose_save_destination(None, window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.did_prompt_for_new_path(),
+        "choose_save_destination must invoke the native new-path picker"
+    );
     cx.update_window(w2_handle.into(), |_, window, _| window.activate_window())
         .unwrap();
     let doc_b = cx.update(|cx| {
@@ -2673,18 +2684,15 @@ fn save_as_targets_originating_document_across_focus_change(cx: &mut gpui_kit::T
             .unwrap()
     });
     assert_ne!(doc_b, doc_a);
-    cx.update(|cx| {
-        controller.update(cx, |c, cx| {
-            c.start_save_active(w1_id, Some(doc_a), Some(copy_a.clone()), None, cx)
-                .unwrap();
-        });
-    });
-    wait_for_ui(cx, w1_handle, &controller, &w1_view, |_, _, cx| {
-        controller
-            .read(cx)
-            .scheduler()
-            .tab(doc_a)
-            .is_some_and(|t| !t.document_writing())
+    let copy_a_for_picker = copy_a.clone();
+    cx.simulate_new_path_selection(move |_| Some(copy_a_for_picker));
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, cx| {
+        !q.confirming
+            && controller
+                .read(cx)
+                .scheduler()
+                .tab(doc_a)
+                .is_some_and(|t| !t.document_writing())
             && copy_a.exists()
     });
     assert_eq!(
@@ -2692,21 +2700,35 @@ fn save_as_targets_originating_document_across_focus_change(cx: &mut gpui_kit::T
         "id,val\n1,ALPHA_EDITED\n"
     );
 
-    // 2. Switching active tab inside Window 1 before Save As starts rejects cleanly
-    // instead of saving `doc_c` under `doc_a`'s chosen destination.
+    // 2. Open the real Save As picker on Window 1 (`doc_a`), switch Window 1's active tab to
+    // `doc_c` before the picker resolves, and verify the picker callback rejects cleanly
+    // instead of writing `doc_c` to `doc_a`'s chosen destination.
+    cx.update_window(w1_handle.into(), |_, window, cx| {
+        w1_view.update(cx, |q, cx| q.choose_save_destination(None, window, cx));
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_new_path());
     cx.update(|cx| {
         controller.update(cx, |c, cx| c.activate_tab(w1_id, doc_c, cx).unwrap());
     });
-    let rejected = cx.update(|cx| {
-        controller.update(cx, |c, cx| {
-            c.start_save_active(w1_id, Some(doc_a), Some(copy_wrong.clone()), None, cx)
-        })
+    let copy_wrong_for_picker = copy_wrong.clone();
+    cx.simulate_new_path_selection(move |_| Some(copy_wrong_for_picker));
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, _| {
+        !q.confirming
+    });
+    assert!(!copy_wrong.exists());
+    let warning_text = cx.update(|cx| {
+        controller
+            .read(cx)
+            .window_message(w1_id)
+            .map(|msg| msg.text.clone())
     });
     assert!(
-        rejected.is_err(),
-        "same-window tab switch before Save As starts must be rejected"
+        warning_text
+            .as_deref()
+            .is_some_and(|t| t.contains("active document changed")),
+        "expected active-document-changed warning, got {warning_text:?}"
     );
-    assert!(!copy_wrong.exists());
 }
 
 #[gpui_kit::test]
