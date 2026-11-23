@@ -59,11 +59,14 @@ impl fmt::Display for DocumentId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandId {
     About,
+    NewWindow,
     Open,
     OpenWithEncoding(Encoding),
     CombineFiles,
     JoinFiles,
     CloseTab,
+    CloseWindow,
+    MoveTabToNewWindow,
     KeepEditing,
     DiscardAndClose,
     ReloadFromDisk,
@@ -87,6 +90,7 @@ pub enum CommandId {
     Filters,
     NextTab,
     PreviousTab,
+    Quit,
     UserGuide,
     ReportIssue,
 }
@@ -181,14 +185,18 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
     });
     let target = match command {
         CommandId::About
+        | CommandId::NewWindow
         | CommandId::Open
         | CommandId::OpenWithEncoding(_)
         | CommandId::CombineFiles
         | CommandId::JoinFiles
         | CommandId::ShowAllWhitespace
+        | CommandId::Quit
         | CommandId::UserGuide
         | CommandId::ReportIssue => Some(CommandTarget::Application),
-        CommandId::NextTab | CommandId::PreviousTab => Some(CommandTarget::Window(ctx.window)),
+        CommandId::CloseWindow | CommandId::NextTab | CommandId::PreviousTab => {
+            Some(CommandTarget::Window(ctx.window))
+        }
         CommandId::TemporaryStorage | CommandId::InspectFile | CommandId::KeepEditing => {
             doc_target.or(Some(CommandTarget::Window(ctx.window)))
         }
@@ -196,6 +204,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
             Some(CommandTarget::Window(ctx.window))
         }
         CommandId::CloseTab
+        | CommandId::MoveTabToNewWindow
         | CommandId::DiscardAndClose
         | CommandId::ReloadFromDisk
         | CommandId::Save
@@ -249,6 +258,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
             | CommandId::Paste
             | CommandId::SelectAll
             | CommandId::ShowAllWhitespace
+            | CommandId::Quit
             | CommandId::UserGuide
             | CommandId::ReportIssue => CommandResolution {
                 enabled: true,
@@ -267,18 +277,24 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         |rows| document.is_some_and(|document| document.insertion_disabled_reason(rows).is_none());
     let available = match command {
         CommandId::About
+        | CommandId::NewWindow
         | CommandId::Open
         | CommandId::OpenWithEncoding(_)
         | CommandId::JoinFiles
+        | CommandId::CloseWindow
         | CommandId::Cut
         | CommandId::Copy
         | CommandId::Paste
         | CommandId::SelectAll
         | CommandId::ShowAllWhitespace
+        | CommandId::Quit
         | CommandId::UserGuide
         | CommandId::ReportIssue => true,
         CommandId::CombineFiles => files.combine,
-        CommandId::CloseTab | CommandId::Columns | CommandId::Filters => open,
+        CommandId::CloseTab
+        | CommandId::MoveTabToNewWindow
+        | CommandId::Columns
+        | CommandId::Filters => open,
         CommandId::ReloadFromDisk => files.reload,
         CommandId::Save => files.save,
         CommandId::SaveAs => files.save_as,

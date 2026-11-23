@@ -1,12 +1,15 @@
-mod document;
 mod grid;
+mod menus;
 mod panels;
+mod workbench;
 
 #[cfg(test)]
 mod ui_tests;
 
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
+#[cfg(not(target_os = "macos"))]
+use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Root, Sizable, Theme, ThemeMode, WindowExt,
@@ -18,45 +21,58 @@ use gpui_kit::{
     prelude::*,
     *,
 };
-use quarry_core::OpenOptions;
+use quarry_core::{Encoding, OpenOptions};
+use quarry_workbench::{
+    AppMessage, CommandId, DocumentId, MessageSeverity, ResidencyState, WindowId,
+};
 
-use document::DocumentInfo;
-use grid::{Bridge, Command, Grid, Response};
-use panels::{PanelEvent, Panels};
+use grid::Grid;
+use menus::{
+    CloseTab, CloseWindow, CopySelection, DiscardChanges, EditCell, MoveTabToNewWindow, NewWindow,
+    NextTab, OpenFile, OpenIso88591, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252,
+    PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, SaveAsFile,
+    SaveAsUtf8, SaveFile, ShowAllWhitespace, ToggleColumns, ToggleFilters, UndoEdit,
+    bind_shortcuts, encoding_label, install_menus,
+};
+use panels::{PanelEvent, Panels, Tool};
+use workbench::{CloseReviewAction, DocumentSnapshot, MAX_EDIT_BYTES, WorkbenchController};
 
-gpui_kit::actions!(
-    quarry_comparison,
-    [OpenFile, SaveCopy, Quit, EditCell, UndoEdit, RedoEdit]
-);
-
-struct Quarry {
+pub struct QuarryWindow {
+    window_id: WindowId,
+    controller: Entity<WorkbenchController>,
     focus_handle: FocusHandle,
-    bridge: Bridge,
+    #[cfg(not(target_os = "macos"))]
+    menu_bar: Entity<AppMenuBar>,
     table: Entity<TableState<Grid>>,
     panels: Entity<Panels>,
     row_input: Entity<InputState>,
-    info: Option<DocumentInfo>,
-    busy: bool,
+    last_synced_doc: Option<DocumentId>,
+    last_headers: Vec<String>,
+    last_shown_columns: Vec<usize>,
     confirming: bool,
     editing: bool,
     editor_status: Option<Entity<CellEditStatus>>,
-    message: Option<(String, bool)>,
     _subscriptions: Vec<Subscription>,
 }
 
 #[derive(Default)]
 struct CellEditStatus {
-    pending: bool,
     error: Option<String>,
 }
 
-impl Quarry {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+impl QuarryWindow {
+    fn new(
+        window_id: WindowId,
+        controller: Entity<WorkbenchController>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
-        let bridge = Bridge::new();
+        #[cfg(not(target_os = "macos"))]
+        let menu_bar = AppMenuBar::new(cx);
         let table = cx.new(|cx| {
-            TableState::new(Grid::new(bridge.requester()), window, cx)
+            TableState::new(Grid::new(controller.clone(), window_id), window, cx)
                 .cell_selectable(true)
                 .row_header(false)
                 .col_movable(false)
@@ -64,256 +80,285 @@ impl Quarry {
         let panels = cx.new(|cx| Panels::new(window, cx));
         let row_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
         let subscriptions = vec![
-            cx.subscribe_in(&table, window, |this, _, event, window, cx| match event {
-                TableEvent::DoubleClickedCell(row, column) => this.edit_cell(*row, *column, cx),
-                TableEvent::ColumnWidthsChanged(widths) => {
-                    this.table.update(cx, |table, _| table.delegate_mut().set_widths(widths));
-                }
-                _ => { let _ = window; }
+            cx.observe_in(&controller, window, |this, _, window, cx| {
+                this.sync_from_controller(window, cx);
             }),
+            cx.subscribe_in(
+                &table,
+                window,
+                |this, table, event, window, cx| match event {
+                    TableEvent::SelectCell(row, column) => {
+                        let target = table.read(cx).delegate().cell_at(*row, *column, cx);
+                        this.controller.update(cx, |controller, _| {
+                            controller.set_active_selection(
+                                this.window_id,
+                                target.map(|(r, c)| quarry_workbench::GridSelection::Cell {
+                                    row: r,
+                                    column: c,
+                                }),
+                            );
+                        });
+                    }
+                    TableEvent::DoubleClickedCell(row, column) => {
+                        let target = table.read(cx).delegate().cell_at(*row, *column, cx);
+                        this.controller.update(cx, |controller, _| {
+                            controller.set_active_selection(
+                                this.window_id,
+                                target.map(|(r, c)| quarry_workbench::GridSelection::Cell {
+                                    row: r,
+                                    column: c,
+                                }),
+                            );
+                        });
+                        this.edit_cell(*row, *column, window, cx);
+                    }
+                    TableEvent::ColumnWidthsChanged(widths) => {
+                        let widths = widths.clone();
+                        this.table.update(cx, |table, cx| {
+                            table.delegate_mut().set_widths(&widths, cx);
+                        });
+                    }
+                    _ => {}
+                },
+            ),
             cx.subscribe_in(&panels, window, |this, _, event, window, cx| {
                 match event {
-                    PanelEvent::Columns(columns) => this.table.update(cx, |table, cx| {
-                        table.delegate_mut().set_columns(columns.clone());
-                        table.refresh(cx);
-                        cx.notify();
-                    }),
+                    PanelEvent::Columns(columns) => {
+                        this.controller.update(cx, |controller, cx| {
+                            controller.set_active_shown_columns(
+                                this.window_id,
+                                columns.clone(),
+                                cx,
+                            );
+                        });
+                        this.table.update(cx, |table, cx| {
+                            table.refresh(cx);
+                            cx.notify();
+                        });
+                    }
                     PanelEvent::AutoFit => this.table.update(cx, |table, cx| {
-                        table.delegate_mut().auto_fit();
+                        table.delegate_mut().auto_fit(cx);
                         table.refresh(cx);
                         cx.notify();
                     }),
                     PanelEvent::Filter(query) => {
-                        this.table.update(cx, |table, cx| table.scroll_to_row(0, cx));
-                        this.row_input.update(cx, |state, cx| state.set_value("1", window, cx));
-                        this.command(Command::Filter(query.clone()), cx);
-                    },
+                        this.table
+                            .update(cx, |table, cx| table.scroll_to_row(0, cx));
+                        this.row_input
+                            .update(cx, |state, cx| state.set_value("1", window, cx));
+                        let res = this.controller.update(cx, |controller, cx| {
+                            controller.start_filter_active(this.window_id, query.clone(), cx)
+                        });
+                        if let Err(error) = res {
+                            this.set_message(AppMessage::error(error), cx);
+                        }
+                    }
                     PanelEvent::ClearFilter => {
-                        this.table.update(cx, |table, cx| table.scroll_to_row(0, cx));
-                        this.row_input.update(cx, |state, cx| state.set_value("1", window, cx));
-                        this.command(Command::ClearFilter, cx);
-                    },
-                    PanelEvent::Reopen(options) => {
-                        if let Some(info) = &this.info {
-                            if info.dirty {
-                                this.message = Some(("Undo your edits or save a copy and open it before changing the format.".into(), true));
-                            } else {
-                                this.command(Command::Open(info.path.clone(), *options), cx);
-                            }
+                        this.table
+                            .update(cx, |table, cx| table.scroll_to_row(0, cx));
+                        this.row_input
+                            .update(cx, |state, cx| state.set_value("1", window, cx));
+                        let res = this.controller.update(cx, |controller, cx| {
+                            controller.clear_filter_active(this.window_id, cx)
+                        });
+                        if let Err(error) = res {
+                            this.set_message(AppMessage::error(error), cx);
+                        }
+                    }
+                    PanelEvent::Reopen(options, encoding) => {
+                        let res = this.controller.update(cx, |controller, cx| {
+                            controller.reopen_active_tab(this.window_id, *options, *encoding, cx)
+                        });
+                        if let Err(error) = res {
+                            this.set_message(AppMessage::warning(error), cx);
+                        } else {
+                            this.table.update(cx, |table, cx| {
+                                table.delegate_mut().reset_widths();
+                                table.refresh(cx);
+                                table.scroll_to_row(0, cx);
+                                table.scroll_to_col(0, cx);
+                                cx.notify();
+                            });
                         }
                     }
                 }
                 cx.notify();
             }),
             cx.subscribe_in(&row_input, window, |this, _, event, _, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) { this.go_to_row(cx); }
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.go_to_row(cx);
+                }
             }),
         ];
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| {
-                this.close_requested(window, cx);
+                this.close_window_requested(window, cx);
                 false
             })
             .unwrap_or(true)
         });
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(32))
-                    .await;
-                if this
-                    .update_in(cx, |this, window, cx| this.poll(window, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
         Self {
+            window_id,
+            controller,
             focus_handle,
-            bridge,
+            #[cfg(not(target_os = "macos"))]
+            menu_bar,
             table,
             panels,
             row_input,
-            info: None,
-            busy: false,
+            last_synced_doc: None,
+            last_headers: Vec::new(),
+            last_shown_columns: Vec::new(),
             confirming: false,
             editing: false,
             editor_status: None,
-            message: None,
             _subscriptions: subscriptions,
         }
     }
 
-    fn command(&mut self, command: Command, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        match self.bridge.send(command) {
-            Ok(()) => {
-                self.busy = true;
-                self.message = None;
-                self.panels
-                    .update(cx, |panels, cx| panels.set_busy(true, cx));
-            }
-            Err(error) => self.message = Some((error, true)),
-        }
-        cx.notify();
+    fn set_message(&mut self, message: AppMessage, cx: &mut Context<Self>) {
+        self.controller.update(cx, |controller, cx| {
+            controller.set_window_message(self.window_id, Some(message), cx);
+        });
     }
 
-    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let responses = self.bridge.drain();
-        if responses.is_empty() {
+    fn snapshot(&self, cx: &App) -> Option<DocumentSnapshot> {
+        self.controller.read(cx).active_snapshot(self.window_id)
+    }
+
+    fn command_enabled(&self, command: CommandId, cx: &App) -> bool {
+        self.controller
+            .read(cx)
+            .evaluate_window_command(
+                self.window_id,
+                command,
+                self.confirming || self.editing,
+                false,
+            )
+            .enabled
+    }
+
+    fn sync_from_controller(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (close_windows, quit_done) = self.controller.update(cx, |controller, _| {
+            (
+                controller.take_pending_close_windows(),
+                controller.take_quit_complete(),
+            )
+        });
+        if quit_done {
+            cx.quit();
             return;
         }
-        for response in responses {
-            match response {
-                Response::Opened(info) => {
-                    self.panels
-                        .update(cx, |panels, cx| panels.finish_reopen(true, window, cx));
-                    self.table.update(cx, |table, cx| {
-                        table.delegate_mut().set_info(info.clone());
-                        table.delegate_mut().reset_columns();
-                        table.refresh(cx);
+        for win_id in close_windows {
+            if win_id == self.window_id {
+                self.controller.update(cx, |controller, _| {
+                    controller.unregister_window_handle(self.window_id);
+                });
+                window.remove_window();
+                return;
+            } else if let Some(handle) = self.controller.read(cx).window_handle(win_id) {
+                self.controller.update(cx, |controller, _| {
+                    controller.unregister_window_handle(win_id);
+                });
+                let _ = handle.update(cx, |_, other_window, _| other_window.remove_window());
+            }
+        }
+
+        if let Some(info) = self.snapshot(cx) {
+            let doc_changed = self.last_synced_doc != Some(info.document_id);
+            let schema_changed = doc_changed
+                || self.last_headers != info.headers
+                || self.last_shown_columns != info.shown_columns;
+            window.set_window_title(&format!(
+                "{}{} · Quarry",
+                info.filename,
+                if info.dirty { " *" } else { "" }
+            ));
+            self.panels
+                .update(cx, |panels, cx| panels.sync_document(&info, window, cx));
+            if schema_changed {
+                self.last_synced_doc = Some(info.document_id);
+                self.last_headers = info.headers.clone();
+                self.last_shown_columns = info.shown_columns.clone();
+                self.table.update(cx, |table, cx| {
+                    if doc_changed {
+                        table.delegate_mut().reset_widths();
                         table.scroll_to_row(0, cx);
                         table.scroll_to_col(0, cx);
-                        cx.notify();
-                    });
+                    }
+                    table.refresh(cx);
+                    cx.notify();
+                });
+                if doc_changed {
                     self.row_input
                         .update(cx, |state, cx| state.set_value("1", window, cx));
-                    self.update_info(info, window, cx);
                 }
-                Response::Info(info) => {
-                    let changed = self
-                        .info
-                        .as_ref()
-                        .is_none_or(|old| old.headers != info.headers);
-                    self.table.update(cx, |table, cx| {
-                        table.delegate_mut().set_info(info.clone());
-                        if changed {
-                            table.refresh(cx);
-                        }
-                        cx.notify();
-                    });
-                    self.update_info(info, window, cx);
-                }
-                Response::Viewport {
-                    generation,
-                    sequence,
-                    viewport,
-                } => self.table.update(cx, |table, cx| {
-                    table
-                        .delegate_mut()
-                        .set_viewport(generation, sequence, viewport);
-                    cx.notify();
-                }),
-                Response::Cell { row, column, value } => {
-                    self.show_editor(row, column, value, window, cx)
-                }
-                Response::Saved(path) => {
-                    self.message = Some((format!("Copy saved: {}", path.display()), false));
-                }
-                Response::Done => {
-                    self.busy = false;
-                    self.panels
-                        .update(cx, |panels, cx| panels.set_busy(false, cx));
-                    if self
-                        .editor_status
-                        .as_ref()
-                        .is_some_and(|status| status.read(cx).pending)
-                    {
-                        self.editor_status = None;
-                        self.editing = false;
-                        window.close_dialog(cx);
-                        let table_focus = self.info.is_some().then(|| self.table.focus_handle(cx));
-                        let root_focus = self.focus_handle.clone();
-                        window.defer(cx, move |window, cx| {
-                            if let Some(table_focus) = table_focus {
-                                table_focus.focus(window, cx);
-                            } else {
-                                root_focus.focus(window, cx);
-                            }
-                        });
-                    }
-                }
-                Response::Error(error) => {
-                    if let Some(status) = &self.editor_status {
-                        status.update(cx, |status, cx| {
-                            if status.pending {
-                                status.pending = false;
-                                status.error = Some(error.clone());
-                                cx.notify();
-                            }
-                        });
-                    }
-                    self.panels
-                        .update(cx, |panels, cx| panels.finish_reopen(false, window, cx));
-                    self.message = Some((error, true));
-                }
+            } else {
+                self.table.update(cx, |_, cx| cx.notify());
             }
+        } else {
+            if self.last_synced_doc.is_some() {
+                self.last_synced_doc = None;
+                self.last_headers.clear();
+                self.last_shown_columns.clear();
+                self.panels
+                    .update(cx, |panels, cx| panels.clear_document(window, cx));
+                self.table.update(cx, |table, cx| {
+                    table.delegate_mut().reset_widths();
+                    table.refresh(cx);
+                    cx.notify();
+                });
+            }
+            window.set_window_title("Quarry");
         }
         cx.notify();
     }
 
-    fn update_info(&mut self, info: DocumentInfo, window: &mut Window, cx: &mut Context<Self>) {
-        let filename = info.path.file_name().unwrap_or_default().to_string_lossy();
-        window.set_window_title(&format!(
-            "{}{} · Quarry GPUI comparison",
-            filename,
-            if info.dirty { " *" } else { "" }
-        ));
-        let shown = self.table.read(cx).delegate().columns().to_vec();
-        self.panels.update(cx, |panels, cx| {
-            panels.set_document(&info, shown, window, cx)
+    pub fn open_paths_direct(
+        &mut self,
+        paths: Vec<PathBuf>,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let result = self.controller.update(cx, |controller, cx| {
+            controller.open_paths(self.window_id, paths, options, encoding, cx)
         });
-        self.info = Some(info);
+        if let Err(error) = result {
+            self.set_message(AppMessage::error(error), cx);
+        } else {
+            self.sync_from_controller(window, cx);
+        }
     }
 
-    fn choose_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.confirming || self.editing {
+    fn choose_open_with_encoding(
+        &mut self,
+        encoding: Option<Encoding>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.confirming || self.editing {
             return;
         }
-        if self.info.as_ref().is_some_and(|info| info.dirty) {
-            self.confirming = true;
-            let answer = window.prompt(PromptLevel::Warning, "Open another file?", Some("Your edits are in memory. Save a copy first if you want to keep them. Opening another file discards these edits."), &["Cancel", "Discard edits and open"], cx);
-            cx.spawn_in(window, async move |this, cx| {
-                let discard = matches!(answer.await, Ok(1));
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.confirming = false;
-                    if discard {
-                        this.open_picker(window, cx);
-                    }
-                });
-            })
-            .detach();
-        } else {
-            self.open_picker(window, cx);
-        }
-    }
-
-    fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.confirming = true;
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
-            multiple: false,
-            prompt: Some("Open in Quarry GPUI".into()),
+            multiple: true,
+            prompt: Some("Open in Quarry".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let selection = selection.await;
-            let _ = this.update_in(cx, |this, _, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.confirming = false;
                 match selection {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.into_iter().next() {
-                            this.command(Command::Open(path, OpenOptions::default()), cx);
-                        }
+                    Ok(Ok(Some(paths))) if !paths.is_empty() => {
+                        this.open_paths_direct(paths, OpenOptions::default(), encoding, window, cx);
                     }
                     Ok(Err(error)) => {
-                        this.message = Some((error.to_string(), true));
-                        cx.notify();
+                        this.set_message(AppMessage::error(error.to_string()), cx);
                     }
                     _ => {}
                 }
@@ -322,36 +367,54 @@ impl Quarry {
         .detach();
     }
 
-    fn choose_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.confirming || self.editing {
+    fn choose_save_destination(
+        &mut self,
+        encoding: Option<Encoding>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.confirming || self.editing {
             return;
         }
-        let Some(info) = &self.info else {
+        let Some(info) = self.snapshot(cx) else {
             return;
         };
         let directory = info
             .path
             .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let suffix = if encoding == Some(Encoding::Utf8) {
+            "-utf8"
+        } else {
+            "-copy"
+        };
         let name = format!(
-            "{}-edited.{}",
+            "{}{}.{}",
             info.path.file_stem().unwrap_or_default().to_string_lossy(),
+            suffix,
             info.path
                 .extension()
                 .unwrap_or_else(|| std::ffi::OsStr::new("csv"))
                 .to_string_lossy()
         );
-        let selection = cx.prompt_for_new_path(directory, Some(&name));
+        let selection = cx.prompt_for_new_path(&directory, Some(&name));
         self.confirming = true;
         cx.spawn_in(window, async move |this, cx| {
             let selection = selection.await;
             let _ = this.update_in(cx, |this, _, cx| {
                 this.confirming = false;
                 match selection {
-                    Ok(Ok(Some(path))) => this.command(Command::SaveCopy(path), cx),
+                    Ok(Ok(Some(path))) => {
+                        let res = this.controller.update(cx, |controller, cx| {
+                            controller.start_save_active(this.window_id, Some(path), encoding, cx)
+                        });
+                        if let Err(error) = res {
+                            this.set_message(error, cx);
+                        }
+                    }
                     Ok(Err(error)) => {
-                        this.message = Some((error.to_string(), true));
-                        cx.notify();
+                        this.set_message(AppMessage::error(error.to_string()), cx);
                     }
                     _ => {}
                 }
@@ -360,72 +423,251 @@ impl Quarry {
         .detach();
     }
 
-    fn close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirming {
+    fn save_in_place(&mut self, cx: &mut Context<Self>) {
+        if !self.command_enabled(CommandId::Save, cx) {
             return;
         }
-        if self.busy {
-            self.message = Some((
-                "Wait for the current operation to finish before closing.".into(),
-                false,
-            ));
-            cx.notify();
-            return;
-        }
-        if self.editing || self.info.as_ref().is_some_and(|info| info.dirty) {
-            self.confirming = true;
-            let answer = window.prompt(PromptLevel::Warning, "Close this comparison?", Some("Unsaved edits will be discarded. Your original file stays unchanged. Cancel to save a copy first."), &["Cancel", "Discard edits and close"], cx);
-            cx.spawn_in(window, async move |this, cx| {
-                let discard = matches!(answer.await, Ok(1));
-                let _ = this.update_in(cx, |this, window, _cx| {
-                    this.confirming = false;
-                    if discard {
-                        window.remove_window();
-                    }
-                });
-            })
-            .detach();
-        } else {
-            window.remove_window();
+        let res = self.controller.update(cx, |controller, cx| {
+            controller.start_save_active(self.window_id, None, None, cx)
+        });
+        if let Err(error) = res {
+            self.set_message(error, cx);
         }
     }
 
+    fn handle_review_action(
+        &mut self,
+        action: CloseReviewAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            CloseReviewAction::Proceed => {
+                self.sync_from_controller(window, cx);
+            }
+            CloseReviewAction::Wait { message } => {
+                self.set_message(AppMessage::warning(message), cx);
+            }
+            CloseReviewAction::ConfirmTab {
+                window_id,
+                filename,
+                ..
+            } => {
+                if window_id != self.window_id
+                    && let Some(handle) = self.controller.read(cx).window_handle(window_id)
+                {
+                    let _ = handle.update(cx, |_, other_window, _| other_window.activate_window());
+                }
+                self.show_unsaved_close_dialog(window_id, filename, window, cx);
+            }
+        }
+    }
+
+    fn show_unsaved_close_dialog(
+        &mut self,
+        target_window: WindowId,
+        filename: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.confirming {
+            return;
+        }
+        self.confirming = true;
+        self.panels
+            .update(cx, |panels, cx| panels.close(window, cx));
+        let controller = self.controller.clone();
+        let this_weak = cx.weak_entity();
+        let keep_weak = cx.weak_entity();
+        let discard_weak = cx.weak_entity();
+        let save_weak = cx.weak_entity();
+        let close_weak = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _cx| {
+            let filename_msg = filename.clone();
+            let controller_keep = controller.clone();
+            let controller_discard = controller.clone();
+            let controller_save = controller.clone();
+            let controller_cancel = controller.clone();
+            let keep_weak = keep_weak.clone();
+            let discard_weak = discard_weak.clone();
+            let save_weak = save_weak.clone();
+            let close_weak = close_weak.clone();
+            let _ = &this_weak;
+            dialog
+                .title(format!("Save changes to {filename}?"))
+                .w(px(460.))
+                .overlay_closable(false)
+                .close_button(true)
+                .keyboard(true)
+                .content(move |content, _, cx| {
+                    content.child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{filename_msg} has unsaved edits. Save your changes, discard them, or keep editing."
+                            )),
+                    )
+                })
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("close-keep-editing")
+                                .label("Keep Editing")
+                                .small()
+                                .on_click(move |_, window, cx| {
+                                    controller_keep.update(cx, |c, cx| c.cancel_close_review(cx));
+                                    let _ = keep_weak.update(cx, |this, _| {
+                                        this.confirming = false;
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("close-discard")
+                                .label("Discard")
+                                .danger()
+                                .small()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let next = controller_discard
+                                        .update(cx, |c, cx| c.approve_discard_in_review(cx));
+                                    let _ = discard_weak.update(cx, |this, cx| {
+                                        this.confirming = false;
+                                        this.handle_review_action(next, window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("close-save")
+                                .label("Save")
+                                .primary()
+                                .small()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let res = controller_save.update(cx, |c, cx| {
+                                        c.save_in_review(target_window, cx)
+                                    });
+                                    let _ = save_weak.update(cx, |this, cx| {
+                                        this.confirming = false;
+                                        if let Err(error) = res {
+                                            this.set_message(error, cx);
+                                        }
+                                    });
+                                }),
+                        ),
+                )
+                .on_cancel(move |_, _, cx| {
+                    controller_cancel.update(cx, |c, cx| c.cancel_close_review(cx));
+                    true
+                })
+                .on_close(move |_, _, cx| {
+                    let _ = close_weak.update(cx, |this, cx| {
+                        this.confirming = false;
+                        cx.notify();
+                    });
+                })
+        });
+    }
+
+    fn close_tab_by_id(
+        &mut self,
+        id: DocumentId,
+        close_window_if_last: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.confirming || self.editing {
+            return;
+        }
+        let action = self.controller.update(cx, |controller, cx| {
+            controller.request_close_tab(self.window_id, id, close_window_if_last, cx)
+        });
+        self.handle_review_action(action, window, cx);
+    }
+
+    fn close_window_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirming || self.editing {
+            return;
+        }
+        let action = self.controller.update(cx, |controller, cx| {
+            controller.request_close_window(self.window_id, cx)
+        });
+        self.handle_review_action(action, window, cx);
+    }
+
+    fn quit_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirming || self.editing {
+            return;
+        }
+        let action = self
+            .controller
+            .update(cx, |controller, cx| controller.request_quit(cx));
+        self.handle_review_action(action, window, cx);
+    }
+
     fn go_to_row(&mut self, cx: &mut Context<Self>) {
-        let limit = self.info.as_ref().map_or(0, |info| info.available_rows);
+        let limit = self.snapshot(cx).map_or(0, |info| info.available_rows);
         match self.row_input.read(cx).value().parse::<u64>() {
             Ok(row) if row > 0 && row <= limit => {
                 self.table
                     .update(cx, |table, cx| table.scroll_to_row((row - 1) as usize, cx));
-                self.message = None;
+                self.controller.update(cx, |controller, cx| {
+                    controller.set_window_message(self.window_id, None, cx);
+                });
             }
-            _ => self.message = Some((format!("Enter a row from 1 to {limit}."), true)),
+            _ => self.set_message(
+                AppMessage::error(format!("Enter a row from 1 to {limit}.")),
+                cx,
+            ),
         }
         cx.notify();
     }
 
-    fn edit_cell(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
-        if self.editing || self.busy {
+    fn edit_cell(
+        &mut self,
+        row: usize,
+        column: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
             return;
         }
-        if let Some((row, column)) = self.table.read(cx).delegate().cell_at(row, column) {
-            self.command(Command::Cell(row, column), cx);
+        let Some((source_row, source_col)) =
+            self.table.read(cx).delegate().cell_at(row, column, cx)
+        else {
+            return;
+        };
+        let (title, initial_value, disabled_reason) = {
+            let controller = self.controller.read(cx);
+            let Some(doc) = controller.active_document(self.window_id) else {
+                return;
+            };
+            let source = doc.source_cell(source_row, source_col);
+            let disabled = doc.cell_edit_disabled_reason(source);
+            let value_bytes = doc.effective_cell(source_row, source_col).unwrap_or(&[]);
+            let value = String::from_utf8_lossy(value_bytes).into_owned();
+            (doc.column_name(source_col), value, disabled)
+        };
+        if let Some(reason) = disabled_reason {
+            self.set_message(AppMessage::warning(reason), cx);
+            return;
         }
+        self.show_editor(source_row, source_col, title, initial_value, window, cx);
     }
 
     fn show_editor(
         &mut self,
         row: u64,
         column: usize,
+        title: String,
         value: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let title = self
-            .info
-            .as_ref()
-            .and_then(|info| info.headers.get(column))
-            .cloned()
-            .unwrap_or_else(|| format!("Column {}", column + 1));
         let input = cx.new(|cx| TextareaState::new(window, cx).default_value(value));
         self.panels
             .update(cx, |panels, cx| panels.close(window, cx));
@@ -435,9 +677,7 @@ impl Quarry {
         let focus_input = input.clone();
         let apply = cx.weak_entity();
         let close = cx.weak_entity();
-        // Ensure the dialog records the data grid as its previous focus target so
-        // closing via Cancel, Escape, or Apply restores keyboard/screen-reader focus to the grid.
-        if self.info.is_some() {
+        if self.snapshot(cx).is_some() {
             self.table.focus_handle(cx).focus(window, cx);
         }
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -445,16 +685,14 @@ impl Quarry {
             let input_view = input.clone();
             let apply = apply.clone();
             let close = close.clone();
-            let pending = status.read(cx).pending;
             let error = status.read(cx).error.clone();
             let apply_status = status.clone();
-            let cancel_status = status.clone();
             dialog
                 .title(format!("{} · source row {}", title, row + 1))
                 .w(px(480.))
                 .overlay_closable(false)
-                .close_button(!pending)
-                .keyboard(!pending)
+                .close_button(true)
+                .keyboard(true)
                 .footer(
                     div()
                         .flex()
@@ -464,7 +702,6 @@ impl Quarry {
                             Button::new("cancel-cell-edit")
                                 .label("Cancel")
                                 .small()
-                                .disabled(pending)
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(Box::new(DialogCancel), cx)
                                 }),
@@ -474,7 +711,6 @@ impl Quarry {
                                 .label("Apply edit")
                                 .primary()
                                 .small()
-                                .disabled(pending)
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(
                                         Box::new(DialogConfirm { secondary: false }),
@@ -484,50 +720,68 @@ impl Quarry {
                         ),
                 )
                 .content(move |content, _, cx| {
-                    let too_large = input_view.read(cx).value().len() > document::MAX_EDIT_BYTES;
-                    content.child(
-                        Textarea::new(&input_view)
-                            .aria_label("Cell value")
-                            .readonly(pending)
-                            .h(px(116.)),
-                    )
-                    .when(too_large, |content| content.child(
-                        div().id("cell-edit-error").role(Role::Alert).test_support()
-                            .text_color(cx.theme().danger)
-                            .child("Cell values must be 1 MiB or smaller. Shorten the value to apply it.")
-                    ))
-                    .when_some(error.clone().filter(|_| !too_large), |content, error| content.child(
-                        div().id("cell-edit-error").role(Role::Alert).test_support()
-                            .text_color(cx.theme().danger).child(error)
-                    ))
+                    let too_large = input_view.read(cx).value().len() > MAX_EDIT_BYTES;
+                    content
+                        .child(
+                            Textarea::new(&input_view)
+                                .aria_label("Cell value")
+                                .h(px(116.)),
+                        )
+                        .when(too_large, |content| {
+                            content.child(
+                                div()
+                                    .id("cell-edit-error")
+                                    .role(Role::Alert)
+                                    .test_support()
+                                    .text_color(cx.theme().danger)
+                                    .child(
+                                        "Cell values must be 1 MiB or smaller. Shorten the value to apply it.",
+                                    ),
+                            )
+                        })
+                        .when_some(error.clone().filter(|_| !too_large), |content, error| {
+                            content.child(
+                                div()
+                                    .id("cell-edit-error")
+                                    .role(Role::Alert)
+                                    .test_support()
+                                    .text_color(cx.theme().danger)
+                                    .child(error),
+                            )
+                        })
                 })
                 .on_ok(move |_, window, cx| {
                     let value = input_value.read(cx).value().to_string();
-                    if value.len() > document::MAX_EDIT_BYTES {
+                    if value.len() > MAX_EDIT_BYTES {
                         window.refresh();
                         return false;
                     }
-                    let _ = apply.update(cx, |this, cx| {
-                        if this.busy || apply_status.read(cx).pending {
-                            return;
-                        }
-                        this.command(Command::Edit(row, column, value), cx);
-                        apply_status.update(cx, |status, cx| {
-                            status.pending = this.busy;
-                            status.error = this.message.as_ref().filter(|(_, error)| *error)
-                                .map(|(message, _)| message.clone());
-                            cx.notify();
-                        });
+                    let outcome = apply.update(cx, |this, cx| {
+                        this.controller.update(cx, |controller, cx| {
+                            controller.apply_cell_edit(this.window_id, row, column, value, cx)
+                        })
                     });
-                    window.refresh();
-                    false
+                    match outcome {
+                        Ok(Ok(())) => true,
+                        Ok(Err(err)) => {
+                            apply_status.update(cx, |status, cx| {
+                                status.error = Some(err);
+                                cx.notify();
+                            });
+                            window.refresh();
+                            false
+                        }
+                        Err(_) => true,
+                    }
                 })
-                .on_cancel(move |_, _, cx| !cancel_status.read(cx).pending)
                 .on_close(move |_, window, cx| {
                     let _ = close.update(cx, |this, cx| {
                         this.editing = false;
                         this.editor_status = None;
-                        let table_focus = this.info.is_some().then(|| this.table.focus_handle(cx));
+                        let table_focus = this
+                            .snapshot(cx)
+                            .is_some()
+                            .then(|| this.table.focus_handle(cx));
                         let root_focus = this.focus_handle.clone();
                         window.defer(cx, move |window, cx| {
                             if let Some(table_focus) = table_focus {
@@ -543,51 +797,381 @@ impl Quarry {
         focus_input.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    fn show_header_rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let selected_col = self
+            .table
+            .read(cx)
+            .selected_cell()
+            .and_then(|(_, col)| self.table.read(cx).delegate().source_column_at(col, cx))
+            .or_else(|| self.table.read(cx).delegate().columns(cx).first().copied());
+        let Some(source_col) = selected_col else {
+            return;
+        };
+        let (editable, current_name) = {
+            let controller = self.controller.read(cx);
+            let Some(doc) = controller.active_document(self.window_id) else {
+                return;
+            };
+            (
+                doc.header_is_editable(source_col),
+                doc.column_name(source_col),
+            )
+        };
+        if !editable {
+            self.set_message(
+                AppMessage::warning("Header renaming is unavailable for this document."),
+                cx,
+            );
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current_name.clone()));
+        self.editing = true;
+        let focus_input = input.clone();
+        let apply = cx.weak_entity();
+        let close = cx.weak_entity();
+        let status = cx.new(|_| CellEditStatus::default());
+        self.table.focus_handle(cx).focus(window, cx);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let input_value = input.clone();
+            let input_view = input.clone();
+            let apply = apply.clone();
+            let close = close.clone();
+            let error = status.read(cx).error.clone();
+            let apply_status = status.clone();
+            dialog
+                .title(format!("Rename column {}", source_col + 1))
+                .w(px(400.))
+                .overlay_closable(false)
+                .close_button(true)
+                .keyboard(true)
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("cancel-header-rename")
+                                .label("Cancel")
+                                .small()
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(DialogCancel), cx)
+                                }),
+                        )
+                        .child(
+                            Button::new("apply-header-rename")
+                                .label("Rename")
+                                .primary()
+                                .small()
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(DialogConfirm { secondary: false }),
+                                        cx,
+                                    )
+                                }),
+                        ),
+                )
+                .content(move |content, _, cx| {
+                    content
+                        .child(Input::new(&input_view).aria_label("Column header name"))
+                        .when_some(error.clone(), |content, error| {
+                            content.child(
+                                div()
+                                    .id("header-rename-error")
+                                    .role(Role::Alert)
+                                    .text_color(cx.theme().danger)
+                                    .child(error),
+                            )
+                        })
+                })
+                .on_ok(move |_, window, cx| {
+                    let name = input_value.read(cx).value().to_string();
+                    let outcome = apply.update(cx, |this, cx| {
+                        this.controller.update(cx, |controller, cx| {
+                            controller.rename_header_active(this.window_id, source_col, name, cx)
+                        })
+                    });
+                    match outcome {
+                        Ok(Ok(())) => true,
+                        Ok(Err(err)) => {
+                            apply_status.update(cx, |status, cx| {
+                                status.error = Some(err);
+                                cx.notify();
+                            });
+                            window.refresh();
+                            false
+                        }
+                        Err(_) => true,
+                    }
+                })
+                .on_close(move |_, window, cx| {
+                    let _ = close.update(cx, |this, cx| {
+                        this.editing = false;
+                        let table_focus = this
+                            .snapshot(cx)
+                            .is_some()
+                            .then(|| this.table.focus_handle(cx));
+                        window.defer(cx, move |window, cx| {
+                            if let Some(table_focus) = table_focus {
+                                table_focus.focus(window, cx);
+                            }
+                        });
+                        cx.notify();
+                    });
+                })
+        });
+        focus_input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    fn new_window_action(&mut self, _: &NewWindow, _: &mut Window, cx: &mut Context<Self>) {
+        open_quarry_window(self.controller.clone(), Vec::new(), None, cx);
+    }
+
     fn open_action(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
-        self.choose_open(window, cx);
+        self.choose_open_with_encoding(None, window, cx);
     }
-    fn save_action(&mut self, _: &SaveCopy, window: &mut Window, cx: &mut Context<Self>) {
-        self.choose_save(window, cx);
+    fn open_utf8(&mut self, _: &OpenUtf8, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_open_with_encoding(Some(Encoding::Utf8), window, cx);
     }
-    fn quit_action(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_requested(window, cx);
+    fn open_utf16le(&mut self, _: &OpenUtf16Le, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_open_with_encoding(Some(Encoding::Utf16Le), window, cx);
     }
-    fn edit_action(&mut self, _: &EditCell, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((row, column)) = self.table.read(cx).selected_cell() {
-            self.edit_cell(row, column, cx);
+    fn open_utf16be(&mut self, _: &OpenUtf16Be, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_open_with_encoding(Some(Encoding::Utf16Be), window, cx);
+    }
+    fn open_win1252(&mut self, _: &OpenWindows1252, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_open_with_encoding(Some(Encoding::Windows1252), window, cx);
+    }
+    fn open_iso88591(&mut self, _: &OpenIso88591, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_open_with_encoding(Some(Encoding::Latin1), window, cx);
+    }
+
+    fn close_tab_action(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active_id) = self
+            .controller
+            .read(cx)
+            .scheduler()
+            .active_document(self.window_id)
+        {
+            self.close_tab_by_id(active_id, true, window, cx);
+        } else {
+            self.close_window_requested(window, cx);
         }
     }
+
+    fn close_window_action(
+        &mut self,
+        _: &CloseWindow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_window_requested(window, cx);
+    }
+
+    fn move_tab_to_new_window_action(
+        &mut self,
+        _: &MoveTabToNewWindow,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.command_enabled(CommandId::MoveTabToNewWindow, cx) {
+            return;
+        }
+        let Some(active_id) = self
+            .controller
+            .read(cx)
+            .scheduler()
+            .active_document(self.window_id)
+        else {
+            return;
+        };
+        open_quarry_window(self.controller.clone(), Vec::new(), Some(active_id), cx);
+    }
+
+    fn next_tab_action(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
+        if self.command_enabled(CommandId::NextTab, cx) {
+            self.controller.update(cx, |controller, cx| {
+                controller.cycle_tab(self.window_id, 1, cx);
+            });
+        }
+    }
+
+    fn previous_tab_action(&mut self, _: &PreviousTab, _: &mut Window, cx: &mut Context<Self>) {
+        if self.command_enabled(CommandId::PreviousTab, cx) {
+            self.controller.update(cx, |controller, cx| {
+                controller.cycle_tab(self.window_id, -1, cx);
+            });
+        }
+    }
+
+    fn reload_action(&mut self, _: &ReloadFromDisk, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.command_enabled(CommandId::ReloadFromDisk, cx) {
+            return;
+        }
+        let res = self.controller.update(cx, |controller, cx| {
+            controller.reload_active_tab(self.window_id, cx)
+        });
+        if let Err(error) = res {
+            self.set_message(AppMessage::warning(error), cx);
+        }
+    }
+
+    fn save_action(&mut self, _: &SaveFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.save_in_place(cx);
+    }
+
+    fn save_as_action(&mut self, _: &SaveAsFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_enabled(CommandId::SaveAs, cx) {
+            self.choose_save_destination(None, window, cx);
+        }
+    }
+
+    fn save_as_utf8_action(&mut self, _: &SaveAsUtf8, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_enabled(CommandId::SaveAsUtf8, cx) {
+            self.choose_save_destination(Some(Encoding::Utf8), window, cx);
+        }
+    }
+
+    fn discard_action(&mut self, _: &DiscardChanges, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.command_enabled(CommandId::DiscardChanges, cx) {
+            return;
+        }
+        let res = self.controller.update(cx, |controller, cx| {
+            controller.discard_active_edits(self.window_id, cx)
+        });
+        if let Err(error) = res {
+            self.set_message(error, cx);
+        }
+    }
+
     fn undo_action(&mut self, _: &UndoEdit, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.editing && self.info.as_ref().is_some_and(|info| info.can_undo) {
-            self.command(Command::Undo, cx);
+        if !self.editing && self.command_enabled(CommandId::Undo, cx) {
+            let res = self.controller.update(cx, |controller, cx| {
+                controller.undo_redo_active(self.window_id, false, cx)
+            });
+            if let Err(error) = res {
+                self.set_message(error, cx);
+            }
         }
     }
+
     fn redo_action(&mut self, _: &RedoEdit, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.editing && self.info.as_ref().is_some_and(|info| info.can_redo) {
-            self.command(Command::Redo, cx);
+        if !self.editing && self.command_enabled(CommandId::Redo, cx) {
+            let res = self.controller.update(cx, |controller, cx| {
+                controller.undo_redo_active(self.window_id, true, cx)
+            });
+            if let Err(error) = res {
+                self.set_message(error, cx);
+            }
         }
+    }
+
+    fn copy_action(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing {
+            return;
+        }
+        if let Some((row, col)) = self.table.read(cx).selected_cell() {
+            let target = self.table.read(cx).delegate().cell_at(row, col, cx);
+            self.controller.update(cx, |controller, _| {
+                controller.set_active_selection(
+                    self.window_id,
+                    target
+                        .map(|(r, c)| quarry_workbench::GridSelection::Cell { row: r, column: c }),
+                );
+            });
+        }
+        match self
+            .controller
+            .read(cx)
+            .copy_active_selection(self.window_id)
+        {
+            Ok(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.set_message(AppMessage::status("Copied selection."), cx);
+            }
+            Err(error) => {
+                self.set_message(AppMessage::warning(error), cx);
+            }
+        }
+    }
+
+    fn edit_action(&mut self, _: &EditCell, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((row, column)) = self.table.read(cx).selected_cell() {
+            self.edit_cell(row, column, window, cx);
+        }
+    }
+
+    fn rename_header_action(
+        &mut self,
+        _: &RenameHeader,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_header_rename_dialog(window, cx);
+    }
+
+    fn toggle_whitespace_action(
+        &mut self,
+        _: &ShowAllWhitespace,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.controller.update(cx, |controller, cx| {
+            controller.toggle_show_all_whitespace(cx);
+        });
+        self.table.update(cx, |_, cx| cx.notify());
+    }
+
+    fn toggle_columns_action(
+        &mut self,
+        _: &ToggleColumns,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_enabled(CommandId::Columns, cx) {
+            self.panels
+                .update(cx, |panels, cx| panels.open_tool(Tool::Columns, window, cx));
+        }
+    }
+
+    fn toggle_filters_action(
+        &mut self,
+        _: &ToggleFilters,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_enabled(CommandId::Filters, cx) {
+            self.panels
+                .update(cx, |panels, cx| panels.open_tool(Tool::Filters, window, cx));
+        }
+    }
+
+    fn quit_action(&mut self, _: &QuitApp, window: &mut Window, cx: &mut Context<Self>) {
+        self.quit_requested(window, cx);
     }
 }
 
-impl Render for Quarry {
+impl Render for QuarryWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if window.focused(cx).is_none() {
             self.focus_handle.focus(window, cx);
         }
-        let loaded = self.info.is_some();
-        let filename = self
-            .info
+        let info = self.snapshot(cx);
+        let loaded = info.is_some();
+        let tabs = self.controller.read(cx).tabs_for_window(self.window_id);
+        let total_open_tabs = self.controller.read(cx).scheduler().total_tabs();
+        let show_whitespace = self.controller.read(cx).show_all_whitespace();
+        let filename = info
             .as_ref()
-            .map(|info| {
-                info.path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|i| i.filename.clone())
             .unwrap_or_else(|| "Open file…".into());
-        let can_undo = !self.busy && self.info.as_ref().is_some_and(|info| info.can_undo);
-        let can_redo = !self.busy && self.info.as_ref().is_some_and(|info| info.can_redo);
+        let can_undo = self.command_enabled(CommandId::Undo, cx);
+        let can_redo = self.command_enabled(CommandId::Redo, cx);
+        let can_save = self.command_enabled(CommandId::Save, cx);
+        let can_save_as = self.command_enabled(CommandId::SaveAs, cx);
+        let busy = info.as_ref().is_some_and(|i| i.busy);
         let format = self
             .panels
             .update(cx, |panels, cx| panels.render_format(window, cx));
@@ -597,6 +1181,13 @@ impl Render for Quarry {
         let filters = self
             .panels
             .update(cx, |panels, cx| panels.render_filters(window, cx));
+        let tokens = &quarry_workbench::theme::LIGHT;
+        let message = self
+            .controller
+            .read(cx)
+            .window_message(self.window_id)
+            .cloned();
+
         let mut body = div()
             .flex()
             .flex_col()
@@ -605,90 +1196,257 @@ impl Render for Quarry {
             .text_color(cx.theme().foreground)
             .text_size(px(13.))
             .track_focus(&self.focus_handle)
-            .key_context("QuarryComparison")
+            .key_context(QUARRY_KEY_CONTEXT)
+            .on_action(cx.listener(Self::new_window_action))
             .on_action(cx.listener(Self::open_action))
+            .on_action(cx.listener(Self::open_utf8))
+            .on_action(cx.listener(Self::open_utf16le))
+            .on_action(cx.listener(Self::open_utf16be))
+            .on_action(cx.listener(Self::open_win1252))
+            .on_action(cx.listener(Self::open_iso88591))
+            .on_action(cx.listener(Self::close_tab_action))
+            .on_action(cx.listener(Self::close_window_action))
+            .on_action(cx.listener(Self::move_tab_to_new_window_action))
+            .on_action(cx.listener(Self::next_tab_action))
+            .on_action(cx.listener(Self::previous_tab_action))
+            .on_action(cx.listener(Self::reload_action))
             .on_action(cx.listener(Self::save_action))
-            .on_action(cx.listener(Self::quit_action))
-            .on_action(cx.listener(Self::edit_action))
+            .on_action(cx.listener(Self::save_as_action))
+            .on_action(cx.listener(Self::save_as_utf8_action))
+            .on_action(cx.listener(Self::discard_action))
             .on_action(cx.listener(Self::undo_action))
             .on_action(cx.listener(Self::redo_action))
-            .child(
+            .on_action(cx.listener(Self::copy_action))
+            .on_action(cx.listener(Self::edit_action))
+            .on_action(cx.listener(Self::rename_header_action))
+            .on_action(cx.listener(Self::toggle_whitespace_action))
+            .on_action(cx.listener(Self::toggle_columns_action))
+            .on_action(cx.listener(Self::toggle_filters_action))
+            .on_action(cx.listener(Self::quit_action));
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            body = body.child(
                 div()
-                    .id("document-toolbar")
-                    .role(Role::Toolbar)
-                    .aria_label("Document toolbar")
-                    .h(px(42.))
+                    .h(px(28.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .px_2()
+                    .px_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .bg(rgb(quarry_workbench::theme::LIGHT.chrome.to_rgb_hex()))
-                    .child(
-                        Button::new("open-file")
-                            .label(filename.clone())
-                            .ghost()
-                            .small()
-                            .max_w(px(220.))
-                            .disabled(self.busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.choose_open(window, cx)),
-                            ),
-                    )
-                    .child(format)
-                    .child(div().w(px(1.)).h(px(18.)).mx_1().bg(cx.theme().border))
-                    .child(div().text_color(cx.theme().muted_foreground).child("Row"))
-                    .child(
-                        Input::new(&self.row_input)
-                            .aria_label("Go to row")
-                            .small()
-                            .w(px(64.))
-                            .disabled(!loaded),
-                    )
-                    .child(
-                        Button::new("go-row")
-                            .label("Go")
-                            .ghost()
-                            .small()
-                            .disabled(!loaded)
-                            .on_click(cx.listener(|this, _, _, cx| this.go_to_row(cx))),
-                    )
-                    .child(
-                        Button::new("undo")
-                            .label("Undo")
-                            .ghost()
-                            .small()
-                            .disabled(!can_undo)
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.command(Command::Undo, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("redo")
-                            .label("Redo")
-                            .ghost()
-                            .small()
-                            .disabled(!can_redo)
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.command(Command::Redo, cx)),
-                            ),
-                    )
-                    .child(columns)
-                    .child(filters)
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("save-copy")
-                            .label("Save a copy…")
-                            .ghost()
-                            .small()
-                            .disabled(!loaded || self.busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.choose_save(window, cx)),
-                            ),
-                    ),
+                    .bg(rgb(tokens.chrome.to_rgb_hex()))
+                    .child(self.menu_bar.clone()),
             );
+        }
+
+        if !tabs.is_empty() {
+            let tab_bar = div()
+                .id("window-tab-bar")
+                .role(Role::TabList)
+                .aria_label("Open documents")
+                .h(px(32.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(rgb(tokens.chrome.to_rgb_hex()))
+                .child(
+                    div()
+                        .id("window-tabs-scroll")
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .overflow_x_scroll()
+                        .children(tabs.iter().map(|entry| {
+                            let doc_id = entry.id;
+                            let is_dormant = !matches!(entry.residency, ResidencyState::Hydrated);
+                            let label =
+                                format!("{}{}", entry.title, if entry.dirty { " •" } else { "" });
+                            div()
+                                .id(("tab-item", doc_id.raw()))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_2()
+                                .h(px(24.))
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(if entry.active {
+                                    rgb(tokens.selection_strong.to_rgb_hex())
+                                } else {
+                                    rgb(tokens.separator.to_rgb_hex())
+                                })
+                                .bg(if entry.active {
+                                    rgb(tokens.canvas.to_rgb_hex())
+                                } else {
+                                    rgb(tokens.chrome.to_rgb_hex())
+                                })
+                                .child(
+                                    Button::new(("select-tab", doc_id.raw()))
+                                        .label(label)
+                                        .ghost()
+                                        .xsmall()
+                                        .text_color(if is_dormant && !entry.active {
+                                            rgb(tokens.text_secondary.to_rgb_hex())
+                                        } else {
+                                            rgb(tokens.text.to_rgb_hex())
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            let res =
+                                                this.controller.update(cx, |controller, cx| {
+                                                    controller.activate_tab(
+                                                        this.window_id,
+                                                        doc_id,
+                                                        cx,
+                                                    )
+                                                });
+                                            if let Err(error) = res {
+                                                this.set_message(AppMessage::warning(error), cx);
+                                            } else {
+                                                this.sync_from_controller(window, cx);
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("close-tab", doc_id.raw()))
+                                        .label("×")
+                                        .accessibility_label(format!("Close {}", entry.title))
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.close_tab_by_id(doc_id, true, window, cx);
+                                        })),
+                                )
+                        })),
+                )
+                .child(
+                    Button::new("move-tab-new-window")
+                        .label("Move to Window")
+                        .ghost()
+                        .xsmall()
+                        .disabled(!loaded)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.move_tab_to_new_window_action(&MoveTabToNewWindow, window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("new-window-btn")
+                        .label("+ Window")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_window_action(&NewWindow, window, cx);
+                        })),
+                );
+            body = body.child(tab_bar);
+        }
+
+        body = body.child(
+            div()
+                .id("document-toolbar")
+                .role(Role::Toolbar)
+                .aria_label("Document toolbar")
+                .h(px(42.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(rgb(tokens.chrome.to_rgb_hex()))
+                .child(
+                    Button::new("open-file")
+                        .label(filename.clone())
+                        .ghost()
+                        .small()
+                        .max_w(px(220.))
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.choose_open_with_encoding(None, window, cx)
+                        })),
+                )
+                .child(format)
+                .child(div().w(px(1.)).h(px(18.)).mx_1().bg(cx.theme().border))
+                .child(div().text_color(cx.theme().muted_foreground).child("Row"))
+                .child(
+                    Input::new(&self.row_input)
+                        .aria_label("Go to row")
+                        .small()
+                        .w(px(64.))
+                        .disabled(!loaded),
+                )
+                .child(
+                    Button::new("go-row")
+                        .label("Go")
+                        .ghost()
+                        .small()
+                        .disabled(!loaded)
+                        .on_click(cx.listener(|this, _, _, cx| this.go_to_row(cx))),
+                )
+                .child(
+                    Button::new("undo")
+                        .label("Undo")
+                        .ghost()
+                        .small()
+                        .disabled(!can_undo)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.undo_action(&UndoEdit, window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("redo")
+                        .label("Redo")
+                        .ghost()
+                        .small()
+                        .disabled(!can_redo)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.redo_action(&RedoEdit, window, cx);
+                        })),
+                )
+                .child(columns)
+                .child(filters)
+                .child(
+                    Button::new("toggle-whitespace")
+                        .label(if show_whitespace {
+                            "Whitespace: On"
+                        } else {
+                            "Whitespace"
+                        })
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_whitespace_action(&ShowAllWhitespace, window, cx);
+                        })),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("save-file")
+                        .label("Save")
+                        .ghost()
+                        .small()
+                        .disabled(!can_save)
+                        .on_click(cx.listener(|this, _, _, cx| this.save_in_place(cx))),
+                )
+                .child(
+                    Button::new("save-copy")
+                        .label("Save As…")
+                        .ghost()
+                        .small()
+                        .disabled(!can_save_as)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.choose_save_destination(None, window, cx);
+                        })),
+                ),
+        );
+
         if loaded {
             let table = self.table.clone();
             let shift_horizontal_scroll = canvas(
@@ -757,19 +1515,25 @@ impl Render for Quarry {
                         Button::new("open-empty")
                             .label("Open file…")
                             .small()
-                            .disabled(self.busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.choose_open(window, cx)),
-                            ),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.choose_open_with_encoding(None, window, cx)
+                            })),
                     ),
             );
         }
-        if let Some((message, is_error)) = &self.message {
+
+        if let Some(msg) = message {
+            let is_error = msg.severity == MessageSeverity::Error;
+            let is_warning = msg.severity == MessageSeverity::Warning;
             body = body.child(
                 div()
                     .id("status-banner")
-                    .role(if *is_error { Role::Alert } else { Role::Status })
-                    .aria_label(message.clone())
+                    .role(if is_error || is_warning {
+                        Role::Alert
+                    } else {
+                        Role::Status
+                    })
+                    .aria_label(msg.text.clone())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -777,12 +1541,21 @@ impl Render for Quarry {
                     .py_1()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .text_color(if *is_error {
-                        rgb(0xb13c35).into()
+                    .bg(if is_error {
+                        rgb(tokens.error_fill.to_rgb_hex())
+                    } else if is_warning {
+                        rgb(tokens.warning_fill.to_rgb_hex())
+                    } else {
+                        rgb(tokens.chrome.to_rgb_hex())
+                    })
+                    .text_color(if is_error {
+                        rgb(tokens.error_text.to_rgb_hex()).into()
+                    } else if is_warning {
+                        rgb(tokens.warning_text.to_rgb_hex()).into()
                     } else {
                         cx.theme().foreground
                     })
-                    .child(div().flex_1().min_w_0().child(message.clone()))
+                    .child(div().flex_1().min_w_0().child(msg.text))
                     .child(
                         Button::new("dismiss-message")
                             .label("×")
@@ -790,18 +1563,18 @@ impl Render for Quarry {
                             .ghost()
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.message = None;
-                                cx.notify();
+                                this.controller.update(cx, |controller, cx| {
+                                    controller.set_window_message(this.window_id, None, cx);
+                                });
                             })),
                     ),
             );
         }
-        let status = self
-            .info
+
+        let status = info
             .as_ref()
             .map(|info| {
-                let shown = self.table.read(cx).delegate().columns().len();
-                let rows = if info.filter_progress.is_some() {
+                let rows = if info.filter_active {
                     format!(
                         "{} of {} rows",
                         number(info.available_rows),
@@ -811,11 +1584,12 @@ impl Render for Quarry {
                     format!("{} rows", number(info.total_rows))
                 };
                 format!(
-                    "{}   ·   {:.2} MiB   ·   {} of {} columns{}",
+                    "{}   ·   {:.2} MiB   ·   {} of {} columns   ·   {}{}",
                     rows,
                     info.file_size as f64 / 1_048_576.,
-                    shown,
+                    info.shown_columns.len(),
                     info.headers.len(),
+                    encoding_label(info.encoding),
                     if info.dirty {
                         "   ·   Unsaved edits"
                     } else {
@@ -823,31 +1597,40 @@ impl Render for Quarry {
                     }
                 )
             })
-            .unwrap_or_else(|| "GPUI comparison".into());
-        let progress = if self.busy {
-            "Working…".into()
-        } else if let Some(info) = &self.info {
-            if let Some(progress) = info.filter_progress {
-                if progress.done {
+            .unwrap_or_else(|| "Ready".into());
+
+        let progress = if let Some(info) = &info {
+            if info.saving {
+                "Saving…".into()
+            } else if info.filter_active {
+                if info.filter_done {
                     "Filter complete".into()
                 } else {
                     "Filtering…".into()
                 }
-            } else if info.index_progress.done {
+            } else if info.index_done {
                 "Index complete".into()
             } else {
-                format!(
-                    "Indexing {:.0}%",
-                    100. * info.index_progress.bytes_scanned as f64 / info.file_size.max(1) as f64
-                )
+                format!("Indexing {:.0}%", info.index_fraction * 100.0)
             }
         } else {
             #[cfg(target_os = "macos")]
-            let hint = "⌘O to open";
+            let hint = "⌘O to open · ⌘N new window";
             #[cfg(not(target_os = "macos"))]
-            let hint = "Ctrl+O to open";
+            let hint = "Ctrl+O to open · Ctrl+N new window";
             hint.into()
         };
+
+        let tabs_badge = if total_open_tabs > 1 {
+            format!(
+                "{} tabs ({} active)",
+                total_open_tabs,
+                self.controller.read(cx).scheduler().hydrated_count()
+            )
+        } else {
+            "Quarry GPUI".into()
+        };
+
         body.child(
             div()
                 .id("document-status")
@@ -861,13 +1644,13 @@ impl Render for Quarry {
                 .gap_4()
                 .border_t_1()
                 .border_color(cx.theme().border)
-                .bg(rgb(quarry_workbench::theme::LIGHT.chrome.to_rgb_hex()))
+                .bg(rgb(tokens.chrome.to_rgb_hex()))
                 .text_size(px(12.))
                 .text_color(cx.theme().muted_foreground)
                 .child(status)
                 .child(div().flex_1())
                 .child(progress)
-                .child(div().child("GPUI comparison")),
+                .child(div().child(tabs_badge)),
         )
     }
 }
@@ -884,75 +1667,86 @@ fn number(value: u64) -> String {
     out
 }
 
-fn bind_shortcuts(cx: &mut App) {
-    #[cfg(target_os = "macos")]
-    let bindings = [
-        KeyBinding::new("cmd-o", OpenFile, None),
-        KeyBinding::new("cmd-s", SaveCopy, None),
-        KeyBinding::new("cmd-shift-s", SaveCopy, None),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("f2", EditCell, Some("QuarryComparison")),
-        KeyBinding::new("cmd-z", UndoEdit, Some("QuarryComparison && !Input")),
-        KeyBinding::new("cmd-shift-z", RedoEdit, Some("QuarryComparison && !Input")),
-    ];
-    #[cfg(not(target_os = "macos"))]
-    let bindings = [
-        KeyBinding::new("ctrl-o", OpenFile, None),
-        KeyBinding::new("ctrl-s", SaveCopy, None),
-        KeyBinding::new("ctrl-shift-s", SaveCopy, None),
-        KeyBinding::new("ctrl-q", Quit, None),
-        KeyBinding::new("f2", EditCell, Some("QuarryComparison")),
-        KeyBinding::new("ctrl-z", UndoEdit, Some("QuarryComparison && !Input")),
-        KeyBinding::new("ctrl-shift-z", RedoEdit, Some("QuarryComparison && !Input")),
-    ];
-    cx.bind_keys(bindings);
+fn apply_light_theme(cx: &mut App) {
+    Theme::change(ThemeMode::Light, None, cx);
+    let tokens = &quarry_workbench::theme::LIGHT;
+    let theme = Theme::global_mut(cx);
+    theme.font_size = px(quarry_workbench::theme::GRID_FONT_SIZE);
+    theme.radius = px(f32::from(quarry_workbench::theme::CONTROL_RADIUS));
+    theme.radius_lg = px(f32::from(quarry_workbench::theme::WINDOW_RADIUS));
+    theme.colors.background = rgb(tokens.chrome.to_rgb_hex()).into();
+    theme.colors.foreground = rgb(tokens.text.to_rgb_hex()).into();
+    theme.colors.border = rgb(tokens.separator.to_rgb_hex()).into();
+    theme.colors.muted_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
+    theme.colors.primary = rgb(quarry_workbench::theme::ACCENT.to_rgb_hex()).into();
+    theme.colors.primary_hover = rgb(0xe4b23c).into();
+    theme.colors.primary_active = rgb(0xd8a32e).into();
+    theme.colors.primary_foreground = rgb(tokens.on_accent.to_rgb_hex()).into();
+    theme.colors.table = rgb(tokens.canvas.to_rgb_hex()).into();
+    theme.colors.table_even = rgb(tokens.zebra.to_rgb_hex()).into();
+    theme.colors.table_head = rgb(tokens.header_fill.to_rgb_hex()).into();
+    theme.colors.table_head_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
+    theme.colors.table_row_border = rgb(tokens.grid_line.to_rgb_hex()).into();
+    theme.colors.table_active = rgb(tokens.selection.to_rgb_hex()).into();
+    theme.colors.table_active_border = rgb(tokens.selection_strong.to_rgb_hex()).into();
+    theme.colors.popover = rgb(tokens.canvas.to_rgb_hex()).into();
+    theme.colors.button_primary = theme.colors.primary;
+    theme.colors.button_primary_hover = theme.colors.primary_hover;
+    theme.colors.button_primary_active = theme.colors.primary_active;
+    theme.colors.button_primary_foreground = theme.colors.primary_foreground;
+    theme.tokens = theme.colors.into();
+    Theme::sync_base(cx);
+}
+
+fn open_quarry_window(
+    controller: Entity<WorkbenchController>,
+    initial_paths: Vec<PathBuf>,
+    moved_tab: Option<DocumentId>,
+    cx: &mut App,
+) {
+    let window_id = controller.update(cx, |controller, _| controller.allocate_window());
+    let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+    let controller_for_handle = controller.clone();
+    if let Ok(handle) = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(860.), px(500.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Quarry".into()),
+                ..Default::default()
+            }),
+            app_id: Some("dev.quarry.gpui".into()),
+            ..Default::default()
+        },
+        move |window, cx| {
+            let view = cx.new(|cx| QuarryWindow::new(window_id, controller.clone(), window, cx));
+            if let Some(doc_id) = moved_tab {
+                let _ = controller.update(cx, |c, cx| c.move_tab_to_window(doc_id, window_id, cx));
+                view.update(cx, |this, cx| this.sync_from_controller(window, cx));
+            } else if !initial_paths.is_empty() {
+                view.update(cx, |this, cx| {
+                    this.open_paths_direct(initial_paths, OpenOptions::default(), None, window, cx);
+                });
+            }
+            cx.new(|cx| Root::new(view, window, cx))
+        },
+    ) {
+        controller_for_handle.update(cx, |controller, _| {
+            controller.register_window_handle(window_id, handle);
+        });
+    }
 }
 
 fn main() {
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    let initial_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            Theme::change(ThemeMode::Light, None, cx);
-            let tokens = &quarry_workbench::theme::LIGHT;
-            let theme = Theme::global_mut(cx);
-            theme.font_size = px(quarry_workbench::theme::GRID_FONT_SIZE);
-            theme.radius = px(f32::from(quarry_workbench::theme::CONTROL_RADIUS));
-            theme.radius_lg = px(f32::from(quarry_workbench::theme::WINDOW_RADIUS));
-            theme.colors.background = rgb(tokens.chrome.to_rgb_hex()).into();
-            theme.colors.foreground = rgb(tokens.text.to_rgb_hex()).into();
-            theme.colors.border = rgb(tokens.separator.to_rgb_hex()).into();
-            theme.colors.muted_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
-            theme.colors.primary = rgb(quarry_workbench::theme::ACCENT.to_rgb_hex()).into();
-            theme.colors.primary_hover = rgb(0xe4b23c).into();
-            theme.colors.primary_active = rgb(0xd8a32e).into();
-            theme.colors.primary_foreground = rgb(tokens.on_accent.to_rgb_hex()).into();
-            theme.colors.table = rgb(tokens.canvas.to_rgb_hex()).into();
-            theme.colors.table_even = rgb(tokens.zebra.to_rgb_hex()).into();
-            theme.colors.table_head = rgb(tokens.header_fill.to_rgb_hex()).into();
-            theme.colors.table_head_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
-            theme.colors.table_row_border = rgb(tokens.grid_line.to_rgb_hex()).into();
-            theme.colors.table_active = rgb(tokens.selection.to_rgb_hex()).into();
-            theme.colors.table_active_border = rgb(tokens.selection_strong.to_rgb_hex()).into();
-            theme.colors.popover = rgb(tokens.canvas.to_rgb_hex()).into();
-            theme.colors.button_primary = theme.colors.primary;
-            theme.colors.button_primary_hover = theme.colors.primary_hover;
-            theme.colors.button_primary_active = theme.colors.primary_active;
-            theme.colors.button_primary_foreground = theme.colors.primary_foreground;
-            theme.tokens = theme.colors.into();
-            Theme::sync_base(cx);
+            apply_light_theme(cx);
             bind_shortcuts(cx);
-            cx.set_menus(vec![Menu {
-                name: "Quarry GPUI".into(),
-                disabled: false,
-                items: vec![
-                    MenuItem::action("Open…", OpenFile),
-                    MenuItem::action("Save a copy…", SaveCopy),
-                    MenuItem::separator(),
-                    MenuItem::action("Quit Quarry GPUI", Quit),
-                ],
-            }]);
+            install_menus(cx);
+            let controller = WorkbenchController::init(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -960,29 +1754,9 @@ fn main() {
             })
             .detach();
             cx.spawn(async move |cx| {
-                let bounds = cx.update(|cx| Bounds::centered(None, size(px(1280.), px(800.)), cx));
-                cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        window_min_size: Some(size(px(860.), px(500.))),
-                        titlebar: Some(TitlebarOptions {
-                            title: Some("Quarry GPUI comparison".into()),
-                            ..Default::default()
-                        }),
-                        app_id: Some("dev.quarry.gpui-comparison".into()),
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        let view = cx.new(|cx| Quarry::new(window, cx));
-                        if let Some(path) = path {
-                            view.update(cx, |this, cx| {
-                                this.command(Command::Open(path, OpenOptions::default()), cx)
-                            });
-                        }
-                        cx.new(|cx| Root::new(view, window, cx))
-                    },
-                )
-                .expect("Could not open the GPUI comparison window");
+                cx.update(|cx| {
+                    open_quarry_window(controller, initial_paths, None, cx);
+                });
             })
             .detach();
             cx.activate(true);

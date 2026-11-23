@@ -1600,3 +1600,135 @@ fn filter_and_filtered_read_descriptors_are_pre_reserved_under_tight_fd_budget()
     );
     assert!(roomy.fd_budget().snapshot().peak_reserved < 5);
 }
+
+#[test]
+fn move_tab_close_window_reopen_undo_discard_and_poll_saves_preserve_invariants() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "win-a.csv", 12);
+    let b = write_csv(dir.path(), "win-b.csv", 12);
+    let save_copy = dir.path().join("win-a-copy.csv");
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 2,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let w2 = w1.next();
+    scheduler.register_window(w1);
+    scheduler.register_window(w2);
+
+    let ids = scheduler
+        .open_many_lazy(w1, [a.clone(), b.clone()], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(scheduler.tabs_in_window(w1), vec![ids[0], ids[1]]);
+    assert_eq!(
+        scheduler.tab_display_name(ids[0]).as_deref(),
+        Some("win-a.csv")
+    );
+
+    // Move `ids[1]` to Window 2; both windows keep their own active hydrated tab.
+    scheduler.move_tab_to_window(ids[1], w2).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(scheduler.tabs_in_window(w1), vec![ids[0]]);
+    assert_eq!(scheduler.tabs_in_window(w2), vec![ids[1]]);
+    assert_eq!(scheduler.active_document(w1), Some(ids[0]));
+    assert_eq!(scheduler.active_document(w2), Some(ids[1]));
+
+    // Edit `ids[0]`, undo/redo through scheduler, and verify dirty_tabs + close_window guard.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let src = doc.source_cell(1, 1).unwrap().to_vec();
+        doc.begin_cell_edit(1, 1, src).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "edited-a".into();
+        doc.commit_cell_edit();
+    }
+    assert!(scheduler.tab_is_dirty(ids[0]));
+    assert_eq!(scheduler.dirty_tabs(), vec![(w1, ids[0])]);
+    assert!(matches!(
+        scheduler.close_window(w1),
+        Err(SchedulerError::UnapprovedDirtyTabs(ref list)) if list == &vec![ids[0]]
+    ));
+
+    assert_eq!(
+        scheduler.apply_undo_redo(ids[0], false).unwrap(),
+        "Edit undone."
+    );
+    assert!(!scheduler.tab_is_dirty(ids[0]));
+    assert_eq!(
+        scheduler.apply_undo_redo(ids[0], true).unwrap(),
+        "Edit restored."
+    );
+    assert!(scheduler.tab_is_dirty(ids[0]));
+
+    // Save As copy and poll_saves to completion.
+    {
+        let tab = scheduler.tab_mut(ids[0]).unwrap();
+        tab.write_destination = Some(save_copy.clone());
+        tab.document
+            .as_mut()
+            .unwrap()
+            .start_save_as(save_copy.clone())
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut completed = None;
+    while completed.is_none() {
+        assert!(Instant::now() < deadline, "save_as timed out");
+        let done = scheduler.poll_saves();
+        if let Some(entry) = done.into_iter().next() {
+            completed = Some(entry);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let completed = completed.unwrap();
+    assert_eq!(completed.document_id, ids[0]);
+    assert_eq!(completed.result.unwrap().0, save_copy);
+    assert!(
+        std::fs::read_to_string(&save_copy)
+            .unwrap()
+            .contains("edited-a")
+    );
+
+    // Discard edits, then reopen cleanly in-place with NoHeader mode.
+    scheduler.discard_tab_edits(ids[0]).unwrap();
+    assert!(!scheduler.tab_is_dirty(ids[0]));
+    let mut no_header = open_options();
+    no_header.header_mode = HeaderMode::NoHeader;
+    scheduler.reopen_tab(w1, ids[0], no_header, None).unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(scheduler.tabs_in_window(w1), vec![ids[0]]);
+    assert!(
+        !scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .dialect
+            .has_header
+    );
+
+    // Close Window 2 and confirm Window 1's tab survives cleanly.
+    let w2_errors = scheduler.close_window(w2).unwrap();
+    assert!(w2_errors.is_empty());
+    assert_eq!(scheduler.windows(), vec![w1]);
+    assert_eq!(scheduler.active_document(w1), Some(ids[0]));
+
+    // Close final tab in Window 1 and verify all FD leases release to zero.
+    let (next_active, tab_errors) = scheduler.close_tab(ids[0]).unwrap();
+    assert_eq!(next_active, None);
+    assert!(tab_errors.is_empty());
+    assert_eq!(scheduler.total_tabs(), 0);
+    assert_eq!(scheduler.fd_budget().snapshot().total_reserved, 0);
+}
