@@ -179,6 +179,7 @@ pub enum PinReason {
     ActiveInWindow(WindowId),
     ActiveWriteJob,
     PendingMaterialization,
+    PendingDuplicatePreview,
     CompressedDecompressing,
     CompressedPendingStorage,
     JoinReserved,
@@ -613,6 +614,12 @@ impl WorkbenchScheduler {
         }
         if doc.pending_materialization.is_some() {
             return Some(PinReason::PendingMaterialization);
+        }
+        if matches!(
+            doc.structural_job,
+            Some(crate::StructuralJob::DuplicatePreview { .. })
+        ) {
+            return Some(PinReason::PendingDuplicatePreview);
         }
         if let Some(compressed) = doc.compressed.as_ref() {
             match compressed.dormancy_policy() {
@@ -1082,6 +1089,10 @@ impl WorkbenchScheduler {
         if doc.join_reserved()
             || slot.tab.document_writing()
             || doc.pending_materialization.is_some()
+            || matches!(
+                doc.structural_job,
+                Some(crate::StructuralJob::DuplicatePreview { .. })
+            )
         {
             return true;
         }

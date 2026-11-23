@@ -10,11 +10,15 @@ use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use quarry_core::{ColumnTransformation, FilterOperator, FilterQuery, HeaderMode, OpenOptions};
+use quarry_core::{
+    CaseSensitivity, ColumnTransformation, DuplicateTarget, FilterOperator, FilterQuery,
+    HeaderMode, OpenOptions,
+};
 use quarry_workbench::{
     CompressedDormancyPolicy, DocumentId, FdCategory, GridSelection, MAX_PROCESS_FD_BUDGET,
-    PinReason, ResidencyState, SOURCE_CHANGED_NOTICE, SchedulerError, WakeKind, WakeOutcome,
-    WindowId, WorkbenchScheduler, WorkbenchSchedulerConfig, WorkingCopyState, compressed,
+    PinReason, ResidencyState, SOURCE_CHANGED_NOTICE, SchedulerError, StructuralJob, WakeKind,
+    WakeOutcome, WindowId, WorkbenchScheduler, WorkbenchSchedulerConfig, WorkingCopyState,
+    compressed,
 };
 
 fn write_csv(dir: &Path, name: &str, rows: usize) -> PathBuf {
@@ -1189,4 +1193,150 @@ fn structural_undo_snapshot_overlay_bytes_count_toward_memory_cap() {
         .unwrap_err();
     assert!(matches!(err, SchedulerError::OverlayBudgetExceeded { .. }));
     assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+}
+
+#[test]
+fn completed_duplicate_preview_pins_tab_until_confirmed_or_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let dup_path = dir.path().join("duplicates.csv");
+    fs::write(
+        &dup_path,
+        b"id,category,amount\n1,alpha,10\n1,alpha,10\n2,beta,20\n",
+    )
+    .unwrap();
+    let other = write_csv(dir.path(), "other-dup.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [dup_path, other], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.start_find_duplicates_target(
+            DuplicateTarget::Columns(vec![0]),
+            CaseSensitivity::Sensitive,
+        )
+        .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        scheduler.poll_all();
+        let ready = {
+            let doc = scheduler
+                .tab_mut(ids[0])
+                .unwrap()
+                .document
+                .as_mut()
+                .unwrap();
+            let _ = doc.poll_structural_edit().unwrap();
+            matches!(
+                doc.structural_job,
+                Some(StructuralJob::DuplicatePreview { .. })
+            )
+        };
+        if ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "duplicate preview timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // While the duplicate preview awaits user confirmation, switching tabs under
+    // hydration pressure must refuse eviction rather than discarding the preview.
+    let err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[1])
+        .unwrap_err();
+    assert!(matches!(err, SchedulerError::AllTabsPinned { .. }));
+    assert!(matches!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .structural_job,
+        Some(StructuralJob::DuplicatePreview { .. })
+    ));
+
+    // Also verify pin_reason directly when the tab is backgrounded under a 2-tab budget.
+    let mut scheduler2 = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 2,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let dup_path2 = dir.path().join("duplicates-2.csv");
+    fs::write(
+        &dup_path2,
+        b"id,category,amount\n1,alpha,10\n1,alpha,10\n2,beta,20\n",
+    )
+    .unwrap();
+    let other2 = write_csv(dir.path(), "other-dup-2.csv", 10);
+    let ids2 = scheduler2
+        .open_many_lazy(WindowId::PRIMARY, [dup_path2, other2], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler2, ids2[0]);
+    scheduler2
+        .tab_mut(ids2[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_find_duplicates_target(
+            DuplicateTarget::Columns(vec![0]),
+            CaseSensitivity::Sensitive,
+        )
+        .unwrap();
+    let deadline2 = Instant::now() + Duration::from_secs(10);
+    loop {
+        let doc = scheduler2
+            .tab_mut(ids2[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let _ = doc.poll_structural_edit().unwrap();
+        if matches!(
+            doc.structural_job,
+            Some(StructuralJob::DuplicatePreview { .. })
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline2, "duplicate preview 2 timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    scheduler2.activate_tab(WindowId::PRIMARY, ids2[1]).unwrap();
+    finish_active_indexing(&mut scheduler2, ids2[1]);
+    assert_eq!(
+        scheduler2.pin_reason(ids2[0]),
+        Some(PinReason::PendingDuplicatePreview)
+    );
+
+    // Cancelling the duplicate preview releases the pin and allows normal clean dormancy.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .cancel_structural_edit();
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
 }
