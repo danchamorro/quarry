@@ -1124,7 +1124,9 @@ fn filtered_wake_preserves_selection_and_pending_materialization_pins_tab() {
     scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
     finish_active_indexing(&mut scheduler, ids[1]);
     scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    finish_active_filter(&mut scheduler, ids[0]);
     let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert!(!doc.filtered_rows.is_empty());
     assert_eq!(
         doc.selection,
         Some(GridSelection::Cell { row: 4, column: 1 })

@@ -422,6 +422,41 @@ struct DormantDocument {
     kind: DormantKind,
 }
 
+#[derive(Clone)]
+struct PendingFilterRestore {
+    filter_viewport_start: u64,
+    scroll_points: f32,
+    selection: Option<GridSelection>,
+    cursor: GridCursor,
+    selected_rows: RowSelection,
+    selected_columns: BTreeSet<usize>,
+    column_selection_anchor: Option<usize>,
+}
+
+impl PendingFilterRestore {
+    fn from_view(view: &DormantViewSnapshot) -> Self {
+        Self {
+            filter_viewport_start: view.filter_viewport_start,
+            scroll_points: view.scroll_points,
+            selection: view.selection,
+            cursor: view.cursor.clone(),
+            selected_rows: view.selected_rows.clone(),
+            selected_columns: view.selected_columns.clone(),
+            column_selection_anchor: view.column_selection_anchor,
+        }
+    }
+
+    fn apply_to(&self, doc: &mut Document) {
+        doc.filter_viewport_start = self.filter_viewport_start;
+        doc.scroll_points = self.scroll_points;
+        doc.selection = self.selection;
+        doc.cursor = self.cursor.clone();
+        doc.selected_rows = self.selected_rows.clone();
+        doc.selected_columns = self.selected_columns.clone();
+        doc.column_selection_anchor = self.column_selection_anchor;
+    }
+}
+
 enum SlotResidency {
     Stub(LazyDocumentStub),
     Hydrated {
@@ -433,6 +468,9 @@ enum SlotResidency {
         /// Code-counted background-job FD lease covering active index (1), filter (2),
         /// and filtered-read (1) workers for the lifetime of those jobs.
         job_fd_lease: Option<FdLease>,
+        /// Saved selection and scroll anchor reapplied once a woken filter rebuild finishes
+        /// loading its filtered row buffer (so `navigate_filter` does not discard it).
+        pending_filter_restore: Option<PendingFilterRestore>,
     },
     Dormant(Box<DormantDocument>),
 }
@@ -893,6 +931,7 @@ impl WorkbenchScheduler {
                 _fd_lease: fd_lease,
                 temp_dir_fd_lease: None,
                 job_fd_lease: None,
+                pending_filter_restore: None,
             },
         );
 
@@ -914,12 +953,18 @@ impl WorkbenchScheduler {
                                 conflict_notice: None,
                                 temp_dir_lease,
                                 job_lease,
+                                pending_filter_restore: None,
                             })
                         }
                         Err(error) => Err((SlotResidency::Stub(stub), error)),
                     }
                 }
                 SlotResidency::Dormant(dormant) => {
+                    let saved_filter_restore = dormant
+                        .view
+                        .filter_query
+                        .as_ref()
+                        .map(|_| PendingFilterRestore::from_view(&dormant.view));
                     match wake_dormant_document(
                         dormant,
                         &self.config,
@@ -928,12 +973,18 @@ impl WorkbenchScheduler {
                         &fd_budget,
                     ) {
                         Ok((doc, kind, conflict_notice, temp_dir_lease, job_lease)) => {
+                            let pending_filter_restore = if doc.filter_job.is_some() {
+                                saved_filter_restore
+                            } else {
+                                None
+                            };
                             slot.tab.document = Some(doc);
                             Ok(HydratedWake {
                                 kind,
                                 conflict_notice,
                                 temp_dir_lease,
                                 job_lease,
+                                pending_filter_restore,
                             })
                         }
                         Err((restored_dormant, error)) => {
@@ -950,15 +1001,18 @@ impl WorkbenchScheduler {
                 conflict_notice,
                 temp_dir_lease,
                 job_lease,
+                pending_filter_restore: restored_filter_anchor,
             }) => {
                 if let SlotResidency::Hydrated {
                     temp_dir_fd_lease,
                     job_fd_lease,
+                    pending_filter_restore,
                     ..
                 } = &mut slot.residency
                 {
                     *temp_dir_fd_lease = temp_dir_lease;
                     *job_fd_lease = job_lease;
+                    *pending_filter_restore = restored_filter_anchor;
                 }
                 slot.window = window;
                 slot.last_used_tick = tick;
@@ -1129,6 +1183,7 @@ impl WorkbenchScheduler {
             let SlotResidency::Hydrated {
                 temp_dir_fd_lease,
                 job_fd_lease,
+                pending_filter_restore,
                 ..
             } = &mut slot.residency
             else {
@@ -1145,6 +1200,22 @@ impl WorkbenchScheduler {
             }
             if let Err(err) = doc.poll_filter_read() {
                 errors.push((id, err));
+            }
+            if pending_filter_restore.is_some() {
+                if doc.filter_query.is_none() {
+                    *pending_filter_restore = None;
+                } else if doc.filter_job.is_none() && !doc.filter_rows_loading() {
+                    let has_matches = doc
+                        .filter_index
+                        .as_ref()
+                        .is_some_and(|index| index.matches_found() > 0);
+                    if (!doc.filtered_rows.is_empty() || !has_matches)
+                        && let Some(pending) = pending_filter_restore.take()
+                        && has_matches
+                    {
+                        pending.apply_to(doc);
+                    }
+                }
             }
             let _ = try_sync_optional_lease(
                 &fd_budget,
@@ -1376,9 +1447,11 @@ impl WorkbenchScheduler {
         // exceed the < 128 FD cap and any preflight error leaves the tab untouched.
         let retained_dir_fds = doc_retained_dir_fds(doc);
         let fd_budget = self.fd_budget.clone();
-        let working_dir_fd_lease = match &mut slot.residency {
+        let (working_dir_fd_lease, pending_filter_restore) = match &mut slot.residency {
             SlotResidency::Hydrated {
-                temp_dir_fd_lease, ..
+                temp_dir_fd_lease,
+                pending_filter_restore,
+                ..
             } => {
                 try_sync_optional_lease(
                     &fd_budget,
@@ -1386,12 +1459,17 @@ impl WorkbenchScheduler {
                     FdCategory::TempDirectory,
                     retained_dir_fds,
                 )?;
-                temp_dir_fd_lease.take()
+                (temp_dir_fd_lease.take(), pending_filter_restore.take())
             }
-            _ => None,
+            _ => (None, None),
         };
 
         let mut doc = slot.tab.document.take().unwrap();
+        if let Some(pending) = pending_filter_restore
+            && doc.filter_query.is_some()
+        {
+            pending.apply_to(&mut doc);
+        }
         let dormant = demote_document(doc_into_dormant_parts(&mut doc), doc, working_dir_fd_lease)?;
         // Replacing `Hydrated { _fd_lease, job_fd_lease, .. }` drops active & job FD leases.
         slot.residency = SlotResidency::Dormant(Box::new(dormant));
@@ -1830,6 +1908,7 @@ struct HydratedWake {
     conflict_notice: Option<String>,
     temp_dir_lease: Option<FdLease>,
     job_lease: Option<FdLease>,
+    pending_filter_restore: Option<PendingFilterRestore>,
 }
 
 type WakeResult = Result<
