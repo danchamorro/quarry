@@ -1196,16 +1196,13 @@ impl WorkbenchScheduler {
                 errors.push((id, err));
             }
             // Reserve descriptors BEFORE polling filter/read workers so `poll_filter()` or
-            // `poll_filter_read()` cannot start a filtered-read worker without an FD lease.
-            let can_run_filter_read = if doc.filter_job.is_some() || doc.filter_read.is_some() {
-                try_sync_optional_lease(
-                    &fd_budget,
-                    job_fd_lease,
-                    FdCategory::BackgroundJob,
-                    doc_active_job_fds(doc),
-                )
-                .is_ok()
-            } else if doc.pending_filter_read.is_some() {
+            // `poll_filter_read()` cannot start a queued filter refresh or filtered-read worker
+            // without an FD lease.
+            let can_run_filter_read = if doc.filter_job.is_some() || doc.filter_refresh_pending {
+                let needed = usize::from(doc.job.is_some()) + FILTER_JOB_AND_READ_FDS;
+                try_sync_optional_lease(&fd_budget, job_fd_lease, FdCategory::BackgroundJob, needed)
+                    .is_ok()
+            } else if doc.filter_read.is_some() || doc.pending_filter_read.is_some() {
                 let needed = usize::from(doc.job.is_some()) + 1;
                 try_sync_optional_lease(&fd_budget, job_fd_lease, FdCategory::BackgroundJob, needed)
                     .is_ok()

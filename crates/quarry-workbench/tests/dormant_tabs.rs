@@ -1559,4 +1559,44 @@ fn filter_and_filtered_read_descriptors_are_pre_reserved_under_tight_fd_budget()
     let snap_after = roomy.fd_budget().snapshot();
     assert_eq!(snap_after.by_category.get(&FdCategory::BackgroundJob), None);
     assert!(snap_after.peak_reserved < 5);
+
+    // Queueing a filter refresh while FD capacity is temporarily occupied must defer starting
+    // the refresh until descriptors are available, then run and complete once released.
+    let blocker = roomy
+        .fd_budget()
+        .try_reserve(FdCategory::GuiSystem, 3)
+        .unwrap();
+    roomy
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .queue_filter_refresh();
+    let _ = roomy.poll_all();
+    {
+        let doc = roomy.tab(ids[0]).unwrap().document.as_ref().unwrap();
+        assert!(doc.filter_refresh_pending);
+        assert!(doc.filter_job.is_none());
+    }
+    assert_eq!(
+        roomy
+            .fd_budget()
+            .snapshot()
+            .by_category
+            .get(&FdCategory::BackgroundJob),
+        None
+    );
+    drop(blocker);
+    finish_active_filter(&mut roomy, ids[0]);
+    assert!(
+        !roomy
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .filter_refresh_pending
+    );
+    assert!(roomy.fd_budget().snapshot().peak_reserved < 5);
 }
