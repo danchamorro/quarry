@@ -195,7 +195,9 @@ fn cell_editor_is_visible_applies_through_real_ui_and_undo_restores_source(
             .expect("the dialog must render its accessible cell editor");
         assert!(input.visible());
         assert_eq!(input.value(), Some("first"));
-        window.click(input.path().last().unwrap().clone(), cx);
+        window
+            .within("dialog")
+            .click(input.path().last().unwrap().clone(), cx);
         window.press("cmd-a", cx);
         cx.write_to_clipboard(ClipboardItem::new_string(
             "x".repeat(super::document::MAX_EDIT_BYTES + 1),
@@ -210,7 +212,9 @@ fn cell_editor_is_visible_applies_through_real_ui_and_undo_restores_source(
             window.find("apply-cell-edit").visible(),
             "invalid edits keep the editor open"
         );
-        window.click(input.path().last().unwrap().clone(), cx);
+        window
+            .within("dialog")
+            .click(input.path().last().unwrap().clone(), cx);
         window.press("cmd-a", cx);
         window.input("Edited café", cx);
         window.click("apply-cell-edit", cx);
@@ -263,7 +267,9 @@ fn cell_editor_is_visible_applies_through_real_ui_and_undo_restores_source(
             .into_iter()
             .find(|element| element.label() == Some("Cell value"))
             .unwrap();
-        window.click(input.path().last().unwrap().clone(), cx);
+        window
+            .within("dialog")
+            .click(input.path().last().unwrap().clone(), cx);
         window.press("cmd-a", cx);
         window.input("Keep this draft", cx);
         window.click("apply-cell-edit", cx);
