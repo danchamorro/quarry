@@ -2426,11 +2426,9 @@ fn analyze_partitioned(
         .max()
         .unwrap_or(0)
         .min(per_partition_cap);
-    let max_concurrent_tables = if max_part_est > 0 {
-        (hash_budget_total / max_part_est).max(1)
-    } else {
-        MAX_HASH_WORKERS
-    };
+    let max_concurrent_tables = hash_budget_total
+        .checked_div(max_part_est)
+        .map_or(MAX_HASH_WORKERS, |tables| tables.max(1));
     let budget = Arc::new(JobByteBudget::new(hash_budget_total));
     let fallback_lock: Arc<Mutex<Option<Failure>>> = Arc::new(Mutex::new(None));
     let next_part = Arc::new(AtomicUsize::new(0));
@@ -3788,8 +3786,8 @@ pub(super) fn write_partitioned(
     let mut expected_pair_fp = LocatorFingerprint::default();
     let mut total_count = 0_u64;
     let mut retained_empty_sides: Vec<usize> = Vec::new();
-    for side in 0..2 {
-        let empty = &hash_plan.sides[side].empty;
+    for (side, side_plan) in hash_plan.sides.iter().enumerate() {
+        let empty = &side_plan.empty;
         if empty.rows == 0 {
             continue;
         }
@@ -3814,11 +3812,9 @@ pub(super) fn write_partitioned(
         .max()
         .unwrap_or(0)
         .min(per_partition_cap);
-    let max_concurrent_tables = if max_build_est > 0 {
-        (hash_budget_total / max_build_est).max(1)
-    } else {
-        MAX_HASH_WORKERS
-    };
+    let max_concurrent_tables = hash_budget_total
+        .checked_div(max_build_est)
+        .map_or(MAX_HASH_WORKERS, |tables| tables.max(1));
     let budget = Arc::new(JobByteBudget::new(hash_budget_total));
     let fallback_lock: Arc<Mutex<Option<Failure>>> = Arc::new(Mutex::new(None));
     let next_part = Arc::new(AtomicUsize::new(0));

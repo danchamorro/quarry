@@ -703,13 +703,13 @@ impl Progress {
         let mut overflow = false;
         let updated = self
             .temporary
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                match current.checked_add(bytes) {
-                    Some(next) => Some(next),
-                    None => {
-                        overflow = true;
-                        None
-                    }
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| match current
+                .checked_add(bytes)
+            {
+                Some(next) => Some(next),
+                None => {
+                    overflow = true;
+                    None
                 }
             });
         match updated {

@@ -570,7 +570,7 @@ impl<R: BufRead> GzipMembers<R> {
                             "The gzip header {field} exceeds the {MAX_GZIP_HEADER_TEXT}-byte limit."
                         )));
                     }
-                    if length % HEADER_CANCEL_CHECK_BYTES == 0 {
+                    if length.is_multiple_of(HEADER_CANCEL_CHECK_BYTES) {
                         self.check_cancelled()?;
                     }
                 }

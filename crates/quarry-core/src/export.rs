@@ -3177,22 +3177,22 @@ pub(crate) fn source_matches_stamp(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    if !expected.matches_metadata(&path_metadata)
-        || !expected.matches(&SourceStamp::from_file(source)?)
-    {
-        return Ok(false);
-    }
+    let matches_open = expected.matches_metadata(&path_metadata)
+        && expected.matches(&SourceStamp::from_file(source)?);
     #[cfg(windows)]
     {
+        if !matches_open {
+            return Ok(false);
+        }
         let named = match File::open(source_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        return Ok(expected.matches(&SourceStamp::from_file(&named)?));
+        Ok(expected.matches(&SourceStamp::from_file(&named)?))
     }
     #[cfg(not(windows))]
-    Ok(true)
+    Ok(matches_open)
 }
 
 fn validate_destination(source: &Path, destination: &Path) -> Result<(), QuarryError> {
@@ -3297,7 +3297,6 @@ enum ScanOutcome {
     Cancelled,
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn run_export(
     mut source: File,

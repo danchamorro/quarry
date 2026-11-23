@@ -454,9 +454,9 @@ impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
         }
         self.shadow.clear();
         let mut skip = 0;
-        for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        for (index, &pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
             let offset = absolute_start + index as u64 * 2;
-            let unit = self.encoding.unit([pair[0], pair[1]]);
+            let unit = self.encoding.unit(pair);
             if self.at_start {
                 self.at_start = false;
                 if unit == 0xfeff {
