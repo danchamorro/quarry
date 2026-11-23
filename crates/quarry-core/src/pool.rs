@@ -161,13 +161,11 @@ pub fn raise_nofile_limit(target_soft: u64) -> NofileLimitStatus {
 
         // On macOS, raising toward an unlimited hard limit can fail with EINVAL if above
         // OPEN_MAX (10,240); fall back to 10,240 before giving up.
-        let mut attempts = [Some(capped_target), None];
         #[cfg(target_os = "macos")]
-        {
-            if capped_target > 10_240 {
-                attempts[1] = Some(10_240.max(current));
-            }
-        }
+        let fallback = (capped_target > 10_240).then(|| 10_240.max(current));
+        #[cfg(not(target_os = "macos"))]
+        let fallback = None;
+        let attempts = [Some(capped_target), fallback];
         for desired in attempts.into_iter().flatten() {
             if desired <= current {
                 continue;
