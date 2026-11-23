@@ -2871,7 +2871,9 @@ fn external_open_urls_routes_hardlink_alias_to_owning_window(cx: &mut gpui_kit::
     // Opening a modal operation dialog (Sort Rows) in Window 2 also registers it as editing so
     // Finder external opens skip Window 2 and never switch the document underneath the dialog.
     cx.update_window(w2_handle.into(), |_, window, cx| {
-        w2_view.update(cx, |q, cx| q.sort_rows_action(&SortRows, window, cx));
+        w2_view.update(cx, |q, cx| {
+            q.sort_rows_action(&crate::menus::SortRows, window, cx)
+        });
     })
     .unwrap();
     cx.update(|cx| {
@@ -2892,7 +2894,7 @@ fn external_open_urls_routes_hardlink_alias_to_owning_window(cx: &mut gpui_kit::
         );
     });
     cx.update_window(w2_handle.into(), |_, window, cx| {
-        window.dispatch_action(Box::new(DialogCancel), cx);
+        window.dispatch_action(Box::new(gpui_kit::component::dialog::Cancel), cx);
     })
     .unwrap();
     wait_for_ui(cx, w2_handle, &controller, &w2_view, |q, _, _| !q.editing);
