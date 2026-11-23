@@ -1,3 +1,5 @@
+//! Toolbar popovers (Format, Columns, Filters) backed by `DocumentSnapshot` from `WorkbenchController`.
+
 use std::path::PathBuf;
 
 use gpui_kit::component::{
@@ -10,17 +12,19 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use quarry_core::{
-    CaseSensitivity, FilterOperator, FilterPredicate, FilterQuery, HeaderMode, OpenOptions,
+    CaseSensitivity, Encoding, FilterOperator, FilterPredicate, FilterQuery, HeaderMode,
+    OpenOptions,
 };
 
-use crate::document::DocumentInfo;
+use crate::menus::{encoding_from_label, encoding_index, encoding_label};
+use crate::workbench::DocumentSnapshot;
 
 pub enum PanelEvent {
     Columns(Vec<usize>),
     AutoFit,
     Filter(FilterQuery),
     ClearFilter,
-    Reopen(OpenOptions),
+    Reopen(OpenOptions, Option<Encoding>),
 }
 
 #[derive(Clone)]
@@ -54,6 +58,14 @@ const OPERATORS: [(FilterOperator, &str); 8] = [
 ];
 const DELIMITERS: [&str; 5] = ["Auto", "Comma", "Tab", "Pipe", "Semicolon"];
 const HEADERS: [&str; 3] = ["Auto", "First row is header", "No header"];
+const ENCODINGS: [&str; 6] = [
+    "Auto",
+    "UTF-8",
+    "UTF-16 LE",
+    "UTF-16 BE",
+    "Windows-1252",
+    "ISO-8859-1",
+];
 
 struct Rule {
     id: usize,
@@ -65,7 +77,7 @@ struct Rule {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool {
+pub enum Tool {
     Columns,
     Filters,
     Format,
@@ -84,8 +96,8 @@ pub struct Panels {
     active: Option<Tool>,
     delimiter: Entity<ChoiceState>,
     header: Entity<ChoiceState>,
-    applied_format: (usize, usize),
-    pending_format: Option<(usize, usize)>,
+    encoding: Entity<ChoiceState>,
+    applied_format: (usize, usize, usize),
     details: bool,
     detected: String,
     busy: bool,
@@ -120,11 +132,31 @@ fn select_state(
     })
 }
 
+fn delimiter_index(delimiter: Option<u8>) -> usize {
+    match delimiter {
+        None => 0,
+        Some(b',') => 1,
+        Some(b'\t') => 2,
+        Some(b'|') => 3,
+        Some(b';') => 4,
+        Some(_) => 0,
+    }
+}
+
+fn header_index(mode: HeaderMode) -> usize {
+    match mode {
+        HeaderMode::Auto => 0,
+        HeaderMode::FirstRow => 1,
+        HeaderMode::NoHeader => 2,
+    }
+}
+
 impl Panels {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search columns"));
         let delimiter = select_state(DELIMITERS.map(str::to_owned), false, window, cx);
         let header = select_state(HEADERS.map(str::to_owned), false, window, cx);
+        let encoding = select_state(ENCODINGS.map(str::to_owned), false, window, cx);
         let subscriptions = vec![
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -142,6 +174,11 @@ impl Panels {
                 window,
                 |_, _, _: &SelectEvent<SearchableVec<Choice>>, _, cx| cx.notify(),
             ),
+            cx.subscribe_in(
+                &encoding,
+                window,
+                |_, _, _: &SelectEvent<SearchableVec<Choice>>, _, cx| cx.notify(),
+            ),
         ];
         Self {
             path: None,
@@ -156,8 +193,8 @@ impl Panels {
             active: None,
             delimiter,
             header,
-            applied_format: (0, 0),
-            pending_format: None,
+            encoding,
+            applied_format: (0, 0, 0),
             details: false,
             detected: String::new(),
             busy: false,
@@ -166,16 +203,47 @@ impl Panels {
         }
     }
 
-    pub fn set_document(
+    pub fn open_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.path.is_none() {
+            return;
+        }
+        if self.active == Some(tool) {
+            self.close(window, cx);
+        } else {
+            if tool == Tool::Format {
+                self.restore_format(window, cx);
+            }
+            self.active = Some(tool);
+            cx.notify();
+        }
+    }
+
+    pub fn clear_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.path.is_some() {
+            self.close(window, cx);
+            self.path = None;
+            self.headers.clear();
+            self.order.clear();
+            self.shown.clear();
+            self.matches.clear();
+            self.rules.clear();
+            self.dirty = false;
+            self.busy = false;
+            self.detected.clear();
+            cx.notify();
+        }
+    }
+
+    pub fn sync_document(
         &mut self,
-        info: &DocumentInfo,
-        shown: Vec<usize>,
+        info: &DocumentSnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.dirty = info.dirty;
+        self.busy = info.busy;
         self.detected = format!(
-            "Detected: {} · {}",
+            "Detected: {} · {} · {}",
             match info.delimiter {
                 b',' => "Comma",
                 b'\t' => "Tab",
@@ -187,8 +255,20 @@ impl Panels {
                 "Header row"
             } else {
                 "No header"
-            }
+            },
+            encoding_label(info.encoding),
         );
+        let applied = (
+            delimiter_index(info.applied_delimiter),
+            header_index(info.applied_header_mode),
+            encoding_index(info.applied_encoding),
+        );
+        if self.applied_format != applied {
+            self.applied_format = applied;
+            if self.active != Some(Tool::Format) {
+                self.restore_format(window, cx);
+            }
+        }
         let added_columns = self.path.as_ref() == Some(&info.path)
             && info.headers.len() > self.headers.len()
             && info.headers.starts_with(&self.headers);
@@ -219,12 +299,12 @@ impl Panels {
             self.path = Some(info.path.clone());
             self.headers = info.headers.clone();
             let mut is_shown = vec![false; self.headers.len()];
-            for &source in &shown {
+            for &source in &info.shown_columns {
                 if let Some(flag) = is_shown.get_mut(source) {
                     *flag = true;
                 }
             }
-            self.order = shown.clone();
+            self.order = info.shown_columns.clone();
             self.order
                 .extend((0..self.headers.len()).filter(|&source| !is_shown[source]));
             self.shown = is_shown;
@@ -239,12 +319,11 @@ impl Panels {
             .order
             .iter()
             .copied()
-            .filter(|source| self.shown[*source])
-            .eq(shown.iter().copied())
+            .filter(|source| self.shown.get(*source).copied().unwrap_or(false))
+            .eq(info.shown_columns.iter().copied())
         {
-            // A successful reopen can reset the grid while keeping the same headers.
             let mut is_shown = vec![false; self.headers.len()];
-            for &source in &shown {
+            for &source in &info.shown_columns {
                 if let Some(flag) = is_shown.get_mut(source) {
                     *flag = true;
                 }
@@ -255,33 +334,12 @@ impl Panels {
                 .copied()
                 .filter(|&source| !is_shown.get(source).copied().unwrap_or(false))
                 .collect::<Vec<_>>();
-            self.order = shown.clone();
+            self.order = info.shown_columns.clone();
             self.order.extend(hidden);
             self.shown = is_shown;
             self.refresh_matches(cx);
         }
         cx.notify();
-    }
-
-    pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
-        if self.busy != busy {
-            self.busy = busy;
-            cx.notify();
-        }
-    }
-
-    pub fn finish_reopen(&mut self, success: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(format) = self.pending_format.take() {
-            if success {
-                self.applied_format = format;
-                cx.notify();
-            }
-        } else if success {
-            // A successful picker or startup Open uses OpenOptions::default() (Auto).
-            self.applied_format = (0, 0);
-            self.restore_format(window, cx);
-            cx.notify();
-        }
     }
 
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -298,6 +356,9 @@ impl Panels {
         self.header.update(cx, |state, cx| {
             state.set_selected_value(&self.applied_format.1, window, cx)
         });
+        self.encoding.update(cx, |state, cx| {
+            state.set_selected_value(&self.applied_format.2, window, cx)
+        });
     }
 
     fn refresh_matches(&mut self, cx: &App) {
@@ -307,7 +368,9 @@ impl Panels {
             .iter()
             .copied()
             .filter(|source| {
-                self.headers[*source].to_lowercase().contains(&query)
+                self.headers
+                    .get(*source)
+                    .is_some_and(|h| h.to_lowercase().contains(&query))
                     || (source + 1).to_string() == query
             })
             .collect();
@@ -318,7 +381,7 @@ impl Panels {
             self.order
                 .iter()
                 .copied()
-                .filter(|source| self.shown[*source])
+                .filter(|source| self.shown.get(*source).copied().unwrap_or(false))
                 .collect(),
         ));
         self.refresh_matches(cx);
@@ -567,7 +630,12 @@ impl Panels {
             .iter()
             .position(|candidate| *candidate == source)
             .unwrap_or(0);
-        let title = format!("{}: {}", source + 1, self.headers[source]);
+        let title = format!(
+            "{}: {}",
+            source + 1,
+            self.headers.get(source).map(String::as_str).unwrap_or("")
+        );
+        let is_shown = self.shown.get(source).copied().unwrap_or(true);
         div()
             .flex()
             .h(px(30.))
@@ -582,16 +650,15 @@ impl Panels {
             })
             .child(
                 Checkbox::new(("show-column", source))
-                    .checked(self.shown[source])
+                    .checked(is_shown)
                     .small()
                     .flex_shrink_0()
                     .accessibility_label(format!("Show {title}"))
-                    .disabled(
-                        self.shown[source]
-                            && self.shown.iter().filter(|shown| **shown).count() == 1,
-                    )
+                    .disabled(is_shown && self.shown.iter().filter(|shown| **shown).count() == 1)
                     .on_change(cx.listener(move |this, checked, _, cx| {
-                        this.shown[source] = *checked;
+                        if let Some(slot) = this.shown.get_mut(source) {
+                            *slot = *checked;
+                        }
                         this.emit_columns(cx);
                     })),
             )
@@ -683,27 +750,44 @@ impl Panels {
                                     .child((position + 1).to_string()),
                             )
                             .child(
-                                div().w(px(188.)).h(px(30.)).flex_shrink_0().min_w_0().child(Select::new(&rule.column)
-                                    .id(("filter-column", id))
-                                    .small()
+                                div()
+                                    .w(px(188.))
                                     .h(px(30.))
-                                    .w_full()
-                                    .menu_width(px(320.))
-                                    .menu_max_h(px(300.))
-                                    .accessibility_label(format!("Rule {} column", position + 1))
-                                    .search_placeholder("Search all columns")),
+                                    .flex_shrink_0()
+                                    .min_w_0()
+                                    .child(
+                                        Select::new(&rule.column)
+                                            .id(("filter-column", id))
+                                            .small()
+                                            .h(px(30.))
+                                            .w_full()
+                                            .menu_width(px(320.))
+                                            .menu_max_h(px(300.))
+                                            .accessibility_label(format!(
+                                                "Rule {} column",
+                                                position + 1
+                                            ))
+                                            .search_placeholder("Search all columns"),
+                                    ),
                             )
                             .child(
-                                div().w(px(150.)).h(px(30.)).flex_shrink_0().min_w_0().child(Select::new(&rule.operator)
-                                    .id(("filter-condition", id))
-                                    .small()
+                                div()
+                                    .w(px(150.))
                                     .h(px(30.))
-                                    .w_full()
-                                    .menu_width(px(210.))
-                                    .accessibility_label(format!(
-                                        "Rule {} condition",
-                                        position + 1
-                                    ))),
+                                    .flex_shrink_0()
+                                    .min_w_0()
+                                    .child(
+                                        Select::new(&rule.operator)
+                                            .id(("filter-condition", id))
+                                            .small()
+                                            .h(px(30.))
+                                            .w_full()
+                                            .menu_width(px(210.))
+                                            .accessibility_label(format!(
+                                                "Rule {} condition",
+                                                position + 1
+                                            )),
+                                    ),
                             )
                             .child(
                                 div()
@@ -721,9 +805,16 @@ impl Panels {
                                             .aria_label(format!("Rule {} value", position + 1)),
                                     )
                                     .when(between, |this| {
-                                        this.child(Input::new(&rule.upper).small().w_full().min_w_0().aria_label(
-                                            format!("Rule {} upper bound", position + 1),
-                                        ))
+                                        this.child(
+                                            Input::new(&rule.upper)
+                                                .small()
+                                                .w_full()
+                                                .min_w_0()
+                                                .aria_label(format!(
+                                                    "Rule {} upper bound",
+                                                    position + 1
+                                                )),
+                                        )
                                     }),
                             )
                             .child(
@@ -765,10 +856,30 @@ impl Panels {
                             })),
                     ),
             )
-            .child(div().flex().justify_start().child(Button::new("filter-details").label(if self.details { "▾ Details" } else { "▸ Details" }).ghost().small()
-                .on_click(cx.listener(|this, _, _, cx| { this.details = !this.details; cx.notify(); }))))
-            .when(self.details, |this| this.child(div().text_size(px(12.)).text_color(cx.theme().muted_foreground)
-                .child("Rows must match every filtered column. Inclusion rules in one column are alternatives. Does not equal rules exclude matches. Text values are literal, including line breaks.")))
+            .child(
+                div().flex().justify_start().child(
+                    Button::new("filter-details")
+                        .label(if self.details {
+                            "▾ Details"
+                        } else {
+                            "▸ Details"
+                        })
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.details = !this.details;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .when(self.details, |this| {
+                this.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Rows must match every filtered column. Inclusion rules in one column are alternatives. Does not equal rules exclude matches. Text values are literal, including line breaks."),
+                )
+            })
             .when(
                 self.rules
                     .iter()
@@ -796,9 +907,9 @@ impl Panels {
                             .label("Clear filter")
                             .small()
                             .disabled(self.busy)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            cx.emit(PanelEvent::ClearFilter);
-                            this.close(window, cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.emit(PanelEvent::ClearFilter);
+                                this.close(window, cx);
                             })),
                     )
                     .child(
@@ -823,11 +934,12 @@ impl Panels {
         let selected = (
             *self.delimiter.read(cx).selected_value().unwrap_or(&0),
             *self.header.read(cx).selected_value().unwrap_or(&0),
+            *self.encoding.read(cx).selected_value().unwrap_or(&0),
         );
         div()
             .flex()
             .flex_col()
-            .w(px(292.))
+            .w(px(304.))
             .gap_3()
             .text_size(px(13.))
             .child(self.heading("Format", cx))
@@ -881,12 +993,34 @@ impl Panels {
                             ),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(68.)).flex_shrink_0().child("Encoding"))
+                    .child(
+                        div()
+                            .w(px(216.))
+                            .h(px(30.))
+                            .flex_shrink_0()
+                            .min_w_0()
+                            .child(
+                                Select::new(&self.encoding)
+                                    .id("format-encoding")
+                                    .small()
+                                    .h(px(30.))
+                                    .w_full()
+                                    .accessibility_label("Text encoding"),
+                            ),
+                    ),
+            )
             .when(self.dirty, |this| {
                 this.child(
                     div()
                         .text_size(px(12.))
                         .text_color(cx.theme().muted_foreground)
-                        .child("Undo all edits, or save a copy and open it, before changing the format."),
+                        .child("Save or discard your changes before changing the format."),
                 )
             })
             .child(
@@ -913,8 +1047,10 @@ impl Panels {
                             .small()
                             .disabled(self.busy || self.dirty || selected == self.applied_format)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.pending_format = Some(selected);
-                                cx.emit(PanelEvent::Reopen(format_options(selected)));
+                                cx.emit(PanelEvent::Reopen(
+                                    format_options((selected.0, selected.1)),
+                                    encoding_from_label(selected.2),
+                                ));
                                 this.close(window, cx);
                             })),
                     ),

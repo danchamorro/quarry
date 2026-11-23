@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, DuplicateTarget, FilterOperator, FilterQuery,
+    CaseSensitivity, ColumnTransformation, DuplicateTarget, Encoding, FilterOperator, FilterQuery,
     HeaderMode, OpenOptions,
 };
 use quarry_workbench::{
@@ -1599,4 +1599,368 @@ fn filter_and_filtered_read_descriptors_are_pre_reserved_under_tight_fd_budget()
             .filter_refresh_pending
     );
     assert!(roomy.fd_budget().snapshot().peak_reserved < 5);
+}
+
+#[test]
+fn move_tab_close_window_reopen_undo_discard_and_poll_saves_preserve_invariants() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "win-a.csv", 12);
+    let b = write_csv(dir.path(), "win-b.csv", 12);
+    let save_copy = dir.path().join("win-a-copy.csv");
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 2,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let w2 = w1.next();
+    scheduler.register_window(w1);
+    scheduler.register_window(w2);
+
+    let ids = scheduler
+        .open_many_lazy(w1, [a.clone(), b.clone()], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(scheduler.tabs_in_window(w1), vec![ids[0], ids[1]]);
+    assert_eq!(
+        scheduler.tab_display_name(ids[0]).as_deref(),
+        Some("win-a.csv")
+    );
+
+    // Move `ids[1]` to Window 2; both windows keep their own active hydrated tab.
+    scheduler.move_tab_to_window(ids[1], w2).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(scheduler.tabs_in_window(w1), vec![ids[0]]);
+    assert_eq!(scheduler.tabs_in_window(w2), vec![ids[1]]);
+    assert_eq!(scheduler.active_document(w1), Some(ids[0]));
+    assert_eq!(scheduler.active_document(w2), Some(ids[1]));
+
+    // Edit `ids[0]`, undo/redo through scheduler, and verify dirty_tabs + close_window guard.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let src = doc.source_cell(1, 1).unwrap().to_vec();
+        doc.begin_cell_edit(1, 1, src).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "edited-a".into();
+        doc.commit_cell_edit();
+    }
+    assert!(scheduler.tab_is_dirty(ids[0]));
+    assert_eq!(scheduler.dirty_tabs(), vec![(w1, ids[0])]);
+    assert!(matches!(
+        scheduler.close_window(w1),
+        Err(SchedulerError::UnapprovedDirtyTabs(ref list)) if list == &vec![ids[0]]
+    ));
+
+    assert_eq!(
+        scheduler.apply_undo_redo(ids[0], false).unwrap(),
+        "Edit undone."
+    );
+    assert!(!scheduler.tab_is_dirty(ids[0]));
+    assert_eq!(
+        scheduler.apply_undo_redo(ids[0], true).unwrap(),
+        "Edit restored."
+    );
+    assert!(scheduler.tab_is_dirty(ids[0]));
+
+    // Save As copy and poll_saves to completion.
+    {
+        let tab = scheduler.tab_mut(ids[0]).unwrap();
+        tab.write_destination = Some(save_copy.clone());
+        tab.document
+            .as_mut()
+            .unwrap()
+            .start_save_as(save_copy.clone())
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut completed = None;
+    while completed.is_none() {
+        assert!(Instant::now() < deadline, "save_as timed out");
+        let done = scheduler.poll_saves();
+        if let Some(entry) = done.into_iter().next() {
+            completed = Some(entry);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let completed = completed.unwrap();
+    assert_eq!(completed.document_id, ids[0]);
+    assert_eq!(completed.result.unwrap().0, save_copy);
+    assert!(
+        std::fs::read_to_string(&save_copy)
+            .unwrap()
+            .contains("edited-a")
+    );
+
+    // Discard edits, then reopen cleanly in-place with NoHeader mode.
+    scheduler.discard_tab_edits(ids[0]).unwrap();
+    assert!(!scheduler.tab_is_dirty(ids[0]));
+    let mut no_header = open_options();
+    no_header.header_mode = HeaderMode::NoHeader;
+    scheduler.reopen_tab(w1, ids[0], no_header, None).unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(scheduler.tabs_in_window(w1), vec![ids[0]]);
+    assert!(
+        !scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .session
+            .dialect
+            .has_header
+    );
+
+    // Close Window 2 and confirm Window 1's tab survives cleanly.
+    let w2_errors = scheduler.close_window(w2).unwrap();
+    assert!(w2_errors.is_empty());
+    assert_eq!(scheduler.windows(), vec![w1]);
+    assert_eq!(scheduler.active_document(w1), Some(ids[0]));
+
+    // Close final tab in Window 1 and verify all FD leases release to zero.
+    let (next_active, tab_errors) = scheduler.close_tab(ids[0]).unwrap();
+    assert_eq!(next_active, None);
+    assert!(tab_errors.is_empty());
+    assert_eq!(scheduler.total_tabs(), 0);
+    assert_eq!(scheduler.fd_budget().snapshot().total_reserved, 0);
+}
+
+#[test]
+fn in_place_save_via_poll_saves_reloads_session_and_allows_subsequent_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let csv = write_csv(dir.path(), "inplace.csv", 5);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv.clone()], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // First edit + in-place save.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "saved_once".into();
+        doc.commit_cell_edit();
+        doc.start_save().unwrap();
+    }
+    let mut completed = Vec::new();
+    for _ in 0..400 {
+        completed = scheduler.poll_saves();
+        if !completed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].document_id, ids[0]);
+    let (saved_path, in_place) = completed[0].result.as_ref().unwrap();
+    assert_eq!(saved_path, &csv);
+    assert!(*in_place);
+
+    // Reloaded document must be clean, refreshed against the new file, and accept a follow-up edit.
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert!(!scheduler.tab_is_dirty(ids[0]));
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert!(!doc.source_changed);
+        assert_eq!(doc.effective_cell(1, 1), Some(b"saved_once".as_slice()));
+        doc.begin_cell_edit(1, 1, b"saved_once".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "saved_twice".into();
+        doc.commit_cell_edit();
+        doc.start_save().unwrap();
+    }
+    completed.clear();
+    for _ in 0..400 {
+        completed = scheduler.poll_saves();
+        if !completed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(completed.len(), 1);
+    assert!(
+        completed[0].result.is_ok(),
+        "second in-place save must succeed without SOURCE_CHANGED_NOTICE"
+    );
+    let content = fs::read_to_string(&csv).unwrap();
+    assert!(content.contains("saved_twice"));
+}
+
+#[test]
+fn failed_reopen_tab_preserves_existing_document_and_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    // Odd byte count (not valid UTF-16 LE) so reopening with UTF-16 LE must fail cleanly.
+    let csv = dir.path().join("odd.csv");
+    fs::write(&csv, "a,b\n1,2").unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    let err = scheduler.reopen_tab(w1, ids[0], open_options(), Some(Encoding::Utf16Le));
+    assert!(err.is_err(), "odd-byte UTF-8 file must fail UTF-16 LE open");
+    assert_eq!(scheduler.active_document(w1), Some(ids[0]));
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+    let tab = scheduler.tab(ids[0]).unwrap();
+    assert!(tab.document.is_some(), "existing document must remain open");
+    assert_eq!(tab.encoding_mode, None);
+    assert_eq!(
+        tab.document.as_ref().unwrap().session.encoding(),
+        Encoding::Utf8
+    );
+}
+
+#[test]
+fn quit_approval_is_invalidated_when_approved_tab_is_edited_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let csv = write_csv(dir.path(), "reedit.csv", 5);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "first_edit".into();
+        doc.commit_cell_edit();
+    }
+    scheduler.begin_quit_review();
+    scheduler.approve_tab_for_quit(ids[0]).unwrap();
+
+    // Edit the tab AFTER quit approval: finalize_quit must reject it until re-approved.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "second_edit".into();
+        doc.commit_cell_edit();
+    }
+    let err = scheduler.finalize_quit().unwrap_err();
+    assert!(
+        matches!(err, SchedulerError::UnapprovedDirtyTabs(ref unapproved) if unapproved == &vec![ids[0]])
+    );
+    assert_eq!(
+        scheduler.total_tabs(),
+        1,
+        "tab must not be dropped on stale approval"
+    );
+
+    // Re-approving at the new edit revision allows quit to finalize cleanly even if the
+    // approved dirty tab is evicted to dormancy while reviewing another dirty tab.
+    let csv2 = write_csv(dir.path(), "reedit2.csv", 5);
+    let mut tight = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let pair = tight
+        .open_many_lazy(
+            w1,
+            [csv2.clone(), write_csv(dir.path(), "reedit3.csv", 5)],
+            open_options(),
+            None,
+        )
+        .unwrap();
+    finish_active_indexing(&mut tight, pair[0]);
+    {
+        let doc = tight.tab_mut(pair[0]).unwrap().document.as_mut().unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "dirty_one".into();
+        doc.commit_cell_edit();
+    }
+    tight.activate_tab(w1, pair[1]).unwrap();
+    finish_active_indexing(&mut tight, pair[1]);
+    {
+        let doc = tight.tab_mut(pair[1]).unwrap().document.as_mut().unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "dirty_two".into();
+        doc.commit_cell_edit();
+    }
+    tight.begin_quit_review();
+    tight.activate_tab(w1, pair[0]).unwrap();
+    tight.approve_tab_for_quit(pair[0]).unwrap();
+    // Activating pair[1] evicts approved pair[0] back to DormantDirty; approval must hold!
+    tight.activate_tab(w1, pair[1]).unwrap();
+    assert_eq!(tight.residency(pair[0]), Some(ResidencyState::DormantDirty));
+    tight.approve_tab_for_quit(pair[1]).unwrap();
+    tight.finalize_quit().unwrap();
+    assert_eq!(tight.total_tabs(), 0);
+
+    // Window-close approval must also invalidate when the approved tab is edited again.
+    scheduler.approve_tab_for_close(ids[0]).unwrap();
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "third_edit".into();
+        doc.commit_cell_edit();
+    }
+    let close_err = scheduler.close_window(w1).unwrap_err();
+    assert!(matches!(
+        close_err,
+        SchedulerError::UnapprovedDirtyTabs(ref unapproved) if unapproved == &vec![ids[0]]
+    ));
+
+    scheduler.approve_tab_for_quit(ids[0]).unwrap();
+    scheduler.finalize_quit().unwrap();
+    assert_eq!(scheduler.total_tabs(), 0);
 }

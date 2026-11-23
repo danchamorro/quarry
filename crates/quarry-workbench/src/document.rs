@@ -217,7 +217,19 @@ pub fn sort_progress(
     }
 }
 
+/// Snapshot of immutable inputs needed to read an uncached viewport window off the UI thread.
+pub struct ViewportReadPlan {
+    pub session: Arc<Session>,
+    pub index: StructuralIndex,
+    pub start: u64,
+    pub count: usize,
+}
+
+static NEXT_DOCUMENT_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 pub struct Document {
+    pub instance_id: u64,
     pub join_reservations: Arc<std::sync::atomic::AtomicUsize>,
     pub pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
     pub pending_diagnostic_message: Option<String>,
@@ -421,6 +433,8 @@ impl Document {
             index_cache_enabled: true,
             working_cleanup: quarry_core::WorkingCopyCleanup::default(),
             decompression_slots: compressed::DecompressionSlots::default(),
+            instance_id: NEXT_DOCUMENT_INSTANCE_ID
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             join_reservations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_materialization: None,
             original_session: None,
@@ -3759,6 +3773,109 @@ impl Document {
         self.whitespace.invalidate_rows();
         self.buffered_rows = rows.into_iter().map(Arc::new).collect();
         Ok(())
+    }
+
+    /// Updates viewport position for `position` and returns a [`ViewportReadPlan`] when an
+    /// uncached indexed disk read is needed so callers can execute `Session::read_rows` off
+    /// the UI thread. Cached buffers, bootstrap `first_rows`, and active filters (which already
+    /// use background `FilterReadJob` workers) are handled immediately and return `Ok(None)`.
+    pub fn prepare_async_buffer_read(
+        &mut self,
+        position: u64,
+        visible_rows: usize,
+    ) -> Result<Option<ViewportReadPlan>, String> {
+        self.visible_rows = visible_rows.max(1);
+        self.commit_edits();
+        if self.filter_active() {
+            if !self.filter_waiting_for_page() {
+                self.navigate_filter(position)?;
+            }
+            return Ok(None);
+        }
+        let available = self.available_rows();
+        let requested = self.data_start.saturating_add(position);
+        if available <= self.data_start || requested >= available {
+            self.buffer_start = self.data_start;
+            if !self.buffered_rows.is_empty() {
+                self.whitespace.invalidate_rows();
+                self.buffered_rows.clear();
+            }
+            return Ok(None);
+        }
+        let viewport_start = logical_viewport_start(
+            requested,
+            self.data_start,
+            self.available_data_rows(),
+            self.visible_rows,
+        );
+        self.viewport_start = viewport_start;
+        self.clear_hidden_selection();
+
+        let visible_end = viewport_start.saturating_add(
+            available
+                .saturating_sub(viewport_start)
+                .min(self.visible_rows as u64),
+        );
+        let loaded_end = self
+            .buffer_start
+            .saturating_add(self.buffered_rows.len() as u64);
+        let capacity = self.visible_rows.saturating_add(2 * OVERSCAN_ROWS) as u64;
+        if self.buffer_start <= viewport_start
+            && loaded_end >= visible_end
+            && self.buffered_rows.len() as u64 <= capacity
+        {
+            return Ok(None);
+        }
+
+        let last_start = available.saturating_sub(capacity).max(self.data_start);
+        let start = viewport_start
+            .saturating_sub(OVERSCAN_ROWS as u64)
+            .max(self.data_start)
+            .min(last_start);
+        let count = available.saturating_sub(start).min(capacity) as usize;
+        let end = start.saturating_add(count as u64);
+        if end <= self.session.first_rows.len() as u64 {
+            let began = Instant::now();
+            let rows = self.session.first_rows[start as usize..end as usize].to_vec();
+            self.install_buffer_rows(start, rows, began.elapsed());
+            return Ok(None);
+        }
+        if let Some(index) = &self.index {
+            return Ok(Some(ViewportReadPlan {
+                session: Arc::clone(&self.session),
+                index: index.clone(),
+                start,
+                count,
+            }));
+        }
+        if let Some(rows) = self.read_decompressed_rows(start, count) {
+            let began = Instant::now();
+            let rows = rows.map_err(|error| self.diagnostic_error(error))?;
+            self.install_buffer_rows(start, rows, began.elapsed());
+            return Ok(None);
+        }
+        if let Some(job) = &self.job {
+            return Ok(Some(ViewportReadPlan {
+                session: Arc::clone(&self.session),
+                index: job.snapshot(),
+                start,
+                count,
+            }));
+        }
+        Err("No structural index is available.".into())
+    }
+
+    /// Installs rows fetched by an off-UI-thread [`ViewportReadPlan`].
+    pub fn install_buffer_rows(&mut self, start: u64, rows: Vec<Row>, elapsed: Duration) {
+        let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
+        if loaded_columns > self.total_columns {
+            self.ensure_column_count(loaded_columns);
+            self.refresh_column_headers();
+        }
+        self.last_viewport_read = Some(elapsed);
+        self.buffer_start = start;
+        self.whitespace.invalidate_rows();
+        self.buffered_rows = rows.into_iter().map(Arc::new).collect();
     }
 
     pub fn filter_read_window(&self, viewport_start: u64) -> Option<FilterReadWindow> {

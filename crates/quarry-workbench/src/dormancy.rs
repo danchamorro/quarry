@@ -27,12 +27,12 @@
 use crate::compressed::CompressedDormancyPolicy;
 use crate::{
     AppMessage, ColumnView, Document, DocumentId, EditHistory, GridCursor, GridSelection,
-    RowSelection, SOURCE_CHANGED_NOTICE, SharedCellEdits, WindowId, WorkbenchTab, WorkingCopyState,
-    compressed,
+    JOIN_INPUT_RESERVED, RowSelection, SOURCE_CHANGED_NOTICE, SharedCellEdits, StructuralOverlay,
+    WindowId, WorkbenchTab, WorkingCopySnapshot, WorkingCopyState, compressed,
 };
 use quarry_core::{
-    Encoding, FileIdentity, FilterQuery, OpenOptions, Session, SourceGuard, WorkingCopyCleanup,
-    inspect_storage,
+    Encoding, FileIdentity, FilterQuery, OpenOptions, QuarryError, Session, SourceGuard,
+    WorkingCopyCleanup, inspect_storage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -271,6 +271,13 @@ pub enum ResidencyState {
     DormantDirty,
     DormantCompressedComplete,
     DormantCompressedPreview,
+}
+
+/// Completion or failure of a background save job reported by [`WorkbenchScheduler::poll_saves`].
+#[derive(Debug)]
+pub struct SaveCompletion {
+    pub document_id: DocumentId,
+    pub result: Result<(PathBuf, bool), AppMessage>,
 }
 
 /// Actionable scheduler failure that always preserves every open document and edit.
@@ -518,9 +525,11 @@ pub struct WorkbenchScheduler {
     next_document_id: u64,
     access_clock: u64,
     tabs: BTreeMap<DocumentId, ManagedTab>,
+    window_tabs: BTreeMap<WindowId, Vec<DocumentId>>,
     active_by_window: BTreeMap<WindowId, DocumentId>,
     quit_pending: bool,
-    quit_approved: BTreeSet<DocumentId>,
+    quit_approved: BTreeMap<DocumentId, u64>,
+    close_approved: BTreeMap<DocumentId, u64>,
 }
 
 impl WorkbenchScheduler {
@@ -534,10 +543,86 @@ impl WorkbenchScheduler {
             next_document_id: 1,
             access_clock: 0,
             tabs: BTreeMap::new(),
+            window_tabs: BTreeMap::new(),
             active_by_window: BTreeMap::new(),
             quit_pending: false,
-            quit_approved: BTreeSet::new(),
+            quit_approved: BTreeMap::new(),
+            close_approved: BTreeMap::new(),
         }
+    }
+
+    /// Registers an open top-level window so empty windows are tracked alongside tabbed windows.
+    pub fn register_window(&mut self, window: WindowId) {
+        self.window_tabs.entry(window).or_default();
+    }
+
+    /// Returns all currently registered window IDs in deterministic order.
+    pub fn windows(&self) -> Vec<WindowId> {
+        self.window_tabs.keys().copied().collect()
+    }
+
+    /// Returns ordered document tabs owned by `window`.
+    pub fn tabs_in_window(&self, window: WindowId) -> Vec<DocumentId> {
+        self.window_tabs.get(&window).cloned().unwrap_or_default()
+    }
+
+    /// Returns the window currently owning `id`.
+    pub fn window_of(&self, id: DocumentId) -> Option<WindowId> {
+        self.tabs.get(&id).map(|slot| slot.window)
+    }
+
+    /// Returns the display filename of `id` across hydrated, dormant, and stub states.
+    pub fn tab_display_name(&self, id: DocumentId) -> Option<String> {
+        let path = self.tab_logical_path(id)?;
+        Some(
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    /// Returns the logical source path of `id` across hydrated, dormant, and stub states.
+    pub fn tab_logical_path(&self, id: DocumentId) -> Option<PathBuf> {
+        let slot = self.tabs.get(&id)?;
+        match &slot.residency {
+            SlotResidency::Stub(stub) => Some(stub.logical_path.clone()),
+            SlotResidency::Dormant(dormant) => Some(dormant.logical_path.clone()),
+            SlotResidency::Hydrated { .. } => slot
+                .tab
+                .document
+                .as_ref()
+                .map(|doc| doc.logical_path.clone()),
+        }
+    }
+
+    /// True when `id` has unsaved edits (whether currently hydrated or dormant-dirty).
+    pub fn tab_is_dirty(&self, id: DocumentId) -> bool {
+        self.tabs.get(&id).is_some_and(slot_is_dirty)
+    }
+
+    /// Lists all dirty `(WindowId, DocumentId)` tabs across every open window in window/tab order.
+    pub fn dirty_tabs(&self) -> Vec<(WindowId, DocumentId)> {
+        let mut out = Vec::new();
+        for (&window, ids) in &self.window_tabs {
+            for &id in ids {
+                if self.tab_is_dirty(id) {
+                    out.push((window, id));
+                }
+            }
+        }
+        out
+    }
+
+    /// Lists all dirty `DocumentId`s in `window` in tab order.
+    pub fn dirty_tabs_in_window(&self, window: WindowId) -> Vec<DocumentId> {
+        self.window_tabs
+            .get(&window)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&id| self.tab_is_dirty(id))
+            .collect()
     }
 
     pub fn config(&self) -> &WorkbenchSchedulerConfig {
@@ -782,6 +867,7 @@ impl WorkbenchScheduler {
                     last_used_tick: tick,
                 },
             );
+            self.window_tabs.entry(window).or_default().push(id);
             if first_in_window.is_none() {
                 first_in_window = Some(id);
             }
@@ -831,10 +917,12 @@ impl WorkbenchScheduler {
                 last_used_tick: tick,
             },
         );
+        self.window_tabs.entry(window).or_default().push(id);
         match self.activate_tab(window, id) {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
                 self.tabs.remove(&id);
+                self.remove_tab_from_window_lists(id);
                 Err(error)
             }
         }
@@ -872,6 +960,7 @@ impl WorkbenchScheduler {
                 slot.last_used_tick = tick;
             }
             self.detach_from_other_windows(window, id);
+            self.assign_tab_to_window_list(window, id);
             self.active_by_window.insert(window, id);
             return Ok(WakeOutcome::Ready {
                 document_id: id,
@@ -1021,6 +1110,7 @@ impl WorkbenchScheduler {
                     slot.tab.notice = Some(AppMessage::warning(notice));
                 }
                 self.detach_from_other_windows(window, id);
+                self.assign_tab_to_window_list(window, id);
                 self.active_by_window.insert(window, id);
                 if let Some(notice) = notice_out {
                     Ok(WakeOutcome::SourceChangedConflict {
@@ -1271,26 +1361,63 @@ impl WorkbenchScheduler {
         }
     }
 
-    /// Approves one tab for quit without releasing it yet (cancelled quit stays lossless).
-    pub fn approve_tab_for_quit(&mut self, id: DocumentId) -> Result<(), SchedulerError> {
-        if !self.tabs.contains_key(&id) {
+    /// Approves one tab for window/tab close at its current edit revision. Any subsequent edit
+    /// changes its revision and automatically invalidates this approval in [`Self::close_window`].
+    pub fn approve_tab_for_close(&mut self, id: DocumentId) -> Result<(), SchedulerError> {
+        let Some(slot) = self.tabs.get_mut(&id) else {
             return Err(SchedulerError::NotFound(id));
-        }
-        self.quit_approved.insert(id);
+        };
+        slot.tab.approve_discard_and_close();
+        let revision = slot_edit_revision(slot);
+        self.close_approved.insert(id, revision);
         Ok(())
     }
 
+    /// Revokes any pending window/tab close approval on `id`.
+    pub fn revoke_tab_close_approval(&mut self, id: DocumentId) {
+        self.close_approved.remove(&id);
+        if let Some(slot) = self.tabs.get_mut(&id) {
+            slot.tab.cancel_close();
+        }
+    }
+
+    fn tab_is_close_approved(&self, id: DocumentId, slot: &ManagedTab) -> bool {
+        slot.tab.close_ready
+            && self
+                .close_approved
+                .get(&id)
+                .is_some_and(|&approved_rev| approved_rev == slot_edit_revision(slot))
+    }
+
+    /// Approves one tab for quit at its current edit revision without releasing it yet
+    /// (cancelled quit stays lossless; any subsequent edit invalidates this approval).
+    pub fn approve_tab_for_quit(&mut self, id: DocumentId) -> Result<(), SchedulerError> {
+        let Some(slot) = self.tabs.get(&id) else {
+            return Err(SchedulerError::NotFound(id));
+        };
+        let revision = slot_edit_revision(slot);
+        self.quit_approved.insert(id, revision);
+        Ok(())
+    }
+
+    fn tab_is_quit_approved(&self, id: DocumentId, slot: &ManagedTab) -> bool {
+        self.quit_approved
+            .get(&id)
+            .is_some_and(|&approved_rev| approved_rev == slot_edit_revision(slot))
+    }
+
     /// Finalizes quit only after every dirty tab (hydrated or dormant) has been approved via
-    /// [`Self::approve_tab_for_quit`]. If any dirty tab is unapproved, returns
-    /// [`SchedulerError::UnapprovedDirtyTabs`] while leaving every tab and working copy intact.
-    /// Otherwise shuts down and drops every tab, releasing all Quarry-owned private working
-    /// copies, Undo/Redo directories, and FD leases.
+    /// [`Self::approve_tab_for_quit`] at its current edit revision. If any dirty tab is
+    /// unapproved or was edited after approval, returns [`SchedulerError::UnapprovedDirtyTabs`]
+    /// while leaving every tab and working copy intact. Otherwise shuts down and drops every
+    /// tab, releasing all Quarry-owned private working copies, Undo/Redo directories, and FD
+    /// leases.
     pub fn finalize_quit(&mut self) -> Result<Vec<String>, SchedulerError> {
         let unapproved: Vec<DocumentId> = self
             .tabs
             .iter()
             .filter_map(|(&id, slot)| {
-                (slot_is_dirty(slot) && !self.quit_approved.contains(&id)).then_some(id)
+                (slot_is_dirty(slot) && !self.tab_is_quit_approved(id, slot)).then_some(id)
             })
             .collect();
         if !unapproved.is_empty() {
@@ -1298,7 +1425,9 @@ impl WorkbenchScheduler {
         }
         self.quit_pending = false;
         self.quit_approved.clear();
+        self.close_approved.clear();
         self.active_by_window.clear();
+        self.window_tabs.clear();
         let tabs = std::mem::take(&mut self.tabs);
         for (_, mut slot) in tabs {
             if let Some(doc) = slot.tab.document.as_mut() {
@@ -1307,6 +1436,558 @@ impl WorkbenchScheduler {
             drop(slot);
         }
         Ok(self.working_cleanup.take_errors())
+    }
+
+    /// Moves `id` from its current window into `target_window`, activating it in `target_window`
+    /// and activating an adjacent tab in the previous window if any tabs remain there.
+    pub fn move_tab_to_window(
+        &mut self,
+        id: DocumentId,
+        target_window: WindowId,
+    ) -> Result<WakeOutcome, SchedulerError> {
+        let Some(old_window) = self.tabs.get(&id).map(|slot| slot.window) else {
+            return Err(SchedulerError::NotFound(id));
+        };
+        self.register_window(target_window);
+        if old_window == target_window {
+            return self.activate_tab(target_window, id);
+        }
+        let outcome = self.activate_tab(target_window, id)?;
+        if !self.active_by_window.contains_key(&old_window)
+            && let Some(next_id) = self
+                .window_tabs
+                .get(&old_window)
+                .and_then(|ids| ids.first().copied())
+        {
+            let _ = self.activate_tab(old_window, next_id);
+        }
+        Ok(outcome)
+    }
+
+    /// Shuts down and removes `id` from its window, releasing its FD leases and working copies,
+    /// and activates an adjacent tab in that window if any remain.
+    pub fn close_tab(
+        &mut self,
+        id: DocumentId,
+    ) -> Result<(Option<DocumentId>, Vec<String>), SchedulerError> {
+        let Some(old_window) = self.tabs.get(&id).map(|slot| slot.window) else {
+            return Err(SchedulerError::NotFound(id));
+        };
+        let was_active = self.active_by_window.get(&old_window) == Some(&id);
+        let removed_index = self
+            .window_tabs
+            .get(&old_window)
+            .and_then(|ids| ids.iter().position(|&entry| entry == id));
+        if let Some(mut slot) = self.tabs.remove(&id) {
+            if let Some(doc) = slot.tab.document.as_mut() {
+                doc.shutdown();
+            }
+            drop(slot);
+        }
+        self.quit_approved.remove(&id);
+        self.close_approved.remove(&id);
+        self.remove_tab_from_window_lists(id);
+        if was_active {
+            self.active_by_window.remove(&old_window);
+        }
+        let next_active = if was_active {
+            let candidate = self.window_tabs.get(&old_window).and_then(|ids| {
+                if ids.is_empty() {
+                    None
+                } else {
+                    let idx = removed_index.unwrap_or(0).min(ids.len() - 1);
+                    Some(ids[idx])
+                }
+            });
+            if let Some(next_id) = candidate {
+                let _ = self.activate_tab(old_window, next_id);
+                self.active_by_window.get(&old_window).copied()
+            } else {
+                None
+            }
+        } else {
+            self.active_by_window.get(&old_window).copied()
+        };
+        Ok((next_active, self.working_cleanup.take_errors()))
+    }
+
+    /// Closes `window` and all tabs it owns if no dirty tab in `window` remains unapproved.
+    /// If any tab in `window` is dirty and neither `close_ready` nor quit-approved, returns
+    /// [`SchedulerError::UnapprovedDirtyTabs`] while leaving every tab and edit intact.
+    pub fn close_window(&mut self, window: WindowId) -> Result<Vec<String>, SchedulerError> {
+        let ids = self.tabs_in_window(window);
+        let unapproved: Vec<DocumentId> = ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.tabs.get(&id).is_some_and(|slot| {
+                    slot_is_dirty(slot)
+                        && !self.tab_is_close_approved(id, slot)
+                        && !self.tab_is_quit_approved(id, slot)
+                })
+            })
+            .collect();
+        if !unapproved.is_empty() {
+            return Err(SchedulerError::UnapprovedDirtyTabs(unapproved));
+        }
+        for id in ids {
+            if let Some(mut slot) = self.tabs.remove(&id) {
+                if let Some(doc) = slot.tab.document.as_mut() {
+                    doc.shutdown();
+                }
+                drop(slot);
+            }
+            self.quit_approved.remove(&id);
+            self.close_approved.remove(&id);
+        }
+        self.window_tabs.remove(&window);
+        self.active_by_window.remove(&window);
+        Ok(self.working_cleanup.take_errors())
+    }
+
+    /// Reopens a clean tab in-place with updated format/encoding options (or Reload from Disk),
+    /// preserving its `DocumentId` and tab-bar position. Prepares the replacement before mutating
+    /// any live tab state so a failed format/encoding change never blanks the active document.
+    pub fn reopen_tab(
+        &mut self,
+        window: WindowId,
+        id: DocumentId,
+        options: OpenOptions,
+        encoding: Option<Encoding>,
+    ) -> Result<WakeOutcome, SchedulerError> {
+        let Some(slot) = self.tabs.get(&id) else {
+            return Err(SchedulerError::NotFound(id));
+        };
+        if slot_is_dirty(slot) {
+            return Err(SchedulerError::OpenFailed(
+                "Discard or save your changes before reopening this document.".into(),
+            ));
+        }
+        if slot.tab.document_writing() {
+            return Err(SchedulerError::OpenFailed(
+                "Wait for the active file operation before reopening this document.".into(),
+            ));
+        }
+        if slot
+            .tab
+            .document
+            .as_ref()
+            .is_some_and(Document::join_reserved)
+        {
+            return Err(SchedulerError::OpenFailed(JOIN_INPUT_RESERVED.into()));
+        }
+        let Some(path) = self.tab_logical_path(id) else {
+            return Err(SchedulerError::NotFound(id));
+        };
+        let was_hydrated = matches!(slot.residency, SlotResidency::Hydrated { .. });
+
+        // Validate and prepare the replacement document BEFORE touching the existing slot.
+        let mut replacement = Document::prepare_with_encoding(&path, options, encoding)
+            .map_err(SchedulerError::OpenFailed)?;
+        replacement.working_directory = self.config.working_directory.clone();
+        replacement.custom_working_directory = self.config.custom_working_directory;
+        replacement.index_cache_enabled = self.config.index_cache_enabled;
+        replacement.working_cleanup = self.working_cleanup.clone();
+        replacement.decompression_slots = self.decompression_slots.clone();
+        replacement
+            .start_indexing()
+            .map_err(SchedulerError::OpenFailed)?;
+
+        if was_hydrated {
+            let tick = self.next_tick();
+            if let Some(slot) = self.tabs.get_mut(&id) {
+                if let Some(doc) = slot.tab.document.as_mut() {
+                    doc.shutdown();
+                }
+                slot.tab.document = Some(replacement);
+                slot.tab.header_mode = options.header_mode;
+                slot.tab.encoding_mode = encoding;
+                slot.tab.notice = None;
+                slot.tab.footer_status = None;
+                slot.window = window;
+                slot.last_used_tick = tick;
+            }
+            self.active_by_window.insert(window, id);
+            let _ = self.sync_fd_leases();
+            return Ok(WakeOutcome::Ready {
+                document_id: id,
+                kind: WakeKind::AlreadyHydrated,
+                evicted: Vec::new(),
+            });
+        }
+
+        // For Stub or Dormant tabs, shut down the pre-check document and hydrate normally now
+        // that we know the target path + options + encoding open cleanly.
+        replacement.shutdown();
+        let canonical_path = canonicalize_best_effort(&path);
+        let file_identity = FileIdentity::from_path(&path).ok().flatten();
+        if let Some(slot) = self.tabs.get_mut(&id) {
+            slot.tab.header_mode = options.header_mode;
+            slot.tab.encoding_mode = encoding;
+            slot.tab.notice = None;
+            slot.tab.footer_status = None;
+            slot.residency = SlotResidency::Stub(LazyDocumentStub {
+                logical_path: path,
+                canonical_path,
+                file_identity,
+                open_options: options,
+                encoding,
+            });
+        }
+        if self.active_by_window.get(&window) == Some(&id) {
+            self.active_by_window.remove(&window);
+        }
+        self.activate_tab(window, id)
+    }
+
+    /// Applies one value-edit or structural-working-copy undo/redo step on hydrated tab `id`.
+    pub fn apply_undo_redo(&mut self, id: DocumentId, redo: bool) -> Result<String, AppMessage> {
+        let Some(slot) = self.tabs.get_mut(&id) else {
+            return Err(AppMessage::warning("Open a file before undoing a change."));
+        };
+        let Some(current) = slot.tab.document.as_mut() else {
+            return Err(AppMessage::warning("Open a file before undoing a change."));
+        };
+        if !current.history_ready() {
+            return Err(AppMessage::warning(if current.source_changed {
+                SOURCE_CHANGED_NOTICE
+            } else {
+                "Finish editing and wait for active operations before Undo or Redo."
+            }));
+        }
+        match current.session.ensure_source_unchanged() {
+            Ok(()) => {}
+            Err(QuarryError::SourceChanged) => {
+                current.invalidate_changed_source();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+            Err(error) => return Err(AppMessage::core_error(error)),
+        }
+        let edit = if redo {
+            current.edit_history.redo.pop()
+        } else {
+            current.edit_history.undo.pop_back()
+        };
+        if let Some(edit) = edit {
+            current.set_edit_value(
+                edit.target,
+                if redo {
+                    edit.after.clone()
+                } else {
+                    edit.before.clone()
+                },
+            );
+            current.clear_edit_search();
+            if redo {
+                current.edit_history.undo.push_back(edit);
+            } else {
+                current.edit_history.redo.push(edit);
+            }
+            let message = if redo {
+                "Edit restored."
+            } else {
+                "Edit undone."
+            };
+            slot.tab.footer_status = Some(AppMessage::status(message));
+            let _ = self.sync_fd_leases();
+            return Ok(message.into());
+        }
+        if current.filter_active() {
+            return Err(AppMessage::warning(
+                "Clear the filter before undoing structural changes.",
+            ));
+        }
+        current.commit_edits();
+        if !redo && (!current.header_renames.is_empty() || current.has_cell_edits()) {
+            return Err(AppMessage::warning(
+                "Save or discard later header and cell edits before undoing the change.",
+            ));
+        }
+        if current.save_job.is_some()
+            || current.export_job.is_some()
+            || current.structural_job.is_some()
+        {
+            return Err(AppMessage::warning(
+                "Wait for the active file operation to finish.",
+            ));
+        }
+        let state = current
+            .working_copy
+            .as_ref()
+            .ok_or_else(|| AppMessage::warning("There is no change to undo or redo."))?;
+        let target = if redo {
+            state.redo.clone()
+        } else {
+            state.undo.clone()
+        }
+        .ok_or_else(|| {
+            AppMessage::warning(if redo {
+                "There is no change to redo."
+            } else {
+                "There is no change to undo."
+            })
+        })?;
+        if !redo
+            && target.path == current.logical_path
+            && let Some(original) = current.original_session.as_ref()
+        {
+            match original.ensure_source_unchanged() {
+                Ok(()) => {}
+                Err(QuarryError::SourceChanged) => {
+                    current.invalidate_changed_source();
+                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                }
+                Err(error) => return Err(AppMessage::core_error(error)),
+            }
+        }
+
+        let options = current.current_open_options();
+        let logical_path = current.logical_path.clone();
+        let encoding = current.session.encoding();
+        let current_snapshot = WorkingCopySnapshot {
+            path: current.session.path().to_path_buf(),
+            overlay: StructuralOverlay {
+                header_renames: current.header_renames.as_ref().clone(),
+                cell_edits: current.cell_edits.as_ref().clone(),
+            },
+            edit_history: current.edit_history.clone(),
+        };
+        // Reserve descriptor headroom for the concurrent replacement open + its index worker
+        // BEFORE opening or mutating live state so admission failure leaves history untouched.
+        let temp_open_fd = self
+            .fd_budget
+            .try_reserve(FdCategory::ActiveDocument, 1)
+            .map_err(|error| AppMessage::warning(error.to_string()))?;
+        let index_job_fd = self
+            .fd_budget
+            .try_reserve(FdCategory::BackgroundJob, 1)
+            .map_err(|error| AppMessage::warning(error.to_string()))?;
+
+        let mut replacement =
+            Document::prepare_with_encoding(&target.path, options, Some(encoding))
+                .map_err(AppMessage::error)?;
+        replacement.header_renames = Arc::new(target.overlay.header_renames.clone());
+        replacement.cell_edits = Arc::new(target.overlay.cell_edits.clone());
+        replacement.edit_history = target.edit_history;
+        replacement.refresh_column_headers();
+        replacement.index_cache_enabled = self.config.index_cache_enabled;
+        replacement.start_indexing().map_err(AppMessage::error)?;
+
+        let mut state = current
+            .working_copy
+            .take()
+            .expect("the history target came from working-copy state");
+        if redo {
+            state.redo = None;
+            state.undo = Some(current_snapshot);
+        } else {
+            state.undo = None;
+            state.redo = Some(current_snapshot);
+        }
+        replacement.logical_path = logical_path;
+        replacement.original_session = current.original_session.take();
+        replacement.working_copy = Some(state);
+        replacement.working_directory = self.config.working_directory.clone();
+        replacement.custom_working_directory = self.config.custom_working_directory;
+        replacement.working_cleanup = self.working_cleanup.clone();
+        replacement.decompression_slots = self.decompression_slots.clone();
+        current.shutdown();
+        drop(temp_open_fd);
+        slot.tab.document = Some(replacement);
+        if let SlotResidency::Hydrated { job_fd_lease, .. } = &mut slot.residency {
+            *job_fd_lease = Some(index_job_fd);
+        }
+        slot.tab.structural_dialog = None;
+        slot.tab.columns_open = false;
+        slot.tab.notice = None;
+        let message = if redo {
+            "Change restored."
+        } else {
+            "Change undone."
+        };
+        slot.tab.footer_status = Some(AppMessage::status(message));
+        let _ = self.sync_fd_leases();
+        Ok(message.into())
+    }
+
+    /// Discards unsaved edits and working copies on hydrated tab `id`.
+    pub fn discard_tab_edits(&mut self, id: DocumentId) -> Result<(), AppMessage> {
+        let Some(slot) = self.tabs.get_mut(&id) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let Some(doc) = slot.tab.document.as_mut() else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        if doc.join_reserved() {
+            return Err(AppMessage::warning(JOIN_INPUT_RESERVED));
+        }
+        if doc.save_job.is_some() || doc.export_job.is_some() || doc.structural_job.is_some() {
+            return Err(AppMessage::warning(
+                "Wait for the active file operation to finish before discarding changes.",
+            ));
+        }
+        let logical_path = doc.logical_path.clone();
+        let options = doc.current_open_options();
+        let encoding = Some(doc.session.encoding());
+        let had_working_copy = doc.working_copy.is_some() || doc.original_session.is_some();
+        if had_working_copy {
+            let temp_open_fd = self
+                .fd_budget
+                .try_reserve(FdCategory::ActiveDocument, 1)
+                .map_err(|error| AppMessage::warning(error.to_string()))?;
+            let index_job_fd = self
+                .fd_budget
+                .try_reserve(FdCategory::BackgroundJob, 1)
+                .map_err(|error| AppMessage::warning(error.to_string()))?;
+            let mut replacement = Document::prepare_with_encoding(&logical_path, options, encoding)
+                .map_err(AppMessage::error)?;
+            replacement.working_directory = self.config.working_directory.clone();
+            replacement.custom_working_directory = self.config.custom_working_directory;
+            replacement.index_cache_enabled = self.config.index_cache_enabled;
+            replacement.working_cleanup = self.working_cleanup.clone();
+            replacement.decompression_slots = self.decompression_slots.clone();
+            replacement.start_indexing().map_err(AppMessage::error)?;
+            doc.shutdown();
+            drop(temp_open_fd);
+            slot.tab.document = Some(replacement);
+            if let SlotResidency::Hydrated { job_fd_lease, .. } = &mut slot.residency {
+                *job_fd_lease = Some(index_job_fd);
+            }
+        } else {
+            doc.discard_edits();
+        }
+        slot.tab.notice = None;
+        slot.tab.footer_status = Some(AppMessage::status("Changes discarded."));
+        let _ = self.sync_fd_leases();
+        Ok(())
+    }
+
+    /// Polls active save jobs across all hydrated tabs, reloading saved documents cleanly and
+    /// clearing write reservations on finish or cancellation.
+    pub fn poll_saves(&mut self) -> Vec<SaveCompletion> {
+        let mut results = Vec::new();
+        let mut any_finished = false;
+        for (&id, slot) in &mut self.tabs {
+            if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
+                continue;
+            }
+            let Some(doc) = slot.tab.document.as_mut() else {
+                continue;
+            };
+            if doc.save_job.is_none() {
+                continue;
+            }
+            match doc.poll_save() {
+                Ok(Some((destination, in_place))) => {
+                    any_finished = true;
+                    slot.tab.write_destination = None;
+                    if !in_place {
+                        doc.save_status = None;
+                        results.push(SaveCompletion {
+                            document_id: id,
+                            result: Ok((destination, false)),
+                        });
+                        continue;
+                    }
+                    let dialect = doc.session.dialect;
+                    let options = OpenOptions {
+                        delimiter: Some(dialect.delimiter),
+                        header_mode: if dialect.has_header {
+                            quarry_core::HeaderMode::FirstRow
+                        } else {
+                            quarry_core::HeaderMode::NoHeader
+                        },
+                        ..OpenOptions::default()
+                    };
+                    let output_encoding = doc
+                        .save_output_encoding
+                        .unwrap_or_else(|| doc.session.encoding());
+                    let source_encoding = doc.session.encoding();
+                    let prior_encoding_mode = slot.tab.encoding_mode;
+
+                    let reload = Document::prepare_with_encoding(
+                        &destination,
+                        options,
+                        Some(output_encoding),
+                    )
+                    .and_then(|mut replacement| {
+                        replacement.working_directory = self.config.working_directory.clone();
+                        replacement.custom_working_directory = self.config.custom_working_directory;
+                        replacement.index_cache_enabled = self.config.index_cache_enabled;
+                        replacement.working_cleanup = self.working_cleanup.clone();
+                        replacement.decompression_slots = self.decompression_slots.clone();
+                        replacement.start_indexing()?;
+                        Ok(replacement)
+                    });
+
+                    match reload {
+                        Ok(replacement) => {
+                            doc.shutdown();
+                            slot.tab.document = Some(replacement);
+                            slot.tab.encoding_mode = if output_encoding == source_encoding {
+                                prior_encoding_mode
+                            } else {
+                                Some(output_encoding)
+                            };
+                            slot.tab.notice = None;
+                            results.push(SaveCompletion {
+                                document_id: id,
+                                result: Ok((destination, true)),
+                            });
+                        }
+                        Err(error) => {
+                            doc.shutdown();
+                            slot.tab.document = None;
+                            results.push(SaveCompletion {
+                                document_id: id,
+                                result: Err(AppMessage::error(format!(
+                                    "Saved {} but could not reload it: {error}. Reopen the file to continue.",
+                                    destination.display()
+                                ))),
+                            });
+                        }
+                    }
+                }
+                Ok(None) => {
+                    if doc.save_job.is_none() {
+                        // Save was cancelled cleanly.
+                        any_finished = true;
+                        slot.tab.write_destination = None;
+                        slot.tab.close_after_save = false;
+                    }
+                }
+                Err(error) => {
+                    any_finished = true;
+                    slot.tab.write_destination = None;
+                    results.push(SaveCompletion {
+                        document_id: id,
+                        result: Err(error),
+                    });
+                }
+            }
+        }
+        if any_finished {
+            let _ = self.sync_fd_leases();
+        }
+        results
+    }
+
+    fn assign_tab_to_window_list(&mut self, target_window: WindowId, id: DocumentId) {
+        for (&win, ids) in &mut self.window_tabs {
+            if win != target_window {
+                ids.retain(|&entry| entry != id);
+            }
+        }
+        let list = self.window_tabs.entry(target_window).or_default();
+        if !list.contains(&id) {
+            list.push(id);
+        }
+    }
+
+    fn remove_tab_from_window_lists(&mut self, id: DocumentId) {
+        for ids in self.window_tabs.values_mut() {
+            ids.retain(|&entry| entry != id);
+        }
     }
 
     fn ensure_hydration_capacity(
@@ -1526,6 +2207,71 @@ fn slot_is_dirty(slot: &ManagedTab) -> bool {
         },
         SlotResidency::Stub(_) => false,
     }
+}
+
+/// Computes a residency-independent fingerprint of a tab's unsaved edit state so quit approvals
+/// survive normal hydration <-> dormancy eviction while still invalidating on any new edit.
+fn slot_edit_revision(slot: &ManagedTab) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match &slot.residency {
+        SlotResidency::Hydrated { .. } => {
+            if let Some(doc) = slot.tab.document.as_ref()
+                && doc.is_dirty()
+            {
+                1u8.hash(&mut hasher);
+                doc.session.path().hash(&mut hasher);
+                doc.original_session.is_some().hash(&mut hasher);
+                doc.cell_edits.len().hash(&mut hasher);
+                for (coord, value) in doc.cell_edits.iter() {
+                    coord.hash(&mut hasher);
+                    value.as_ref().hash(&mut hasher);
+                }
+                doc.header_renames.len().hash(&mut hasher);
+                for (col, name) in doc.header_renames.iter() {
+                    col.hash(&mut hasher);
+                    name.as_str().hash(&mut hasher);
+                }
+                if let Some(edit) = doc.cell_edit.as_ref() {
+                    1u8.hash(&mut hasher);
+                    edit.row.hash(&mut hasher);
+                    edit.column.hash(&mut hasher);
+                    edit.draft.hash(&mut hasher);
+                }
+                if let Some(edit) = doc.header_edit.as_ref() {
+                    2u8.hash(&mut hasher);
+                    edit.column.hash(&mut hasher);
+                    edit.draft.hash(&mut hasher);
+                }
+            } else {
+                0u8.hash(&mut hasher);
+            }
+        }
+        SlotResidency::Dormant(dormant) => {
+            if let DormantKind::Dirty(dirty) = &dormant.kind {
+                1u8.hash(&mut hasher);
+                dirty.session.path().hash(&mut hasher);
+                dirty.original_session.is_some().hash(&mut hasher);
+                dirty.cell_edits.len().hash(&mut hasher);
+                for (coord, value) in dirty.cell_edits.iter() {
+                    coord.hash(&mut hasher);
+                    value.as_ref().hash(&mut hasher);
+                }
+                dirty.header_renames.len().hash(&mut hasher);
+                for (col, name) in dirty.header_renames.iter() {
+                    col.hash(&mut hasher);
+                    name.as_str().hash(&mut hasher);
+                }
+            } else {
+                0u8.hash(&mut hasher);
+            }
+        }
+        SlotResidency::Stub(_) => {
+            0u8.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn doc_retained_dir_fds(doc: &Document) -> usize {

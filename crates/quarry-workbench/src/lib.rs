@@ -18,15 +18,15 @@ pub use compressed::CompressedDormancyPolicy;
 pub use dormancy::{
     DEFAULT_MAX_DIRTY_OVERLAY_BYTES, DEFAULT_MAX_HYDRATED_TABS, DEFAULT_NOFILE_TARGET,
     FdBudgetLedger, FdBudgetSnapshot, FdCategory, FdLease, LazyDocumentStub, MAX_PROCESS_FD_BUDGET,
-    MIN_DORMANT_SCRATCH_HEADROOM_BYTES, PinReason, ResidencyState, SchedulerError, WakeKind,
-    WakeOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig, document_overlay_bytes,
+    MIN_DORMANT_SCRATCH_HEADROOM_BYTES, PinReason, ResidencyState, SaveCompletion, SchedulerError,
+    WakeKind, WakeOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig, document_overlay_bytes,
 };
 
 pub use document::{
     ActiveFilterRead, CapturedDocument, CellEdit, Document, DocumentLease, DocumentProbe,
     FilterReadWindow, HeaderEdit, MaterializationPreparation, MaterializedWorkingCopy,
-    StructuralJob, StructuralProgressDisplay, footer_range_text, materialization_progress,
-    sort_progress,
+    StructuralJob, StructuralProgressDisplay, ViewportReadPlan, footer_range_text,
+    materialization_progress, sort_progress,
 };
 pub use history::{
     EditHistory, EditTarget, MAX_EDIT_HISTORY_BYTES, MAX_EDIT_HISTORY_ENTRIES, SharedCellEdits,
