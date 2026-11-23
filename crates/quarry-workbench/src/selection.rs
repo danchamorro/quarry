@@ -220,12 +220,12 @@ impl RowSelection {
                 .anchor
                 .or_else(|| self.ranges.first().map(|range| *range.start()))
                 .unwrap_or(row);
-            self.ranges = vec![anchor.min(row)..=anchor.max(row)];
+            self.ranges = Vec::from([anchor.min(row)..=anchor.max(row)]);
             self.anchor = Some(anchor);
         } else if modifiers.command {
             self.toggle(row);
         } else {
-            self.ranges = vec![row..=row];
+            self.ranges = Vec::from([row..=row]);
             self.anchor = Some(row);
         }
     }

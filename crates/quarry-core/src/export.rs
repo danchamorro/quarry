@@ -6242,7 +6242,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                vec![0..=0],
+                Vec::from([0..=0]),
                 &working_path,
             )
             .unwrap();
@@ -6262,7 +6262,7 @@ mod tests {
             headered.start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                vec![0..=0],
+                Vec::from([0..=0]),
                 &invalid_path,
             ),
             Err(QuarryError::InvalidOption(_))
@@ -6274,7 +6274,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                vec![9..=9],
+                Vec::from([9..=9]),
                 &out_of_range_path,
             )
             .unwrap();
@@ -6298,7 +6298,7 @@ mod tests {
             .start_create_working_copy_deleting_rows(
                 BTreeMap::new(),
                 BTreeMap::new(),
-                vec![0..=0],
+                Vec::from([0..=0]),
                 &working_path,
             )
             .unwrap();
@@ -6330,7 +6330,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            Vec::from([0..=0]),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6379,7 +6379,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            Vec::from([0..=0]),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6424,7 +6424,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            Vec::from([0..=0]),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6465,7 +6465,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            Vec::from([0..=0]),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 3,
@@ -6504,7 +6504,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            Vec::from([0..=0]),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -6544,7 +6544,7 @@ mod tests {
                 transformation: None,
             },
             None,
-            vec![0..=0],
+            Vec::from([0..=0]),
             SaveTarget::WorkingCopy(working_path.clone(), source_session.source_stamp.clone()),
             ExportConfig {
                 chunk_bytes: 1,
@@ -10440,10 +10440,8 @@ mod tests {
                         .unwrap();
                     assert_eq!(adopted, fresh, "{label} w={workers} output_index mismatch");
                 } else {
-                    assert!(
-                        !cfg!(target_os = "macos"),
-                        "local macOS publication must retain replace index provenance"
-                    );
+                    #[cfg(target_os = "macos")]
+                    panic!("local macOS publication must retain replace index provenance");
                 }
                 let bytes = fs::read(&dest).unwrap();
                 if let Some((ref expected_bytes, expected_count)) = baseline {

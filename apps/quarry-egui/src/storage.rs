@@ -219,22 +219,23 @@ fn encode_scratch_directory_pref(path: &Path) -> std::io::Result<String> {
 fn parse_scratch_directory_pref(content: &str) -> Option<PathBuf> {
     for line in content.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(rest) = line.strip_prefix("scratch_directory=") {
-            if !rest.is_empty() && !rest.contains('\0') {
-                let candidate = PathBuf::from(rest);
-                if candidate.is_absolute() {
-                    return Some(candidate);
-                }
+        if let Some(rest) = line.strip_prefix("scratch_directory=")
+            && !rest.is_empty()
+            && !rest.contains('\0')
+        {
+            let candidate = PathBuf::from(rest);
+            if candidate.is_absolute() {
+                return Some(candidate);
             }
         }
         #[cfg(unix)]
         if let Some(hex) = line.strip_prefix("scratch_directory_hex=") {
             use std::os::unix::ffi::OsStringExt;
             let hex = hex.trim();
-            if !hex.is_empty() && hex.len() % 2 == 0 {
+            if !hex.is_empty() && hex.len().is_multiple_of(2) {
                 let mut bytes = Vec::with_capacity(hex.len() / 2);
                 let mut valid = true;
-                for pair in hex.as_bytes().chunks_exact(2) {
+                for pair in hex.as_bytes().as_chunks::<2>().0 {
                     let Ok(s) = std::str::from_utf8(pair) else {
                         valid = false;
                         break;
@@ -824,10 +825,14 @@ impl QuarryApp {
                             if working {
                                 ui.add_enabled_ui(review.worker.is_none(), |ui| {
                                     ui.horizontal_wrapped(|ui| {
-                                        if ui.button("Choose another folder…").clicked() {
-                                            if let Some(path) = rfd::FileDialog::new().set_title("Choose temporary working folder").set_directory(&review.path_input).pick_folder() {
-                                                review.path_input = path.display().to_string(); check = true;
-                                            }
+                                        if ui.button("Choose another folder…").clicked()
+                                            && let Some(path) = rfd::FileDialog::new()
+                                                .set_title("Choose temporary working folder")
+                                                .set_directory(&review.path_input)
+                                                .pick_folder()
+                                        {
+                                            review.path_input = path.display().to_string();
+                                            check = true;
                                         }
                                         if ui.button("Use system temporary folder").clicked() {
                                             review.path_input = std::env::temp_dir().display().to_string(); check = true;
@@ -1421,7 +1426,7 @@ mod tests {
         );
         app.working_directory = second.clone();
         app.active.document.as_mut().unwrap().working_directory = second.clone();
-        app.apply_delete_rows(vec![2..=2]);
+        app.apply_delete_rows(Vec::from([2..=2]));
         finish(&mut app);
         let second_copy = app
             .active
@@ -1447,7 +1452,7 @@ mod tests {
         );
         app.active.document.as_mut().unwrap().working_directory =
             directory.path().join("disconnected");
-        app.apply_delete_rows(vec![1..=1]);
+        app.apply_delete_rows(Vec::from([1..=1]));
         assert!(
             app.active
                 .notice
@@ -1483,7 +1488,7 @@ mod tests {
         let path = directory.path().to_path_buf();
         let mut app = QuarryApp::new(None, Instant::now());
         app.active.storage_review = Some(StorageReview {
-            operation: Some(PendingStorageOperation::DeleteRows(vec![1..=1])),
+            operation: Some(PendingStorageOperation::DeleteRows(Vec::from([1..=1]))),
             path_input: path.display().to_string(),
             checked_path: path.clone(),
             required_bytes: 200,
@@ -1943,7 +1948,7 @@ mod tests {
             app.working_directory, custom_dir,
             "must not silently fall back to another volume"
         );
-        let deferred = app.defer_storage(PendingStorageOperation::DeleteRows(vec![1..=1]));
+        let deferred = app.defer_storage(PendingStorageOperation::DeleteRows(Vec::from([1..=1])));
         assert!(deferred);
         assert!(app.active.storage_review.is_some());
         assert!(
@@ -2037,7 +2042,7 @@ mod tests {
         let valid_dir = dir.path().join("valid-session-scratch");
         std::fs::create_dir(&valid_dir).unwrap();
         let ctx = egui::Context::default();
-        app.begin_storage_review(PendingStorageOperation::DeleteRows(vec![1..=1]));
+        app.begin_storage_review(PendingStorageOperation::DeleteRows(Vec::from([1..=1])));
         let review = app.active.storage_review.as_mut().unwrap();
         review.path_input = valid_dir.display().to_string();
         review.checked_path = valid_dir.clone();

@@ -228,11 +228,11 @@ impl Cache {
             match job.handle.join() {
                 Ok(entries) => {
                     for (id, summary) in entries {
-                        if self.entries.len() >= MAX_CACHE_CELLS && !self.entries.contains_key(&id)
+                        if self.entries.len() >= MAX_CACHE_CELLS
+                            && !self.entries.contains_key(&id)
+                            && let Some((_, oldest)) = self.usage.pop_first()
                         {
-                            if let Some((_, oldest)) = self.usage.pop_first() {
-                                self.entries.remove(&oldest);
-                            }
+                            self.entries.remove(&oldest);
                         }
                         if let Some((used, _)) = self.entries.insert(id, (self.clock, summary)) {
                             self.usage.remove(&(used, id));

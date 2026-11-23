@@ -2574,10 +2574,9 @@ mod tests {
                 panic!("sort cancelled")
             };
             let Some(completed) = summary.output_index else {
-                assert!(
-                    !cfg!(target_os = "macos"),
-                    "local macOS publication must retain index provenance"
-                );
+                #[cfg(target_os = "macos")]
+                panic!("local macOS publication must retain index provenance");
+                #[cfg(not(target_os = "macos"))]
                 continue;
             };
             let sorted = session(&destination, header_mode);
@@ -2625,7 +2624,9 @@ mod tests {
             panic!("sort cancelled")
         };
         let Some(completed) = summary.output_index else {
-            assert!(!cfg!(target_os = "macos"));
+            #[cfg(target_os = "macos")]
+            panic!("local macOS publication must retain index provenance");
+            #[cfg(not(target_os = "macos"))]
             return;
         };
         let mut sorted = session(&destination, HeaderMode::FirstRow);

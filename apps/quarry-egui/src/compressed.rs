@@ -407,7 +407,10 @@ mod tests {
         assert_eq!(document.insertion_disabled_reason(true), Some(READ_ONLY));
         assert_eq!(document.insertion_disabled_reason(false), Some(READ_ONLY));
         assert_eq!(
-            document.start_delete_rows(vec![1..=1]).unwrap_err().text,
+            document
+                .start_delete_rows(Vec::from([1..=1]))
+                .unwrap_err()
+                .text,
             READ_ONLY
         );
         assert_eq!(

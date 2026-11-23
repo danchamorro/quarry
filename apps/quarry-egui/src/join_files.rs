@@ -422,10 +422,11 @@ impl JoinDialog {
             .is_some_and(|job| job.progress().done)
         {
             let job = self.checking.take().unwrap();
-            if !self.closing && !self.cancel_requested {
-                if let Some(headers) = job.take_discovered_headers() {
-                    self.adopt_discovered_headers(headers);
-                }
+            if !self.closing
+                && !self.cancel_requested
+                && let Some(headers) = job.take_discovered_headers()
+            {
+                self.adopt_discovered_headers(headers);
             }
             match job.wait() {
                 Ok(Some(plan)) => {
@@ -1146,7 +1147,7 @@ impl JoinDialog {
         ui.horizontal_top(|ui| {
             egui::Frame::new()
                 .fill(palette.canvas)
-                .stroke(egui::Stroke::new(1.0, palette.control_border))
+                .stroke(egui::Stroke::new(1.0_f32, palette.control_border))
                 .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS + 2))
                 .inner_margin(egui::Margin::symmetric(6, 4))
                 .show(ui, |ui| {
@@ -1468,7 +1469,7 @@ impl JoinDialog {
             if has_examples {
                 egui::Frame::new()
                     .fill(theme::ui_palette(ui).canvas)
-                    .stroke(egui::Stroke::new(1.0, theme::ui_palette(ui).grid_line))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::ui_palette(ui).grid_line))
                     .corner_radius(6)
                     .inner_margin(10)
                     .show(ui, |ui| {

@@ -652,7 +652,12 @@ mod tests {
             let bytes = if encoding == Encoding::Utf16Le {
                 little.to_vec()
             } else {
-                little.chunks_exact(2).flat_map(|p| [p[1], p[0]]).collect()
+                little
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[1], p[0]])
+                    .collect()
             };
             for requested in 1..=19 {
                 let mut file = tempfile::tempfile().unwrap();
@@ -1121,7 +1126,7 @@ mod tests {
                             .start_create_working_copy_deleting_rows(
                                 BTreeMap::new(),
                                 BTreeMap::new(),
-                                vec![1..=1],
+                                Vec::from([1..=1]),
                                 &destination,
                             )
                             .unwrap()
@@ -1236,10 +1241,9 @@ mod tests {
                 let index = if let Some(completed) = summary.output_index.take() {
                     reopened.adopt_completed_index(completed).unwrap()
                 } else {
-                    assert!(
-                        !cfg!(target_os = "macos"),
-                        "macOS must preserve output index provenance"
-                    );
+                    #[cfg(target_os = "macos")]
+                    panic!("macOS must preserve output index provenance");
+                    #[cfg(not(target_os = "macos"))]
                     reopened
                         .start_indexing(crate::IndexConfig::default())
                         .unwrap()
@@ -1684,7 +1688,7 @@ mod tests {
                 .start_create_working_copy_deleting_rows(
                     BTreeMap::new(),
                     BTreeMap::new(),
-                    vec![0..=1],
+                    Vec::from([0..=1]),
                     &output,
                 )
                 .unwrap()

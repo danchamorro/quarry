@@ -150,10 +150,10 @@ pub(super) fn paint_indicator(ui: &egui::Ui, response: &Response, indicated: boo
         painter.add(Shape::convex_polygon(
             points,
             palette.indicator_fill,
-            Stroke::new(0.7, palette.indicator_stroke),
+            Stroke::new(0.7_f32, palette.indicator_stroke),
         ));
     } else if pending {
-        painter.circle_stroke(center, 2.0, Stroke::new(0.7, palette.mark));
+        painter.circle_stroke(center, 2.0, Stroke::new(0.7_f32, palette.mark));
     }
 }
 
