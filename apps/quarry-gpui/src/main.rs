@@ -810,7 +810,8 @@ fn number(value: u64) -> String {
 }
 
 fn bind_shortcuts(cx: &mut App) {
-    cx.bind_keys([
+    #[cfg(target_os = "macos")]
+    let bindings = [
         KeyBinding::new("cmd-o", OpenFile, None),
         KeyBinding::new("cmd-s", SaveCopy, None),
         KeyBinding::new("cmd-shift-s", SaveCopy, None),
@@ -818,7 +819,18 @@ fn bind_shortcuts(cx: &mut App) {
         KeyBinding::new("f2", EditCell, Some("QuarryComparison")),
         KeyBinding::new("cmd-z", UndoEdit, Some("QuarryComparison && !Input")),
         KeyBinding::new("cmd-shift-z", RedoEdit, Some("QuarryComparison && !Input")),
-    ]);
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let bindings = [
+        KeyBinding::new("ctrl-o", OpenFile, None),
+        KeyBinding::new("ctrl-s", SaveCopy, None),
+        KeyBinding::new("ctrl-shift-s", SaveCopy, None),
+        KeyBinding::new("ctrl-q", Quit, None),
+        KeyBinding::new("f2", EditCell, Some("QuarryComparison")),
+        KeyBinding::new("ctrl-z", UndoEdit, Some("QuarryComparison && !Input")),
+        KeyBinding::new("ctrl-shift-z", RedoEdit, Some("QuarryComparison && !Input")),
+    ];
+    cx.bind_keys(bindings);
 }
 
 fn main() {

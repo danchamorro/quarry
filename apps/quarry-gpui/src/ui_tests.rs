@@ -12,6 +12,11 @@ use quarry_core::{HeaderMode, OpenOptions};
 
 use super::{Quarry, bind_shortcuts, grid::Command};
 
+#[cfg(target_os = "macos")]
+const PRIMARY_MOD: &str = "cmd";
+#[cfg(not(target_os = "macos"))]
+const PRIMARY_MOD: &str = "ctrl";
+
 #[gpui_kit::test]
 fn quit_shortcut_works_before_any_control_is_clicked(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
@@ -31,7 +36,7 @@ fn quit_shortcut_works_before_any_control_is_clicked(cx: &mut TestAppContext) {
         window.render_frame(cx);
     })
     .unwrap();
-    cx.simulate_keystrokes(handle.into(), "cmd-q");
+    cx.simulate_keystrokes(handle.into(), &format!("{PRIMARY_MOD}-q"));
     cx.run_until_parked();
     cx.update(|cx| {
         assert!(
@@ -198,11 +203,11 @@ fn cell_editor_is_visible_applies_through_real_ui_and_undo_restores_source(
         window
             .within("dialog")
             .click(input.path().last().unwrap().clone(), cx);
-        window.press("cmd-a", cx);
+        window.press(&format!("{PRIMARY_MOD}-a"), cx);
         cx.write_to_clipboard(ClipboardItem::new_string(
             "x".repeat(super::document::MAX_EDIT_BYTES + 1),
         ));
-        window.press("cmd-v", cx);
+        window.press(&format!("{PRIMARY_MOD}-v"), cx);
         window.click("apply-cell-edit", cx);
         assert!(
             window.find("cell-edit-error").visible(),
@@ -215,7 +220,7 @@ fn cell_editor_is_visible_applies_through_real_ui_and_undo_restores_source(
         window
             .within("dialog")
             .click(input.path().last().unwrap().clone(), cx);
-        window.press("cmd-a", cx);
+        window.press(&format!("{PRIMARY_MOD}-a"), cx);
         window.input("Edited café", cx);
         window.click("apply-cell-edit", cx);
     })
@@ -270,7 +275,7 @@ fn cell_editor_is_visible_applies_through_real_ui_and_undo_restores_source(
         window
             .within("dialog")
             .click(input.path().last().unwrap().clone(), cx);
-        window.press("cmd-a", cx);
+        window.press(&format!("{PRIMARY_MOD}-a"), cx);
         window.input("Keep this draft", cx);
         window.click("apply-cell-edit", cx);
         assert!(
