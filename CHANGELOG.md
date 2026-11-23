@@ -10,9 +10,18 @@ parentheses are GitHub pull requests.
 
 ## [2026-11-23]
 
+### Added
+
+- Adopted GPUI (`gpui-kit = "=0.10.0"`) as Quarry's v1.0 desktop frontend in [ADR 0013](docs/adr/0013-adopt-gpui-desktop-frontend.md) (superseding [ADR 0003](docs/adr/0003-select-egui-ui.md) while keeping `apps/quarry-egui` as the default packaged macOS app until Phase 4B-3 cutover), recorded the Phase 4B-1 hardening, zero-transport, binary-size, macOS AccessKit (`macOS VM 1`), and Linux/Omarchy Wayland + Vulkan + AT-SPI (`Omarchy VM 4`) verification report in `docs/benchmarks/2026-11-23-phase4b1-gpui-hardening.md`, and updated `apps/quarry-gpui/VALIDATION.md` and `docs/V1_CLAIM_LEDGER.md` (`C06`, `C09`, `C10`, `C14`, `C39`, `C40`, `C42`, `T1`–`T4`, `T19`). (#192)
+- Wired OS accessibility metadata into `apps/quarry-gpui` (`TableDelegate::cell_label` exposing `"Row N"` and `"Column N: value"` / `"empty"`, `DataTable::accessibility_label`, `Role::Toolbar` on the document toolbar, `Role::Status` / `Role::Alert` on banners and the status bar, `"Dismiss message"` label, and Cell Editor dialog-close focus restoration back to `DataTable`), verified in automated GPUI tests and live across macOS (`accesskit_macos`) and Linux/Omarchy AT-SPI (`accesskit_unix`). (#192)
+
 ### Changed
 
 - Unified `apps/quarry-gpui` into the root Cargo workspace and lockfile on `gpui-kit = "=0.10.0"` (removing `/apps/quarry-gpui/` from `.gitignore` and deleting the standalone prototype lockfile and toolchain override), adapted its window root and Light theme to `gpui-component 0.10.0` and `quarry_workbench::theme`, enabled platform-native `cmd-*` / `ctrl-*` shortcuts across macOS and Linux, and verified zero HTTP/TLS/socket transport crates (`gpui-pre-reqwest`, `reqwest`, `hyper`, `rustls`, `quinn`, `native-tls`, `libcurl`) in both `cargo tree` target graphs (macOS and Linux ARM64/x86_64) and linked `quarry-gpui` release binaries (`otool -L` / `ldd` / `nm` / `strings`); upgraded the workspace MSRV and pinned toolchain to Rust `1.100.0` (`rust-toolchain.toml`, `Cargo.toml`, `.github/workflows/ci.yml`), resolved Rust `1.100.0` deprecations and Clippy lints across all workspace crates, and refreshed the Rust `1.100.0` runtime notices and third-party notice inventory (`packaging/licenses/{generate.py,rust/COPYRIGHT-library.html,rust/COPYRIGHT-backtrace.html,THIRD_PARTY_NOTICES.html,manifest.json,reviewed.sha256,AUDIT.md}`) while keeping `apps/quarry-egui` as the active macOS `.app` packaging target until Phase 4B-3. (#191)
+
+### Fixed
+
+- Resolved the two `apps/quarry-gpui` prototype interaction quirks with regression UI tests (`apps/quarry-gpui/src/ui_tests.rs`): added a capture-phase `Shift + vertical wheel` horizontal scroll bridge alongside native horizontal `Pixels`/`Lines` scrolling (`apps/quarry-gpui/src/main.rs`), and intercepted toolbar popover trigger clicks in capture phase while removing a spurious `window.blur` so switching from an open nested `Select` (such as **Format → Delimiter**) to another toolbar panel (such as **Columns**) completes in a single click with focus preserved (`apps/quarry-gpui/src/panels.rs`). (#192)
 
 ## [2026-11-22]
 

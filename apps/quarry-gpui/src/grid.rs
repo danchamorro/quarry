@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
-use gpui_kit::{App, Context, IntoElement, ParentElement, Pixels, Styled, Window, div, px, rgb};
+use gpui_kit::{
+    App, Context, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
+};
 use quarry_core::{FilterQuery, OpenOptions};
 
 use crate::document::{Document, DocumentInfo, MAX_VIEWPORT_COLUMNS, MAX_VIEWPORT_ROWS, Viewport};
@@ -505,26 +507,25 @@ impl Grid {
         }
     }
 
-    fn display(&self, row: usize, column: usize) -> String {
-        let Some(viewport) = &self.viewport else {
-            return String::new();
-        };
-        let Some(row) = (row as u64)
+    fn display_loaded(&self, row: usize, column: usize) -> Option<String> {
+        let viewport = self.viewport.as_ref()?;
+        let row = (row as u64)
             .checked_sub(viewport.start)
-            .and_then(|index| viewport.rows.get(index as usize))
-        else {
-            return String::new();
-        };
+            .and_then(|index| viewport.rows.get(index as usize))?;
         if column == 0 {
             let header = u64::from(self.info.as_ref().is_some_and(|info| info.has_header));
-            return (row.source_row + 1 - header).to_string();
+            return Some((row.source_row + 1 - header).to_string());
         }
-        self.columns
-            .get(column - 1)
-            .and_then(|source| viewport.columns.iter().position(|column| column == source))
-            .and_then(|column| row.cells.get(column))
-            .cloned()
-            .unwrap_or_default()
+        let source = self.columns.get(column - 1)?;
+        let index = viewport
+            .columns
+            .iter()
+            .position(|column| column == source)?;
+        Some(row.cells.get(index).cloned().unwrap_or_default())
+    }
+
+    fn display(&self, row: usize, column: usize) -> String {
+        self.display_loaded(row, column).unwrap_or_default()
     }
 }
 
@@ -558,6 +559,24 @@ impl TableDelegate for Grid {
             .width(self.widths.get(&source).copied().unwrap_or(px(124.)))
             .min_width(px(60.))
             .max_width(px(900.))
+    }
+    fn cell_label(&self, row: usize, column: usize, _: &App) -> Option<SharedString> {
+        let value = self.display_loaded(row, column)?;
+        if column == 0 {
+            return (!value.is_empty()).then(|| format!("Row {value}").into());
+        }
+        let source = *self.columns.get(column - 1)?;
+        let header = self
+            .info
+            .as_ref()
+            .and_then(|info| info.headers.get(source))
+            .map(String::as_str)
+            .unwrap_or("Column");
+        if value.is_empty() {
+            Some(format!("{header}: empty").into())
+        } else {
+            Some(format!("{header}: {value}").into())
+        }
     }
     fn render_td(
         &mut self,

@@ -227,6 +227,15 @@ impl Quarry {
                         self.editor_status = None;
                         self.editing = false;
                         window.close_dialog(cx);
+                        let table_focus = self.info.is_some().then(|| self.table.focus_handle(cx));
+                        let root_focus = self.focus_handle.clone();
+                        window.defer(cx, move |window, cx| {
+                            if let Some(table_focus) = table_focus {
+                                table_focus.focus(window, cx);
+                            } else {
+                                root_focus.focus(window, cx);
+                            }
+                        });
                     }
                 }
                 Response::Error(error) => {
@@ -426,6 +435,11 @@ impl Quarry {
         let focus_input = input.clone();
         let apply = cx.weak_entity();
         let close = cx.weak_entity();
+        // Ensure the dialog records the data grid as its previous focus target so
+        // closing via Cancel, Escape, or Apply restores keyboard/screen-reader focus to the grid.
+        if self.info.is_some() {
+            self.table.focus_handle(cx).focus(window, cx);
+        }
         window.open_dialog(cx, move |dialog, _, cx| {
             let input_value = input.clone();
             let input_view = input.clone();
@@ -478,12 +492,12 @@ impl Quarry {
                             .h(px(116.)),
                     )
                     .when(too_large, |content| content.child(
-                        div().id("cell-edit-error").test_support()
+                        div().id("cell-edit-error").role(Role::Alert).test_support()
                             .text_color(cx.theme().danger)
                             .child("Cell values must be 1 MiB or smaller. Shorten the value to apply it.")
                     ))
                     .when_some(error.clone().filter(|_| !too_large), |content, error| content.child(
-                        div().id("cell-edit-error").test_support()
+                        div().id("cell-edit-error").role(Role::Alert).test_support()
                             .text_color(cx.theme().danger).child(error)
                     ))
                 })
@@ -509,10 +523,19 @@ impl Quarry {
                     false
                 })
                 .on_cancel(move |_, _, cx| !cancel_status.read(cx).pending)
-                .on_close(move |_, _, cx| {
+                .on_close(move |_, window, cx| {
                     let _ = close.update(cx, |this, cx| {
                         this.editing = false;
                         this.editor_status = None;
+                        let table_focus = this.info.is_some().then(|| this.table.focus_handle(cx));
+                        let root_focus = this.focus_handle.clone();
+                        window.defer(cx, move |window, cx| {
+                            if let Some(table_focus) = table_focus {
+                                table_focus.focus(window, cx);
+                            } else {
+                                root_focus.focus(window, cx);
+                            }
+                        });
                         cx.notify();
                     });
                 })
@@ -591,6 +614,9 @@ impl Render for Quarry {
             .on_action(cx.listener(Self::redo_action))
             .child(
                 div()
+                    .id("document-toolbar")
+                    .role(Role::Toolbar)
+                    .aria_label("Document toolbar")
                     .h(px(42.))
                     .flex_shrink_0()
                     .flex()
@@ -599,10 +625,10 @@ impl Render for Quarry {
                     .px_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .bg(rgb(0xeaf0f2))
+                    .bg(rgb(quarry_workbench::theme::LIGHT.chrome.to_rgb_hex()))
                     .child(
                         Button::new("open-file")
-                            .label(filename)
+                            .label(filename.clone())
                             .ghost()
                             .small()
                             .max_w(px(220.))
@@ -664,13 +690,48 @@ impl Render for Quarry {
                     ),
             );
         if loaded {
+            let table = self.table.clone();
+            let shift_horizontal_scroll = canvas(
+                move |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                move |_, hitbox, window, _| {
+                    let table = table.clone();
+                    let line_height = window.line_height();
+                    window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
+                        if !(phase.capture()
+                            && hitbox.should_handle_scroll(window)
+                            && event.modifiers.shift)
+                        {
+                            return;
+                        }
+                        let delta = event.delta.pixel_delta(line_height);
+                        if delta.x.is_zero() && !delta.y.is_zero() {
+                            table.update(cx, |table, cx| {
+                                let mut offset = table.horizontal_scroll_handle.offset();
+                                offset.x += delta.y;
+                                table.horizontal_scroll_handle.set_offset(offset);
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full();
             body = body.child(
-                div().flex_1().min_h_0().overflow_hidden().child(
-                    DataTable::new(&self.table)
-                        .stripe(true)
-                        .bordered(false)
-                        .small(),
-                ),
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(shift_horizontal_scroll)
+                    .child(
+                        DataTable::new(&self.table)
+                            .accessibility_label(format!("{filename} data grid"))
+                            .stripe(true)
+                            .bordered(false)
+                            .small(),
+                    ),
             );
         } else {
             body = body.child(
@@ -706,6 +767,9 @@ impl Render for Quarry {
         if let Some((message, is_error)) = &self.message {
             body = body.child(
                 div()
+                    .id("status-banner")
+                    .role(if *is_error { Role::Alert } else { Role::Status })
+                    .aria_label(message.clone())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -722,6 +786,7 @@ impl Render for Quarry {
                     .child(
                         Button::new("dismiss-message")
                             .label("×")
+                            .accessibility_label("Dismiss message")
                             .ghost()
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -785,6 +850,9 @@ impl Render for Quarry {
         };
         body.child(
             div()
+                .id("document-status")
+                .role(Role::Status)
+                .aria_label(format!("{status} · {progress}"))
                 .flex()
                 .items_center()
                 .h(px(30.))
