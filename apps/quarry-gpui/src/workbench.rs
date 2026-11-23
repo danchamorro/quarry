@@ -247,13 +247,15 @@ impl WorkbenchController {
                 }
             }
         };
-        let Some(plan) = plan else {
-            return;
-        };
+        // Always advance the generation — even on cache hits or bootstrap reads — so an
+        // in-flight async read from an earlier scroll position cannot overwrite current rows.
         let seq = {
             let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
             *entry = entry.wrapping_add(1);
             *entry
+        };
+        let Some(plan) = plan else {
+            return;
         };
         let session = Arc::clone(&plan.session);
         let index = plan.index;
@@ -455,6 +457,18 @@ impl WorkbenchController {
         if paths.len() == 1 {
             let path = paths.into_iter().next().unwrap();
             let existing_owner = self.scheduler.find_owner_for_path(&path);
+            if let Some((owner_win, doc_id)) = existing_owner
+                && self.editing_windows.contains(&owner_win)
+                && self.scheduler.active_document(owner_win) != Some(doc_id)
+            {
+                if let Some(handle) = self.window_handle(owner_win) {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                }
+                return Err(
+                    "Apply or cancel the open edit in the owning window before switching tabs."
+                        .into(),
+                );
+            }
             let outcome = self
                 .scheduler
                 .open_path(target_window, path, options, encoding)
