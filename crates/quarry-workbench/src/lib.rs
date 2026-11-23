@@ -7,6 +7,7 @@ pub mod dormancy;
 pub mod history;
 pub mod selection;
 pub mod tab;
+pub mod theme;
 pub mod whitespace;
 
 pub use command::{
@@ -39,6 +40,7 @@ pub use tab::{
     DelimiterMode, FilterRuleDraft, TabCloseState, WorkbenchTab, filter_predicate_from_rule,
     filter_query_from_rules,
 };
+pub use theme::{ACCENT, CONTROL_RADIUS, GRID_FONT_SIZE, LIGHT, Palette, Rgba, WINDOW_RADIUS};
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use document::{owned_edit_snapshot_bytes, reset_owned_edit_snapshot_bytes};
