@@ -1844,3 +1844,63 @@ fn failed_reopen_tab_preserves_existing_document_and_options() {
         Encoding::Utf8
     );
 }
+
+#[test]
+fn quit_approval_is_invalidated_when_approved_tab_is_edited_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let csv = write_csv(dir.path(), "reedit.csv", 5);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "first_edit".into();
+        doc.commit_cell_edit();
+    }
+    scheduler.begin_quit_review();
+    scheduler.approve_tab_for_quit(ids[0]).unwrap();
+
+    // Edit the tab AFTER quit approval: finalize_quit must reject it until re-approved.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "second_edit".into();
+        doc.commit_cell_edit();
+    }
+    let err = scheduler.finalize_quit().unwrap_err();
+    assert!(
+        matches!(err, SchedulerError::UnapprovedDirtyTabs(ref unapproved) if unapproved == &vec![ids[0]])
+    );
+    assert_eq!(
+        scheduler.total_tabs(),
+        1,
+        "tab must not be dropped on stale approval"
+    );
+
+    // Re-approving at the new edit revision allows quit to finalize cleanly.
+    scheduler.approve_tab_for_quit(ids[0]).unwrap();
+    scheduler.finalize_quit().unwrap();
+    assert_eq!(scheduler.total_tabs(), 0);
+}

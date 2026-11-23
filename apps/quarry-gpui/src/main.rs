@@ -385,6 +385,7 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        let target_doc_id = info.document_id;
         let directory = info
             .path
             .parent()
@@ -413,7 +414,13 @@ impl QuarryWindow {
                 match selection {
                     Ok(Ok(Some(path))) => {
                         let res = this.controller.update(cx, |controller, cx| {
-                            controller.start_save_active(this.window_id, Some(path), encoding, cx)
+                            controller.start_save_active(
+                                this.window_id,
+                                Some(target_doc_id),
+                                Some(path),
+                                encoding,
+                                cx,
+                            )
                         });
                         if let Err(error) = res {
                             this.set_message(error, cx);
@@ -434,7 +441,7 @@ impl QuarryWindow {
             return;
         }
         let res = self.controller.update(cx, |controller, cx| {
-            controller.start_save_active(self.window_id, None, None, cx)
+            controller.start_save_active(self.window_id, None, None, None, cx)
         });
         if let Err(error) = res {
             self.set_message(error, cx);
@@ -457,15 +464,26 @@ impl QuarryWindow {
             CloseReviewAction::ConfirmTab {
                 review_token,
                 window_id,
+                document_id,
                 filename,
-                ..
             } => {
                 if window_id != self.window_id
-                    && let Some(handle) = self.controller.read(cx).window_handle(window_id)
+                    && self.controller.read(cx).window_handle(window_id).is_some()
                 {
-                    let _ = handle.update(cx, |_, other_window, _| other_window.activate_window());
+                    self.controller.update(cx, |controller, cx| {
+                        controller.queue_review_action(
+                            CloseReviewAction::ConfirmTab {
+                                review_token,
+                                window_id,
+                                document_id,
+                                filename,
+                            },
+                            cx,
+                        );
+                    });
+                    return;
                 }
-                self.show_unsaved_close_dialog(review_token, window_id, filename, window, cx);
+                self.show_unsaved_close_dialog(review_token, document_id, filename, window, cx);
             }
         }
     }
@@ -473,7 +491,7 @@ impl QuarryWindow {
     fn show_unsaved_close_dialog(
         &mut self,
         review_token: u64,
-        target_window: WindowId,
+        document_id: DocumentId,
         filename: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -485,12 +503,13 @@ impl QuarryWindow {
         self.panels
             .update(cx, |panels, cx| panels.close(window, cx));
         let controller = self.controller.clone();
+        let status = cx.new(|_| CellEditStatus::default());
         let this_weak = cx.weak_entity();
         let keep_weak = cx.weak_entity();
         let discard_weak = cx.weak_entity();
         let save_weak = cx.weak_entity();
         let close_weak = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _cx| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let filename_msg = filename.clone();
             let controller_keep = controller.clone();
             let controller_discard = controller.clone();
@@ -500,6 +519,8 @@ impl QuarryWindow {
             let discard_weak = discard_weak.clone();
             let save_weak = save_weak.clone();
             let close_weak = close_weak.clone();
+            let save_status = status.clone();
+            let error = status.read(cx).error.clone();
             let _ = &this_weak;
             dialog
                 .title(format!("Save changes to {filename}?"))
@@ -508,13 +529,23 @@ impl QuarryWindow {
                 .close_button(true)
                 .keyboard(true)
                 .content(move |content, _, cx| {
-                    content.child(
-                        div()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{filename_msg} has unsaved edits. Save your changes, discard them, or keep editing."
-                            )),
-                    )
+                    content
+                        .child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{filename_msg} has unsaved edits. Save your changes, discard them, or keep editing."
+                                )),
+                        )
+                        .when_some(error.clone(), |content, error| {
+                            content.child(
+                                div()
+                                    .id("close-review-error")
+                                    .role(Role::Alert)
+                                    .text_color(cx.theme().danger)
+                                    .child(error),
+                            )
+                        })
                 })
                 .footer(
                     div()
@@ -557,16 +588,27 @@ impl QuarryWindow {
                                 .primary()
                                 .small()
                                 .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
                                     let res = controller_save.update(cx, |c, cx| {
-                                        c.save_in_review(review_token, target_window, cx)
+                                        c.save_in_review(review_token, document_id, cx)
                                     });
-                                    let _ = save_weak.update(cx, |this, cx| {
-                                        this.confirming = false;
-                                        if let Err(error) = res {
-                                            this.set_message(error, cx);
+                                    match res {
+                                        Ok(()) => {
+                                            window.close_dialog(cx);
+                                            let _ = save_weak.update(cx, |this, _| {
+                                                this.confirming = false;
+                                            });
                                         }
-                                    });
+                                        Err(error) => {
+                                            save_status.update(cx, |st, cx| {
+                                                st.error = Some(error.text.clone());
+                                                cx.notify();
+                                            });
+                                            let _ = save_weak.update(cx, |this, cx| {
+                                                this.set_message(error, cx);
+                                            });
+                                            window.refresh();
+                                        }
+                                    }
                                 }),
                         ),
                 )
@@ -653,8 +695,11 @@ impl QuarryWindow {
         else {
             return;
         };
-        let (title, initial_value, disabled_reason) = {
+        let (doc_id, title, initial_value, disabled_reason) = {
             let controller = self.controller.read(cx);
+            let Some(doc_id) = controller.scheduler().active_document(self.window_id) else {
+                return;
+            };
             let Some(doc) = controller.active_document(self.window_id) else {
                 return;
             };
@@ -662,17 +707,27 @@ impl QuarryWindow {
             let disabled = doc.cell_edit_disabled_reason(source);
             let value_bytes = doc.effective_cell(source_row, source_col).unwrap_or(&[]);
             let value = String::from_utf8_lossy(value_bytes).into_owned();
-            (doc.column_name(source_col), value, disabled)
+            (doc_id, doc.column_name(source_col), value, disabled)
         };
         if let Some(reason) = disabled_reason {
             self.set_message(AppMessage::warning(reason), cx);
             return;
         }
-        self.show_editor(source_row, source_col, title, initial_value, window, cx);
+        self.show_editor(
+            doc_id,
+            source_row,
+            source_col,
+            title,
+            initial_value,
+            window,
+            cx,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn show_editor(
         &mut self,
+        doc_id: DocumentId,
         row: u64,
         column: usize,
         title: String,
@@ -773,7 +828,7 @@ impl QuarryWindow {
                     }
                     let outcome = apply.update(cx, |this, cx| {
                         this.controller.update(cx, |controller, cx| {
-                            controller.apply_cell_edit(this.window_id, row, column, value, cx)
+                            controller.apply_cell_edit(this.window_id, doc_id, row, column, value, cx)
                         })
                     });
                     match outcome {
@@ -828,12 +883,16 @@ impl QuarryWindow {
         let Some(source_col) = selected_col else {
             return;
         };
-        let (editable, current_name) = {
+        let (doc_id, editable, current_name) = {
             let controller = self.controller.read(cx);
+            let Some(doc_id) = controller.scheduler().active_document(self.window_id) else {
+                return;
+            };
             let Some(doc) = controller.active_document(self.window_id) else {
                 return;
             };
             (
+                doc_id,
                 doc.header_is_editable(source_col),
                 doc.column_name(source_col),
             )
@@ -911,7 +970,13 @@ impl QuarryWindow {
                     let name = input_value.read(cx).value().to_string();
                     let outcome = apply.update(cx, |this, cx| {
                         this.controller.update(cx, |controller, cx| {
-                            controller.rename_header_active(this.window_id, source_col, name, cx)
+                            controller.rename_header_active(
+                                this.window_id,
+                                doc_id,
+                                source_col,
+                                name,
+                                cx,
+                            )
                         })
                     });
                     match outcome {

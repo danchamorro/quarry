@@ -233,7 +233,8 @@ fn cell_editor_is_visible_applies_through_real_ui_and_undo_restores_source(
         controller
             .update(cx, |c, cx| {
                 let win = view.read(cx).window_id;
-                c.start_save_active(win, Some(copy_path.clone()), None, cx)
+                let doc_id = c.scheduler().active_document(win);
+                c.start_save_active(win, doc_id, Some(copy_path.clone()), None, cx)
             })
             .unwrap();
     });
@@ -541,10 +542,27 @@ fn multi_window_move_tab_alias_routing_and_cross_window_quit_review(cx: &mut Tes
     // both dirty documents must stay open and intact.
     cx.update(|cx| {
         controller
-            .update(cx, |c, cx| c.apply_cell_edit(w1, 1, 0, "A-mod".into(), cx))
+            .update(cx, |c, cx| {
+                let doc1 = c.scheduler().active_document(w1).unwrap();
+                let doc2 = c.scheduler().active_document(w2).unwrap();
+                // Mismatched doc IDs must be rejected without modifying the active document.
+                assert!(
+                    c.apply_cell_edit(w1, doc2, 1, 0, "wrong".into(), cx)
+                        .is_err()
+                );
+                assert!(
+                    c.rename_header_active(w1, doc2, 0, "wrong".into(), cx)
+                        .is_err()
+                );
+                assert!(c.start_save_active(w1, Some(doc2), None, None, cx).is_err());
+                c.apply_cell_edit(w1, doc1, 1, 0, "A-mod".into(), cx)
+            })
             .unwrap();
         controller
-            .update(cx, |c, cx| c.apply_cell_edit(w2, 1, 0, "B-mod".into(), cx))
+            .update(cx, |c, cx| {
+                let doc2 = c.scheduler().active_document(w2).unwrap();
+                c.apply_cell_edit(w2, doc2, 1, 0, "B-mod".into(), cx)
+            })
             .unwrap();
     });
     let review = cx.update(|cx| controller.update(cx, |c, cx| c.request_quit(cx)));
@@ -646,7 +664,8 @@ fn bulk_lazy_open_and_header_rename_copy_whitespace_work(cx: &mut TestAppContext
     cx.update(|cx| {
         controller
             .update(cx, |c, cx| {
-                c.rename_header_active(win_id, 0, "town".into(), cx)
+                let doc_id = c.scheduler().active_document(win_id).unwrap();
+                c.rename_header_active(win_id, doc_id, 0, "town".into(), cx)
             })
             .unwrap();
     });
@@ -718,14 +737,15 @@ fn in_place_save_reloads_and_multi_tab_close_review_advances_after_save(cx: &mut
     );
 
     // Dirty both tabs in the same window.
+    let tab_a = cx.update(|cx| controller.read(cx).scheduler().tabs_in_window(win_id)[0]);
+    let tab_b = cx.update(|cx| controller.read(cx).scheduler().tabs_in_window(win_id)[1]);
     cx.update(|cx| {
         controller
             .update(cx, |c, cx| {
-                c.apply_cell_edit(win_id, 1, 0, "A-saved".into(), cx)
+                c.apply_cell_edit(win_id, tab_a, 1, 0, "A-saved".into(), cx)
             })
             .unwrap();
     });
-    let tab_b = cx.update(|cx| controller.read(cx).scheduler().tabs_in_window(win_id)[1]);
     cx.update(|cx| {
         controller
             .update(cx, |c, cx| c.activate_tab(win_id, tab_b, cx))
@@ -738,10 +758,42 @@ fn in_place_save_reloads_and_multi_tab_close_review_advances_after_save(cx: &mut
     cx.update(|cx| {
         controller
             .update(cx, |c, cx| {
-                c.apply_cell_edit(win_id, 1, 0, "B-dirty".into(), cx)
+                c.apply_cell_edit(win_id, tab_b, 1, 0, "B-dirty".into(), cx)
             })
             .unwrap();
     });
+
+    // Verify cancelling a window review after approving Discard on tab 1 revokes tab 1's approval.
+    let first_review =
+        cx.update(|cx| controller.update(cx, |c, cx| c.request_close_window(win_id, cx)));
+    let first_token = match first_review {
+        CloseReviewAction::ConfirmTab { review_token, .. } => review_token,
+        other => panic!("expected ConfirmTab, got {other:?}"),
+    };
+    let second_review =
+        cx.update(|cx| controller.update(cx, |c, cx| c.approve_discard_in_review(first_token, cx)));
+    let second_token = match second_review {
+        CloseReviewAction::ConfirmTab { review_token, .. } => review_token,
+        other => panic!("expected ConfirmTab for second tab, got {other:?}"),
+    };
+    assert!(cx.update(|cx| {
+        controller
+            .read(cx)
+            .scheduler()
+            .tab(tab_a)
+            .unwrap()
+            .close_ready
+    }));
+    cx.update(|cx| controller.update(cx, |c, cx| c.cancel_close_review(Some(second_token), cx)));
+    assert!(
+        !cx.update(|cx| controller
+            .read(cx)
+            .scheduler()
+            .tab(tab_a)
+            .unwrap()
+            .close_ready),
+        "cancelling window review must revoke earlier discard approvals"
+    );
 
     // Request closing the window: first dirty tab prompts Save / Discard / Keep Editing.
     cx.update_window(handle.into(), |_, window, cx| {

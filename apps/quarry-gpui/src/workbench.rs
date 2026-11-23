@@ -82,6 +82,7 @@ pub enum PendingReviewScope {
     Window {
         window_id: WindowId,
         remaining_dirty: Vec<DocumentId>,
+        approved_dirty: Vec<DocumentId>,
     },
     Quit {
         remaining_dirty: Vec<(WindowId, DocumentId)>,
@@ -93,6 +94,16 @@ impl PendingReviewScope {
         match self {
             Self::SingleTab { window_id, .. } | Self::Window { window_id, .. } => Some(*window_id),
             Self::Quit { remaining_dirty } => remaining_dirty.first().map(|(win, _)| *win),
+        }
+    }
+
+    fn current_document(&self) -> Option<DocumentId> {
+        match self {
+            Self::SingleTab { document_id, .. } => Some(*document_id),
+            Self::Window {
+                remaining_dirty, ..
+            } => remaining_dirty.first().copied(),
+            Self::Quit { remaining_dirty } => remaining_dirty.first().map(|(_, doc)| *doc),
         }
     }
 }
@@ -472,12 +483,26 @@ impl WorkbenchController {
             .scheduler
             .open_many_lazy(target_window, paths, options, encoding)
             .map_err(|e| e.to_string())?;
-        let active_id = self
+        let local_active = self
             .scheduler
             .active_document(target_window)
-            .or_else(|| ids.first().copied())
-            .ok_or_else(|| "No files were opened.".to_string())?;
-        let owner_window = self.scheduler.window_of(active_id).unwrap_or(target_window);
+            .filter(|id| ids.contains(id) && self.scheduler.window_of(*id) == Some(target_window));
+        let (owner_window, active_id) = if let Some(local_id) = local_active {
+            (target_window, local_id)
+        } else {
+            let first_id = ids
+                .first()
+                .copied()
+                .ok_or_else(|| "No files were opened.".to_string())?;
+            let owner = self.scheduler.window_of(first_id).unwrap_or(target_window);
+            let _ = self.scheduler.activate_tab(owner, first_id);
+            if owner != target_window
+                && let Some(handle) = self.window_handle(owner)
+            {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            }
+            (owner, first_id)
+        };
         self.window_messages.remove(&target_window);
         cx.notify();
         Ok((owner_window, active_id))
@@ -685,6 +710,7 @@ impl WorkbenchController {
     pub fn apply_cell_edit(
         &mut self,
         window: WindowId,
+        expected_doc_id: DocumentId,
         source_row: u64,
         source_col: usize,
         value: String,
@@ -693,6 +719,12 @@ impl WorkbenchController {
         if value.len() > MAX_EDIT_BYTES {
             return Err(
                 "Cell values must be 1 MiB or smaller. Shorten the value to apply it.".into(),
+            );
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(
+                "The active document changed before this edit was applied. Switch back to the original tab or cancel."
+                    .into(),
             );
         }
         let Some(doc) = self.active_document_mut(window) else {
@@ -707,9 +739,7 @@ impl WorkbenchController {
             edit.draft = value;
         }
         doc.commit_cell_edit();
-        if let Some(id) = self.scheduler.active_document(window)
-            && let Some(tab) = self.scheduler.tab_mut(id)
-        {
+        if let Some(tab) = self.scheduler.tab_mut(expected_doc_id) {
             tab.notice = None;
         }
         let _ = self.scheduler.sync_fd_leases();
@@ -720,10 +750,17 @@ impl WorkbenchController {
     pub fn rename_header_active(
         &mut self,
         window: WindowId,
+        expected_doc_id: DocumentId,
         source_col: usize,
         name: String,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(
+                "The active document changed before this header rename was applied. Switch back to the original tab or cancel."
+                    .into(),
+            );
+        }
         let Some(doc) = self.active_document_mut(window) else {
             return Err("Open a file first.".into());
         };
@@ -743,6 +780,27 @@ impl WorkbenchController {
     pub fn start_save_active(
         &mut self,
         window: WindowId,
+        expected_doc: Option<DocumentId>,
+        destination: Option<PathBuf>,
+        encoding: Option<Encoding>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        let Some(active_id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        if let Some(expected) = expected_doc
+            && active_id != expected
+        {
+            return Err(AppMessage::warning(
+                "The active document changed before saving started. Try Save As again.",
+            ));
+        }
+        self.start_save_document(active_id, destination, encoding, cx)
+    }
+
+    pub fn start_save_document(
+        &mut self,
+        id: DocumentId,
         destination: Option<PathBuf>,
         encoding: Option<Encoding>,
         cx: &mut Context<Self>,
@@ -753,20 +811,15 @@ impl WorkbenchController {
             ));
         }
         if let Some(dest) = destination.as_ref() {
-            let active_path = self
-                .active_document(window)
-                .map(|doc| doc.logical_path.clone());
-            let aliases_other = self.scheduler.path_reserved(dest)
-                && active_path.as_ref().is_none_or(|p| p != dest);
+            let doc_path = self.scheduler.tab_logical_path(id);
+            let aliases_other =
+                self.scheduler.path_reserved(dest) && doc_path.as_ref().is_none_or(|p| p != dest);
             if aliases_other {
                 return Err(AppMessage::warning(
                     "That destination is already open or reserved in another tab.",
                 ));
             }
         }
-        let Some(id) = self.scheduler.active_document(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
         let tab = self
             .scheduler
             .tab_mut(id)
@@ -918,6 +971,7 @@ impl WorkbenchController {
             self.pending_review = Some(PendingReviewScope::Window {
                 window_id: window,
                 remaining_dirty: dirty,
+                approved_dirty: Vec::new(),
             });
             cx.notify();
             return CloseReviewAction::ConfirmTab {
@@ -1012,9 +1066,11 @@ impl WorkbenchController {
                     }
                 }
                 PendingReviewScope::Window {
-                    remaining_dirty, ..
+                    remaining_dirty,
+                    approved_dirty,
+                    ..
                 } => {
-                    for id in remaining_dirty {
+                    for id in remaining_dirty.into_iter().chain(approved_dirty) {
                         if let Some(tab) = self.scheduler.tab_mut(id) {
                             tab.cancel_close();
                         }
@@ -1063,15 +1119,23 @@ impl WorkbenchController {
             PendingReviewScope::Window {
                 window_id,
                 mut remaining_dirty,
+                mut approved_dirty,
             } => {
                 if !remaining_dirty.is_empty() {
                     let approved = remaining_dirty.remove(0);
                     if let Some(tab) = self.scheduler.tab_mut(approved) {
                         tab.approve_discard_and_close();
                     }
+                    approved_dirty.push(approved);
                 }
                 if let Some(&next_id) = remaining_dirty.first() {
                     if let Err(error) = self.scheduler.activate_tab(window_id, next_id) {
+                        for id in remaining_dirty.into_iter().chain(approved_dirty) {
+                            if let Some(tab) = self.scheduler.tab_mut(id) {
+                                tab.cancel_close();
+                            }
+                        }
+                        cx.notify();
                         return CloseReviewAction::Wait {
                             message: error.to_string(),
                         };
@@ -1087,6 +1151,7 @@ impl WorkbenchController {
                     self.pending_review = Some(PendingReviewScope::Window {
                         window_id,
                         remaining_dirty,
+                        approved_dirty,
                     });
                     cx.notify();
                     CloseReviewAction::ConfirmTab {
@@ -1158,32 +1223,53 @@ impl WorkbenchController {
         }
     }
 
-    /// Starts saving the currently reviewed dirty tab and marks it to finish closing once saved.
+    /// Starts saving the specific reviewed dirty tab `document_id` and marks it to finish closing
+    /// once saved. On startup failure (e.g., write slots busy), restores `close_confirmation_open`
+    /// and preserves `pending_review` so the confirmation remains retryable.
     pub fn save_in_review(
         &mut self,
         expected_token: u64,
-        window: WindowId,
+        document_id: DocumentId,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
         if self.active_review_token != Some(expected_token) {
             return Ok(());
         }
-        let Some(id) = self.scheduler.active_document(window) else {
-            self.cancel_close_review(Some(expected_token), cx);
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        if let Some(tab) = self.scheduler.tab_mut(id) {
+        if self
+            .pending_review
+            .as_ref()
+            .and_then(PendingReviewScope::current_document)
+            != Some(document_id)
+        {
+            return Err(AppMessage::warning(
+                "The reviewed document is no longer active in this confirmation.",
+            ));
+        }
+        if let Some(tab) = self.scheduler.tab_mut(document_id) {
             tab.close_confirmation_open = false;
             tab.close_after_save = true;
         }
-        if let Err(error) = self.start_save_active(window, None, None, cx) {
-            if let Some(tab) = self.scheduler.tab_mut(id) {
+        if let Err(error) = self.start_save_document(document_id, None, None, cx) {
+            if let Some(tab) = self.scheduler.tab_mut(document_id) {
                 tab.close_after_save = false;
+                tab.close_confirmation_open = true;
             }
-            self.cancel_close_review(Some(expected_token), cx);
+            cx.notify();
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Routes a `ConfirmTab` (or `Wait`) review action to its owning window, activating that
+    /// window so its own `sync_from_controller` presents the confirmation dialog in the foreground.
+    pub fn queue_review_action(&mut self, action: CloseReviewAction, cx: &mut Context<Self>) {
+        if let CloseReviewAction::ConfirmTab { window_id, .. } = &action
+            && let Some(handle) = self.window_handle(*window_id)
+        {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        }
+        self.pending_review_action = Some(action);
+        cx.notify();
     }
 
     pub fn take_pending_review_action(&mut self, window: WindowId) -> Option<CloseReviewAction> {
@@ -1234,6 +1320,10 @@ impl WorkbenchController {
         }
         let save_results = self.scheduler.poll_saves();
         let mut advance_review = false;
+        let reviewed_doc = self
+            .pending_review
+            .as_ref()
+            .and_then(PendingReviewScope::current_document);
         for completion in save_results {
             changed = true;
             match completion.result {
@@ -1247,7 +1337,9 @@ impl WorkbenchController {
                         tab.notice = Some(AppMessage::new(text, MessageSeverity::Status));
                         if tab.close_after_save {
                             tab.close_after_save = false;
-                            advance_review = true;
+                            if reviewed_doc == Some(completion.document_id) {
+                                advance_review = true;
+                            }
                         }
                     }
                 }
@@ -1256,7 +1348,9 @@ impl WorkbenchController {
                         tab.close_after_save = false;
                         tab.notice = Some(error);
                     }
-                    self.cancel_close_review(None, cx);
+                    if reviewed_doc == Some(completion.document_id) {
+                        self.cancel_close_review(None, cx);
+                    }
                 }
             }
         }
