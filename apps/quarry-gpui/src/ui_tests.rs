@@ -2907,4 +2907,42 @@ fn external_open_urls_routes_hardlink_alias_to_owning_window(cx: &mut gpui_kit::
             "closing the Sort dialog must restore Window 2 as eligible for external opens"
         );
     });
+
+    // If Window 1 owns inactive tab `doc_orig` while editing a second tab, an external open
+    // of `alias_path` from preferred Window 2 reports the warning on Window 1 without stealing
+    // the warning/activation back onto Window 2.
+    let w1_second = dir.path().join("w1_second.csv");
+    std::fs::write(&w1_second, "id,name\n5,Second\n").unwrap();
+    cx.update_window(w1_handle.into(), |_, window, cx| {
+        w1_view.update(cx, |q, cx| {
+            q.open_paths_direct(vec![w1_second], OpenOptions::default(), None, window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, w1_handle, &controller, &w1_view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.document_id != doc_orig && i.index_done)
+    });
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.set_window_message(w2_id, None, cx);
+            c.set_window_editing(w1_id, true, cx);
+        });
+        let conflict = controller.update(cx, |c, cx| {
+            c.open_external_paths(Some(w2_id), vec![alias_path.clone()], cx)
+        });
+        assert!(conflict.expect("outcome").is_err());
+        assert!(
+            controller
+                .read(cx)
+                .window_message(w1_id)
+                .is_some_and(|m| m.text.contains("owning window")),
+            "owner-editing rejection warning must be surfaced on editing owner Window 1"
+        );
+        assert!(
+            controller.read(cx).window_message(w2_id).is_none(),
+            "non-owning preferred Window 2 must not receive the owner-editing warning"
+        );
+        controller.update(cx, |c, cx| c.set_window_editing(w1_id, false, cx));
+    });
 }

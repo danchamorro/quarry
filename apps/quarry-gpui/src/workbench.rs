@@ -725,6 +725,17 @@ impl WorkbenchController {
             return None;
         }
         let target_window = preferred_window.or_else(|| self.windows.keys().next().copied())?;
+        let conflict_owner = if paths.len() == 1 {
+            self.scheduler
+                .find_owner_for_path(&paths[0])
+                .and_then(|(owner_win, doc_id)| {
+                    (self.editing_windows.contains(&owner_win)
+                        && self.scheduler.active_document(owner_win) != Some(doc_id))
+                    .then_some(owner_win)
+                })
+        } else {
+            None
+        };
         let result = self.open_paths(target_window, paths, OpenOptions::default(), None, cx);
         match &result {
             Ok((owner_window, _)) => {
@@ -733,8 +744,11 @@ impl WorkbenchController {
                 }
             }
             Err(message) => {
-                self.set_window_message(target_window, Some(message.clone()), cx);
-                if let Some(handle) = self.window_handle(target_window) {
+                let notice_window = conflict_owner.unwrap_or(target_window);
+                self.set_window_message(notice_window, Some(message.clone()), cx);
+                if conflict_owner.is_none()
+                    && let Some(handle) = self.window_handle(target_window)
+                {
                     let _ = handle.update(cx, |_, window, _| window.activate_window());
                 }
             }
