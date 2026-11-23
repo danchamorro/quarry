@@ -38,13 +38,14 @@ use quarry_core::{
 #[cfg(test)]
 use quarry_core::{CleanupOutcome, FilterProgress, IndexConfig, SearchMatch};
 use quarry_workbench::{
-    AppMessage, ColumnView, Document, GridSelection, MAX_GRID_TEXT_CHARS, MaterializedWorkingCopy,
-    MessageSeverity, POLL_INTERVAL, RowSelection, SOURCE_CHANGED_NOTICE, SelectionModifiers,
-    StructuralDialog, StructuralJob, StructuralOverlay, StructuralRequest, WorkingCopySnapshot,
-    case_sensitivity, field_preview, field_text, footer_range_text, format_bytes, grid_field_text,
-    group_digits, open_failure_line, parse_data_row, parse_file_column, parse_move_position,
-    progress_fraction, row_for_scroll_fraction, scroll_fraction_for_row, selected_split_column,
-    sort_direction_label,
+    AppMessage, ColumnView, DelimiterMode, Document, FilterRuleDraft, GridSelection,
+    MAX_GRID_TEXT_CHARS, MaterializedWorkingCopy, MessageSeverity, POLL_INTERVAL, RowSelection,
+    SOURCE_CHANGED_NOTICE, SelectionModifiers, StructuralDialog, StructuralJob, StructuralOverlay,
+    StructuralRequest, WorkbenchTab, WorkingCopySnapshot, case_sensitivity, field_preview,
+    field_text, filter_predicate_from_rule, filter_query_from_rules, footer_range_text,
+    format_bytes, grid_field_text, group_digits, open_failure_line, parse_data_row,
+    parse_file_column, parse_move_position, progress_fraction, row_for_scroll_fraction,
+    scroll_fraction_for_row, selected_split_column, sort_direction_label,
 };
 #[cfg(test)]
 use quarry_workbench::{
@@ -63,7 +64,7 @@ mod tabs;
 mod theme;
 mod whitespace;
 use storage::{PendingStorageOperation, StorageReview};
-use tabs::DocumentTab;
+use tabs::{DocumentTab, EguiGridState};
 
 const ROW_HEIGHT: f32 = 22.0;
 const COLUMN_RULER_HEIGHT: f32 = 18.0;
@@ -376,31 +377,10 @@ struct QuarryApp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FilterRuleDraft {
-    column_input: String,
-    column_search: String,
-    operator: FilterOperator,
-    value_input: String,
-    upper_bound_input: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum GridColumnRequest {
     Dialog(StructuralDialog),
     Delete(Vec<usize>),
     DeleteRows(Vec<RangeInclusive<u64>>),
-}
-
-impl Default for FilterRuleDraft {
-    fn default() -> Self {
-        Self {
-            column_input: "1".into(),
-            column_search: String::new(),
-            operator: FilterOperator::Contains,
-            value_input: String::new(),
-            upper_bound_input: String::new(),
-        }
-    }
 }
 
 impl QuarryApp {
@@ -667,6 +647,7 @@ impl QuarryApp {
         self.active.format_draft = None;
         self.active.encoding_mode = encoding;
         self.active.document = Some(document);
+        self.active.view.grid.reset();
         self.active.footer_status = None;
         Ok(())
     }
@@ -1172,6 +1153,7 @@ impl QuarryApp {
                         return;
                     }
                     document.discard_edits();
+                    self.active.view.grid.clear_focus();
                 }
                 self.active.notice = None;
                 return;
@@ -1205,11 +1187,13 @@ impl QuarryApp {
             }
             _ => {}
         }
-        let Some(document) = self.active.document.as_mut() else {
+        let active = &mut self.active.state;
+        let grid_view = &mut self.active.view.grid;
+        let Some(document) = active.document.as_mut() else {
             return;
         };
         if document.source_changed {
-            self.active.notice = Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            active.notice = Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
             return;
         }
         let result = match action {
@@ -1240,43 +1224,43 @@ impl QuarryApp {
             Action::PageUp => document.page(-1).map_err(AppMessage::error),
             Action::PageDown => document.page(1).map_err(AppMessage::error),
             Action::AutoFitColumns => {
-                document.auto_fit_columns = true;
+                grid_view.auto_fit_columns = true;
                 Ok(())
             }
-            Action::Jump => parse_data_row(&self.active.jump_input, document.data_start)
+            Action::Jump => parse_data_row(&active.jump_input, document.data_start)
                 .map_err(AppMessage::warning)
                 .and_then(|start| document.navigate(start).map_err(AppMessage::error)),
             Action::FindPrevious => document
                 .start_find_previous_with_case(
-                    self.active.find_input.as_bytes(),
-                    case_sensitivity(self.active.find_match_case),
+                    active.find_input.as_bytes(),
+                    case_sensitivity(active.find_match_case),
                 )
                 .map_err(AppMessage::warning),
             Action::FindNext => document
                 .start_find_next_with_case(
-                    self.active.find_input.as_bytes(),
-                    case_sensitivity(self.active.find_match_case),
+                    active.find_input.as_bytes(),
+                    case_sensitivity(active.find_match_case),
                 )
                 .map_err(AppMessage::warning),
             Action::ReplaceCurrent => document
                 .replace_current_match_with_case(
-                    self.active.find_input.as_bytes(),
-                    self.active.replace_input.as_bytes(),
-                    case_sensitivity(self.active.find_match_case),
+                    active.find_input.as_bytes(),
+                    active.replace_input.as_bytes(),
+                    case_sensitivity(active.find_match_case),
                 )
                 .map_err(AppMessage::warning),
             Action::ReplaceAll => document.start_replace_all_with_case(
-                self.active.find_input.as_bytes(),
-                self.active.replace_input.as_bytes(),
-                case_sensitivity(self.active.find_match_case),
+                active.find_input.as_bytes(),
+                active.replace_input.as_bytes(),
+                case_sensitivity(active.find_match_case),
             ),
             Action::CancelSearch => {
                 document.cancel_search();
                 Ok(())
             }
             Action::ApplyFilter => filter_query_from_rules(
-                &self.active.filter_rules,
-                self.active.filter_match_case,
+                &active.filter_rules,
+                active.filter_match_case,
                 document.total_columns,
             )
             .map_err(AppMessage::warning)
@@ -1393,8 +1377,10 @@ impl QuarryApp {
             self.active.structural_dialog = None;
             return;
         }
+        let sort_match_case = self.active.state.sort_match_case;
         let result = self
             .active
+            .state
             .document
             .as_mut()
             .ok_or_else(|| AppMessage::warning("Open a file before editing columns."))
@@ -1420,7 +1406,7 @@ impl QuarryApp {
                 .map_err(AppMessage::warning)
                 .and_then(|position| document.start_move_columns(dialog.columns, position)),
                 StructuralRequest::Sort => {
-                    document.start_sort_plan(dialog.sort_plan(self.active.sort_match_case))
+                    document.start_sort_plan(dialog.sort_plan(sort_match_case))
                 }
                 StructuralRequest::Duplicates => document.start_find_duplicates_target(
                     dialog.duplicate_target(),
@@ -1551,7 +1537,6 @@ impl QuarryApp {
         replacement.selected_columns = ready.selected_columns;
         let first_selected = replacement.selected_columns.iter().next().copied();
         replacement.column_selection_anchor = first_selected;
-        replacement.column_focus_requested = first_selected;
         if let Some(first_selected) = first_selected
             && replacement.columns.view(first_selected)
         {
@@ -1559,6 +1544,8 @@ impl QuarryApp {
         }
         current.shutdown();
         self.active.document = Some(replacement);
+        self.active.view.grid.reset();
+        self.active.view.grid.column_focus_requested = first_selected;
         self.active.format_draft = None;
         self.active.columns_open = false;
         self.active.structural_dialog = None;
@@ -1785,6 +1772,7 @@ impl QuarryApp {
         replacement.working_cleanup = self.working_cleanup.clone();
         current.shutdown();
         self.active.document = Some(replacement);
+        self.active.view.grid.reset();
         self.active.structural_dialog = None;
         self.active.columns_open = false;
         self.active.notice = None;
@@ -1821,33 +1809,32 @@ impl QuarryApp {
             self.active.footer_status = None;
             self.active.notice = Some(AppMessage::error(error));
         }
-        if let Some(document) = &mut self.active.document {
+        let active = &mut self.active.state;
+        if let Some(document) = &mut active.document {
             let was_active = document.search_job.is_some();
             match document.poll_search() {
                 Ok(()) if was_active && document.search_job.is_none() => {
-                    self.active.notice = None;
-                    self.active.footer_status =
-                        document.search_status.clone().map(AppMessage::status);
+                    active.notice = None;
+                    active.footer_status = document.search_status.clone().map(AppMessage::status);
                 }
                 Ok(()) => {}
                 Err(error) => {
-                    self.active.footer_status = None;
-                    self.active.notice = Some(AppMessage::error(error));
+                    active.footer_status = None;
+                    active.notice = Some(AppMessage::error(error));
                 }
             }
         }
-        if let Some(document) = &mut self.active.document {
+        if let Some(document) = &mut active.document {
             let was_active = document.filter_job.is_some();
             match document.poll_filter() {
                 Ok(()) if was_active && document.filter_job.is_none() => {
-                    self.active.notice = None;
-                    self.active.footer_status =
-                        document.filter_status.clone().map(AppMessage::status);
+                    active.notice = None;
+                    active.footer_status = document.filter_status.clone().map(AppMessage::status);
                 }
                 Ok(()) => {}
                 Err(error) => {
-                    self.active.footer_status = None;
-                    self.active.notice = Some(AppMessage::error(error));
+                    active.footer_status = None;
+                    active.notice = Some(AppMessage::error(error));
                 }
             }
         }
@@ -2174,7 +2161,7 @@ impl eframe::App for QuarryApp {
                     ui.set_opacity(1.0);
                 }
                 theme::chrome_controls(ui.style_mut());
-                let document = self.active.document.as_ref();
+                let document = self.active.state.document.as_ref();
                 let document_open = document.is_some();
                 let filter_active = document.is_some_and(Document::filter_active);
                 let compact = ui.available_width() < 1_000.0;
@@ -2195,8 +2182,12 @@ impl eframe::App for QuarryApp {
                     if let Some(format_action) = format_menu(
                         ui,
                         document,
-                        (self.active.delimiter_mode, self.active.header_mode, self.active.encoding_mode),
-                        &mut self.active.format_draft,
+                        (
+                            self.active.state.delimiter_mode,
+                            self.active.state.header_mode,
+                            self.active.state.encoding_mode,
+                        ),
+                        &mut self.active.state.format_draft,
                         compact,
                         if compact {
                             COMPACT_FORMAT_MENU_WIDTH
@@ -2297,7 +2288,7 @@ impl eframe::App for QuarryApp {
                         });
                     }
                     if find.clicked() {
-                        self.active.find_bar_open = true;
+                        self.active.state.find_bar_open = true;
                         focus_find = true;
                     }
 
@@ -2323,7 +2314,7 @@ impl eframe::App for QuarryApp {
                     let jump = ui
                         .add_enabled(
                             jump_enabled,
-                            egui::TextEdit::singleline(&mut self.active.jump_input)
+                            egui::TextEdit::singleline(&mut self.active.state.jump_input)
                                 .id(egui::Id::new(JUMP_INPUT_ID))
                                 .horizontal_align(Align::RIGHT)
                                 .vertical_align(Align::Center)
@@ -2411,21 +2402,21 @@ impl eframe::App for QuarryApp {
                             memory.request_focus(egui::Id::new(FIND_INPUT_ID));
                         });
                     }
-                    if let Some(document) = self.active.document.as_ref() {
+                    if let Some(document) = self.active.state.document.as_ref() {
                         let can_find_previous = document.can_find_previous_with_case(
-                            self.active.find_input.as_bytes(),
-                            case_sensitivity(self.active.find_match_case),
+                            self.active.state.find_input.as_bytes(),
+                            case_sensitivity(self.active.state.find_match_case),
                         );
                         let can_replace = document.can_replace_current_with_case(
-                            self.active.find_input.as_bytes(),
-                            case_sensitivity(self.active.find_match_case),
+                            self.active.state.find_input.as_bytes(),
+                            case_sensitivity(self.active.state.find_match_case),
                         );
                         let (search_action, close_requested) = search_controls(
                             ui,
-                            &mut self.active.find_input,
-                            &mut self.active.replace_input,
-                            &mut self.active.find_match_case,
-                            &mut self.active.replace_expanded,
+                            &mut self.active.state.find_input,
+                            &mut self.active.state.replace_input,
+                            &mut self.active.state.find_match_case,
+                            &mut self.active.state.replace_expanded,
                             document.is_search_ready(),
                             can_find_previous,
                             can_replace,
@@ -2539,14 +2530,15 @@ impl eframe::App for QuarryApp {
         }
         let column_command = self
             .active
+            .state
             .document
             .as_ref()
             .filter(|_| !interaction_blocked)
             .and_then(|document| {
                 show_column_manager(
                     ctx,
-                    &mut self.active.columns_open,
-                    &mut self.active.column_search_input,
+                    &mut self.active.state.columns_open,
+                    &mut self.active.state.column_search_input,
                     document,
                 )
             });
@@ -2556,15 +2548,16 @@ impl eframe::App for QuarryApp {
 
         let filter_action = self
             .active
+            .state
             .document
             .as_ref()
             .filter(|_| !interaction_blocked)
             .and_then(|document| {
                 show_filter_manager(
                     ctx,
-                    &mut self.active.filters_open,
-                    &mut self.active.filter_rules,
-                    &mut self.active.filter_match_case,
+                    &mut self.active.state.filters_open,
+                    &mut self.active.state.filter_rules,
+                    &mut self.active.state.filter_match_case,
                     document,
                 )
             });
@@ -2582,14 +2575,15 @@ impl eframe::App for QuarryApp {
                     ui.disable();
                     ui.set_opacity(1.0);
                 }
-                if let Some(document) = self.active.document.as_mut() {
+                if let Some(document) = self.active.state.document.as_mut() {
                     document.whitespace_all = self.whitespace_preferences.show_all;
                     let grid_result = ui
-                        .push_id(self.active.id, |ui| {
+                        .push_id(self.active.state.id, |ui| {
                             show_grid_with_filter_case(
                                 ui,
                                 document,
-                                case_sensitivity(self.active.filter_match_case),
+                                &mut self.active.view.grid,
+                                case_sensitivity(self.active.state.filter_match_case),
                             )
                         })
                         .inner;
@@ -2613,12 +2607,18 @@ impl eframe::App for QuarryApp {
         }
         let structural_dialog_action = self
             .active
+            .state
             .structural_dialog
             .as_mut()
             .filter(|_| !interaction_blocked)
-            .zip(self.active.document.as_ref())
+            .zip(self.active.state.document.as_ref())
             .and_then(|(dialog, document)| {
-                show_structural_dialog(ctx, dialog, &mut self.active.sort_match_case, document)
+                show_structural_dialog(
+                    ctx,
+                    dialog,
+                    &mut self.active.state.sort_match_case,
+                    document,
+                )
             });
         if let Some(action) = structural_dialog_action {
             self.apply_structural_dialog_action(action);
@@ -2790,45 +2790,6 @@ impl eframe::App for QuarryApp {
         self.show_join_files(ctx);
         self.show_inspection(ctx);
         self.show_document_cleanup(ctx);
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DelimiterMode {
-    Auto,
-    Comma,
-    Tab,
-    Pipe,
-    Semicolon,
-}
-
-impl DelimiterMode {
-    const ALL: [Self; 5] = [
-        Self::Auto,
-        Self::Comma,
-        Self::Tab,
-        Self::Pipe,
-        Self::Semicolon,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Auto",
-            Self::Comma => "Comma",
-            Self::Tab => "Tab",
-            Self::Pipe => "Pipe",
-            Self::Semicolon => "Semicolon",
-        }
-    }
-
-    fn delimiter(self) -> Option<u8> {
-        match self {
-            Self::Auto => None,
-            Self::Comma => Some(b','),
-            Self::Tab => Some(b'\t'),
-            Self::Pipe => Some(b'|'),
-            Self::Semicolon => Some(b';'),
-        }
     }
 }
 
@@ -5074,40 +5035,6 @@ fn show_duplicate_preview(
     action
 }
 
-fn filter_predicate_from_rule(
-    rule: &FilterRuleDraft,
-    total_columns: usize,
-) -> Result<FilterPredicate, String> {
-    Ok(FilterPredicate {
-        column: parse_file_column(&rule.column_input, total_columns)?,
-        operator: rule.operator,
-        value: rule.value_input.as_bytes().to_vec(),
-        upper_bound: (rule.operator == FilterOperator::Between)
-            .then(|| rule.upper_bound_input.as_bytes().to_vec()),
-    })
-}
-
-fn filter_query_from_rules(
-    rules: &[FilterRuleDraft],
-    match_case: bool,
-    total_columns: usize,
-) -> Result<FilterQuery, String> {
-    let predicates = rules
-        .iter()
-        .enumerate()
-        .map(|(index, rule)| {
-            filter_predicate_from_rule(rule, total_columns)
-                .map_err(|error| format!("Rule {}: {error}", index + 1))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let query = FilterQuery {
-        predicates,
-        case_sensitivity: case_sensitivity(match_case),
-    };
-    query.validate().map_err(|error| error.to_string())?;
-    Ok(query)
-}
-
 fn tool_dialog_frame(ctx: &egui::Context) -> egui::Frame {
     let palette = theme::ctx_palette(ctx);
     egui::Frame::window(&ctx.style())
@@ -5875,6 +5802,7 @@ fn rendered_column_range(
 fn show_grid_with_filter_case(
     ui: &mut egui::Ui,
     document: &mut Document,
+    grid_view: &mut EguiGridState,
     filter_case_sensitivity: CaseSensitivity,
 ) -> Result<Option<GridColumnRequest>, String> {
     if document.source_changed {
@@ -5962,7 +5890,13 @@ fn show_grid_with_filter_case(
         ui.separator();
         let interaction = ui
             .allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::Min), |ui| {
-                show_table(ui, document, reveal_cell, filter_case_sensitivity)
+                show_table(
+                    ui,
+                    document,
+                    grid_view,
+                    reveal_cell,
+                    filter_case_sensitivity,
+                )
             })
             .inner;
         if let Some((row_selection, active_row)) = interaction.row_selection.clone() {
@@ -5995,7 +5929,17 @@ fn show_grid(
     ui: &mut egui::Ui,
     document: &mut Document,
 ) -> Result<Option<GridColumnRequest>, String> {
-    show_grid_with_filter_case(ui, document, CaseSensitivity::Insensitive)
+    let mut grid_view = EguiGridState::default();
+    show_grid_with_filter_case(ui, document, &mut grid_view, CaseSensitivity::Insensitive)
+}
+
+#[cfg(test)]
+fn show_grid_with_view(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    grid_view: &mut EguiGridState,
+) -> Result<Option<GridColumnRequest>, String> {
+    show_grid_with_filter_case(ui, document, grid_view, CaseSensitivity::Insensitive)
 }
 
 fn whitespace_view_menu(ui: &mut egui::Ui, show_all: bool) -> Option<Action> {
@@ -6014,6 +5958,7 @@ fn whitespace_view_menu(ui: &mut egui::Ui, show_all: bool) -> Option<Action> {
 fn show_table(
     ui: &mut egui::Ui,
     document: &mut Document,
+    grid_view: &mut EguiGridState,
     reveal_cell: Option<(u64, usize)>,
     filter_case_sensitivity: CaseSensitivity,
 ) -> GridInteraction {
@@ -6024,17 +5969,17 @@ fn show_table(
     whitespace.begin_frame();
     let show_all = document.whitespace_all;
     let row_count = document.visible_row_count();
-    let auto_fit_columns = std::mem::take(&mut document.auto_fit_columns);
+    let auto_fit_columns = std::mem::take(&mut grid_view.auto_fit_columns);
     let virtualized = document.headers.len() > MAX_RENDERED_COLUMNS;
     if auto_fit_columns {
-        document.columns_to_fit.clear();
-        if virtualized || !document.fitted_column_widths.is_empty() {
-            document.columns_to_fit.extend(&document.columns.visible);
+        grid_view.columns_to_fit.clear();
+        if virtualized || !grid_view.fitted_column_widths.is_empty() {
+            grid_view.columns_to_fit.extend(&document.columns.visible);
         }
     }
     // Fit in bounded batches so very wide files do not block the UI.
     for _ in 0..MAX_RENDERED_COLUMNS {
-        let Some(column) = document.columns_to_fit.pop_front() else {
+        let Some(column) = grid_view.columns_to_fit.pop_front() else {
             break;
         };
         if document.columns.hidden[column] {
@@ -6090,10 +6035,10 @@ fn show_table(
                 );
             }
         }
-        document.fitted_column_widths.insert(column, width.ceil());
-        document.reset_table_widths = true;
+        grid_view.fitted_column_widths.insert(column, width.ceil());
+        grid_view.reset_table_widths = true;
     }
-    if !document.columns_to_fit.is_empty() {
+    if !grid_view.columns_to_fit.is_empty() {
         ui.ctx().request_repaint();
     }
     let mut interaction = GridInteraction::default();
@@ -6102,8 +6047,8 @@ fn show_table(
     let mut commit_header_edit = false;
     let mut cancel_header_edit = false;
     let mut active_cell_edit = document.cell_edit.take();
-    let cell_focus_requested = document.cell_focus_requested.take();
-    let column_focus_requested = document.column_focus_requested.take();
+    let cell_focus_requested = grid_view.cell_focus_requested.take();
+    let column_focus_requested = grid_view.column_focus_requested.take();
     let mut begin_cell_edit = None;
     let mut commit_cell_edit = false;
     let mut cancel_cell_edit = false;
@@ -6123,7 +6068,7 @@ fn show_table(
         .visible
         .iter()
         .map(|column| {
-            document
+            grid_view
                 .fitted_column_widths
                 .get(column)
                 .copied()
@@ -6250,7 +6195,7 @@ fn show_table(
                 )
             };
         }
-        if !virtualized && (std::mem::take(&mut document.reset_table_widths) || auto_fit_columns) {
+        if !virtualized && (std::mem::take(&mut grid_view.reset_table_widths) || auto_fit_columns) {
             table.reset();
         }
         table
@@ -7103,7 +7048,7 @@ fn show_table(
         document.header_edit = active_header_edit;
         document.cell_edit = active_cell_edit;
     }
-    document.cell_focus_requested = restore_cell_focus;
+    grid_view.cell_focus_requested = restore_cell_focus;
     interaction
 }
 
@@ -7951,16 +7896,17 @@ mod tests {
 
     use super::{
         Action, ActiveJobDisplay, ActiveJobKind, AppMessage, CaseSensitivity, ColumnCommand,
-        ColumnView, DelimiterMode, Document, FIND_INPUT_ID, FilterOperator, FilterPredicate,
-        FilterProgress, FilterQuery, GridColumnRequest, GridSelection, HeaderMode, IndexConfig,
-        MAX_RENDERED_COLUMNS, MessageSeverity, OpenOptions, QuarryApp, REPLACE_INPUT_ID,
-        ROW_NUMBER_WIDTH, SOURCE_CHANGED_NOTICE, SearchMatch, Session, SortMode, StructuralDialog,
-        StructuralDialogAction, WorkingCopyState, active_job_controls, column_ruler_divider_stroke,
-        column_selection_fill, configure_style, estimate_sort_temporary_bytes, filter_button_label,
-        filtered_export_file_name, first_active_job, notice_strip, page_controls,
-        parse_move_position, rendered_column_range, save_as_file_name, search_controls,
-        select_column, selected_split_column, show_column_manager, show_empty_state,
-        show_filter_manager, show_grid, show_grid_with_filter_case, show_structural_dialog,
+        ColumnView, DelimiterMode, Document, EguiGridState, FIND_INPUT_ID, FilterOperator,
+        FilterPredicate, FilterProgress, FilterQuery, GridColumnRequest, GridSelection, HeaderMode,
+        IndexConfig, MAX_RENDERED_COLUMNS, MessageSeverity, OpenOptions, QuarryApp,
+        REPLACE_INPUT_ID, ROW_NUMBER_WIDTH, SOURCE_CHANGED_NOTICE, SearchMatch, Session, SortMode,
+        StructuralDialog, StructuralDialogAction, WorkingCopyState, active_job_controls,
+        column_ruler_divider_stroke, column_selection_fill, configure_style,
+        estimate_sort_temporary_bytes, filter_button_label, filtered_export_file_name,
+        first_active_job, notice_strip, page_controls, parse_move_position, rendered_column_range,
+        save_as_file_name, search_controls, select_column, selected_split_column,
+        show_column_manager, show_empty_state, show_filter_manager, show_grid,
+        show_grid_with_filter_case, show_grid_with_view, show_structural_dialog,
     };
 
     #[test]
@@ -9153,9 +9099,18 @@ mod tests {
     }
 
     fn render_grid(ctx: &egui::Context, document: &mut Document) -> egui::FullOutput {
+        let mut grid_view = EguiGridState::default();
+        render_grid_with_view(ctx, document, &mut grid_view)
+    }
+
+    fn render_grid_with_view(
+        ctx: &egui::Context,
+        document: &mut Document,
+        grid_view: &mut EguiGridState,
+    ) -> egui::FullOutput {
         ctx.run(grid_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_grid(ui, document).unwrap();
+                show_grid_with_view(ui, document, grid_view).unwrap();
             });
         })
     }
@@ -9220,6 +9175,17 @@ mod tests {
         key: egui::Key,
         modifiers: egui::Modifiers,
     ) {
+        let mut grid_view = EguiGridState::default();
+        press_grid_key_with_view(ctx, document, &mut grid_view, key, modifiers);
+    }
+
+    fn press_grid_key_with_view(
+        ctx: &egui::Context,
+        document: &mut Document,
+        grid_view: &mut EguiGridState,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
         let _ = ctx.run(
             egui::RawInput {
                 modifiers,
@@ -9234,7 +9200,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show_grid(ui, document).unwrap();
+                    show_grid_with_view(ui, document, grid_view).unwrap();
                 });
             },
         );
@@ -9498,10 +9464,10 @@ mod tests {
             |ctx| {
                 action = show_filter_manager(
                     ctx,
-                    &mut app.active.filters_open,
-                    &mut app.active.filter_rules,
-                    &mut app.active.filter_match_case,
-                    app.active.document.as_ref().unwrap(),
+                    &mut app.active.state.filters_open,
+                    &mut app.active.state.filter_rules,
+                    &mut app.active.state.filter_match_case,
+                    app.active.state.document.as_ref().unwrap(),
                 );
             },
         );
@@ -10033,10 +9999,10 @@ mod tests {
                 |ctx| {
                     action = show_filter_manager(
                         ctx,
-                        &mut app.active.filters_open,
-                        &mut app.active.filter_rules,
-                        &mut app.active.filter_match_case,
-                        app.active.document.as_ref().unwrap(),
+                        &mut app.active.state.filters_open,
+                        &mut app.active.state.filter_rules,
+                        &mut app.active.state.filter_match_case,
+                        app.active.state.document.as_ref().unwrap(),
                     );
                 },
             );
@@ -10194,41 +10160,6 @@ mod tests {
     }
 
     #[test]
-    fn switching_numeric_filter_operators_keeps_text_and_case_preferences() {
-        let mut rule = super::FilterRuleDraft {
-            column_input: "1".into(),
-            column_search: String::new(),
-            operator: FilterOperator::Between,
-            value_input: "1".into(),
-            upper_bound_input: "2".into(),
-        };
-        let query = super::filter_query_from_rules(&[rule.clone()], true, 1).unwrap();
-        assert_eq!(
-            query.predicates[0].upper_bound.as_deref(),
-            Some(b"2".as_slice())
-        );
-        for operator in [
-            FilterOperator::GreaterThan,
-            FilterOperator::Equals,
-            FilterOperator::Contains,
-        ] {
-            rule.operator = operator;
-            let query = super::filter_query_from_rules(&[rule.clone()], true, 1).unwrap();
-            assert_eq!(query.predicates[0].upper_bound, None);
-            assert_eq!(query.case_sensitivity, CaseSensitivity::Sensitive);
-        }
-        rule.operator = FilterOperator::Between;
-        assert_eq!(
-            super::filter_query_from_rules(&[rule], false, 1)
-                .unwrap()
-                .predicates[0]
-                .upper_bound
-                .as_deref(),
-            Some(b"2".as_slice())
-        );
-    }
-
-    #[test]
     fn filter_manager_applies_a_labelled_multiline_equals_value_by_button() {
         let name = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10254,10 +10185,10 @@ mod tests {
         let output = ctx.run(grid_input(), |ctx| {
             action = show_filter_manager(
                 ctx,
-                &mut app.active.filters_open,
-                &mut app.active.filter_rules,
-                &mut app.active.filter_match_case,
-                app.active.document.as_ref().unwrap(),
+                &mut app.active.state.filters_open,
+                &mut app.active.state.filter_rules,
+                &mut app.active.state.filter_match_case,
+                app.active.state.document.as_ref().unwrap(),
             );
         });
         let tree = output
@@ -10319,10 +10250,10 @@ mod tests {
             |ctx| {
                 action = show_filter_manager(
                     ctx,
-                    &mut app.active.filters_open,
-                    &mut app.active.filter_rules,
-                    &mut app.active.filter_match_case,
-                    app.active.document.as_ref().unwrap(),
+                    &mut app.active.state.filters_open,
+                    &mut app.active.state.filter_rules,
+                    &mut app.active.state.filter_match_case,
+                    app.active.state.document.as_ref().unwrap(),
                 );
             },
         );
@@ -10343,10 +10274,10 @@ mod tests {
             |ctx| {
                 action = show_filter_manager(
                     ctx,
-                    &mut app.active.filters_open,
-                    &mut app.active.filter_rules,
-                    &mut app.active.filter_match_case,
-                    app.active.document.as_ref().unwrap(),
+                    &mut app.active.state.filters_open,
+                    &mut app.active.state.filter_rules,
+                    &mut app.active.state.filter_match_case,
+                    app.active.state.document.as_ref().unwrap(),
                 );
             },
         );
@@ -11403,9 +11334,16 @@ mod tests {
         );
         assert!(!selection_copy);
 
-        press_grid_key(&ctx, &mut document, egui::Key::Enter, egui::Modifiers::NONE);
+        let mut grid_view = EguiGridState::default();
+        press_grid_key_with_view(
+            &ctx,
+            &mut document,
+            &mut grid_view,
+            egui::Key::Enter,
+            egui::Modifiers::NONE,
+        );
         assert!(document.cell_edit.is_none());
-        let output = render_grid(&ctx, &mut document);
+        let output = render_grid_with_view(&ctx, &mut document, &mut grid_view);
         assert_eq!(
             output
                 .platform_output
@@ -11472,15 +11410,16 @@ mod tests {
             "changed\r\nvalue"
         );
         document.cell_edit.as_mut().unwrap().draft = "cancelled".into();
-        let _ = render_grid(&ctx, &mut document);
-        press_grid_key(
+        let _ = render_grid_with_view(&ctx, &mut document, &mut grid_view);
+        press_grid_key_with_view(
             &ctx,
             &mut document,
+            &mut grid_view,
             egui::Key::Escape,
             egui::Modifiers::NONE,
         );
         assert!(document.cell_edit.is_none());
-        let output = render_grid(&ctx, &mut document);
+        let output = render_grid_with_view(&ctx, &mut document, &mut grid_view);
         assert_eq!(
             output
                 .platform_output
@@ -12506,26 +12445,27 @@ mod tests {
             let ctx = egui::Context::default();
             configure_style(&ctx);
             ctx.enable_accesskit();
-            let render = |document: &mut Document| {
+            let mut grid_view = EguiGridState::default();
+            let render = |document: &mut Document, grid_view: &mut EguiGridState| {
                 ctx.run(grid_input_with_width(2400.0), |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        show_grid(ui, document).unwrap();
+                        show_grid_with_view(ui, document, grid_view).unwrap();
                     });
                 })
             };
             for _ in 0..2 {
-                let _ = render(&mut document);
+                let _ = render(&mut document, &mut grid_view);
             }
             // Exercise the source value and a longer unsaved replacement.
             for expected in [&value, &(value.clone() + " with an unsaved ending")] {
                 if expected != &value {
                     commit_test_cell(&mut document, 1, 0, expected);
                 }
-                document.auto_fit_columns = true;
+                grid_view.auto_fit_columns = true;
                 for _ in 0..4 {
-                    let _ = render(&mut document);
+                    let _ = render(&mut document, &mut grid_view);
                 }
-                let output = render(&mut document);
+                let output = render(&mut document, &mut grid_view);
                 let text = output
                     .shapes
                     .iter()
@@ -12606,35 +12546,40 @@ mod tests {
                     .width()
             };
             if total_columns == 65 {
-                let document = app.active.document.as_mut().unwrap();
+                let document = app.active.state.document.as_mut().unwrap();
                 document.set_column_shown(64, false).unwrap();
-                let _ = render_grid(&ctx, document);
+                let _ = render_grid_with_view(&ctx, document, &mut app.active.view.grid);
                 document.set_column_shown(64, true).unwrap();
             }
-            let before = render_grid(&ctx, app.active.document.as_mut().unwrap());
+            let before = render_grid_with_view(
+                &ctx,
+                app.active.state.document.as_mut().unwrap(),
+                &mut app.active.view.grid,
+            );
             let initial_width = header_width(&before, 0);
             let command = click_column_manager_control(
                 egui::accesskit::Role::Button,
                 "Auto-fit columns",
-                app.active.document.as_ref().unwrap(),
+                app.active.state.document.as_ref().unwrap(),
             );
             app.apply_column_command(&ctx, command);
-            let document = app.active.document.as_mut().unwrap();
+            let document = app.active.state.document.as_mut().unwrap();
+            let grid_view = &mut app.active.view.grid;
             for _ in 0..total_columns.div_ceil(MAX_RENDERED_COLUMNS) + 2 {
-                let _ = render_grid(&ctx, document);
+                let _ = render_grid_with_view(&ctx, document, grid_view);
             }
-            assert!(document.columns_to_fit.is_empty());
-            let after = render_grid(&ctx, document);
+            assert!(grid_view.columns_to_fit.is_empty());
+            let after = render_grid_with_view(&ctx, document, grid_view);
             assert!(header_width(&after, 0) > initial_width + 100.0);
             if total_columns <= MAX_RENDERED_COLUMNS {
                 continue;
             }
-            assert_eq!(document.fitted_column_widths.len(), total_columns);
-            let last_width = document.fitted_column_widths[&(total_columns - 1)];
+            assert_eq!(grid_view.fitted_column_widths.len(), total_columns);
+            let last_width = grid_view.fitted_column_widths[&(total_columns - 1)];
             assert!(last_width > 200.0);
             document.reveal_cell = Some((1, total_columns - 1));
-            let _ = render_grid(&ctx, document);
-            let last = render_grid(&ctx, document);
+            let _ = render_grid_with_view(&ctx, document, grid_view);
+            let last = render_grid_with_view(&ctx, document, grid_view);
             assert!(header_width(&last, total_columns - 1) >= f64::from(last_width) - 1.0);
             let rendered_headers = last
                 .platform_output
@@ -12652,8 +12597,8 @@ mod tests {
             document.move_column(total_columns - 1, 0).unwrap();
             document.set_column_shown(0, false).unwrap();
             document.reveal_cell = Some((1, total_columns - 1));
-            let _ = render_grid(&ctx, document);
-            let reordered = render_grid(&ctx, document);
+            let _ = render_grid_with_view(&ctx, document, grid_view);
+            let reordered = render_grid_with_view(&ctx, document, grid_view);
             assert!(header_width(&reordered, total_columns - 1) >= f64::from(last_width) - 1.0);
             assert!(document.cell_edits.is_empty());
             assert!(document.header_renames.is_empty());
@@ -12661,15 +12606,15 @@ mod tests {
                 document
                     .rename_header(total_columns - 1, "short".into())
                     .unwrap();
-                document.auto_fit_columns = true;
-                let _ = render_grid(&ctx, document);
-                let refitted = render_grid(&ctx, document);
+                grid_view.auto_fit_columns = true;
+                let _ = render_grid_with_view(&ctx, document, grid_view);
+                let refitted = render_grid_with_view(&ctx, document, grid_view);
                 assert!(header_width(&refitted, total_columns - 1) < f64::from(last_width) - 100.0);
-                assert_eq!(document.fitted_column_widths[&(total_columns - 1)], 80.0);
+                assert_eq!(grid_view.fitted_column_widths[&(total_columns - 1)], 80.0);
                 document.set_column_shown(0, true).unwrap();
                 document.reveal_cell = Some((1, total_columns - 1));
-                let _ = render_grid(&ctx, document);
-                let restored = render_grid(&ctx, document);
+                let _ = render_grid_with_view(&ctx, document, grid_view);
+                let restored = render_grid_with_view(&ctx, document, grid_view);
                 assert!(header_width(&restored, total_columns - 1) < f64::from(last_width) - 100.0);
             }
         }
@@ -12698,20 +12643,21 @@ mod tests {
         let ctx = egui::Context::default();
         configure_style(&ctx);
         ctx.enable_accesskit();
-        let render = |document: &mut Document| {
+        let mut grid_view = EguiGridState::default();
+        let render = |document: &mut Document, grid_view: &mut EguiGridState| {
             ctx.run(grid_input_with_width(600.0), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show_grid(ui, document).unwrap();
+                    show_grid_with_view(ui, document, grid_view).unwrap();
                 });
             })
         };
-        document.auto_fit_columns = true;
+        grid_view.auto_fit_columns = true;
         for _ in 0..3 {
-            let _ = render(&mut document);
+            let _ = render(&mut document, &mut grid_view);
         }
         document.view_column(64).unwrap();
         for _ in 0..3 {
-            let output = render(&mut document);
+            let output = render(&mut document, &mut grid_view);
             let tree = output.platform_output.accesskit_update.unwrap();
             let bounds = tree
                 .nodes
@@ -13095,7 +13041,7 @@ mod tests {
             app.active.document.as_ref().unwrap(),
         );
         app.apply_column_command(&ctx, command);
-        assert!(app.active.document.as_ref().unwrap().auto_fit_columns);
+        assert!(app.active.view.grid.auto_fit_columns);
 
         app.apply_column_command(
             &ctx,
@@ -13528,7 +13474,11 @@ mod tests {
 
         let focus_ctx = egui::Context::default();
         focus_ctx.enable_accesskit();
-        let output = render_grid(&focus_ctx, app.active.document.as_mut().unwrap());
+        let output = render_grid_with_view(
+            &focus_ctx,
+            app.active.state.document.as_mut().unwrap(),
+            &mut app.active.view.grid,
+        );
         let tree = output
             .platform_output
             .accesskit_update
@@ -13579,8 +13529,8 @@ mod tests {
                 show_structural_dialog(
                     ctx,
                     &mut dialog,
-                    &mut app.active.sort_match_case,
-                    app.active.document.as_ref().unwrap(),
+                    &mut app.active.state.sort_match_case,
+                    app.active.state.document.as_ref().unwrap(),
                 ),
                 None
             );
@@ -14381,8 +14331,8 @@ mod tests {
                 show_structural_dialog(
                     ctx,
                     &mut dialog,
-                    &mut app.active.sort_match_case,
-                    app.active.document.as_ref().unwrap(),
+                    &mut app.active.state.sort_match_case,
+                    app.active.state.document.as_ref().unwrap(),
                 ),
                 None
             );
@@ -14540,8 +14490,8 @@ mod tests {
                     action = show_structural_dialog(
                         ctx,
                         dialog,
-                        &mut app.active.sort_match_case,
-                        app.active.document.as_ref().unwrap(),
+                        &mut app.active.state.sort_match_case,
+                        app.active.state.document.as_ref().unwrap(),
                     );
                 },
             );
@@ -14736,8 +14686,8 @@ mod tests {
             show_structural_dialog(
                 ctx,
                 dialog,
-                &mut app.active.sort_match_case,
-                app.active.document.as_ref().unwrap(),
+                &mut app.active.state.sort_match_case,
+                app.active.state.document.as_ref().unwrap(),
             );
         });
         let tree = output.platform_output.accesskit_update.unwrap();
@@ -14765,8 +14715,8 @@ mod tests {
                 action = show_structural_dialog(
                     ctx,
                     dialog,
-                    &mut app.active.sort_match_case,
-                    app.active.document.as_ref().unwrap(),
+                    &mut app.active.state.sort_match_case,
+                    app.active.state.document.as_ref().unwrap(),
                 );
             },
         );
@@ -15139,7 +15089,7 @@ mod tests {
         );
 
         app.open_structural_dialog(StructuralDialog::split(0));
-        let dialog = app.active.structural_dialog.as_mut().unwrap();
+        let dialog = app.active.state.structural_dialog.as_mut().unwrap();
         assert_eq!(dialog.columns, vec![0]);
         dialog.separator = "@".into();
         let ctx = egui::Context::default();
@@ -15149,8 +15099,8 @@ mod tests {
                 show_structural_dialog(
                     ctx,
                     dialog,
-                    &mut app.active.sort_match_case,
-                    app.active.document.as_ref().unwrap(),
+                    &mut app.active.state.sort_match_case,
+                    app.active.state.document.as_ref().unwrap(),
                 ),
                 None
             );
@@ -15208,7 +15158,11 @@ mod tests {
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
-        let output = render_grid(&ctx, app.active.document.as_mut().unwrap());
+        let output = render_grid_with_view(
+            &ctx,
+            app.active.state.document.as_mut().unwrap(),
+            &mut app.active.view.grid,
+        );
         let tree = output
             .platform_output
             .accesskit_update
@@ -15538,27 +15492,33 @@ mod tests {
                 .map(|(id, _)| *id)
                 .unwrap_or_else(|| panic!("missing enabled cell menu item {label}"))
         };
-        let click_item = |target,
-                          document: &mut Document,
-                          filter_case_sensitivity: CaseSensitivity| {
-            ctx.run(
-                egui::RawInput {
-                    events: vec![egui::Event::AccessKitActionRequest(
-                        egui::accesskit::ActionRequest {
-                            action: egui::accesskit::Action::Click,
-                            target,
-                            data: None,
-                        },
-                    )],
-                    ..grid_input()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        show_grid_with_filter_case(ui, document, filter_case_sensitivity).unwrap();
-                    });
-                },
-            )
-        };
+        let click_item =
+            |target, document: &mut Document, filter_case_sensitivity: CaseSensitivity| {
+                ctx.run(
+                    egui::RawInput {
+                        events: vec![egui::Event::AccessKitActionRequest(
+                            egui::accesskit::ActionRequest {
+                                action: egui::accesskit::Action::Click,
+                                target,
+                                data: None,
+                            },
+                        )],
+                        ..grid_input()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut grid_view = EguiGridState::default();
+                            show_grid_with_filter_case(
+                                ui,
+                                document,
+                                &mut grid_view,
+                                filter_case_sensitivity,
+                            )
+                            .unwrap();
+                        });
+                    },
+                )
+            };
 
         let menu = open_menu(&mut document);
         for label in ["Filter to This Value", "Filter Out This Value", "Copy"] {
@@ -17717,8 +17677,8 @@ mod tests {
                     show_structural_dialog(
                         ctx,
                         &mut dialog,
-                        &mut app.active.sort_match_case,
-                        app.active.document.as_ref().unwrap()
+                        &mut app.active.state.sort_match_case,
+                        app.active.state.document.as_ref().unwrap()
                     ),
                     None
                 );
@@ -18075,8 +18035,8 @@ mod tests {
                 |ctx| {
                     let _ = super::show_cleanup_dialog(
                         ctx,
-                        app.active.structural_dialog.as_mut().unwrap(),
-                        app.active.document.as_ref().unwrap(),
+                        app.active.state.structural_dialog.as_mut().unwrap(),
+                        app.active.state.document.as_ref().unwrap(),
                     );
                 },
             )
@@ -18117,11 +18077,12 @@ mod tests {
         app.apply_structural_dialog_action(StructuralDialogAction::Apply);
         finish_structural_edit(&mut app);
         let expected = b"city,other\nLos Angeles,keep  this\nNew York,\n";
-        let document = app.active.document.as_mut().unwrap();
+        let document = app.active.state.document.as_mut().unwrap();
         assert_eq!(fs::read(document.session.path()).unwrap(), expected);
         assert_eq!(fs::read(&path).unwrap(), original);
         assert!(
             app.active
+                .state
                 .footer_status
                 .as_ref()
                 .unwrap()

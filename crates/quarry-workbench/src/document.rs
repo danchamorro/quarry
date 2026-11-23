@@ -30,7 +30,7 @@ use quarry_core::{
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use quarry_core::{SearchProgress, SortSpec};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -280,8 +280,6 @@ pub struct Document {
     pub header_edit: Option<HeaderEdit>,
     pub cell_edits: SharedCellEdits,
     pub cell_edit: Option<CellEdit>,
-    pub cell_focus_requested: Option<(u64, usize)>,
-    pub column_focus_requested: Option<usize>,
     pub total_columns: usize,
     pub columns: ColumnView,
     pub data_start: u64,
@@ -290,10 +288,6 @@ pub struct Document {
     pub buffered_rows: Vec<Arc<Row>>,
     pub whitespace: whitespace::Cache,
     pub whitespace_all: bool,
-    pub auto_fit_columns: bool,
-    pub fitted_column_widths: BTreeMap<usize, f32>,
-    pub columns_to_fit: VecDeque<usize>,
-    pub reset_table_widths: bool,
     pub visible_rows: usize,
     pub scroll_points: f32,
     pub last_viewport_read: Option<Duration>,
@@ -472,8 +466,6 @@ impl Document {
             header_edit: None,
             cell_edits: Arc::default(),
             cell_edit: None,
-            cell_focus_requested: None,
-            column_focus_requested: None,
             total_columns,
             columns,
             data_start,
@@ -482,10 +474,6 @@ impl Document {
             buffered_rows,
             whitespace: whitespace::Cache::default(),
             whitespace_all: false,
-            auto_fit_columns: false,
-            fitted_column_widths: BTreeMap::new(),
-            columns_to_fit: VecDeque::new(),
-            reset_table_widths: false,
             visible_rows: BOOTSTRAP_ROWS,
             scroll_points: 0.0,
             last_viewport_read: None,
@@ -3386,8 +3374,6 @@ impl Document {
         self.search_history.clear();
         self.search_history_index = None;
         self.search_status = None;
-        self.cell_focus_requested = None;
-        self.column_focus_requested = None;
         if self.session.path() == self.logical_path {
             self.working_copy = None;
             self.original_session = None;

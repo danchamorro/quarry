@@ -1,41 +1,64 @@
 use super::*;
+use std::collections::VecDeque;
+use std::ops::{Deref, DerefMut};
 
 const MAX_DOCUMENT_TABS: usize = 8;
 const MAX_WRITE_JOBS: usize = 2;
 
-/// Owns one document's drafts, feedback, worker reservations and close decisions.
+/// Frontend-local egui grid layout and focus targets for one tab.
+#[derive(Default)]
+pub(super) struct EguiGridState {
+    pub(super) auto_fit_columns: bool,
+    pub(super) fitted_column_widths: BTreeMap<usize, f32>,
+    pub(super) columns_to_fit: VecDeque<usize>,
+    pub(super) reset_table_widths: bool,
+    pub(super) cell_focus_requested: Option<(u64, usize)>,
+    pub(super) column_focus_requested: Option<usize>,
+}
+
+impl EguiGridState {
+    pub(super) fn reset(&mut self) {
+        self.auto_fit_columns = false;
+        self.fitted_column_widths.clear();
+        self.columns_to_fit.clear();
+        self.reset_table_widths = false;
+        self.clear_focus();
+    }
+
+    pub(super) fn clear_focus(&mut self) {
+        self.cell_focus_requested = None;
+        self.column_focus_requested = None;
+    }
+}
+
+/// Frontend-local egui widget, focus, IME, and table-layout state for one tab.
+#[derive(Default)]
+pub(super) struct EguiTabViewState {
+    pub(super) managed_column: Option<usize>,
+    pub(super) editor_states: Vec<(egui::Id, egui::text_edit::TextEditState)>,
+    pub(super) grid: EguiGridState,
+}
+
+/// Owns one document's UI-neutral workbench tab state alongside egui-local widget state.
 pub(super) struct DocumentTab {
-    pub(super) id: u64,
+    pub(super) state: WorkbenchTab,
+    pub(super) view: EguiTabViewState,
     pub(super) inspection: inspection_ui::InspectionUi,
     pub(super) storage_review: Option<StorageReview>,
-    pub(super) storage_approved: bool,
-    pub(super) jump_input: String,
-    pub(super) find_input: String,
-    pub(super) replace_input: String,
-    pub(super) find_match_case: bool,
-    pub(super) find_bar_open: bool,
-    pub(super) replace_expanded: bool,
-    pub(super) filter_match_case: bool,
-    pub(super) sort_match_case: bool,
-    pub(super) column_search_input: String,
-    pub(super) columns_open: bool,
-    pub(super) structural_dialog: Option<StructuralDialog>,
-    pub(super) filter_rules: Vec<FilterRuleDraft>,
-    pub(super) filters_open: bool,
-    pub(super) delimiter_mode: DelimiterMode,
-    pub(super) header_mode: HeaderMode,
-    pub(super) encoding_mode: Option<Encoding>,
-    pub(super) format_draft: Option<(DelimiterMode, HeaderMode, Option<Encoding>)>,
-    pub(super) document: Option<Document>,
-    pub(super) notice: Option<AppMessage>,
-    pub(super) footer_status: Option<AppMessage>,
-    pub(super) close_confirmation_open: bool,
-    pub(super) close_after_save: bool,
-    pub(super) close_ready: bool,
-    pub(super) close_after_jobs: bool,
-    managed_column: Option<usize>,
-    editor_states: Vec<(egui::Id, egui::text_edit::TextEditState)>,
-    pub(super) write_destination: Option<PathBuf>,
+}
+
+impl Deref for DocumentTab {
+    type Target = WorkbenchTab;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for DocumentTab {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 /// A single background retirement owns approved tabs until all readers and
@@ -121,37 +144,10 @@ impl DocumentTab {
     /// Creates an empty tab with an identity that remains stable across switches.
     pub(super) fn new(id: u64) -> Self {
         Self {
-            id,
+            state: WorkbenchTab::new(id),
+            view: EguiTabViewState::default(),
             inspection: inspection_ui::InspectionUi::default(),
             storage_review: None,
-            storage_approved: false,
-            jump_input: "1".into(),
-            find_input: String::new(),
-            replace_input: String::new(),
-            find_match_case: false,
-            find_bar_open: false,
-            replace_expanded: false,
-            filter_match_case: false,
-            sort_match_case: false,
-            column_search_input: String::new(),
-            columns_open: false,
-            structural_dialog: None,
-            filter_rules: vec![FilterRuleDraft::default()],
-            filters_open: false,
-            delimiter_mode: DelimiterMode::Auto,
-            header_mode: HeaderMode::Auto,
-            encoding_mode: None,
-            format_draft: None,
-            document: None,
-            notice: None,
-            footer_status: None,
-            close_confirmation_open: false,
-            close_after_save: false,
-            close_ready: false,
-            close_after_jobs: false,
-            managed_column: None,
-            editor_states: Vec::new(),
-            write_destination: None,
         }
     }
 }
@@ -183,40 +179,12 @@ impl DocumentTab {
     /// The tab's accessible name: the filename plus its unsaved and busy
     /// states in words. The visible tab shows these as a dot and an ellipsis.
     fn title(&self) -> String {
-        self.document.as_ref().map_or_else(
-            || "No file".into(),
-            |document| {
-                let filename = document
-                    .logical_path
-                    .file_name()
-                    .unwrap_or(document.logical_path.as_os_str())
-                    .to_string_lossy();
-                format!(
-                    "{filename}{}{}",
-                    if document.is_dirty() {
-                        ", unsaved changes"
-                    } else {
-                        ""
-                    },
-                    if self.busy() { ", busy" } else { "" }
-                )
-            },
-        )
+        self.state.title_with_extra_busy(self.inspection.busy())
     }
 
     /// Includes read workers as well as operations that materialize files.
     pub(super) fn busy(&self) -> bool {
-        self.inspection.busy()
-            || self.document.as_ref().is_some_and(|document| {
-                document.job.is_some()
-                    || document.decompressing()
-                    || document.search_job.is_some()
-                    || document.filter_job.is_some()
-                    || document.filter_rows_loading()
-                    || document.save_job.is_some()
-                    || document.export_job.is_some()
-                    || document.structural_job.is_some()
-            })
+        self.inspection.busy() || self.state.document_busy()
     }
 
     /// File operations this tab counts against the global job limit itself: a
@@ -224,25 +192,13 @@ impl DocumentTab {
     /// Running decompressions, the document's and the inspection's, count through
     /// their worker slots instead, so a writer beside one is still counted.
     fn unslotted_operations(&self) -> usize {
-        usize::from(self.writing())
-            + usize::from(
-                self.document
-                    .as_ref()
-                    .is_some_and(Document::awaiting_decompression),
-            )
+        self.state
+            .unslotted_document_operations(self.inspection.recovering())
     }
 
     /// Counts file operations and structural analysis against the global job limit.
     pub(super) fn writing(&self) -> bool {
-        self.inspection.recovering()
-            || self.document.as_ref().is_some_and(|document| {
-                document.save_job.is_some()
-                    || document.export_job.is_some()
-                    || document
-                        .structural_job
-                        .as_ref()
-                        .is_some_and(|job| !matches!(job, StructuralJob::DuplicatePreview { .. }))
-            })
+        self.inspection.recovering() || self.state.document_writing()
     }
 }
 
@@ -444,9 +400,9 @@ impl QuarryApp {
         if self.pending_tab_focus {
             return;
         }
-        self.active.managed_column = ctx
+        self.active.view.managed_column = ctx
             .data_mut(|data| data.get_persisted(egui::Id::new("quarry-selected-managed-column")));
-        self.active.editor_states = self
+        self.active.view.editor_states = self
             .active
             .editor_ids()
             .into_iter()
@@ -462,7 +418,7 @@ impl QuarryApp {
         self.pending_tab_focus = false;
         let mut ids = self.active.editor_ids();
         for tab in self.document_tabs() {
-            for (id, _) in &tab.editor_states {
+            for (id, _) in &tab.view.editor_states {
                 if !ids.contains(id) {
                     ids.push(*id);
                 }
@@ -470,6 +426,7 @@ impl QuarryApp {
         }
         for id in ids {
             self.active
+                .view
                 .editor_states
                 .iter()
                 .find(|(saved, _)| *saved == id)
@@ -485,7 +442,7 @@ impl QuarryApp {
         ctx.data_mut(|data| {
             let key = egui::Id::new("quarry-selected-managed-column");
             data.remove::<usize>(key);
-            if let Some(column) = self.active.managed_column {
+            if let Some(column) = self.active.view.managed_column {
                 data.insert_persisted(key, column);
             }
         });
