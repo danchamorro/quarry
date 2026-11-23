@@ -752,10 +752,27 @@ impl WorkbenchController {
             return Ok((owner_window, doc_id));
         }
 
+        let first_local_path = paths
+            .iter()
+            .find(|p| {
+                self.scheduler
+                    .find_owner_for_path(p)
+                    .is_none_or(|(owner, _)| owner == target_window)
+            })
+            .cloned();
         let ids = self
             .scheduler
             .open_many_lazy(target_window, paths, options, encoding)
-            .map_err(|e| AppMessage::error(e.to_string()))?;
+            .map_err(|err| match err {
+                SchedulerError::OpenFailed(message) => {
+                    if let Some(failed_path) = first_local_path {
+                        AppMessage::file_open_error(failed_path, options, encoding, message)
+                    } else {
+                        AppMessage::error(message)
+                    }
+                }
+                other => AppMessage::warning(other.to_string()),
+            })?;
         let local_active = self
             .scheduler
             .active_document(target_window)
@@ -2498,13 +2515,18 @@ impl WorkbenchController {
             res == path || Self::normalize_output_alias(res) == target_norm
         };
         (!exclude_combine && self.combine.reserved_output().is_some_and(matches_path))
-            || (!exclude_join && self.join.reserved_outputs().into_iter().any(matches_path))
-            || (!exclude_inspect
-                && self
-                    .inspect
-                    .reserved_outputs()
-                    .into_iter()
-                    .any(matches_path))
+            || (!exclude_join && self.join.reserved_output().is_some_and(matches_path))
+            || self
+                .join
+                .retired_reserved_outputs()
+                .into_iter()
+                .any(matches_path)
+            || (!exclude_inspect && self.inspect.reserved_output().is_some_and(matches_path))
+            || self
+                .inspect
+                .retired_reserved_outputs()
+                .into_iter()
+                .any(matches_path)
     }
 
     pub fn combine_prepare_destination(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
@@ -2765,7 +2787,7 @@ impl WorkbenchController {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let slot = self.write_slot_available();
-        let protected = self.path_reserved_excluding(&destination, false, false, true);
+        let protected = self.path_reserved_excluding(&destination, false, false, false);
         let res = self
             .inspect
             .start_recovery(destination, slot, |_| protected);

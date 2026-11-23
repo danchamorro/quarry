@@ -1691,6 +1691,35 @@ fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
 
     // 1. Inspect File & Recovery dialog -> inspect -> select eligible -> jump & recover.
     let (second_handle, second_view) = open_test_window(cx, &controller);
+    let second_win_id = cx.update(|cx| second_view.read(cx).window_id);
+
+    // Multi-file open failure on an empty window must preserve the failed file path and options
+    // so the user can launch Inspect File directly from the error banner.
+    let missing_batch_file = dir.path().join("missing-first.csv");
+    let batch_opts = OpenOptions {
+        header_mode: HeaderMode::FirstRow,
+        ..OpenOptions::default()
+    };
+    let batch_err = cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.open_paths(
+                second_win_id,
+                vec![missing_batch_file.clone(), uneven.clone()],
+                batch_opts,
+                Some(quarry_core::Encoding::Utf8),
+                cx,
+            )
+            .unwrap_err()
+        })
+    });
+    let failed = batch_err
+        .failed_open
+        .as_ref()
+        .expect("multi-file open failure should retain failed_open target");
+    assert_eq!(failed.path, missing_batch_file);
+    assert_eq!(failed.encoding, Some(quarry_core::Encoding::Utf8));
+    assert_eq!(failed.options.header_mode, HeaderMode::FirstRow);
+
     cx.update_window(handle.into(), |_, window, cx| {
         view.update(cx, |q, cx| q.open_inspect_dialog_now(window, cx));
         window.render_frame(cx);
@@ -1710,10 +1739,15 @@ fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
     });
 
     let recovered = dir.path().join("recovered.csv");
+    let sub_dir = dir.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
     cx.update(|cx| {
         controller.update(cx, |c, cx| {
             c.inspect_select_all_eligible(cx);
             assert!(c.inspect_jump_to_finding(win_id, 0, cx));
+            // Attempting recovery to an alias of the open source file must be blocked.
+            let open_alias = sub_dir.join("..").join("uneven.csv");
+            assert!(c.inspect_start_recovery(open_alias, cx).is_err());
             c.inspect_start_recovery(recovered.clone(), cx).unwrap();
         });
     });

@@ -2393,3 +2393,55 @@ fn pending_split_blocks_concurrent_edits_and_workers_enforce_fd_budget() {
     );
     drop(cancel_blocker);
 }
+
+#[test]
+fn eager_gzip_hydration_reserves_four_job_descriptors_before_decompression() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let gz = write_gzip_csv(dir.path(), "eager-fd.csv.gz", 40);
+
+    // `max_process_fds = 5` enforces `total_reserved < 5` (at most 4 simultaneous FDs).
+    // Hydrating a `.gz` eagerly needs 1 Document FD + 4 BackgroundJob FDs (5 total), so it must
+    // fail upfront with FdBudgetExhausted instead of reserving 2 and launching unreserved handles.
+    let mut tight = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        max_process_fds: 5,
+        defer_gzip_decompression: false,
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let err = tight
+        .open_path(WindowId::PRIMARY, gz.clone(), open_options(), None)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SchedulerError::FdBudgetExhausted {
+            cap: 5,
+            category: FdCategory::BackgroundJob,
+            ..
+        }
+    ));
+
+    // With `max_process_fds = 7` (up to 6 simultaneous FDs: 1 doc + 4 job + 1 temp dir),
+    // eager decompression reserves all 4 BackgroundJob FDs upfront and completes cleanly.
+    let mut roomy = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        max_process_fds: 7,
+        defer_gzip_decompression: false,
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let outcome = roomy
+        .open_path(WindowId::PRIMARY, gz, open_options(), None)
+        .unwrap();
+    let doc_id = match outcome {
+        WakeOutcome::Ready { document_id, .. }
+        | WakeOutcome::SourceChangedConflict { document_id, .. } => document_id,
+    };
+    finish_active_indexing(&mut roomy, doc_id);
+    assert!(roomy.fd_budget().snapshot().peak_reserved < 7);
+}

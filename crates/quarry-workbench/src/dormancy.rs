@@ -3500,7 +3500,7 @@ fn hydrate_from_stub(
                     compressed::WRITE_SLOTS_FULL.to_owned(),
                 ));
             }
-            job_fd_lease = Some(fd_budget.try_reserve(FdCategory::BackgroundJob, 2)?);
+            job_fd_lease = Some(fd_budget.try_reserve(FdCategory::BackgroundJob, 4)?);
             doc.start_indexing().map_err(SchedulerError::OpenFailed)?;
         }
     } else {

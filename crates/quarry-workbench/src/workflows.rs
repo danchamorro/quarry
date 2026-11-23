@@ -434,12 +434,15 @@ impl JoinWorkflow {
         if let Some(dest) = self.destination.as_deref() {
             out.push(dest);
         }
-        for (_, dest, _) in &self.retired_ops {
-            if let Some(d) = dest.as_deref() {
-                out.push(d);
-            }
-        }
+        out.extend(self.retired_reserved_outputs());
         out
+    }
+
+    pub fn retired_reserved_outputs(&self) -> Vec<&Path> {
+        self.retired_ops
+            .iter()
+            .filter_map(|(_, dest, _)| dest.as_deref())
+            .collect()
     }
 
     pub fn analysis_progress(&self) -> Option<JoinProgress> {
@@ -1291,12 +1294,15 @@ impl InspectWorkflow {
         if let Some(dest) = self.recovery_destination.as_deref() {
             out.push(dest);
         }
-        for (_, dest, _) in &self.retired_jobs {
-            if let Some(d) = dest.as_deref() {
-                out.push(d);
-            }
-        }
+        out.extend(self.retired_reserved_outputs());
         out
+    }
+
+    pub fn retired_reserved_outputs(&self) -> Vec<&Path> {
+        self.retired_jobs
+            .iter()
+            .filter_map(|(_, dest, _)| dest.as_deref())
+            .collect()
     }
 
     pub fn progress(&self) -> Option<InspectionProgress> {
@@ -1991,5 +1997,27 @@ mod tests {
             "stale inspection from prior target must never populate the newly configured target"
         );
         assert_eq!(wf.display_path.as_deref(), Some(clean.as_path()));
+
+        // A retired recovery worker keeps its output destination reserved until exit.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let gate_worker = gate.clone();
+        let retired_dest = dir.path().join("retired-recovery.csv");
+        let handle = thread::spawn(move || {
+            gate_worker.wait();
+        });
+        wf.retired_jobs
+            .push((handle, Some(retired_dest.clone()), true));
+        assert_eq!(wf.retired_reserved_outputs(), vec![retired_dest.as_path()]);
+        assert_eq!(wf.active_recovery_count(), 1);
+        gate.wait();
+        for _ in 0..40 {
+            wf.poll();
+            if wf.retired_reserved_outputs().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(wf.retired_reserved_outputs().is_empty());
+        assert_eq!(wf.active_recovery_count(), 0);
     }
 }
