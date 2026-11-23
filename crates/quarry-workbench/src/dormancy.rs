@@ -1814,6 +1814,14 @@ impl WorkbenchScheduler {
                 Ok(Some((destination, in_place))) => {
                     any_finished = true;
                     slot.tab.write_destination = None;
+                    if !in_place {
+                        doc.save_status = None;
+                        results.push(SaveCompletion {
+                            document_id: id,
+                            result: Ok((destination, false)),
+                        });
+                        continue;
+                    }
                     let dialect = doc.session.dialect;
                     let options = OpenOptions {
                         delimiter: Some(dialect.delimiter),
@@ -1857,26 +1865,16 @@ impl WorkbenchScheduler {
                             slot.tab.notice = None;
                             results.push(SaveCompletion {
                                 document_id: id,
-                                result: Ok((destination, in_place)),
+                                result: Ok((destination, true)),
                             });
                         }
-                        Err(error) if in_place => {
+                        Err(error) => {
                             doc.shutdown();
                             slot.tab.document = None;
                             results.push(SaveCompletion {
                                 document_id: id,
                                 result: Err(AppMessage::error(format!(
                                     "Saved {} but could not reload it: {error}. Reopen the file to continue.",
-                                    destination.display()
-                                ))),
-                            });
-                        }
-                        Err(error) => {
-                            doc.save_status = None;
-                            results.push(SaveCompletion {
-                                document_id: id,
-                                result: Err(AppMessage::error(format!(
-                                    "Saved {} but could not open it: {error}",
                                     destination.display()
                                 ))),
                             });
