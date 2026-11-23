@@ -703,3 +703,149 @@ fn external_source_change_while_dormant_surfaces_conflict_instead_of_silent_relo
             .is_some_and(|msg| msg.text == SOURCE_CHANGED_NOTICE)
     );
 }
+
+#[test]
+fn pending_inline_draft_counts_toward_overlay_budget_before_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "draft-a.csv", 10);
+    let b = write_csv(dir.path(), "draft-b.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        max_dirty_overlay_bytes: 128,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a, b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Stage an uncommitted inline cell draft whose committed size exceeds the 128-byte cap.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let src = doc.source_cell(1, 1).unwrap().to_vec();
+        doc.begin_cell_edit(1, 1, src).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "x".repeat(200);
+    }
+
+    // Switching away must reject eviction BEFORE demoting the document so the user keeps access.
+    let err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[1])
+        .unwrap_err();
+    assert!(matches!(err, SchedulerError::OverlayBudgetExceeded { .. }));
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+    assert_eq!(scheduler.active_document(WindowId::PRIMARY), Some(ids[0]));
+    assert!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .cell_edit
+            .is_some()
+    );
+}
+
+#[test]
+fn failed_hydration_restores_previously_active_tab_and_removes_failed_open_stub() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "valid-a.csv", 10);
+    let missing = dir.path().join("does-not-exist.csv");
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let outcome = scheduler
+        .open_path(WindowId::PRIMARY, a, open_options(), None)
+        .unwrap();
+    let a_id = match outcome {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("expected Ready, got {other:?}"),
+    };
+    finish_active_indexing(&mut scheduler, a_id);
+
+    // Opening a nonexistent file must fail without leaving the window empty or dropping `a`.
+    let err = scheduler
+        .open_path(WindowId::PRIMARY, missing, open_options(), None)
+        .unwrap_err();
+    assert!(matches!(err, SchedulerError::OpenFailed(_)));
+    assert_eq!(scheduler.total_tabs(), 1);
+    assert_eq!(scheduler.active_document(WindowId::PRIMARY), Some(a_id));
+    assert_eq!(scheduler.residency(a_id), Some(ResidencyState::Hydrated));
+}
+
+#[test]
+fn clean_document_dormancy_preserves_redo_history_across_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let a = write_csv(dir.path(), "redo-a.csv", 10);
+    let b = write_csv(dir.path(), "redo-b.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [a, b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Edit a cell and undo it: document is clean (`!is_dirty()`), yet `can_redo()` is true.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let src = doc.source_cell(1, 1).unwrap().to_vec();
+        doc.begin_cell_edit(1, 1, src).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "redo-me".into();
+        doc.commit_cell_edit();
+        let undone = doc.edit_history.undo.pop_back().unwrap();
+        doc.set_edit_value(undone.target, undone.before.clone());
+        doc.edit_history.redo.push(undone);
+        assert!(!doc.is_dirty());
+        assert!(doc.can_redo());
+    }
+
+    // Evict clean `a` to DormantClean, then wake it and verify redo still works.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
+
+    scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+    let doc = scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap();
+    assert!(doc.can_redo(), "redo history must survive clean dormancy");
+    let redone = doc.edit_history.redo.pop().unwrap();
+    doc.set_edit_value(redone.target, redone.after.clone());
+    doc.edit_history.undo.push_back(redone);
+    assert_eq!(
+        doc.cell_edits.get(&(1, 1)).map(|v| v.as_slice()),
+        Some(b"redo-me".as_slice())
+    );
+}

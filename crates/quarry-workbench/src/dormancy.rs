@@ -327,13 +327,13 @@ struct DormantViewSnapshot {
     total_columns: usize,
     filter_query: Option<FilterQuery>,
     filter_viewport_start: u64,
+    edit_history: EditHistory,
 }
 
 struct DormantDirtyState {
     session: Arc<Session>,
     original_session: Option<Session>,
     working_copy: Option<WorkingCopyState>,
-    edit_history: EditHistory,
     header_renames: Arc<BTreeMap<usize, Arc<String>>>,
     cell_edits: SharedCellEdits,
     overlay_bytes: usize,
@@ -520,7 +520,7 @@ impl WorkbenchScheduler {
                 }
                 SlotResidency::Dormant(dormant) => match &dormant.kind {
                     DormantKind::Dirty(dirty) => dirty.overlay_bytes,
-                    _ => 0,
+                    _ => dormant.view.edit_history.bytes,
                 },
                 SlotResidency::Stub(_) => 0,
             })
@@ -683,15 +683,35 @@ impl WorkbenchScheduler {
         if let Some((owner_window, existing_id)) = self.find_owner_for_path(&path) {
             return self.activate_tab(owner_window, existing_id);
         }
-        let ids = self.open_many_lazy(window, [path], options, encoding)?;
-        let id = ids[0];
-        match self.residency(id) {
-            Some(ResidencyState::Hydrated) => Ok(WakeOutcome::Ready {
-                document_id: id,
-                kind: WakeKind::StubInitialOpen,
-                evicted: Vec::new(),
-            }),
-            _ => self.activate_tab(window, id),
+        let canonical_path = canonicalize_best_effort(&path);
+        let file_identity = FileIdentity::from_path(&path).ok().flatten();
+        let id = self.allocate_id();
+        let mut tab = WorkbenchTab::new(id.raw());
+        tab.header_mode = options.header_mode;
+        tab.encoding_mode = encoding;
+        let stub = LazyDocumentStub {
+            logical_path: path,
+            canonical_path,
+            file_identity,
+            open_options: options,
+            encoding,
+        };
+        let tick = self.next_tick();
+        self.tabs.insert(
+            id,
+            ManagedTab {
+                window,
+                tab,
+                residency: SlotResidency::Stub(stub),
+                last_used_tick: tick,
+            },
+        );
+        match self.activate_tab(window, id) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.tabs.remove(&id);
+                Err(error)
+            }
         }
     }
 
@@ -725,6 +745,11 @@ impl WorkbenchScheduler {
             });
         }
 
+        let waking_dormant_dirty = matches!(
+            self.tabs.get(&id).map(|slot| &slot.residency),
+            Some(SlotResidency::Dormant(dormant)) if matches!(dormant.kind, DormantKind::Dirty(_))
+        );
+
         // Before hydrating a new tab, verify we can stay within the hydration limit.
         // Temporarily consider `window`'s previous active tab eligible for eviction if
         // `id` will replace it as `window`'s active tab!
@@ -732,15 +757,26 @@ impl WorkbenchScheduler {
         let evicted = self.ensure_hydration_capacity(Some(window), previous_active)?;
 
         // Reserve an active-document FD lease BEFORE opening the file.
-        let fd_lease = self.fd_budget.try_reserve(FdCategory::ActiveDocument, 1)?;
+        let fd_lease = match self.fd_budget.try_reserve(FdCategory::ActiveDocument, 1) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.restore_previous_active_on_failure(window, previous_active, &evicted);
+                return Err(error);
+            }
+        };
 
-        // Re-check overlay budget before hydrating if dirty overlays are already above cap.
-        let overlay_used = self.total_dirty_overlay_bytes();
-        if overlay_used > self.config.max_dirty_overlay_bytes {
-            return Err(SchedulerError::OverlayBudgetExceeded {
-                used_bytes: overlay_used,
-                cap_bytes: self.config.max_dirty_overlay_bytes,
-            });
+        // Re-check overlay budget before hydrating a non-dirty tab; waking an already-dormant
+        // dirty tab stays allowed so users can always wake it to save or discard edits.
+        if !waking_dormant_dirty {
+            let overlay_used = self.total_dirty_overlay_bytes();
+            if overlay_used > self.config.max_dirty_overlay_bytes {
+                drop(fd_lease);
+                self.restore_previous_active_on_failure(window, previous_active, &evicted);
+                return Err(SchedulerError::OverlayBudgetExceeded {
+                    used_bytes: overlay_used,
+                    cap_bytes: self.config.max_dirty_overlay_bytes,
+                });
+            }
         }
 
         let tick = self.next_tick();
@@ -808,10 +844,26 @@ impl WorkbenchScheduler {
                 }
             }
             Err((restored, error)) => {
-                // Roll back residency cleanly (drops `_fd_lease` automatically).
+                // Roll back residency cleanly (drops `_fd_lease` automatically) and restore
+                // the window's previously active tab if it was evicted for this failed open.
                 slot.residency = restored;
+                self.restore_previous_active_on_failure(window, previous_active, &evicted);
                 Err(error)
             }
+        }
+    }
+
+    fn restore_previous_active_on_failure(
+        &mut self,
+        window: WindowId,
+        previous_active: Option<DocumentId>,
+        evicted: &[DocumentId],
+    ) {
+        if let Some(prev_id) = previous_active
+            && evicted.contains(&prev_id)
+            && self.tabs.contains_key(&prev_id)
+        {
+            let _ = self.activate_tab(window, prev_id);
         }
     }
 
@@ -989,18 +1041,22 @@ impl WorkbenchScheduler {
             return Ok(());
         };
 
-        // Enforce explicit sparse overlay cap and scratch disk-space headroom for dirty tabs
-        // BEFORE mutating or dropping anything, so failure preserves every open document.
-        if doc.is_dirty() {
+        // Enforce explicit sparse overlay cap (including pending inline drafts and history)
+        // and scratch disk-space headroom for dirty tabs BEFORE mutating or dropping anything,
+        // so failure preserves every open document and its edits.
+        let has_pending_draft = doc.cell_edit.is_some() || doc.header_edit.is_some();
+        if doc.is_dirty() || has_pending_draft || doc.edit_history.bytes > 0 {
             let doc_overlay = document_overlay_bytes(doc);
             if total_overlay_before > self.config.max_dirty_overlay_bytes
                 || doc_overlay > self.config.max_dirty_overlay_bytes
             {
                 return Err(SchedulerError::OverlayBudgetExceeded {
-                    used_bytes: total_overlay_before,
+                    used_bytes: total_overlay_before.max(doc_overlay),
                     cap_bytes: self.config.max_dirty_overlay_bytes,
                 });
             }
+        }
+        if doc.is_dirty() || has_pending_draft {
             let available = match self.config.simulated_scratch_available_bytes {
                 Some(bytes) => bytes,
                 None => inspect_storage(&doc.working_directory)
@@ -1122,7 +1178,8 @@ fn working_copy_reserves_path(wc: &WorkingCopyState, path: &Path) -> bool {
         .any(|snapshot| paths_alias(path, &snapshot.path))
 }
 
-/// Computes tracked sparse-overlay memory bytes for a hydrated document.
+/// Computes tracked sparse-overlay memory bytes for a hydrated document, including
+/// any uncommitted inline cell or header edit drafts (and their prospective history cost).
 pub fn document_overlay_bytes(doc: &Document) -> usize {
     let cell_bytes: usize = doc.cell_edits.values().map(|value| value.len() + 32).sum();
     let header_bytes: usize = doc
@@ -1130,8 +1187,21 @@ pub fn document_overlay_bytes(doc: &Document) -> usize {
         .values()
         .map(|name| name.len() + 24)
         .sum();
+    let pending_cell_bytes = doc.cell_edit.as_ref().map_or(0, |edit| {
+        // Account for both the committed cell_edits entry and the recorded ValueEdit history entry.
+        edit.draft
+            .len()
+            .saturating_mul(2)
+            .saturating_add(edit.source.len())
+            .saturating_add(32)
+    });
+    let pending_header_bytes = doc.header_edit.as_ref().map_or(0, |edit| {
+        edit.draft.len().saturating_mul(2).saturating_add(24)
+    });
     cell_bytes
         .saturating_add(header_bytes)
+        .saturating_add(pending_cell_bytes)
+        .saturating_add(pending_header_bytes)
         .saturating_add(doc.edit_history.bytes)
 }
 
@@ -1219,6 +1289,7 @@ fn demote_document(
         total_columns: doc.total_columns,
         filter_query: doc.filter_query.clone(),
         filter_viewport_start: doc.filter_viewport_start,
+        edit_history: std::mem::take(&mut doc.edit_history),
     };
 
     let logical_path = doc.logical_path.clone();
@@ -1242,7 +1313,6 @@ fn demote_document(
             session: Arc::clone(&doc.session),
             original_session: doc.original_session.take(),
             working_copy: doc.working_copy.take(),
-            edit_history: std::mem::take(&mut doc.edit_history),
             header_renames: Arc::clone(&doc.header_renames),
             cell_edits: Arc::clone(&doc.cell_edits),
             overlay_bytes: prep.overlay_bytes,
@@ -1377,6 +1447,7 @@ fn wake_dormant_document(
                 working_cleanup,
                 decompression_slots,
             );
+            doc.edit_history = dormant.view.edit_history.clone();
             if let Err(message) = doc.start_indexing() {
                 let restored = Box::new(DormantDocument {
                     logical_path: dormant.logical_path,
@@ -1404,7 +1475,7 @@ fn wake_dormant_document(
             let mut doc = Document::from_arc_session(dirty.session, &dormant.logical_path);
             doc.original_session = dirty.original_session;
             doc.working_copy = dirty.working_copy;
-            doc.edit_history = dirty.edit_history;
+            doc.edit_history = dormant.view.edit_history.clone();
             doc.header_renames = dirty.header_renames;
             doc.cell_edits = dirty.cell_edits;
             apply_view_snapshot(
