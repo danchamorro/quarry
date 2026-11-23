@@ -273,6 +273,7 @@ impl Document {
             return Err("Save a copy and open it, or undo edits, before filtering.".into());
         }
         query.validate().map_err(|error| error.to_string())?;
+        self.extend_headers(self.index.progress().columns_found);
         if query
             .predicates
             .iter()
