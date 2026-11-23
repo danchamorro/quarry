@@ -7,15 +7,28 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::Root;
 use gpui_kit::{App, AppContext, Context, Entity, Global, WindowHandle};
-use quarry_core::{Encoding, FilterQuery, HeaderMode, OpenOptions, raise_nofile_limit};
+use quarry_core::{
+    CaseSensitivity, ColumnCleanup, DateFormatSuggestion, DuplicateTarget, Encoding, FilterQuery,
+    HeaderMode, OpenOptions, SortPlan, raise_nofile_limit,
+};
 use quarry_workbench::{
     AppMessage, CommandContext, CommandId, CommandResolution, DEFAULT_NOFILE_TARGET, Document,
-    DocumentId, MessageSeverity, ResidencyState, SchedulerError, WakeOutcome, WindowId,
-    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab, evaluate_command,
+    DocumentId, MessageSeverity, ResidencyState, SchedulerError, SelectionModifiers,
+    StructuralDialog, StructuralJob, WakeOutcome, WindowId, WorkbenchScheduler,
+    WorkbenchSchedulerConfig, WorkbenchTab, evaluate_command, materialization_progress,
+    select_column, sort_progress,
 };
 
 /// Maximum single-cell edit payload accepted by the modal cell editor (1 MiB).
 pub const MAX_EDIT_BYTES: usize = 1024 * 1024;
+
+/// Summary of a completed duplicate scan awaiting user confirmation to remove duplicates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DuplicatePreviewInfo {
+    pub duplicate_rows: u64,
+    pub unique_rows: u64,
+    pub total_rows: u64,
+}
 
 /// Read-only snapshot of an active hydrated document for toolbar, panels, and status bar rendering.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +47,20 @@ pub struct DocumentSnapshot {
     pub available_rows: u64,
     pub filter_active: bool,
     pub filter_done: bool,
+    pub filter_running: bool,
+    pub filter_status: Option<String>,
+    pub can_export_filtered: bool,
+    pub export_running: bool,
+    pub export_status: Option<String>,
+    pub search_running: bool,
+    pub search_status: Option<String>,
+    pub structural_running: bool,
+    pub structural_status: Option<String>,
+    pub structural_progress: Option<f32>,
+    pub duplicate_preview: Option<DuplicatePreviewInfo>,
+    pub pending_split_confirm_bytes: Option<u64>,
+    pub selected_rows_count: u64,
+    pub selected_columns: Vec<usize>,
     pub index_done: bool,
     pub index_fraction: f32,
     pub dirty: bool,
@@ -120,6 +147,7 @@ pub struct WorkbenchController {
     windows: BTreeMap<WindowId, WindowHandle<Root>>,
     editing_windows: BTreeSet<WindowId>,
     viewport_read_seq: BTreeMap<DocumentId, u64>,
+    pending_reveal_cells: BTreeMap<WindowId, (u64, usize)>,
     show_all_whitespace: bool,
     window_messages: BTreeMap<WindowId, AppMessage>,
     pending_review: Option<PendingReviewScope>,
@@ -138,6 +166,7 @@ impl WorkbenchController {
             windows: BTreeMap::new(),
             editing_windows: BTreeSet::new(),
             viewport_read_seq: BTreeMap::new(),
+            pending_reveal_cells: BTreeMap::new(),
             show_all_whitespace: false,
             window_messages: BTreeMap::new(),
             pending_review: None,
@@ -410,6 +439,53 @@ impl WorkbenchController {
             .collect::<Vec<_>>();
         let filter_active = doc.filter_active();
         let filter_done = doc.filter_job.is_none() && !doc.filter_rows_loading();
+        let (structural_running, structural_progress, duplicate_preview) = match &doc.structural_job
+        {
+            None => (false, None, None),
+            Some(StructuralJob::DuplicatePreview { summary, .. }) => (
+                false,
+                None,
+                Some(DuplicatePreviewInfo {
+                    duplicate_rows: summary.duplicate_rows,
+                    unique_rows: summary.retained_rows,
+                    total_rows: summary.rows_scanned,
+                }),
+            ),
+            Some(StructuralJob::Sorting { job, .. }) => {
+                let sp = job.progress();
+                let p = sort_progress(
+                    sp.preparing,
+                    sp.preparation_bytes_scanned,
+                    sp.bytes_scanned,
+                    sp.total_bytes,
+                    sp.done,
+                );
+                (true, Some(p.fraction), None)
+            }
+            Some(StructuralJob::Materializing { job, .. }) => {
+                let p = materialization_progress(job.progress(), "Applying column edit");
+                (true, Some(p.fraction), None)
+            }
+            Some(StructuralJob::InsertingRows { job, .. }) => {
+                let p = materialization_progress(job.progress(), "Inserting rows");
+                (true, Some(p.fraction), None)
+            }
+            Some(StructuralJob::DeletingRows { job, .. }) => {
+                let p = materialization_progress(job.progress(), "Deleting rows");
+                (true, Some(p.fraction), None)
+            }
+            Some(_) => (true, None, None),
+        };
+        let pending_split_confirm_bytes =
+            doc.pending_materialization
+                .as_ref()
+                .map(|(transformation, _, records)| {
+                    doc.materialization_storage_estimate_for_records(
+                        Some(transformation),
+                        None,
+                        *records,
+                    )
+                });
         Some(DocumentSnapshot {
             document_id: doc_id,
             instance_id: doc.instance_id,
@@ -425,6 +501,20 @@ impl WorkbenchController {
             available_rows: doc.grid_total_rows(),
             filter_active,
             filter_done,
+            filter_running: doc.filter_job.is_some(),
+            filter_status: doc.filter_status.clone(),
+            can_export_filtered: doc.is_filtered_export_ready(),
+            export_running: doc.export_job.is_some(),
+            export_status: doc.export_status.clone(),
+            search_running: doc.search_job.is_some(),
+            search_status: doc.search_status.clone(),
+            structural_running,
+            structural_status: doc.structural_status.clone(),
+            structural_progress,
+            duplicate_preview,
+            pending_split_confirm_bytes,
+            selected_rows_count: doc.selected_rows.count(),
+            selected_columns: doc.selected_columns.iter().copied().collect(),
             index_done: doc.job.is_none() && doc.progress.done,
             index_fraction: if doc.session.file_size == 0 {
                 1.0
@@ -1409,6 +1499,569 @@ impl WorkbenchController {
         std::mem::take(&mut self.quit_requested_complete)
     }
 
+    pub fn take_pending_reveal_cell(&mut self, window: WindowId) -> Option<(u64, usize)> {
+        self.pending_reveal_cells.remove(&window)
+    }
+
+    pub fn select_row_active(
+        &mut self,
+        window: WindowId,
+        source_row: u64,
+        shift: bool,
+        toggle: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(doc) = self.active_document_mut(window) {
+            if doc.filter_active() {
+                return;
+            }
+            if !shift
+                && !toggle
+                && doc.selected_rows.contains(source_row)
+                && doc.selected_rows.count() == 1
+            {
+                doc.selected_rows.clear();
+            } else {
+                doc.selected_rows.select(
+                    source_row,
+                    SelectionModifiers {
+                        shift,
+                        command: toggle,
+                    },
+                );
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn select_column_active(
+        &mut self,
+        window: WindowId,
+        source_col: usize,
+        shift: bool,
+        toggle: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(doc) = self.active_document_mut(window) {
+            let total = doc.known_width();
+            if source_col >= total {
+                return;
+            }
+            select_column(
+                &doc.columns,
+                &mut doc.selected_columns,
+                &mut doc.column_selection_anchor,
+                source_col,
+                SelectionModifiers {
+                    shift,
+                    command: toggle,
+                },
+            );
+            cx.notify();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 4B-2b operations: Find/Replace, Filter Export, Sort, Duplicates,
+    // Cleanup, and Structural Row/Column operations
+    // -------------------------------------------------------------------------
+
+    pub fn can_find_previous(
+        &self,
+        window: WindowId,
+        query: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> bool {
+        self.active_document(window)
+            .is_some_and(|doc| doc.can_find_previous_with_case(query, case_sensitivity))
+    }
+
+    pub fn can_replace_current(
+        &self,
+        window: WindowId,
+        query: &[u8],
+        case_sensitivity: CaseSensitivity,
+    ) -> bool {
+        self.active_document(window)
+            .is_some_and(|doc| doc.can_replace_current_with_case(query, case_sensitivity))
+    }
+
+    pub fn find_next_active(
+        &mut self,
+        window: WindowId,
+        query: Vec<u8>,
+        case_sensitivity: CaseSensitivity,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err("Open a file first.".into());
+        };
+        doc.start_find_next_with_case(&query, case_sensitivity)?;
+        if let Some(cell) = doc.reveal_cell.take() {
+            self.pending_reveal_cells.insert(window, cell);
+        }
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn find_previous_active(
+        &mut self,
+        window: WindowId,
+        query: Vec<u8>,
+        case_sensitivity: CaseSensitivity,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err("Open a file first.".into());
+        };
+        doc.start_find_previous_with_case(&query, case_sensitivity)?;
+        if let Some(cell) = doc.reveal_cell.take() {
+            self.pending_reveal_cells.insert(window, cell);
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn replace_current_active(
+        &mut self,
+        window: WindowId,
+        query: Vec<u8>,
+        replacement: Vec<u8>,
+        case_sensitivity: CaseSensitivity,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return Err("Open a file first.".into());
+        };
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err("Open a file first.".into());
+        };
+        doc.replace_current_match_with_case(&query, &replacement, case_sensitivity)?;
+        if let Some(cell) = doc.reveal_cell.take() {
+            self.pending_reveal_cells.insert(window, cell);
+        }
+        self.scheduler.revoke_tab_close_approval(doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn replace_all_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        query: Vec<u8>,
+        replacement: Vec<u8>,
+        case_sensitivity: CaseSensitivity,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before Replace All started.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_replace_all_with_case(&query, &replacement, case_sensitivity)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn cancel_search_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(doc) = self.active_document_mut(window) {
+            doc.cancel_search();
+            let _ = self.scheduler.sync_fd_leases();
+            cx.notify();
+        }
+    }
+
+    pub fn start_filtered_export_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before Export Filtered started.",
+            ));
+        }
+        if self.scheduler.path_reserved(&destination) {
+            return Err(AppMessage::warning(
+                "That destination is already open or reserved in another tab.",
+            ));
+        }
+        let Some(tab) = self.scheduler.tab_mut(expected_doc_id) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let Some(doc) = tab.document.as_mut() else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_filtered_export(destination.clone())?;
+        tab.write_destination = Some(destination);
+        tab.notice = None;
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn cancel_filter_or_export_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(doc) = self.active_document_mut(window) {
+            if doc.export_job.is_some() {
+                doc.cancel_filtered_export();
+            } else if let Some(job) = doc.filter_job.as_ref() {
+                job.cancel();
+            }
+            let _ = self.scheduler.sync_fd_leases();
+            cx.notify();
+        }
+    }
+
+    pub fn suggest_date_time_formats(
+        &self,
+        window: WindowId,
+        column: usize,
+    ) -> Option<DateFormatSuggestion> {
+        self.active_document(window)?
+            .suggest_date_time_formats(column)
+    }
+
+    pub fn sort_plan_disk_estimate(&self, window: WindowId, plan: &SortPlan) -> Option<u64> {
+        self.active_document(window)?.sort_plan_disk_estimate(plan)
+    }
+
+    pub fn start_sort_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        plan: SortPlan,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before Sort started.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_sort_plan(plan)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_find_duplicates_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        target: DuplicateTarget,
+        case_sensitivity: CaseSensitivity,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before duplicate search started.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_find_duplicates_target(target, case_sensitivity)?;
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn confirm_duplicate_removal_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<String, AppMessage> {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let notice = self.scheduler.confirm_duplicate_removal(doc_id)?;
+        self.viewport_read_seq.remove(&doc_id);
+        cx.notify();
+        Ok(notice)
+    }
+
+    pub fn cancel_structural_edit_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(doc_id) = self.scheduler.active_document(window) {
+            self.scheduler.cancel_structural_edit(doc_id);
+            cx.notify();
+        }
+    }
+
+    pub fn confirm_pending_materialization_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        self.scheduler.confirm_pending_materialization(doc_id)?;
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn cancel_pending_materialization_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(doc_id) = self.scheduler.active_document(window) {
+            self.scheduler.cancel_pending_materialization(doc_id);
+            cx.notify();
+        }
+    }
+
+    pub fn start_cleanup_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        cleanup: ColumnCleanup,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before cleanup started.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_cleanup(cleanup)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_insert_rows_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        dialog: &StructuralDialog,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before row insertion started.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.insert_rows_from_dialog(dialog)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_insert_columns_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        dialog: &StructuralDialog,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before column insertion started.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.insert_columns_from_dialog(dialog)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_delete_selected_rows_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let ranges = doc.selected_rows.ranges.clone();
+        doc.start_delete_rows(ranges)?;
+        self.scheduler.revoke_tab_close_approval(doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_delete_selected_columns_active(
+        &mut self,
+        window: WindowId,
+        columns: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_delete_columns(columns)?;
+        self.scheduler.revoke_tab_close_approval(doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_move_columns_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        columns: Vec<usize>,
+        position: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before moving columns.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_move_columns(columns, position)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_split_column_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        source_column: usize,
+        separator: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before splitting the column.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_split(source_column, separator)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_combine_columns_active(
+        &mut self,
+        window: WindowId,
+        expected_doc_id: DocumentId,
+        columns: Vec<usize>,
+        separator: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        if !self.scheduler.write_slot_available() {
+            return Err(AppMessage::warning(
+                "Two file operations are already running. Wait for one to finish.",
+            ));
+        }
+        if self.scheduler.active_document(window) != Some(expected_doc_id) {
+            return Err(AppMessage::warning(
+                "The active document changed before combining columns.",
+            ));
+        }
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        doc.start_combine(columns, separator)?;
+        self.scheduler.revoke_tab_close_approval(expected_doc_id);
+        let _ = self.scheduler.sync_fd_leases();
+        cx.notify();
+        Ok(())
+    }
+
     fn any_hydrated_tab_busy(&self) -> bool {
         self.scheduler.windows().into_iter().any(|window| {
             self.scheduler.tabs_in_window(window).into_iter().any(|id| {
@@ -1431,6 +2084,55 @@ impl WorkbenchController {
                 }
             }
             changed = true;
+        }
+        for completion in self.scheduler.poll_searches() {
+            changed = true;
+            match completion.result {
+                Ok(Some(cell)) => {
+                    if let Some(win) = self.scheduler.window_of(completion.document_id) {
+                        self.pending_reveal_cells.insert(win, cell);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
+                        tab.notice = Some(AppMessage::error(error));
+                    }
+                }
+            }
+        }
+        for completion in self.scheduler.poll_filtered_exports() {
+            changed = true;
+            match completion.result {
+                Ok(Some(status)) => {
+                    if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
+                        tab.notice = Some(AppMessage::new(status, MessageSeverity::Status));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
+                        tab.notice = Some(AppMessage::error(error));
+                    }
+                }
+            }
+        }
+        for completion in self.scheduler.poll_structural_edits() {
+            changed = true;
+            match completion.result {
+                Ok(Some(status)) => {
+                    self.viewport_read_seq.remove(&completion.document_id);
+                    if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
+                        tab.notice = Some(AppMessage::new(status, MessageSeverity::Status));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
+                        tab.notice = Some(error);
+                    }
+                }
+            }
         }
         let save_results = self.scheduler.poll_saves();
         let mut advance_review = false;

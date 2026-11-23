@@ -1964,3 +1964,176 @@ fn quit_approval_is_invalidated_when_approved_tab_is_edited_again() {
     scheduler.finalize_quit().unwrap();
     assert_eq!(scheduler.total_tabs(), 0);
 }
+
+#[test]
+fn scheduler_polls_search_filtered_export_sort_cleanup_and_duplicate_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("ops.csv");
+    fs::write(
+        &csv,
+        "name,score,note\n  zebra  ,30,hi\nalpha,10,dup\nalpha,10,dup\nbeta,20,world\n",
+    )
+    .unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // 1. Async search via poll_searches reveals exact cell.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_find_next_with_case(b"beta", CaseSensitivity::Insensitive)
+        .unwrap();
+    let mut found = None;
+    for _ in 0..400 {
+        let done = scheduler.poll_searches();
+        if !done.is_empty() {
+            found = done[0].result.as_ref().unwrap().to_owned();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(found, Some((4, 0)));
+
+    // 2. Numeric filter + filtered export via poll_filtered_exports.
+    let export_dest = dir.path().join("filtered-out.csv");
+    let query = FilterQuery::single(1, FilterOperator::GreaterThanOrEqual, b"20".to_vec());
+    scheduler.start_filter(ids[0], query).unwrap();
+    finish_active_filter(&mut scheduler, ids[0]);
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filtered_export(export_dest.clone())
+        .unwrap();
+    let mut export_done = false;
+    for _ in 0..400 {
+        let done = scheduler.poll_filtered_exports();
+        if !done.is_empty() {
+            assert!(done[0].result.is_ok());
+            export_done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(export_done);
+    let exported = fs::read_to_string(&export_dest).unwrap();
+    assert!(exported.contains("zebra") && exported.contains("beta") && !exported.contains("alpha"));
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .clear_filter()
+        .unwrap();
+
+    // 3. Cleanup Trim via poll_structural_edits installs materialized working copy.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_cleanup(quarry_core::ColumnCleanup {
+            columns: vec![0],
+            operation: quarry_core::CleanupOperation::Trim,
+        })
+        .unwrap();
+    let mut cleaned = false;
+    for _ in 0..400 {
+        let done = scheduler.poll_structural_edits();
+        if !done.is_empty() {
+            assert!(done[0].result.is_ok());
+            cleaned = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(cleaned);
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .effective_cell(1, 0),
+        Some(b"zebra".as_slice())
+    );
+
+    // 4. Find & Remove Duplicates via poll_structural_edits + confirm_duplicate_removal.
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_find_duplicates_target(DuplicateTarget::AllFields, CaseSensitivity::Sensitive)
+        .unwrap();
+    for _ in 0..400 {
+        let done = scheduler.poll_structural_edits();
+        if !done.is_empty() {
+            assert!(done[0].result.is_ok());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let notice = scheduler.confirm_duplicate_removal(ids[0]).unwrap();
+    assert!(notice.contains("Removed 1 extra duplicate"));
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert_eq!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .available_data_rows(),
+        3
+    );
+
+    // 5. Numeric Sort via poll_structural_edits orders rows ascending by score (10, 20, 30).
+    let plan = quarry_core::SortPlan::from(quarry_core::SortSpec {
+        column: 1,
+        direction: quarry_core::SortDirection::Ascending,
+        mode: quarry_core::SortMode::Number,
+        case_sensitivity: CaseSensitivity::Insensitive,
+    });
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_sort_plan(plan)
+        .unwrap();
+    for _ in 0..400 {
+        let done = scheduler.poll_structural_edits();
+        if !done.is_empty() {
+            assert!(done[0].result.is_ok());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert_eq!(doc.effective_cell(1, 0), Some(b"alpha".as_slice()));
+    assert_eq!(doc.effective_cell(2, 0), Some(b"beta".as_slice()));
+    assert_eq!(doc.effective_cell(3, 0), Some(b"zebra".as_slice()));
+}

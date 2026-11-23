@@ -1,5 +1,7 @@
+mod find_bar;
 mod grid;
 mod menus;
+mod operations;
 mod panels;
 mod workbench;
 
@@ -23,16 +25,19 @@ use gpui_kit::{
 };
 use quarry_core::{Encoding, OpenOptions};
 use quarry_workbench::{
-    AppMessage, CommandId, DocumentId, MessageSeverity, ResidencyState, WindowId,
+    AppMessage, CommandId, DocumentId, MessageSeverity, ResidencyState, WindowId, format_bytes,
 };
 
+use find_bar::{FindBar, FindBarEvent};
 use grid::Grid;
 use menus::{
-    CloseTab, CloseWindow, CopySelection, DiscardChanges, EditCell, MoveTabToNewWindow, NewWindow,
+    CleanupColumns, CloseTab, CloseWindow, CombineColumns, CopySelection, DeleteSelectedColumns,
+    DeleteSelectedRows, DiscardChanges, EditCell, ExportFiltered, FindDuplicates, FindNext,
+    FindPrevious, FindText, InsertColumns, InsertRows, MoveColumns, MoveTabToNewWindow, NewWindow,
     NextTab, OpenFile, OpenIso88591, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252,
-    PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, SaveAsFile,
-    SaveAsUtf8, SaveFile, ShowAllWhitespace, ToggleColumns, ToggleFilters, UndoEdit,
-    bind_shortcuts, encoding_label, install_menus,
+    PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText,
+    SaveAsFile, SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, ToggleColumns,
+    ToggleFilters, UndoEdit, bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use workbench::{CloseReviewAction, DocumentSnapshot, MAX_EDIT_BYTES, WorkbenchController};
@@ -45,6 +50,7 @@ pub struct QuarryWindow {
     menu_bar: Entity<AppMenuBar>,
     table: Entity<TableState<Grid>>,
     panels: Entity<Panels>,
+    find_bar: Entity<FindBar>,
     row_input: Entity<InputState>,
     last_synced_doc: Option<(DocumentId, u64)>,
     last_headers: Vec<String>,
@@ -78,11 +84,26 @@ impl QuarryWindow {
                 .col_movable(false)
         });
         let panels = cx.new(|cx| Panels::new(window, cx));
+        let find_bar = cx.new(|cx| FindBar::new(controller.clone(), window_id, window, cx));
         let row_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
         let subscriptions = vec![
             cx.observe_in(&controller, window, |this, _, window, cx| {
                 this.sync_from_controller(window, cx);
             }),
+            cx.subscribe_in(
+                &find_bar,
+                window,
+                |this, _, event: &FindBarEvent, window, cx| {
+                    if matches!(event, FindBarEvent::Closed) {
+                        if this.snapshot(cx).is_some() {
+                            this.table.focus_handle(cx).focus(window, cx);
+                        } else {
+                            this.focus_handle.focus(window, cx);
+                        }
+                        cx.notify();
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &table,
                 window,
@@ -175,6 +196,14 @@ impl QuarryWindow {
                             this.set_message(AppMessage::error(error), cx);
                         }
                     }
+                    PanelEvent::ExportFiltered => {
+                        this.choose_export_filtered_destination(window, cx);
+                    }
+                    PanelEvent::CancelFilterOrExport => {
+                        this.controller.update(cx, |controller, cx| {
+                            controller.cancel_filter_or_export_active(this.window_id, cx);
+                        });
+                    }
                     PanelEvent::Reopen(options, encoding) => {
                         let res = this.controller.update(cx, |controller, cx| {
                             controller.reopen_active_tab(this.window_id, *options, *encoding, cx)
@@ -216,6 +245,7 @@ impl QuarryWindow {
             menu_bar,
             table,
             panels,
+            find_bar,
             row_input,
             last_synced_doc: None,
             last_headers: Vec::new(),
@@ -326,6 +356,26 @@ impl QuarryWindow {
                 });
             }
             window.set_window_title("Quarry");
+        }
+        let pending_reveal = self.controller.update(cx, |controller, _| {
+            controller.take_pending_reveal_cell(self.window_id)
+        });
+        if let Some((source_row, source_col)) = pending_reveal
+            && let Some((table_row, table_col)) = self
+                .table
+                .read(cx)
+                .delegate()
+                .display_position_for_source(source_row, source_col, cx)
+        {
+            self.table.update(cx, |table, cx| {
+                table.scroll_to_row(table_row, cx);
+                table.scroll_to_col(table_col, cx);
+                table.set_selected_cell(table_row, table_col, cx);
+                cx.notify();
+            });
+            self.row_input.update(cx, |state, cx| {
+                state.set_value((table_row + 1).to_string(), window, cx);
+            });
         }
         let pending_action = self.controller.update(cx, |controller, _| {
             controller.take_pending_review_action(self.window_id)
@@ -1255,6 +1305,407 @@ impl QuarryWindow {
     fn quit_action(&mut self, _: &QuitApp, window: &mut Window, cx: &mut Context<Self>) {
         self.quit_requested(window, cx);
     }
+
+    fn choose_export_filtered_destination(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirming || self.editing {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        if !info.can_export_filtered {
+            self.set_message(
+                AppMessage::warning("Wait for filtering to complete before exporting."),
+                cx,
+            );
+            return;
+        }
+        let target_doc_id = info.document_id;
+        let directory = info
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let name = format!(
+            "{}-filtered.{}",
+            info.path.file_stem().unwrap_or_default().to_string_lossy(),
+            info.path
+                .extension()
+                .unwrap_or_else(|| std::ffi::OsStr::new("csv"))
+                .to_string_lossy()
+        );
+        let selection = cx.prompt_for_new_path(&directory, Some(&name));
+        self.confirming = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let selection = selection.await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.confirming = false;
+                match selection {
+                    Ok(Ok(Some(path))) => {
+                        let res = this.controller.update(cx, |c, cx| {
+                            c.start_filtered_export_active(this.window_id, target_doc_id, path, cx)
+                        });
+                        if let Err(error) = res {
+                            this.set_message(error, cx);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        this.set_message(AppMessage::error(error.to_string()), cx);
+                    }
+                    _ => {}
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn active_selected_column(&self, cx: &App) -> usize {
+        self.table
+            .read(cx)
+            .selected_cell()
+            .and_then(|(_, col)| self.table.read(cx).delegate().source_column_at(col, cx))
+            .or_else(|| {
+                self.snapshot(cx)
+                    .and_then(|i| i.selected_columns.first().copied())
+            })
+            .unwrap_or(0)
+    }
+
+    fn active_selected_columns_or_current(&self, cx: &App) -> Vec<usize> {
+        let mut cols = self
+            .snapshot(cx)
+            .map(|i| i.selected_columns)
+            .unwrap_or_default();
+        if cols.is_empty()
+            && let Some((_, col)) = self.table.read(cx).selected_cell()
+            && let Some(src) = self.table.read(cx).delegate().source_column_at(col, cx)
+        {
+            cols.push(src);
+        }
+        cols
+    }
+
+    fn restore_grid_focus_callback(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let weak = cx.weak_entity();
+        move |window, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                this.editing = false;
+                let table_focus = this
+                    .snapshot(cx)
+                    .is_some()
+                    .then(|| this.table.focus_handle(cx));
+                let root_focus = this.focus_handle.clone();
+                window.defer(cx, move |window, cx| {
+                    if let Some(tf) = table_focus {
+                        tf.focus(window, cx);
+                    } else {
+                        root_focus.focus(window, cx);
+                    }
+                });
+                cx.notify();
+            });
+        }
+    }
+
+    fn find_action(&mut self, _: &FindText, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot(cx).is_some() && !self.confirming && !self.editing {
+            self.find_bar
+                .update(cx, |bar, cx| bar.open_find(false, window, cx));
+        }
+    }
+
+    fn replace_action(&mut self, _: &ReplaceText, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot(cx).is_some() && !self.confirming && !self.editing {
+            self.find_bar
+                .update(cx, |bar, cx| bar.open_find(true, window, cx));
+        }
+    }
+
+    fn find_next_action(&mut self, _: &FindNext, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot(cx).is_none() || self.confirming || self.editing {
+            return;
+        }
+        if !self.find_bar.read(cx).is_open() {
+            self.find_bar
+                .update(cx, |bar, cx| bar.open_find(false, window, cx));
+        } else {
+            self.find_bar.update(cx, |bar, cx| bar.find_next(cx));
+        }
+    }
+
+    fn find_previous_action(
+        &mut self,
+        _: &FindPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.snapshot(cx).is_none() || self.confirming || self.editing {
+            return;
+        }
+        if !self.find_bar.read(cx).is_open() {
+            self.find_bar
+                .update(cx, |bar, cx| bar.open_find(false, window, cx));
+        } else {
+            self.find_bar.update(cx, |bar, cx| bar.find_previous(cx));
+        }
+    }
+
+    fn export_filtered_action(
+        &mut self,
+        _: &ExportFiltered,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.choose_export_filtered_destination(window, cx);
+    }
+
+    fn dialog_target(&self, doc_id: DocumentId) -> operations::DialogTarget {
+        operations::DialogTarget {
+            controller: self.controller.clone(),
+            window_id: self.window_id,
+            doc_id,
+        }
+    }
+
+    fn sort_rows_action(&mut self, _: &SortRows, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let initial_col = self.active_selected_column(cx);
+        let on_closed = self.restore_grid_focus_callback(cx);
+        operations::open_sort_dialog(
+            self.dialog_target(info.document_id),
+            info.headers,
+            initial_col,
+            on_closed,
+            window,
+            cx,
+        );
+    }
+
+    fn find_duplicates_action(
+        &mut self,
+        _: &FindDuplicates,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let selected = info.selected_columns;
+        let on_closed = self.restore_grid_focus_callback(cx);
+        operations::open_duplicates_dialog(
+            self.dialog_target(info.document_id),
+            info.headers,
+            selected,
+            on_closed,
+            window,
+            cx,
+        );
+    }
+
+    fn cleanup_columns_action(
+        &mut self,
+        _: &CleanupColumns,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let selected = self.active_selected_columns_or_current(cx);
+        let on_closed = self.restore_grid_focus_callback(cx);
+        operations::open_cleanup_dialog(
+            self.dialog_target(info.document_id),
+            info.headers,
+            selected,
+            on_closed,
+            window,
+            cx,
+        );
+    }
+
+    fn insert_rows_action(&mut self, _: &InsertRows, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let default_pos = self
+            .table
+            .read(cx)
+            .selected_cell()
+            .map_or(1, |(row, _)| (row as u64).saturating_add(1));
+        let on_closed = self.restore_grid_focus_callback(cx);
+        operations::open_insert_dialog(
+            self.dialog_target(info.document_id),
+            true,
+            default_pos,
+            on_closed,
+            window,
+            cx,
+        );
+    }
+
+    fn insert_columns_action(
+        &mut self,
+        _: &InsertColumns,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let default_pos = (self.active_selected_column(cx) as u64).saturating_add(1);
+        let on_closed = self.restore_grid_focus_callback(cx);
+        operations::open_insert_dialog(
+            self.dialog_target(info.document_id),
+            false,
+            default_pos,
+            on_closed,
+            window,
+            cx,
+        );
+    }
+
+    fn delete_selected_rows_action(
+        &mut self,
+        _: &DeleteSelectedRows,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let res = self.controller.update(cx, |c, cx| {
+            c.start_delete_selected_rows_active(self.window_id, cx)
+        });
+        if let Err(error) = res {
+            self.set_message(error, cx);
+        }
+    }
+
+    fn delete_selected_columns_action(
+        &mut self,
+        _: &DeleteSelectedColumns,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let cols = self.active_selected_columns_or_current(cx);
+        let res = self.controller.update(cx, |c, cx| {
+            c.start_delete_selected_columns_active(self.window_id, cols, cx)
+        });
+        if let Err(error) = res {
+            self.set_message(error, cx);
+        }
+    }
+
+    fn move_columns_action(
+        &mut self,
+        _: &MoveColumns,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let selected = self.active_selected_columns_or_current(cx);
+        let on_closed = self.restore_grid_focus_callback(cx);
+        operations::open_move_columns_dialog(
+            self.dialog_target(info.document_id),
+            info.headers,
+            selected,
+            on_closed,
+            window,
+            cx,
+        );
+    }
+
+    fn split_column_action(
+        &mut self,
+        _: &SplitColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let initial_col = self.active_selected_column(cx);
+        let on_closed = self.restore_grid_focus_callback(cx);
+        operations::open_split_column_dialog(
+            self.dialog_target(info.document_id),
+            info.headers,
+            initial_col,
+            on_closed,
+            window,
+            cx,
+        );
+    }
+
+    fn combine_columns_action(
+        &mut self,
+        _: &CombineColumns,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        self.editing = true;
+        self.panels.update(cx, |p, cx| p.close(window, cx));
+        let selected = self.active_selected_columns_or_current(cx);
+        let on_closed = self.restore_grid_focus_callback(cx);
+        operations::open_combine_columns_dialog(
+            self.dialog_target(info.document_id),
+            info.headers,
+            selected,
+            on_closed,
+            window,
+            cx,
+        );
+    }
 }
 
 impl Render for QuarryWindow {
@@ -1317,12 +1768,27 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::save_action))
             .on_action(cx.listener(Self::save_as_action))
             .on_action(cx.listener(Self::save_as_utf8_action))
+            .on_action(cx.listener(Self::export_filtered_action))
             .on_action(cx.listener(Self::discard_action))
             .on_action(cx.listener(Self::undo_action))
             .on_action(cx.listener(Self::redo_action))
             .on_action(cx.listener(Self::copy_action))
             .on_action(cx.listener(Self::edit_action))
             .on_action(cx.listener(Self::rename_header_action))
+            .on_action(cx.listener(Self::find_action))
+            .on_action(cx.listener(Self::find_next_action))
+            .on_action(cx.listener(Self::find_previous_action))
+            .on_action(cx.listener(Self::replace_action))
+            .on_action(cx.listener(Self::sort_rows_action))
+            .on_action(cx.listener(Self::find_duplicates_action))
+            .on_action(cx.listener(Self::cleanup_columns_action))
+            .on_action(cx.listener(Self::insert_rows_action))
+            .on_action(cx.listener(Self::insert_columns_action))
+            .on_action(cx.listener(Self::delete_selected_rows_action))
+            .on_action(cx.listener(Self::delete_selected_columns_action))
+            .on_action(cx.listener(Self::move_columns_action))
+            .on_action(cx.listener(Self::split_column_action))
+            .on_action(cx.listener(Self::combine_columns_action))
             .on_action(cx.listener(Self::toggle_whitespace_action))
             .on_action(cx.listener(Self::toggle_columns_action))
             .on_action(cx.listener(Self::toggle_filters_action))
@@ -1518,6 +1984,46 @@ impl Render for QuarryWindow {
                 .child(columns)
                 .child(filters)
                 .child(
+                    Button::new("toolbar-find")
+                        .label("Find")
+                        .ghost()
+                        .small()
+                        .disabled(!loaded)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.find_action(&FindText, window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("toolbar-sort")
+                        .label("Sort")
+                        .ghost()
+                        .small()
+                        .disabled(!loaded || busy)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.sort_rows_action(&SortRows, window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("toolbar-duplicates")
+                        .label("Duplicates")
+                        .ghost()
+                        .small()
+                        .disabled(!loaded || busy)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.find_duplicates_action(&FindDuplicates, window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("toolbar-cleanup")
+                        .label("Clean")
+                        .ghost()
+                        .small()
+                        .disabled(!loaded || busy)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cleanup_columns_action(&CleanupColumns, window, cx);
+                        })),
+                )
+                .child(
                     Button::new("toggle-whitespace")
                         .label(if show_whitespace {
                             "Whitespace: On"
@@ -1550,6 +2056,159 @@ impl Render for QuarryWindow {
                         })),
                 ),
         );
+
+        if loaded && self.find_bar.read(cx).is_open() {
+            body = body.child(self.find_bar.clone());
+        }
+
+        if let Some(ref snap) = info {
+            if let Some(preview) = &snap.duplicate_preview {
+                body = body.child(
+                    div()
+                        .id("duplicate-preview-banner")
+                        .role(Role::Alert)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1p5()
+                        .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(div().flex_1().child(format!(
+                            "Found {} extra duplicate row{} ({} unique of {} total).",
+                            preview.duplicate_rows,
+                            if preview.duplicate_rows == 1 { "" } else { "s" },
+                            preview.unique_rows,
+                            preview.total_rows
+                        )))
+                        .child(
+                            Button::new("confirm-remove-duplicates")
+                                .label("Remove Duplicates")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let res = this.controller.update(cx, |c, cx| {
+                                        c.confirm_duplicate_removal_active(this.window_id, cx)
+                                    });
+                                    match res {
+                                        Ok(notice) => {
+                                            this.set_message(AppMessage::status(notice), cx);
+                                        }
+                                        Err(error) => this.set_message(error, cx),
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new("cancel-duplicate-preview")
+                                .label("Cancel")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| {
+                                        c.cancel_structural_edit_active(this.window_id, cx);
+                                    });
+                                })),
+                        ),
+                );
+            } else if let Some(bytes) = snap.pending_split_confirm_bytes {
+                body = body.child(
+                    div()
+                        .id("split-confirm-banner")
+                        .role(Role::Alert)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1p5()
+                        .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(div().flex_1().child(format!(
+                            "Split will create a temporary working copy (~{}). Continue?",
+                            format_bytes(bytes)
+                        )))
+                        .child(
+                            Button::new("confirm-split-materialization")
+                                .label("Continue Split")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let res = this.controller.update(cx, |c, cx| {
+                                        c.confirm_pending_materialization_active(this.window_id, cx)
+                                    });
+                                    if let Err(error) = res {
+                                        this.set_message(error, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new("cancel-split-materialization")
+                                .label("Cancel")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| {
+                                        c.cancel_pending_materialization_active(this.window_id, cx);
+                                    });
+                                })),
+                        ),
+                );
+            } else if snap.structural_running || snap.export_running || snap.filter_running {
+                let op_label = if snap.structural_running {
+                    let base = snap
+                        .structural_status
+                        .clone()
+                        .unwrap_or_else(|| "Applying operation…".into());
+                    match snap.structural_progress {
+                        Some(frac) => format!("{base} ({:.0}%)", (frac * 100.0).clamp(0.0, 100.0)),
+                        None => base,
+                    }
+                } else if snap.export_running {
+                    snap.export_status
+                        .clone()
+                        .unwrap_or_else(|| "Exporting filtered rows…".into())
+                } else {
+                    snap.filter_status
+                        .clone()
+                        .unwrap_or_else(|| "Filtering rows…".into())
+                };
+                let is_structural = snap.structural_running;
+                body = body.child(
+                    div()
+                        .id("operation-progress-banner")
+                        .role(Role::Status)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .bg(cx.theme().secondary)
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(op_label),
+                        )
+                        .child(
+                            Button::new("cancel-operation")
+                                .label("Cancel")
+                                .small()
+                                .danger()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| {
+                                        if is_structural {
+                                            c.cancel_structural_edit_active(this.window_id, cx);
+                                        } else {
+                                            c.cancel_filter_or_export_active(this.window_id, cx);
+                                        }
+                                    });
+                                })),
+                        ),
+                );
+            }
+        }
 
         if loaded {
             let table = self.table.clone();

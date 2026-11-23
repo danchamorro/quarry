@@ -27,12 +27,13 @@
 use crate::compressed::CompressedDormancyPolicy;
 use crate::{
     AppMessage, ColumnView, Document, DocumentId, EditHistory, GridCursor, GridSelection,
-    JOIN_INPUT_RESERVED, RowSelection, SOURCE_CHANGED_NOTICE, SharedCellEdits, StructuralOverlay,
-    WindowId, WorkbenchTab, WorkingCopySnapshot, WorkingCopyState, compressed,
+    JOIN_INPUT_RESERVED, MaterializedWorkingCopy, RowSelection, SOURCE_CHANGED_NOTICE,
+    SharedCellEdits, StructuralJob, StructuralOverlay, WindowId, WorkbenchTab, WorkingCopySnapshot,
+    WorkingCopyState, compressed,
 };
 use quarry_core::{
-    Encoding, FileIdentity, FilterQuery, OpenOptions, QuarryError, Session, SourceGuard,
-    WorkingCopyCleanup, inspect_storage,
+    CompletedIndex, Encoding, FileIdentity, FilterQuery, OpenOptions, QuarryError, Session,
+    SourceGuard, WorkingCopyCleanup, inspect_storage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -278,6 +279,29 @@ pub enum ResidencyState {
 pub struct SaveCompletion {
     pub document_id: DocumentId,
     pub result: Result<(PathBuf, bool), AppMessage>,
+}
+
+/// Completion or failure of a background search job reported by [`WorkbenchScheduler::poll_searches`].
+#[derive(Debug)]
+pub struct SearchCompletion {
+    pub document_id: DocumentId,
+    pub result: Result<Option<(u64, usize)>, String>,
+}
+
+/// Completion or failure of a background filtered export job reported by
+/// [`WorkbenchScheduler::poll_filtered_exports`].
+#[derive(Debug)]
+pub struct ExportCompletion {
+    pub document_id: DocumentId,
+    pub result: Result<Option<String>, String>,
+}
+
+/// Completion or failure of a background structural edit job reported by
+/// [`WorkbenchScheduler::poll_structural_edits`].
+#[derive(Debug)]
+pub struct StructuralCompletion {
+    pub document_id: DocumentId,
+    pub result: Result<Option<String>, AppMessage>,
 }
 
 /// Actionable scheduler failure that always preserves every open document and edit.
@@ -1970,6 +1994,415 @@ impl WorkbenchScheduler {
             let _ = self.sync_fd_leases();
         }
         results
+    }
+
+    /// Polls active search jobs across all hydrated tabs, returning newly revealed cell coordinates.
+    pub fn poll_searches(&mut self) -> Vec<SearchCompletion> {
+        let mut results = Vec::new();
+        let mut any_finished = false;
+        for (&id, slot) in &mut self.tabs {
+            if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
+                continue;
+            }
+            let Some(doc) = slot.tab.document.as_mut() else {
+                continue;
+            };
+            if doc.search_job.is_none() {
+                continue;
+            }
+            match doc.poll_search() {
+                Ok(()) => {
+                    if doc.search_job.is_none() {
+                        any_finished = true;
+                        let revealed = doc.reveal_cell.take();
+                        results.push(SearchCompletion {
+                            document_id: id,
+                            result: Ok(revealed),
+                        });
+                    }
+                }
+                Err(error) => {
+                    any_finished = true;
+                    results.push(SearchCompletion {
+                        document_id: id,
+                        result: Err(error),
+                    });
+                }
+            }
+        }
+        if any_finished {
+            let _ = self.sync_fd_leases();
+        }
+        results
+    }
+
+    /// Polls active filtered-export jobs across all hydrated tabs, clearing write reservations.
+    pub fn poll_filtered_exports(&mut self) -> Vec<ExportCompletion> {
+        let mut results = Vec::new();
+        let mut any_finished = false;
+        for (&id, slot) in &mut self.tabs {
+            if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
+                continue;
+            }
+            let Some(doc) = slot.tab.document.as_mut() else {
+                continue;
+            };
+            if doc.export_job.is_none() {
+                continue;
+            }
+            match doc.poll_filtered_export() {
+                Ok(()) => {
+                    if doc.export_job.is_none() {
+                        any_finished = true;
+                        slot.tab.write_destination = None;
+                        results.push(ExportCompletion {
+                            document_id: id,
+                            result: Ok(doc.export_status.clone()),
+                        });
+                    }
+                }
+                Err(error) => {
+                    any_finished = true;
+                    slot.tab.write_destination = None;
+                    results.push(ExportCompletion {
+                        document_id: id,
+                        result: Err(error),
+                    });
+                }
+            }
+        }
+        if any_finished {
+            let _ = self.sync_fd_leases();
+        }
+        results
+    }
+
+    fn prepare_materialized_document(
+        &self,
+        path: &Path,
+        options: OpenOptions,
+        encoding: Encoding,
+        output_index: Option<CompletedIndex>,
+    ) -> Result<Document, String> {
+        let mut replacement = Document::prepare_with_encoding(path, options, Some(encoding))?;
+        replacement.working_directory = self.config.working_directory.clone();
+        replacement.custom_working_directory = self.config.custom_working_directory;
+        replacement.index_cache_enabled = self.config.index_cache_enabled;
+        replacement.working_cleanup = self.working_cleanup.clone();
+        replacement.decompression_slots = self.decompression_slots.clone();
+        if let Some(index) = output_index {
+            let index = replacement
+                .session
+                .adopt_completed_index(index)
+                .map_err(|error| error.to_string())?;
+            replacement.progress.bytes_scanned = index.indexed_bytes();
+            replacement.progress.rows_scanned = index.indexed_rows();
+            replacement.progress.done = true;
+            replacement.progress.columns_found = index.maximum_width();
+            replacement.apply_indexed_width(index.maximum_width());
+            replacement.index = Some(index);
+            replacement.load_buffer(replacement.viewport_start)?;
+        } else {
+            replacement.start_indexing()?;
+        }
+        Ok(replacement)
+    }
+
+    fn install_prepared_working_copy(
+        &mut self,
+        id: DocumentId,
+        mut replacement: Document,
+        ready: MaterializedWorkingCopy,
+        index_job_fd: Option<FdLease>,
+    ) {
+        let Some(slot) = self.tabs.get_mut(&id) else {
+            replacement.shutdown();
+            return;
+        };
+        let Some(current) = slot.tab.document.as_mut() else {
+            replacement.shutdown();
+            return;
+        };
+        current.accept_materialized_change(ready.undo);
+        replacement.logical_path = current.logical_path.clone();
+        replacement.original_session = current.original_session.take();
+        replacement.working_copy = current.working_copy.take();
+        replacement.working_directory = self.config.working_directory.clone();
+        replacement.custom_working_directory = self.config.custom_working_directory;
+        replacement.working_cleanup = self.working_cleanup.clone();
+        replacement.decompression_slots = self.decompression_slots.clone();
+        replacement.selected_columns = ready.selected_columns;
+        let first_selected = replacement.selected_columns.iter().next().copied();
+        replacement.column_selection_anchor = first_selected;
+        if let Some(first_selected) = first_selected
+            && replacement.columns.view(first_selected)
+        {
+            replacement.refresh_column_headers();
+        }
+        current.shutdown();
+        slot.tab.document = Some(replacement);
+        if let Some(lease) = index_job_fd
+            && let SlotResidency::Hydrated { job_fd_lease, .. } = &mut slot.residency
+        {
+            *job_fd_lease = Some(lease);
+        }
+        slot.tab.format_draft = None;
+        slot.tab.columns_open = false;
+        slot.tab.structural_dialog = None;
+        slot.tab.notice = None;
+        slot.tab.footer_status = Some(AppMessage::status(ready.notice));
+        self.close_approved.remove(&id);
+    }
+
+    /// Polls active structural edit jobs (Sort, Replace All, Cleanup, Split, Combine, Insert/Delete
+    /// Rows/Columns, Find Duplicates) across all hydrated tabs, installing materialized working
+    /// copies with pre-reserved FD leases.
+    pub fn poll_structural_edits(&mut self) -> Vec<StructuralCompletion> {
+        let mut results = Vec::new();
+        let mut ready_to_install: Vec<(DocumentId, MaterializedWorkingCopy)> = Vec::new();
+        let mut any_finished = false;
+        let ids: Vec<DocumentId> = self.tabs.keys().copied().collect();
+        for id in ids {
+            let Some(slot) = self.tabs.get_mut(&id) else {
+                continue;
+            };
+            if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
+                continue;
+            }
+            let Some(doc) = slot.tab.document.as_mut() else {
+                continue;
+            };
+            if doc.structural_job.is_none()
+                || matches!(
+                    doc.structural_job,
+                    Some(StructuralJob::DuplicatePreview { .. })
+                )
+            {
+                continue;
+            }
+            match doc.poll_structural_edit() {
+                Ok(Some(ready)) => {
+                    any_finished = true;
+                    ready_to_install.push((id, ready));
+                }
+                Ok(None) => {
+                    if doc.structural_job.is_none()
+                        || matches!(
+                            doc.structural_job,
+                            Some(StructuralJob::DuplicatePreview { .. })
+                        )
+                    {
+                        any_finished = true;
+                        results.push(StructuralCompletion {
+                            document_id: id,
+                            result: Ok(doc.structural_status.clone()),
+                        });
+                    }
+                }
+                Err(error) => {
+                    any_finished = true;
+                    results.push(StructuralCompletion {
+                        document_id: id,
+                        result: Err(error),
+                    });
+                }
+            }
+        }
+
+        for (id, mut ready) in ready_to_install {
+            let Some((options, encoding)) = self.tabs.get(&id).and_then(|slot| {
+                slot.tab
+                    .document
+                    .as_ref()
+                    .map(|doc| (doc.current_open_options(), doc.session.encoding()))
+            }) else {
+                continue;
+            };
+            let needs_index_worker = ready.output_index.is_none();
+            let temp_open_fd = match self.fd_budget.try_reserve(FdCategory::ActiveDocument, 1) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    results.push(StructuralCompletion {
+                        document_id: id,
+                        result: Err(AppMessage::warning(error.to_string())),
+                    });
+                    continue;
+                }
+            };
+            let index_job_fd = if needs_index_worker {
+                match self.fd_budget.try_reserve(FdCategory::BackgroundJob, 1) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        results.push(StructuralCompletion {
+                            document_id: id,
+                            result: Err(AppMessage::warning(error.to_string())),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let output_index = ready.output_index.take();
+            match self.prepare_materialized_document(&ready.path, options, encoding, output_index) {
+                Ok(replacement) => {
+                    let notice = ready.notice.clone();
+                    self.install_prepared_working_copy(id, replacement, ready, index_job_fd);
+                    drop(temp_open_fd);
+                    results.push(StructuralCompletion {
+                        document_id: id,
+                        result: Ok(Some(notice)),
+                    });
+                }
+                Err(error) => {
+                    drop(index_job_fd);
+                    drop(temp_open_fd);
+                    results.push(StructuralCompletion {
+                        document_id: id,
+                        result: Err(AppMessage::error(error)),
+                    });
+                }
+            }
+        }
+
+        if any_finished {
+            let _ = self.sync_fd_leases();
+        }
+        results
+    }
+
+    /// Confirms removal of duplicates from a completed `StructuralJob::DuplicatePreview`, adopting
+    /// its pre-built working copy and completed index cleanly with FD pre-reservation.
+    pub fn confirm_duplicate_removal(&mut self, id: DocumentId) -> Result<String, AppMessage> {
+        let (destination, options, encoding, output_index) = {
+            let Some(slot) = self.tabs.get(&id) else {
+                return Err(AppMessage::warning("Open a file first."));
+            };
+            let Some(doc) = slot.tab.document.as_ref() else {
+                return Err(AppMessage::warning("Open a file first."));
+            };
+            let Some(StructuralJob::DuplicatePreview { summary, .. }) = &doc.structural_job else {
+                return Err(AppMessage::warning(
+                    "No duplicate preview is awaiting confirmation.",
+                ));
+            };
+            (
+                summary.destination.clone(),
+                doc.current_open_options(),
+                doc.session.encoding(),
+                summary.output_index.clone(),
+            )
+        };
+        {
+            let doc = self
+                .tabs
+                .get_mut(&id)
+                .and_then(|slot| slot.tab.document.as_mut())
+                .ok_or_else(|| AppMessage::warning("Open a file first."))?;
+            if doc.session.ensure_source_unchanged().is_err()
+                || doc
+                    .original_session
+                    .as_ref()
+                    .is_some_and(|source| source.ensure_source_unchanged().is_err())
+            {
+                doc.cancel_structural_edit();
+                doc.invalidate_changed_source();
+                let _ = self.sync_fd_leases();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+        }
+        let temp_open_fd = self
+            .fd_budget
+            .try_reserve(FdCategory::ActiveDocument, 1)
+            .map_err(|error| AppMessage::warning(error.to_string()))?;
+        let index_job_fd = if output_index.is_none() {
+            Some(
+                self.fd_budget
+                    .try_reserve(FdCategory::BackgroundJob, 1)
+                    .map_err(|error| AppMessage::warning(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let replacement = self
+            .prepare_materialized_document(&destination, options, encoding, output_index)
+            .map_err(AppMessage::error)?;
+        let Some(StructuralJob::DuplicatePreview {
+            summary,
+            selected_columns,
+            undo,
+        }) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+            .and_then(|doc| doc.structural_job.take())
+        else {
+            return Err(AppMessage::warning(
+                "No duplicate preview is awaiting confirmation.",
+            ));
+        };
+        let notice = format!(
+            "Removed {} extra duplicate row{}. Save to keep the change, or discard changes.",
+            summary.duplicate_rows,
+            if summary.duplicate_rows == 1 { "" } else { "s" }
+        );
+        self.install_prepared_working_copy(
+            id,
+            replacement,
+            MaterializedWorkingCopy {
+                path: summary.destination,
+                output_index: None,
+                undo,
+                selected_columns,
+                notice: notice.clone(),
+            },
+            index_job_fd,
+        );
+        drop(temp_open_fd);
+        let _ = self.sync_fd_leases();
+        Ok(notice)
+    }
+
+    /// Cancels a pending `DuplicatePreview` or active structural job on tab `id`.
+    pub fn cancel_structural_edit(&mut self, id: DocumentId) {
+        if let Some(doc) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+        {
+            doc.cancel_structural_edit();
+        }
+        let _ = self.sync_fd_leases();
+    }
+
+    /// Confirms a deferred split materialization whose temporary storage estimate exceeded the
+    /// storage-review threshold.
+    pub fn confirm_pending_materialization(&mut self, id: DocumentId) -> Result<(), AppMessage> {
+        let Some(doc) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+        else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let Some((transformation, selected_columns, _)) = doc.pending_materialization.take() else {
+            return Ok(());
+        };
+        let result = doc.begin_materialization(transformation, selected_columns);
+        let _ = self.sync_fd_leases();
+        result
+    }
+
+    /// Dismisses a deferred split materialization without modifying the document.
+    pub fn cancel_pending_materialization(&mut self, id: DocumentId) {
+        if let Some(doc) = self
+            .tabs
+            .get_mut(&id)
+            .and_then(|slot| slot.tab.document.as_mut())
+        {
+            doc.pending_materialization = None;
+            doc.structural_status = Some("Split cancelled. The document was not changed.".into());
+        }
     }
 
     fn assign_tab_to_window_list(&mut self, target_window: WindowId, id: DocumentId) {
