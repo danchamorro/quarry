@@ -158,8 +158,18 @@ impl QuarryWindow {
                             .update(cx, |table, cx| table.scroll_to_row(0, cx));
                         this.row_input
                             .update(cx, |state, cx| state.set_value("1", window, cx));
+                        let visible_rows = this.table.read(cx).delegate().visible_rows_count();
                         let res = this.controller.update(cx, |controller, cx| {
-                            controller.clear_filter_active(this.window_id, cx)
+                            let cleared = controller.clear_filter_active(this.window_id, cx);
+                            if cleared.is_ok() {
+                                controller.request_viewport_rows(
+                                    this.window_id,
+                                    0,
+                                    visible_rows,
+                                    cx,
+                                );
+                            }
+                            cleared
                         });
                         if let Err(error) = res {
                             this.set_message(AppMessage::error(error), cx);
