@@ -2301,7 +2301,7 @@ impl WorkbenchScheduler {
             let advancing_split_analysis = matches!(
                 doc.structural_job,
                 Some(StructuralJob::AnalyzingSplit { .. })
-            );
+            ) && !doc.structural_cancel_requested;
             if advancing_split_analysis {
                 // `poll_structural_edit()` can transition a completed split analysis directly into
                 // `begin_materialization()`, which allocates `original_session` and working-copy

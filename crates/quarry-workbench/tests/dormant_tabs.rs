@@ -2344,4 +2344,52 @@ fn pending_split_blocks_concurrent_edits_and_workers_enforce_fd_budget() {
         "deferred split must complete once FDs are available"
     );
     assert!(split_sched.fd_budget().snapshot().peak_reserved < 8);
+
+    // Also verify a cancelled split analysis collects cleanly without reserving materialization FDs.
+    let mut cancel_sched = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_process_fds: 8,
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    let cids = cancel_sched
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [dir.path().join("split-fd.csv")],
+            open_options(),
+            None,
+        )
+        .unwrap();
+    finish_active_indexing(&mut cancel_sched, cids[0]);
+    cancel_sched
+        .with_reserved_job_fds(
+            cids[0],
+            2,
+            true,
+            |doc| doc.start_split(0, b"-".to_vec()),
+            |e| quarry_workbench::AppMessage::warning(e.to_string()),
+        )
+        .unwrap();
+    let cancel_blocker = cancel_sched
+        .fd_budget()
+        .try_reserve(FdCategory::BackgroundJob, 4)
+        .unwrap();
+    assert_eq!(cancel_sched.fd_budget().snapshot().total_reserved, 7);
+    cancel_sched.cancel_structural_edit(cids[0]);
+    let mut cancel_collected = false;
+    for _ in 0..400 {
+        let done = cancel_sched.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == cids[0]) {
+            assert!(comp.result.is_ok());
+            cancel_collected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        cancel_collected,
+        "cancelled split analysis must finish without reserving materialization FDs"
+    );
+    drop(cancel_blocker);
 }
