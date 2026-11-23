@@ -1,11 +1,21 @@
-//! Quarry's design tokens: the palette, typography, and shared frames.
+//! Quarry's egui design-token adapter: palette conversion, typography, and shared frames.
 //!
-//! Quarry has one light appearance, whatever the system setting. Every surface
-//! reads colors from [`ui_palette`] or [`ctx_palette`]. Brand amber is reserved
+//! Semantic RGBA tokens live in [`quarry_workbench::theme`] so all frontends share one
+//! source of truth. Quarry has one light appearance, whatever the system setting. Every
+//! surface reads colors from [`ui_palette`] or [`ctx_palette`]. Brand amber is reserved
 //! for selection, focus, and primary actions.
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
+use quarry_workbench::theme as tokens;
 
-/// Quarry's semantic colors.
+const fn color32(color: tokens::Rgba) -> Color32 {
+    assert!(
+        color.a == 255,
+        "opaque semantic theme tokens require alpha == 255"
+    );
+    Color32::from_rgb(color.r, color.g, color.b)
+}
+
+/// Quarry's semantic colors adapted to [`Color32`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Palette {
     /// Window chrome: title bar, toolbar, status bar.
@@ -49,36 +59,42 @@ pub(super) struct Palette {
     pub indicator_stroke: Color32,
 }
 
-/// Brand amber.
-pub(super) const ACCENT: Color32 = Color32::from_rgb(233, 196, 106);
+impl Palette {
+    const fn from_tokens(palette: &tokens::Palette) -> Self {
+        Self {
+            chrome: color32(palette.chrome),
+            separator: color32(palette.separator),
+            canvas: color32(palette.canvas),
+            zebra: color32(palette.zebra),
+            grid_line: color32(palette.grid_line),
+            header_fill: color32(palette.header_fill),
+            text: color32(palette.text),
+            text_secondary: color32(palette.text_secondary),
+            text_tertiary: color32(palette.text_tertiary),
+            hover: color32(palette.hover),
+            pressed: color32(palette.pressed),
+            control: color32(palette.control),
+            control_border: color32(palette.control_border),
+            selection: color32(palette.selection),
+            selection_strong: color32(palette.selection_strong),
+            on_accent: color32(palette.on_accent),
+            accent_text: color32(palette.accent_text),
+            error_text: color32(palette.error_text),
+            error_fill: color32(palette.error_fill),
+            warning_text: color32(palette.warning_text),
+            warning_fill: color32(palette.warning_fill),
+            success_text: color32(palette.success_text),
+            mark: color32(palette.mark),
+            indicator_fill: color32(palette.indicator_fill),
+            indicator_stroke: color32(palette.indicator_stroke),
+        }
+    }
+}
 
-pub(super) const LIGHT: Palette = Palette {
-    chrome: Color32::from_rgb(246, 245, 243),
-    separator: Color32::from_rgb(222, 220, 216),
-    canvas: Color32::from_rgb(255, 255, 255),
-    zebra: Color32::from_rgb(250, 249, 247),
-    grid_line: Color32::from_rgb(236, 234, 230),
-    header_fill: Color32::from_rgb(248, 247, 245),
-    text: Color32::from_rgb(29, 29, 27),
-    text_secondary: Color32::from_rgb(104, 102, 97),
-    text_tertiary: Color32::from_rgb(150, 147, 141),
-    hover: Color32::from_rgb(232, 230, 226),
-    pressed: Color32::from_rgb(220, 218, 213),
-    control: Color32::from_rgb(255, 255, 255),
-    control_border: Color32::from_rgb(211, 209, 204),
-    selection: Color32::from_rgb(252, 238, 200),
-    selection_strong: ACCENT,
-    on_accent: Color32::from_rgb(43, 33, 10),
-    accent_text: Color32::from_rgb(138, 96, 10),
-    error_text: Color32::from_rgb(178, 45, 35),
-    error_fill: Color32::from_rgb(253, 236, 233),
-    warning_text: Color32::from_rgb(128, 84, 0),
-    warning_fill: Color32::from_rgb(255, 245, 219),
-    success_text: Color32::from_rgb(29, 120, 74),
-    mark: Color32::from_rgb(150, 147, 141),
-    indicator_fill: Color32::from_rgb(111, 145, 150),
-    indicator_stroke: Color32::from_rgb(57, 77, 84),
-};
+/// Brand amber.
+pub(super) const ACCENT: Color32 = color32(tokens::ACCENT);
+
+pub(super) const LIGHT: Palette = Palette::from_tokens(&tokens::LIGHT);
 
 /// The palette for colors drawn inside `_ui`. Quarry is light only, so this is
 /// always [`LIGHT`]; call sites keep the `Ui` so they read like egui's own
@@ -93,7 +109,7 @@ pub(super) fn ctx_palette(_ctx: &egui::Context) -> &'static Palette {
 }
 
 /// Grid cell text. Proportional text reads like a document; whitespace marks stay visible.
-pub(super) const GRID_FONT_SIZE: f32 = 13.0;
+pub(super) const GRID_FONT_SIZE: f32 = tokens::GRID_FONT_SIZE;
 
 pub(super) fn grid_font() -> FontId {
     FontId::proportional(GRID_FONT_SIZE)
@@ -194,8 +210,8 @@ pub(super) fn tabular_extra_width(text: &str, padding: &DigitPadding) -> f32 {
 }
 
 /// Small enough that checkboxes stay square and never read as radio buttons.
-pub(super) const CONTROL_RADIUS: u8 = 4;
-pub(super) const WINDOW_RADIUS: u8 = 10;
+pub(super) const CONTROL_RADIUS: u8 = tokens::CONTROL_RADIUS;
+pub(super) const WINDOW_RADIUS: u8 = tokens::WINDOW_RADIUS;
 
 /// Loads the macOS system faces so Quarry reads like a native app.
 ///
@@ -481,6 +497,44 @@ pub(super) fn stat(ui: &mut egui::Ui, value: String, caption: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egui_light_palette_matches_workbench_tokens_byte_for_byte() {
+        let pairs = [
+            (ACCENT, tokens::ACCENT),
+            (LIGHT.chrome, tokens::LIGHT.chrome),
+            (LIGHT.separator, tokens::LIGHT.separator),
+            (LIGHT.canvas, tokens::LIGHT.canvas),
+            (LIGHT.zebra, tokens::LIGHT.zebra),
+            (LIGHT.grid_line, tokens::LIGHT.grid_line),
+            (LIGHT.header_fill, tokens::LIGHT.header_fill),
+            (LIGHT.text, tokens::LIGHT.text),
+            (LIGHT.text_secondary, tokens::LIGHT.text_secondary),
+            (LIGHT.text_tertiary, tokens::LIGHT.text_tertiary),
+            (LIGHT.hover, tokens::LIGHT.hover),
+            (LIGHT.pressed, tokens::LIGHT.pressed),
+            (LIGHT.control, tokens::LIGHT.control),
+            (LIGHT.control_border, tokens::LIGHT.control_border),
+            (LIGHT.selection, tokens::LIGHT.selection),
+            (LIGHT.selection_strong, tokens::LIGHT.selection_strong),
+            (LIGHT.on_accent, tokens::LIGHT.on_accent),
+            (LIGHT.accent_text, tokens::LIGHT.accent_text),
+            (LIGHT.error_text, tokens::LIGHT.error_text),
+            (LIGHT.error_fill, tokens::LIGHT.error_fill),
+            (LIGHT.warning_text, tokens::LIGHT.warning_text),
+            (LIGHT.warning_fill, tokens::LIGHT.warning_fill),
+            (LIGHT.success_text, tokens::LIGHT.success_text),
+            (LIGHT.mark, tokens::LIGHT.mark),
+            (LIGHT.indicator_fill, tokens::LIGHT.indicator_fill),
+            (LIGHT.indicator_stroke, tokens::LIGHT.indicator_stroke),
+        ];
+        for (egui_color, token_color) in pairs {
+            assert_eq!(egui_color.to_array(), token_color.to_array());
+        }
+        assert_eq!(GRID_FONT_SIZE, tokens::GRID_FONT_SIZE);
+        assert_eq!(CONTROL_RADIUS, tokens::CONTROL_RADIUS);
+        assert_eq!(WINDOW_RADIUS, tokens::WINDOW_RADIUS);
+    }
 
     #[test]
     fn tabular_digits_center_each_digit_and_keep_the_text() {
