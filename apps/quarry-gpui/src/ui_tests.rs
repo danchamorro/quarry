@@ -1713,9 +1713,9 @@ fn inspect_recovery_temporary_storage_and_about_dialog_work_through_gpui_ui(
         })
     });
     let failed = batch_err
-        .failed_open
+        .inspection_target
         .as_ref()
-        .expect("multi-file open failure should retain failed_open target");
+        .expect("multi-file open failure should retain inspection_target");
     assert_eq!(failed.path, missing_batch_file);
     assert_eq!(failed.encoding, Some(quarry_core::Encoding::Utf8));
     assert_eq!(failed.options.header_mode, HeaderMode::FirstRow);
