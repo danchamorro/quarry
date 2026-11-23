@@ -1317,6 +1317,9 @@ fn doc_into_dormant_parts(doc: &mut Document) -> Result<DormantPrep, SchedulerEr
     let encoding = Some(doc.session.encoding());
     let canonical_path = canonicalize_best_effort(&doc.logical_path);
     let source_guard = if doc.compressed.is_some() {
+        if doc.session.ensure_compressed_source_unchanged().is_err() {
+            doc.source_changed = true;
+        }
         SourceGuard::capture_path(&doc.logical_path).unwrap_or_else(|_| doc.session.source_guard())
     } else if let Some(original) = doc.original_session.as_ref() {
         original.source_guard()
@@ -1594,6 +1597,8 @@ fn wake_dormant_document(
             session,
             compressed,
         } => {
+            let compressed_unchanged =
+                source_unchanged && session.ensure_compressed_source_unchanged().is_ok();
             let mut doc = Document::from_arc_session(session, &dormant.logical_path);
             doc.compressed = Some(compressed);
             apply_view_snapshot(
@@ -1603,7 +1608,7 @@ fn wake_dormant_document(
                 working_cleanup,
                 decompression_slots,
             );
-            if !source_unchanged {
+            if !compressed_unchanged {
                 doc.source_changed = true;
                 return Ok((
                     doc,

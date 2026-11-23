@@ -1085,3 +1085,40 @@ fn filtered_wake_preserves_selection_and_pending_materialization_pins_tab() {
     );
     assert_eq!(doc.scroll_points, 42.5);
 }
+
+#[test]
+fn gzip_source_replaced_before_demotion_still_surfaces_conflict_on_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let gz = write_gzip_csv(dir.path(), "mutated-before-demote.csv.gz", 20);
+    let plain = write_csv(dir.path(), "other.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [gz, plain], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Replace the gzip source AFTER decompression finishes, BEFORE demoting to dormant.
+    write_gzip_csv(dir.path(), "mutated-before-demote.csv.gz", 35);
+
+    // Demote, then wake: must detect the mismatch against the original compressed backing.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    let wake = scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    assert!(matches!(wake, WakeOutcome::SourceChangedConflict { .. }));
+    assert!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .source_changed
+    );
+}

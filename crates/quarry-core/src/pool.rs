@@ -145,7 +145,15 @@ pub fn raise_nofile_limit(target_soft: u64) -> NofileLimitStatus {
         let before = rustix::process::getrlimit(rustix::process::Resource::Nofile);
         let previous_soft = before.current;
         let hard_limit = before.maximum;
-        let current = previous_soft.unwrap_or(0);
+        // `None` represents RLIM_INFINITY (unlimited); never lower an unlimited soft limit.
+        let Some(current) = previous_soft else {
+            return NofileLimitStatus {
+                previous_soft,
+                current_soft: previous_soft,
+                hard_limit,
+                raised: false,
+            };
+        };
         let capped_target = match hard_limit {
             Some(hard) => target_soft.min(hard),
             None => target_soft,
