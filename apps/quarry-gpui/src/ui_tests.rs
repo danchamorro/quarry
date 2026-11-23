@@ -2082,6 +2082,7 @@ fn two_hundred_tabs_across_four_windows_stay_bounded_and_preserve_dirty_work(
         WorkbenchController::reset_for_test(
             cx,
             WorkbenchSchedulerConfig {
+                max_hydrated_tabs: 4,
                 index_cache_enabled: false,
                 ..WorkbenchSchedulerConfig::default()
             },
