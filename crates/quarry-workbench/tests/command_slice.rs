@@ -15,14 +15,16 @@ fn open_indexed_document(contents: &[u8]) -> (tempfile::TempDir, Document) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("slice.csv");
     fs::write(&path, contents).unwrap();
-    let mut doc = Document::open(
+    let mut doc = Document::prepare_with_encoding(
         &path,
         OpenOptions {
             header_mode: HeaderMode::FirstRow,
             ..Default::default()
         },
+        None,
     )
     .unwrap();
+    doc.start_indexing().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while doc.job.is_some() {
         assert!(Instant::now() < deadline, "index timed out");
