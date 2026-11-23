@@ -1992,6 +1992,13 @@ impl Session {
             .map(|backing| backing.compressed_size())
     }
 
+    /// OS file identity of the original compressed source file (if compressed).
+    pub fn compressed_source_file_identity(&self) -> Option<crate::FileIdentity> {
+        self.compressed
+            .as_ref()
+            .and_then(|backing| backing.source_stamp.file_identity())
+    }
+
     /// Confirm the compressed source still matches the version decompressed.
     pub fn ensure_compressed_source_unchanged(&self) -> Result<(), QuarryError> {
         match &self.compressed {

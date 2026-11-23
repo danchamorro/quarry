@@ -377,6 +377,11 @@ impl Document {
 
     /// Builds the view over an opened session; no worker starts here.
     pub fn from_session(session: Session, path: &Path) -> Self {
+        Self::from_arc_session(Arc::new(session), path)
+    }
+
+    /// Builds the view over a shared session (used when waking dormant dirty or compressed tabs).
+    pub fn from_arc_session(session: Arc<Session>, path: &Path) -> Self {
         let buffer_rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS;
         let data_start = u64::from(session.dialect.has_header);
         let total_columns = session
@@ -406,7 +411,7 @@ impl Document {
         };
 
         Self {
-            session: Arc::new(session),
+            session,
             compressed: None,
             logical_path: path.to_path_buf(),
             pending_diagnostic: None,

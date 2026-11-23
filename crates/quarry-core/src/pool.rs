@@ -128,6 +128,92 @@ pub(crate) fn cap_single_run_budget_for_ram(requested: usize, physical_ram: Opti
     }
 }
 
+/// Result of attempting to raise the process soft file-descriptor limit (`RLIMIT_NOFILE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NofileLimitStatus {
+    pub previous_soft: Option<u64>,
+    pub current_soft: Option<u64>,
+    pub hard_limit: Option<u64>,
+    pub raised: bool,
+}
+
+/// Raises the process soft `RLIMIT_NOFILE` toward `target_soft` (capped by the hard limit)
+/// without ever lowering an already higher soft limit.
+pub fn raise_nofile_limit(target_soft: u64) -> NofileLimitStatus {
+    #[cfg(unix)]
+    {
+        let before = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let previous_soft = before.current;
+        let hard_limit = before.maximum;
+        // `None` represents RLIM_INFINITY (unlimited); never lower an unlimited soft limit.
+        let Some(current) = previous_soft else {
+            return NofileLimitStatus {
+                previous_soft,
+                current_soft: previous_soft,
+                hard_limit,
+                raised: false,
+            };
+        };
+        let capped_target = match hard_limit {
+            Some(hard) => target_soft.min(hard),
+            None => target_soft,
+        };
+        if capped_target <= current {
+            return NofileLimitStatus {
+                previous_soft,
+                current_soft: previous_soft,
+                hard_limit,
+                raised: false,
+            };
+        }
+
+        // On macOS, raising toward an unlimited hard limit can fail with EINVAL if above
+        // OPEN_MAX (10,240); fall back to 10,240 before giving up.
+        #[cfg(target_os = "macos")]
+        let fallback = (capped_target > 10_240).then(|| 10_240.max(current));
+        #[cfg(not(target_os = "macos"))]
+        let fallback = None;
+        let attempts = [Some(capped_target), fallback];
+        for desired in attempts.into_iter().flatten() {
+            if desired <= current {
+                continue;
+            }
+            let updated = rustix::process::Rlimit {
+                current: Some(desired),
+                maximum: hard_limit,
+            };
+            if rustix::process::setrlimit(rustix::process::Resource::Nofile, updated).is_ok() {
+                let after = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+                return NofileLimitStatus {
+                    previous_soft,
+                    current_soft: after.current,
+                    hard_limit: after.maximum,
+                    raised: after.current.unwrap_or(0) > current,
+                };
+            }
+        }
+
+        let after = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        NofileLimitStatus {
+            previous_soft,
+            current_soft: after.current,
+            hard_limit: after.maximum,
+            raised: after.current.unwrap_or(0) > current,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = target_soft;
+        NofileLimitStatus {
+            previous_soft: None,
+            current_soft: None,
+            hard_limit: None,
+            raised: false,
+        }
+    }
+}
+
 /// Safe concurrent file-descriptor ceiling for merge groups, staying well beneath macOS's 256 soft limit.
 pub(crate) fn default_fd_budget_limit() -> usize {
     #[cfg(unix)]

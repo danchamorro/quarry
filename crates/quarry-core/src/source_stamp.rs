@@ -28,6 +28,86 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// OS-level file identity (`(dev, ino)` on Unix, `(volume_serial, file_id)` on Windows)
+/// retained by dormant tab stubs without keeping an open file descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+}
+
+impl FileIdentity {
+    /// Captures file identity for an existing regular file path without keeping it open.
+    pub fn from_path(path: &Path) -> io::Result<Option<Self>> {
+        let file = open_regular_file(path)?;
+        let stamp = SourceStamp::from_file(&file)?;
+        Ok(stamp.file_identity())
+    }
+
+    #[cfg(unix)]
+    pub const fn device(&self) -> u64 {
+        self.device
+    }
+
+    #[cfg(unix)]
+    pub const fn inode(&self) -> u64 {
+        self.inode
+    }
+}
+
+/// Snapshot of a source file's identity and modification metadata used to detect
+/// external changes while a document tab is dormant without holding an open file handle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceGuard {
+    stamp: SourceStamp,
+}
+
+impl SourceGuard {
+    pub(crate) fn from_stamp(stamp: SourceStamp) -> Self {
+        Self { stamp }
+    }
+
+    /// Captures a guard for an existing regular file path and closes the descriptor immediately.
+    pub fn capture_path(path: &Path) -> io::Result<Self> {
+        let file = open_regular_file(path)?;
+        let stamp = SourceStamp::from_file(&file)?;
+        Ok(Self { stamp })
+    }
+
+    /// Returns `Ok(true)` when `path` still refers to the same unchanged regular file.
+    /// Returns `Ok(false)` when the file changed, was replaced, or is missing/non-regular.
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        let file = match open_regular_file(path) {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let observed = SourceStamp::from_file(&file)?;
+        Ok(self.stamp.matches(&observed))
+    }
+
+    pub fn file_identity(&self) -> Option<FileIdentity> {
+        self.stamp.file_identity()
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.stamp.file_size()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceStamp {
     len: u64,
@@ -71,6 +151,27 @@ impl SourceStamp {
 
     pub(crate) fn file_size(&self) -> u64 {
         self.len
+    }
+
+    pub(crate) fn file_identity(&self) -> Option<FileIdentity> {
+        #[cfg(unix)]
+        {
+            Some(FileIdentity {
+                device: self.device,
+                inode: self.inode,
+            })
+        }
+        #[cfg(windows)]
+        {
+            self.windows.map(|version| FileIdentity {
+                volume_serial: version.identity.0,
+                file_id: version.identity.1,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
     }
 
     pub(crate) fn from_file(file: &File) -> io::Result<Self> {
