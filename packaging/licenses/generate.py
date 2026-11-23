@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = ROOT / "packaging/licenses"
 TARGET = "aarch64-apple-darwin"
 VERSION = "0.9.2"
-RUST_RELEASE = "1.88.0"
+RUST_RELEASE = "1.100.0"
 STATUS = "collected"
 ARTIFACT = HERE / "THIRD_PARTY_NOTICES.html"
 MANIFEST = HERE / "manifest.json"
@@ -147,7 +147,7 @@ def render(raw):
              "<h2>Tool fallback inventory</h2><p>The following tool-selected notices had no source file or contained a generic placeholder. Placeholder texts have been omitted. The supplemental section preserves source permissions and copyright statements collected during review; packaging/licenses/AUDIT.md records their coverage and remaining questions.</p><ul>"]
     for kind, users, reason in sorted(gaps):
         parts.append(f"<li>{esc(', '.join(users))}: {esc(kind)}. {esc(reason)}.</li>")
-    parts += ["</ul><p>Rust 1.88.0 standard-library and compiler-runtime notices are provided separately in the adjacent Rust directory, including upstream copyright, license, and backtrace notices. Other toolchains, architectures, and operating systems need their own inventories. See packaging/licenses/AUDIT.md in the source repository for the review evidence.</p>",
+    parts += ["</ul><p>Rust 1.100.0 standard-library and compiler-runtime notices are provided separately in the adjacent Rust directory, including upstream copyright, license, and backtrace notices. Other toolchains, architectures, and operating systems need their own inventories. See packaging/licenses/AUDIT.md in the source repository for the review evidence.</p>",
               "<h2>Collected source notices</h2>"]
     for kind, users, source, original in sorted(sections):
         parts.append(f"<h3>{esc(kind)}: {esc(', '.join(users))}</h3><p>Source: {esc(source)}</p><pre>{esc(original)}</pre>")
