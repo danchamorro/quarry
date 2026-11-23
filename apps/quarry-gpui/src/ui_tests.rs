@@ -1995,6 +1995,37 @@ cyan = "#449dab"
         assert!(quarry_workbench::palette_meets_wcag_aa(&updated.palette));
     })
     .unwrap();
+
+    // If a new generation is observed while colors.toml is temporarily missing, fallback occurs
+    // without caching that generation, so the next poll recovers once colors.toml reappears.
+    std::fs::remove_file(omarchy_dir.join("colors.toml")).unwrap();
+    std::fs::write(
+        home.path()
+            .join(".local/state/omarchy/current/theme.generation"),
+        "gen-3\n",
+    )
+    .unwrap();
+    cx.update(|cx| {
+        let fallback = controller
+            .update(cx, |c, cx| c.reload_omarchy_theme_now(cx))
+            .expect("missing colors.toml should transition to fallback");
+        assert!(fallback.warning.is_some());
+    });
+    std::fs::write(
+        omarchy_dir.join("colors.toml"),
+        "mode = \"dark\"\nbackground = \"#1a1b26\"\nforeground = \"#c0caf5\"\naccent = \"#7aa2f7\"\n",
+    )
+    .unwrap();
+    cx.update(|cx| {
+        let recovered = controller
+            .update(cx, |c, cx| c.reload_omarchy_theme_now(cx))
+            .expect("subsequent reload should recover once colors.toml is ready");
+        assert!(recovered.warning.is_none());
+        assert_eq!(
+            recovered.palette.canvas,
+            quarry_workbench::Rgba::rgb(0x1a, 0x1b, 0x26)
+        );
+    });
 }
 
 #[gpui_kit::test]

@@ -242,7 +242,9 @@ impl WorkbenchController {
             system_appearance,
             theme_home.as_deref(),
         );
-        let omarchy_fingerprint = if theme_prefs.preference == ThemePreference::Omarchy {
+        let omarchy_fingerprint = if theme_prefs.preference == ThemePreference::Omarchy
+            && resolved_theme.warning.is_none()
+        {
             theme_home.as_deref().and_then(omarchy_theme_fingerprint)
         } else {
             None
@@ -403,13 +405,14 @@ impl WorkbenchController {
         );
         self.resolved_theme = resolved.clone();
         self.omarchy_last_check = Instant::now();
-        self.omarchy_fingerprint = if preference == ThemePreference::Omarchy {
-            self.theme_home
-                .as_deref()
-                .and_then(omarchy_theme_fingerprint)
-        } else {
-            None
-        };
+        self.omarchy_fingerprint =
+            if preference == ThemePreference::Omarchy && resolved.warning.is_none() {
+                self.theme_home
+                    .as_deref()
+                    .and_then(omarchy_theme_fingerprint)
+            } else {
+                None
+            };
         cx.notify();
         Ok(resolved)
     }
@@ -456,15 +459,19 @@ impl WorkbenchController {
             .theme_home
             .as_deref()
             .and_then(omarchy_theme_fingerprint);
-        if next_fp == self.omarchy_fingerprint {
+        if self.resolved_theme.warning.is_none() && next_fp == self.omarchy_fingerprint {
             return None;
         }
-        self.omarchy_fingerprint = next_fp;
         let resolved = resolve_theme(
             ThemePreference::Omarchy,
             self.system_appearance,
             self.theme_home.as_deref(),
         );
+        self.omarchy_fingerprint = if resolved.warning.is_none() {
+            next_fp
+        } else {
+            None
+        };
         if resolved != self.resolved_theme {
             self.resolved_theme = resolved.clone();
             cx.notify();
