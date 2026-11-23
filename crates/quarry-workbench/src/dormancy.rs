@@ -1552,6 +1552,7 @@ impl WorkbenchScheduler {
             .map_err(SchedulerError::OpenFailed)?;
 
         if was_hydrated {
+            let tick = self.next_tick();
             if let Some(slot) = self.tabs.get_mut(&id) {
                 if let Some(doc) = slot.tab.document.as_mut() {
                     doc.shutdown();
@@ -1561,10 +1562,10 @@ impl WorkbenchScheduler {
                 slot.tab.encoding_mode = encoding;
                 slot.tab.notice = None;
                 slot.tab.footer_status = None;
-                slot.owner_window = window;
+                slot.window = window;
+                slot.last_used_tick = tick;
             }
             self.active_by_window.insert(window, id);
-            self.touch_lru(id);
             let _ = self.sync_fd_leases();
             return Ok(WakeOutcome::Ready {
                 document_id: id,
@@ -1817,9 +1818,9 @@ impl WorkbenchScheduler {
                     let options = OpenOptions {
                         delimiter: Some(dialect.delimiter),
                         header_mode: if dialect.has_header {
-                            HeaderMode::FirstRow
+                            quarry_core::HeaderMode::FirstRow
                         } else {
-                            HeaderMode::NoHeader
+                            quarry_core::HeaderMode::NoHeader
                         },
                         ..OpenOptions::default()
                     };
