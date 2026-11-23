@@ -89,6 +89,13 @@ impl FindBar {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn focus_replace_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.open {
             self.open = false;
@@ -191,6 +198,12 @@ impl Render for FindBar {
 
         div()
             .id("find-replace-bar")
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .flex()
             .flex_col()
             .gap_1p5()

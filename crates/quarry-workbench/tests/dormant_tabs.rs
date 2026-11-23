@@ -2087,14 +2087,17 @@ fn scheduler_polls_search_filtered_export_sort_cleanup_and_duplicate_removal() {
         .unwrap()
         .start_find_duplicates_target(DuplicateTarget::AllFields, CaseSensitivity::Sensitive)
         .unwrap();
+    let mut dup_preview_ready = false;
     for _ in 0..400 {
         let done = scheduler.poll_structural_edits();
-        if !done.is_empty() {
-            assert!(done[0].result.is_ok());
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == ids[0]) {
+            assert!(comp.result.is_ok());
+            dup_preview_ready = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(dup_preview_ready, "duplicate preview must complete");
     let notice = scheduler.confirm_duplicate_removal(ids[0]).unwrap();
     assert!(notice.contains("Removed 1 extra duplicate"));
     finish_active_indexing(&mut scheduler, ids[0]);
@@ -2109,10 +2112,11 @@ fn scheduler_polls_search_filtered_export_sort_cleanup_and_duplicate_removal() {
         3
     );
 
-    // 5. Numeric Sort via poll_structural_edits orders rows ascending by score (10, 20, 30).
+    // 5. Numeric Sort (Descending) via poll_structural_edits must actually reorder rows
+    // (30, 20, 10) rather than matching the already-ascending dedup order.
     let plan = quarry_core::SortPlan::from(quarry_core::SortSpec {
         column: 1,
-        direction: quarry_core::SortDirection::Ascending,
+        direction: quarry_core::SortDirection::Descending,
         mode: quarry_core::SortMode::Number,
         case_sensitivity: CaseSensitivity::Insensitive,
     });
@@ -2124,16 +2128,136 @@ fn scheduler_polls_search_filtered_export_sort_cleanup_and_duplicate_removal() {
         .unwrap()
         .start_sort_plan(plan)
         .unwrap();
+    let mut sort_completed = false;
     for _ in 0..400 {
         let done = scheduler.poll_structural_edits();
-        if !done.is_empty() {
-            assert!(done[0].result.is_ok());
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == ids[0]) {
+            assert!(comp.result.is_ok());
+            sort_completed = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(
+        sort_completed,
+        "sort must complete before asserting row order"
+    );
     let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
-    assert_eq!(doc.effective_cell(1, 0), Some(b"alpha".as_slice()));
+    assert_eq!(doc.effective_cell(1, 0), Some(b"zebra".as_slice()));
     assert_eq!(doc.effective_cell(2, 0), Some(b"beta".as_slice()));
-    assert_eq!(doc.effective_cell(3, 0), Some(b"zebra".as_slice()));
+    assert_eq!(doc.effective_cell(3, 0), Some(b"alpha".as_slice()));
+}
+
+#[test]
+fn pending_split_blocks_concurrent_edits_and_workers_enforce_fd_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let path = dir.path().join("split-fd.csv");
+    fs::write(&path, "a,b\n1-2,x\n3-4,y\n").unwrap();
+
+    // Cap of 3 FDs => at most 2 simultaneous FDs (1 active doc + 1 free).
+    // Starting a structural edit (needs +1 doc for original_session, +1 temp dir, +2 job)
+    // must fail cleanly before spawning a worker or modifying document state.
+    let mut tight = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_process_fds: 3,
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    let ids = tight
+        .open_many_lazy(WindowId::PRIMARY, [path.clone()], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut tight, ids[0]);
+    assert_eq!(tight.fd_budget().snapshot().total_reserved, 1);
+
+    let err = tight.with_reserved_job_fds(
+        ids[0],
+        2,
+        true,
+        |doc| doc.start_split(0, b"-".to_vec()),
+        |e| quarry_workbench::AppMessage::warning(e.to_string()),
+    );
+    assert!(
+        err.is_err(),
+        "tight FD budget must reject structural worker"
+    );
+    assert_eq!(tight.fd_budget().snapshot().total_reserved, 1);
+    assert!(
+        tight
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .structural_job
+            .is_none()
+    );
+
+    // Now test pending Split materialization isolation with ample FD budget.
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        working_directory: scratch.path().to_path_buf(),
+        custom_working_directory: true,
+        index_cache_enabled: false,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [path], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Simulate Split awaiting storage confirmation.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.pending_materialization = Some((
+            ColumnTransformation::Split {
+                source_column: 0,
+                separator: b"-".to_vec(),
+                output_count: 2,
+                output_headers: None,
+            },
+            std::collections::BTreeSet::from([0]),
+            3,
+        ));
+    }
+
+    // Starting Sort while Split awaits confirmation must be blocked.
+    let plan = quarry_core::SortPlan::from(quarry_core::SortSpec {
+        column: 0,
+        direction: quarry_core::SortDirection::Ascending,
+        mode: quarry_core::SortMode::Text,
+        case_sensitivity: CaseSensitivity::Insensitive,
+    });
+    let sort_err = scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_sort_plan(plan)
+        .unwrap_err();
+    assert!(sort_err.text.contains("pending split"));
+
+    // Confirming Split while a filter is active must reject WITHOUT consuming pending_materialization.
+    let query = FilterQuery::single(1, FilterOperator::Contains, b"x".to_vec());
+    scheduler.start_filter(ids[0], query).unwrap();
+    finish_active_filter(&mut scheduler, ids[0]);
+    let confirm_err = scheduler.confirm_pending_materialization(ids[0]);
+    assert!(confirm_err.is_err());
+    assert!(
+        scheduler
+            .tab(ids[0])
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .pending_materialization
+            .is_some(),
+        "rejected confirmation must preserve pending_materialization"
+    );
 }

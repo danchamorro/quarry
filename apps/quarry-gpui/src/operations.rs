@@ -2,7 +2,7 @@
 //! Find & Remove Duplicates, Cleanup Selected Columns, Insert Rows/Columns, Move Columns,
 //! Split Column, and Combine Columns.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gpui_kit::component::{
     ActiveTheme, Disableable, IndexPath, Sizable, WindowExt,
@@ -107,14 +107,30 @@ struct SortLevelState {
 }
 
 struct SortDialogState {
+    controller: Entity<WorkbenchController>,
+    window_id: WindowId,
     headers: Vec<String>,
     levels: Vec<SortLevelState>,
     next_level_id: usize,
     match_case: bool,
+    date_suggestions: BTreeMap<usize, Vec<DateTimeFormat>>,
     error: Option<String>,
 }
 
 impl SortDialogState {
+    fn ensure_date_suggestions(&mut self, col_idx: usize, cx: &mut Context<Self>) {
+        if self.date_suggestions.contains_key(&col_idx) {
+            return;
+        }
+        let formats = self
+            .controller
+            .read(cx)
+            .suggest_date_time_formats(self.window_id, col_idx)
+            .map(|s| s.matching_formats)
+            .unwrap_or_default();
+        self.date_suggestions.insert(col_idx, formats);
+    }
+
     fn add_level(&mut self, initial_col: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.levels.len() >= 16 {
             return;
@@ -129,16 +145,30 @@ impl SortDialogState {
             window,
             cx,
         );
+        let mode_for_col = mode.clone();
+        let col_for_mode = col.clone();
         let subs = vec![
             cx.subscribe_in(
                 &col,
                 window,
-                |_, _, _: &SelectEvent<SearchableVec<Choice>>, _, cx| cx.notify(),
+                move |this, col_ent, _: &SelectEvent<SearchableVec<Choice>>, _, cx| {
+                    if *mode_for_col.read(cx).selected_value().unwrap_or(&0) == 2 {
+                        let col_idx = *col_ent.read(cx).selected_value().unwrap_or(&0);
+                        this.ensure_date_suggestions(col_idx, cx);
+                    }
+                    cx.notify();
+                },
             ),
             cx.subscribe_in(
                 &mode,
                 window,
-                |_, _, _: &SelectEvent<SearchableVec<Choice>>, _, cx| cx.notify(),
+                move |this, mode_ent, _: &SelectEvent<SearchableVec<Choice>>, _, cx| {
+                    if *mode_ent.read(cx).selected_value().unwrap_or(&0) == 2 {
+                        let col_idx = *col_for_mode.read(cx).selected_value().unwrap_or(&0);
+                        this.ensure_date_suggestions(col_idx, cx);
+                    }
+                    cx.notify();
+                },
             ),
             cx.subscribe_in(
                 &direction,
@@ -224,12 +254,16 @@ pub fn open_sort_dialog(
         window_id,
         doc_id,
     } = target;
+    let ctrl_state = controller.clone();
     let state = cx.new(|cx| {
         let mut st = SortDialogState {
+            controller: ctrl_state,
+            window_id,
             headers,
             levels: Vec::new(),
             next_level_id: 1,
             match_case: false,
+            date_suggestions: BTreeMap::new(),
             error: None,
         };
         st.add_level(initial_col, window, cx);
@@ -266,10 +300,10 @@ pub fn open_sort_dialog(
                         let mode_idx = *lvl.mode.read(cx).selected_value().unwrap_or(&0);
                         let col_idx = *lvl.column.read(cx).selected_value().unwrap_or(&0);
                         let suggestions = if mode_idx == 2 {
-                            ctrl_view
-                                .read(cx)
-                                .suggest_date_time_formats(window_id, col_idx)
-                                .map(|s| s.matching_formats)
+                            st_read
+                                .date_suggestions
+                                .get(&col_idx)
+                                .cloned()
                                 .unwrap_or_default()
                         } else {
                             Vec::new()
@@ -289,11 +323,15 @@ pub fn open_sort_dialog(
 
                 let st_add = st_view.clone();
                 let st_case = st_view.clone();
-                content
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(level_rows.into_iter().map(
+                content.child(
+                    div()
+                        .id("sort-levels-scroll")
+                        .max_h(px(360.))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(level_rows.into_iter().map(
                         |(ix, id, col, mode, dir, date_fmt, mode_idx, suggestions)| {
                             let st_rm = st_view.clone();
                             let uses_column = mode_idx < 4;
@@ -462,10 +500,19 @@ pub fn open_sort_dialog(
                                     .disabled(level_count >= 16)
                                     .on_click(move |_, window, cx| {
                                         st_add.update(cx, |s, cx| {
-                                            let next_col = s
+                                            let used: BTreeSet<usize> = s
                                                 .levels
-                                                .len()
-                                                .min(s.headers.len().saturating_sub(1));
+                                                .iter()
+                                                .map(|lvl| {
+                                                    *lvl.column
+                                                        .read(cx)
+                                                        .selected_value()
+                                                        .unwrap_or(&0)
+                                                })
+                                                .collect();
+                                            let next_col = (0..s.headers.len())
+                                                .find(|c| !used.contains(c))
+                                                .unwrap_or(0);
                                             s.add_level(next_col, window, cx);
                                         });
                                     }),
@@ -503,7 +550,8 @@ pub fn open_sort_dialog(
                                 .text_color(cx.theme().danger)
                                 .child(err),
                         )
-                    })
+                    }),
+                )
             })
             .footer(
                 div()
@@ -1430,9 +1478,11 @@ pub fn open_combine_columns_dialog(
         doc_id,
     } = target;
     let state = cx.new(|cx| {
-        let mut selected_order = initial_selected;
-        if selected_order.len() < 2 && headers.len() >= 2 {
-            selected_order = vec![0, 1];
+        let mut selected_order = Vec::new();
+        for col in initial_selected {
+            if col < headers.len() && !selected_order.contains(&col) {
+                selected_order.push(col);
+            }
         }
         CombineColumnsState {
             headers,
@@ -1451,7 +1501,7 @@ pub fn open_combine_columns_dialog(
         let on_closed_cb = on_closed.clone();
         dialog
             .title("Combine Columns")
-            .w(px(440.))
+            .w(px(460.))
             .overlay_closable(false)
             .close_button(true)
             .keyboard(true)
@@ -1461,6 +1511,23 @@ pub fn open_combine_columns_dialog(
                 let selected_order = st.selected_order.clone();
                 let sep_input = st.separator.clone();
                 let error = st.error.clone();
+                let order_preview = if selected_order.len() >= 2 {
+                    let parts: Vec<String> = selected_order
+                        .iter()
+                        .filter_map(|&c| headers.get(c).map(|h| format!("{}: {h}", c + 1)))
+                        .collect();
+                    let out_header = selected_order
+                        .first()
+                        .and_then(|&c| headers.get(c))
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    format!(
+                        "Join order: {} (output header: {out_header})",
+                        parts.join(" + ")
+                    )
+                } else {
+                    "Select at least 2 columns in the order they should be joined.".to_string()
+                };
                 content
                     .flex()
                     .flex_col()
@@ -1478,10 +1545,16 @@ pub fn open_combine_columns_dialog(
                             .border_color(cx.theme().border)
                             .rounded(px(6.))
                             .children(headers.into_iter().enumerate().map(|(col_ix, name)| {
-                                let is_checked = selected_order.contains(&col_ix);
+                                let order_pos = selected_order.iter().position(|&c| c == col_ix);
+                                let is_checked = order_pos.is_some();
+                                let label = if let Some(pos) = order_pos {
+                                    format!("[#{}] {}: {name}", pos + 1, col_ix + 1)
+                                } else {
+                                    format!("{}: {name}", col_ix + 1)
+                                };
                                 let st_col = st_view.clone();
                                 Checkbox::new(("combine-col", col_ix))
-                                    .label(format!("{}: {name}", col_ix + 1))
+                                    .label(label)
                                     .small()
                                     .checked(is_checked)
                                     .on_change(move |checked, _, cx| {
@@ -1493,10 +1566,18 @@ pub fn open_combine_columns_dialog(
                                             } else {
                                                 s.selected_order.retain(|&c| c != col_ix);
                                             }
+                                            s.error = None;
                                             cx.notify();
                                         });
                                     })
                             })),
+                    )
+                    .child(
+                        div()
+                            .id("combine-order-preview")
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(order_preview),
                     )
                     .child(
                         div()

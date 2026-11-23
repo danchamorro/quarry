@@ -147,7 +147,7 @@ pub struct WorkbenchController {
     windows: BTreeMap<WindowId, WindowHandle<Root>>,
     editing_windows: BTreeSet<WindowId>,
     viewport_read_seq: BTreeMap<DocumentId, u64>,
-    pending_reveal_cells: BTreeMap<WindowId, (u64, usize)>,
+    pending_reveal_cells: BTreeMap<DocumentId, (u64, usize)>,
     show_all_whitespace: bool,
     window_messages: BTreeMap<WindowId, AppMessage>,
     pending_review: Option<PendingReviewScope>,
@@ -686,6 +686,7 @@ impl WorkbenchController {
             };
         }
         self.viewport_read_seq.remove(&id);
+        self.pending_reveal_cells.remove(&id);
         cx.notify();
         Ok(())
     }
@@ -796,6 +797,9 @@ impl WorkbenchController {
             return Err(AppMessage::warning("Open a file first."));
         };
         let result = self.scheduler.apply_undo_redo(id, redo);
+        if result.is_ok() {
+            self.pending_reveal_cells.remove(&id);
+        }
         cx.notify();
         result
     }
@@ -809,6 +813,9 @@ impl WorkbenchController {
             return Err(AppMessage::warning("Open a file first."));
         };
         let result = self.scheduler.discard_tab_edits(id);
+        if result.is_ok() {
+            self.pending_reveal_cells.remove(&id);
+        }
         cx.notify();
         result
     }
@@ -928,24 +935,25 @@ impl WorkbenchController {
                 ));
             }
         }
-        let tab = self
-            .scheduler
-            .tab_mut(id)
-            .ok_or_else(|| AppMessage::warning("Open a file first."))?;
-        let doc = tab
-            .document
-            .as_mut()
-            .ok_or_else(|| AppMessage::warning("Open a file first."))?;
-        doc.commit_edits();
         let target_dest = destination.clone();
-        if encoding == Some(Encoding::Utf8) {
-            doc.start_save_operation_format(destination, true)?;
-        } else {
-            doc.start_save_operation(destination)?;
+        self.scheduler.with_reserved_job_fds(
+            id,
+            2,
+            false,
+            |doc| {
+                doc.commit_edits();
+                if encoding == Some(Encoding::Utf8) {
+                    doc.start_save_operation_format(destination, true)
+                } else {
+                    doc.start_save_operation(destination)
+                }
+            },
+            |err| AppMessage::warning(err.to_string()),
+        )?;
+        if let Some(tab) = self.scheduler.tab_mut(id) {
+            tab.write_destination = target_dest;
+            tab.notice = None;
         }
-        tab.write_destination = target_dest;
-        tab.notice = None;
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1027,6 +1035,7 @@ impl WorkbenchController {
 
         let _ = self.scheduler.close_tab(id);
         self.viewport_read_seq.remove(&id);
+        self.pending_reveal_cells.remove(&id);
         let empty_now = self.scheduler.tabs_in_window(window).is_empty();
         if empty_now && close_window_if_last && self.scheduler.close_window(window).is_ok() {
             self.pending_close_windows.push(window);
@@ -1224,6 +1233,7 @@ impl WorkbenchController {
                 let _ = self.scheduler.approve_tab_for_close(document_id);
                 let _ = self.scheduler.close_tab(document_id);
                 self.viewport_read_seq.remove(&document_id);
+                self.pending_reveal_cells.remove(&document_id);
                 if close_window_if_last
                     && self.scheduler.tabs_in_window(window_id).is_empty()
                     && self.scheduler.close_window(window_id).is_ok()
@@ -1500,7 +1510,17 @@ impl WorkbenchController {
     }
 
     pub fn take_pending_reveal_cell(&mut self, window: WindowId) -> Option<(u64, usize)> {
-        self.pending_reveal_cells.remove(&window)
+        let active_doc = self.scheduler.active_document(window)?;
+        self.pending_reveal_cells.remove(&active_doc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_pending_reveal_cell_for_test(
+        &mut self,
+        doc_id: DocumentId,
+        cell: (u64, usize),
+    ) {
+        self.pending_reveal_cells.insert(doc_id, cell);
     }
 
     pub fn select_row_active(
@@ -1593,14 +1613,22 @@ impl WorkbenchController {
         case_sensitivity: CaseSensitivity,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let Some(doc) = self.active_document_mut(window) else {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
-        doc.start_find_next_with_case(&query, case_sensitivity)?;
-        if let Some(cell) = doc.reveal_cell.take() {
-            self.pending_reveal_cells.insert(window, cell);
+        let reveal = self.scheduler.with_reserved_job_fds(
+            doc_id,
+            1,
+            false,
+            |doc| {
+                doc.start_find_next_with_case(&query, case_sensitivity)?;
+                Ok(doc.reveal_cell.take())
+            },
+            |err| err.to_string(),
+        )?;
+        if let Some(cell) = reveal {
+            self.pending_reveal_cells.insert(doc_id, cell);
         }
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1612,12 +1640,21 @@ impl WorkbenchController {
         case_sensitivity: CaseSensitivity,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let Some(doc) = self.active_document_mut(window) else {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
-        doc.start_find_previous_with_case(&query, case_sensitivity)?;
-        if let Some(cell) = doc.reveal_cell.take() {
-            self.pending_reveal_cells.insert(window, cell);
+        let reveal = self.scheduler.with_reserved_job_fds(
+            doc_id,
+            1,
+            false,
+            |doc| {
+                doc.start_find_previous_with_case(&query, case_sensitivity)?;
+                Ok(doc.reveal_cell.take())
+            },
+            |err| err.to_string(),
+        )?;
+        if let Some(cell) = reveal {
+            self.pending_reveal_cells.insert(doc_id, cell);
         }
         cx.notify();
         Ok(())
@@ -1634,15 +1671,20 @@ impl WorkbenchController {
         let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err("Open a file first.".into());
-        };
-        doc.replace_current_match_with_case(&query, &replacement, case_sensitivity)?;
-        if let Some(cell) = doc.reveal_cell.take() {
-            self.pending_reveal_cells.insert(window, cell);
+        let reveal = self.scheduler.with_reserved_job_fds(
+            doc_id,
+            1,
+            false,
+            |doc| {
+                doc.replace_current_match_with_case(&query, &replacement, case_sensitivity)?;
+                Ok(doc.reveal_cell.take())
+            },
+            |err| err.to_string(),
+        )?;
+        if let Some(cell) = reveal {
+            self.pending_reveal_cells.insert(doc_id, cell);
         }
         self.scheduler.revoke_tab_close_approval(doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1666,12 +1708,14 @@ impl WorkbenchController {
                 "The active document changed before Replace All started.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_replace_all_with_case(&query, &replacement, case_sensitivity)?;
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.start_replace_all_with_case(&query, &replacement, case_sensitivity),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(expected_doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1706,16 +1750,18 @@ impl WorkbenchController {
                 "That destination is already open or reserved in another tab.",
             ));
         }
-        let Some(tab) = self.scheduler.tab_mut(expected_doc_id) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        let Some(doc) = tab.document.as_mut() else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_filtered_export(destination.clone())?;
-        tab.write_destination = Some(destination);
-        tab.notice = None;
-        let _ = self.scheduler.sync_fd_leases();
+        let dest_for_tab = destination.clone();
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            false,
+            |doc| doc.start_filtered_export(destination),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
+        if let Some(tab) = self.scheduler.tab_mut(expected_doc_id) {
+            tab.write_destination = Some(dest_for_tab);
+            tab.notice = None;
+        }
         cx.notify();
         Ok(())
     }
@@ -1762,12 +1808,14 @@ impl WorkbenchController {
                 "The active document changed before Sort started.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_sort_plan(plan)?;
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.start_sort_plan(plan),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(expected_doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1790,11 +1838,13 @@ impl WorkbenchController {
                 "The active document changed before duplicate search started.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_find_duplicates_target(target, case_sensitivity)?;
-        let _ = self.scheduler.sync_fd_leases();
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.start_find_duplicates_target(target, case_sensitivity),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         cx.notify();
         Ok(())
     }
@@ -1809,6 +1859,7 @@ impl WorkbenchController {
         };
         let notice = self.scheduler.confirm_duplicate_removal(doc_id)?;
         self.viewport_read_seq.remove(&doc_id);
+        self.pending_reveal_cells.remove(&doc_id);
         cx.notify();
         Ok(notice)
     }
@@ -1866,12 +1917,14 @@ impl WorkbenchController {
                 "The active document changed before cleanup started.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_cleanup(cleanup)?;
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.start_cleanup(cleanup),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(expected_doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1893,12 +1946,14 @@ impl WorkbenchController {
                 "The active document changed before row insertion started.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.insert_rows_from_dialog(dialog)?;
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.insert_rows_from_dialog(dialog),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(expected_doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1920,12 +1975,14 @@ impl WorkbenchController {
                 "The active document changed before column insertion started.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.insert_columns_from_dialog(dialog)?;
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.insert_columns_from_dialog(dialog),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(expected_doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1943,13 +2000,17 @@ impl WorkbenchController {
         let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err(AppMessage::warning("Open a file first."));
         };
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        let ranges = doc.selected_rows.ranges.clone();
-        doc.start_delete_rows(ranges)?;
+        self.scheduler.with_reserved_job_fds(
+            doc_id,
+            2,
+            true,
+            |doc| {
+                let ranges = doc.selected_rows.ranges.clone();
+                doc.start_delete_rows(ranges)
+            },
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1968,12 +2029,14 @@ impl WorkbenchController {
         let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err(AppMessage::warning("Open a file first."));
         };
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_delete_columns(columns)?;
+        self.scheduler.with_reserved_job_fds(
+            doc_id,
+            2,
+            true,
+            |doc| doc.start_delete_columns(columns),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -1996,12 +2059,14 @@ impl WorkbenchController {
                 "The active document changed before moving columns.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_move_columns(columns, position)?;
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.start_move_columns(columns, position),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(expected_doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -2024,12 +2089,14 @@ impl WorkbenchController {
                 "The active document changed before splitting the column.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_split(source_column, separator)?;
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.start_split(source_column, separator),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(expected_doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -2052,12 +2119,14 @@ impl WorkbenchController {
                 "The active document changed before combining columns.",
             ));
         }
-        let Some(doc) = self.active_document_mut(window) else {
-            return Err(AppMessage::warning("Open a file first."));
-        };
-        doc.start_combine(columns, separator)?;
+        self.scheduler.with_reserved_job_fds(
+            expected_doc_id,
+            2,
+            true,
+            |doc| doc.start_combine(columns, separator),
+            |err| AppMessage::warning(err.to_string()),
+        )?;
         self.scheduler.revoke_tab_close_approval(expected_doc_id);
-        let _ = self.scheduler.sync_fd_leases();
         cx.notify();
         Ok(())
     }
@@ -2089,9 +2158,8 @@ impl WorkbenchController {
             changed = true;
             match completion.result {
                 Ok(Some(cell)) => {
-                    if let Some(win) = self.scheduler.window_of(completion.document_id) {
-                        self.pending_reveal_cells.insert(win, cell);
-                    }
+                    self.pending_reveal_cells
+                        .insert(completion.document_id, cell);
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -2122,6 +2190,7 @@ impl WorkbenchController {
             match completion.result {
                 Ok(Some(status)) => {
                     self.viewport_read_seq.remove(&completion.document_id);
+                    self.pending_reveal_cells.remove(&completion.document_id);
                     if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
                         tab.notice = Some(AppMessage::new(status, MessageSeverity::Status));
                     }

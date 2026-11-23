@@ -95,11 +95,18 @@ impl QuarryWindow {
                 window,
                 |this, _, event: &FindBarEvent, window, cx| {
                     if matches!(event, FindBarEvent::Closed) {
-                        if this.snapshot(cx).is_some() {
-                            this.table.focus_handle(cx).focus(window, cx);
-                        } else {
-                            this.focus_handle.focus(window, cx);
-                        }
+                        let table_focus = this
+                            .snapshot(cx)
+                            .is_some()
+                            .then(|| this.table.focus_handle(cx));
+                        let root_focus = this.focus_handle.clone();
+                        window.defer(cx, move |window, cx| {
+                            if let Some(tf) = table_focus {
+                                tf.focus(window, cx);
+                            } else {
+                                root_focus.focus(window, cx);
+                            }
+                        });
                         cx.notify();
                     }
                 },
@@ -1360,13 +1367,13 @@ impl QuarryWindow {
     }
 
     fn active_selected_column(&self, cx: &App) -> usize {
-        self.table
-            .read(cx)
-            .selected_cell()
-            .and_then(|(_, col)| self.table.read(cx).delegate().source_column_at(col, cx))
+        self.snapshot(cx)
+            .and_then(|i| i.selected_columns.first().copied())
             .or_else(|| {
-                self.snapshot(cx)
-                    .and_then(|i| i.selected_columns.first().copied())
+                self.table
+                    .read(cx)
+                    .selected_cell()
+                    .and_then(|(_, col)| self.table.read(cx).delegate().source_column_at(col, cx))
             })
             .unwrap_or(0)
     }
@@ -1470,6 +1477,24 @@ impl QuarryWindow {
         }
     }
 
+    fn can_open_schema_dialog(&mut self, info: &DocumentSnapshot, cx: &mut Context<Self>) -> bool {
+        if info.structural_running {
+            self.set_message(
+                AppMessage::warning("Wait for the active file operation to finish."),
+                cx,
+            );
+            return false;
+        }
+        if info.pending_split_confirm_bytes.is_some() {
+            self.set_message(
+                AppMessage::warning("Confirm or cancel the pending split first."),
+                cx,
+            );
+            return false;
+        }
+        true
+    }
+
     fn sort_rows_action(&mut self, _: &SortRows, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing || self.confirming {
             return;
@@ -1477,6 +1502,9 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        if !self.can_open_schema_dialog(&info, cx) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let initial_col = self.active_selected_column(cx);
@@ -1503,6 +1531,9 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        if !self.can_open_schema_dialog(&info, cx) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = info.selected_columns;
@@ -1529,6 +1560,9 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        if !self.can_open_schema_dialog(&info, cx) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);
@@ -1550,6 +1584,9 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        if !self.can_open_schema_dialog(&info, cx) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let default_pos = self
@@ -1580,6 +1617,9 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        if !self.can_open_schema_dialog(&info, cx) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let default_pos = (self.active_selected_column(cx) as u64).saturating_add(1);
@@ -1641,6 +1681,9 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        if !self.can_open_schema_dialog(&info, cx) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);
@@ -1667,6 +1710,9 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        if !self.can_open_schema_dialog(&info, cx) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let initial_col = self.active_selected_column(cx);
@@ -1693,6 +1739,9 @@ impl QuarryWindow {
         let Some(info) = self.snapshot(cx) else {
             return;
         };
+        if !self.can_open_schema_dialog(&info, cx) {
+            return;
+        }
         self.editing = true;
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);

@@ -1171,3 +1171,127 @@ fn sort_duplicates_cleanup_and_structural_ops_work_through_gpui_ui(cx: &mut Test
             .is_some_and(|i| !i.structural_running && i.index_done && i.headers.len() == 2)
     });
 }
+
+#[gpui_kit::test]
+fn find_escape_header_column_default_and_cross_tab_reveal_isolation(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let path_a = directory.path().join("tab-a.csv");
+    let path_b = directory.path().join("tab-b.csv");
+    std::fs::write(&path_a, "col_a,col_b\nfoo,1\nbar,2\n").unwrap();
+    std::fs::write(&path_b, "x,y\n10,20\n30,40\n").unwrap();
+
+    let controller = init_test_app(cx);
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_a.clone(), path_b.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.index_done)
+    });
+    let tabs = cx.update(|cx| controller.read(cx).tabs_for_window(win_id));
+    assert_eq!(tabs.len(), 2);
+    let doc_a = tabs[0].id;
+    let doc_b = tabs[1].id;
+
+    // 1. Escape closes the Find & Replace bar from both Find and Replace inputs and restores grid focus.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("toolbar-find", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).find_bar.read(cx).is_open());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).find_bar.read(cx).is_open());
+        assert!(
+            view.read(cx)
+                .table
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        );
+
+        view.update(cx, |q, cx| {
+            q.find_bar.update(cx, |bar, cx| {
+                bar.open_find(true, window, cx);
+                bar.focus_replace_for_test(window, cx);
+            });
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).find_bar.read(cx).is_open());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).find_bar.read(cx).is_open());
+        assert!(
+            view.read(cx)
+                .table
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        );
+    })
+    .unwrap();
+
+    // 2. Selecting a column header overrides an earlier selected cell for dialog defaults.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |t, cx| t.set_selected_cell(0, 1, cx));
+        });
+        controller.update(cx, |c, cx| {
+            c.select_column_active(win_id, 1, false, false, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).active_selected_column(cx), 1);
+    })
+    .unwrap();
+
+    // 3. A pending search reveal for Tab A must NOT move Tab B's selection, and applies once Tab A wakes.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, doc_b, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.document_id == doc_b && i.index_done)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |t, cx| t.set_selected_cell(0, 1, cx));
+        });
+        controller.update(cx, |c, cx| {
+            c.queue_pending_reveal_cell_for_test(doc_a, (2, 1));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+    })
+    .unwrap();
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, doc_a, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|i| i.document_id == doc_a)
+            && q.table.read(cx).selected_cell() == Some((1, 2))
+    });
+}
