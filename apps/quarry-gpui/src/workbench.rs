@@ -1,8 +1,9 @@
 //! Process-wide multi-window workbench controller backed by `quarry_workbench::WorkbenchScheduler`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::Root;
 use gpui_kit::{App, AppContext, Context, Entity, Global, WindowHandle};
@@ -62,6 +63,7 @@ pub enum CloseReviewAction {
     Proceed,
     /// Present Save / Discard / Keep Editing for `document_id` in `window_id`.
     ConfirmTab {
+        review_token: u64,
         window_id: WindowId,
         document_id: DocumentId,
         filename: String,
@@ -86,6 +88,15 @@ pub enum PendingReviewScope {
     },
 }
 
+impl PendingReviewScope {
+    fn current_window(&self) -> Option<WindowId> {
+        match self {
+            Self::SingleTab { window_id, .. } | Self::Window { window_id, .. } => Some(*window_id),
+            Self::Quit { remaining_dirty } => remaining_dirty.first().map(|(win, _)| *win),
+        }
+    }
+}
+
 struct WorkbenchGlobal(Entity<WorkbenchController>);
 
 impl Global for WorkbenchGlobal {}
@@ -93,10 +104,15 @@ impl Global for WorkbenchGlobal {}
 pub struct WorkbenchController {
     scheduler: WorkbenchScheduler,
     next_window_id: u64,
+    next_review_token: u64,
     windows: BTreeMap<WindowId, WindowHandle<Root>>,
+    editing_windows: BTreeSet<WindowId>,
+    viewport_read_seq: BTreeMap<DocumentId, u64>,
     show_all_whitespace: bool,
     window_messages: BTreeMap<WindowId, AppMessage>,
     pending_review: Option<PendingReviewScope>,
+    active_review_token: Option<u64>,
+    pending_review_action: Option<CloseReviewAction>,
     pending_close_windows: Vec<WindowId>,
     quit_requested_complete: bool,
 }
@@ -106,10 +122,15 @@ impl WorkbenchController {
         Self {
             scheduler: WorkbenchScheduler::new(config),
             next_window_id: 1,
+            next_review_token: 1,
             windows: BTreeMap::new(),
+            editing_windows: BTreeSet::new(),
+            viewport_read_seq: BTreeMap::new(),
             show_all_whitespace: false,
             window_messages: BTreeMap::new(),
             pending_review: None,
+            active_review_token: None,
+            pending_review_action: None,
             pending_close_windows: Vec::new(),
             quit_requested_complete: false,
         }
@@ -177,7 +198,92 @@ impl WorkbenchController {
 
     pub fn unregister_window_handle(&mut self, id: WindowId) {
         self.windows.remove(&id);
+        self.editing_windows.remove(&id);
         self.window_messages.remove(&id);
+    }
+
+    pub fn set_window_editing(&mut self, id: WindowId, editing: bool, cx: &mut Context<Self>) {
+        if editing {
+            self.editing_windows.insert(id);
+        } else {
+            self.editing_windows.remove(&id);
+        }
+        cx.notify();
+    }
+
+    pub fn request_viewport_rows(
+        &mut self,
+        window: WindowId,
+        position: u64,
+        visible_rows: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return;
+        };
+        let plan = {
+            let Some(doc) = self.active_document_mut(window) else {
+                return;
+            };
+            match doc.prepare_async_buffer_read(position, visible_rows) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    if let Some(tab) = self.scheduler.tab_mut(doc_id) {
+                        tab.notice = Some(AppMessage::error(error));
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let Some(plan) = plan else {
+            return;
+        };
+        let seq = {
+            let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
+            *entry = entry.wrapping_add(1);
+            *entry
+        };
+        let session = Arc::clone(&plan.session);
+        let index = plan.index;
+        let start = plan.start;
+        let count = plan.count;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let began = Instant::now();
+                    let read = session.read_rows(&index, start, count);
+                    (session, read, began.elapsed())
+                })
+                .await;
+            let _ = this.update(cx, |controller, cx| {
+                if controller.viewport_read_seq.get(&doc_id) != Some(&seq) {
+                    return;
+                }
+                let Some(tab) = controller.scheduler.tab_mut(doc_id) else {
+                    return;
+                };
+                let Some(doc) = tab.document.as_mut() else {
+                    return;
+                };
+                let (expected_session, read, elapsed) = result;
+                if !Arc::ptr_eq(&doc.session, &expected_session) {
+                    return;
+                }
+                match read {
+                    Ok(rows) => {
+                        doc.install_buffer_rows(start, rows, elapsed);
+                    }
+                    Err(error) => {
+                        let msg = doc.diagnostic_error(error);
+                        tab.notice = Some(AppMessage::error(msg));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn window_handle(&self, id: WindowId) -> Option<WindowHandle<Root>> {
@@ -435,6 +541,9 @@ impl WorkbenchController {
         let Some(id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
+        self.scheduler
+            .reopen_tab(window, id, options, encoding)
+            .map_err(|e| e.to_string())?;
         if let Some(tab) = self.scheduler.tab_mut(id) {
             tab.delimiter_mode = match options.delimiter {
                 None => quarry_workbench::DelimiterMode::Auto,
@@ -445,9 +554,7 @@ impl WorkbenchController {
                 Some(_) => quarry_workbench::DelimiterMode::Auto,
             };
         }
-        self.scheduler
-            .reopen_tab(window, id, options, encoding)
-            .map_err(|e| e.to_string())?;
+        self.viewport_read_seq.remove(&id);
         cx.notify();
         Ok(())
     }
@@ -682,6 +789,27 @@ impl WorkbenchController {
         Ok(())
     }
 
+    fn allocate_review_token(&mut self) -> u64 {
+        let token = self.next_review_token;
+        self.next_review_token = self.next_review_token.wrapping_add(1).max(1);
+        self.active_review_token = Some(token);
+        token
+    }
+
+    fn overlapping_review_wait(&self, cx: &mut Context<Self>) -> Option<CloseReviewAction> {
+        let review = self.pending_review.as_ref()?;
+        if let Some(win) = review.current_window()
+            && let Some(handle) = self.window_handle(win)
+        {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        }
+        Some(CloseReviewAction::Wait {
+            message:
+                "Finish the open save confirmation dialog before closing another tab or window."
+                    .into(),
+        })
+    }
+
     /// Starts a single-tab close review. Closes immediately if clean & idle; otherwise asks the
     /// window to prompt Save / Discard / Keep Editing.
     pub fn request_close_tab(
@@ -691,6 +819,16 @@ impl WorkbenchController {
         close_window_if_last: bool,
         cx: &mut Context<Self>,
     ) -> CloseReviewAction {
+        if let Some(wait) = self.overlapping_review_wait(cx) {
+            return wait;
+        }
+        if self.editing_windows.contains(&window)
+            && self.scheduler.active_document(window) == Some(id)
+        {
+            return CloseReviewAction::Wait {
+                message: "Apply or cancel the open edit before closing this tab.".into(),
+            };
+        }
         if let Some(tab) = self.scheduler.tab(id)
             && tab.document_writing()
         {
@@ -711,6 +849,7 @@ impl WorkbenchController {
                 .scheduler
                 .tab_display_name(id)
                 .unwrap_or_else(|| "Untitled".into());
+            let review_token = self.allocate_review_token();
             self.pending_review = Some(PendingReviewScope::SingleTab {
                 window_id: window,
                 document_id: id,
@@ -718,6 +857,7 @@ impl WorkbenchController {
             });
             cx.notify();
             return CloseReviewAction::ConfirmTab {
+                review_token,
                 window_id: window,
                 document_id: id,
                 filename,
@@ -725,6 +865,7 @@ impl WorkbenchController {
         }
 
         let _ = self.scheduler.close_tab(id);
+        self.viewport_read_seq.remove(&id);
         let empty_now = self.scheduler.tabs_in_window(window).is_empty();
         if empty_now && close_window_if_last {
             let _ = self.scheduler.close_window(window);
@@ -740,6 +881,14 @@ impl WorkbenchController {
         window: WindowId,
         cx: &mut Context<Self>,
     ) -> CloseReviewAction {
+        if let Some(wait) = self.overlapping_review_wait(cx) {
+            return wait;
+        }
+        if self.editing_windows.contains(&window) {
+            return CloseReviewAction::Wait {
+                message: "Apply or cancel the open edit before closing this window.".into(),
+            };
+        }
         let ids = self.scheduler.tabs_in_window(window);
         if ids.iter().any(|&id| {
             self.scheduler
@@ -765,12 +914,14 @@ impl WorkbenchController {
                 .scheduler
                 .tab_display_name(first_dirty)
                 .unwrap_or_else(|| "Untitled".into());
+            let review_token = self.allocate_review_token();
             self.pending_review = Some(PendingReviewScope::Window {
                 window_id: window,
                 remaining_dirty: dirty,
             });
             cx.notify();
             return CloseReviewAction::ConfirmTab {
+                review_token,
                 window_id: window,
                 document_id: first_dirty,
                 filename,
@@ -784,6 +935,17 @@ impl WorkbenchController {
 
     /// Starts unified cross-window Quit review across every open window and dormant dirty tab.
     pub fn request_quit(&mut self, cx: &mut Context<Self>) -> CloseReviewAction {
+        if let Some(wait) = self.overlapping_review_wait(cx) {
+            return wait;
+        }
+        if let Some(&editing_window) = self.editing_windows.first() {
+            if let Some(handle) = self.window_handle(editing_window) {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            }
+            return CloseReviewAction::Wait {
+                message: "Apply or cancel open edits before quitting Quarry.".into(),
+            };
+        }
         for window in self.scheduler.windows() {
             for id in self.scheduler.tabs_in_window(window) {
                 if self
@@ -814,11 +976,13 @@ impl WorkbenchController {
                 .scheduler
                 .tab_display_name(first_doc)
                 .unwrap_or_else(|| "Untitled".into());
+            let review_token = self.allocate_review_token();
             self.pending_review = Some(PendingReviewScope::Quit {
                 remaining_dirty: dirty,
             });
             cx.notify();
             return CloseReviewAction::ConfirmTab {
+                review_token,
                 window_id: first_window,
                 document_id: first_doc,
                 filename,
@@ -832,7 +996,14 @@ impl WorkbenchController {
     }
 
     /// Cancels an active tab, window, or quit review (Keep Editing), preserving all state.
-    pub fn cancel_close_review(&mut self, cx: &mut Context<Self>) {
+    pub fn cancel_close_review(&mut self, expected_token: Option<u64>, cx: &mut Context<Self>) {
+        if let Some(token) = expected_token
+            && self.active_review_token != Some(token)
+        {
+            return;
+        }
+        self.active_review_token = None;
+        self.pending_review_action = None;
         if let Some(review) = self.pending_review.take() {
             match review {
                 PendingReviewScope::SingleTab { document_id, .. } => {
@@ -859,7 +1030,15 @@ impl WorkbenchController {
 
     /// Approves discarding edits on the current tab under review and advances to the next dirty
     /// tab (or finishes closing the tab / window / app).
-    pub fn approve_discard_in_review(&mut self, cx: &mut Context<Self>) -> CloseReviewAction {
+    pub fn approve_discard_in_review(
+        &mut self,
+        expected_token: u64,
+        cx: &mut Context<Self>,
+    ) -> CloseReviewAction {
+        if self.active_review_token != Some(expected_token) {
+            return CloseReviewAction::Proceed;
+        }
+        self.active_review_token = None;
         let Some(review) = self.pending_review.take() else {
             return CloseReviewAction::Proceed;
         };
@@ -873,6 +1052,7 @@ impl WorkbenchController {
                     tab.approve_discard_and_close();
                 }
                 let _ = self.scheduler.close_tab(document_id);
+                self.viewport_read_seq.remove(&document_id);
                 if close_window_if_last && self.scheduler.tabs_in_window(window_id).is_empty() {
                     let _ = self.scheduler.close_window(window_id);
                     self.pending_close_windows.push(window_id);
@@ -903,12 +1083,14 @@ impl WorkbenchController {
                         .scheduler
                         .tab_display_name(next_id)
                         .unwrap_or_else(|| "Untitled".into());
+                    let review_token = self.allocate_review_token();
                     self.pending_review = Some(PendingReviewScope::Window {
                         window_id,
                         remaining_dirty,
                     });
                     cx.notify();
                     CloseReviewAction::ConfirmTab {
+                        review_token,
                         window_id,
                         document_id: next_id,
                         filename,
@@ -944,9 +1126,11 @@ impl WorkbenchController {
                         .scheduler
                         .tab_display_name(next_doc)
                         .unwrap_or_else(|| "Untitled".into());
+                    let review_token = self.allocate_review_token();
                     self.pending_review = Some(PendingReviewScope::Quit { remaining_dirty });
                     cx.notify();
                     CloseReviewAction::ConfirmTab {
+                        review_token,
                         window_id: next_window,
                         document_id: next_doc,
                         filename,
@@ -977,10 +1161,15 @@ impl WorkbenchController {
     /// Starts saving the currently reviewed dirty tab and marks it to finish closing once saved.
     pub fn save_in_review(
         &mut self,
+        expected_token: u64,
         window: WindowId,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
+        if self.active_review_token != Some(expected_token) {
+            return Ok(());
+        }
         let Some(id) = self.scheduler.active_document(window) else {
+            self.cancel_close_review(Some(expected_token), cx);
             return Err(AppMessage::warning("Open a file first."));
         };
         if let Some(tab) = self.scheduler.tab_mut(id) {
@@ -991,9 +1180,25 @@ impl WorkbenchController {
             if let Some(tab) = self.scheduler.tab_mut(id) {
                 tab.close_after_save = false;
             }
+            self.cancel_close_review(Some(expected_token), cx);
             return Err(error);
         }
         Ok(())
+    }
+
+    pub fn take_pending_review_action(&mut self, window: WindowId) -> Option<CloseReviewAction> {
+        let should_take = match self.pending_review_action.as_ref() {
+            Some(CloseReviewAction::ConfirmTab { window_id, .. }) => {
+                *window_id == window || !self.windows.contains_key(window_id)
+            }
+            Some(CloseReviewAction::Wait { .. }) | Some(CloseReviewAction::Proceed) => true,
+            None => false,
+        };
+        if should_take {
+            self.pending_review_action.take()
+        } else {
+            None
+        }
     }
 
     pub fn take_pending_close_windows(&mut self) -> Vec<WindowId> {
@@ -1004,8 +1209,20 @@ impl WorkbenchController {
         std::mem::take(&mut self.quit_requested_complete)
     }
 
+    fn any_hydrated_tab_busy(&self) -> bool {
+        self.scheduler.windows().into_iter().any(|window| {
+            self.scheduler.tabs_in_window(window).into_iter().any(|id| {
+                self.scheduler
+                    .tab(id)
+                    .is_some_and(WorkbenchTab::document_busy)
+            })
+        })
+    }
+
     pub fn poll_background(&mut self, cx: &mut Context<Self>) {
-        let mut changed = false;
+        // Track whether any hydrated tab had an active background job BEFORE polling so
+        // the exact tick a job finishes cleanly still notifies observers.
+        let mut changed = self.any_hydrated_tab_busy();
         let poll_errors = self.scheduler.poll_all();
         if !poll_errors.is_empty() {
             for (doc_id, error) in poll_errors {
@@ -1039,22 +1256,28 @@ impl WorkbenchController {
                         tab.close_after_save = false;
                         tab.notice = Some(error);
                     }
-                    self.cancel_close_review(cx);
+                    self.cancel_close_review(None, cx);
                 }
             }
         }
-        if advance_review {
-            let _ = self.approve_discard_in_review(cx);
-        }
-        // Check if any hydrated document has live indexing/filtering/saving progress to paint.
-        for window in self.scheduler.windows() {
-            if let Some(doc_id) = self.scheduler.active_document(window)
-                && let Some(tab) = self.scheduler.tab(doc_id)
-                && tab.document_busy()
-            {
-                changed = true;
-                break;
+        if advance_review && let Some(token) = self.active_review_token {
+            let next = self.approve_discard_in_review(token, cx);
+            match &next {
+                CloseReviewAction::ConfirmTab { window_id, .. } => {
+                    if let Some(handle) = self.window_handle(*window_id) {
+                        let _ = handle.update(cx, |_, window, _| window.activate_window());
+                    }
+                    self.pending_review_action = Some(next);
+                }
+                CloseReviewAction::Wait { .. } => {
+                    self.pending_review_action = Some(next);
+                }
+                CloseReviewAction::Proceed => {}
             }
+            changed = true;
+        }
+        if !changed && self.any_hydrated_tab_busy() {
+            changed = true;
         }
         if changed {
             cx.notify();

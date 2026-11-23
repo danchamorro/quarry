@@ -1504,7 +1504,8 @@ impl WorkbenchScheduler {
     }
 
     /// Reopens a clean tab in-place with updated format/encoding options (or Reload from Disk),
-    /// preserving its `DocumentId` and tab-bar position.
+    /// preserving its `DocumentId` and tab-bar position. Prepares the replacement before mutating
+    /// any live tab state so a failed format/encoding change never blanks the active document.
     pub fn reopen_tab(
         &mut self,
         window: WindowId,
@@ -1536,13 +1537,48 @@ impl WorkbenchScheduler {
         let Some(path) = self.tab_logical_path(id) else {
             return Err(SchedulerError::NotFound(id));
         };
+        let was_hydrated = matches!(slot.residency, SlotResidency::Hydrated { .. });
+
+        // Validate and prepare the replacement document BEFORE touching the existing slot.
+        let mut replacement = Document::prepare_with_encoding(&path, options, encoding)
+            .map_err(SchedulerError::OpenFailed)?;
+        replacement.working_directory = self.config.working_directory.clone();
+        replacement.custom_working_directory = self.config.custom_working_directory;
+        replacement.index_cache_enabled = self.config.index_cache_enabled;
+        replacement.working_cleanup = self.working_cleanup.clone();
+        replacement.decompression_slots = self.decompression_slots.clone();
+        replacement
+            .start_indexing()
+            .map_err(SchedulerError::OpenFailed)?;
+
+        if was_hydrated {
+            if let Some(slot) = self.tabs.get_mut(&id) {
+                if let Some(doc) = slot.tab.document.as_mut() {
+                    doc.shutdown();
+                }
+                slot.tab.document = Some(replacement);
+                slot.tab.header_mode = options.header_mode;
+                slot.tab.encoding_mode = encoding;
+                slot.tab.notice = None;
+                slot.tab.footer_status = None;
+                slot.owner_window = window;
+            }
+            self.active_by_window.insert(window, id);
+            self.touch_lru(id);
+            let _ = self.sync_fd_leases();
+            return Ok(WakeOutcome::Ready {
+                document_id: id,
+                kind: WakeKind::AlreadyHydrated,
+                evicted: Vec::new(),
+            });
+        }
+
+        // For Stub or Dormant tabs, shut down the pre-check document and hydrate normally now
+        // that we know the target path + options + encoding open cleanly.
+        replacement.shutdown();
         let canonical_path = canonicalize_best_effort(&path);
         let file_identity = FileIdentity::from_path(&path).ok().flatten();
         if let Some(slot) = self.tabs.get_mut(&id) {
-            if let Some(doc) = slot.tab.document.as_mut() {
-                doc.shutdown();
-            }
-            slot.tab.document = None;
             slot.tab.header_mode = options.header_mode;
             slot.tab.encoding_mode = encoding;
             slot.tab.notice = None;
@@ -1758,9 +1794,11 @@ impl WorkbenchScheduler {
         Ok(())
     }
 
-    /// Polls active save jobs across all hydrated tabs, clearing write reservations on finish.
+    /// Polls active save jobs across all hydrated tabs, reloading saved documents cleanly and
+    /// clearing write reservations on finish or cancellation.
     pub fn poll_saves(&mut self) -> Vec<SaveCompletion> {
         let mut results = Vec::new();
+        let mut any_finished = false;
         for (&id, slot) in &mut self.tabs {
             if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
                 continue;
@@ -1772,15 +1810,88 @@ impl WorkbenchScheduler {
                 continue;
             }
             match doc.poll_save() {
-                Ok(Some((path, replaced_source))) => {
+                Ok(Some((destination, in_place))) => {
+                    any_finished = true;
                     slot.tab.write_destination = None;
-                    results.push(SaveCompletion {
-                        document_id: id,
-                        result: Ok((path, replaced_source)),
+                    let dialect = doc.session.dialect;
+                    let options = OpenOptions {
+                        delimiter: Some(dialect.delimiter),
+                        header_mode: if dialect.has_header {
+                            HeaderMode::FirstRow
+                        } else {
+                            HeaderMode::NoHeader
+                        },
+                        ..OpenOptions::default()
+                    };
+                    let output_encoding = doc
+                        .save_output_encoding
+                        .unwrap_or_else(|| doc.session.encoding());
+                    let source_encoding = doc.session.encoding();
+                    let prior_encoding_mode = slot.tab.encoding_mode;
+
+                    let reload = Document::prepare_with_encoding(
+                        &destination,
+                        options,
+                        Some(output_encoding),
+                    )
+                    .and_then(|mut replacement| {
+                        replacement.working_directory = self.config.working_directory.clone();
+                        replacement.custom_working_directory = self.config.custom_working_directory;
+                        replacement.index_cache_enabled = self.config.index_cache_enabled;
+                        replacement.working_cleanup = self.working_cleanup.clone();
+                        replacement.decompression_slots = self.decompression_slots.clone();
+                        replacement.start_indexing()?;
+                        Ok(replacement)
                     });
+
+                    match reload {
+                        Ok(replacement) => {
+                            doc.shutdown();
+                            slot.tab.document = Some(replacement);
+                            slot.tab.encoding_mode = if output_encoding == source_encoding {
+                                prior_encoding_mode
+                            } else {
+                                Some(output_encoding)
+                            };
+                            slot.tab.notice = None;
+                            results.push(SaveCompletion {
+                                document_id: id,
+                                result: Ok((destination, in_place)),
+                            });
+                        }
+                        Err(error) if in_place => {
+                            doc.shutdown();
+                            slot.tab.document = None;
+                            results.push(SaveCompletion {
+                                document_id: id,
+                                result: Err(AppMessage::error(format!(
+                                    "Saved {} but could not reload it: {error}. Reopen the file to continue.",
+                                    destination.display()
+                                ))),
+                            });
+                        }
+                        Err(error) => {
+                            doc.save_status = None;
+                            results.push(SaveCompletion {
+                                document_id: id,
+                                result: Err(AppMessage::error(format!(
+                                    "Saved {} but could not open it: {error}",
+                                    destination.display()
+                                ))),
+                            });
+                        }
+                    }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if doc.save_job.is_none() {
+                        // Save was cancelled cleanly.
+                        any_finished = true;
+                        slot.tab.write_destination = None;
+                        slot.tab.close_after_save = false;
+                    }
+                }
                 Err(error) => {
+                    any_finished = true;
                     slot.tab.write_destination = None;
                     results.push(SaveCompletion {
                         document_id: id,
@@ -1789,7 +1900,7 @@ impl WorkbenchScheduler {
                 }
             }
         }
-        if !results.is_empty() {
+        if any_finished {
             let _ = self.sync_fd_leases();
         }
         results

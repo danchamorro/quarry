@@ -548,20 +548,48 @@ fn multi_window_move_tab_alias_routing_and_cross_window_quit_review(cx: &mut Tes
             .unwrap();
     });
     let review = cx.update(|cx| controller.update(cx, |c, cx| c.request_quit(cx)));
-    assert!(matches!(review, CloseReviewAction::ConfirmTab { window_id, .. } if window_id == w1));
-    cx.update(|cx| controller.update(cx, |c, cx| c.cancel_close_review(cx)));
+    let token = match review {
+        CloseReviewAction::ConfirmTab {
+            review_token,
+            window_id,
+            ..
+        } => {
+            assert_eq!(window_id, w1);
+            review_token
+        }
+        other => panic!("expected ConfirmTab for w1, got {other:?}"),
+    };
+    // Overlapping close request from Window 2 must wait instead of overwriting Window 1's review.
+    let overlap = cx.update(|cx| controller.update(cx, |c, cx| c.request_close_window(w2, cx)));
+    assert!(matches!(overlap, CloseReviewAction::Wait { .. }));
+    cx.update(|cx| controller.update(cx, |c, cx| c.cancel_close_review(Some(token), cx)));
     cx.update(|cx| {
         let sched = controller.read(cx).scheduler();
         assert_eq!(sched.dirty_tabs().len(), 2);
         assert_eq!(sched.total_tabs(), 2);
     });
 
+    // Quit must wait while another window has an active unapplied editor dialog open.
+    cx.update(|cx| controller.update(cx, |c, cx| c.set_window_editing(w2, true, cx)));
+    let blocked_quit = cx.update(|cx| controller.update(cx, |c, cx| c.request_quit(cx)));
+    assert!(matches!(blocked_quit, CloseReviewAction::Wait { .. }));
+    cx.update(|cx| controller.update(cx, |c, cx| c.set_window_editing(w2, false, cx)));
+
     // Close Window 2 after approving discard; Window 1's dirty document must survive cleanly.
     let w2_review = cx.update(|cx| controller.update(cx, |c, cx| c.request_close_window(w2, cx)));
-    assert!(
-        matches!(w2_review, CloseReviewAction::ConfirmTab { window_id, .. } if window_id == w2)
-    );
-    let done = cx.update(|cx| controller.update(cx, |c, cx| c.approve_discard_in_review(cx)));
+    let w2_token = match w2_review {
+        CloseReviewAction::ConfirmTab {
+            review_token,
+            window_id,
+            ..
+        } => {
+            assert_eq!(window_id, w2);
+            review_token
+        }
+        other => panic!("expected ConfirmTab for w2, got {other:?}"),
+    };
+    let done =
+        cx.update(|cx| controller.update(cx, |c, cx| c.approve_discard_in_review(w2_token, cx)));
     assert_eq!(done, CloseReviewAction::Proceed);
     cx.update(|cx| {
         let sched = controller.read(cx).scheduler();
@@ -641,4 +669,108 @@ fn bulk_lazy_open_and_header_rename_copy_whitespace_work(cx: &mut TestAppContext
         assert!(controller.read(cx).show_all_whitespace());
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn in_place_save_reloads_and_multi_tab_close_review_advances_after_save(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let file_a = directory.path().join("first.csv");
+    let file_b = directory.path().join("second.csv");
+    std::fs::write(&file_a, "name,val\nA,1\n").unwrap();
+    std::fs::write(&file_b, "name,val\nB,2\n").unwrap();
+
+    let controller = init_test_app(cx);
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // Track controller notifications to verify the finishing poll tick notifies observers.
+    let notified = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let notified_flag = notified.clone();
+    let _observer = cx.update(|cx| {
+        cx.observe(&controller, move |_, _| {
+            notified_flag.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![file_a.clone(), file_b.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    let before_poll = notified.load(std::sync::atomic::Ordering::SeqCst);
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.index_done && i.filename == "first.csv")
+    });
+    assert!(
+        notified.load(std::sync::atomic::Ordering::SeqCst) > before_poll,
+        "controller must notify observers when indexing finishes cleanly"
+    );
+
+    // Dirty both tabs in the same window.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.apply_cell_edit(win_id, 1, 0, "A-saved".into(), cx)
+            })
+            .unwrap();
+    });
+    let tab_b = cx.update(|cx| controller.read(cx).scheduler().tabs_in_window(win_id)[1]);
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, tab_b, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.index_done && i.filename == "second.csv")
+    });
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.apply_cell_edit(win_id, 1, 0, "B-dirty".into(), cx)
+            })
+            .unwrap();
+    });
+
+    // Request closing the window: first dirty tab prompts Save / Discard / Keep Editing.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| q.close_window_requested(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("close-save").visible());
+        window.click("close-save", cx);
+    })
+    .unwrap();
+
+    // Once the first tab finishes saving, the second dirty tab must become active AND its
+    // close-review confirmation dialog must be presented automatically.
+    wait_for_ui(cx, handle, &controller, &view, |q, window, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| i.filename == "second.csv" && i.dirty)
+            && q.confirming
+            && window.find("close-discard").visible()
+    });
+    assert!(
+        std::fs::read_to_string(&file_a)
+            .unwrap()
+            .contains("A-saved")
+    );
+
+    // Keep Editing cancels cleanly; first tab is already clean & reloaded on disk.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("close-keep-editing", cx);
+    })
+    .unwrap();
+    let tab_a = cx.update(|cx| controller.read(cx).scheduler().tabs_in_window(win_id)[0]);
+    assert!(!cx.update(|cx| controller.read(cx).scheduler().tab_is_dirty(tab_a)));
 }

@@ -281,12 +281,8 @@ impl TableDelegate for Grid {
     ) {
         self.visible_rows = range.clone();
         let window_id = self.window_id;
-        self.controller.update(cx, |controller, _| {
-            if let Some(doc) = controller.active_document_mut(window_id) {
-                let count = range.len().max(1);
-                let _ = doc.set_visible_rows(count);
-                let _ = doc.navigate_grid_position(range.start as u64);
-            }
+        self.controller.update(cx, |controller, cx| {
+            controller.request_viewport_rows(window_id, range.start as u64, range.len().max(1), cx);
         });
     }
 

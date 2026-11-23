@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use quarry_core::{
-    CaseSensitivity, ColumnTransformation, DuplicateTarget, FilterOperator, FilterQuery,
+    CaseSensitivity, ColumnTransformation, DuplicateTarget, Encoding, FilterOperator, FilterQuery,
     HeaderMode, OpenOptions,
 };
 use quarry_workbench::{
@@ -1731,4 +1731,116 @@ fn move_tab_close_window_reopen_undo_discard_and_poll_saves_preserve_invariants(
     assert!(tab_errors.is_empty());
     assert_eq!(scheduler.total_tabs(), 0);
     assert_eq!(scheduler.fd_budget().snapshot().total_reserved, 0);
+}
+
+#[test]
+fn in_place_save_via_poll_saves_reloads_session_and_allows_subsequent_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let csv = write_csv(dir.path(), "inplace.csv", 5);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv.clone()], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // First edit + in-place save.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "saved_once".into();
+        doc.commit_cell_edit();
+        doc.start_save().unwrap();
+    }
+    let mut completed = Vec::new();
+    for _ in 0..400 {
+        completed = scheduler.poll_saves();
+        if !completed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].document_id, ids[0]);
+    let (saved_path, in_place) = completed[0].result.as_ref().unwrap();
+    assert_eq!(saved_path, &csv);
+    assert!(*in_place);
+
+    // Reloaded document must be clean, refreshed against the new file, and accept a follow-up edit.
+    finish_active_indexing(&mut scheduler, ids[0]);
+    assert!(!scheduler.tab_is_dirty(ids[0]));
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert!(!doc.source_changed);
+        assert_eq!(doc.effective_cell(1, 1), Some(b"saved_once".as_slice()));
+        doc.begin_cell_edit(1, 1, b"saved_once".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "saved_twice".into();
+        doc.commit_cell_edit();
+        doc.start_save().unwrap();
+    }
+    completed.clear();
+    for _ in 0..400 {
+        completed = scheduler.poll_saves();
+        if !completed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(completed.len(), 1);
+    assert!(
+        completed[0].result.is_ok(),
+        "second in-place save must succeed without SOURCE_CHANGED_NOTICE"
+    );
+    let content = fs::read_to_string(&csv).unwrap();
+    assert!(content.contains("saved_twice"));
+}
+
+#[test]
+fn failed_reopen_tab_preserves_existing_document_and_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    // Odd byte count (not valid UTF-16 LE) so reopening with UTF-16 LE must fail cleanly.
+    let csv = dir.path().join("odd.csv");
+    fs::write(&csv, "a,b\n1,2").unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    let err = scheduler.reopen_tab(w1, ids[0], open_options(), Some(Encoding::Utf16Le));
+    assert!(err.is_err(), "odd-byte UTF-8 file must fail UTF-16 LE open");
+    assert_eq!(scheduler.active_document(w1), Some(ids[0]));
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+    let tab = scheduler.tab(ids[0]).unwrap();
+    assert!(tab.document.is_some(), "existing document must remain open");
+    assert_eq!(tab.encoding_mode, None);
+    assert_eq!(
+        tab.document.as_ref().unwrap().session.encoding(),
+        Encoding::Utf8
+    );
 }

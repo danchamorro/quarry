@@ -25,8 +25,8 @@ pub use dormancy::{
 pub use document::{
     ActiveFilterRead, CapturedDocument, CellEdit, Document, DocumentLease, DocumentProbe,
     FilterReadWindow, HeaderEdit, MaterializationPreparation, MaterializedWorkingCopy,
-    StructuralJob, StructuralProgressDisplay, footer_range_text, materialization_progress,
-    sort_progress,
+    StructuralJob, StructuralProgressDisplay, ViewportReadPlan, footer_range_text,
+    materialization_progress, sort_progress,
 };
 pub use history::{
     EditHistory, EditTarget, MAX_EDIT_HISTORY_BYTES, MAX_EDIT_HISTORY_ENTRIES, SharedCellEdits,

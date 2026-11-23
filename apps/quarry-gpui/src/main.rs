@@ -312,6 +312,12 @@ impl QuarryWindow {
             }
             window.set_window_title("Quarry");
         }
+        let pending_action = self.controller.update(cx, |controller, _| {
+            controller.take_pending_review_action(self.window_id)
+        });
+        if let Some(action) = pending_action {
+            self.handle_review_action(action, window, cx);
+        }
         cx.notify();
     }
 
@@ -449,6 +455,7 @@ impl QuarryWindow {
                 self.set_message(AppMessage::warning(message), cx);
             }
             CloseReviewAction::ConfirmTab {
+                review_token,
                 window_id,
                 filename,
                 ..
@@ -458,13 +465,14 @@ impl QuarryWindow {
                 {
                     let _ = handle.update(cx, |_, other_window, _| other_window.activate_window());
                 }
-                self.show_unsaved_close_dialog(window_id, filename, window, cx);
+                self.show_unsaved_close_dialog(review_token, window_id, filename, window, cx);
             }
         }
     }
 
     fn show_unsaved_close_dialog(
         &mut self,
+        review_token: u64,
         target_window: WindowId,
         filename: String,
         window: &mut Window,
@@ -518,7 +526,9 @@ impl QuarryWindow {
                                 .label("Keep Editing")
                                 .small()
                                 .on_click(move |_, window, cx| {
-                                    controller_keep.update(cx, |c, cx| c.cancel_close_review(cx));
+                                    controller_keep.update(cx, |c, cx| {
+                                        c.cancel_close_review(Some(review_token), cx)
+                                    });
                                     let _ = keep_weak.update(cx, |this, _| {
                                         this.confirming = false;
                                     });
@@ -532,8 +542,9 @@ impl QuarryWindow {
                                 .small()
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
-                                    let next = controller_discard
-                                        .update(cx, |c, cx| c.approve_discard_in_review(cx));
+                                    let next = controller_discard.update(cx, |c, cx| {
+                                        c.approve_discard_in_review(review_token, cx)
+                                    });
                                     let _ = discard_weak.update(cx, |this, cx| {
                                         this.confirming = false;
                                         this.handle_review_action(next, window, cx);
@@ -548,7 +559,7 @@ impl QuarryWindow {
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
                                     let res = controller_save.update(cx, |c, cx| {
-                                        c.save_in_review(target_window, cx)
+                                        c.save_in_review(review_token, target_window, cx)
                                     });
                                     let _ = save_weak.update(cx, |this, cx| {
                                         this.confirming = false;
@@ -560,7 +571,8 @@ impl QuarryWindow {
                         ),
                 )
                 .on_cancel(move |_, _, cx| {
-                    controller_cancel.update(cx, |c, cx| c.cancel_close_review(cx));
+                    controller_cancel
+                        .update(cx, |c, cx| c.cancel_close_review(Some(review_token), cx));
                     true
                 })
                 .on_close(move |_, _, cx| {
@@ -672,6 +684,9 @@ impl QuarryWindow {
         self.panels
             .update(cx, |panels, cx| panels.close(window, cx));
         self.editing = true;
+        self.controller.update(cx, |controller, cx| {
+            controller.set_window_editing(self.window_id, true, cx);
+        });
         let status = cx.new(|_| CellEditStatus::default());
         self.editor_status = Some(status.clone());
         let focus_input = input.clone();
@@ -778,6 +793,9 @@ impl QuarryWindow {
                     let _ = close.update(cx, |this, cx| {
                         this.editing = false;
                         this.editor_status = None;
+                        this.controller.update(cx, |controller, cx| {
+                            controller.set_window_editing(this.window_id, false, cx);
+                        });
                         let table_focus = this
                             .snapshot(cx)
                             .is_some()
@@ -829,6 +847,9 @@ impl QuarryWindow {
         }
         let input = cx.new(|cx| InputState::new(window, cx).default_value(current_name.clone()));
         self.editing = true;
+        self.controller.update(cx, |controller, cx| {
+            controller.set_window_editing(self.window_id, true, cx);
+        });
         let focus_input = input.clone();
         let apply = cx.weak_entity();
         let close = cx.weak_entity();
@@ -909,6 +930,9 @@ impl QuarryWindow {
                 .on_close(move |_, window, cx| {
                     let _ = close.update(cx, |this, cx| {
                         this.editing = false;
+                        this.controller.update(cx, |controller, cx| {
+                            controller.set_window_editing(this.window_id, false, cx);
+                        });
                         let table_focus = this
                             .snapshot(cx)
                             .is_some()
