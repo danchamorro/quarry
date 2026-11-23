@@ -2867,4 +2867,42 @@ fn external_open_urls_routes_hardlink_alias_to_owning_window(cx: &mut gpui_kit::
         assert_eq!(alias_routed.unwrap().unwrap(), (w1_id, doc_orig));
         controller.update(cx, |c, cx| c.set_window_editing(w2_id, false, cx));
     });
+
+    // Opening a modal operation dialog (Sort Rows) in Window 2 also registers it as editing so
+    // Finder external opens skip Window 2 and never switch the document underneath the dialog.
+    cx.update_window(w2_handle.into(), |_, window, cx| {
+        w2_view.update(cx, |q, cx| q.sort_rows_action(&SortRows, window, cx));
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert_eq!(
+            controller
+                .read(cx)
+                .preferred_window_for_external_open(Some(w2_handle.into())),
+            Some(w1_id),
+            "preferred external target must skip a window with an open Sort dialog"
+        );
+        let blocked = controller.update(cx, |c, cx| {
+            c.open_external_paths(Some(w2_id), vec![blocked_path.clone()], cx)
+        });
+        assert!(blocked.expect("outcome").is_err());
+        assert_eq!(
+            controller.read(cx).scheduler().active_document(w2_id),
+            Some(opened_doc)
+        );
+    });
+    cx.update_window(w2_handle.into(), |_, window, cx| {
+        window.dispatch_action(Box::new(DialogCancel), cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, w2_handle, &controller, &w2_view, |q, _, _| !q.editing);
+    cx.update(|cx| {
+        assert_eq!(
+            controller
+                .read(cx)
+                .preferred_window_for_external_open(Some(w2_handle.into())),
+            Some(w2_id),
+            "closing the Sort dialog must restore Window 2 as eligible for external opens"
+        );
+    });
 }

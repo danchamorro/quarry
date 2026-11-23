@@ -298,6 +298,14 @@ impl QuarryWindow {
         });
     }
 
+    fn set_editing(&mut self, editing: bool, cx: &mut Context<Self>) {
+        self.editing = editing;
+        let window_id = self.window_id;
+        self.controller.update(cx, |controller, cx| {
+            controller.set_window_editing(window_id, editing, cx);
+        });
+    }
+
     fn snapshot(&self, cx: &App) -> Option<DocumentSnapshot> {
         self.controller.read(cx).active_snapshot(self.window_id)
     }
@@ -841,10 +849,7 @@ impl QuarryWindow {
         let input = cx.new(|cx| TextareaState::new(window, cx).default_value(value));
         self.panels
             .update(cx, |panels, cx| panels.close(window, cx));
-        self.editing = true;
-        self.controller.update(cx, |controller, cx| {
-            controller.set_window_editing(self.window_id, true, cx);
-        });
+        self.set_editing(true, cx);
         let status = cx.new(|_| CellEditStatus::default());
         self.editor_status = Some(status.clone());
         let focus_input = input.clone();
@@ -949,11 +954,8 @@ impl QuarryWindow {
                 })
                 .on_close(move |_, window, cx| {
                     let _ = close.update(cx, |this, cx| {
-                        this.editing = false;
                         this.editor_status = None;
-                        this.controller.update(cx, |controller, cx| {
-                            controller.set_window_editing(this.window_id, false, cx);
-                        });
+                        this.set_editing(false, cx);
                         let table_focus = this
                             .snapshot(cx)
                             .is_some()
@@ -1008,10 +1010,7 @@ impl QuarryWindow {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).default_value(current_name.clone()));
-        self.editing = true;
-        self.controller.update(cx, |controller, cx| {
-            controller.set_window_editing(self.window_id, true, cx);
-        });
+        self.set_editing(true, cx);
         let focus_input = input.clone();
         let apply = cx.weak_entity();
         let close = cx.weak_entity();
@@ -1097,10 +1096,7 @@ impl QuarryWindow {
                 })
                 .on_close(move |_, window, cx| {
                     let _ = close.update(cx, |this, cx| {
-                        this.editing = false;
-                        this.controller.update(cx, |controller, cx| {
-                            controller.set_window_editing(this.window_id, false, cx);
-                        });
+                        this.set_editing(false, cx);
                         let table_focus = this
                             .snapshot(cx)
                             .is_some()
@@ -1433,7 +1429,7 @@ impl QuarryWindow {
         let weak = cx.weak_entity();
         move |window, cx| {
             let _ = weak.update(cx, |this, cx| {
-                this.editing = false;
+                this.set_editing(false, cx);
                 let table_focus = this
                     .snapshot(cx)
                     .is_some()
@@ -1539,7 +1535,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let initial_col = self.active_selected_column(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1568,7 +1564,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = info.selected_columns;
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1597,7 +1593,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1621,7 +1617,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let default_pos = self
             .table
@@ -1654,7 +1650,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let default_pos = (self.active_selected_column(cx) as u64).saturating_add(1);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1718,7 +1714,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1747,7 +1743,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let initial_col = self.active_selected_column(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1776,7 +1772,7 @@ impl QuarryWindow {
         if !self.can_open_schema_dialog(&info, cx) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let selected = self.active_selected_columns_or_current(cx);
         let on_closed = self.restore_grid_focus_callback(cx);
@@ -1797,7 +1793,14 @@ impl QuarryWindow {
         let weak = cx.weak_entity();
         move |path, window, cx| {
             let _ = weak.update(cx, |this, cx| {
+                let was_editing = this.editing;
+                if was_editing {
+                    this.set_editing(false, cx);
+                }
                 this.open_paths_direct(vec![path], OpenOptions::default(), None, window, cx);
+                if was_editing {
+                    this.set_editing(true, cx);
+                }
             });
         }
     }
@@ -1825,7 +1828,7 @@ impl QuarryWindow {
         }) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_open = self.open_output_path_callback(cx);
         let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Combine, cx);
@@ -1841,7 +1844,7 @@ impl QuarryWindow {
         }) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_open = self.open_output_path_callback(cx);
         let on_closed = self.workflow_dialog_closed_callback(WorkflowDialogKind::Join, cx);
@@ -1866,7 +1869,7 @@ impl QuarryWindow {
         }) {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         self.controller.update(cx, |c, cx| {
             if let Some(failed) = failed_target {
@@ -1918,7 +1921,7 @@ impl QuarryWindow {
         if self.editing || self.confirming {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_closed = self.restore_grid_focus_callback(cx);
         workflows_ui::open_temporary_storage_dialog(self.controller.clone(), on_closed, window, cx);
@@ -1998,7 +2001,7 @@ impl QuarryWindow {
         if self.editing || self.confirming {
             return;
         }
-        self.editing = true;
+        self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
         let on_closed = self.restore_grid_focus_callback(cx);
         workflows_ui::open_about_dialog(on_closed, window, cx);
