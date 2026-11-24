@@ -17,16 +17,18 @@ use crate::{
     progress_fraction, replace_literal_all_with_case, selection_fields_text, sort_direction_label,
 };
 use quarry_core::{
-    CaseSensitivity, CleanupJob, CleanupOutcome, ColumnCleanup, ColumnTransformation,
-    CompletedIndex, DateFormatSuggestion, DateFormatSuggestionConfig, DuplicateJob,
-    DuplicateOutcome, DuplicateSpec, DuplicateSummary, DuplicateTarget, Encoding, FilterExportJob,
-    FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob, FilterMatch, FilterOperator,
-    FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexConfig,
-    IndexJob, IndexProgress, JoinConfig, JoinWorkingSource, LiteralReplacement,
-    MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row,
-    RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchMatch, SearchOutcome,
-    SearchPosition, Session, SortDirection, SortJob, SortMode, SortOutcome, SortPlan,
-    SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    BoundaryTrust, ByteWindow, CaseSensitivity, CleanupJob, CleanupOutcome, ColumnCleanup,
+    ColumnTransformation, CompletedIndex, DateFormatSuggestion, DateFormatSuggestionConfig,
+    DuplicateJob, DuplicateOutcome, DuplicateSpec, DuplicateSummary, DuplicateTarget, Encoding,
+    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
+    FilterMatch, FilterOperator, FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome,
+    HeaderMode, IndexConfig, IndexJob, IndexProgress, JoinConfig, JoinWorkingSource,
+    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob,
+    ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob,
+    SearchMatch, SearchOutcome, SearchPosition, SectionBounds, SectionOpenOptions, Session,
+    SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SplitAnalysisJob,
+    SplitAnalysisOutcome, StructuralIndex, VerifyBoundaryJob, VerifyBoundaryOutcome,
+    VerifyBoundaryProgress,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use quarry_core::{SearchProgress, SortSpec};
@@ -278,6 +280,12 @@ pub struct Document {
     pub structural_job: Option<StructuralJob>,
     pub structural_status: Option<String>,
     pub structural_cancel_requested: bool,
+    pub section_verify_job: Option<VerifyBoundaryJob>,
+    pub section_verify_progress: Option<VerifyBoundaryProgress>,
+    pub section_verify_status: Option<String>,
+    pub verified_bounds_override: Option<SectionBounds>,
+    pub pending_verified_reopen: Option<SectionBounds>,
+    pub section_quote_free_confirmed: bool,
     pub source_changed: bool,
     pub filter_viewport_start: u64,
     pub filter_buffer_start: u64,
@@ -390,6 +398,21 @@ impl Document {
         Ok(Self::from_session(session, path))
     }
 
+    /// Prepares a bounded section document (`Session::open_section`); no indexer starts here.
+    pub fn prepare_section(
+        path: &Path,
+        window: ByteWindow,
+        mut options: SectionOpenOptions,
+    ) -> Result<Self, String> {
+        let quote_free = options.quote_free_confirmed;
+        options.open.rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS + 1;
+        let session =
+            Session::open_section(path, window, options).map_err(|error| error.to_string())?;
+        let mut doc = Self::from_session(session, path);
+        doc.section_quote_free_confirmed = quote_free;
+        Ok(doc)
+    }
+
     /// Builds the view over an opened session; no worker starts here.
     pub fn from_session(session: Session, path: &Path) -> Self {
         Self::from_arc_session(Arc::new(session), path)
@@ -398,13 +421,18 @@ impl Document {
     /// Builds the view over a shared session (used when waking dormant dirty or compressed tabs).
     pub fn from_arc_session(session: Arc<Session>, path: &Path) -> Self {
         let buffer_rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS;
-        let data_start = u64::from(session.dialect.has_header);
+        let (section_base, _) = session.active_byte_range();
+        let data_start = u64::from(session.dialect.has_header && section_base == 0);
+        let header_cols = session
+            .section_header_row()
+            .map_or(0, |row| row.fields.len());
         let total_columns = session
             .first_rows
             .iter()
             .map(|row| row.fields.len())
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(header_cols);
         let columns = ColumnView::new(total_columns);
         let headers = headers_for(&session, &columns.visible);
         let buffered_rows = session
@@ -420,7 +448,7 @@ impl Document {
             bytes_read: 0,
             rows_scanned: 0,
             columns_found: 0,
-            file_size: session.file_size,
+            file_size: session.active_byte_len(),
             elapsed: Duration::ZERO,
             paused: false,
             done: false,
@@ -476,6 +504,12 @@ impl Document {
             structural_job: None,
             structural_status: None,
             structural_cancel_requested: false,
+            section_verify_job: None,
+            section_verify_progress: None,
+            section_verify_status: None,
+            verified_bounds_override: None,
+            pending_verified_reopen: None,
+            section_quote_free_confirmed: false,
             source_changed: false,
             filter_viewport_start: 0,
             filter_buffer_start: 0,
@@ -523,6 +557,11 @@ impl Document {
     pub fn pending_materialization_confirm_disabled_reason(&self) -> Option<&'static str> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Some(reason);
+        }
+        if self.is_section() {
+            return Some(
+                "Structural table rewrites are not enabled for section documents yet; use Save As to export this section as a standalone file first.",
+            );
         }
         if self.join_reserved() {
             return Some(JOIN_INPUT_RESERVED);
@@ -2853,8 +2892,202 @@ impl Document {
                 .is_some_and(|progress| progress.done && !progress.cancelled)
     }
 
+    pub fn is_section(&self) -> bool {
+        self.session.is_section()
+    }
+
+    pub fn section_bounds(&self) -> Option<SectionBounds> {
+        self.verified_bounds_override
+            .or_else(|| self.session.section_bounds())
+    }
+
+    pub fn section_trust(&self) -> Option<BoundaryTrust> {
+        self.section_bounds().map(|bounds| bounds.trust)
+    }
+
+    pub fn section_first_global_row(&self) -> Option<u64> {
+        self.section_bounds()
+            .and_then(|bounds| bounds.first_global_row())
+    }
+
+    /// Returns the 1-based global data row number for a local physical `row` when a counted scan
+    /// proved exact global ordinals, or `None` (*"global row unknown"*).
+    pub fn global_data_row_number(&self, local_physical_row: u64) -> Option<u64> {
+        let first_physical = self.section_first_global_row()?;
+        let global_physical = first_physical.saturating_add(local_physical_row);
+        if self.session.dialect.has_header {
+            // Global physical row 0 is the header; physical row 1 is data row 1.
+            Some(global_physical)
+        } else {
+            Some(global_physical.saturating_add(1))
+        }
+    }
+
+    pub fn speculative_save_warning(&self) -> Option<&'static str> {
+        (self.section_trust() == Some(BoundaryTrust::Speculative)).then_some(
+            "This section has speculative boundaries: the first record may be torn if a quoted field crosses the start offset. Verify Boundary first or inspect the first row before exporting.",
+        )
+    }
+
+    pub fn can_verify_section_boundary(&self) -> bool {
+        self.is_section()
+            && !self.source_changed
+            && self.section_verify_job.is_none()
+            && self.section_bounds().is_some_and(|bounds| {
+                bounds.trust == BoundaryTrust::Speculative || bounds.first_global_row().is_none()
+            })
+    }
+
+    pub fn is_section_verifying(&self) -> bool {
+        self.section_verify_job.is_some()
+    }
+
+    pub fn is_section_verify_paused(&self) -> bool {
+        self.section_verify_job
+            .as_ref()
+            .is_some_and(VerifyBoundaryJob::is_paused)
+    }
+
+    pub fn is_section_verify_pausing(&self) -> bool {
+        self.section_verify_job
+            .as_ref()
+            .is_some_and(|job| job.is_pause_requested() && !job.is_paused())
+    }
+
+    pub fn start_verify_section_boundary(
+        &mut self,
+        parent_index: Option<&StructuralIndex>,
+    ) -> Result<(), AppMessage> {
+        if !self.is_section() {
+            return Err(AppMessage::warning(
+                "Verify Boundary is only available for section documents.",
+            ));
+        }
+        if self.source_changed {
+            return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+        }
+        if self.section_verify_job.is_some() {
+            return Err(AppMessage::warning(
+                "Boundary verification is already running.",
+            ));
+        }
+        let job = match self.session.start_verify_section_boundary(parent_index) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
+            Err(error) => return Err(AppMessage::core_error(error)),
+        };
+        self.section_verify_progress = Some(job.progress());
+        self.section_verify_job = Some(job);
+        self.section_verify_status = Some("Verifying section boundaries…".into());
+        Ok(())
+    }
+
+    pub fn pause_verify_section_boundary(&mut self) -> Result<(), String> {
+        let Some(job) = &self.section_verify_job else {
+            return Err("No active boundary verification job to pause.".into());
+        };
+        job.pause();
+        self.section_verify_progress = Some(job.progress());
+        self.section_verify_status = Some("Pausing boundary verification…".into());
+        Ok(())
+    }
+
+    pub fn resume_verify_section_boundary(&mut self) -> Result<(), String> {
+        let result = {
+            let Some(job) = self.section_verify_job.as_mut() else {
+                return Err("No paused boundary verification job to resume.".into());
+            };
+            job.resume()
+        };
+        if let Err(error) = result {
+            if matches!(error, QuarryError::SourceChanged) {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            return Err(self.diagnostic_error(error));
+        }
+        if let Some(job) = &self.section_verify_job {
+            self.section_verify_progress = Some(job.progress());
+        }
+        self.section_verify_status = Some("Verifying section boundaries…".into());
+        Ok(())
+    }
+
+    pub fn cancel_verify_section_boundary(&mut self) {
+        if let Some(job) = self.section_verify_job.take() {
+            job.cancel();
+            let _ = job.wait();
+        }
+        self.section_verify_progress = None;
+        self.section_verify_status = Some("Boundary verification cancelled.".into());
+    }
+
+    pub fn poll_section_verify(&mut self) -> Option<Result<VerifyBoundaryOutcome, AppMessage>> {
+        let progress = self.section_verify_job.as_ref()?.progress();
+        self.section_verify_progress = Some(progress);
+        if progress.paused {
+            self.section_verify_status = Some("Boundary verification paused.".into());
+        }
+        if !progress.done {
+            return None;
+        }
+        let job = self.section_verify_job.take()?;
+        self.section_verify_progress = None;
+        match job.wait() {
+            Ok(VerifyBoundaryOutcome::Verified {
+                bounds,
+                boundary_changed,
+            }) => {
+                if !boundary_changed {
+                    self.verified_bounds_override = Some(bounds);
+                    self.pending_verified_reopen = None;
+                    self.section_verify_status = Some(
+                        if let Some(first) = self.global_data_row_number(self.data_start) {
+                            format!(
+                                "Section boundaries verified (starts at row {}).",
+                                group_digits(first)
+                            )
+                        } else {
+                            "Section boundaries verified.".into()
+                        },
+                    );
+                } else {
+                    self.pending_verified_reopen = Some(bounds);
+                    self.section_verify_status = Some(if self.is_dirty() {
+                        "Verified boundaries shifted. Save your draft as a new file first, or reopen at the verified bounds."
+                            .into()
+                    } else {
+                        "Verified boundaries shifted. Ready to reopen at exact record boundaries."
+                            .into()
+                    });
+                }
+                Some(Ok(VerifyBoundaryOutcome::Verified {
+                    bounds,
+                    boundary_changed,
+                }))
+            }
+            Ok(VerifyBoundaryOutcome::Cancelled) => {
+                self.section_verify_status = Some("Boundary verification cancelled.".into());
+                Some(Ok(VerifyBoundaryOutcome::Cancelled))
+            }
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                self.section_verify_status = Some(SOURCE_CHANGED_NOTICE.into());
+                Some(Err(AppMessage::warning(SOURCE_CHANGED_NOTICE)))
+            }
+            Err(error) => {
+                let msg = AppMessage::core_error(error);
+                self.section_verify_status = Some(msg.text.clone());
+                Some(Err(msg))
+            }
+        }
+    }
+
     pub fn is_save_ready(&self) -> bool {
-        !self.is_compressed() && self.is_dirty() && self.save_operations_ready()
+        !self.is_compressed() && !self.is_section() && self.is_dirty() && self.save_operations_ready()
     }
 
     pub fn has_reordered_columns(&self) -> bool {
@@ -2871,7 +3104,10 @@ impl Document {
     }
 
     pub fn is_save_as_ready(&self) -> bool {
-        (self.is_dirty() || self.has_reordered_columns() || self.compressed_save_as_ready())
+        (self.is_dirty()
+            || self.has_reordered_columns()
+            || self.compressed_save_as_ready()
+            || self.is_section())
             && self.save_operations_ready()
     }
 
@@ -2939,11 +3175,20 @@ impl Document {
                 return Err(AppMessage::warning(reason));
             }
         }
+        if self.is_section() && destination.is_none() {
+            return Err(AppMessage::warning(
+                "In-place save is not enabled for section documents yet. Use Save As to write a new file.",
+            ));
+        }
         self.commit_edits();
         // A compressed document has no edits; its Save As writes an uncompressed copy.
+        // A section document can always be exported via Save Section As New File.
         if !(self.is_dirty()
             || destination.is_some()
-                && (self.has_reordered_columns() || utf8 || self.is_compressed()))
+                && (self.has_reordered_columns()
+                    || utf8
+                    || self.is_compressed()
+                    || self.is_section()))
         {
             return Err(AppMessage::warning("Make a change before saving."));
         }
@@ -2953,14 +3198,19 @@ impl Document {
             .map(|(column, name)| (*column, name.as_bytes().to_vec()))
             .collect();
         let saving_in_place = destination.is_none();
+        let save_as_transformation = if self.is_section() {
+            None
+        } else {
+            self.save_as_transformation()
+        };
         let result = match destination {
             Some(destination) if utf8 => self.session.start_save_as_utf8(
                 renames,
                 self.owned_cell_edits(),
-                self.save_as_transformation(),
+                save_as_transformation,
                 destination,
             ),
-            Some(destination) => match self.save_as_transformation() {
+            Some(destination) => match save_as_transformation {
                 Some(transformation) => self.session.start_save_as_with_transformation(
                     renames,
                     self.owned_cell_edits(),
@@ -3735,6 +3985,11 @@ impl Document {
         }
         self.save_cancel_requested = false;
         self.saving_in_place = false;
+        if let Some(job) = self.section_verify_job.take() {
+            job.cancel();
+            drop(job);
+        }
+        self.section_verify_progress = None;
         if let Some(job) = self.export_job.take() {
             job.cancel();
             drop(job);

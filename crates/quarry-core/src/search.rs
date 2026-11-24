@@ -490,7 +490,8 @@ impl Session {
         if needle.is_empty() {
             return Err(QuarryError::InvalidOption("search query must not be empty"));
         }
-        let data_start = u64::from(self.dialect.has_header);
+        let (section_base, section_end) = self.active_byte_range();
+        let data_start = u64::from(self.dialect.has_header && section_base == 0);
         cell_edits.retain(|(row, _), _| *row >= data_start);
         let start = if start.row < data_start {
             SearchPosition {
@@ -501,21 +502,21 @@ impl Session {
             start
         };
         let indexed_frontier = if index.is_complete() {
-            self.file_size
+            section_end
         } else {
-            index.committed_record_end().min(self.file_size)
+            index.committed_record_end().min(section_end)
         };
         let checkpoint = index.nearest_checkpoint(start.row);
         let stripes = build_search_stripes(
             index,
             checkpoint,
             indexed_frontier,
-            self.file_size,
+            section_end,
             tuning.stripe_target_bytes,
         );
         SearchJob::start_plan(
             self.path.clone(),
-            self.file_size,
+            section_end,
             indexed_frontier,
             index.indexed_rows(),
             Some(self.source_stamp.clone()),

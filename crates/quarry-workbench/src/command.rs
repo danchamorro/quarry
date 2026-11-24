@@ -61,6 +61,7 @@ pub enum CommandId {
     About,
     NewWindow,
     Open,
+    OpenSection,
     OpenWithEncoding(Encoding),
     CombineFiles,
     JoinFiles,
@@ -89,6 +90,7 @@ pub enum CommandId {
     Columns,
     Filters,
     PauseResumeIndexing,
+    VerifySectionBoundary,
     NextTab,
     PreviousTab,
     Quit,
@@ -188,6 +190,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         CommandId::About
         | CommandId::NewWindow
         | CommandId::Open
+        | CommandId::OpenSection
         | CommandId::OpenWithEncoding(_)
         | CommandId::CombineFiles
         | CommandId::JoinFiles
@@ -223,7 +226,8 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::InsertColumns
         | CommandId::Columns
         | CommandId::Filters
-        | CommandId::PauseResumeIndexing => doc_target,
+        | CommandId::PauseResumeIndexing
+        | CommandId::VerifySectionBoundary => doc_target,
     };
 
     // Close-review actions are explicitly active during the close confirmation/wait modal.
@@ -281,6 +285,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         CommandId::About
         | CommandId::NewWindow
         | CommandId::Open
+        | CommandId::OpenSection
         | CommandId::OpenWithEncoding(_)
         | CommandId::JoinFiles
         | CommandId::CloseWindow
@@ -311,6 +316,9 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         CommandId::InsertColumns => insertion(false),
         CommandId::PauseResumeIndexing => {
             document.is_some_and(|doc| doc.can_pause_indexing() || doc.can_resume_indexing())
+        }
+        CommandId::VerifySectionBoundary => {
+            document.is_some_and(Document::can_verify_section_boundary)
         }
         CommandId::NextTab | CommandId::PreviousTab => ctx.open_document_count > 1,
         CommandId::KeepEditing | CommandId::DiscardAndClose => unreachable!(),

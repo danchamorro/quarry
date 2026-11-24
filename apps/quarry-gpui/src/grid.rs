@@ -147,6 +147,9 @@ impl Grid {
         let doc = controller.active_document(self.window_id)?;
         let (source_row, fields) = loaded_row(doc, row)?;
         if column == 0 {
+            if let Some(global_row) = doc.global_data_row_number(source_row) {
+                return Some(global_row.to_string());
+            }
             return Some((source_row + 1 - doc.data_start).to_string());
         }
         let source_col = *doc.columns.visible.get(column - 1)?;
@@ -165,6 +168,9 @@ impl Grid {
         let doc = controller.active_document(self.window_id)?;
         let (source_row, fields) = loaded_row(doc, row)?;
         if column == 0 {
+            if let Some(global_row) = doc.global_data_row_number(source_row) {
+                return Some(global_row.to_string());
+            }
             return Some((source_row + 1 - doc.data_start).to_string());
         }
         let source_col = *doc.columns.visible.get(column - 1)?;
@@ -222,17 +228,30 @@ impl TableDelegate for Grid {
     }
 
     fn column(&self, column: usize, cx: &App) -> Column {
+        let controller = self.controller.read(cx);
+        let doc = controller.active_document(self.window_id);
         if column == 0 {
+            let gutter_width = doc
+                .map(|doc| {
+                    let last_source = doc
+                        .data_start
+                        .saturating_add(doc.available_data_rows().saturating_sub(1));
+                    let max_ordinal = doc
+                        .global_data_row_number(last_source)
+                        .unwrap_or_else(|| doc.available_data_rows().max(1));
+                    let digits = max_ordinal.to_string().len();
+                    (digits as f32 * 9.5 + 28.0).clamp(58.0, 140.0)
+                })
+                .unwrap_or(58.0);
             return Column::new("source-row", "#")
-                .width(px(58.))
+                .width(px(gutter_width))
                 .fixed_left()
                 .resizable(false)
                 .movable(false)
                 .selectable(false)
                 .text_right();
         }
-        let controller = self.controller.read(cx);
-        let Some(doc) = controller.active_document(self.window_id) else {
+        let Some(doc) = doc else {
             return Column::new("empty", "");
         };
         let Some(&source) = doc.columns.visible.get(column - 1) else {

@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::Root;
 use gpui_kit::{AnyWindowHandle, App, AppContext, Context, Entity, Global, WindowHandle};
 use quarry_core::{
-    CaseSensitivity, ColumnCleanup, DateFormatSuggestion, DuplicateTarget, Encoding, FilterQuery,
-    HeaderMode, JoinMode, OpenOptions, SortPlan, StorageSpace, raise_nofile_limit,
+    ByteWindow, CaseSensitivity, ColumnCleanup, DateFormatSuggestion, DuplicateTarget, Encoding,
+    FilterQuery, HeaderMode, JoinMode, OpenOptions, SectionBounds, SectionOpenOptions, SortPlan,
+    StorageSpace, VerifyBoundaryOutcome, VerifyBoundaryProgress, raise_nofile_limit,
 };
 use quarry_workbench::compressed::{
     DecompressionStatus, decompression_status, gzip_destination_warning,
@@ -42,6 +43,21 @@ pub struct DuplicatePreviewInfo {
     pub total_rows: u64,
 }
 
+/// Read-only snapshot of bounded section document state (boxed on `DocumentSnapshot` to keep stack frames small).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SectionSnapshot {
+    pub bounds: SectionBounds,
+    pub first_global_data_row: Option<u64>,
+    pub verify_running: bool,
+    pub verify_paused: bool,
+    pub verify_pausing: bool,
+    pub verify_progress: Option<VerifyBoundaryProgress>,
+    pub verify_status: Option<String>,
+    pub pending_verified_reopen: Option<SectionBounds>,
+    pub can_verify_boundary: bool,
+    pub speculative_save_warning: Option<&'static str>,
+}
+
 /// Read-only snapshot of an active hydrated document for toolbar, panels, and status bar rendering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentSnapshot {
@@ -50,6 +66,8 @@ pub struct DocumentSnapshot {
     pub path: PathBuf,
     pub filename: String,
     pub file_size: u64,
+    pub active_byte_len: u64,
+    pub section: Option<Box<SectionSnapshot>>,
     pub delimiter: u8,
     pub has_header: bool,
     pub encoding: Encoding,
@@ -940,12 +958,29 @@ impl WorkbenchController {
                         *records,
                     )
                 });
+        let active_byte_len = doc.session.active_byte_len();
+        let section = doc.section_bounds().map(|bounds| {
+            Box::new(SectionSnapshot {
+                bounds,
+                first_global_data_row: doc.global_data_row_number(doc.data_start),
+                verify_running: doc.is_section_verifying(),
+                verify_paused: doc.is_section_verify_paused(),
+                verify_pausing: doc.is_section_verify_pausing(),
+                verify_progress: doc.section_verify_progress,
+                verify_status: doc.section_verify_status.clone(),
+                pending_verified_reopen: doc.pending_verified_reopen,
+                can_verify_boundary: doc.can_verify_section_boundary(),
+                speculative_save_warning: doc.speculative_save_warning(),
+            })
+        });
         Some(DocumentSnapshot {
             document_id: doc_id,
             instance_id: doc.instance_id,
             path: doc.logical_path.clone(),
             filename,
             file_size: doc.session.file_size,
+            active_byte_len,
+            section,
             delimiter: doc.session.dialect.delimiter,
             has_header: doc.session.dialect.has_header,
             encoding: doc.session.encoding(),
@@ -972,10 +1007,10 @@ impl WorkbenchController {
             index_done: doc.job.is_none() && doc.progress.done,
             index_paused: doc.is_indexing_paused(),
             index_pausing: doc.is_indexing_pausing(),
-            index_fraction: if doc.session.file_size == 0 {
+            index_fraction: if active_byte_len == 0 {
                 1.0
             } else {
-                (doc.progress.bytes_scanned as f32 / doc.session.file_size as f32).clamp(0.0, 1.0)
+                (doc.progress.bytes_scanned as f32 / active_byte_len as f32).clamp(0.0, 1.0)
             },
             index_committed_bytes: doc.progress.bytes_scanned,
             index_bytes_read: doc.progress.bytes_read,
@@ -1000,6 +1035,101 @@ impl WorkbenchController {
             join_reserved: doc.join_reserved(),
             has_diagnostic: doc.pending_diagnostic.is_some(),
         })
+    }
+
+    /// Opens a bounded byte section of `path` as a distinct tab in `target_window`.
+    pub fn open_section(
+        &mut self,
+        target_window: WindowId,
+        path: PathBuf,
+        byte_window: ByteWindow,
+        options: SectionOpenOptions,
+        cx: &mut Context<Self>,
+    ) -> Result<DocumentId, AppMessage> {
+        if self.editing_windows.contains(&target_window) {
+            return Err(AppMessage::warning(
+                "Apply or cancel the open edit before opening a section in this window.",
+            ));
+        }
+        let outcome = self
+            .scheduler
+            .open_section(target_window, path.clone(), byte_window, options)
+            .map_err(|err| match err {
+                SchedulerError::OpenFailed(message) => AppMessage::error(message),
+                other => AppMessage::warning(other.to_string()),
+            })?;
+        let doc_id = match outcome {
+            WakeOutcome::Ready { document_id, .. }
+            | WakeOutcome::SourceChangedConflict { document_id, .. } => document_id,
+        };
+        self.window_messages.remove(&target_window);
+        cx.notify();
+        Ok(doc_id)
+    }
+
+    pub fn start_verify_section_boundary_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a section first."));
+        };
+        self.scheduler.start_verify_section_boundary(id)?;
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn pause_verify_section_boundary_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err("Open a section first.".into());
+        };
+        self.scheduler.pause_verify_section_boundary(id)?;
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn resume_verify_section_boundary_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err("Open a section first.".into());
+        };
+        self.scheduler.resume_verify_section_boundary(id)?;
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn cancel_verify_section_boundary_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.scheduler.active_document(window) {
+            self.scheduler.cancel_verify_section_boundary(id);
+            cx.notify();
+        }
+    }
+
+    pub fn reopen_verified_section_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<String, AppMessage> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a section first."));
+        };
+        let notice = self.scheduler.reopen_verified_section(id)?;
+        self.viewport_read_seq.remove(&id);
+        self.pending_reveal_cells.remove(&id);
+        cx.notify();
+        Ok(notice)
     }
 
     /// Opens one or more paths into `target_window`, routing existing hard-link/canonical aliases
@@ -3392,7 +3522,7 @@ impl WorkbenchController {
                             phase,
                             doc.committed_data_rows(),
                             doc.progress.bytes_scanned,
-                            doc.session.file_size,
+                            doc.session.active_byte_len(),
                         )
                     }
                     None => (None, None, HudIndexPhase::Idle, 0, 0, 0),
@@ -3468,6 +3598,53 @@ impl WorkbenchController {
                 }
             }
             changed = true;
+        }
+        for completion in self.scheduler.poll_section_verifications() {
+            changed = true;
+            if completion.reopened {
+                self.viewport_read_seq.remove(&completion.document_id);
+                self.pending_reveal_cells.remove(&completion.document_id);
+            }
+            match completion.result {
+                Ok(VerifyBoundaryOutcome::Verified {
+                    bounds: _,
+                    boundary_changed,
+                }) => {
+                    if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
+                        if completion.reopened {
+                            // `reopen_verified_section` already set a status notice.
+                        } else if boundary_changed {
+                            tab.notice = Some(AppMessage::warning(
+                                "Verified section boundaries shifted. Save your unsaved draft as a new file before reopening at the verified bounds.",
+                            ));
+                        } else {
+                            let msg = if let Some(first) = tab
+                                .document
+                                .as_ref()
+                                .and_then(|d| d.global_data_row_number(d.data_start))
+                            {
+                                format!(
+                                    "Section boundaries verified (starts at row {}).",
+                                    quarry_workbench::group_digits(first)
+                                )
+                            } else {
+                                "Section boundaries verified.".into()
+                            };
+                            tab.notice = Some(AppMessage::status(msg));
+                        }
+                    }
+                }
+                Ok(VerifyBoundaryOutcome::Cancelled) => {
+                    if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
+                        tab.notice = Some(AppMessage::status("Boundary verification cancelled."));
+                    }
+                }
+                Err(error) => {
+                    if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
+                        tab.notice = Some(error);
+                    }
+                }
+            }
         }
         for completion in self.scheduler.poll_searches() {
             changed = true;

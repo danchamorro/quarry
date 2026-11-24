@@ -326,12 +326,14 @@ struct SharedState {
     cancelled: AtomicBool,
     error: Mutex<Option<String>>,
     started: Instant,
+    section_base: u64,
+    scan_end: u64,
     file_size: u64,
     bounded_scan: bool,
 }
 
 impl SharedState {
-    fn new(index: FilterIndex, file_size: u64, bounded_scan: bool) -> Self {
+    fn new(index: FilterIndex, section_base: u64, scan_end: u64, bounded_scan: bool) -> Self {
         Self {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
@@ -343,7 +345,9 @@ impl SharedState {
             cancelled: AtomicBool::new(false),
             error: Mutex::new(None),
             started: Instant::now(),
-            file_size,
+            section_base,
+            scan_end,
+            file_size: scan_end.saturating_sub(section_base),
             bounded_scan,
         }
     }
@@ -419,10 +423,42 @@ impl FilterJob {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn start_with_edits_and_tuning(
         path: PathBuf,
         file_size: u64,
+        delimiter: u8,
+        data_start: u64,
+        query: FilterQuery,
+        config: FilterScanConfig,
+        edits: FilterEdits,
+        expected: Option<SourceStamp>,
+        encoding: Encoding,
+        tuning: FilterParallelTuning,
+        bounded_scan: bool,
+    ) -> Result<Self, QuarryError> {
+        Self::start_with_range_edits_and_tuning(
+            path,
+            0,
+            file_size,
+            delimiter,
+            data_start,
+            query,
+            config,
+            edits,
+            expected,
+            encoding,
+            tuning,
+            bounded_scan,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_range_edits_and_tuning(
+        path: PathBuf,
+        section_base: u64,
+        scan_end: u64,
         delimiter: u8,
         data_start: u64,
         query: FilterQuery,
@@ -453,20 +489,21 @@ impl FilterJob {
         let guard_file = file.try_clone()?;
         index.edits = edits;
         index.source = Some(source.clone());
-        index.scan_limit = bounded_scan.then_some(file_size);
-        let shared = Arc::new(SharedState::new(index, file_size, bounded_scan));
+        index.scan_limit = (bounded_scan || section_base > 0).then_some(scan_end);
+        let shared = Arc::new(SharedState::new(index, section_base, scan_end, bounded_scan));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("quarry-filter".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
-                let result = if let Some(byte_class) = encoding.simd_byte_class()
+                let result = if section_base == 0
+                    && let Some(byte_class) = encoding.simd_byte_class()
                     && tuning.requested_threads > 1
-                    && file_size >= tuning.min_parallel_bytes
+                    && scan_end >= tuning.min_parallel_bytes
                 {
                     run_parallel_filter(
                         Arc::new(file),
-                        file_size,
+                        scan_end,
                         delimiter,
                         data_start,
                         &query,
@@ -758,31 +795,36 @@ impl Session {
     ) -> Result<FilterJob, QuarryError> {
         let requested_threads = resolve_worker_count(threads)?;
         self.ensure_source_unchanged()?;
+        let (section_base, section_end) = self.active_byte_range();
+        let data_start = u64::from(self.dialect.has_header && section_base == 0);
         let scan_limit = max_bytes
-            .map(|limit| limit.min(self.file_size))
-            .unwrap_or(self.file_size);
-        FilterJob::start_with_edits_and_tuning(
+            .map(|limit| section_base.saturating_add(limit).min(section_end))
+            .unwrap_or(section_end);
+        FilterJob::start_with_range_edits_and_tuning(
             self.path.clone(),
+            section_base,
             scan_limit,
             self.dialect.delimiter,
-            u64::from(self.dialect.has_header),
+            data_start,
             query,
             DEFAULT_FILTER_SCAN_CONFIG,
             edits,
             Some(self.source_stamp.clone()),
             self.encoding,
             FilterParallelTuning::for_production(requested_threads),
-            scan_limit < self.file_size,
+            scan_limit < section_end,
         )
     }
 
     fn check_filter_index(&self, index: &FilterIndex) -> Result<(), QuarryError> {
         self.ensure_source_unchanged()?;
+        let (section_base, _) = self.active_byte_range();
+        let expected_data_start = u64::from(self.dialect.has_header && section_base == 0);
         if let Some(source) = &index.source
             && (source.path != self.path
                 || source.stamp != self.source_stamp
                 || source.delimiter != self.dialect.delimiter
-                || source.data_start != u64::from(self.dialect.has_header)
+                || source.data_start != expected_data_start
                 || source.encoding != self.encoding)
         {
             return Err(QuarryError::SourceChanged);
@@ -815,9 +857,10 @@ impl Session {
     ) -> Result<FilterReadJob, QuarryError> {
         self.check_filter_index(index)?;
         let plan = prepare_filtered_read(index, start_match, count)?;
+        let (_, section_end) = self.active_byte_range();
         FilterReadJob::start(
             self.path.clone(),
-            self.file_size,
+            section_end,
             self.dialect.delimiter,
             plan,
             DEFAULT_FILTER_READ_CONFIG,
@@ -1154,11 +1197,14 @@ fn run_filter(
     let groups = predicate_groups(query);
     let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
     let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
-    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut scanner = RecordScanner::at_offset(delimiter, shared.section_base, encoding)?;
+    if shared.section_base > 0 {
+        file.seek(SeekFrom::Start(shared.section_base))?;
+    }
     let mut chunk = vec![0; encoding.chunk_size(chunk_bytes)];
-    let mut absolute_start = 0_u64;
+    let mut absolute_start = shared.section_base;
     let mut row_number = 0_u64;
-    let mut record_start = 0_u64;
+    let mut record_start = shared.section_base;
     let mut records_scanned = 0_u64;
     let mut record = Vec::new();
     let mut pending_matches = Vec::with_capacity(MATCH_PUBLISH_BATCH);
@@ -1169,11 +1215,11 @@ fn run_filter(
             shared.cancelled.store(true, Ordering::Release);
             return Ok(());
         }
-        let remaining = shared.file_size.saturating_sub(absolute_start);
+        let remaining = shared.scan_end.saturating_sub(absolute_start);
         let read = if remaining == 0 {
             0
         } else {
-            let cap = encoding.chunk_size((remaining as usize).min(chunk.len()));
+            let cap = encoding.chunk_size(usize::try_from(remaining).unwrap_or(usize::MAX).min(chunk.len()));
             encoding.read_chunk(&mut file, &mut chunk[..cap])?
         };
         if read == 0 {
@@ -1214,7 +1260,7 @@ fn run_filter(
             publish_matches(shared, &mut pending_matches);
             shared
                 .bytes_scanned
-                .store(absolute_start, Ordering::Release);
+                .store(absolute_start.saturating_sub(shared.section_base), Ordering::Release);
             shared
                 .rows_scanned
                 .store(records_scanned, Ordering::Release);
@@ -1320,7 +1366,7 @@ fn run_filter(
         publish_matches(shared, &mut pending_matches);
         shared
             .bytes_scanned
-            .store(absolute_start, Ordering::Release);
+            .store(absolute_start.saturating_sub(shared.section_base), Ordering::Release);
         shared
             .rows_scanned
             .store(records_scanned, Ordering::Release);
@@ -3722,7 +3768,7 @@ mod tests {
             DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES,
         )
         .unwrap();
-        let shared = Arc::new(SharedState::new(index, 0, false));
+        let shared = Arc::new(SharedState::new(index, 0, 0, false));
         let worker_state = Arc::clone(&shared);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
