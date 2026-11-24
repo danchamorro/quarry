@@ -16,6 +16,7 @@ mod join_faults;
 mod pool;
 mod positional_io;
 mod search;
+mod section;
 mod sidecar;
 mod sort;
 mod source_stamp;
@@ -105,6 +106,11 @@ use quarry_delimited::{ParseError, parse_record};
 pub use search::{
     SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress, SearchTelemetry,
 };
+pub use section::{
+    BoundaryProof, BoundaryTrust, ByteUnit, ByteWindow, MAX_SPECULATIVE_SEARCH_BYTES,
+    SectionBounds, SectionOpenOptions, VerifyBoundaryJob, VerifyBoundaryOutcome,
+    VerifyBoundaryProgress, format_exact_bytes_in_unit, parse_exact_byte_input,
+};
 pub use sidecar::{
     CacheClearSummary, DEFAULT_INDEX_CACHE_MAX_BYTES, DEFAULT_INDEX_CACHE_MIN_FILE_BYTES,
     IndexCacheConfig, clear_index_cache, default_index_cache_dir,
@@ -135,19 +141,6 @@ const DEFAULT_READ_CHUNK: usize = 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
-pub(crate) fn parse_source_record(
-    record: &[u8],
-    delimiter: u8,
-    physical_row: u64,
-) -> Result<Vec<Cow<'_, [u8]>>, ParseError> {
-    let record = if physical_row == 0 {
-        record.strip_prefix(UTF8_BOM).unwrap_or(record)
-    } else {
-        record
-    };
-    parse_record(record, delimiter)
-}
-
 /// Parses native record bytes and wraps record-local decoding failures with their logical record.
 pub(crate) fn parse_encoded_record(
     record: &[u8],
@@ -155,14 +148,26 @@ pub(crate) fn parse_encoded_record(
     physical_row: u64,
     encoding: Encoding,
 ) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
-    if encoding == Encoding::Utf8 {
-        return parse_source_record(record, delimiter, physical_row).map_err(Into::into);
-    }
-    let body = if physical_row == 0 {
+    parse_encoded_record_with_bom(record, delimiter, physical_row, physical_row == 0, encoding)
+}
+
+/// Parses native record bytes with explicit control over whether a leading BOM should be stripped
+/// (only true for a record starting at byte 0 of the source file, never for interior sections).
+pub(crate) fn parse_encoded_record_with_bom(
+    record: &[u8],
+    delimiter: u8,
+    physical_row: u64,
+    strip_bom: bool,
+    encoding: Encoding,
+) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
+    let body = if strip_bom {
         encoding.strip_bom(record).1
     } else {
         record
     };
+    if encoding == Encoding::Utf8 {
+        return parse_record(body, delimiter).map_err(Into::into);
+    }
     let decoded = encoding
         .decode(body, DEFAULT_MAX_RECORD_BYTES)
         .map_err(|error| record_encoding_error(physical_row.saturating_add(1), error))?;
@@ -275,6 +280,11 @@ pub enum QuarryError {
     },
     /// Compressed documents are read-only; write an uncompressed copy instead.
     CompressedReadOnly,
+    /// Section boundary snapping could not locate a record terminator within the bounded search cap.
+    SectionBoundaryNotFound {
+        search_limit_bytes: usize,
+        reason: String,
+    },
 }
 
 impl fmt::Display for QuarryError {
@@ -408,6 +418,13 @@ impl fmt::Display for QuarryError {
                 f,
                 "Compressed files open read-only. Use Save Copy As to write an uncompressed copy; the compressed file is unchanged."
             ),
+            Self::SectionBoundaryNotFound {
+                search_limit_bytes,
+                reason,
+            } => write!(
+                f,
+                "{reason} (search limit: {search_limit_bytes} bytes). Try a different byte range or run Verify Boundary."
+            ),
         }
     }
 }
@@ -492,6 +509,8 @@ pub struct Session {
     completed_record_count: Arc<Mutex<Option<CompletedRecordCount>>>,
     /// Present when this document reads a private copy of a compressed source.
     compressed: Option<Arc<compressed::CompressedBacking>>,
+    /// Present when this document views a bounded byte section of a parent file.
+    section: Option<section::SectionMetadata>,
     pub file_size: u64,
     pub dialect: Dialect,
     pub first_rows: Vec<Row>,
@@ -600,6 +619,7 @@ impl Session {
             encoding,
             completed_record_count: Arc::new(Mutex::new(None)),
             compressed: None,
+            section: None,
             file_size,
             dialect: Dialect {
                 delimiter,
@@ -612,6 +632,274 @@ impl Session {
                 bootstrap_bytes_read: bootstrap.len() as u64,
             },
         })
+    }
+
+    /// Open a bounded byte section `[window.base, window.base + window.len)` of a regular
+    /// uncompressed delimited file with outward record-boundary snapping and trust metadata.
+    pub fn open_section(
+        path: impl AsRef<Path>,
+        window: ByteWindow,
+        options: SectionOpenOptions,
+    ) -> Result<Self, QuarryError> {
+        Self::open_section_inner(path.as_ref(), window, options, None)
+    }
+
+    /// Reopens a bounded byte section at previously validated `preserved_bounds` ONLY when the
+    /// underlying file still matches `expected_guard` AND the resolved `(delimiter, encoding)`
+    /// match `(expected_delimiter, expected_encoding)`. Returns `QuarryError::SourceChanged` if
+    /// the file changed on disk, or re-snaps `preserved_bounds.requested` when the resolved
+    /// delimiter or encoding changed. Used by verified boundary reopen and clean-section dormancy
+    /// wake so proven bounds (including multiline quoted starts past 16 MiB) are never re-snapped
+    /// speculatively when file and framing are unchanged.
+    pub fn open_section_preserved(
+        path: impl AsRef<Path>,
+        preserved_bounds: SectionBounds,
+        expected_guard: &SourceGuard,
+        expected_delimiter: u8,
+        expected_encoding: Encoding,
+        options: SectionOpenOptions,
+    ) -> Result<Self, QuarryError> {
+        Self::open_section_inner(
+            path.as_ref(),
+            preserved_bounds.requested,
+            options,
+            Some((
+                preserved_bounds,
+                expected_guard,
+                expected_delimiter,
+                expected_encoding,
+            )),
+        )
+    }
+
+    fn open_section_inner(
+        path: &Path,
+        window: ByteWindow,
+        options: SectionOpenOptions,
+        preserved: Option<(SectionBounds, &SourceGuard, u8, Encoding)>,
+    ) -> Result<Self, QuarryError> {
+        validate_open_options(&options.open)?;
+        if window.end().is_none() {
+            return Err(QuarryError::InvalidOption(
+                "section byte window overflows 64-bit range",
+            ));
+        }
+
+        let started = Instant::now();
+        let open_started = Instant::now();
+        let mut file = crate::source_stamp::open_regular_file(path)?;
+        let file_open = open_started.elapsed();
+        if let Some(format) = compressed::compression_of(&mut file, path)? {
+            return Err(QuarryError::CompressedFile {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "This file is {format}-compressed. Open Section requires an uncompressed file; decompress or save an uncompressed copy first."
+                ),
+            });
+        }
+        let source_stamp = SourceStamp::from_file(&file)?;
+        if let Some((_, expected_guard, _, _)) = preserved
+            && SourceGuard::from_stamp(source_stamp.clone()) != *expected_guard
+        {
+            return Err(QuarryError::SourceChanged);
+        }
+        let file_size = source_stamp.file_size();
+        let encoding = Encoding::detect(&mut file, options.encoding)?;
+        if encoding.is_utf16() && options.open.bootstrap_limit < 2 {
+            return Err(QuarryError::InvalidOption(
+                "UTF-16 bootstrap limit must fit a code unit",
+            ));
+        }
+
+        let bom = encoding.bom();
+        let bom_len = if !bom.is_empty() && file_size >= bom.len() as u64 {
+            let mut probe = [0u8; 3];
+            let read = positional_io::read_at_exact_or_eof(&file, 0, &mut probe[..bom.len()])?;
+            if read == bom.len() && &probe[..bom.len()] == bom {
+                bom.len() as u64
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        file.seek(SeekFrom::Start(0))?;
+        let delimiter = match options.open.delimiter {
+            Some(delimiter) => {
+                RecordScanner::new(delimiter, encoding)?;
+                delimiter
+            }
+            None => detect_file_delimiter(
+                &mut file,
+                Some(file_size),
+                options.open.sample_bytes,
+                options.open.bootstrap_limit,
+                encoding,
+            )?,
+        };
+
+        // Read only as many rows from byte 0 as needed to resolve headers (0 for NoHeader,
+        // 1 for FirstRow, 2 for Auto header detection), stopping immediately at the closing
+        // record boundary so malformed CSV later in the file never breaks opening a valid section.
+        let (has_header, header_row, byte0_bytes_read) = match options.open.header_mode {
+            HeaderMode::NoHeader => (false, None, 0u64),
+            HeaderMode::FirstRow => {
+                let (byte0_rows, bytes_read, reached_eof) = section::read_header_probe_rows(
+                    &file,
+                    file_size,
+                    delimiter,
+                    1,
+                    options.open.bootstrap_limit,
+                    encoding,
+                )?;
+                if byte0_rows.is_empty() && !reached_eof {
+                    return Err(QuarryError::BootstrapLimitExceeded {
+                        limit: options.open.bootstrap_limit,
+                        rows_found: 0,
+                    });
+                }
+                (true, byte0_rows.into_iter().next(), bytes_read)
+            }
+            HeaderMode::Auto => {
+                let (byte0_rows, bytes_read, reached_eof) = section::read_header_probe_rows(
+                    &file,
+                    file_size,
+                    delimiter,
+                    2,
+                    options.open.bootstrap_limit,
+                    encoding,
+                )?;
+                if byte0_rows.len() < 2 && !reached_eof {
+                    return Err(QuarryError::BootstrapLimitExceeded {
+                        limit: options.open.bootstrap_limit,
+                        rows_found: byte0_rows.len(),
+                    });
+                }
+                let detected = detect_header(&byte0_rows);
+                let header = if detected {
+                    byte0_rows.into_iter().next()
+                } else {
+                    None
+                };
+                (detected, header, bytes_read)
+            }
+        };
+
+        let bounds = if let Some((preserved_bounds, _, expected_delimiter, expected_encoding)) =
+            preserved
+            && delimiter == expected_delimiter
+            && encoding == expected_encoding
+        {
+            if preserved_bounds.snapped.end().is_none()
+                || preserved_bounds.snapped_end() > file_size
+            {
+                return Err(QuarryError::SourceChanged);
+            }
+            preserved_bounds
+        } else {
+            section::snap_section_window(
+                &file,
+                file_size,
+                delimiter,
+                encoding,
+                bom_len,
+                &source_stamp,
+                window,
+                &options,
+            )?
+        };
+        let (first_rows, section_bytes_read) = section::read_section_initial_rows(
+            &file,
+            bounds.snapped.base,
+            bounds.snapped_end(),
+            delimiter,
+            options.open.rows,
+            options.open.bootstrap_limit,
+            encoding,
+        )?;
+        // Revalidate that the file did not change between the byte-0 header probe and the
+        // section initial-row read so header, stamp, bounds, and rows share one generation.
+        if !export::source_matches_stamp(&file, path, &source_stamp)? {
+            return Err(QuarryError::SourceChanged);
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            source_stamp,
+            encoding,
+            completed_record_count: Arc::new(Mutex::new(None)),
+            compressed: None,
+            section: Some(section::SectionMetadata {
+                bounds,
+                header_row,
+                bom_len,
+            }),
+            file_size,
+            dialect: Dialect {
+                delimiter,
+                has_header,
+            },
+            first_rows,
+            metrics: OpenMetrics {
+                file_open,
+                first_rows: started.elapsed(),
+                bootstrap_bytes_read: byte0_bytes_read.saturating_add(section_bytes_read),
+            },
+        })
+    }
+
+    /// Returns section bounds and trust metadata when this session was opened via `open_section`.
+    pub fn section_bounds(&self) -> Option<SectionBounds> {
+        self.section.as_ref().map(|meta| meta.bounds)
+    }
+
+    /// True when this session views a bounded byte section of a parent file.
+    pub fn is_section(&self) -> bool {
+        self.section.is_some()
+    }
+
+    /// Returns the byte-0 header row captured when opening a section of a headered file.
+    pub fn section_header_row(&self) -> Option<&Row> {
+        self.section
+            .as_ref()
+            .and_then(|meta| meta.header_row.as_ref())
+    }
+
+    /// Active half-open byte range `[start, end)` viewed by this session (`[0, file_size)` for
+    /// whole files, `[snapped.base, snapped_end)` for bounded section documents).
+    pub fn active_byte_range(&self) -> (u64, u64) {
+        self.section.as_ref().map_or((0, self.file_size), |meta| {
+            (meta.bounds.snapped.base, meta.bounds.snapped_end())
+        })
+    }
+
+    /// Length in bytes of the active byte range viewed by this session.
+    pub fn active_byte_len(&self) -> u64 {
+        let (start, end) = self.active_byte_range();
+        end.saturating_sub(start)
+    }
+
+    /// Start a pausable, cancellable background `VerifyBoundaryJob` that proves exact record
+    /// boundaries and global row ordinals for this section under `SourceStamp` guards.
+    pub fn start_verify_section_boundary(
+        &self,
+        parent_index: Option<&StructuralIndex>,
+    ) -> Result<VerifyBoundaryJob, QuarryError> {
+        let Some(meta) = &self.section else {
+            return Err(QuarryError::InvalidOption(
+                "Verify Boundary is only available for bounded section documents",
+            ));
+        };
+        VerifyBoundaryJob::start(
+            self.path.clone(),
+            self.source_stamp.clone(),
+            self.file_size,
+            self.dialect.delimiter,
+            self.encoding,
+            meta.bounds,
+            parent_index,
+        )
     }
 
     pub fn path(&self) -> &Path {
@@ -671,6 +959,20 @@ impl Session {
         start: u64,
         count: usize,
     ) -> Result<Vec<Row>, QuarryError> {
+        let (section_base, section_end) = self.active_byte_range();
+        if !index.matches_session(
+            &self.source_stamp,
+            self.dialect.delimiter,
+            self.encoding,
+            section_base,
+            section_end,
+            self.is_section(),
+        ) {
+            return Err(QuarryError::InvalidOption(
+                "index does not match session source, framing, or byte range",
+            ));
+        }
+        let end = index.section_end().unwrap_or(u64::MAX);
         read_rows_from_index(
             &self.path,
             self.dialect.delimiter,
@@ -679,7 +981,7 @@ impl Session {
             count,
             DEFAULT_MAX_RECORD_BYTES,
             self.encoding,
-            u64::MAX,
+            end,
         )
     }
 }
@@ -1013,8 +1315,11 @@ fn read_rows_from_index(
 
     let target_end = start.saturating_add(count as u64).min(index.indexed_rows());
     let checkpoint = index.nearest_checkpoint(start);
+    let section_base = index.section_base();
     let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(checkpoint.offset))?;
+    if encoding.is_utf16() {
+        file.seek(SeekFrom::Start(checkpoint.offset))?;
+    }
     let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset, encoding)?;
     let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut absolute_start = checkpoint.offset;
@@ -1025,7 +1330,7 @@ fn read_rows_from_index(
 
     while row_number < target_end {
         // Bound the read itself, so bytes past `end` (such as half of a UTF-16
-        // code unit still being written) are never read.
+        // code unit still being written, or bytes beyond a section's end) are never read.
         let remaining = end.saturating_sub(absolute_start);
         let read = if remaining == 0 {
             0
@@ -1033,11 +1338,20 @@ fn read_rows_from_index(
             let limit = chunk
                 .len()
                 .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-            encoding.read_chunk(&mut file, &mut chunk[..limit])?
+            if encoding.is_utf16() {
+                encoding.read_chunk(&mut file, &mut chunk[..limit])?
+            } else {
+                positional_io::read_at_exact_or_eof(&file, absolute_start, &mut chunk[..limit])?
+            }
         };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
-                let fields = parse_encoded_record(&record, delimiter, row_number, encoding)?
+                let bom_row = if section_base == 0 {
+                    row_number
+                } else {
+                    row_number.saturating_add(1)
+                };
+                let fields = parse_encoded_record(&record, delimiter, bom_row, encoding)?
                     .into_iter()
                     .map(|field| field.into_owned())
                     .collect();
@@ -1059,7 +1373,12 @@ fn read_rows_from_index(
                         limit: max_record_bytes,
                     });
                 } else if deferred_error.is_none() {
-                    match parse_encoded_record(&record, delimiter, row_number, encoding) {
+                    let bom_row = if section_base == 0 {
+                        row_number
+                    } else {
+                        row_number.saturating_add(1)
+                    };
+                    match parse_encoded_record(&record, delimiter, bom_row, encoding) {
                         Ok(fields) => rows.push(Row {
                             offset: record_start,
                             fields: fields.into_iter().map(|field| field.into_owned()).collect(),

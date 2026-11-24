@@ -32,8 +32,9 @@ use crate::{
     WorkingCopyState, compressed,
 };
 use quarry_core::{
-    CompletedIndex, Encoding, FileIdentity, FilterQuery, OpenOptions, QuarryError, Session,
-    SourceGuard, WorkingCopyCleanup, inspect_storage,
+    ByteWindow, CompletedIndex, Encoding, FileIdentity, FilterQuery, OpenOptions, QuarryError,
+    SectionBounds, SectionOpenOptions, Session, SourceGuard, StructuralIndex,
+    VerifyBoundaryOutcome, WorkingCopyCleanup, inspect_storage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -224,6 +225,7 @@ pub enum PinReason {
     CompressedDecompressing,
     CompressedPendingStorage,
     IndexingPaused,
+    SectionVerifying,
     JoinReserved,
     CloseFlowPending,
 }
@@ -303,6 +305,16 @@ pub struct ExportCompletion {
 pub struct StructuralCompletion {
     pub document_id: DocumentId,
     pub result: Result<Option<String>, AppMessage>,
+}
+
+/// Completion or failure of a background `VerifyBoundaryJob` reported by
+/// [`WorkbenchScheduler::poll_section_verifications`].
+#[derive(Debug)]
+pub struct SectionVerifyCompletion {
+    pub document_id: DocumentId,
+    pub result: Result<VerifyBoundaryOutcome, AppMessage>,
+    /// True when a clean section was automatically reopened at its newly verified boundaries.
+    pub reopened: bool,
 }
 
 /// Actionable scheduler failure that always preserves every open document and edit.
@@ -417,8 +429,19 @@ struct DormantDirtyState {
     header_renames: Arc<BTreeMap<usize, Arc<String>>>,
     cell_edits: SharedCellEdits,
     overlay_bytes: usize,
+    verified_bounds_override: Option<SectionBounds>,
+    pending_verified_reopen: Option<SectionBounds>,
+    section_quote_free_confirmed: bool,
     /// Retains code-counted directory FD reservations for any live `WorkingCopyStorage`.
     _working_dir_fd_lease: Option<FdLease>,
+}
+
+#[derive(Clone, Copy)]
+struct DormantSectionSpec {
+    bounds: SectionBounds,
+    quote_free_confirmed: bool,
+    delimiter: u8,
+    encoding: Encoding,
 }
 
 enum DormantKind {
@@ -426,6 +449,7 @@ enum DormantKind {
     CleanPlain {
         open_options: OpenOptions,
         encoding: Option<Encoding>,
+        section: Option<DormantSectionSpec>,
     },
     /// Dirty document: sparse edits, history, working copy, and Undo/Redo dirs retained.
     Dirty(Box<DormantDirtyState>),
@@ -604,12 +628,48 @@ impl WorkbenchScheduler {
     /// Returns the display filename of `id` across hydrated, dormant, and stub states.
     pub fn tab_display_name(&self, id: DocumentId) -> Option<String> {
         let path = self.tab_logical_path(id)?;
-        Some(
-            path.file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .into_owned(),
-        )
+        let base = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        if let Some(bounds) = self.tab_section_bounds(id) {
+            return Some(format!(
+                "{base} [{}–{}]",
+                crate::format_bytes(bounds.snapped.base),
+                crate::format_bytes(bounds.snapped_end()),
+            ));
+        }
+        if let Some(slot) = self.tabs.get(&id)
+            && let SlotResidency::Dormant(dormant) = &slot.residency
+        {
+            let dormant_bounds = match &dormant.kind {
+                DormantKind::CleanPlain {
+                    section: Some(spec),
+                    ..
+                } => Some(spec.bounds),
+                DormantKind::Dirty(dirty) => dirty
+                    .verified_bounds_override
+                    .or_else(|| dirty.session.section_bounds()),
+                _ => None,
+            };
+            if let Some(bounds) = dormant_bounds {
+                return Some(format!(
+                    "{base} [{}–{}]",
+                    crate::format_bytes(bounds.snapped.base),
+                    crate::format_bytes(bounds.snapped_end()),
+                ));
+            }
+        }
+        Some(base)
+    }
+
+    /// Returns section bounds for a hydrated section tab (if applicable).
+    pub fn tab_section_bounds(&self, id: DocumentId) -> Option<SectionBounds> {
+        self.tabs
+            .get(&id)
+            .and_then(|slot| slot.tab.document.as_ref())
+            .and_then(Document::section_bounds)
     }
 
     /// Returns the logical source path of `id` across hydrated, dormant, and stub states.
@@ -746,14 +806,40 @@ impl WorkbenchScheduler {
             .max(self.active_by_window.len().max(1))
     }
 
-    /// Finds an existing tab owning `path` by canonical path OR OS `FileIdentity` (`dev`, `ino`),
-    /// across hydrated tabs, dormant tabs, AND lazy stubs (plus active working files).
+    /// Finds an existing whole-file tab owning `path` by canonical path OR OS `FileIdentity`
+    /// (`dev`, `ino`), across hydrated tabs, dormant tabs, AND lazy stubs (plus active working
+    /// files). Bounded section tabs are skipped so opening a parent file and a section coexist.
     pub fn find_owner_for_path(&self, path: &Path) -> Option<(WindowId, DocumentId)> {
         let canonical = canonicalize_best_effort(path);
         let identity = FileIdentity::from_path(path).ok().flatten();
         for (&doc_id, slot) in &self.tabs {
+            if slot_is_section(slot) {
+                continue;
+            }
             if tab_matches_path(slot, path, &canonical, identity) {
                 return Some((slot.window, doc_id));
+            }
+        }
+        None
+    }
+
+    /// Finds a validated `StructuralIndex` from an already-hydrated whole-file tab matching `path`.
+    fn find_parent_index_for_path(&self, path: &Path) -> Option<StructuralIndex> {
+        let canonical = canonicalize_best_effort(path);
+        let identity = FileIdentity::from_path(path).ok().flatten();
+        for slot in self.tabs.values() {
+            if slot_is_section(slot) {
+                continue;
+            }
+            if tab_matches_path(slot, path, &canonical, identity)
+                && let Some(doc) = slot.tab.document.as_ref()
+            {
+                if let Some(index) = doc.index.as_ref() {
+                    return Some(index.clone());
+                }
+                if let Some(job) = doc.job.as_ref() {
+                    return Some(job.snapshot());
+                }
             }
         }
         None
@@ -816,6 +902,9 @@ impl WorkbenchScheduler {
         }
         if doc.is_indexing_pause_pinned() {
             return Some(PinReason::IndexingPaused);
+        }
+        if doc.section_verify_job.is_some() || doc.pending_verified_reopen.is_some() {
+            return Some(PinReason::SectionVerifying);
         }
         if slot.tab.document_writing() {
             return Some(PinReason::ActiveWriteJob);
@@ -902,6 +991,7 @@ impl WorkbenchScheduler {
             let file_identity = FileIdentity::from_path(&path).ok().flatten();
             let id = self.allocate_id();
             let mut tab = WorkbenchTab::new(id.raw());
+            tab.delimiter_mode = crate::tab::DelimiterMode::from_delimiter(options.delimiter);
             tab.header_mode = options.header_mode;
             tab.encoding_mode = encoding;
             let stub = LazyDocumentStub {
@@ -936,6 +1026,316 @@ impl WorkbenchScheduler {
         Ok(ids)
     }
 
+    /// Opens a bounded byte section of `path` as a distinct tab in `window`.
+    /// Automatically borrows a validated `StructuralIndex` from any already-open whole-file tab
+    /// of the same file when `options.parent_index` is `None`.
+    pub fn open_section(
+        &mut self,
+        window: WindowId,
+        path: PathBuf,
+        byte_window: ByteWindow,
+        mut options: SectionOpenOptions,
+    ) -> Result<WakeOutcome, SchedulerError> {
+        if options.parent_index.is_none() {
+            options.parent_index = self.find_parent_index_for_path(&path);
+        }
+        let overlay_used = self.total_dirty_overlay_bytes();
+        if overlay_used > self.config.max_dirty_overlay_bytes {
+            return Err(SchedulerError::OverlayBudgetExceeded {
+                used_bytes: overlay_used,
+                cap_bytes: self.config.max_dirty_overlay_bytes,
+            });
+        }
+        let previous_active = self.active_by_window.get(&window).copied();
+        let evicted_records = self.ensure_hydration_capacity(Some(window), previous_active)?;
+        let evicted: Vec<DocumentId> = evicted_records
+            .iter()
+            .map(|&(_, doc_id, _)| doc_id)
+            .collect();
+
+        let fd_lease = match self.fd_budget.try_reserve(FdCategory::ActiveDocument, 1) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.restore_evicted_on_failure(&evicted_records);
+                return Err(error);
+            }
+        };
+
+        let delimiter_mode = crate::tab::DelimiterMode::from_delimiter(options.open.delimiter);
+        let header_mode = options.open.header_mode;
+        let encoding_mode = options.encoding;
+        let mut doc = match Document::prepare_section(&path, byte_window, options) {
+            Ok(doc) => doc,
+            Err(message) => {
+                drop(fd_lease);
+                self.restore_evicted_on_failure(&evicted_records);
+                return Err(SchedulerError::OpenFailed(message));
+            }
+        };
+        doc.working_directory = self.config.working_directory.clone();
+        doc.custom_working_directory = self.config.custom_working_directory;
+        doc.index_cache_enabled = self.config.index_cache_enabled;
+        doc.working_cleanup = self.working_cleanup.clone();
+        doc.decompression_slots = self.decompression_slots.clone();
+
+        let job_fd_lease = match self.fd_budget.try_reserve(FdCategory::BackgroundJob, 1) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                doc.shutdown();
+                drop(fd_lease);
+                self.restore_evicted_on_failure(&evicted_records);
+                return Err(error);
+            }
+        };
+        if let Err(message) = doc.start_indexing() {
+            doc.shutdown();
+            drop(job_fd_lease);
+            drop(fd_lease);
+            self.restore_evicted_on_failure(&evicted_records);
+            return Err(SchedulerError::OpenFailed(message));
+        }
+
+        let id = self.allocate_id();
+        let mut tab = WorkbenchTab::new(id.raw());
+        tab.delimiter_mode = delimiter_mode;
+        tab.header_mode = header_mode;
+        tab.encoding_mode = encoding_mode;
+        tab.document = Some(doc);
+        let tick = self.next_tick();
+        self.tabs.insert(
+            id,
+            ManagedTab {
+                window,
+                tab,
+                residency: SlotResidency::Hydrated {
+                    fd_lease,
+                    temp_dir_fd_lease: None,
+                    job_fd_lease,
+                    pending_filter_restore: None,
+                },
+                last_used_tick: tick,
+            },
+        );
+        self.window_tabs.entry(window).or_default().push(id);
+        self.active_by_window.insert(window, id);
+        let _ = self.sync_fd_leases();
+        Ok(WakeOutcome::Ready {
+            document_id: id,
+            kind: WakeKind::StubInitialOpen,
+            evicted,
+        })
+    }
+
+    /// Starts a pausable/cancellable `VerifyBoundaryJob` on section tab `id`, reserving its
+    /// background FD and borrowing a validated parent index when available.
+    pub fn start_verify_section_boundary(&mut self, id: DocumentId) -> Result<(), AppMessage> {
+        let parent_index = self
+            .tab_logical_path(id)
+            .and_then(|path| self.find_parent_index_for_path(&path));
+        self.with_reserved_job_fds(
+            id,
+            1,
+            false,
+            |doc| doc.start_verify_section_boundary(parent_index.as_ref()),
+            |error| AppMessage::warning(error.to_string()),
+        )
+    }
+
+    pub fn pause_verify_section_boundary(&mut self, id: DocumentId) -> Result<(), String> {
+        let doc = self
+            .tab_mut(id)
+            .and_then(|tab| tab.document.as_mut())
+            .ok_or_else(|| "Document is not hydrated.".to_owned())?;
+        doc.pause_verify_section_boundary()
+    }
+
+    pub fn resume_verify_section_boundary(&mut self, id: DocumentId) -> Result<(), String> {
+        let doc = self
+            .tab_mut(id)
+            .and_then(|tab| tab.document.as_mut())
+            .ok_or_else(|| "Document is not hydrated.".to_owned())?;
+        let res = doc.resume_verify_section_boundary();
+        let _ = self.sync_fd_leases();
+        res
+    }
+
+    pub fn cancel_verify_section_boundary(&mut self, id: DocumentId) {
+        if let Some(doc) = self.tab_mut(id).and_then(|tab| tab.document.as_mut()) {
+            doc.cancel_verify_section_boundary();
+        }
+        let _ = self.sync_fd_leases();
+    }
+
+    /// Reopens section tab `id` at its newly verified exact record boundaries, replacing the
+    /// section's session. Refuses to discard unsaved section edits unless `discard_unsaved` is
+    /// explicitly `true` (after caller confirmation).
+    pub fn reopen_verified_section(
+        &mut self,
+        id: DocumentId,
+        discard_unsaved: bool,
+    ) -> Result<String, AppMessage> {
+        let (
+            path,
+            verified_bounds,
+            open_options,
+            encoding,
+            quote_free,
+            expected_guard,
+            expected_delimiter,
+            expected_encoding,
+        ) = {
+            let Some(slot) = self.tabs.get(&id) else {
+                return Err(AppMessage::warning("Document is not hydrated."));
+            };
+            let Some(doc) = slot.tab.document.as_ref() else {
+                return Err(AppMessage::warning("Document is not hydrated."));
+            };
+            if slot.tab.document_writing()
+                || doc.save_job.is_some()
+                || doc.export_job.is_some()
+                || doc.structural_job.is_some()
+            {
+                return Err(AppMessage::warning(
+                    "Wait for the active save or export to finish before reopening at verified boundaries.",
+                ));
+            }
+            let Some(bounds) = doc.pending_verified_reopen else {
+                return Err(AppMessage::warning(
+                    "No verified boundary update is pending for this section.",
+                ));
+            };
+            if doc.is_dirty() && !discard_unsaved {
+                return Err(AppMessage::warning(
+                    "Unsaved section edits would be discarded. Save the section as a new file first, or confirm discarding edits to reopen at verified boundaries.",
+                ));
+            }
+            (
+                doc.logical_path.clone(),
+                bounds,
+                doc.current_open_options(),
+                Some(doc.session.encoding()),
+                doc.section_quote_free_confirmed,
+                doc.session.source_guard(),
+                doc.session.dialect.delimiter,
+                doc.session.encoding(),
+            )
+        };
+        let options = SectionOpenOptions {
+            open: open_options,
+            encoding,
+            parent_index: None,
+            quote_free_confirmed: quote_free,
+            ..SectionOpenOptions::default()
+        };
+        let mut replacement = match Document::prepare_section_preserved(
+            &path,
+            verified_bounds,
+            &expected_guard,
+            expected_delimiter,
+            expected_encoding,
+            options,
+        ) {
+            Ok(doc) => doc,
+            Err(quarry_core::QuarryError::SourceChanged) => {
+                if let Some(doc) = self.tabs.get_mut(&id).and_then(|s| s.tab.document.as_mut()) {
+                    doc.pending_verified_reopen = None;
+                    doc.source_changed = true;
+                }
+                return Err(AppMessage::warning(
+                    "The source file changed after boundary verification; reload or verify boundaries again.",
+                ));
+            }
+            Err(err) => return Err(AppMessage::error(err.to_string())),
+        };
+        replacement.working_directory = self.config.working_directory.clone();
+        replacement.custom_working_directory = self.config.custom_working_directory;
+        replacement.index_cache_enabled = self.config.index_cache_enabled;
+        replacement.working_cleanup = self.working_cleanup.clone();
+        replacement.decompression_slots = self.decompression_slots.clone();
+        replacement.section_verify_status = Some(
+            if let Some(first) = replacement.global_data_row_number(replacement.data_start) {
+                format!(
+                    "Reopened at verified boundaries (starts at row {}).",
+                    crate::group_digits(first)
+                )
+            } else {
+                "Reopened at verified boundaries.".into()
+            },
+        );
+        replacement.start_indexing().map_err(AppMessage::error)?;
+
+        let notice = replacement
+            .section_verify_status
+            .clone()
+            .unwrap_or_else(|| "Reopened at verified boundaries.".into());
+        if let Some(slot) = self.tabs.get_mut(&id) {
+            if let Some(mut old) = slot.tab.document.take() {
+                old.shutdown();
+            }
+            slot.tab.document = Some(replacement);
+            slot.tab.notice = Some(AppMessage::status(notice.clone()));
+        }
+        let _ = self.sync_fd_leases();
+        Ok(notice)
+    }
+
+    /// Polls all hydrated tabs' `VerifyBoundaryJob`s. Clean sections whose boundaries shifted
+    /// are automatically reopened at the exact verified bounds unless blocked by an active writer
+    /// or open cell editor; dirty or blocked sections keep all state intact and expose
+    /// `pending_verified_reopen` for explicit Save As + Reopen.
+    pub fn poll_section_verifications(&mut self) -> Vec<SectionVerifyCompletion> {
+        self.poll_section_verifications_with_blocked(&BTreeSet::new())
+    }
+
+    /// Same as [`Self::poll_section_verifications`], skipping auto-reopen for any `DocumentId`
+    /// in `blocked_auto_reopen` (e.g. tabs currently open in a cell editor with an unapplied draft).
+    pub fn poll_section_verifications_with_blocked(
+        &mut self,
+        blocked_auto_reopen: &BTreeSet<DocumentId>,
+    ) -> Vec<SectionVerifyCompletion> {
+        let ids: Vec<DocumentId> = self.tabs.keys().copied().collect();
+        let mut completions = Vec::new();
+        for id in ids {
+            let outcome = self
+                .tabs
+                .get_mut(&id)
+                .and_then(|slot| slot.tab.document.as_mut())
+                .and_then(Document::poll_section_verify);
+            let Some(result) = outcome else {
+                continue;
+            };
+            let mut reopened = false;
+            if let Ok(VerifyBoundaryOutcome::Verified {
+                boundary_changed: true,
+                ..
+            }) = &result
+            {
+                let can_auto_reopen = !blocked_auto_reopen.contains(&id)
+                    && self.tabs.get(&id).is_some_and(|slot| {
+                        !slot.tab.document_writing()
+                            && slot.tab.document.as_ref().is_some_and(|doc| {
+                                !doc.is_dirty()
+                                    && doc.save_job.is_none()
+                                    && doc.export_job.is_none()
+                                    && doc.structural_job.is_none()
+                            })
+                    });
+                if can_auto_reopen && self.reopen_verified_section(id, false).is_ok() {
+                    reopened = true;
+                }
+            }
+            completions.push(SectionVerifyCompletion {
+                document_id: id,
+                result,
+                reopened,
+            });
+        }
+        if !completions.is_empty() {
+            let _ = self.sync_fd_leases();
+        }
+        completions
+    }
+
     /// Opens a single path immediately in `window`, deduplicating canonical paths / hard links
     /// and evicting an unpinned LRU tab if the hydration cap is reached.
     pub fn open_path(
@@ -952,6 +1352,7 @@ impl WorkbenchScheduler {
         let file_identity = FileIdentity::from_path(&path).ok().flatten();
         let id = self.allocate_id();
         let mut tab = WorkbenchTab::new(id.raw());
+        tab.delimiter_mode = crate::tab::DelimiterMode::from_delimiter(options.delimiter);
         tab.header_mode = options.header_mode;
         tab.encoding_mode = encoding;
         let stub = LazyDocumentStub {
@@ -1744,10 +2145,93 @@ impl WorkbenchScheduler {
             return Err(SchedulerError::NotFound(id));
         };
         let was_hydrated = matches!(slot.residency, SlotResidency::Hydrated { .. });
+        let existing_section = slot
+            .tab
+            .document
+            .as_ref()
+            .and_then(|doc| {
+                doc.section_bounds().map(|bounds| {
+                    (
+                        bounds,
+                        doc.section_quote_free_confirmed,
+                        doc.session.source_guard(),
+                        doc.session.dialect.delimiter,
+                        doc.session.encoding(),
+                    )
+                })
+            })
+            .or(match &slot.residency {
+                SlotResidency::Dormant(dormant) => match &dormant.kind {
+                    DormantKind::CleanPlain {
+                        section: Some(spec),
+                        ..
+                    } => Some((
+                        spec.bounds,
+                        spec.quote_free_confirmed,
+                        dormant.source_guard.clone(),
+                        spec.delimiter,
+                        spec.encoding,
+                    )),
+                    DormantKind::Dirty(dirty) => dirty
+                        .verified_bounds_override
+                        .or_else(|| dirty.session.section_bounds())
+                        .map(|bounds| {
+                            (
+                                bounds,
+                                dirty.section_quote_free_confirmed,
+                                dormant.source_guard.clone(),
+                                dirty.session.dialect.delimiter,
+                                dirty.session.encoding(),
+                            )
+                        }),
+                    _ => None,
+                },
+                _ => None,
+            });
 
         // Validate and prepare the replacement document BEFORE touching the existing slot.
-        let mut replacement = Document::prepare_with_encoding(&path, options, encoding)
-            .map_err(SchedulerError::OpenFailed)?;
+        // For section tabs, stay bounded to the section window instead of opening the whole parent.
+        // Core resolves Auto encoding/delimiter first and only reuses `prev_bounds` when both the
+        // file guard AND resolved `(delimiter, encoding)` match; otherwise it re-snaps `requested`.
+        let (mut replacement, source_reloaded) = if let Some((
+            prev_bounds,
+            quote_free_confirmed,
+            prev_guard,
+            prev_delimiter,
+            prev_encoding,
+        )) = existing_section
+        {
+            let parent_index = self.find_parent_index_for_path(&path);
+            let sec_opts = SectionOpenOptions {
+                open: options,
+                encoding,
+                parent_index,
+                quote_free_confirmed,
+                ..SectionOpenOptions::default()
+            };
+            match Document::prepare_section_preserved(
+                &path,
+                prev_bounds,
+                &prev_guard,
+                prev_delimiter,
+                prev_encoding,
+                sec_opts.clone(),
+            ) {
+                Ok(doc) => (doc, false),
+                Err(quarry_core::QuarryError::SourceChanged) => (
+                    Document::prepare_section(&path, prev_bounds.requested, sec_opts)
+                        .map_err(SchedulerError::OpenFailed)?,
+                    true,
+                ),
+                Err(err) => return Err(SchedulerError::OpenFailed(err.to_string())),
+            }
+        } else {
+            (
+                Document::prepare_with_encoding(&path, options, encoding)
+                    .map_err(SchedulerError::OpenFailed)?,
+                false,
+            )
+        };
         if replacement.is_compressed() && !self.write_slot_available() {
             replacement.shutdown();
             return Err(SchedulerError::OpenFailed(
@@ -1770,6 +2254,8 @@ impl WorkbenchScheduler {
                     doc.shutdown();
                 }
                 slot.tab.document = Some(replacement);
+                slot.tab.delimiter_mode =
+                    crate::tab::DelimiterMode::from_delimiter(options.delimiter);
                 slot.tab.header_mode = options.header_mode;
                 slot.tab.encoding_mode = encoding;
                 slot.tab.notice = None;
@@ -1787,27 +2273,141 @@ impl WorkbenchScheduler {
         }
 
         // For Stub or Dormant tabs, shut down the pre-check document and hydrate normally now
-        // that we know the target path + options + encoding open cleanly.
+        // that we know the target path + options + encoding open cleanly. Save prior slot state
+        // so an activation failure (e.g. FD budget exhausted) leaves the dormant/stub tab intact.
+        let replacement_section = replacement
+            .section_bounds()
+            .map(|bounds| DormantSectionSpec {
+                bounds,
+                quote_free_confirmed: replacement.section_quote_free_confirmed,
+                delimiter: replacement.session.dialect.delimiter,
+                encoding: replacement.session.encoding(),
+            });
+        let replacement_guard = replacement.session.source_guard();
+        let replacement_view = DormantViewSnapshot {
+            viewport_start: replacement.viewport_start,
+            scroll_points: replacement.scroll_points,
+            visible_rows: replacement.visible_rows,
+            data_start: replacement.data_start,
+            selection: replacement.selection,
+            cursor: replacement.cursor.clone(),
+            selected_rows: replacement.selected_rows.clone(),
+            selected_columns: replacement.selected_columns.clone(),
+            column_selection_anchor: replacement.column_selection_anchor,
+            columns: replacement.columns.clone(),
+            headers: replacement.headers.clone(),
+            total_columns: replacement.total_columns,
+            filter_query: None,
+            filter_viewport_start: 0,
+            edit_history: crate::history::EditHistory::default(),
+        };
         replacement.shutdown();
         let canonical_path = canonicalize_best_effort(&path);
         let file_identity = FileIdentity::from_path(&path).ok().flatten();
-        if let Some(slot) = self.tabs.get_mut(&id) {
+        let prev_active = self.active_by_window.get(&window).copied();
+        let prev_slot_state = self.tabs.get_mut(&id).map(|slot| {
+            let old_delimiter_mode = slot.tab.delimiter_mode;
+            let old_header_mode = slot.tab.header_mode;
+            let old_encoding_mode = slot.tab.encoding_mode;
+            let old_notice = slot.tab.notice.take();
+            let old_footer_status = slot.tab.footer_status.take();
+            let new_residency = if let Some(sec_spec) = replacement_section {
+                let view = match &slot.residency {
+                    SlotResidency::Dormant(dormant) => {
+                        let (prev_bounds, prev_delimiter, prev_encoding) = match &dormant.kind {
+                            DormantKind::CleanPlain {
+                                section: Some(s), ..
+                            } => (Some(s.bounds), Some(s.delimiter), Some(s.encoding)),
+                            DormantKind::Dirty(d) => (
+                                d.verified_bounds_override
+                                    .or_else(|| d.session.section_bounds()),
+                                Some(d.session.dialect.delimiter),
+                                Some(d.session.encoding()),
+                            ),
+                            _ => (None, None, None),
+                        };
+                        let format_changed = source_reloaded
+                            || dormant.source_changed
+                            || old_header_mode != options.header_mode
+                            || old_encoding_mode != encoding
+                            || dormant.view.data_start != replacement_view.data_start
+                            || prev_bounds.map(|b| b.snapped) != Some(sec_spec.bounds.snapped)
+                            || prev_delimiter != Some(sec_spec.delimiter)
+                            || prev_encoding != Some(sec_spec.encoding);
+                        if format_changed {
+                            replacement_view.clone()
+                        } else {
+                            dormant.view.clone()
+                        }
+                    }
+                    _ => replacement_view.clone(),
+                };
+                SlotResidency::Dormant(Box::new(DormantDocument {
+                    logical_path: path.clone(),
+                    canonical_path: canonical_path.clone(),
+                    file_identity,
+                    source_guard: replacement_guard,
+                    source_changed: false,
+                    view,
+                    kind: DormantKind::CleanPlain {
+                        open_options: options,
+                        encoding,
+                        section: Some(sec_spec),
+                    },
+                }))
+            } else {
+                SlotResidency::Stub(LazyDocumentStub {
+                    logical_path: path.clone(),
+                    canonical_path,
+                    file_identity,
+                    open_options: options,
+                    encoding,
+                })
+            };
+            let old_residency = std::mem::replace(&mut slot.residency, new_residency);
+            slot.tab.delimiter_mode = crate::tab::DelimiterMode::from_delimiter(options.delimiter);
             slot.tab.header_mode = options.header_mode;
             slot.tab.encoding_mode = encoding;
-            slot.tab.notice = None;
-            slot.tab.footer_status = None;
-            slot.residency = SlotResidency::Stub(LazyDocumentStub {
-                logical_path: path,
-                canonical_path,
-                file_identity,
-                open_options: options,
-                encoding,
-            });
-        }
+            (
+                old_delimiter_mode,
+                old_header_mode,
+                old_encoding_mode,
+                old_notice,
+                old_footer_status,
+                old_residency,
+            )
+        });
         if self.active_by_window.get(&window) == Some(&id) {
             self.active_by_window.remove(&window);
         }
-        self.activate_tab(window, id)
+        match self.activate_tab(window, id) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                if let (
+                    Some(slot),
+                    Some((
+                        old_delimiter_mode,
+                        old_header_mode,
+                        old_encoding_mode,
+                        old_notice,
+                        old_footer_status,
+                        old_residency,
+                    )),
+                ) = (self.tabs.get_mut(&id), prev_slot_state)
+                {
+                    slot.tab.delimiter_mode = old_delimiter_mode;
+                    slot.tab.header_mode = old_header_mode;
+                    slot.tab.encoding_mode = old_encoding_mode;
+                    slot.tab.notice = old_notice;
+                    slot.tab.footer_status = old_footer_status;
+                    slot.residency = old_residency;
+                }
+                if let Some(active) = prev_active {
+                    self.active_by_window.insert(window, active);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Applies one value-edit or structural-working-copy undo/redo step on hydrated tab `id`.
@@ -2788,12 +3388,13 @@ impl WorkbenchScheduler {
         result
     }
 
-    /// Lists hydrated non-compressed tabs eligible as open-document inputs to Join Files.
+    /// Lists hydrated non-compressed whole-file tabs eligible as open-document inputs to Join Files.
     pub fn hydrated_join_choices(&self) -> Vec<(DocumentId, String, PathBuf)> {
         let mut choices = Vec::new();
         for (&id, slot) in &self.tabs {
             if let Some(doc) = slot.tab.document.as_ref()
                 && !doc.is_compressed()
+                && !doc.is_section()
             {
                 let label = doc
                     .logical_path
@@ -3133,6 +3734,7 @@ fn doc_non_filter_job_fds(doc: &Document) -> usize {
     // (source + destination); gzip decompression holds up to 4 FDs; DuplicatePreview holds no
     // running worker FDs.
     usize::from(doc.job.is_some())
+        + usize::from(doc.section_verify_job.is_some())
         + usize::from(doc.search_job.is_some()) * 2
         + usize::from(doc.export_job.is_some()) * 2
         + usize::from(doc.save_job.is_some()) * 2
@@ -3225,6 +3827,20 @@ fn paths_alias(left: &Path, right: &Path) -> bool {
         return a == b;
     }
     false
+}
+
+fn slot_is_section(slot: &ManagedTab) -> bool {
+    match &slot.residency {
+        SlotResidency::Hydrated { .. } => {
+            slot.tab.document.as_ref().is_some_and(Document::is_section)
+        }
+        SlotResidency::Dormant(dormant) => match &dormant.kind {
+            DormantKind::CleanPlain { section, .. } => section.is_some(),
+            DormantKind::Dirty(dirty) => dirty.session.is_section(),
+            DormantKind::CompressedComplete { .. } | DormantKind::CompressedPreview { .. } => false,
+        },
+        SlotResidency::Stub(_) => false,
+    }
 }
 
 fn tab_matches_path(
@@ -3477,15 +4093,25 @@ fn demote_document(
             header_renames: Arc::clone(&doc.header_renames),
             cell_edits: Arc::clone(&doc.cell_edits),
             overlay_bytes: prep.overlay_bytes,
+            verified_bounds_override: doc.verified_bounds_override,
+            pending_verified_reopen: doc.pending_verified_reopen,
+            section_quote_free_confirmed: doc.section_quote_free_confirmed,
             _working_dir_fd_lease: working_dir_fd_lease,
         }))
     } else {
         // Clean plain document: drop `Document` (including `Session`, `StructuralIndex`, buffers).
+        let section = doc.section_bounds().map(|bounds| DormantSectionSpec {
+            bounds,
+            quote_free_confirmed: doc.section_quote_free_confirmed,
+            delimiter: doc.session.dialect.delimiter,
+            encoding: doc.session.encoding(),
+        });
         doc.shutdown();
         drop(doc);
         DormantKind::CleanPlain {
             open_options: prep.open_options,
             encoding: prep.encoding,
+            section,
         }
     };
 
@@ -3596,15 +4222,28 @@ fn wake_dormant_document(
         DormantKind::CleanPlain {
             open_options,
             encoding,
+            section,
         } => {
+            let prepare_fresh = |path: &Path| {
+                if let Some(spec) = section {
+                    Document::prepare_section(
+                        path,
+                        spec.bounds.requested,
+                        SectionOpenOptions {
+                            open: open_options,
+                            encoding,
+                            quote_free_confirmed: spec.quote_free_confirmed,
+                            ..SectionOpenOptions::default()
+                        },
+                    )
+                } else {
+                    Document::prepare_with_encoding(path, open_options, encoding)
+                }
+            };
             if !source_unchanged {
                 // External file changed or vanished while dormant: never silently reload!
                 // Try opening a read-only shell if the file exists, or surface a conflict error.
-                let mut doc = match Document::prepare_with_encoding(
-                    &dormant.logical_path,
-                    open_options,
-                    encoding,
-                ) {
+                let mut doc = match prepare_fresh(&dormant.logical_path) {
                     Ok(doc) => doc,
                     Err(message) => {
                         let restored = Box::new(DormantDocument {
@@ -3617,6 +4256,7 @@ fn wake_dormant_document(
                             kind: DormantKind::CleanPlain {
                                 open_options,
                                 encoding,
+                                section,
                             },
                         });
                         return Err((
@@ -3644,11 +4284,32 @@ fn wake_dormant_document(
                 ));
             }
 
-            let mut doc = match Document::prepare_with_encoding(
-                &dormant.logical_path,
-                open_options,
-                encoding,
-            ) {
+            let opened = if let Some(spec) = section {
+                match Document::prepare_section_preserved(
+                    &dormant.logical_path,
+                    spec.bounds,
+                    &dormant.source_guard,
+                    spec.delimiter,
+                    spec.encoding,
+                    SectionOpenOptions {
+                        open: open_options,
+                        encoding,
+                        quote_free_confirmed: spec.quote_free_confirmed,
+                        ..SectionOpenOptions::default()
+                    },
+                ) {
+                    Ok(doc) => Ok(doc),
+                    Err(quarry_core::QuarryError::SourceChanged) => {
+                        // File changed between matches_path and open: reopen freshly without
+                        // reusing the old proof and mark source_changed below.
+                        prepare_fresh(&dormant.logical_path)
+                    }
+                    Err(err) => Err(err.to_string()),
+                }
+            } else {
+                Document::prepare_with_encoding(&dormant.logical_path, open_options, encoding)
+            };
+            let mut doc = match opened {
                 Ok(doc) => doc,
                 Err(message) => {
                     let restored = Box::new(DormantDocument {
@@ -3661,6 +4322,7 @@ fn wake_dormant_document(
                         kind: DormantKind::CleanPlain {
                             open_options,
                             encoding,
+                            section,
                         },
                     });
                     return Err((restored, SchedulerError::OpenFailed(message)));
@@ -3706,6 +4368,7 @@ fn wake_dormant_document(
                             kind: DormantKind::CleanPlain {
                                 open_options,
                                 encoding,
+                                section,
                             },
                         });
                         return Err((restored, error));
@@ -3731,6 +4394,7 @@ fn wake_dormant_document(
                     kind: DormantKind::CleanPlain {
                         open_options,
                         encoding,
+                        section,
                     },
                 });
                 return Err((restored, SchedulerError::OpenFailed(message)));
@@ -3748,6 +4412,7 @@ fn wake_dormant_document(
                         kind: DormantKind::CleanPlain {
                             open_options,
                             encoding,
+                            section,
                         },
                     });
                     return Err((restored, SchedulerError::OpenFailed(message)));
@@ -3773,6 +4438,9 @@ fn wake_dormant_document(
                 header_renames,
                 cell_edits,
                 overlay_bytes,
+                verified_bounds_override,
+                pending_verified_reopen,
+                section_quote_free_confirmed,
                 _working_dir_fd_lease: working_dir_fd_lease,
             } = *dirty;
             let mut doc = Document::from_arc_session(session, &dormant.logical_path);
@@ -3781,6 +4449,11 @@ fn wake_dormant_document(
             doc.edit_history = dormant.view.edit_history.clone();
             doc.header_renames = header_renames;
             doc.cell_edits = cell_edits;
+            doc.section_quote_free_confirmed = section_quote_free_confirmed;
+            if source_unchanged {
+                doc.verified_bounds_override = verified_bounds_override;
+                doc.pending_verified_reopen = pending_verified_reopen;
+            }
             apply_view_snapshot(
                 &mut doc,
                 &dormant.view,
@@ -3821,6 +4494,9 @@ fn wake_dormant_document(
                                 header_renames: Arc::clone(&doc.header_renames),
                                 cell_edits: Arc::clone(&doc.cell_edits),
                                 overlay_bytes,
+                                verified_bounds_override,
+                                pending_verified_reopen,
+                                section_quote_free_confirmed,
                                 _working_dir_fd_lease: working_dir_fd_lease,
                             })),
                         });
@@ -3842,6 +4518,9 @@ fn wake_dormant_document(
                         header_renames: Arc::clone(&doc.header_renames),
                         cell_edits: Arc::clone(&doc.cell_edits),
                         overlay_bytes,
+                        verified_bounds_override,
+                        pending_verified_reopen,
+                        section_quote_free_confirmed,
                         _working_dir_fd_lease: working_dir_fd_lease,
                     })),
                 });
@@ -3864,6 +4543,9 @@ fn wake_dormant_document(
                             header_renames: Arc::clone(&doc.header_renames),
                             cell_edits: Arc::clone(&doc.cell_edits),
                             overlay_bytes,
+                            verified_bounds_override,
+                            pending_verified_reopen,
+                            section_quote_free_confirmed,
                             _working_dir_fd_lease: working_dir_fd_lease,
                         })),
                     });

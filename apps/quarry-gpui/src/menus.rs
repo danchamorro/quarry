@@ -8,6 +8,7 @@ gpui_kit::actions!(
     [
         NewWindow,
         OpenFile,
+        OpenSection,
         OpenUtf8,
         OpenUtf16Le,
         OpenUtf16Be,
@@ -44,6 +45,7 @@ gpui_kit::actions!(
         SplitColumn,
         CombineColumns,
         PauseResumeIndexing,
+        VerifySectionBoundary,
         ShowAllWhitespace,
         ThemeSystem,
         ThemeLight,
@@ -94,6 +96,7 @@ pub fn bind_shortcuts(cx: &mut App) {
     let bindings = [
         KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-o", OpenFile, None),
+        KeyBinding::new("cmd-shift-o", OpenSection, None),
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("cmd-shift-w", CloseWindow, None),
         KeyBinding::new("cmd-s", SaveFile, None),
@@ -115,6 +118,7 @@ pub fn bind_shortcuts(cx: &mut App) {
     let bindings = [
         KeyBinding::new("ctrl-n", NewWindow, None),
         KeyBinding::new("ctrl-o", OpenFile, None),
+        KeyBinding::new("ctrl-shift-o", OpenSection, None),
         KeyBinding::new("ctrl-w", CloseTab, None),
         KeyBinding::new("ctrl-shift-w", CloseWindow, None),
         KeyBinding::new("ctrl-s", SaveFile, None),
@@ -153,6 +157,7 @@ pub fn build_app_menus() -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("Open…", OpenFile),
+                MenuItem::action("Open Section…", OpenSection),
                 MenuItem::submenu(Menu {
                     name: "Open with Encoding".into(),
                     disabled: false,
@@ -218,6 +223,7 @@ pub fn build_app_menus() -> Vec<Menu> {
                 MenuItem::action("Combine Selected Columns…", CombineColumns),
                 MenuItem::separator(),
                 MenuItem::action("Pause / Resume Indexing", PauseResumeIndexing),
+                MenuItem::action("Verify Section Boundary", VerifySectionBoundary),
             ],
         },
         Menu {

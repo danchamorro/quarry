@@ -45,6 +45,16 @@ impl DelimiterMode {
             Self::Semicolon => Some(b';'),
         }
     }
+
+    pub fn from_delimiter(delimiter: Option<u8>) -> Self {
+        match delimiter {
+            Some(b',') => Self::Comma,
+            Some(b'\t') => Self::Tab,
+            Some(b'|') => Self::Pipe,
+            Some(b';') => Self::Semicolon,
+            _ => Self::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +219,7 @@ impl WorkbenchTab {
     pub fn document_busy(&self) -> bool {
         self.document.as_ref().is_some_and(|document| {
             document.job.is_some()
+                || document.section_verify_job.is_some()
                 || document.decompressing()
                 || document.search_job.is_some()
                 || document.filter_job.is_some()

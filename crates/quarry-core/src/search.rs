@@ -15,7 +15,7 @@ use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
 use crate::source_stamp::SourceStamp;
 use crate::{
     CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError,
-    Session, StructuralIndex, parse_encoded_record,
+    Session, StructuralIndex,
 };
 
 const DEFAULT_SEARCH_STRIPE_BYTES: u64 = 2 * 1024 * 1024;
@@ -490,7 +490,20 @@ impl Session {
         if needle.is_empty() {
             return Err(QuarryError::InvalidOption("search query must not be empty"));
         }
-        let data_start = u64::from(self.dialect.has_header);
+        let (section_base, section_end) = self.active_byte_range();
+        if !index.matches_session(
+            &self.source_stamp,
+            self.dialect.delimiter,
+            self.encoding,
+            section_base,
+            section_end,
+            self.is_section(),
+        ) {
+            return Err(QuarryError::InvalidOption(
+                "index does not match session source, framing, or byte range",
+            ));
+        }
+        let data_start = u64::from(self.dialect.has_header && section_base == 0);
         cell_edits.retain(|(row, _), _| *row >= data_start);
         let start = if start.row < data_start {
             SearchPosition {
@@ -501,21 +514,21 @@ impl Session {
             start
         };
         let indexed_frontier = if index.is_complete() {
-            self.file_size
+            section_end
         } else {
-            index.committed_record_end().min(self.file_size)
+            index.committed_record_end().min(section_end)
         };
         let checkpoint = index.nearest_checkpoint(start.row);
         let stripes = build_search_stripes(
             index,
             checkpoint,
             indexed_frontier,
-            self.file_size,
+            section_end,
             tuning.stripe_target_bytes,
         );
         SearchJob::start_plan(
             self.path.clone(),
-            self.file_size,
+            section_end,
             indexed_frontier,
             index.indexed_rows(),
             Some(self.source_stamp.clone()),
@@ -1524,7 +1537,8 @@ fn find_record(
     encoding: Encoding,
 ) -> Result<Option<SearchMatch>, QuarryError> {
     let first_column = if row == start.row { start.column } else { 0 };
-    let fields = parse_encoded_record(record, delimiter, row, encoding)?;
+    let fields =
+        crate::parse_encoded_record_with_bom(record, delimiter, row, record_offset == 0, encoding)?;
     Ok(fields
         .iter()
         .enumerate()
@@ -2089,7 +2103,7 @@ mod tests {
             },
         )
         .unwrap();
-        let index = session
+        let mut index = session
             .start_indexing(IndexConfig {
                 chunk_bytes: 64,
                 checkpoint_every: 20,
@@ -2103,6 +2117,11 @@ mod tests {
         let mut session = session;
         session.source_stamp =
             crate::source_stamp::SourceStamp::from_file(&fs::File::open(&path).unwrap()).unwrap();
+        index.set_provenance(
+            session.source_stamp.clone(),
+            session.dialect.delimiter,
+            session.encoding,
+        );
 
         let err = session
             .start_search_with_tuning(
@@ -2149,6 +2168,11 @@ mod tests {
             memory_budget_bytes: 64 * 1024,
         })
         .unwrap();
+        partial.set_provenance(
+            session.source_stamp.clone(),
+            session.dialect.delimiter,
+            session.encoding,
+        );
         let mut boundaries = 0usize;
         for (idx, &byte) in data.iter().enumerate() {
             if byte == b'\n' {

@@ -3089,3 +3089,325 @@ fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut Tes
         "expected completion transition announcement, got: {done_announcement:?}"
     );
 }
+
+#[gpui_kit::test]
+fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("section_source.csv");
+    // Write > 17 MiB so opening a section past 16 MiB starts as Speculative without a parent index.
+    let mut bytes = Vec::from(&b"id,payload\n"[..]);
+    let pad = "x".repeat(60);
+    let mut row_idx = 0u64;
+    while bytes.len() < 17 * 1024 * 1024 {
+        bytes.extend_from_slice(format!("{row_idx},{pad}\n").as_bytes());
+        row_idx += 1;
+    }
+    let section_offset = bytes.len() as u64;
+    for j in 0..40u64 {
+        bytes.extend_from_slice(format!("{},sec_row_{j}\n", row_idx + j).as_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let export_path = dir.path().join("section_saved.csv");
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // 1. Open the Open Section modal dialog from the welcome button and verify it renders cleanly.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("welcome-open-section").visible());
+        window.click("welcome-open-section", cx);
+        window.render_frame(cx);
+        assert!(window.find("section-browse-file").visible());
+        assert!(window.find("section-unit-select").visible());
+        assert!(window.find("section-encoding-select").visible());
+        assert!(window.find("section-delimiter-select").visible());
+        assert!(window.find("section-header-select").visible());
+        assert!(window.find("section-quote-free").visible());
+        assert!(window.find("section-open-confirm").visible());
+        window.click("section-cancel", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 2. Open a speculative section near 17 MiB via WorkbenchController.
+    let window_req = quarry_core::ByteWindow::new(section_offset + 5, 512).unwrap();
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_section(
+                    win_id,
+                    path.clone(),
+                    window_req,
+                    quarry_core::SectionOpenOptions::default(),
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.section.is_some() && s.index_done)
+    });
+
+    // Verify Speculative badge, Verify Boundary button, in-place Save disabled, Save As enabled.
+    let spec_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    let spec_sec = spec_snap.section.as_deref().unwrap();
+    assert_eq!(
+        spec_sec.bounds.trust,
+        quarry_core::BoundaryTrust::Speculative
+    );
+    assert_eq!(spec_sec.bounds.first_global_row(), None);
+    assert!(spec_sec.can_verify_boundary);
+    assert!(spec_sec.speculative_save_warning.is_some());
+    assert!(!cx.update(|cx| {
+        view.read(cx)
+            .command_enabled(quarry_workbench::CommandId::Save, cx)
+    }));
+    assert!(cx.update(|cx| {
+        view.read(cx)
+            .command_enabled(quarry_workbench::CommandId::SaveAs, cx)
+    }));
+
+    // 3. Click the inline Verify Boundary button and wait for Verified promotion with exact global row!
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("section-verify-boundary").visible());
+        window.click("section-verify-boundary", cx);
+    })
+    .unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| {
+            s.section.as_deref().is_some_and(|sec| {
+                !sec.verify_running && sec.bounds.trust == quarry_core::BoundaryTrust::Verified
+            })
+        })
+    });
+    let verified_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    let verified_sec = verified_snap.section.as_deref().unwrap();
+    assert_eq!(verified_sec.bounds.first_global_row(), Some(row_idx + 1));
+    assert_eq!(verified_sec.first_global_data_row, Some(row_idx + 1));
+    assert!(verified_sec.speculative_save_warning.is_none());
+
+    // 4. Save Section As New File and verify byte-0 header + section rows were written cleanly.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_save_active(win_id, None, Some(export_path.clone()), None, cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| !s.saving) && export_path.exists()
+    });
+    let saved = std::fs::read_to_string(&export_path).unwrap();
+    assert!(saved.starts_with("id,payload\n"));
+    assert!(saved.contains("sec_row_0"));
+
+    // 5. Open a second section directly through the modal's Open Section submit button (pre-filled
+    // from the active tab's path) and confirm the modal submits cleanly and clears editing state.
+    let tabs_before = cx.update(|cx| controller.read(cx).tabs_for_window(win_id).len());
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| q.open_section_dialog_now(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("section-open-confirm").visible());
+        window.click("section-open-confirm", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        controller.read(cx).tabs_for_window(win_id).len() == tabs_before + 1
+            && q.snapshot(cx)
+                .is_some_and(|s| s.section.is_some() && s.index_done)
+    });
+
+    // 6. Edit the active section, request tab close, and complete Save-and-Close via Save As.
+    let close_save_path = dir.path().join("section_close_save_as.csv");
+    let dirty_sec_id = cx.update(|cx| view.read(cx).snapshot(cx).unwrap().document_id);
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.rename_header_active(win_id, dirty_sec_id, 0, "edited_id".into(), cx)
+            })
+            .unwrap();
+    });
+    let review_token = cx.update(|cx| {
+        match controller.update(cx, |c, cx| {
+            c.request_close_tab(win_id, dirty_sec_id, false, cx)
+        }) {
+            CloseReviewAction::ConfirmTab {
+                review_token,
+                document_id,
+                ..
+            } => {
+                assert_eq!(document_id, dirty_sec_id);
+                assert!(controller.read(cx).document_is_section(document_id));
+                review_token
+            }
+            other => panic!("expected ConfirmTab for dirty section, got {other:?}"),
+        }
+    });
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.save_as_in_review(review_token, dirty_sec_id, close_save_path.clone(), cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+        close_save_path.exists()
+            && controller
+                .read(cx)
+                .tabs_for_window(win_id)
+                .iter()
+                .all(|tab| tab.id != dirty_sec_id)
+    });
+    let close_saved = std::fs::read_to_string(&close_save_path).unwrap();
+    assert!(close_saved.starts_with("edited_id,payload\n"));
+}
+
+#[gpui_kit::test]
+fn open_section_dialog_preserves_active_explicit_encoding_for_bomless_utf16le(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bomless_utf16le.csv");
+    let text = "id,note\n1,\"hello, world\"\n2,\"second, row\"\n";
+    let mut bytes = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // Open the BOM-less UTF-16LE file with an explicit encoding override.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![path.clone()],
+                    quarry_core::OpenOptions::default(),
+                    Some(quarry_core::Encoding::Utf16Le),
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+    let parent_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(parent_snap.encoding, quarry_core::Encoding::Utf16Le);
+    assert_eq!(
+        parent_snap.applied_encoding,
+        Some(quarry_core::Encoding::Utf16Le)
+    );
+
+    // Open Section… from the active BOM-less UTF-16LE tab and submit without manually re-picking.
+    let tabs_before = cx.update(|cx| controller.read(cx).tabs_for_window(win_id).len());
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| q.open_section_dialog_now(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("section-encoding-select").visible());
+        assert!(window.find("section-open-confirm").visible());
+        window.click("section-open-confirm", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        controller.read(cx).tabs_for_window(win_id).len() == tabs_before + 1
+            && q.snapshot(cx)
+                .is_some_and(|s| s.section.is_some() && s.index_done)
+    });
+
+    let sec_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(sec_snap.section.is_some());
+    assert_eq!(sec_snap.encoding, quarry_core::Encoding::Utf16Le);
+    assert_eq!(
+        sec_snap.applied_encoding,
+        Some(quarry_core::Encoding::Utf16Le)
+    );
+    assert_eq!(sec_snap.headers, vec!["id".to_string(), "note".to_string()]);
+    assert_eq!(sec_snap.total_rows, 2);
+
+    // Also verify explicit NoHeader + delimiter override are preserved when launching
+    // Open Section… from an active tab (so a headerless file never becomes headered).
+    let no_header_path = dir.path().join("explicit_no_header.csv");
+    std::fs::write(&no_header_path, "name;value\nalice;1\nbob;2\n").unwrap();
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![no_header_path.clone()],
+                    quarry_core::OpenOptions {
+                        delimiter: Some(b';'),
+                        header_mode: quarry_core::HeaderMode::NoHeader,
+                        ..quarry_core::OpenOptions::default()
+                    },
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.path == no_header_path && s.index_done)
+    });
+    let tabs_before_nh = cx.update(|cx| controller.read(cx).tabs_for_window(win_id).len());
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| q.open_section_dialog_now(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("section-delimiter-select").visible());
+        assert!(window.find("section-header-select").visible());
+        window.click("section-open-confirm", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        controller.read(cx).tabs_for_window(win_id).len() == tabs_before_nh + 1
+            && q.snapshot(cx)
+                .is_some_and(|s| s.section.is_some() && s.index_done)
+    });
+    let nh_sec = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(nh_sec.section.is_some());
+    assert!(!nh_sec.has_header);
+    assert_eq!(nh_sec.delimiter, b';');
+    assert_eq!(nh_sec.applied_delimiter, Some(b';'));
+    assert_eq!(
+        nh_sec.applied_header_mode,
+        quarry_core::HeaderMode::NoHeader
+    );
+    assert_eq!(nh_sec.total_rows, 3);
+}

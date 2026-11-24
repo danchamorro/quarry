@@ -22,8 +22,9 @@ pub use dormancy::{
     DEFAULT_MAX_DIRTY_OVERLAY_BYTES, DEFAULT_MAX_HYDRATED_TABS, DEFAULT_NOFILE_TARGET,
     ExportCompletion, FdBudgetLedger, FdBudgetSnapshot, FdCategory, FdLease, LazyDocumentStub,
     MAX_PROCESS_FD_BUDGET, MIN_DORMANT_SCRATCH_HEADROOM_BYTES, PinReason, ResidencyState,
-    SaveCompletion, SchedulerError, SearchCompletion, StructuralCompletion, WakeKind, WakeOutcome,
-    WorkbenchScheduler, WorkbenchSchedulerConfig, document_overlay_bytes,
+    SaveCompletion, SchedulerError, SearchCompletion, SectionVerifyCompletion,
+    StructuralCompletion, WakeKind, WakeOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig,
+    document_overlay_bytes,
 };
 pub use storage_prefs::{
     ADAPTIVE_MEMORY_BUDGET_BYTES, StoragePreferences, clear_index_cache_summary,
@@ -724,8 +725,8 @@ pub fn headers_for(session: &Session, columns: &[usize]) -> Vec<String> {
 pub fn column_name(session: &Session, column: usize) -> String {
     if session.dialect.has_header
         && let Some(field) = session
-            .first_rows
-            .first()
+            .section_header_row()
+            .or_else(|| session.first_rows.first())
             .and_then(|row| row.fields.get(column))
     {
         return field_text(field);

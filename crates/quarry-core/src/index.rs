@@ -101,6 +101,8 @@ pub struct StructuralIndex {
     maximum_width: usize,
     indexed_bytes: u64,
     last_record_end: u64,
+    section_base: u64,
+    section_end: Option<u64>,
     complete: bool,
     telemetry: IndexTelemetry,
     provenance: Option<IndexProvenance>,
@@ -116,6 +118,8 @@ impl PartialEq for StructuralIndex {
             && self.maximum_width == other.maximum_width
             && self.indexed_bytes == other.indexed_bytes
             && self.last_record_end == other.last_record_end
+            && self.section_base == other.section_base
+            && self.section_end == other.section_end
     }
 }
 
@@ -123,6 +127,57 @@ impl Eq for StructuralIndex {}
 
 impl StructuralIndex {
     pub(crate) fn new(config: IndexConfig) -> Result<Self, QuarryError> {
+        Self::new_inner(config, 0, None)
+    }
+
+    pub(crate) fn new_for_section(
+        config: IndexConfig,
+        section_base: u64,
+        section_end: u64,
+    ) -> Result<Self, QuarryError> {
+        Self::new_inner(config, section_base, Some(section_end))
+    }
+
+    /// Returns `true` when this index covers the whole source file from byte 0 rather than a
+    /// bounded byte section (whose checkpoints store section-local row numbers).
+    pub fn is_whole_file(&self) -> bool {
+        self.section_base == 0 && self.section_end.is_none()
+    }
+
+    /// Returns `true` when this index's byte scope matches a session's active byte range.
+    pub fn matches_byte_range(
+        &self,
+        section_base: u64,
+        section_end: u64,
+        is_section: bool,
+    ) -> bool {
+        if is_section {
+            self.section_base == section_base && self.section_end == Some(section_end)
+        } else {
+            self.is_whole_file()
+        }
+    }
+
+    /// Returns `true` when this index matches the session's source stamp, framing, and byte range
+    /// (covering both live in-progress indexes and completed indexes).
+    pub(crate) fn matches_session(
+        &self,
+        source_stamp: &SourceStamp,
+        delimiter: u8,
+        encoding: Encoding,
+        section_base: u64,
+        section_end: u64,
+        is_section: bool,
+    ) -> bool {
+        self.matches_byte_range(section_base, section_end, is_section)
+            && self.matches_provenance(source_stamp, delimiter, encoding)
+    }
+
+    fn new_inner(
+        config: IndexConfig,
+        section_base: u64,
+        section_end: Option<u64>,
+    ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 || config.checkpoint_every == 0 {
             return Err(QuarryError::InvalidOption(
                 "index chunk and checkpoint interval must be non-zero",
@@ -136,14 +191,19 @@ impl StructuralIndex {
         }
         let max_checkpoints = 1_usize << checkpoint_capacity.ilog2();
         Ok(Self {
-            checkpoints: vec![Checkpoint { row: 0, offset: 0 }],
+            checkpoints: vec![Checkpoint {
+                row: 0,
+                offset: section_base,
+            }],
             checkpoint_every: config.checkpoint_every,
             checkpoint_byte_stride: None,
             max_checkpoints,
             indexed_rows: 0,
             maximum_width: 0,
             indexed_bytes: 0,
-            last_record_end: 0,
+            last_record_end: section_base,
+            section_base,
+            section_end,
             complete: false,
             telemetry: IndexTelemetry::default(),
             provenance: None,
@@ -207,7 +267,7 @@ impl StructuralIndex {
 
     pub(crate) fn record_boundary(&mut self, offset: u64) {
         self.indexed_rows += 1;
-        self.indexed_bytes = offset;
+        self.indexed_bytes = offset.saturating_sub(self.section_base);
         self.last_record_end = offset;
         if self.checkpoint_byte_stride.is_some() {
             let row = self.indexed_rows;
@@ -235,8 +295,11 @@ impl StructuralIndex {
         let Some(stride) = self.checkpoint_byte_stride else {
             return;
         };
-        let bucket = offset / stride;
-        let last_bucket = self.checkpoints.last().map_or(0, |cp| cp.offset / stride);
+        let bucket = offset.saturating_sub(self.section_base) / stride;
+        let last_bucket = self
+            .checkpoints
+            .last()
+            .map_or(0, |cp| cp.offset.saturating_sub(self.section_base) / stride);
         if bucket <= last_bucket {
             return;
         }
@@ -262,7 +325,7 @@ impl StructuralIndex {
             let mut prev_bucket = 0u64;
             for read in 1..self.checkpoints.len() {
                 let cp = self.checkpoints[read];
-                let b = cp.offset / new_stride;
+                let b = cp.offset.saturating_sub(self.section_base) / new_stride;
                 if b > prev_bucket {
                     self.checkpoints[write] = cp;
                     write += 1;
@@ -272,11 +335,10 @@ impl StructuralIndex {
             self.checkpoints.truncate(write);
         }
         let active_stride = self.checkpoint_byte_stride.unwrap();
-        let active_bucket = offset / active_stride;
-        let active_last_bucket = self
-            .checkpoints
-            .last()
-            .map_or(0, |cp| cp.offset / active_stride);
+        let active_bucket = offset.saturating_sub(self.section_base) / active_stride;
+        let active_last_bucket = self.checkpoints.last().map_or(0, |cp| {
+            cp.offset.saturating_sub(self.section_base) / active_stride
+        });
         if active_bucket > active_last_bucket
             && self
                 .checkpoints
@@ -321,6 +383,25 @@ impl StructuralIndex {
     /// Byte offset immediately after the last complete logical record committed so far.
     pub fn committed_record_end(&self) -> u64 {
         self.last_record_end
+    }
+
+    /// Start byte offset of the indexed window (`0` for whole-file indexes).
+    pub fn section_base(&self) -> u64 {
+        self.section_base
+    }
+
+    /// Exclusive end byte offset of the indexed window (`None` for whole-file indexes).
+    pub fn section_end(&self) -> Option<u64> {
+        self.section_end
+    }
+
+    /// Nearest checkpoint whose byte offset is `<= byte_offset`.
+    pub fn checkpoint_at_or_before_offset(&self, byte_offset: u64) -> Checkpoint {
+        let position = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.offset <= byte_offset)
+            .saturating_sub(1);
+        self.checkpoints[position]
     }
 
     pub fn checkpoint_every(&self) -> u64 {
@@ -497,6 +578,7 @@ enum PausedScannerState {
 struct JobResumeContext {
     path: PathBuf,
     file_size: u64,
+    section_range: Option<(u64, u64)>,
     delimiter: u8,
     encoding: Encoding,
     config: IndexConfig,
@@ -765,10 +847,25 @@ impl IndexJob {
         cache_config: IndexCacheConfig,
         pool: &'static EnginePool,
     ) -> Result<Self, QuarryError> {
-        let index = StructuralIndex::new(config)?;
+        let section_range = session
+            .section_bounds()
+            .map(|bounds| (bounds.snapped.base, bounds.snapped_end()));
+        let (mut index, target_bytes) = match section_range {
+            Some((base, end)) => (
+                StructuralIndex::new_for_section(config, base, end)?,
+                end.saturating_sub(base),
+            ),
+            None => (StructuralIndex::new(config)?, session.file_size),
+        };
+        index.set_provenance(
+            session.source_stamp.clone(),
+            session.dialect.delimiter,
+            session.encoding,
+        );
         let ctx = JobResumeContext {
             path: session.path.clone(),
             file_size: session.file_size,
+            section_range,
             delimiter: session.dialect.delimiter,
             encoding: session.encoding,
             config,
@@ -805,7 +902,7 @@ impl IndexJob {
             }),
             error: Mutex::new(None),
             started: Instant::now(),
-            file_size: ctx.file_size,
+            file_size: target_bytes,
             #[cfg(any(test, debug_assertions))]
             path: ctx.path.clone(),
         });
@@ -851,7 +948,8 @@ impl IndexJob {
                     None
                 };
                 let result = (|| {
-                    if resume_from.is_none()
+                    if ctx.section_range.is_none()
+                        && resume_from.is_none()
                         && !resuming
                         && !worker_state.cancelled.load(Ordering::Acquire)
                         && !worker_state.pause_requested.load(Ordering::Acquire)
@@ -902,6 +1000,7 @@ impl IndexJob {
                     let (file, paused_state) = run_indexer(
                         file,
                         ctx.file_size,
+                        ctx.section_range,
                         ctx.delimiter,
                         ctx.encoding,
                         ctx.config,
@@ -927,7 +1026,22 @@ impl IndexJob {
                     if !source_matches_stamp(&file, &ctx.path, &ctx.source_stamp)? {
                         return Err(QuarryError::SourceChanged);
                     }
-                    if !worker_state.cancelled.load(Ordering::Acquire)
+                    if let Some((base, end)) = ctx.section_range {
+                        if !worker_state.cancelled.load(Ordering::Acquire)
+                            && !worker_state.paused.load(Ordering::Acquire)
+                            && worker_state.bytes_scanned.load(Ordering::Acquire)
+                                == end.saturating_sub(base)
+                        {
+                            let mut guard = worker_state.index.write().unwrap();
+                            guard.last_record_end = end;
+                            guard.complete = true;
+                            guard.set_provenance(
+                                ctx.source_stamp.clone(),
+                                ctx.delimiter,
+                                ctx.encoding,
+                            );
+                        }
+                    } else if !worker_state.cancelled.load(Ordering::Acquire)
                         && !worker_state.paused.load(Ordering::Acquire)
                         && worker_state.bytes_scanned.load(Ordering::Acquire)
                             == ctx.source_stamp.file_size()
@@ -1184,6 +1298,7 @@ impl Drop for IndexJob {
 fn run_indexer(
     file: File,
     file_size: u64,
+    section_range: Option<(u64, u64)>,
     delimiter: u8,
     encoding: Encoding,
     config: IndexConfig,
@@ -1192,6 +1307,25 @@ fn run_indexer(
     resume_from: Option<PausedScannerState>,
     shared: &Arc<SharedState>,
 ) -> Result<(File, Option<PausedScannerState>), QuarryError> {
+    if let Some((section_base, section_end)) = section_range {
+        let resume = match resume_from {
+            Some(PausedScannerState::Sequential { cursor, scanner }) => Some((cursor, scanner)),
+            _ => None,
+        };
+        let paused = run_sequential_indexer_range(
+            &file,
+            section_base,
+            section_end,
+            delimiter,
+            encoding,
+            config,
+            tuning,
+            resume,
+            shared,
+        )?;
+        return Ok((file, paused));
+    }
+
     let chunk_ok = tuning.allow_small_chunks || config.chunk_bytes >= PARALLEL_MIN_CHUNK_BYTES;
     let use_byte_stride = config.checkpoint_every == DEFAULT_CHECKPOINT_EVERY
         && file_size >= tuning.min_parallel_bytes
@@ -1226,8 +1360,9 @@ fn run_indexer(
             return Ok((file, paused));
         }
         Some(PausedScannerState::Sequential { cursor, scanner }) => {
-            let paused = run_sequential_indexer(
+            let paused = run_sequential_indexer_range(
                 &file,
+                0,
                 file_size,
                 delimiter,
                 encoding,
@@ -1273,16 +1408,17 @@ fn run_indexer(
             .enable_byte_stride_checkpoints(tuning.byte_stride);
     }
 
-    let paused = run_sequential_indexer(
-        &file, file_size, delimiter, encoding, config, tuning, None, shared,
+    let paused = run_sequential_indexer_range(
+        &file, 0, file_size, delimiter, encoding, config, tuning, None, shared,
     )?;
     Ok((file, paused))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_sequential_indexer(
+fn run_sequential_indexer_range(
     file: &File,
-    file_size: u64,
+    range_start: u64,
+    range_end: u64,
     delimiter: u8,
     encoding: Encoding,
     config: IndexConfig,
@@ -1304,8 +1440,12 @@ fn run_sequential_indexer(
     let (mut absolute_start, mut scanner) = match resume_from {
         Some((cursor, scanner)) => (cursor, scanner),
         None => (
-            0u64,
-            Box::new(EncodedScanner::<true>::new(delimiter, encoding)?),
+            range_start,
+            Box::new(EncodedScanner::<true>::at_offset(
+                delimiter,
+                range_start,
+                encoding,
+            )?),
         ),
     };
     let chunk_len = encoding.chunk_size(config.chunk_bytes);
@@ -1313,9 +1453,7 @@ fn run_sequential_indexer(
 
     if encoding.is_utf16() {
         let mut cursor_file = file;
-        if absolute_start > 0 {
-            cursor_file.seek(SeekFrom::Start(absolute_start))?;
-        }
+        cursor_file.seek(SeekFrom::Start(absolute_start))?;
         loop {
             if shared.cancelled.load(Ordering::Acquire) {
                 return Ok(None);
@@ -1326,68 +1464,15 @@ fn run_sequential_indexer(
                     scanner,
                 }));
             }
-            let read = encoding.read_chunk(&mut cursor_file, &mut chunk)?;
-            if read == 0 {
-                let mut index = shared.index.write().unwrap();
-                scanner.finish(absolute_start, |end| index.record_boundary(end))?;
-                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
-                shared
-                    .columns_found
-                    .store(index.maximum_width, Ordering::Release);
-                shared
-                    .rows_scanned
-                    .store(index.indexed_rows, Ordering::Release);
-                break;
-            }
-            shared.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
-            #[cfg(test)]
-            if let Some(delay) = tuning.chunk_delay {
-                thread::sleep(delay);
-            }
-            {
-                let mut index = shared.index.write().unwrap();
-                scanner.scan_chunk(&chunk[..read], absolute_start, |end| {
-                    index.record_boundary(end)
-                })?;
-                index.indexed_bytes = absolute_start + read as u64;
-                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
-                index.telemetry.chunks_processed += 1;
-                shared
-                    .columns_found
-                    .store(index.maximum_width, Ordering::Release);
-                shared
-                    .rows_scanned
-                    .store(index.indexed_rows, Ordering::Release);
-            }
-            absolute_start += read as u64;
-            shared
-                .bytes_scanned
-                .store(absolute_start, Ordering::Release);
-            #[cfg(any(test, debug_assertions))]
-            if absolute_start < file_size {
-                test_hooks::wait_if_gated(&shared.path, absolute_start, &shared.stop_dispatch);
-            }
-        }
-    } else {
-        let _ = tuning;
-        advise_readahead(
-            file,
-            absolute_start,
-            file_size
-                .saturating_sub(absolute_start)
-                .min(4 * 1024 * 1024),
-        );
-        loop {
-            if shared.cancelled.load(Ordering::Acquire) {
-                return Ok(None);
-            }
-            if shared.pause_requested.load(Ordering::Acquire) {
-                return Ok(Some(PausedScannerState::Sequential {
-                    cursor: absolute_start,
-                    scanner,
-                }));
-            }
-            let read = read_at_exact_or_eof(file, absolute_start, &mut chunk)?;
+            let remaining = range_end.saturating_sub(absolute_start);
+            let read = if remaining == 0 {
+                0
+            } else {
+                let limit = chunk
+                    .len()
+                    .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                encoding.read_chunk(&mut cursor_file, &mut chunk[..limit])?
+            };
             if read == 0 {
                 let mut index = shared.index.write().unwrap();
                 scanner.finish(absolute_start, |end| index.record_boundary(end))?;
@@ -1406,19 +1491,13 @@ fn run_sequential_indexer(
                 thread::sleep(delay);
             }
             let next_offset = absolute_start + read as u64;
-            if next_offset < file_size {
-                advise_readahead(
-                    file,
-                    next_offset,
-                    (file_size - next_offset).min(chunk_len as u64 * 2),
-                );
-            }
+            let scanned_rel = next_offset.saturating_sub(range_start);
             {
                 let mut index = shared.index.write().unwrap();
                 scanner.scan_chunk(&chunk[..read], absolute_start, |end| {
                     index.record_boundary(end)
                 })?;
-                index.indexed_bytes = next_offset;
+                index.indexed_bytes = scanned_rel;
                 index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 index.telemetry.chunks_processed += 1;
                 shared
@@ -1429,19 +1508,94 @@ fn run_sequential_indexer(
                     .store(index.indexed_rows, Ordering::Release);
             }
             absolute_start = next_offset;
-            shared
-                .bytes_scanned
-                .store(absolute_start, Ordering::Release);
+            shared.bytes_scanned.store(scanned_rel, Ordering::Release);
             #[cfg(any(test, debug_assertions))]
-            if absolute_start < file_size {
-                test_hooks::wait_if_gated(&shared.path, absolute_start, &shared.stop_dispatch);
+            if absolute_start < range_end {
+                test_hooks::wait_if_gated(&shared.path, scanned_rel, &shared.stop_dispatch);
+            }
+        }
+    } else {
+        let _ = tuning;
+        advise_readahead(
+            file,
+            absolute_start,
+            range_end
+                .saturating_sub(absolute_start)
+                .min(4 * 1024 * 1024),
+        );
+        loop {
+            if shared.cancelled.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            if shared.pause_requested.load(Ordering::Acquire) {
+                return Ok(Some(PausedScannerState::Sequential {
+                    cursor: absolute_start,
+                    scanner,
+                }));
+            }
+            let remaining = range_end.saturating_sub(absolute_start);
+            let read = if remaining == 0 {
+                0
+            } else {
+                let limit = chunk
+                    .len()
+                    .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                read_at_exact_or_eof(file, absolute_start, &mut chunk[..limit])?
+            };
+            if read == 0 {
+                let mut index = shared.index.write().unwrap();
+                scanner.finish(absolute_start, |end| index.record_boundary(end))?;
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
+                shared
+                    .columns_found
+                    .store(index.maximum_width, Ordering::Release);
+                shared
+                    .rows_scanned
+                    .store(index.indexed_rows, Ordering::Release);
+                break;
+            }
+            shared.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+            #[cfg(test)]
+            if let Some(delay) = tuning.chunk_delay {
+                thread::sleep(delay);
+            }
+            let next_offset = absolute_start + read as u64;
+            let scanned_rel = next_offset.saturating_sub(range_start);
+            if next_offset < range_end {
+                advise_readahead(
+                    file,
+                    next_offset,
+                    (range_end - next_offset).min(chunk_len as u64 * 2),
+                );
+            }
+            {
+                let mut index = shared.index.write().unwrap();
+                scanner.scan_chunk(&chunk[..read], absolute_start, |end| {
+                    index.record_boundary(end)
+                })?;
+                index.indexed_bytes = scanned_rel;
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
+                index.telemetry.chunks_processed += 1;
+                shared
+                    .columns_found
+                    .store(index.maximum_width, Ordering::Release);
+                shared
+                    .rows_scanned
+                    .store(index.indexed_rows, Ordering::Release);
+            }
+            absolute_start = next_offset;
+            shared.bytes_scanned.store(scanned_rel, Ordering::Release);
+            #[cfg(any(test, debug_assertions))]
+            if absolute_start < range_end {
+                test_hooks::wait_if_gated(&shared.path, scanned_rel, &shared.stop_dispatch);
             }
         }
     }
 
-    shared
-        .bytes_scanned
-        .store(absolute_start, Ordering::Release);
+    shared.bytes_scanned.store(
+        absolute_start.saturating_sub(range_start),
+        Ordering::Release,
+    );
     Ok(None)
 }
 
@@ -3244,5 +3398,46 @@ mod tests {
         let avail = crate::available_disk_space(dir.path()).unwrap();
         assert!(avail > 0);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn nonzero_base_section_index_reports_section_relative_progress_and_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("section_progress.csv");
+        // "a,b\n" = 4 bytes [0, 4), "1,2\n" = 4 bytes [4, 8), "3,4\n" = 4 bytes [8, 12)
+        fs::write(&path, b"a,b\n1,2\n3,4\n").unwrap();
+
+        let session = crate::Session::open_section(
+            &path,
+            crate::ByteWindow::from_range(4, 8).unwrap(),
+            crate::SectionOpenOptions {
+                open: crate::OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: crate::HeaderMode::FirstRow,
+                    ..crate::OpenOptions::default()
+                },
+                ..crate::SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let job = session.start_indexing(IndexConfig::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.progress().done {
+            assert!(Instant::now() < deadline, "section index job timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let progress = job.progress();
+        let index = job.wait().unwrap();
+
+        assert_eq!(progress.file_size, 4);
+        assert_eq!(
+            progress.bytes_scanned, 4,
+            "section bytes_scanned must be section-relative, not absolute offset"
+        );
+        assert_eq!(index.indexed_bytes(), 4);
+        assert!(
+            index.is_complete(),
+            "finished nonzero-base section index must be marked complete"
+        );
     }
 }

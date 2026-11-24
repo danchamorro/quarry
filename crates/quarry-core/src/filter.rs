@@ -24,7 +24,7 @@ use crate::sort::numeric_key;
 use crate::source_stamp::SourceStamp;
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
-    parse_encoded_record,
+    parse_encoded_record_with_bom,
 };
 
 /// Immutable sparse working values, keyed by physical source row and column.
@@ -38,6 +38,7 @@ struct FilterSource {
     delimiter: u8,
     data_start: u64,
     encoding: Encoding,
+    section_range: (u64, u64),
 }
 
 impl FilterSource {
@@ -326,12 +327,14 @@ struct SharedState {
     cancelled: AtomicBool,
     error: Mutex<Option<String>>,
     started: Instant,
+    section_base: u64,
+    scan_end: u64,
     file_size: u64,
     bounded_scan: bool,
 }
 
 impl SharedState {
-    fn new(index: FilterIndex, file_size: u64, bounded_scan: bool) -> Self {
+    fn new(index: FilterIndex, section_base: u64, scan_end: u64, bounded_scan: bool) -> Self {
         Self {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
@@ -343,7 +346,9 @@ impl SharedState {
             cancelled: AtomicBool::new(false),
             error: Mutex::new(None),
             started: Instant::now(),
-            file_size,
+            section_base,
+            scan_end,
+            file_size: scan_end.saturating_sub(section_base),
             bounded_scan,
         }
     }
@@ -419,6 +424,7 @@ impl FilterJob {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn start_with_edits_and_tuning(
         path: PathBuf,
@@ -432,6 +438,41 @@ impl FilterJob {
         encoding: Encoding,
         tuning: FilterParallelTuning,
         bounded_scan: bool,
+    ) -> Result<Self, QuarryError> {
+        Self::start_with_range_edits_and_tuning(
+            path,
+            0,
+            file_size,
+            file_size,
+            delimiter,
+            data_start,
+            query,
+            config,
+            edits,
+            expected,
+            encoding,
+            tuning,
+            bounded_scan,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_range_edits_and_tuning(
+        path: PathBuf,
+        section_base: u64,
+        section_end: u64,
+        scan_end: u64,
+        delimiter: u8,
+        data_start: u64,
+        query: FilterQuery,
+        config: FilterScanConfig,
+        edits: FilterEdits,
+        expected: Option<SourceStamp>,
+        encoding: Encoding,
+        tuning: FilterParallelTuning,
+        bounded_scan: bool,
+        is_section: bool,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
@@ -448,25 +489,34 @@ impl FilterJob {
             delimiter,
             data_start,
             encoding,
+            section_range: (section_base, section_end),
         };
         source.check_file(&file)?;
         let guard_file = file.try_clone()?;
         index.edits = edits;
         index.source = Some(source.clone());
-        index.scan_limit = bounded_scan.then_some(file_size);
-        let shared = Arc::new(SharedState::new(index, file_size, bounded_scan));
+        // Always retain `scan_limit` for sections (including byte-0 sections) and paused scans so
+        // filtered readers never scan past the section's end boundary.
+        index.scan_limit = (bounded_scan || is_section).then_some(scan_end);
+        let shared = Arc::new(SharedState::new(
+            index,
+            section_base,
+            scan_end,
+            bounded_scan,
+        ));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("quarry-filter".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
-                let result = if let Some(byte_class) = encoding.simd_byte_class()
+                let result = if section_base == 0
+                    && let Some(byte_class) = encoding.simd_byte_class()
                     && tuning.requested_threads > 1
-                    && file_size >= tuning.min_parallel_bytes
+                    && scan_end >= tuning.min_parallel_bytes
                 {
                     run_parallel_filter(
                         Arc::new(file),
-                        file_size,
+                        scan_end,
                         delimiter,
                         data_start,
                         &query,
@@ -758,32 +808,42 @@ impl Session {
     ) -> Result<FilterJob, QuarryError> {
         let requested_threads = resolve_worker_count(threads)?;
         self.ensure_source_unchanged()?;
+        let (section_base, section_end) = self.active_byte_range();
+        let data_start = u64::from(self.dialect.has_header && section_base == 0);
+        // `max_bytes` is an absolute file offset (e.g. `StructuralIndex::committed_record_end()`),
+        // so clamp it within `[section_base, section_end]` instead of adding `section_base` again.
         let scan_limit = max_bytes
-            .map(|limit| limit.min(self.file_size))
-            .unwrap_or(self.file_size);
-        FilterJob::start_with_edits_and_tuning(
+            .map(|limit| limit.clamp(section_base, section_end))
+            .unwrap_or(section_end);
+        FilterJob::start_with_range_edits_and_tuning(
             self.path.clone(),
+            section_base,
+            section_end,
             scan_limit,
             self.dialect.delimiter,
-            u64::from(self.dialect.has_header),
+            data_start,
             query,
             DEFAULT_FILTER_SCAN_CONFIG,
             edits,
             Some(self.source_stamp.clone()),
             self.encoding,
             FilterParallelTuning::for_production(requested_threads),
-            scan_limit < self.file_size,
+            scan_limit < section_end,
+            self.is_section(),
         )
     }
 
     fn check_filter_index(&self, index: &FilterIndex) -> Result<(), QuarryError> {
         self.ensure_source_unchanged()?;
+        let (section_base, section_end) = self.active_byte_range();
+        let expected_data_start = u64::from(self.dialect.has_header && section_base == 0);
         if let Some(source) = &index.source
             && (source.path != self.path
                 || source.stamp != self.source_stamp
                 || source.delimiter != self.dialect.delimiter
-                || source.data_start != u64::from(self.dialect.has_header)
-                || source.encoding != self.encoding)
+                || source.data_start != expected_data_start
+                || source.encoding != self.encoding
+                || source.section_range != (section_base, section_end))
         {
             return Err(QuarryError::SourceChanged);
         }
@@ -815,9 +875,10 @@ impl Session {
     ) -> Result<FilterReadJob, QuarryError> {
         self.check_filter_index(index)?;
         let plan = prepare_filtered_read(index, start_match, count)?;
+        let (_, section_end) = self.active_byte_range();
         FilterReadJob::start(
             self.path.clone(),
-            self.file_size,
+            section_end,
             self.dialect.delimiter,
             plan,
             DEFAULT_FILTER_READ_CONFIG,
@@ -973,13 +1034,15 @@ pub(crate) fn matching_fields_with_edits<'a>(
     record: &'a [u8],
     delimiter: u8,
     physical_row: u64,
+    strip_bom: bool,
     query: &FilterQuery,
     matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
     edits: &FilterEdits,
     encoding: Encoding,
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
-    let fields = parse_encoded_record(record, delimiter, physical_row, encoding)?;
+    let fields =
+        parse_encoded_record_with_bom(record, delimiter, physical_row, strip_bom, encoding)?;
     if edits
         .range((physical_row, 0)..=(physical_row, usize::MAX))
         .next_back()
@@ -1038,6 +1101,7 @@ pub(crate) fn record_matches_fast(
     record: &[u8],
     delimiter: u8,
     physical_row: u64,
+    strip_bom: bool,
     query: &FilterQuery,
     matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
@@ -1056,6 +1120,7 @@ pub(crate) fn record_matches_fast(
             record,
             delimiter,
             physical_row,
+            strip_bom,
             query,
             matchers,
             groups,
@@ -1065,7 +1130,7 @@ pub(crate) fn record_matches_fast(
         .is_some());
     }
 
-    let body = if physical_row == 0 {
+    let body = if strip_bom {
         record.strip_prefix(UTF8_BOM).unwrap_or(record)
     } else {
         record
@@ -1154,11 +1219,14 @@ fn run_filter(
     let groups = predicate_groups(query);
     let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
     let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
-    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut scanner = RecordScanner::at_offset(delimiter, shared.section_base, encoding)?;
+    if shared.section_base > 0 {
+        file.seek(SeekFrom::Start(shared.section_base))?;
+    }
     let mut chunk = vec![0; encoding.chunk_size(chunk_bytes)];
-    let mut absolute_start = 0_u64;
+    let mut absolute_start = shared.section_base;
     let mut row_number = 0_u64;
-    let mut record_start = 0_u64;
+    let mut record_start = shared.section_base;
     let mut records_scanned = 0_u64;
     let mut record = Vec::new();
     let mut pending_matches = Vec::with_capacity(MATCH_PUBLISH_BATCH);
@@ -1169,11 +1237,15 @@ fn run_filter(
             shared.cancelled.store(true, Ordering::Release);
             return Ok(());
         }
-        let remaining = shared.file_size.saturating_sub(absolute_start);
+        let remaining = shared.scan_end.saturating_sub(absolute_start);
         let read = if remaining == 0 {
             0
         } else {
-            let cap = encoding.chunk_size((remaining as usize).min(chunk.len()));
+            let cap = encoding.chunk_size(
+                usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(chunk.len()),
+            );
             encoding.read_chunk(&mut file, &mut chunk[..cap])?
         };
         if read == 0 {
@@ -1192,6 +1264,7 @@ fn run_filter(
                             &record,
                             delimiter,
                             row_number,
+                            record_start == 0,
                             query,
                             &matchers,
                             &groups,
@@ -1212,9 +1285,10 @@ fn run_filter(
                 record.clear();
             });
             publish_matches(shared, &mut pending_matches);
-            shared
-                .bytes_scanned
-                .store(absolute_start, Ordering::Release);
+            shared.bytes_scanned.store(
+                absolute_start.saturating_sub(shared.section_base),
+                Ordering::Release,
+            );
             shared
                 .rows_scanned
                 .store(records_scanned, Ordering::Release);
@@ -1259,6 +1333,7 @@ fn run_filter(
                                 rec,
                                 delimiter,
                                 row_number,
+                                record_start == 0,
                                 query,
                                 &matchers,
                                 &groups,
@@ -1288,6 +1363,7 @@ fn run_filter(
                                 &record,
                                 delimiter,
                                 row_number,
+                                record_start == 0,
                                 query,
                                 &matchers,
                                 &groups,
@@ -1318,9 +1394,10 @@ fn run_filter(
 
         absolute_start += read as u64;
         publish_matches(shared, &mut pending_matches);
-        shared
-            .bytes_scanned
-            .store(absolute_start, Ordering::Release);
+        shared.bytes_scanned.store(
+            absolute_start.saturating_sub(shared.section_base),
+            Ordering::Release,
+        );
         shared
             .rows_scanned
             .store(records_scanned, Ordering::Release);
@@ -1446,10 +1523,6 @@ fn eval_filter_slice_from_field_start(
     let mut record_start = slice_start;
     let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
     let mut deferred_error: Option<QuarryError> = None;
-    // Only record 0 at byte offset 0 may strip a file-leading UTF-8 BOM. Speculative workers
-    // scanning non-initial chunks with `base_row == 0` use a non-zero synthetic row so leading
-    // U+FEFF bytes stay literal cell data; exact edit re-evaluations already pass `base_row > 0`.
-    let bom_row_offset: u64 = u64::from(slice_start != 0 && base_row == 0);
 
     let mut offset = 0usize;
     while offset < buf.len() {
@@ -1475,7 +1548,8 @@ fn eval_filter_slice_from_field_start(
                             match record_matches_fast(
                                 &buf[s..e],
                                 delimiter,
-                                row.saturating_add(bom_row_offset),
+                                row,
+                                record_start == 0,
                                 query,
                                 matchers,
                                 groups,
@@ -1486,19 +1560,7 @@ fn eval_filter_slice_from_field_start(
                             ) {
                                 Ok(true) => matches.push((local_row, record_start)),
                                 Ok(false) => {}
-                                Err(err) => {
-                                    deferred_error = Some(match err {
-                                        QuarryError::RecordEncoding { record, cause }
-                                            if bom_row_offset != 0 =>
-                                        {
-                                            QuarryError::RecordEncoding {
-                                                record: record.saturating_sub(bom_row_offset),
-                                                cause,
-                                            }
-                                        }
-                                        other => other,
-                                    });
-                                }
+                                Err(err) => deferred_error = Some(err),
                             }
                         }
                     }
@@ -1532,7 +1594,8 @@ fn eval_filter_slice_from_field_start(
                         match record_matches_fast(
                             rec,
                             delimiter,
-                            row.saturating_add(bom_row_offset),
+                            row,
+                            record_start == 0,
                             query,
                             matchers,
                             groups,
@@ -1543,19 +1606,7 @@ fn eval_filter_slice_from_field_start(
                         ) {
                             Ok(true) => matches.push((local_row, record_start)),
                             Ok(false) => {}
-                            Err(err) => {
-                                deferred_error = Some(match err {
-                                    QuarryError::RecordEncoding { record, cause }
-                                        if bom_row_offset != 0 =>
-                                    {
-                                        QuarryError::RecordEncoding {
-                                            record: record.saturating_sub(bom_row_offset),
-                                            cause,
-                                        }
-                                    }
-                                    other => other,
-                                });
-                            }
+                            Err(err) => deferred_error = Some(err),
                         }
                     }
                 }
@@ -1890,6 +1941,7 @@ impl FilterMergeState {
                             &rec,
                             delimiter,
                             row,
+                            self.open_record_start == 0,
                             query,
                             matchers,
                             groups,
@@ -2067,6 +2119,7 @@ fn scan_filter_giant_line_sequential(
                                 &buf[s..e],
                                 delimiter,
                                 row,
+                                record_start == 0,
                                 query,
                                 matchers,
                                 groups,
@@ -2082,6 +2135,7 @@ fn scan_filter_giant_line_sequential(
                                     &stitched,
                                     delimiter,
                                     row,
+                                    record_start == 0,
                                     query,
                                     matchers,
                                     groups,
@@ -2135,6 +2189,7 @@ fn scan_filter_giant_line_sequential(
                     &stitched,
                     delimiter,
                     row,
+                    record_start == 0,
                     query,
                     matchers,
                     groups,
@@ -2673,6 +2728,7 @@ fn run_filtered_read(
                     &record,
                     delimiter,
                     row_number,
+                    record_start == 0,
                     &plan.query,
                     &matchers,
                     &groups,
@@ -2715,6 +2771,7 @@ fn run_filtered_read(
                             &record,
                             delimiter,
                             row_number,
+                            record_start == 0,
                             &plan.query,
                             &matchers,
                             &groups,
@@ -3722,7 +3779,7 @@ mod tests {
             DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES,
         )
         .unwrap();
-        let shared = Arc::new(SharedState::new(index, 0, false));
+        let shared = Arc::new(SharedState::new(index, 0, 0, false));
         let worker_state = Arc::clone(&shared);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
