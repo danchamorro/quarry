@@ -3271,7 +3271,7 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
                 .read(cx)
                 .tabs_for_window(win_id)
                 .iter()
-                .all(|tab| tab.document_id != dirty_sec_id)
+                .all(|tab| tab.id != dirty_sec_id)
     });
     let close_saved = std::fs::read_to_string(&close_save_path).unwrap();
     assert!(close_saved.starts_with("edited_id,payload\n"));
