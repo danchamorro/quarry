@@ -142,7 +142,8 @@ process_is_running() {
 require_app_closed() {
     if process_is_running "$EXECUTABLE" \
         || process_is_running QuarryEgui \
-        || process_is_running quarry-egui
+        || process_is_running quarry-egui \
+        || process_is_running quarry-gpui
     then
         fail "Quit Quarry before installing an update."
     fi
@@ -191,7 +192,7 @@ package_app() {
     [[ -f "$PLIST_TEMPLATE" ]] || fail "Info.plist template is missing."
     [[ -f "$ICON_SOURCE" ]] || fail "icon source is missing."
 
-    package_id="$(cd "$ROOT" && cargo pkgid --offline -p quarry-egui)"
+    package_id="$(cd "$ROOT" && cargo pkgid --offline -p quarry-gpui)"
     version="${package_id##*#}"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "app version must be numeric x.y.z: $version"
 
@@ -215,7 +216,7 @@ package_app() {
     "$ROOT/scripts/generate-notices.sh" --check --target "$host_target" --rust-release "$rust_release"
     (
         cd "$ROOT"
-        cargo build --release --locked --target "$host_target" --target-dir "$ROOT/target" -p quarry-egui
+        cargo build --release --locked --target "$host_target" --target-dir "$ROOT/target" -p quarry-gpui
     )
     post_revision="$(git -C "$ROOT" rev-parse --verify HEAD)"
     [[ "$post_revision" == "$revision" ]] || fail "source revision changed during the build."
@@ -223,7 +224,7 @@ package_app() {
         fail "could not recheck the source checkout after the build."
     fi
     [[ "$post_changes" == "$source_changes" ]] || fail "source checkout changed during the build."
-    binary="$ROOT/target/$host_target/release/quarry-egui"
+    binary="$ROOT/target/$host_target/release/quarry-gpui"
     architecture="$(/usr/bin/lipo -archs "$binary")"
 
     /bin/mkdir -p "$ROOT/target"
@@ -260,11 +261,12 @@ package_app() {
 }
 
 install_app() {
-    local candidate
+    local install_dir candidate
 
+    install_dir="$(dirname "$INSTALL_APP")"
     acquire_app_install_lock
     require_app_closed
-    [[ -d /Applications && -w /Applications ]] || fail "/Applications is not writable for this account."
+    [[ -d "$install_dir" && -w "$install_dir" ]] || fail "$install_dir is not writable for this account."
     package_app
     require_app_closed
 
@@ -279,7 +281,7 @@ install_app() {
     fi
 
     require_app_closed
-    INSTALL_STAGE="$(mktemp -d "/Applications/.quarry-install.XXXXXX")"
+    INSTALL_STAGE="$(mktemp -d "$install_dir/.quarry-install.XXXXXX")"
     candidate="$INSTALL_STAGE/candidate.app"
     INSTALL_PREVIOUS="$INSTALL_STAGE/previous.app"
     /usr/bin/ditto "$PACKAGE_APP" "$candidate"
@@ -317,10 +319,54 @@ install_app() {
     printf 'Installed and verified %s\n' "$INSTALL_APP"
 }
 
+restore_backup_app() {
+    local archive="${1:-$BACKUP_ARCHIVE}"
+    local install_dir archive_stage candidate
+
+    install_dir="$(dirname "$INSTALL_APP")"
+    acquire_app_install_lock
+    require_app_closed
+    [[ -d "$install_dir" && -w "$install_dir" ]] || fail "$install_dir is not writable for this account."
+    [[ -f "$archive" ]] || fail "rollback archive not found: $archive"
+    /usr/bin/unzip -tq "$archive" >/dev/null || fail "rollback archive is corrupted: $archive"
+
+    INSTALL_STAGE="$(mktemp -d "$install_dir/.quarry-install.XXXXXX")"
+    archive_stage="$INSTALL_STAGE/archive"
+    candidate="$archive_stage/$APP_NAME.app"
+    INSTALL_PREVIOUS="$INSTALL_STAGE/previous.app"
+    /bin/mkdir "$archive_stage" || fail "could not create rollback extraction directory."
+    /usr/bin/ditto -x -k "$archive" "$archive_stage" || fail "could not extract rollback archive: $archive"
+    verify_app_identity "$candidate" || fail "rollback archive does not contain a valid signed Quarry.app."
+    require_app_closed
+
+    if [[ -e "$INSTALL_APP" ]]; then
+        INSTALL_REPLACED=true
+        /bin/mv "$INSTALL_APP" "$INSTALL_PREVIOUS"
+    fi
+    INSTALL_ACTIVATED=true
+    if ! /bin/mv "$candidate" "$INSTALL_APP"; then
+        fail "rollback failed; the existing app will be restored."
+    fi
+    if ! verify_app_identity "$INSTALL_APP" || ! register_app "$INSTALL_APP"; then
+        fail "rollback verification failed; the existing app will be restored."
+    fi
+
+    INSTALL_COMMITTED=true
+    /bin/rm -rf "$INSTALL_STAGE"
+    INSTALL_STAGE=""
+    INSTALL_PREVIOUS=""
+    INSTALL_ACTIVATED=false
+    INSTALL_REPLACED=false
+    INSTALL_COMMITTED=false
+    printf 'Restored and verified %s from %s\n' "$INSTALL_APP" "$archive"
+}
+
 rollback_install() {
     local restored=true
+    local install_dir
 
     [[ -n "$INSTALL_STAGE" ]] || return 0
+    install_dir="$(dirname "$INSTALL_APP")"
     if [[ "$INSTALL_COMMITTED" != true ]]; then
         if [[ "$INSTALL_ACTIVATED" == true && -e "$INSTALL_APP" ]]; then
             /bin/rm -rf "$INSTALL_APP" || restored=false
@@ -336,7 +382,7 @@ rollback_install() {
     fi
     if [[ "$restored" == true ]]; then
         case "$INSTALL_STAGE" in
-            /Applications/.quarry-install.*) /bin/rm -rf "$INSTALL_STAGE" ;;
+            "$install_dir"/.quarry-install.*) /bin/rm -rf "$INSTALL_STAGE" ;;
         esac
     else
         printf 'error: rollback app remains at %s\n' "$INSTALL_PREVIOUS" >&2
@@ -366,8 +412,26 @@ cleanup() {
     return "$status"
 }
 
+make_test_signed_app() {
+    local app="$1"
+    local revision="$2"
+    local plist="$app/Contents/Info.plist"
+
+    /bin/mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+    printf '#!/bin/sh\nexit 0\n' > "$app/Contents/MacOS/$EXECUTABLE"
+    /bin/chmod 0755 "$app/Contents/MacOS/$EXECUTABLE"
+    /bin/cp "$PLIST_TEMPLATE" "$plist"
+    /usr/bin/plutil -replace CFBundleShortVersionString -string "0.1.0" "$plist"
+    /usr/bin/plutil -replace CFBundleVersion -string "1" "$plist"
+    /usr/bin/plutil -replace QuarryArchitecture -string "arm64" "$plist"
+    /usr/bin/plutil -replace QuarryGitRevision -string "$revision" "$plist"
+    /usr/bin/plutil -replace QuarrySourceStatus -string "clean" "$plist"
+    printf 'test-icon\n' > "$app/Contents/Resources/Quarry.icns"
+    /usr/bin/codesign --force --deep --sign - --timestamp=none "$app" >/dev/null 2>&1
+}
+
 self_test_rollback() {
-    local test_root
+    local test_root old_src new_src target_src old_archive target_archive corrupt_zip wrong_src wrong_zip fail_once_lsregister
 
     test_root="$(mktemp -d /private/tmp/quarry-rollback-test.XXXXXX)"
     LSREGISTER=/usr/bin/true
@@ -383,6 +447,93 @@ self_test_rollback() {
     if [[ ! -f "$INSTALL_APP/old.marker" || -e "$INSTALL_APP/new.marker" ]]; then
         fail "rollback self-test failed; test data remains at $test_root"
     fi
+    /bin/rm -rf "$INSTALL_APP"
+
+    BACKUP_DIR="$test_root/backups"
+    APP_INSTALL_LOCK_FILE="$test_root/install.lock"
+    old_src="$test_root/old-src/$APP_NAME.app"
+    new_src="$test_root/new-src/$APP_NAME.app"
+    target_src="$test_root/target-src/$APP_NAME.app"
+    old_archive="$BACKUP_DIR/old.zip"
+    target_archive="$BACKUP_DIR/target.zip"
+    corrupt_zip="$BACKUP_DIR/corrupt.zip"
+    wrong_src="$test_root/wrong-src/Other.app"
+    wrong_zip="$BACKUP_DIR/wrong.zip"
+
+    make_test_signed_app "$old_src" "rev-old"
+    make_test_signed_app "$new_src" "rev-new"
+    make_test_signed_app "$target_src" "rev-target"
+    backup_app "$old_src" "$old_archive" >/dev/null
+    backup_app "$target_src" "$target_archive" >/dev/null
+    /usr/bin/ditto "$new_src" "$INSTALL_APP"
+
+    # 1. Valid archive restore replaces the current app with the archived bundle.
+    (
+        trap cleanup EXIT
+        LSREGISTER=/usr/bin/true
+        require_app_closed() { return 0; }
+        restore_backup_app "$old_archive" >/dev/null
+    ) || fail "valid archive restore failed; test data remains at $test_root"
+    [[ "$(plist_value QuarryGitRevision "$INSTALL_APP/Contents/Info.plist")" == "rev-old" ]] \
+        || fail "valid archive restore did not activate expected revision; test data remains at $test_root"
+
+    # 2. Corrupt archive is rejected and leaves the installed app untouched.
+    printf 'not a valid zip archive\n' > "$corrupt_zip"
+    if (
+        trap cleanup EXIT
+        LSREGISTER=/usr/bin/true
+        require_app_closed() { return 0; }
+        restore_backup_app "$corrupt_zip" >/dev/null 2>&1
+    ); then
+        fail "corrupt rollback archive was accepted; test data remains at $test_root"
+    fi
+    [[ "$(plist_value QuarryGitRevision "$INSTALL_APP/Contents/Info.plist")" == "rev-old" ]] \
+        || fail "corrupt archive changed the installed app; test data remains at $test_root"
+
+    # 3. Wrong-shaped archive (valid zip without Quarry.app) is rejected cleanly.
+    /bin/mkdir -p "$wrong_src"
+    printf 'wrong\n' > "$wrong_src/marker"
+    /usr/bin/ditto -c -k --keepParent "$wrong_src" "$wrong_zip"
+    if (
+        trap cleanup EXIT
+        LSREGISTER=/usr/bin/true
+        require_app_closed() { return 0; }
+        restore_backup_app "$wrong_zip" >/dev/null 2>&1
+    ); then
+        fail "wrong-shaped rollback archive was accepted; test data remains at $test_root"
+    fi
+    [[ "$(plist_value QuarryGitRevision "$INSTALL_APP/Contents/Info.plist")" == "rev-old" ]] \
+        || fail "wrong-shaped archive changed the installed app; test data remains at $test_root"
+
+    # 4. Post-swap verification/registration failure restores the previous app,
+    # even when the archive also contains a top-level previous.app entry.
+    /bin/mkdir -p "$test_root/target-src/previous.app"
+    printf 'decoy\n' > "$test_root/target-src/previous.app/decoy.marker"
+    /usr/bin/ditto -c -k --sequesterRsrc "$test_root/target-src" "$target_archive"
+    fail_once_lsregister="$test_root/fail-once-lsregister.sh"
+    cat > "$fail_once_lsregister" <<EOF
+#!/bin/sh
+if [ ! -f "$test_root/lsregister-failed-once" ]; then
+    : > "$test_root/lsregister-failed-once"
+    exit 1
+fi
+exit 0
+EOF
+    /bin/chmod 0755 "$fail_once_lsregister"
+    if (
+        trap cleanup EXIT
+        LSREGISTER="$fail_once_lsregister"
+        require_app_closed() { return 0; }
+        restore_backup_app "$target_archive" >/dev/null 2>&1
+    ); then
+        fail "post-swap registration failure was not detected; test data remains at $test_root"
+    fi
+    [[ "$(plist_value QuarryGitRevision "$INSTALL_APP/Contents/Info.plist")" == "rev-old" ]] \
+        || fail "post-swap rollback did not restore previous app; test data remains at $test_root"
+    if /usr/bin/find "$test_root" -maxdepth 1 -name '.quarry-install.*' | grep -q .; then
+        fail "post-swap rollback left staging directory behind; test data remains at $test_root"
+    fi
+
     /bin/rm -rf "$test_root"
     printf 'Rollback self-test passed.\n'
 }
@@ -412,7 +563,7 @@ self_test_licenses() {
 }
 
 usage() {
-    printf 'Usage: %s package|install|verify [app-path] | self-test\n' "$0"
+    printf 'Usage: %s package|install|rollback [archive-path]|verify [app-path]|self-test\n' "$0"
 }
 
 trap cleanup EXIT
@@ -421,7 +572,7 @@ trap 'exit 143' TERM
 
 require_macos
 case "${1:-package}" in
-    package | install) run_with_lock "$@" ;;
+    package | install | rollback) run_with_lock "$@" ;;
 esac
 case "${1:-package}" in
     package)
@@ -431,6 +582,10 @@ case "${1:-package}" in
     install)
         [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
         install_app
+        ;;
+    rollback)
+        [[ "$#" -le 2 ]] || { usage >&2; exit 2; }
+        restore_backup_app "${2:-$BACKUP_ARCHIVE}"
         ;;
     verify)
         [[ "$#" -le 2 ]] || { usage >&2; exit 2; }

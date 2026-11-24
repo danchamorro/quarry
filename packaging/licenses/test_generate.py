@@ -58,7 +58,7 @@ class NoticeChecks(unittest.TestCase):
         self.assertIn("Review is checked separately", result.stdout)
 
     def test_dependency_input_change_rejects_stale_inventory(self):
-        for relative in ("Cargo.lock", "apps/quarry-egui/Cargo.toml"):
+        for relative in ("Cargo.lock", "apps/quarry-gpui/Cargo.toml"):
             with self.subTest(relative=relative):
                 path = self.root / relative
                 original = path.read_bytes()
@@ -122,7 +122,7 @@ class NoticeChecks(unittest.TestCase):
             self.assertIn("stale or modified", result.stderr)
 
     def test_missing_workspace_member_fails_explicitly(self):
-        (self.root / "apps/quarry-egui/Cargo.toml").unlink()
+        (self.root / "apps/quarry-gpui/Cargo.toml").unlink()
         result = self.run_check("--check")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cannot read Cargo workspace", result.stderr)

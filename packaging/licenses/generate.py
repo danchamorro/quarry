@@ -155,10 +155,12 @@ def render(raw):
     for notice in extra["notices"]:
         choice = f"<p>Selected license: {esc(notice['selected_license'])}</p>" if "selected_license" in notice else ""
         parts.append(f"<h3>{esc(', '.join(notice['packages']))}</h3>{choice}<p>Source: {esc(notice['source'])}<br>SHA-256: {notice['sha256']}</p><pre>{esc(notice['text'])}</pre>")
-    parts.append("<h2>Bundled font byte inventory</h2><ul>")
-    for asset in extra["assets"]:
-        parts.append(f"<li>{esc(asset['package'] + '/' + asset['path'])}: {asset['bytes']} bytes, SHA-256 {asset['sha256']}</li>")
-    parts.append("</ul><h2>Dependency inventory</h2><table><tr><th>Package</th><th>Declared license expression</th></tr>")
+    if extra["assets"]:
+        parts.append("<h2>Bundled font byte inventory</h2><ul>")
+        for asset in extra["assets"]:
+            parts.append(f"<li>{esc(asset['package'] + '/' + asset['path'])}: {asset['bytes']} bytes, SHA-256 {asset['sha256']}</li>")
+        parts.append("</ul>")
+    parts.append("<h2>Dependency inventory</h2><table><tr><th>Package</th><th>Declared license expression</th></tr>")
     for key, package in sorted(packages.items()):
         parts.append(f"<tr><td>{esc(key)}</td><td>{esc(package['license'] or 'Unspecified')}</td></tr>")
     parts.append("</table></body></html>\n")
@@ -174,7 +176,7 @@ def generate(binary):
         output = Path(directory) / "notices.json"
         subprocess.run([
             binary, "generate", "--locked", "--target", TARGET,
-            "-m", str(ROOT / "apps/quarry-egui/Cargo.toml"),
+            "-m", str(ROOT / "apps/quarry-gpui/Cargo.toml"),
             "-c", str(HERE / "about.toml"), "--fail", "--format", "json",
             "-o", str(output),
         ], cwd=ROOT, check=True)

@@ -1,6 +1,6 @@
 # ADR 0003: Select egui for the production UI
 
-**Status:** Superseded by [ADR 0013: Adopt GPUI as Quarry's v1.0 desktop frontend](0013-adopt-gpui-desktop-frontend.md) (`apps/quarry-egui` remains the default packaged macOS app until Phase 4B-3 cutover)
+**Status:** Superseded by [ADR 0013: Adopt GPUI as Quarry's v1.0 desktop frontend](0013-adopt-gpui-desktop-frontend.md) (`scripts/macos-app.sh` switched to `apps/quarry-gpui` in Phase 4B-3; `apps/quarry-egui` remains intact in the workspace for rollback until explicit post-cutover retirement sign-off)
 **Date:** 2026-08-14
 
 ## Context

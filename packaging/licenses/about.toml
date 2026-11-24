@@ -1,4 +1,17 @@
 # Automated selection inputs. Reviewed alternatives are recorded in supplemental.json.
-accepted = ["MIT", "Apache-2.0", "Unicode-3.0", "OFL-1.1", "Ubuntu-font-1.0", "Zlib", "ISC"]
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Zlib",
+    "ISC",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "MPL-2.0",
+]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true

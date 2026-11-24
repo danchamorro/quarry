@@ -290,3 +290,46 @@ The affected inputs are `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`,
 `packaging/licenses/rust/COPYRIGHT-backtrace.html`, and this audit record. The
 regenerated manifest hash records this bounded review; it is not a change of
 license terms or release approval.
+
+## 2026-11-23 GPUI desktop cutover notice inventory (Phase 4B-3)
+
+Phase 4B-3 switches `scripts/macos-app.sh` and `packaging/licenses/generate.py`
+from `apps/quarry-egui/Cargo.toml` to `apps/quarry-gpui/Cargo.toml` for
+`aarch64-apple-darwin` (Rust `1.100.0`, checksum-verified `cargo-about 0.9.2`,
+SHA-256 `ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e`).
+
+- **Locked package count:** `397` packages (including Quarry workspace crates;
+  build and development dependencies excluded).
+- **Allowlist expansion (`about.toml`):** Added the five OSI-approved licenses
+  pre-audited in Phase 4B-1: `0BSD` (`enum-iterator@2.3.0`,
+  `enum-iterator-derive@1.5.0`), `BSD-2-Clause` (`arrayref@0.3.9`),
+  `BSD-3-Clause` (`encoding_rs@0.8.44`, `exr@1.74.3`, `instant@0.1.13`,
+  `lebe@0.5.3`, `tiny-skia@0.11.4`, `tiny-skia-path@0.11.4`), `CC0-1.0`
+  (`notify@8.2.2`), and file-level weak copyleft `MPL-2.0` (`option-ext@0.2.0`
+  via `dirs-sys`/`zed-font-kit`, unmodified upstream crate). Zero GPL, LGPL,
+  AGPL, or non-OSI crates exist in the shipping graph.
+- **Zero bundled fonts & bundled Lucide icons:** `quarry-gpui` uses native OS
+  system fonts (CoreText on macOS, `cosmic-text` + fontconfig on Linux) and
+  embeds zero runtime font files (`epaint_default_fonts` is no longer in the
+  shipping app graph). `gpui-kit-assets@0.10.0` embeds the default 101 Lucide
+  SVG component icons; its locked `gpui-kit-assets@0.10.0/LICENSE-LUCIDE`
+  notice is preserved and hash-verified in `supplemental.json`.
+- **Supplemental notice coverage (`supplemental.json`):** Updated to 38
+  hash-verified records covering every `cargo-about` fallback crate in
+  `quarry-gpui` (`gpui-kit`, `gpui-kit-assets`, `ryu`, `exr`, `chrono`,
+  `granit-parser` including all four inherited `.licenses/{ChenYuheng,Ethiraric}-{Apache,MIT}` files,
+  `libm`, `accesskit@0.24.1`, `accesskit_consumer@0.38.0`,
+  `accesskit_macos@0.26.3`, the `objc2`/`block2`/`dispatch2`/`objc-sys` family
+  with `Zlib` selected where offered, `lyon*`, `mac`, `pathfinder_*`,
+  `profiling*`, `rust-i18n-*`, `seahash`, `svg_fmt`, `taffy`, `zune-inflate`),
+  the MPL-2.0 Section 3.2(a) source-obtainment notice for `option-ext@0.2.0`
+  (citing crates.io version `0.2.0`, SHA-256 `04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d`,
+  and upstream repository `https://github.com/soc/option-ext`),
+  plus crate `COPYRIGHT` files (`rustix`, `unicode-segmentation`, `utf8_iter`).
+- **Rust runtime notices:** Unchanged from the verified Rust `1.100.0` runtime
+  notices in `packaging/licenses/rust/`.
+
+The affected inputs are `packaging/licenses/about.toml`,
+`packaging/licenses/generate.py`, `packaging/licenses/supplemental.json`, and
+this audit record. The regenerated manifest hash records this bounded Phase
+4B-3 cutover review; it is not legal clearance or release authorization.
