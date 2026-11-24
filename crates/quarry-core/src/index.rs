@@ -1295,7 +1295,7 @@ fn run_sequential_indexer(
             if read == 0 {
                 let mut index = shared.index.write().unwrap();
                 scanner.finish(absolute_start, |end| index.record_boundary(end))?;
-                index.maximum_width = scanner.maximum_width();
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 shared
                     .columns_found
                     .store(index.maximum_width, Ordering::Release);
@@ -1315,7 +1315,7 @@ fn run_sequential_indexer(
                     index.record_boundary(end)
                 })?;
                 index.indexed_bytes = absolute_start + read as u64;
-                index.maximum_width = scanner.maximum_width();
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 index.telemetry.chunks_processed += 1;
                 shared
                     .columns_found
@@ -1356,7 +1356,7 @@ fn run_sequential_indexer(
             if read == 0 {
                 let mut index = shared.index.write().unwrap();
                 scanner.finish(absolute_start, |end| index.record_boundary(end))?;
-                index.maximum_width = scanner.maximum_width();
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 shared
                     .columns_found
                     .store(index.maximum_width, Ordering::Release);
@@ -1384,7 +1384,7 @@ fn run_sequential_indexer(
                     index.record_boundary(end)
                 })?;
                 index.indexed_bytes = next_offset;
-                index.maximum_width = scanner.maximum_width();
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 index.telemetry.chunks_processed += 1;
                 shared
                     .columns_found
@@ -1853,6 +1853,10 @@ fn scan_giant_line_sequential(
         shared.bytes_scanned.store(pos, Ordering::Release);
         if hit_lf_after_min {
             break;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if pos < file_size {
+            test_hooks::wait_if_gated(&shared.path, &shared.stop_dispatch);
         }
     }
 
@@ -3075,6 +3079,108 @@ mod tests {
         let partial = job.wait().unwrap();
         assert!(partial.indexed_rows() > 0);
         assert_eq!(session.completed_record_count(), None);
+    }
+
+    #[test]
+    fn pausing_inside_giant_line_fallback_preserves_prior_parallel_maximum_width() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("giant-line-pause-width.csv");
+        let mut bytes = Vec::new();
+        // Leading parallel chunk with 8 columns (> 64 KiB so it commits before the giant line).
+        bytes.extend_from_slice(b"c1,c2,c3,c4,c5,c6,c7,c8\n");
+        for i in 0..3200 {
+            bytes.extend_from_slice(format!("r{i},b,c,d,e,f,g,h\n").as_bytes());
+        }
+        let prefix_len = bytes.len() as u64;
+        assert!(prefix_len > 64 * 1024);
+        // Giant single-line 2-column record exceeding chunk_bytes + max_alignment_search.
+        bytes.extend_from_slice(b"giant,");
+        bytes.extend(std::iter::repeat_n(b'x', 320 * 1024));
+        bytes.push(b'\n');
+        // Trailing narrow 2-column rows.
+        for i in 0..200 {
+            bytes.extend_from_slice(format!("tail{i},v\n").as_bytes());
+        }
+        fs::write(&path, &bytes).unwrap();
+
+        let session = crate::Session::open(
+            &path,
+            crate::OpenOptions {
+                rows: 5,
+                delimiter: Some(b','),
+                sample_bytes: 512,
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let expected = IndexJob::start_with_tuning_cache_and_pool(
+            &session,
+            IndexConfig {
+                chunk_bytes: 64 * 1024,
+                ..IndexConfig::default()
+            },
+            ParallelTuning {
+                requested_threads: 1,
+                min_parallel_bytes: u64::MAX,
+                byte_stride: 64 * 1024,
+                max_alignment_search: 64 * 1024,
+                allow_small_chunks: true,
+                chunk_delay: None,
+            },
+            crate::sidecar::IndexCacheConfig::disabled(),
+            crate::pool::engine_pool(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert_eq!(expected.maximum_width(), 8);
+
+        let gate = test_hooks::TestIndexPauseGate::arm(&path);
+        let job = IndexJob::start_with_tuning_cache_and_pool(
+            &session,
+            IndexConfig {
+                chunk_bytes: 64 * 1024,
+                ..IndexConfig::default()
+            },
+            ParallelTuning {
+                requested_threads: 2,
+                min_parallel_bytes: 64 * 1024,
+                byte_stride: 64 * 1024,
+                max_alignment_search: 64 * 1024,
+                allow_small_chunks: true,
+                chunk_delay: None,
+            },
+            crate::sidecar::IndexCacheConfig::disabled(),
+            crate::pool::engine_pool(),
+        )
+        .unwrap();
+
+        // Gate fires inside scan_giant_line_sequential after the 8-column parallel prefix committed.
+        assert!(
+            gate.wait_until_hit(Duration::from_secs(5)),
+            "expected giant-line fallback to hit pause gate"
+        );
+        assert_eq!(job.progress().columns_found, 8);
+        assert!(job.progress().bytes_scanned > prefix_len);
+        job.pause();
+        drop(gate);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.is_paused() {
+            assert!(
+                Instant::now() < deadline,
+                "job did not pause inside giant line"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        job.resume().unwrap();
+        let resumed = job.wait().unwrap();
+        assert_eq!(resumed.maximum_width(), 8);
+        assert_eq!(resumed.indexed_rows(), expected.indexed_rows());
+        assert_eq!(resumed.indexed_bytes(), expected.indexed_bytes());
+        assert_eq!(resumed.maximum_width(), expected.maximum_width());
     }
 
     #[test]

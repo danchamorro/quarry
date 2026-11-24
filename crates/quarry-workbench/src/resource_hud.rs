@@ -25,6 +25,9 @@ pub const DEFAULT_HUD_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 pub struct VolumeSpaceSample {
     pub label: String,
     pub directory: PathBuf,
+    /// OS volume/device identifier captured off-thread during sampling (`st_dev` on Unix) so
+    /// per-window volume deduplication requires zero filesystem I/O on the UI thread.
+    pub device_id: Option<u64>,
     pub available_bytes: u64,
     pub low_disk: bool,
 }
@@ -67,7 +70,7 @@ impl ResourceHudSample {
             Some(dir) => match self.document_volumes.get(dir) {
                 Some(Some(doc_vol)) => {
                     if let Some(scratch) = &self.scratch_volume {
-                        if same_volume(&doc_vol.directory, &scratch.directory) {
+                        if same_sampled_volume(doc_vol, scratch) {
                             let mut merged = scratch.clone();
                             merged.label = "Disk".into();
                             out.push(merged);
@@ -144,17 +147,16 @@ fn volume_device(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|meta| meta.dev())
 }
 
-#[cfg(unix)]
-fn same_volume(a: &Path, b: &Path) -> bool {
-    match (volume_device(a), volume_device(b)) {
-        (Some(da), Some(db)) => da == db,
-        _ => a == b,
-    }
+#[cfg(not(unix))]
+fn volume_device(_path: &Path) -> Option<u64> {
+    None
 }
 
-#[cfg(not(unix))]
-fn same_volume(a: &Path, b: &Path) -> bool {
-    a == b
+fn same_sampled_volume(a: &VolumeSpaceSample, b: &VolumeSpaceSample) -> bool {
+    match (a.device_id, b.device_id) {
+        (Some(da), Some(db)) => da == db,
+        _ => a.directory == b.directory,
+    }
 }
 
 /// Sample OS process memory and all relevant volume availabilities once.
@@ -163,33 +165,33 @@ pub fn sample_resource_hud(targets: &ResourceHudTargets) -> ResourceHudSample {
     let memory = process_memory_usage();
     let scratch_existing = nearest_existing_dir(&targets.scratch_dir);
 
-    #[cfg(unix)]
     let mut dev_cache: BTreeMap<u64, Option<u64>> = BTreeMap::new();
-    let mut query_space = |dir: &Path| -> Option<u64> {
-        #[cfg(unix)]
-        if let Some(dev) = volume_device(dir) {
-            if let Some(&cached) = dev_cache.get(&dev) {
-                return cached;
+    let mut query_space = |dir: &Path| -> (Option<u64>, Option<u64>) {
+        let dev = volume_device(dir);
+        if let Some(dev_id) = dev {
+            if let Some(&cached) = dev_cache.get(&dev_id) {
+                return (Some(dev_id), cached);
             }
             let reading = available_disk_space(dir).ok();
-            dev_cache.insert(dev, reading);
-            return reading;
+            dev_cache.insert(dev_id, reading);
+            return (Some(dev_id), reading);
         }
-        available_disk_space(dir).ok()
+        (None, available_disk_space(dir).ok())
     };
 
     let (scratch_volume, scratch_failed) = match scratch_existing {
         Some(dir) => match query_space(&dir) {
-            Some(available_bytes) => (
+            (device_id, Some(available_bytes)) => (
                 Some(VolumeSpaceSample {
                     label: "Scratch".into(),
                     directory: dir,
+                    device_id,
                     available_bytes,
                     low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
                 }),
                 false,
             ),
-            None => (None, true),
+            (_, None) => (None, true),
         },
         None => (None, true),
     };
@@ -197,12 +199,16 @@ pub fn sample_resource_hud(targets: &ResourceHudTargets) -> ResourceHudSample {
     let mut document_volumes = BTreeMap::new();
     for raw_dir in &targets.document_dirs {
         let entry = match nearest_existing_dir(raw_dir) {
-            Some(dir) => query_space(&dir).map(|available_bytes| VolumeSpaceSample {
-                label: "File disk".into(),
-                directory: dir,
-                available_bytes,
-                low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
-            }),
+            Some(dir) => {
+                let (device_id, space) = query_space(&dir);
+                space.map(|available_bytes| VolumeSpaceSample {
+                    label: "File disk".into(),
+                    directory: dir,
+                    device_id,
+                    available_bytes,
+                    low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
+                })
+            }
             None => None,
         };
         document_volumes.insert(raw_dir.clone(), entry);
@@ -468,12 +474,14 @@ mod tests {
         let healthy = vec![VolumeSpaceSample {
             label: "Disk".into(),
             directory: PathBuf::from("/tmp"),
+            device_id: Some(1),
             available_bytes: 10 * 1024 * 1024 * 1024,
             low_disk: false,
         }];
         let low = vec![VolumeSpaceSample {
             label: "Scratch".into(),
             directory: PathBuf::from("/tmp"),
+            device_id: Some(1),
             available_bytes: 64 * 1024 * 1024,
             low_disk: true,
         }];
@@ -654,31 +662,34 @@ mod tests {
         assert_eq!(vols_a.len(), 1);
         assert_eq!(vols_a[0].label, "Disk");
 
-        // Per-window selection handles distinct document volumes independently.
+        // Per-window selection deduplicates purely by cached device_id without filesystem I/O.
         let synthetic = ResourceHudSample {
             memory: sample.memory,
             scratch_volume: Some(VolumeSpaceSample {
                 label: "Scratch".into(),
-                directory: PathBuf::from("/vol-a"),
+                directory: PathBuf::from("/nonexistent-scratch-root"),
+                device_id: Some(42),
                 available_bytes: 50 * 1024 * 1024 * 1024,
                 low_disk: false,
             }),
             scratch_failed: false,
             document_volumes: BTreeMap::from([
                 (
-                    PathBuf::from("/vol-a/doc1"),
+                    PathBuf::from("/nonexistent-vol-a/doc1"),
                     Some(VolumeSpaceSample {
                         label: "File disk".into(),
-                        directory: PathBuf::from("/vol-a"),
+                        directory: PathBuf::from("/nonexistent-vol-a"),
+                        device_id: Some(42),
                         available_bytes: 50 * 1024 * 1024 * 1024,
                         low_disk: false,
                     }),
                 ),
                 (
-                    PathBuf::from("/vol-b/doc2"),
+                    PathBuf::from("/nonexistent-vol-b/doc2"),
                     Some(VolumeSpaceSample {
                         label: "File disk".into(),
-                        directory: PathBuf::from("/vol-b"),
+                        directory: PathBuf::from("/nonexistent-vol-b"),
+                        device_id: Some(99),
                         available_bytes: 64 * 1024 * 1024,
                         low_disk: true,
                     }),
@@ -687,12 +698,15 @@ mod tests {
             volumes: Vec::new(),
             sampled_at: Instant::now(),
         };
-        let (win1_vols, win1_inc) = synthetic.volumes_for(Some(Path::new("/vol-a/doc1")));
+        let (win1_vols, win1_inc) =
+            synthetic.volumes_for(Some(Path::new("/nonexistent-vol-a/doc1")));
         assert!(!win1_inc);
         assert_eq!(win1_vols.len(), 1);
+        assert_eq!(win1_vols[0].label, "Disk");
         assert!(!win1_vols[0].low_disk);
 
-        let (win2_vols, win2_inc) = synthetic.volumes_for(Some(Path::new("/vol-b/doc2")));
+        let (win2_vols, win2_inc) =
+            synthetic.volumes_for(Some(Path::new("/nonexistent-vol-b/doc2")));
         assert!(!win2_inc);
         assert_eq!(win2_vols.len(), 2);
         assert_eq!(win2_vols[0].label, "File disk");
