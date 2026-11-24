@@ -663,6 +663,7 @@ impl QuarryWindow {
             let close_weak = close_weak.clone();
             let save_status = status.clone();
             let save_as_info = save_as_info.clone();
+            let speculative_warning = save_as_info.as_ref().and_then(|(_, warning)| *warning);
             let prompting_save = std::sync::Arc::clone(&prompting_save_as);
             let prompting_close = std::sync::Arc::clone(&prompting_save_as);
             let error = status.read(cx).error.clone();
@@ -689,6 +690,23 @@ impl QuarryWindow {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(prompt_copy),
                         )
+                        .when_some(speculative_warning, |content, warning| {
+                            content.child(
+                                div()
+                                    .id("close-review-speculative-warning")
+                                    .role(Role::Alert)
+                                    .mt_2()
+                                    .px_2p5()
+                                    .py_1p5()
+                                    .rounded(px(6.))
+                                    .bg(cx.theme().warning.opacity(0.14))
+                                    .border_1()
+                                    .border_color(cx.theme().warning.opacity(0.45))
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().warning_foreground)
+                                    .child(warning),
+                            )
+                        })
                         .when_some(error.clone(), |content, error| {
                             content.child(
                                 div()

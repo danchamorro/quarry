@@ -1916,7 +1916,7 @@ impl Session {
         if let Some(meta) = &self.section {
             if transformation.is_some() {
                 return Err(QuarryError::InvalidOption(
-                    "Column transformations on section documents are not supported yet; save the section as a new file first.",
+                    "Saving a section with reordered or hidden columns is not supported yet. Reset the column layout in the Columns panel and retry Save Section As New.",
                 ));
             }
             return SaveAsJob::start_section_as(
@@ -2095,7 +2095,7 @@ impl Session {
         if let Some(meta) = &self.section {
             if transformation.is_some() {
                 return Err(QuarryError::InvalidOption(
-                    "Column transformations on section documents are not supported yet; save the section as a new file first.",
+                    "Saving a section with reordered or hidden columns is not supported yet. Reset the column layout in the Columns panel and retry Save Section As New.",
                 ));
             }
             return SaveAsJob::start_section_as(
@@ -3699,9 +3699,7 @@ fn run_section_filtered_export(
                 true,
                 config.max_record_bytes,
             )?;
-            rows_written += 1;
             bytes_written = output.bytes_written();
-            shared.rows_written.store(rows_written, Ordering::Release);
             shared.bytes_written.store(bytes_written, Ordering::Release);
         } else if section_base > 0 && source_had_bom {
             // Preserve the source BOM for headerless interior sections (critical for UTF-16LE/BE
@@ -3841,6 +3839,16 @@ fn run_section_filtered_export(
                 shared.rows_written.store(rows_written, Ordering::Release);
                 shared.bytes_written.store(bytes_written, Ordering::Release);
             }
+        }
+        if edits
+            .cells
+            .keys()
+            .next_back()
+            .is_some_and(|(row, _)| *row >= local_row)
+        {
+            return Err(QuarryError::InvalidOption(
+                "cell edit points beyond the source rows",
+            ));
         }
         Ok(ScanOutcome::Complete {
             rows_written,

@@ -158,6 +158,21 @@ impl StructuralIndex {
         }
     }
 
+    /// Returns `true` when this index matches the session's source stamp, framing, and byte range
+    /// (covering both live in-progress indexes and completed indexes).
+    pub(crate) fn matches_session(
+        &self,
+        source_stamp: &SourceStamp,
+        delimiter: u8,
+        encoding: Encoding,
+        section_base: u64,
+        section_end: u64,
+        is_section: bool,
+    ) -> bool {
+        self.matches_byte_range(section_base, section_end, is_section)
+            && self.matches_provenance(source_stamp, delimiter, encoding)
+    }
+
     fn new_inner(
         config: IndexConfig,
         section_base: u64,
@@ -835,13 +850,18 @@ impl IndexJob {
         let section_range = session
             .section_bounds()
             .map(|bounds| (bounds.snapped.base, bounds.snapped_end()));
-        let (index, target_bytes) = match section_range {
+        let (mut index, target_bytes) = match section_range {
             Some((base, end)) => (
                 StructuralIndex::new_for_section(config, base, end)?,
                 end.saturating_sub(base),
             ),
             None => (StructuralIndex::new(config)?, session.file_size),
         };
+        index.set_provenance(
+            session.source_stamp.clone(),
+            session.dialect.delimiter,
+            session.encoding,
+        );
         let ctx = JobResumeContext {
             path: session.path.clone(),
             file_size: session.file_size,

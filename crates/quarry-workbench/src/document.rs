@@ -414,17 +414,26 @@ impl Document {
     }
 
     /// Prepares a bounded section document at previously verified/snapped `preserved_bounds`
-    /// guarded by `expected_guard` (`Session::open_section_preserved`).
+    /// guarded by `expected_guard` and `(expected_delimiter, expected_encoding)`
+    /// (`Session::open_section_preserved`).
     pub fn prepare_section_preserved(
         path: &Path,
         preserved_bounds: SectionBounds,
         expected_guard: &quarry_core::SourceGuard,
+        expected_delimiter: u8,
+        expected_encoding: Encoding,
         mut options: SectionOpenOptions,
     ) -> Result<Self, QuarryError> {
         let quote_free = options.quote_free_confirmed;
         options.open.rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS + 1;
-        let session =
-            Session::open_section_preserved(path, preserved_bounds, expected_guard, options)?;
+        let session = Session::open_section_preserved(
+            path,
+            preserved_bounds,
+            expected_guard,
+            expected_delimiter,
+            expected_encoding,
+            options,
+        )?;
         let mut doc = Self::from_session(session, path);
         doc.section_quote_free_confirmed = quote_free;
         Ok(doc)

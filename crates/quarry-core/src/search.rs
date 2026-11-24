@@ -491,9 +491,16 @@ impl Session {
             return Err(QuarryError::InvalidOption("search query must not be empty"));
         }
         let (section_base, section_end) = self.active_byte_range();
-        if !index.matches_byte_range(section_base, section_end, self.is_section()) {
+        if !index.matches_session(
+            &self.source_stamp,
+            self.dialect.delimiter,
+            self.encoding,
+            section_base,
+            section_end,
+            self.is_section(),
+        ) {
             return Err(QuarryError::InvalidOption(
-                "index byte range does not match session scope",
+                "index does not match session source, framing, or byte range",
             ));
         }
         let data_start = u64::from(self.dialect.has_header && section_base == 0);
@@ -2096,7 +2103,7 @@ mod tests {
             },
         )
         .unwrap();
-        let index = session
+        let mut index = session
             .start_indexing(IndexConfig {
                 chunk_bytes: 64,
                 checkpoint_every: 20,
@@ -2110,6 +2117,11 @@ mod tests {
         let mut session = session;
         session.source_stamp =
             crate::source_stamp::SourceStamp::from_file(&fs::File::open(&path).unwrap()).unwrap();
+        index.set_provenance(
+            session.source_stamp.clone(),
+            session.dialect.delimiter,
+            session.encoding,
+        );
 
         let err = session
             .start_search_with_tuning(
@@ -2156,6 +2168,11 @@ mod tests {
             memory_budget_bytes: 64 * 1024,
         })
         .unwrap();
+        partial.set_provenance(
+            session.source_stamp.clone(),
+            session.dialect.delimiter,
+            session.encoding,
+        );
         let mut boundaries = 0usize;
         for (idx, &byte) in data.iter().enumerate() {
             if byte == b'\n' {

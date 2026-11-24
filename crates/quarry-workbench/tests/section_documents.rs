@@ -678,16 +678,97 @@ fn interior_section_header_rename_uses_captured_header_and_reordered_columns_rej
     assert!(doc.is_dirty());
     assert_eq!(doc.headers[0], "alice");
 
-    // 2. Reordering columns on a section must reject Save As rather than silently dropping order.
+    // 2. Reordering columns on a section must reject Save As rather than silently dropping order,
+    // and instruct the user to reset the column layout in the Columns panel.
     doc.move_column(1, 0).unwrap();
     let err = doc.start_save_as(out_path.clone()).unwrap_err();
     assert!(
-        err.text.to_lowercase().contains("transformation"),
-        "expected unsupported transformation error, got: {}",
+        err.text.to_lowercase().contains("reordered") && err.text.contains("Columns panel"),
+        "expected actionable column-layout reset error, got: {}",
         err.text
     );
     assert!(!out_path.exists());
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&out_path);
+}
+
+#[test]
+fn dormant_section_reopen_resets_row_coordinates_when_header_mode_changes() {
+    let raw = b"h1,h2\nr1,v1\nr2,v2\n";
+    let path1 = temp_csv("dormant-reopen-hdr", raw);
+    let path2 = temp_csv("dormant-reopen-evictor", b"x,y\n1,2\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path1.clone(),
+            ByteWindow::from_range(0, 12).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: quarry_core::HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+    assert_eq!(
+        scheduler
+            .tab(sec_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .data_start,
+        1
+    );
+
+    // Evict section to dormancy, then reopen with NoHeader.
+    let _ = scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path2.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        scheduler.residency(sec_id),
+        Some(ResidencyState::DormantClean)
+    );
+
+    let _ = scheduler
+        .reopen_tab(
+            WindowId::PRIMARY,
+            sec_id,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: quarry_core::HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+    wait_for_index(&mut scheduler, sec_id);
+    let doc = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+    assert!(doc.is_section());
+    assert_eq!(
+        doc.data_start, 0,
+        "reopening dormant byte-0 section as NoHeader must reset data_start to 0"
+    );
+
+    let _ = fs::remove_file(&path1);
+    let _ = fs::remove_file(&path2);
 }

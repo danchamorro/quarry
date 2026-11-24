@@ -440,6 +440,8 @@ struct DormantDirtyState {
 struct DormantSectionSpec {
     bounds: SectionBounds,
     quote_free_confirmed: bool,
+    delimiter: u8,
+    encoding: Encoding,
 }
 
 enum DormantKind {
@@ -1169,7 +1171,16 @@ impl WorkbenchScheduler {
         id: DocumentId,
         discard_unsaved: bool,
     ) -> Result<String, AppMessage> {
-        let (path, verified_bounds, open_options, encoding, quote_free, expected_guard) = {
+        let (
+            path,
+            verified_bounds,
+            open_options,
+            encoding,
+            quote_free,
+            expected_guard,
+            expected_delimiter,
+            expected_encoding,
+        ) = {
             let Some(slot) = self.tabs.get(&id) else {
                 return Err(AppMessage::warning("Document is not hydrated."));
             };
@@ -1202,6 +1213,8 @@ impl WorkbenchScheduler {
                 Some(doc.session.encoding()),
                 doc.section_quote_free_confirmed,
                 doc.session.source_guard(),
+                doc.session.dialect.delimiter,
+                doc.session.encoding(),
             )
         };
         let options = SectionOpenOptions {
@@ -1215,6 +1228,8 @@ impl WorkbenchScheduler {
             &path,
             verified_bounds,
             &expected_guard,
+            expected_delimiter,
+            expected_encoding,
             options,
         ) {
             Ok(doc) => doc,
@@ -2144,15 +2159,14 @@ impl WorkbenchScheduler {
             .or(match &slot.residency {
                 SlotResidency::Dormant(dormant) => match &dormant.kind {
                     DormantKind::CleanPlain {
-                        open_options: prev_opts,
-                        encoding: prev_enc,
                         section: Some(spec),
+                        ..
                     } => Some((
                         spec.bounds,
                         spec.quote_free_confirmed,
                         dormant.source_guard.clone(),
-                        prev_opts.delimiter.unwrap_or(b','),
-                        prev_enc.unwrap_or(Encoding::Utf8),
+                        spec.delimiter,
+                        spec.encoding,
                     )),
                     DormantKind::Dirty(dirty) => dirty
                         .verified_bounds_override
@@ -2173,6 +2187,8 @@ impl WorkbenchScheduler {
 
         // Validate and prepare the replacement document BEFORE touching the existing slot.
         // For section tabs, stay bounded to the section window instead of opening the whole parent.
+        // Core resolves Auto encoding/delimiter first and only reuses `prev_bounds` when both the
+        // file guard AND resolved `(delimiter, encoding)` match; otherwise it re-snaps `requested`.
         let mut replacement = if let Some((
             prev_bounds,
             quote_free_confirmed,
@@ -2182,9 +2198,6 @@ impl WorkbenchScheduler {
         )) = existing_section
         {
             let parent_index = self.find_parent_index_for_path(&path);
-            let same_framing = (options.delimiter.is_none()
-                || options.delimiter == Some(prev_delimiter))
-                && (encoding.is_none() || encoding == Some(prev_encoding));
             let sec_opts = SectionOpenOptions {
                 open: options,
                 encoding,
@@ -2192,23 +2205,20 @@ impl WorkbenchScheduler {
                 quote_free_confirmed,
                 ..SectionOpenOptions::default()
             };
-            if same_framing {
-                match Document::prepare_section_preserved(
-                    &path,
-                    prev_bounds,
-                    &prev_guard,
-                    sec_opts.clone(),
-                ) {
-                    Ok(doc) => doc,
-                    Err(quarry_core::QuarryError::SourceChanged) => {
-                        Document::prepare_section(&path, prev_bounds.requested, sec_opts)
-                            .map_err(SchedulerError::OpenFailed)?
-                    }
-                    Err(err) => return Err(SchedulerError::OpenFailed(err.to_string())),
+            match Document::prepare_section_preserved(
+                &path,
+                prev_bounds,
+                &prev_guard,
+                prev_delimiter,
+                prev_encoding,
+                sec_opts.clone(),
+            ) {
+                Ok(doc) => doc,
+                Err(quarry_core::QuarryError::SourceChanged) => {
+                    Document::prepare_section(&path, prev_bounds.requested, sec_opts)
+                        .map_err(SchedulerError::OpenFailed)?
                 }
-            } else {
-                Document::prepare_section(&path, prev_bounds.requested, sec_opts)
-                    .map_err(SchedulerError::OpenFailed)?
+                Err(err) => return Err(SchedulerError::OpenFailed(err.to_string())),
             }
         } else {
             Document::prepare_with_encoding(&path, options, encoding)
@@ -2253,46 +2263,131 @@ impl WorkbenchScheduler {
         }
 
         // For Stub or Dormant tabs, shut down the pre-check document and hydrate normally now
-        // that we know the target path + options + encoding open cleanly.
+        // that we know the target path + options + encoding open cleanly. Save prior slot state
+        // so an activation failure (e.g. FD budget exhausted) leaves the dormant/stub tab intact.
         let replacement_section = replacement
             .section_bounds()
             .map(|bounds| DormantSectionSpec {
                 bounds,
                 quote_free_confirmed: replacement.section_quote_free_confirmed,
+                delimiter: replacement.session.dialect.delimiter,
+                encoding: replacement.session.encoding(),
             });
         let replacement_guard = replacement.session.source_guard();
+        let replacement_view = DormantViewSnapshot {
+            viewport_start: replacement.viewport_start,
+            scroll_points: replacement.scroll_points,
+            visible_rows: replacement.visible_rows,
+            data_start: replacement.data_start,
+            selection: replacement.selection,
+            cursor: replacement.cursor.clone(),
+            selected_rows: replacement.selected_rows.clone(),
+            selected_columns: replacement.selected_columns.clone(),
+            column_selection_anchor: replacement.column_selection_anchor,
+            columns: replacement.columns.clone(),
+            headers: replacement.headers.clone(),
+            total_columns: replacement.total_columns,
+            filter_query: None,
+            filter_viewport_start: 0,
+            edit_history: crate::history::EditHistory::default(),
+        };
         replacement.shutdown();
         let canonical_path = canonicalize_best_effort(&path);
         let file_identity = FileIdentity::from_path(&path).ok().flatten();
-        if let Some(slot) = self.tabs.get_mut(&id) {
-            slot.tab.header_mode = options.header_mode;
-            slot.tab.encoding_mode = encoding;
-            slot.tab.notice = None;
-            slot.tab.footer_status = None;
-            if let Some(sec_spec) = replacement_section {
-                if let SlotResidency::Dormant(dormant) = &mut slot.residency {
-                    dormant.source_guard = replacement_guard;
-                    dormant.source_changed = false;
-                    dormant.kind = DormantKind::CleanPlain {
+        let prev_active = self.active_by_window.get(&window).copied();
+        let prev_slot_state = self.tabs.get_mut(&id).map(|slot| {
+            let old_header_mode = slot.tab.header_mode;
+            let old_encoding_mode = slot.tab.encoding_mode;
+            let old_notice = slot.tab.notice.take();
+            let old_footer_status = slot.tab.footer_status.take();
+            let new_residency = if let Some(sec_spec) = replacement_section {
+                let (view, old_bounds) = match &slot.residency {
+                    SlotResidency::Dormant(dormant) => {
+                        let prev_bounds = match &dormant.kind {
+                            DormantKind::CleanPlain {
+                                section: Some(s), ..
+                            } => Some(s.bounds),
+                            DormantKind::Dirty(d) => d
+                                .verified_bounds_override
+                                .or_else(|| d.session.section_bounds()),
+                            _ => None,
+                        };
+                        let format_changed = old_header_mode != options.header_mode
+                            || old_encoding_mode != encoding
+                            || dormant.view.data_start != replacement_view.data_start
+                            || prev_bounds.map(|b| b.snapped) != Some(sec_spec.bounds.snapped);
+                        let chosen_view = if format_changed {
+                            replacement_view.clone()
+                        } else {
+                            dormant.view.clone()
+                        };
+                        (chosen_view, prev_bounds)
+                    }
+                    _ => (replacement_view.clone(), None),
+                };
+                let _ = old_bounds;
+                SlotResidency::Dormant(Box::new(DormantDocument {
+                    logical_path: path.clone(),
+                    canonical_path: canonical_path.clone(),
+                    file_identity,
+                    source_guard: replacement_guard,
+                    source_changed: false,
+                    view,
+                    kind: DormantKind::CleanPlain {
                         open_options: options,
                         encoding,
                         section: Some(sec_spec),
-                    };
-                }
+                    },
+                }))
             } else {
-                slot.residency = SlotResidency::Stub(LazyDocumentStub {
-                    logical_path: path,
+                SlotResidency::Stub(LazyDocumentStub {
+                    logical_path: path.clone(),
                     canonical_path,
                     file_identity,
                     open_options: options,
                     encoding,
-                });
-            }
-        }
+                })
+            };
+            let old_residency = std::mem::replace(&mut slot.residency, new_residency);
+            slot.tab.header_mode = options.header_mode;
+            slot.tab.encoding_mode = encoding;
+            (
+                old_header_mode,
+                old_encoding_mode,
+                old_notice,
+                old_footer_status,
+                old_residency,
+            )
+        });
         if self.active_by_window.get(&window) == Some(&id) {
             self.active_by_window.remove(&window);
         }
-        self.activate_tab(window, id)
+        match self.activate_tab(window, id) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                if let (
+                    Some(slot),
+                    Some((
+                        old_header_mode,
+                        old_encoding_mode,
+                        old_notice,
+                        old_footer_status,
+                        old_residency,
+                    )),
+                ) = (self.tabs.get_mut(&id), prev_slot_state)
+                {
+                    slot.tab.header_mode = old_header_mode;
+                    slot.tab.encoding_mode = old_encoding_mode;
+                    slot.tab.notice = old_notice;
+                    slot.tab.footer_status = old_footer_status;
+                    slot.residency = old_residency;
+                }
+                if let Some(active) = prev_active {
+                    self.active_by_window.insert(window, active);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Applies one value-edit or structural-working-copy undo/redo step on hydrated tab `id`.
@@ -3988,6 +4083,8 @@ fn demote_document(
         let section = doc.section_bounds().map(|bounds| DormantSectionSpec {
             bounds,
             quote_free_confirmed: doc.section_quote_free_confirmed,
+            delimiter: doc.session.dialect.delimiter,
+            encoding: doc.session.encoding(),
         });
         doc.shutdown();
         drop(doc);
@@ -4172,6 +4269,8 @@ fn wake_dormant_document(
                     &dormant.logical_path,
                     spec.bounds,
                     &dormant.source_guard,
+                    spec.delimiter,
+                    spec.encoding,
                     SectionOpenOptions {
                         open: open_options,
                         encoding,

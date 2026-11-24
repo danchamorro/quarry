@@ -645,21 +645,30 @@ impl Session {
     }
 
     /// Reopens a bounded byte section at previously validated `preserved_bounds` ONLY when the
-    /// underlying file still matches `expected_guard`; returns `QuarryError::SourceChanged` if
-    /// the file changed on disk. Used by verified boundary reopen and clean-section dormancy wake
-    /// so proven bounds (including multiline quoted starts past 16 MiB) are never re-snapped
-    /// speculatively when the file is unchanged.
+    /// underlying file still matches `expected_guard` AND the resolved `(delimiter, encoding)`
+    /// match `(expected_delimiter, expected_encoding)`. Returns `QuarryError::SourceChanged` if
+    /// the file changed on disk, or re-snaps `preserved_bounds.requested` when the resolved
+    /// delimiter or encoding changed. Used by verified boundary reopen and clean-section dormancy
+    /// wake so proven bounds (including multiline quoted starts past 16 MiB) are never re-snapped
+    /// speculatively when file and framing are unchanged.
     pub fn open_section_preserved(
         path: impl AsRef<Path>,
         preserved_bounds: SectionBounds,
         expected_guard: &SourceGuard,
+        expected_delimiter: u8,
+        expected_encoding: Encoding,
         options: SectionOpenOptions,
     ) -> Result<Self, QuarryError> {
         Self::open_section_inner(
             path.as_ref(),
             preserved_bounds.requested,
             options,
-            Some((preserved_bounds, expected_guard)),
+            Some((
+                preserved_bounds,
+                expected_guard,
+                expected_delimiter,
+                expected_encoding,
+            )),
         )
     }
 
@@ -667,7 +676,7 @@ impl Session {
         path: &Path,
         window: ByteWindow,
         options: SectionOpenOptions,
-        preserved: Option<(SectionBounds, &SourceGuard)>,
+        preserved: Option<(SectionBounds, &SourceGuard, u8, Encoding)>,
     ) -> Result<Self, QuarryError> {
         validate_open_options(&options.open)?;
         if window.end().is_none() {
@@ -689,7 +698,7 @@ impl Session {
             });
         }
         let source_stamp = SourceStamp::from_file(&file)?;
-        if let Some((_, expected_guard)) = preserved
+        if let Some((_, expected_guard, _, _)) = preserved
             && SourceGuard::from_stamp(source_stamp.clone()) != *expected_guard
         {
             return Err(QuarryError::SourceChanged);
@@ -736,7 +745,7 @@ impl Session {
         let (has_header, header_row, byte0_bytes_read) = match options.open.header_mode {
             HeaderMode::NoHeader => (false, None, 0u64),
             HeaderMode::FirstRow => {
-                let (byte0_rows, bytes_read) = section::read_header_probe_rows(
+                let (byte0_rows, bytes_read, reached_eof) = section::read_header_probe_rows(
                     &file,
                     file_size,
                     delimiter,
@@ -744,10 +753,16 @@ impl Session {
                     options.open.bootstrap_limit,
                     encoding,
                 )?;
+                if byte0_rows.is_empty() && !reached_eof {
+                    return Err(QuarryError::BootstrapLimitExceeded {
+                        limit: options.open.bootstrap_limit,
+                        rows_found: 0,
+                    });
+                }
                 (true, byte0_rows.into_iter().next(), bytes_read)
             }
             HeaderMode::Auto => {
-                let (byte0_rows, bytes_read) = section::read_header_probe_rows(
+                let (byte0_rows, bytes_read, reached_eof) = section::read_header_probe_rows(
                     &file,
                     file_size,
                     delimiter,
@@ -755,6 +770,12 @@ impl Session {
                     options.open.bootstrap_limit,
                     encoding,
                 )?;
+                if byte0_rows.len() < 2 && !reached_eof {
+                    return Err(QuarryError::BootstrapLimitExceeded {
+                        limit: options.open.bootstrap_limit,
+                        rows_found: byte0_rows.len(),
+                    });
+                }
                 let detected = detect_header(&byte0_rows);
                 let header = if detected {
                     byte0_rows.into_iter().next()
@@ -765,7 +786,11 @@ impl Session {
             }
         };
 
-        let bounds = if let Some((preserved_bounds, _)) = preserved {
+        let bounds = if let Some((preserved_bounds, _, expected_delimiter, expected_encoding)) =
+            preserved
+            && delimiter == expected_delimiter
+            && encoding == expected_encoding
+        {
             if preserved_bounds.snapped.end().is_none()
                 || preserved_bounds.snapped_end() > file_size
             {
@@ -935,9 +960,16 @@ impl Session {
         count: usize,
     ) -> Result<Vec<Row>, QuarryError> {
         let (section_base, section_end) = self.active_byte_range();
-        if !index.matches_byte_range(section_base, section_end, self.is_section()) {
+        if !index.matches_session(
+            &self.source_stamp,
+            self.dialect.delimiter,
+            self.encoding,
+            section_base,
+            section_end,
+            self.is_section(),
+        ) {
             return Err(QuarryError::InvalidOption(
-                "index byte range does not match session scope",
+                "index does not match session source, framing, or byte range",
             ));
         }
         let end = index.section_end().unwrap_or(u64::MAX);

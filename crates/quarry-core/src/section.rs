@@ -865,35 +865,58 @@ fn run_verify_boundary(
         if read < want {
             return Err(QuarryError::SourceChanged);
         }
-        let scan_slice = if cursor >= scan_target_end {
-            let first_lf = find_first_lf_end(&chunk[..read], cursor, ctx.encoding)
-                .map(|abs| (abs - cursor) as usize)
-                .unwrap_or(read);
-            &chunk[..first_lf.min(read)]
-        } else {
-            &chunk[..read]
-        };
 
         let mut reached_target = false;
-        scanner.scan_chunk(scan_slice, cursor, |record_end| {
-            observe_record_for_bounds(
-                record_start,
-                record_end,
-                rows_counted,
-                req_start,
-                req_end,
-                &mut aligned_start,
-                &mut first_global_row,
-                &mut aligned_end,
-            );
-            rows_counted += 1;
-            record_start = record_end;
-            if aligned_end.is_some() {
-                reached_target = true;
+        if cursor >= scan_target_end {
+            // Advance through already-read bytes LF-by-LF without re-reading overlapping ranges,
+            // stopping immediately once the closing record covering `req_end` finishes.
+            let mut pos = 0usize;
+            while pos < read && !reached_target {
+                let step_end =
+                    find_first_lf_end(&chunk[pos..read], cursor + pos as u64, ctx.encoding)
+                        .map(|abs| (abs - cursor) as usize)
+                        .unwrap_or(read)
+                        .min(read);
+                scanner.scan_chunk(&chunk[pos..step_end], cursor + pos as u64, |record_end| {
+                    observe_record_for_bounds(
+                        record_start,
+                        record_end,
+                        rows_counted,
+                        req_start,
+                        req_end,
+                        &mut aligned_start,
+                        &mut first_global_row,
+                        &mut aligned_end,
+                    );
+                    rows_counted += 1;
+                    record_start = record_end;
+                    if aligned_end.is_some() {
+                        reached_target = true;
+                    }
+                })?;
+                pos = step_end;
             }
-        })?;
-
-        cursor += scan_slice.len() as u64;
+            cursor += pos as u64;
+        } else {
+            scanner.scan_chunk(&chunk[..read], cursor, |record_end| {
+                observe_record_for_bounds(
+                    record_start,
+                    record_end,
+                    rows_counted,
+                    req_start,
+                    req_end,
+                    &mut aligned_start,
+                    &mut first_global_row,
+                    &mut aligned_end,
+                );
+                rows_counted += 1;
+                record_start = record_end;
+                if aligned_end.is_some() {
+                    reached_target = true;
+                }
+            })?;
+            cursor += read as u64;
+        }
         shared.bytes_scanned.store(
             cursor.saturating_sub(ctx.start_checkpoint.offset),
             Ordering::Release,
@@ -1088,29 +1111,49 @@ fn snap_from_validated_checkpoint(
         if read < want {
             return Err(QuarryError::SourceChanged);
         }
-        let scan_slice = if cursor >= scan_target_end {
-            let first_lf = find_first_lf_end(&chunk[..read], cursor, encoding)
-                .map(|abs| (abs - cursor) as usize)
-                .unwrap_or(read);
-            &chunk[..first_lf.min(read)]
+        if cursor >= scan_target_end {
+            // Advance through already-read bytes LF-by-LF without re-reading overlapping ranges,
+            // stopping immediately once `aligned_end` is established.
+            let mut pos = 0usize;
+            while pos < read && aligned_end.is_none() {
+                let step_end = find_first_lf_end(&chunk[pos..read], cursor + pos as u64, encoding)
+                    .map(|abs| (abs - cursor) as usize)
+                    .unwrap_or(read)
+                    .min(read);
+                scanner.scan_chunk(&chunk[pos..step_end], cursor + pos as u64, |record_end| {
+                    observe_record_for_bounds(
+                        record_start,
+                        record_end,
+                        rows_counted,
+                        req_start,
+                        req_end,
+                        &mut aligned_start,
+                        &mut first_global_row,
+                        &mut aligned_end,
+                    );
+                    rows_counted += 1;
+                    record_start = record_end;
+                })?;
+                pos = step_end;
+            }
+            cursor += pos as u64;
         } else {
-            &chunk[..read]
-        };
-        scanner.scan_chunk(scan_slice, cursor, |record_end| {
-            observe_record_for_bounds(
-                record_start,
-                record_end,
-                rows_counted,
-                req_start,
-                req_end,
-                &mut aligned_start,
-                &mut first_global_row,
-                &mut aligned_end,
-            );
-            rows_counted += 1;
-            record_start = record_end;
-        })?;
-        cursor += scan_slice.len() as u64;
+            scanner.scan_chunk(&chunk[..read], cursor, |record_end| {
+                observe_record_for_bounds(
+                    record_start,
+                    record_end,
+                    rows_counted,
+                    req_start,
+                    req_end,
+                    &mut aligned_start,
+                    &mut first_global_row,
+                    &mut aligned_end,
+                );
+                rows_counted += 1;
+                record_start = record_end;
+            })?;
+            cursor += read as u64;
+        }
     }
 
     if aligned_end.is_none() && cursor == file_size {
@@ -1429,13 +1472,15 @@ fn snap_quote_free_verified(
     })
 }
 
-/// Validate a candidate interior record start by running `EncodedScanner` (`in_quote = false`)
-/// over a bounded forward probe. Returns `true` if the candidate parses cleanly without quote
-/// errors (and completes at least one record when the probe spans an LF or reaches EOF).
+/// Validate a candidate interior record boundary by running `EncodedScanner` (`in_quote = false`)
+/// over a bounded forward probe. When `stop_after_offset` is `Some(req_end)`, validation stops as
+/// soon as a record closes at or past `req_end` so unrelated malformed CSV after the requested
+/// section never rejects a valid start candidate.
 fn validate_speculative_candidate(
     file: &File,
     file_size: u64,
     candidate: u64,
+    stop_after_offset: Option<u64>,
     delimiter: u8,
     encoding: Encoding,
 ) -> Result<bool, QuarryError> {
@@ -1455,6 +1500,57 @@ fn validate_speculative_candidate(
     }
     let mut scanner = EncodedScanner::<false>::at_offset(delimiter, candidate, encoding)?;
     let mut records = 0u64;
+    let mut stopped_early = false;
+    if let Some(target_end) = stop_after_offset {
+        let scan_target = align_up_code_unit(target_end, file_size, encoding);
+        let mut pos = 0usize;
+        while pos < probe_len && !stopped_early {
+            let abs = candidate + pos as u64;
+            let step_end = if abs < scan_target {
+                let want = (scan_target - abs) as usize;
+                let clamped = want.min(probe_len - pos);
+                if encoding.is_utf16() && pos + clamped < probe_len {
+                    pos + (clamped & !1).max(2).min(probe_len - pos)
+                } else {
+                    pos + clamped
+                }
+            } else {
+                find_first_lf_end(&buf[pos..probe_len], abs, encoding)
+                    .map(|end_abs| (end_abs - candidate) as usize)
+                    .unwrap_or(probe_len)
+                    .min(probe_len)
+            };
+            if step_end <= pos {
+                break;
+            }
+            if scanner
+                .scan_chunk(&buf[pos..step_end], abs, |record_end| {
+                    records += 1;
+                    if record_end >= target_end {
+                        stopped_early = true;
+                    }
+                })
+                .is_err()
+            {
+                return Ok(false);
+            }
+            pos = step_end;
+        }
+        if stopped_early {
+            return Ok(true);
+        }
+        if candidate + (pos as u64) == file_size
+            && scanner
+                .finish(file_size, |_| {
+                    records += 1;
+                })
+                .is_err()
+        {
+            return Ok(false);
+        }
+        return Ok(records > 0 || candidate + (pos as u64) < file_size);
+    }
+
     if scanner
         .scan_chunk(&buf, candidate, |_| {
             records += 1;
@@ -1503,7 +1599,14 @@ fn snap_speculative_window(
         let candidates = collect_backward_lf_boundaries(&buf, probe_start, encoding, 16);
         let mut chosen = None;
         for candidate in candidates {
-            if validate_speculative_candidate(file, file_size, candidate, delimiter, encoding)? {
+            if validate_speculative_candidate(
+                file,
+                file_size,
+                candidate,
+                Some(req_end),
+                delimiter,
+                encoding,
+            )? {
                 chosen = Some(candidate);
                 break;
             }
@@ -1604,7 +1707,9 @@ fn snap_speculative_window(
             let n = read_at_exact_or_eof(file, req_end - unit_len, &mut prev[..unit_len as usize])?;
             n == unit_len as usize
                 && is_lf_unit(&prev[..unit_len as usize], encoding)
-                && validate_speculative_candidate(file, file_size, req_end, delimiter, encoding)?
+                && validate_speculative_candidate(
+                    file, file_size, req_end, None, delimiter, encoding,
+                )?
         } else {
             false
         };
@@ -1625,26 +1730,39 @@ fn snap_speculative_window(
             }
             // Validate candidate LF boundaries with `validate_speculative_candidate` so an LF
             // inside a multiline quoted field is never silently accepted as the section end.
+            // If an earlier candidate `< file_size` failed suffix validation, never fall through
+            // to blindly accepting `candidate == file_size` (which would swallow a malformed
+            // trailing record into the section); report boundary-not-found so the user can run a
+            // counted scan instead.
             let candidates = collect_forward_lf_boundaries(&buf, probe_start, encoding, 16);
             let mut chosen = None;
+            let mut saw_rejected_earlier_lf = false;
             for candidate in candidates {
                 if candidate < req_end {
                     continue;
                 }
-                if validate_speculative_candidate(file, file_size, candidate, delimiter, encoding)?
-                {
+                if candidate == file_size {
+                    if !saw_rejected_earlier_lf {
+                        chosen = Some(file_size);
+                    }
+                    break;
+                }
+                if validate_speculative_candidate(
+                    file, file_size, candidate, None, delimiter, encoding,
+                )? {
                     chosen = Some(candidate);
                     break;
                 }
+                saw_rejected_earlier_lf = true;
             }
             if let Some(boundary) = chosen {
                 boundary
-            } else if probe_start + probe_len as u64 >= file_size {
+            } else if !saw_rejected_earlier_lf && probe_start + probe_len as u64 >= file_size {
                 file_size
             } else {
                 return Err(boundary_not_found(
                     search_cap,
-                    "Could not find a valid speculative record end within the 1 MiB alignment window.",
+                    "Could not verify a clean record end within the 1 MiB alignment window; use a counted scan or smaller section.",
                 ));
             }
         }
@@ -1669,9 +1787,9 @@ pub(crate) fn read_header_probe_rows(
     wanted: usize,
     limit: usize,
     encoding: Encoding,
-) -> Result<(Vec<Row>, u64), QuarryError> {
+) -> Result<(Vec<Row>, u64, bool), QuarryError> {
     if file_size == 0 || wanted == 0 {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, file_size == 0));
     }
     let max_bytes = file_size.min(limit as u64);
     let mut scanner = EncodedScanner::<false>::at_offset(delimiter, 0, encoding)?;
@@ -1776,7 +1894,7 @@ pub(crate) fn read_header_probe_rows(
         }
     }
 
-    Ok((rows, cursor))
+    Ok((rows, cursor, cursor >= file_size))
 }
 
 /// Materialize initial rows strictly from `[section_start, section_end)` using positional `pread`
@@ -2920,5 +3038,178 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.first_rows[0].fields[0], "\u{FEFF}keep".as_bytes());
+    }
+
+    #[test]
+    fn speculative_start_candidate_header_budget_preserved_framing_and_cross_file_index_guards() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Speculative interior section start validation must stop at closing record covering
+        // `req_end` and not be rejected by unrelated malformed CSV after the section.
+        let path_spec = dir.path().join("spec-trailing-malformed.csv");
+        let mut raw = Vec::with_capacity(1_200_100);
+        for _ in 0..300_000 {
+            raw.extend_from_slice(b"a,b\n");
+        }
+        let sec_start = raw.len() as u64;
+        raw.extend_from_slice(b"c,d\n");
+        let sec_end = raw.len() as u64;
+        raw.extend_from_slice(b"bad\"quote,x\n");
+        fs::write(&path_spec, &raw).unwrap();
+
+        let sec = Session::open_section(
+            &path_spec,
+            ByteWindow::from_range(sec_start, sec_end).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sec.section_bounds().unwrap().snapped.base, sec_start);
+        assert_eq!(sec.section_bounds().unwrap().snapped_end(), sec_end);
+
+        // 2. Exhausting bootstrap_limit during FirstRow/Auto header probe returns BootstrapLimitExceeded.
+        let path_hdr = dir.path().join("short-budget-header.csv");
+        fs::write(&path_hdr, b"header\nx\n").unwrap();
+        for mode in [HeaderMode::FirstRow, HeaderMode::Auto] {
+            let err = Session::open_section(
+                &path_hdr,
+                ByteWindow::from_range(7, 9).unwrap(),
+                SectionOpenOptions {
+                    open: OpenOptions {
+                        delimiter: Some(b','),
+                        header_mode: mode,
+                        sample_bytes: 4,
+                        bootstrap_limit: 4,
+                        ..OpenOptions::default()
+                    },
+                    ..SectionOpenOptions::default()
+                },
+            );
+            assert!(
+                matches!(
+                    err,
+                    Err(QuarryError::BootstrapLimitExceeded { limit: 4, .. })
+                ),
+                "expected BootstrapLimitExceeded for {mode:?}, got {err:?}"
+            );
+        }
+
+        // 3. Same-range index from a different file must be rejected by both read_rows and start_search.
+        let path_a = dir.path().join("same-range-a.csv");
+        let path_b = dir.path().join("same-range-b.csv");
+        fs::write(&path_a, b"a\nb\nc\n").unwrap();
+        fs::write(&path_b, b"a\nxyz\n").unwrap();
+        let sa = Session::open_section(
+            &path_a,
+            ByteWindow::from_range(2, 6).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let sb = Session::open_section(
+            &path_b,
+            ByteWindow::from_range(2, 6).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let idx_a = sa
+            .start_indexing(crate::IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            sb.read_rows(&idx_a, 0, 5),
+            Err(QuarryError::InvalidOption(_))
+        ));
+        assert!(matches!(
+            sb.start_search(
+                &idx_a,
+                b"z".to_vec(),
+                crate::SearchPosition { row: 0, column: 0 }
+            ),
+            Err(QuarryError::InvalidOption(_))
+        ));
+
+        // 4. Section filtered export excludes synthesized header from rows_written and rejects OOB edits.
+        let path_exp = dir.path().join("sec-exp-count.csv");
+        fs::write(&path_exp, b"id,v\n1,ok\n").unwrap();
+        let se = Session::open_section(
+            &path_exp,
+            ByteWindow::from_range(5, 10).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let no_match = crate::FilterQuery {
+            predicates: vec![crate::FilterPredicate {
+                column: 1,
+                operator: crate::FilterOperator::Equals,
+                value: "missing".into(),
+                upper_bound: None,
+            }],
+            case_sensitivity: crate::CaseSensitivity::Sensitive,
+        };
+        let out_zero = dir.path().join("sec-exp-zero.csv");
+        match se
+            .start_filtered_export_with_edits(
+                no_match.clone(),
+                Arc::default(),
+                BTreeMap::new(),
+                &out_zero,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        {
+            crate::FilterExportOutcome::Complete(summary) => {
+                assert_eq!(
+                    summary.rows_written, 0,
+                    "synthesized header must not be counted in rows_written"
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        let mut oob_edits = BTreeMap::new();
+        oob_edits.insert((1u64, 0usize), Arc::new(b"bad".to_vec()));
+        let out_oob = dir.path().join("sec-exp-oob.csv");
+        let oob_res = se
+            .start_filtered_export_with_edits(
+                no_match,
+                Arc::new(oob_edits),
+                BTreeMap::new(),
+                &out_oob,
+            )
+            .unwrap()
+            .wait();
+        assert!(
+            matches!(oob_res, Err(QuarryError::InvalidOption(_))),
+            "out-of-range cell edit on section filtered export must be rejected, got {oob_res:?}"
+        );
+        assert!(!out_oob.exists());
     }
 }
