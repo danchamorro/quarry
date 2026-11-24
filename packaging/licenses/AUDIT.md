@@ -314,10 +314,11 @@ SHA-256 `ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e`).
   shipping app graph). `gpui-kit-assets@0.10.0` embeds the default 101 Lucide
   SVG component icons; its locked `gpui-kit-assets@0.10.0/LICENSE-LUCIDE`
   notice is preserved and hash-verified in `supplemental.json`.
-- **Supplemental notice coverage (`supplemental.json`):** Updated to 33
+- **Supplemental notice coverage (`supplemental.json`):** Updated to 37
   hash-verified records covering every `cargo-about` fallback crate in
   `quarry-gpui` (`gpui-kit`, `gpui-kit-assets`, `ryu`, `exr`, `chrono`,
-  `granit-parser`, `libm`, `accesskit@0.24.1`, `accesskit_consumer@0.38.0`,
+  `granit-parser` including all four inherited `.licenses/{ChenYuheng,Ethiraric}-{Apache,MIT}` files,
+  `libm`, `accesskit@0.24.1`, `accesskit_consumer@0.38.0`,
   `accesskit_macos@0.26.3`, the `objc2`/`block2`/`dispatch2`/`objc-sys` family
   with `Zlib` selected where offered, `lyon*`, `mac`, `pathfinder_*`,
   `profiling*`, `rust-i18n-*`, `seahash`, `svg_fmt`, `taffy`, `zune-inflate`)

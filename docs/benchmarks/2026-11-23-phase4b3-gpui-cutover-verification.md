@@ -53,7 +53,7 @@ Audited exceptions (retained per ADR 0013): `gpui-pre-http-client` (pure traits 
 
 - Regenerated `packaging/licenses/{THIRD_PARTY_NOTICES.html, manifest.json, reviewed.sha256, AUDIT.md}` directly from `apps/quarry-gpui/Cargo.toml` with checksum-verified `cargo-about 0.9.2` (`SHA-256: ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e`) for **`397` locked packages** (`aarch64-apple-darwin`, Rust `1.100.0`).
 - Expanded `packaging/licenses/about.toml` with the 5 pre-audited OSI licenses (`0BSD`, `BSD-2-Clause`, `BSD-3-Clause`, `CC0-1.0`, `MPL-2.0`; zero GPL/LGPL/AGPL/non-OSI crates).
-- Rebuilt `packaging/licenses/supplemental.json` with **33** hash-verified notices covering every `cargo-about` fallback crate plus `gpui-kit-assets@0.10.0/LICENSE-LUCIDE` (`SHA-256: b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57`) and crate `COPYRIGHT` files (`rustix`, `unicode-segmentation`, `utf8_iter`), with zero bundled runtime fonts.
+- Rebuilt `packaging/licenses/supplemental.json` with **37** hash-verified notices covering every `cargo-about` fallback crate (including `granit-parser@1.3.0`'s four inherited `.licenses/{ChenYuheng,Ethiraric}-{Apache,MIT}` files), `gpui-kit-assets@0.10.0/LICENSE-LUCIDE` (`SHA-256: b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57`), and crate `COPYRIGHT` files (`rustix`, `unicode-segmentation`, `utf8_iter`), with zero bundled runtime fonts.
 - Verification: `./scripts/generate-notices.sh --check --target aarch64-apple-darwin --rust-release 1.100.0`, `./scripts/generate-notices.sh --release-check`, and `python3 -m unittest packaging/licenses/test_generate.py` (`17/17` tests) all passed.
 
 ---
