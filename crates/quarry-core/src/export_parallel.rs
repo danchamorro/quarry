@@ -191,6 +191,7 @@ fn format_export_slice_from_field_start(
             decoded_bytes,
             delimiter,
             row,
+            row == 0,
             query,
             matchers,
             groups,

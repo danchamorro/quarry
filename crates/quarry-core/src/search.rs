@@ -15,7 +15,7 @@ use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
 use crate::source_stamp::SourceStamp;
 use crate::{
     CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError,
-    Session, StructuralIndex, parse_encoded_record,
+    Session, StructuralIndex,
 };
 
 const DEFAULT_SEARCH_STRIPE_BYTES: u64 = 2 * 1024 * 1024;
@@ -1530,7 +1530,8 @@ fn find_record(
     encoding: Encoding,
 ) -> Result<Option<SearchMatch>, QuarryError> {
     let first_column = if row == start.row { start.column } else { 0 };
-    let fields = parse_encoded_record(record, delimiter, row, encoding)?;
+    let fields =
+        crate::parse_encoded_record_with_bom(record, delimiter, row, record_offset == 0, encoding)?;
     Ok(fields
         .iter()
         .enumerate()

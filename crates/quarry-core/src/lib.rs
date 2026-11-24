@@ -139,21 +139,6 @@ const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
 const DEFAULT_BOOTSTRAP_LIMIT: usize = 64 * 1024 * 1024;
 const DEFAULT_READ_CHUNK: usize = 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
-const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
-
-pub(crate) fn parse_source_record(
-    record: &[u8],
-    delimiter: u8,
-    physical_row: u64,
-) -> Result<Vec<Cow<'_, [u8]>>, ParseError> {
-    let record = if physical_row == 0 {
-        record.strip_prefix(UTF8_BOM).unwrap_or(record)
-    } else {
-        record
-    };
-    parse_record(record, delimiter)
-}
-
 /// Parses native record bytes and wraps record-local decoding failures with their logical record.
 pub(crate) fn parse_encoded_record(
     record: &[u8],
@@ -161,14 +146,26 @@ pub(crate) fn parse_encoded_record(
     physical_row: u64,
     encoding: Encoding,
 ) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
-    if encoding == Encoding::Utf8 {
-        return parse_source_record(record, delimiter, physical_row).map_err(Into::into);
-    }
-    let body = if physical_row == 0 {
+    parse_encoded_record_with_bom(record, delimiter, physical_row, physical_row == 0, encoding)
+}
+
+/// Parses native record bytes with explicit control over whether a leading BOM should be stripped
+/// (only true for a record starting at byte 0 of the source file, never for interior sections).
+pub(crate) fn parse_encoded_record_with_bom(
+    record: &[u8],
+    delimiter: u8,
+    physical_row: u64,
+    strip_bom: bool,
+    encoding: Encoding,
+) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
+    let body = if strip_bom {
         encoding.strip_bom(record).1
     } else {
         record
     };
+    if encoding == Encoding::Utf8 {
+        return parse_record(body, delimiter).map_err(Into::into);
+    }
     let decoded = encoding
         .decode(body, DEFAULT_MAX_RECORD_BYTES)
         .map_err(|error| record_encoding_error(physical_row.saturating_add(1), error))?;

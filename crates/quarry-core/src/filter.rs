@@ -24,7 +24,7 @@ use crate::sort::numeric_key;
 use crate::source_stamp::SourceStamp;
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
-    parse_encoded_record,
+    parse_encoded_record_with_bom,
 };
 
 /// Immutable sparse working values, keyed by physical source row and column.
@@ -1034,13 +1034,15 @@ pub(crate) fn matching_fields_with_edits<'a>(
     record: &'a [u8],
     delimiter: u8,
     physical_row: u64,
+    strip_bom: bool,
     query: &FilterQuery,
     matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
     edits: &FilterEdits,
     encoding: Encoding,
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
-    let fields = parse_encoded_record(record, delimiter, physical_row, encoding)?;
+    let fields =
+        parse_encoded_record_with_bom(record, delimiter, physical_row, strip_bom, encoding)?;
     if edits
         .range((physical_row, 0)..=(physical_row, usize::MAX))
         .next_back()
@@ -1099,6 +1101,7 @@ pub(crate) fn record_matches_fast(
     record: &[u8],
     delimiter: u8,
     physical_row: u64,
+    strip_bom: bool,
     query: &FilterQuery,
     matchers: &[PredicateMatcher<'_>],
     groups: &[Vec<usize>],
@@ -1117,6 +1120,7 @@ pub(crate) fn record_matches_fast(
             record,
             delimiter,
             physical_row,
+            strip_bom,
             query,
             matchers,
             groups,
@@ -1126,7 +1130,7 @@ pub(crate) fn record_matches_fast(
         .is_some());
     }
 
-    let body = if physical_row == 0 {
+    let body = if strip_bom {
         record.strip_prefix(UTF8_BOM).unwrap_or(record)
     } else {
         record
@@ -1260,6 +1264,7 @@ fn run_filter(
                             &record,
                             delimiter,
                             row_number,
+                            record_start == 0,
                             query,
                             &matchers,
                             &groups,
@@ -1328,6 +1333,7 @@ fn run_filter(
                                 rec,
                                 delimiter,
                                 row_number,
+                                record_start == 0,
                                 query,
                                 &matchers,
                                 &groups,
@@ -1357,6 +1363,7 @@ fn run_filter(
                                 &record,
                                 delimiter,
                                 row_number,
+                                record_start == 0,
                                 query,
                                 &matchers,
                                 &groups,
@@ -1516,10 +1523,6 @@ fn eval_filter_slice_from_field_start(
     let mut record_start = slice_start;
     let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
     let mut deferred_error: Option<QuarryError> = None;
-    // Only record 0 at byte offset 0 may strip a file-leading UTF-8 BOM. Speculative workers
-    // scanning non-initial chunks with `base_row == 0` use a non-zero synthetic row so leading
-    // U+FEFF bytes stay literal cell data; exact edit re-evaluations already pass `base_row > 0`.
-    let bom_row_offset: u64 = u64::from(slice_start != 0 && base_row == 0);
 
     let mut offset = 0usize;
     while offset < buf.len() {
@@ -1545,7 +1548,8 @@ fn eval_filter_slice_from_field_start(
                             match record_matches_fast(
                                 &buf[s..e],
                                 delimiter,
-                                row.saturating_add(bom_row_offset),
+                                row,
+                                record_start == 0,
                                 query,
                                 matchers,
                                 groups,
@@ -1556,19 +1560,7 @@ fn eval_filter_slice_from_field_start(
                             ) {
                                 Ok(true) => matches.push((local_row, record_start)),
                                 Ok(false) => {}
-                                Err(err) => {
-                                    deferred_error = Some(match err {
-                                        QuarryError::RecordEncoding { record, cause }
-                                            if bom_row_offset != 0 =>
-                                        {
-                                            QuarryError::RecordEncoding {
-                                                record: record.saturating_sub(bom_row_offset),
-                                                cause,
-                                            }
-                                        }
-                                        other => other,
-                                    });
-                                }
+                                Err(err) => deferred_error = Some(err),
                             }
                         }
                     }
@@ -1602,7 +1594,8 @@ fn eval_filter_slice_from_field_start(
                         match record_matches_fast(
                             rec,
                             delimiter,
-                            row.saturating_add(bom_row_offset),
+                            row,
+                            record_start == 0,
                             query,
                             matchers,
                             groups,
@@ -1613,19 +1606,7 @@ fn eval_filter_slice_from_field_start(
                         ) {
                             Ok(true) => matches.push((local_row, record_start)),
                             Ok(false) => {}
-                            Err(err) => {
-                                deferred_error = Some(match err {
-                                    QuarryError::RecordEncoding { record, cause }
-                                        if bom_row_offset != 0 =>
-                                    {
-                                        QuarryError::RecordEncoding {
-                                            record: record.saturating_sub(bom_row_offset),
-                                            cause,
-                                        }
-                                    }
-                                    other => other,
-                                });
-                            }
+                            Err(err) => deferred_error = Some(err),
                         }
                     }
                 }
@@ -1960,6 +1941,7 @@ impl FilterMergeState {
                             &rec,
                             delimiter,
                             row,
+                            self.open_record_start == 0,
                             query,
                             matchers,
                             groups,
@@ -2137,6 +2119,7 @@ fn scan_filter_giant_line_sequential(
                                 &buf[s..e],
                                 delimiter,
                                 row,
+                                record_start == 0,
                                 query,
                                 matchers,
                                 groups,
@@ -2152,6 +2135,7 @@ fn scan_filter_giant_line_sequential(
                                     &stitched,
                                     delimiter,
                                     row,
+                                    record_start == 0,
                                     query,
                                     matchers,
                                     groups,
@@ -2205,6 +2189,7 @@ fn scan_filter_giant_line_sequential(
                     &stitched,
                     delimiter,
                     row,
+                    record_start == 0,
                     query,
                     matchers,
                     groups,
@@ -2743,6 +2728,7 @@ fn run_filtered_read(
                     &record,
                     delimiter,
                     row_number,
+                    record_start == 0,
                     &plan.query,
                     &matchers,
                     &groups,
@@ -2785,6 +2771,7 @@ fn run_filtered_read(
                             &record,
                             delimiter,
                             row_number,
+                            record_start == 0,
                             &plan.query,
                             &matchers,
                             &groups,

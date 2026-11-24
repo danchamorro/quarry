@@ -803,6 +803,7 @@ fn run_verify_boundary(
     let chunk_size = ctx.encoding.chunk_size(256 * 1024);
     let mut chunk = vec![0u8; chunk_size];
     let mut aligned_end: Option<u64> = None;
+    let scan_target_end = align_up_code_unit(req_end, ctx.file_size, ctx.encoding);
 
     advise_readahead(
         file,
@@ -844,14 +845,37 @@ fn run_verify_boundary(
             break;
         }
 
-        let want = (ctx.file_size - cursor).min(chunk.len() as u64) as usize;
+        // Read up to `scan_target_end` first, then advance past `req_end` in bounded slices
+        // truncated at the first encoding-aligned LF so malformed CSV after the closing record
+        // boundary in the same 256 KiB chunk cannot invalidate a valid section's proof.
+        let step_cap = if cursor < scan_target_end {
+            (scan_target_end - cursor).min(chunk.len() as u64) as usize
+        } else {
+            (ctx.file_size - cursor).min(4096).min(chunk.len() as u64) as usize
+        };
+        let want = if ctx.encoding.is_utf16() && cursor + (step_cap as u64) < ctx.file_size {
+            step_cap & !1
+        } else {
+            step_cap
+        };
+        if want == 0 {
+            break;
+        }
         let read = read_at_exact_or_eof(file, cursor, &mut chunk[..want])?;
         if read < want {
             return Err(QuarryError::SourceChanged);
         }
+        let scan_slice = if cursor >= scan_target_end {
+            let first_lf = find_first_lf_end(&chunk[..read], cursor, ctx.encoding)
+                .map(|abs| (abs - cursor) as usize)
+                .unwrap_or(read);
+            &chunk[..first_lf.min(read)]
+        } else {
+            &chunk[..read]
+        };
 
         let mut reached_target = false;
-        scanner.scan_chunk(&chunk[..read], cursor, |record_end| {
+        scanner.scan_chunk(scan_slice, cursor, |record_end| {
             observe_record_for_bounds(
                 record_start,
                 record_end,
@@ -869,7 +893,7 @@ fn run_verify_boundary(
             }
         })?;
 
-        cursor += read as u64;
+        cursor += scan_slice.len() as u64;
         shared.bytes_scanned.store(
             cursor.saturating_sub(ctx.start_checkpoint.offset),
             Ordering::Release,
@@ -1685,7 +1709,13 @@ pub(crate) fn read_section_initial_rows(
                         limit: DEFAULT_MAX_RECORD_BYTES,
                     });
                 } else {
-                    match crate::parse_encoded_record(&record, delimiter, physical_row, encoding) {
+                    match crate::parse_encoded_record_with_bom(
+                        &record,
+                        delimiter,
+                        physical_row,
+                        record_start == 0,
+                        encoding,
+                    ) {
                         Ok(fields) => {
                             rows.push(Row {
                                 offset: record_start,
@@ -1722,10 +1752,16 @@ pub(crate) fn read_section_initial_rows(
             finished = true;
         })?;
         if finished {
-            let fields = crate::parse_encoded_record(&record, delimiter, physical_row, encoding)?
-                .into_iter()
-                .map(|f| f.into_owned())
-                .collect();
+            let fields = crate::parse_encoded_record_with_bom(
+                &record,
+                delimiter,
+                physical_row,
+                record_start == 0,
+                encoding,
+            )?
+            .into_iter()
+            .map(|f| f.into_owned())
+            .collect();
             rows.push(Row {
                 offset: record_start,
                 fields,
@@ -2601,5 +2637,139 @@ mod tests {
             ),
             "read_filtered_rows must reject a FilterIndex from another section"
         );
+    }
+
+    #[test]
+    fn background_verify_stops_before_trailing_malformed_csv_in_same_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify-trailing-malformed.csv");
+        let mut raw = b"a,b\nc,d\n".to_vec();
+        for i in 0..5000u64 {
+            raw.extend_from_slice(format!("{i:05},valid_padding_row\n").as_bytes());
+        }
+        raw.extend_from_slice(b"bad\"quote,x\n");
+        fs::write(&path, &raw).unwrap();
+
+        // Open interior `[4, 8)` (`c,d\n`) as Speculative (`a,b\n` precedes it, no parent index),
+        // then run VerifyBoundaryJob: must stop at byte 8 and succeed without touching `bad"quote`.
+        let sec = Session::open_section(
+            &path,
+            ByteWindow::from_range(4, 8).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sec.section_bounds().unwrap().trust,
+            BoundaryTrust::Speculative
+        );
+
+        let outcome = sec
+            .start_verify_section_boundary(None)
+            .unwrap()
+            .wait()
+            .unwrap();
+        match outcome {
+            VerifyBoundaryOutcome::Verified {
+                bounds,
+                boundary_changed,
+            } => {
+                assert!(!boundary_changed);
+                assert_eq!(bounds.snapped.base, 4);
+                assert_eq!(bounds.snapped_end(), 8);
+                assert_eq!(bounds.first_global_row(), Some(1));
+            }
+            other => panic!("expected Verified outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interior_section_preserves_literal_leading_feff_across_bootstrap_filter_search_and_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interior-literal-feff.csv");
+        let raw = "a,b\n\u{FEFF}keep,x\nlast,y\n".as_bytes();
+        fs::write(&path, raw).unwrap();
+
+        let sec_start = b"a,b\n".len() as u64;
+        let sec_end = sec_start + "\u{FEFF}keep,x\n".len() as u64;
+        let sec = Session::open_section(
+            &path,
+            ByteWindow::from_range(sec_start, sec_end).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        // 1. Bootstrap first_rows keeps literal U+FEFF.
+        assert_eq!(sec.first_rows.len(), 1);
+        assert_eq!(sec.first_rows[0].fields[0], "\u{FEFF}keep".as_bytes());
+
+        // 2. Indexed read_rows and Search keep literal U+FEFF.
+        let idx = sec
+            .start_indexing(crate::IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let rows = sec.read_rows(&idx, 0, 5).unwrap();
+        assert_eq!(rows[0].fields[0], "\u{FEFF}keep".as_bytes());
+        let search = sec
+            .start_search(
+                &idx,
+                "\u{FEFF}keep".as_bytes().to_vec(),
+                crate::SearchPosition { row: 0, column: 0 },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(search, crate::SearchOutcome::Match(_)));
+
+        // 3. Filter Equals("\u{FEFF}keep") matches, read_filtered_rows keeps it, and filtered export keeps it.
+        let query = crate::FilterQuery {
+            predicates: vec![crate::FilterPredicate {
+                column: 0,
+                operator: crate::FilterOperator::Equals,
+                value: "\u{FEFF}keep".into(),
+                upper_bound: None,
+            }],
+            case_sensitivity: crate::CaseSensitivity::Sensitive,
+        };
+        let f_idx = sec
+            .start_filter_with_edits(query.clone(), Arc::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(f_idx.matches_found(), 1);
+        let f_rows = sec.read_filtered_rows(&f_idx, 0, 5).unwrap();
+        assert_eq!(f_rows[0].fields[0], "\u{FEFF}keep".as_bytes());
+
+        let out_path = dir.path().join("interior-feff-filtered.csv");
+        let outcome = sec
+            .start_filtered_export_with_edits(query, Arc::default(), BTreeMap::new(), &out_path)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(outcome, crate::FilterExportOutcome::Complete(_)));
+        let reopened = Session::open(
+            &out_path,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.first_rows[0].fields[0], "\u{FEFF}keep".as_bytes());
     }
 }

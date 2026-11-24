@@ -3767,6 +3767,7 @@ fn run_section_filtered_export(
                             if let Err(err) = process_record(
                                 rec,
                                 local_row,
+                                section_base == 0 && local_row == 0,
                                 data_start,
                                 delimiter,
                                 query,
@@ -3822,6 +3823,7 @@ fn run_section_filtered_export(
                 process_record(
                     &record,
                     local_row,
+                    section_base == 0 && local_row == 0,
                     data_start,
                     delimiter,
                     query,
@@ -6363,6 +6365,7 @@ fn scan_export(
                 } else if let Err(error) = process_record(
                     &record,
                     row_number,
+                    row_number == 0,
                     data_start,
                     delimiter,
                     query,
@@ -6434,6 +6437,7 @@ fn scan_export(
                     if let Err(error) = process_record(
                         &record,
                         row_number,
+                        row_number == 0,
                         data_start,
                         delimiter,
                         query,
@@ -6484,6 +6488,7 @@ fn scan_export(
 fn process_record(
     record: &[u8],
     row_number: u64,
+    record_at_file_start: bool,
     data_start: u64,
     delimiter: u8,
     query: &FilterQuery,
@@ -6512,6 +6517,7 @@ fn process_record(
             record,
             delimiter,
             row_number,
+            record_at_file_start,
             query,
             matchers,
             groups,
@@ -6522,7 +6528,8 @@ fn process_record(
     {
         // A later source row may become the first output record. Its leading
         // U+FEFF is data, even if the source's first record was filtered out.
-        let guard_first = *bytes_written == 0 && !(row_number == 0 && record.starts_with(UTF8_BOM));
+        let guard_first =
+            *bytes_written == 0 && !(record_at_file_start && record.starts_with(UTF8_BOM));
         if guard_first {
             output.begin_first_record_bom_guard(source_had_bom);
         }
@@ -6544,7 +6551,11 @@ fn process_record(
                         .get(&(row_number, column))
                         .map(|value| value.as_slice())
                 },
-                Some(row_number),
+                Some(if record_at_file_start {
+                    0
+                } else {
+                    row_number.max(1)
+                }),
                 max_record_bytes,
             )?
         } else {
