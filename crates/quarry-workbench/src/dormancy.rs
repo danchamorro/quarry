@@ -2189,7 +2189,7 @@ impl WorkbenchScheduler {
         // For section tabs, stay bounded to the section window instead of opening the whole parent.
         // Core resolves Auto encoding/delimiter first and only reuses `prev_bounds` when both the
         // file guard AND resolved `(delimiter, encoding)` match; otherwise it re-snaps `requested`.
-        let mut replacement = if let Some((
+        let (mut replacement, source_reloaded) = if let Some((
             prev_bounds,
             quote_free_confirmed,
             prev_guard,
@@ -2213,16 +2213,20 @@ impl WorkbenchScheduler {
                 prev_encoding,
                 sec_opts.clone(),
             ) {
-                Ok(doc) => doc,
-                Err(quarry_core::QuarryError::SourceChanged) => {
+                Ok(doc) => (doc, false),
+                Err(quarry_core::QuarryError::SourceChanged) => (
                     Document::prepare_section(&path, prev_bounds.requested, sec_opts)
-                        .map_err(SchedulerError::OpenFailed)?
-                }
+                        .map_err(SchedulerError::OpenFailed)?,
+                    true,
+                ),
                 Err(err) => return Err(SchedulerError::OpenFailed(err.to_string())),
             }
         } else {
-            Document::prepare_with_encoding(&path, options, encoding)
-                .map_err(SchedulerError::OpenFailed)?
+            (
+                Document::prepare_with_encoding(&path, options, encoding)
+                    .map_err(SchedulerError::OpenFailed)?,
+                false,
+            )
         };
         if replacement.is_compressed() && !self.write_slot_available() {
             replacement.shutdown();
@@ -2301,31 +2305,36 @@ impl WorkbenchScheduler {
             let old_notice = slot.tab.notice.take();
             let old_footer_status = slot.tab.footer_status.take();
             let new_residency = if let Some(sec_spec) = replacement_section {
-                let (view, old_bounds) = match &slot.residency {
+                let view = match &slot.residency {
                     SlotResidency::Dormant(dormant) => {
-                        let prev_bounds = match &dormant.kind {
+                        let (prev_bounds, prev_delimiter, prev_encoding) = match &dormant.kind {
                             DormantKind::CleanPlain {
                                 section: Some(s), ..
-                            } => Some(s.bounds),
-                            DormantKind::Dirty(d) => d
-                                .verified_bounds_override
-                                .or_else(|| d.session.section_bounds()),
-                            _ => None,
+                            } => (Some(s.bounds), Some(s.delimiter), Some(s.encoding)),
+                            DormantKind::Dirty(d) => (
+                                d.verified_bounds_override
+                                    .or_else(|| d.session.section_bounds()),
+                                Some(d.session.dialect.delimiter),
+                                Some(d.session.encoding()),
+                            ),
+                            _ => (None, None, None),
                         };
-                        let format_changed = old_header_mode != options.header_mode
+                        let format_changed = source_reloaded
+                            || dormant.source_changed
+                            || old_header_mode != options.header_mode
                             || old_encoding_mode != encoding
                             || dormant.view.data_start != replacement_view.data_start
-                            || prev_bounds.map(|b| b.snapped) != Some(sec_spec.bounds.snapped);
-                        let chosen_view = if format_changed {
+                            || prev_bounds.map(|b| b.snapped) != Some(sec_spec.bounds.snapped)
+                            || prev_delimiter != Some(sec_spec.delimiter)
+                            || prev_encoding != Some(sec_spec.encoding);
+                        if format_changed {
                             replacement_view.clone()
                         } else {
                             dormant.view.clone()
-                        };
-                        (chosen_view, prev_bounds)
+                        }
                     }
-                    _ => (replacement_view.clone(), None),
+                    _ => replacement_view.clone(),
                 };
-                let _ = old_bounds;
                 SlotResidency::Dormant(Box::new(DormantDocument {
                     logical_path: path.clone(),
                     canonical_path: canonical_path.clone(),

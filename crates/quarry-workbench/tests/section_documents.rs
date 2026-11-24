@@ -772,3 +772,83 @@ fn dormant_section_reopen_resets_row_coordinates_when_header_mode_changes() {
     let _ = fs::remove_file(&path1);
     let _ = fs::remove_file(&path2);
 }
+
+#[test]
+fn dormant_section_reopen_tab_resets_view_when_delimiter_changes() {
+    let path1 = temp_csv("dormant-reopen-delim", b"a;b\n1;2\n");
+    let path2 = temp_csv("dormant-reopen-delim-evictor", b"x,y\n1,2\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path1.clone(),
+            ByteWindow::from_range(0, 8).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b';'),
+                    header_mode: quarry_core::HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+    {
+        let doc = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+        assert_eq!(doc.total_columns, 2);
+        assert_eq!(doc.headers, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // Evict section to dormancy, then reopen with comma delimiter (same header mode,
+    // encoding, data_start, and snapped bounds).
+    let _ = scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path2.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        scheduler.residency(sec_id),
+        Some(ResidencyState::DormantClean)
+    );
+
+    let _ = scheduler
+        .reopen_tab(
+            WindowId::PRIMARY,
+            sec_id,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: quarry_core::HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+    wait_for_index(&mut scheduler, sec_id);
+    let doc = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+    assert!(doc.is_section());
+    assert_eq!(
+        doc.total_columns, 1,
+        "reopening a dormant section with a different delimiter must reset stale column count"
+    );
+    assert_eq!(
+        doc.headers,
+        vec!["a;b".to_string()],
+        "reopening a dormant section with a different delimiter must reset stale headers"
+    );
+
+    let _ = fs::remove_file(&path1);
+    let _ = fs::remove_file(&path2);
+}
