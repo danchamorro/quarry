@@ -773,7 +773,7 @@ impl QuarryWindow {
                                             cx.prompt_for_new_path(&directory, Some(&name));
                                         let save_weak = save_weak.clone();
                                         let controller_save = controller_save.clone();
-                                        cx.spawn_in(window, async move |_, cx| {
+                                        cx.spawn(async move |cx| {
                                             let selection = selection.await;
                                             let _ = save_weak.update(cx, |this, cx| {
                                                 this.confirming = false;

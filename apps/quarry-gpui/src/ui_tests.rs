@@ -3267,10 +3267,11 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
     });
     wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
         close_save_path.exists()
-            && !controller
+            && controller
                 .read(cx)
                 .tabs_for_window(win_id)
-                .contains(&dirty_sec_id)
+                .iter()
+                .all(|tab| tab.document_id != dirty_sec_id)
     });
     let close_saved = std::fs::read_to_string(&close_save_path).unwrap();
     assert!(close_saved.starts_with("edited_id,payload\n"));
