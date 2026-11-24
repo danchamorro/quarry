@@ -1,28 +1,30 @@
 # Quarry Design Guide
 
 This guide covers how Quarry looks and behaves on screen. Follow it when you add
-or change any UI in `apps/quarry-egui`. It explains where things go and which
+or change any UI in `apps/quarry-gpui` or semantic palette tokens in
+`crates/quarry-workbench/src/theme.rs`. It explains where things go and which
 shared pieces to use, so new features look like they belong.
 
 The code is the source of truth for exact values:
 
 | File | Owns |
 |---|---|
-| `src/theme.rs` | Palettes, fonts, widget styling, shared components |
-| `src/icons.rs` | Toolbar icons, drawn with the painter |
-| `src/menu.rs` | The native macOS menu bar |
-| `src/main.rs` | Toolbar, grid, status bar, notices, dialogs |
-| `src/tabs.rs` | The document tab strip |
+| `crates/quarry-workbench/src/theme.rs` | UI-neutral Light, Dark, and Omarchy semantic palette tokens & WCAG AA contrast checks |
+| `apps/quarry-gpui/src/menus.rs` | Native macOS menu bar and Linux `AppMenuBar` menu actions |
+| `apps/quarry-gpui/src/workbench.rs` | Process-wide `WorkbenchController` over `WorkbenchScheduler` |
+| `apps/quarry-gpui/src/main.rs` | Window chrome, tab strip, toolbar, virtualized grid, status bar, Live Resource HUD |
+| `apps/quarry-gpui/src/find_bar.rs`, `operations.rs`, `workflows_ui.rs` | Find & Replace bar, operation modals, multi-file workflows |
 
 ## Principles
 
 1. **The data is the interface.** The grid gets the most space and the most
    contrast. Chrome (toolbar, tabs, status bar) stays quiet and neutral.
-2. **Native first.** Quarry should feel like a Mac app: system fonts, a toolbar
-   in the title bar, a real menu bar, and standard shortcuts.
-3. **Light only.** Quarry always uses its light appearance, even when macOS uses
-   Dark mode. This is the owner's decision; don't add a dark palette or an
-   appearance setting without the owner's approval.
+2. **Native first.** Quarry should feel native on macOS and Linux/Omarchy: system
+   fonts (`CoreText` / `cosmic-text`), native menu bars, platform-native
+   shortcuts, and OS accessibility (`accesskit_macos` / `accesskit_unix`).
+3. **Calm, high-contrast palettes.** Quarry ships WCAG AA Light, Dark, and
+   hardened local Omarchy theme sync (`View → Theme`), all drawn from shared
+   semantic tokens in `crates/quarry-workbench/src/theme.rs`.
 4. **Amber means "this one."** The brand amber marks selection, focus, the
    active filter, unsaved work, and the single primary action in a dialog.
    Don't use it for decoration.
@@ -259,11 +261,9 @@ VoiceOver regressions are release blockers ([ADR 0003](adr/0003-select-egui-ui.m
 
 ## Checking your change
 
-1. `cargo test -p quarry-egui`. Layout tests check single-row toolbars, bounds
-   at 860 and 1,280 px, and accessible labels. If a test pins a value you
-   meant to change, update the test and keep what it checks.
+1. `cargo test -p quarry-gpui --locked` and `cargo test -p quarry-workbench --locked`.
 2. `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
-3. Run the app and look at the change at the minimum window size and at full
-   screen.
+3. Run the app inside the test VM and check the change at the minimum window size
+   and at full screen, including accessibility tree verification.
 4. Update `docs/USER_GUIDE.md` when a visible label, location, or shortcut
    changes.

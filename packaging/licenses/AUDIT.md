@@ -333,3 +333,14 @@ The affected inputs are `packaging/licenses/about.toml`,
 `packaging/licenses/generate.py`, `packaging/licenses/supplemental.json`, and
 this audit record. The regenerated manifest hash records this bounded Phase
 4B-3 cutover review; it is not legal clearance or release authorization.
+
+## 2026-11-24 Retirement of legacy `apps/quarry-egui` from workspace
+
+Following owner sign-off after Phase 4B-3 cutover verification, the retired
+`apps/quarry-egui` crate and its unused workspace dependencies (`eframe`,
+`egui_extras`) were removed from `Cargo.toml` and `Cargo.lock`. The shipping
+`apps/quarry-gpui` target dependency graph (`397` locked packages for
+`aarch64-apple-darwin`) and `THIRD_PARTY_NOTICES.html` content are unchanged;
+`packaging/licenses/manifest.json` was refreshed with `cargo-about 0.9.2` to
+record the updated `Cargo.toml`, `Cargo.lock`, workspace manifest list, and
+this audit entry.
