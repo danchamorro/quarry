@@ -429,6 +429,9 @@ struct DormantDirtyState {
     header_renames: Arc<BTreeMap<usize, Arc<String>>>,
     cell_edits: SharedCellEdits,
     overlay_bytes: usize,
+    verified_bounds_override: Option<SectionBounds>,
+    pending_verified_reopen: Option<SectionBounds>,
+    section_quote_free_confirmed: bool,
     /// Retains code-counted directory FD reservations for any live `WorkingCopyStorage`.
     _working_dir_fd_lease: Option<FdLease>,
 }
@@ -637,16 +640,24 @@ impl WorkbenchScheduler {
         }
         if let Some(slot) = self.tabs.get(&id)
             && let SlotResidency::Dormant(dormant) = &slot.residency
-            && let DormantKind::CleanPlain {
-                section: Some(spec),
-                ..
-            } = &dormant.kind
         {
-            return Some(format!(
-                "{base} [{}–{}]",
-                crate::format_bytes(spec.bounds.snapped.base),
-                crate::format_bytes(spec.bounds.snapped_end()),
-            ));
+            let dormant_bounds = match &dormant.kind {
+                DormantKind::CleanPlain {
+                    section: Some(spec),
+                    ..
+                } => Some(spec.bounds),
+                DormantKind::Dirty(dirty) => dirty
+                    .verified_bounds_override
+                    .or_else(|| dirty.session.section_bounds()),
+                _ => None,
+            };
+            if let Some(bounds) = dormant_bounds {
+                return Some(format!(
+                    "{base} [{}–{}]",
+                    crate::format_bytes(bounds.snapped.base),
+                    crate::format_bytes(bounds.snapped_end()),
+                ));
+            }
         }
         Some(base)
     }
@@ -1251,9 +1262,19 @@ impl WorkbenchScheduler {
     }
 
     /// Polls all hydrated tabs' `VerifyBoundaryJob`s. Clean sections whose boundaries shifted
-    /// are automatically reopened at the exact verified bounds; dirty sections keep all edits
-    /// intact and expose `pending_verified_reopen` for explicit Save As + Reopen.
+    /// are automatically reopened at the exact verified bounds unless blocked by an active writer
+    /// or open cell editor; dirty or blocked sections keep all state intact and expose
+    /// `pending_verified_reopen` for explicit Save As + Reopen.
     pub fn poll_section_verifications(&mut self) -> Vec<SectionVerifyCompletion> {
+        self.poll_section_verifications_with_blocked(&BTreeSet::new())
+    }
+
+    /// Same as [`Self::poll_section_verifications`], skipping auto-reopen for any `DocumentId`
+    /// in `blocked_auto_reopen` (e.g. tabs currently open in a cell editor with an unapplied draft).
+    pub fn poll_section_verifications_with_blocked(
+        &mut self,
+        blocked_auto_reopen: &BTreeSet<DocumentId>,
+    ) -> Vec<SectionVerifyCompletion> {
         let ids: Vec<DocumentId> = self.tabs.keys().copied().collect();
         let mut completions = Vec::new();
         for id in ids {
@@ -1271,12 +1292,17 @@ impl WorkbenchScheduler {
                 ..
             }) = &result
             {
-                let is_dirty = self
-                    .tabs
-                    .get(&id)
-                    .and_then(|slot| slot.tab.document.as_ref())
-                    .is_some_and(Document::is_dirty);
-                if !is_dirty && self.reopen_verified_section(id, false).is_ok() {
+                let can_auto_reopen = !blocked_auto_reopen.contains(&id)
+                    && self.tabs.get(&id).is_some_and(|slot| {
+                        !slot.tab.document_writing()
+                            && slot.tab.document.as_ref().is_some_and(|doc| {
+                                !doc.is_dirty()
+                                    && doc.save_job.is_none()
+                                    && doc.export_job.is_none()
+                                    && doc.structural_job.is_none()
+                            })
+                    });
+                if can_auto_reopen && self.reopen_verified_section(id, false).is_ok() {
                     reopened = true;
                 }
             }
@@ -2128,6 +2154,18 @@ impl WorkbenchScheduler {
                         prev_opts.delimiter.unwrap_or(b','),
                         prev_enc.unwrap_or(Encoding::Utf8),
                     )),
+                    DormantKind::Dirty(dirty) => dirty
+                        .verified_bounds_override
+                        .or_else(|| dirty.session.section_bounds())
+                        .map(|bounds| {
+                            (
+                                bounds,
+                                dirty.section_quote_free_confirmed,
+                                dormant.source_guard.clone(),
+                                dirty.session.dialect.delimiter,
+                                dirty.session.encoding(),
+                            )
+                        }),
                     _ => None,
                 },
                 _ => None,
@@ -3940,6 +3978,9 @@ fn demote_document(
             header_renames: Arc::clone(&doc.header_renames),
             cell_edits: Arc::clone(&doc.cell_edits),
             overlay_bytes: prep.overlay_bytes,
+            verified_bounds_override: doc.verified_bounds_override,
+            pending_verified_reopen: doc.pending_verified_reopen,
+            section_quote_free_confirmed: doc.section_quote_free_confirmed,
             _working_dir_fd_lease: working_dir_fd_lease,
         }))
     } else {
@@ -4278,6 +4319,9 @@ fn wake_dormant_document(
                 header_renames,
                 cell_edits,
                 overlay_bytes,
+                verified_bounds_override,
+                pending_verified_reopen,
+                section_quote_free_confirmed,
                 _working_dir_fd_lease: working_dir_fd_lease,
             } = *dirty;
             let mut doc = Document::from_arc_session(session, &dormant.logical_path);
@@ -4286,6 +4330,11 @@ fn wake_dormant_document(
             doc.edit_history = dormant.view.edit_history.clone();
             doc.header_renames = header_renames;
             doc.cell_edits = cell_edits;
+            doc.section_quote_free_confirmed = section_quote_free_confirmed;
+            if source_unchanged {
+                doc.verified_bounds_override = verified_bounds_override;
+                doc.pending_verified_reopen = pending_verified_reopen;
+            }
             apply_view_snapshot(
                 &mut doc,
                 &dormant.view,
@@ -4326,6 +4375,9 @@ fn wake_dormant_document(
                                 header_renames: Arc::clone(&doc.header_renames),
                                 cell_edits: Arc::clone(&doc.cell_edits),
                                 overlay_bytes,
+                                verified_bounds_override,
+                                pending_verified_reopen,
+                                section_quote_free_confirmed,
                                 _working_dir_fd_lease: working_dir_fd_lease,
                             })),
                         });
@@ -4347,6 +4399,9 @@ fn wake_dormant_document(
                         header_renames: Arc::clone(&doc.header_renames),
                         cell_edits: Arc::clone(&doc.cell_edits),
                         overlay_bytes,
+                        verified_bounds_override,
+                        pending_verified_reopen,
+                        section_quote_free_confirmed,
                         _working_dir_fd_lease: working_dir_fd_lease,
                     })),
                 });
@@ -4369,6 +4424,9 @@ fn wake_dormant_document(
                             header_renames: Arc::clone(&doc.header_renames),
                             cell_edits: Arc::clone(&doc.cell_edits),
                             overlay_bytes,
+                            verified_bounds_override,
+                            pending_verified_reopen,
+                            section_quote_free_confirmed,
                             _working_dir_fd_lease: working_dir_fd_lease,
                         })),
                     });

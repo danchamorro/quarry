@@ -1222,6 +1222,56 @@ fn collect_backward_lf_boundaries(
     out
 }
 
+fn collect_forward_lf_boundaries(
+    buf: &[u8],
+    buf_start: u64,
+    encoding: Encoding,
+    max_candidates: usize,
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    if !encoding.is_utf16() {
+        let mut offset = 0usize;
+        while offset < buf.len() && out.len() < max_candidates {
+            let Some(rel) = memchr(b'\n', &buf[offset..]) else {
+                break;
+            };
+            let end = offset + rel + 1;
+            out.push(buf_start + end as u64);
+            offset = end;
+        }
+        return out;
+    }
+    let even_len = buf.len() & !1;
+    let mut pos = 0usize;
+    while pos + 2 <= even_len && out.len() < max_candidates {
+        if is_lf_unit(&buf[pos..pos + 2], encoding) {
+            out.push(buf_start + (pos + 2) as u64);
+        }
+        pos += 2;
+    }
+    out
+}
+
+fn contains_quote_unit(buf: &[u8], encoding: Encoding) -> bool {
+    if !encoding.is_utf16() {
+        return memchr(b'"', buf).is_some();
+    }
+    let even_len = buf.len() & !1;
+    let needle = match encoding {
+        Encoding::Utf16Le => [b'"', 0],
+        Encoding::Utf16Be => [0, b'"'],
+        _ => unreachable!(),
+    };
+    let mut pos = 0usize;
+    while pos + 2 <= even_len {
+        if buf[pos..pos + 2] == needle {
+            return true;
+        }
+        pos += 2;
+    }
+    false
+}
+
 fn boundary_not_found(search_cap: usize, detail: impl Into<String>) -> QuarryError {
     QuarryError::SectionBoundaryNotFound {
         search_limit_bytes: search_cap,
@@ -1313,6 +1363,38 @@ fn snap_quote_free_verified(
     };
 
     let aligned_end = align_up_code_unit(aligned_end, file_size, encoding).max(aligned_start);
+
+    // Verify that the snapped section's boundary regions (or full section when <= 1 MiB) do not
+    // actually contain RFC 4180 quote delimiters (`"`). Because Quarry's readers parse with `"`
+    // quoting, granting `BoundaryTrust::Verified` when quotes are present would allow records to
+    // cross LF boundaries unexpectedly.
+    let check_range_quote_free = |start: u64, len: u64| -> Result<(), QuarryError> {
+        let len = len.min(file_size.saturating_sub(start)) as usize;
+        let len = if encoding.is_utf16() { len & !1 } else { len };
+        if len == 0 {
+            return Ok(());
+        }
+        let mut probe = vec![0u8; len];
+        let read = read_at_exact_or_eof(file, start, &mut probe)?;
+        if read < len {
+            return Err(QuarryError::SourceChanged);
+        }
+        if contains_quote_unit(&probe, encoding) {
+            return Err(QuarryError::InvalidOption(
+                "Quoted field delimiter '\"' detected in section; uncheck 'No quoted fields' or run Verify Boundary.",
+            ));
+        }
+        Ok(())
+    };
+    let section_len = aligned_end.saturating_sub(aligned_start);
+    if section_len <= search_cap as u64 {
+        check_range_quote_free(aligned_start, section_len)?;
+    } else {
+        let edge = (SPECULATIVE_VALIDATE_BYTES as u64).min(section_len);
+        check_range_quote_free(aligned_start, edge)?;
+        check_range_quote_free(aligned_end.saturating_sub(edge), edge)?;
+    }
+
     let snapped = ByteWindow::from_range(aligned_start, aligned_end)
         .ok_or(QuarryError::InvalidOption("invalid snapped section bounds"))?;
     Ok(SectionBounds {
@@ -1517,14 +1599,28 @@ fn snap_speculative_window(
             if read < probe_len {
                 return Err(QuarryError::SourceChanged);
             }
-            if let Some(boundary) = find_first_lf_end(&buf, probe_start, encoding) {
+            // Validate candidate LF boundaries with `validate_speculative_candidate` so an LF
+            // inside a multiline quoted field is never silently accepted as the section end.
+            let candidates = collect_forward_lf_boundaries(&buf, probe_start, encoding, 16);
+            let mut chosen = None;
+            for candidate in candidates {
+                if candidate < req_end {
+                    continue;
+                }
+                if validate_speculative_candidate(file, file_size, candidate, delimiter, encoding)?
+                {
+                    chosen = Some(candidate);
+                    break;
+                }
+            }
+            if let Some(boundary) = chosen {
                 boundary
             } else if probe_start + probe_len as u64 >= file_size {
                 file_size
             } else {
                 return Err(boundary_not_found(
                     search_cap,
-                    "Could not find a speculative record end within the 1 MiB alignment window.",
+                    "Could not find a valid speculative record end within the 1 MiB alignment window.",
                 ));
             }
         }
@@ -2258,5 +2354,252 @@ mod tests {
         assert_eq!(lines[20], "40,match");
         assert!(!exported.contains("\n1,match\n"));
         assert!(!exported.contains("\n41,match\n"));
+    }
+
+    #[test]
+    fn headerless_interior_utf16le_bom_section_preserves_bom_on_save_and_filter_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf16le-bom-noheader.csv");
+        let text = "r1,alpha\nr2,beta\nr3,beta\nr4,gamma\n";
+        let mut raw = vec![0xFFu8, 0xFEu8];
+        for unit in text.encode_utf16() {
+            raw.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&path, &raw).unwrap();
+
+        let r2_offset = 2 + ("r1,alpha\n".encode_utf16().count() * 2) as u64;
+        let r3_end = 2 + ("r1,alpha\nr2,beta\nr3,beta\n".encode_utf16().count() * 2) as u64;
+        let sec = Session::open_section(
+            &path,
+            ByteWindow::from_range(r2_offset, r3_end).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sec.encoding(), Encoding::Utf16Le);
+
+        // Save Section As New preserves UTF-16LE BOM so Auto detection reopens cleanly.
+        let save_out = dir.path().join("saved-utf16le.csv");
+        let outcome = sec
+            .start_save_as_with_edits(BTreeMap::new(), BTreeMap::new(), &save_out)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(outcome, crate::SaveAsOutcome::Complete(_)));
+        let saved_bytes = fs::read(&save_out).unwrap();
+        assert!(
+            saved_bytes.starts_with(&[0xFF, 0xFE]),
+            "saved headerless UTF-16LE section must keep BOM"
+        );
+        let reopened = Session::open(
+            &save_out,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.encoding(), Encoding::Utf16Le);
+        assert_eq!(reopened.first_rows.len(), 2);
+        assert_eq!(
+            reopened.first_rows[0].fields,
+            vec![b"r2".to_vec(), b"beta".to_vec()]
+        );
+
+        // Filtered Export also preserves the UTF-16LE BOM for headerless interior sections.
+        let filter_out = dir.path().join("filtered-utf16le.csv");
+        let query = crate::FilterQuery {
+            predicates: vec![crate::FilterPredicate {
+                column: 1,
+                operator: crate::FilterOperator::Equals,
+                value: "beta".into(),
+                upper_bound: None,
+            }],
+            case_sensitivity: crate::CaseSensitivity::Sensitive,
+        };
+        let f_outcome = sec
+            .start_filtered_export_with_edits(query, Arc::default(), BTreeMap::new(), &filter_out)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(f_outcome, crate::FilterExportOutcome::Complete(_)));
+        let filtered_bytes = fs::read(&filter_out).unwrap();
+        assert!(
+            filtered_bytes.starts_with(&[0xFF, 0xFE]),
+            "filtered export of headerless UTF-16LE section must keep BOM"
+        );
+    }
+
+    #[test]
+    fn bomless_headerless_interior_section_protects_leading_feff_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomless-feff.csv");
+        let first_line = b"a,b\n";
+        let sec_start = first_line.len() as u64;
+        let second_line = "\"\u{FEFF}x\",old\n".as_bytes();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(first_line);
+        raw.extend_from_slice(second_line);
+        raw.extend_from_slice(b"c,d\n");
+        fs::write(&path, &raw).unwrap();
+
+        let sec = Session::open_section(
+            &path,
+            ByteWindow::from_range(sec_start, sec_start + second_line.len() as u64).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        // Edit column 1 so row 0 is re-serialized, and verify the leading U+FEFF field stays quoted
+        // (not mistaken for a UTF-8 file BOM on reopen).
+        let out_path = dir.path().join("bomless-feff-out.csv");
+        let mut edits = BTreeMap::new();
+        edits.insert((0u64, 1usize), b"new".to_vec());
+        let outcome = sec
+            .start_save_as_with_edits(BTreeMap::new(), edits, &out_path)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(outcome, crate::SaveAsOutcome::Complete(_)));
+        let saved = fs::read(&out_path).unwrap();
+        assert!(
+            !saved.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "BOM-less section save must quote leading U+FEFF rather than emitting a raw BOM"
+        );
+        let reopened = Session::open(
+            &out_path,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.first_rows[0].fields[0], "\u{FEFF}x".as_bytes());
+        assert_eq!(reopened.first_rows[0].fields[1], b"new");
+    }
+
+    #[test]
+    fn quote_free_confirmed_rejects_quoted_section_and_mismatched_indexes_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quoted-and-mismatch.csv");
+        let mut raw = b"id,note\n".to_vec();
+        for i in 0..400u64 {
+            raw.extend_from_slice(format!("{i},\"quoted_{i}\"\n").as_bytes());
+        }
+        let mid = raw.len() as u64 / 2;
+        fs::write(&path, &raw).unwrap();
+
+        // 1. quote_free_confirmed must refuse when `"` quotes are present in the section.
+        let err = Session::open_section(
+            &path,
+            ByteWindow::from_range(mid, mid + 256).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                quote_free_confirmed: true,
+                ..SectionOpenOptions::default()
+            },
+        );
+        assert!(
+            err.is_err(),
+            "quote_free_confirmed must reject sections containing quote characters"
+        );
+
+        // 2. Two sections of the same file must reject each other's StructuralIndex & FilterIndex,
+        // and a byte-0 section filter must stay bounded to the section end.
+        let sec_a = Session::open_section(
+            &path,
+            ByteWindow::from_range(0, 200).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let sec_b = Session::open_section(
+            &path,
+            ByteWindow::from_range(mid, mid + 200).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let idx_a = sec_a
+            .start_indexing(crate::IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            matches!(
+                sec_b.read_rows(&idx_a, 0, 5),
+                Err(QuarryError::InvalidOption(_))
+            ),
+            "read_rows must reject a StructuralIndex from another section"
+        );
+        assert!(
+            matches!(
+                sec_b.start_search(
+                    &idx_a,
+                    b"quoted".to_vec(),
+                    crate::SearchPosition { row: 0, column: 0 },
+                ),
+                Err(QuarryError::InvalidOption(_))
+            ),
+            "start_search must reject a StructuralIndex from another section"
+        );
+
+        let query = crate::FilterQuery {
+            predicates: vec![crate::FilterPredicate {
+                column: 1,
+                operator: crate::FilterOperator::Contains,
+                value: "quoted_".into(),
+                upper_bound: None,
+            }],
+            case_sensitivity: crate::CaseSensitivity::Sensitive,
+        };
+        let f_idx_a = sec_a
+            .start_filter_with_edits(query, Arc::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            f_idx_a.matches_found() < 40,
+            "byte-0 section filter must stay bounded to section end, got {}",
+            f_idx_a.matches_found()
+        );
+        assert!(
+            matches!(
+                sec_b.read_filtered_rows(&f_idx_a, 0, 5),
+                Err(QuarryError::SourceChanged)
+            ),
+            "read_filtered_rows must reject a FilterIndex from another section"
+        );
     }
 }

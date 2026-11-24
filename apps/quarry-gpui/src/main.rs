@@ -1449,17 +1449,27 @@ impl QuarryWindow {
         }
 
         self.confirming = true;
+        self.set_editing(true, cx);
         self.panels
             .update(cx, |panels, cx| panels.close(window, cx));
+        let target_doc_id = info.document_id;
+        let target_instance_id = info.instance_id;
         let filename = info.filename;
         let save_weak = cx.weak_entity();
         let discard_weak = cx.weak_entity();
         let close_weak = cx.weak_entity();
+        let handled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let save_handled = std::sync::Arc::clone(&handled);
+        let discard_handled = std::sync::Arc::clone(&handled);
+        let close_handled = std::sync::Arc::clone(&handled);
         window.open_dialog(cx, move |dialog, _, _| {
             let filename_msg = filename.clone();
             let save_weak = save_weak.clone();
             let discard_weak = discard_weak.clone();
             let close_weak = close_weak.clone();
+            let save_handled = std::sync::Arc::clone(&save_handled);
+            let discard_handled = std::sync::Arc::clone(&discard_handled);
+            let close_handled = std::sync::Arc::clone(&close_handled);
             dialog
                 .title(format!("Discard unsaved edits to {filename}?"))
                 .w(px(480.))
@@ -1490,10 +1500,18 @@ impl QuarryWindow {
                                 .label("Save Section As New…")
                                 .small()
                                 .on_click(move |_, window, cx| {
+                                    save_handled.store(true, std::sync::atomic::Ordering::SeqCst);
                                     window.dispatch_action(Box::new(DialogCancel), cx);
                                     let _ = save_weak.update(cx, |this, cx| {
                                         this.confirming = false;
-                                        this.choose_save_destination(None, window, cx);
+                                        this.set_editing(false, cx);
+                                        let still_same = this.snapshot(cx).is_some_and(|s| {
+                                            s.document_id == target_doc_id
+                                                && s.instance_id == target_instance_id
+                                        });
+                                        if still_same {
+                                            this.choose_save_destination(None, window, cx);
+                                        }
                                     });
                                 }),
                         )
@@ -1503,9 +1521,19 @@ impl QuarryWindow {
                                 .danger()
                                 .small()
                                 .on_click(move |_, window, cx| {
+                                    discard_handled
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
                                     window.dispatch_action(Box::new(DialogCancel), cx);
                                     let _ = discard_weak.update(cx, |this, cx| {
                                         this.confirming = false;
+                                        this.set_editing(false, cx);
+                                        let still_same = this.snapshot(cx).is_some_and(|s| {
+                                            s.document_id == target_doc_id
+                                                && s.instance_id == target_instance_id
+                                        });
+                                        if !still_same {
+                                            return;
+                                        }
                                         let res = this.controller.update(cx, |c, cx| {
                                             c.reopen_verified_section_active(
                                                 this.window_id,
@@ -1522,10 +1550,13 @@ impl QuarryWindow {
                         ),
                 )
                 .on_close(move |_, _, cx| {
-                    let _ = close_weak.update(cx, |this, cx| {
-                        this.confirming = false;
-                        cx.notify();
-                    });
+                    if !close_handled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = close_weak.update(cx, |this, cx| {
+                            this.confirming = false;
+                            this.set_editing(false, cx);
+                            cx.notify();
+                        });
+                    }
                 })
         });
     }

@@ -144,6 +144,20 @@ impl StructuralIndex {
         self.section_base == 0 && self.section_end.is_none()
     }
 
+    /// Returns `true` when this index's byte scope matches a session's active byte range.
+    pub fn matches_byte_range(
+        &self,
+        section_base: u64,
+        section_end: u64,
+        is_section: bool,
+    ) -> bool {
+        if is_section {
+            self.section_base == section_base && self.section_end == Some(section_end)
+        } else {
+            self.is_whole_file()
+        }
+    }
+
     fn new_inner(
         config: IndexConfig,
         section_base: u64,

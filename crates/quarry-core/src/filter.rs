@@ -38,6 +38,7 @@ struct FilterSource {
     delimiter: u8,
     data_start: u64,
     encoding: Encoding,
+    section_range: (u64, u64),
 }
 
 impl FilterSource {
@@ -442,6 +443,7 @@ impl FilterJob {
             path,
             0,
             file_size,
+            file_size,
             delimiter,
             data_start,
             query,
@@ -451,6 +453,7 @@ impl FilterJob {
             encoding,
             tuning,
             bounded_scan,
+            false,
         )
     }
 
@@ -458,6 +461,7 @@ impl FilterJob {
     fn start_with_range_edits_and_tuning(
         path: PathBuf,
         section_base: u64,
+        section_end: u64,
         scan_end: u64,
         delimiter: u8,
         data_start: u64,
@@ -468,6 +472,7 @@ impl FilterJob {
         encoding: Encoding,
         tuning: FilterParallelTuning,
         bounded_scan: bool,
+        is_section: bool,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
@@ -484,12 +489,15 @@ impl FilterJob {
             delimiter,
             data_start,
             encoding,
+            section_range: (section_base, section_end),
         };
         source.check_file(&file)?;
         let guard_file = file.try_clone()?;
         index.edits = edits;
         index.source = Some(source.clone());
-        index.scan_limit = (bounded_scan || section_base > 0).then_some(scan_end);
+        // Always retain `scan_limit` for sections (including byte-0 sections) and paused scans so
+        // filtered readers never scan past the section's end boundary.
+        index.scan_limit = (bounded_scan || is_section).then_some(scan_end);
         let shared = Arc::new(SharedState::new(
             index,
             section_base,
@@ -810,6 +818,7 @@ impl Session {
         FilterJob::start_with_range_edits_and_tuning(
             self.path.clone(),
             section_base,
+            section_end,
             scan_limit,
             self.dialect.delimiter,
             data_start,
@@ -820,19 +829,21 @@ impl Session {
             self.encoding,
             FilterParallelTuning::for_production(requested_threads),
             scan_limit < section_end,
+            self.is_section(),
         )
     }
 
     fn check_filter_index(&self, index: &FilterIndex) -> Result<(), QuarryError> {
         self.ensure_source_unchanged()?;
-        let (section_base, _) = self.active_byte_range();
+        let (section_base, section_end) = self.active_byte_range();
         let expected_data_start = u64::from(self.dialect.has_header && section_base == 0);
         if let Some(source) = &index.source
             && (source.path != self.path
                 || source.stamp != self.source_stamp
                 || source.delimiter != self.dialect.delimiter
                 || source.data_start != expected_data_start
-                || source.encoding != self.encoding)
+                || source.encoding != self.encoding
+                || source.section_range != (section_base, section_end))
         {
             return Err(QuarryError::SourceChanged);
         }

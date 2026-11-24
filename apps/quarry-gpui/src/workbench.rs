@@ -3602,7 +3602,15 @@ impl WorkbenchController {
             }
             changed = true;
         }
-        for completion in self.scheduler.poll_section_verifications() {
+        let blocked_auto_reopen: BTreeSet<DocumentId> = self
+            .editing_windows
+            .iter()
+            .filter_map(|&window_id| self.scheduler.active_document(window_id))
+            .collect();
+        for completion in self
+            .scheduler
+            .poll_section_verifications_with_blocked(&blocked_auto_reopen)
+        {
             changed = true;
             if completion.reopened {
                 self.viewport_read_seq.remove(&completion.document_id);
@@ -3617,9 +3625,15 @@ impl WorkbenchController {
                         if completion.reopened {
                             // `reopen_verified_section` already set a status notice.
                         } else if boundary_changed {
-                            tab.notice = Some(AppMessage::warning(
-                                "Verified section boundaries shifted. Save your unsaved draft as a new file before reopening at the verified bounds.",
-                            ));
+                            let is_dirty = tab
+                                .document
+                                .as_ref()
+                                .is_some_and(quarry_workbench::Document::is_dirty);
+                            tab.notice = Some(AppMessage::warning(if is_dirty {
+                                "Verified section boundaries shifted. Save your unsaved draft as a new file before reopening at the verified bounds."
+                            } else {
+                                "Verified section boundaries shifted. Finish the open edit or active operation, then click Reopen Verified."
+                            }));
                         } else {
                             let msg = if let Some(first) = tab
                                 .document

@@ -811,6 +811,11 @@ impl Session {
             options.open.bootstrap_limit,
             encoding,
         )?;
+        // Revalidate that the file did not change between the byte-0 header probe and the
+        // section initial-row read so header, stamp, bounds, and rows share one generation.
+        if !export::source_matches_stamp(&file, path, &source_stamp)? {
+            return Err(QuarryError::SourceChanged);
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -947,6 +952,12 @@ impl Session {
         start: u64,
         count: usize,
     ) -> Result<Vec<Row>, QuarryError> {
+        let (section_base, section_end) = self.active_byte_range();
+        if !index.matches_byte_range(section_base, section_end, self.is_section()) {
+            return Err(QuarryError::InvalidOption(
+                "index byte range does not match session scope",
+            ));
+        }
         let end = index.section_end().unwrap_or(u64::MAX);
         read_rows_from_index(
             &self.path,

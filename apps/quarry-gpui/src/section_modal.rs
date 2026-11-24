@@ -73,6 +73,7 @@ impl OpenSectionDialogState {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         self.path = Some(path);
         self.file_size = size;
+        self.quote_free_confirmed = false;
         let default_unit = ByteUnit::default_for_size(size);
         let default_size = size.min(10 * 1024 * 1024);
         self.from_bytes = 0;
@@ -794,6 +795,7 @@ pub fn open_section_dialog(
                             Checkbox::new("section-quote-free")
                                 .label("No quoted fields (quote = None)")
                                 .checked(quote_free)
+                                .disabled(!has_file)
                                 .on_click(move |checked, _, cx| {
                                     st_qf.update(cx, |s, cx| {
                                         s.quote_free_confirmed = *checked;

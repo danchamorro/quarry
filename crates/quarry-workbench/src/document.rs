@@ -2942,7 +2942,7 @@ impl Document {
 
     pub fn speculative_save_warning(&self) -> Option<&'static str> {
         (self.section_trust() == Some(BoundaryTrust::Speculative)).then_some(
-            "This section has speculative boundaries: the first record may be torn if a quoted field crosses the start offset. Verify Boundary first or inspect the first row before exporting.",
+            "This section has speculative boundaries: the first or last record may be torn if a quoted field crosses a section boundary. Verify Boundary first or inspect the first and last rows before exporting.",
         )
     }
 

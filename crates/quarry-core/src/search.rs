@@ -491,6 +491,11 @@ impl Session {
             return Err(QuarryError::InvalidOption("search query must not be empty"));
         }
         let (section_base, section_end) = self.active_byte_range();
+        if !index.matches_byte_range(section_base, section_end, self.is_section()) {
+            return Err(QuarryError::InvalidOption(
+                "index byte range does not match session scope",
+            ));
+        }
         let data_start = u64::from(self.dialect.has_header && section_base == 0);
         cell_edits.retain(|(row, _), _| *row >= data_start);
         let start = if start.row < data_start {

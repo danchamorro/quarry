@@ -504,3 +504,137 @@ fn verified_section_preserves_proof_across_dormancy_reloads_bounded_and_blocks_j
     let _ = fs::remove_file(&path2);
     let _ = fs::remove_file(&path3);
 }
+
+#[test]
+fn dirty_section_preserves_verified_override_across_dormancy_and_respects_blocked_auto_reopen() {
+    let mut bytes = Vec::from(&b"id,note\n"[..]);
+    let pad = "p".repeat(60);
+    let mut i = 0u64;
+    while bytes.len() < 18 * 1024 * 1024 {
+        bytes.extend_from_slice(format!("{i},{pad}\n").as_bytes());
+        i += 1;
+    }
+    let quoted_start = bytes.len() as u64;
+    bytes.extend_from_slice(b"999999,\"first part\n");
+    let interior_lf_after = bytes.len() as u64;
+    for k in 0..2600u64 {
+        bytes.extend_from_slice(
+            format!("{},inside_{k:04}_padding_for_quote_test\n", 5000 + k).as_bytes(),
+        );
+    }
+    bytes.extend_from_slice(b"end_of_quote\"\n");
+    for j in 0..20u64 {
+        bytes.extend_from_slice(format!("{},after_{j}\n", 1_000_000 + j).as_bytes());
+    }
+    let path1 = temp_csv("dirty-verify-dormant", &bytes);
+    let path2 = temp_csv("dirty-verify-evictor", b"x,y\n1,2\n");
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+
+    // 1. Open speculative section and defer auto-reopen via `blocked_auto_reopen` (simulating an
+    // active cell editor with an unapplied draft). Even though the document isn't dirty yet,
+    // verification must NOT silently replace the session while blocked.
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path1.clone(),
+            ByteWindow::new(interior_lf_after + 6, 512).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+    scheduler.start_verify_section_boundary(sec_id).unwrap();
+
+    let blocked = std::collections::BTreeSet::from([sec_id]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let completion = loop {
+        if let Some(c) = scheduler
+            .poll_section_verifications_with_blocked(&blocked)
+            .into_iter()
+            .find(|c| c.document_id == sec_id)
+        {
+            break c;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for verify");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        !completion.reopened,
+        "blocked clean section must not auto-reopen while an editor is active"
+    );
+    assert_eq!(
+        scheduler
+            .tab(sec_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .pending_verified_reopen
+            .map(|b| b.snapped.base),
+        Some(quoted_start)
+    );
+
+    // 2. Now reopen verified, make a cell edit, verify an in-place verified override survives
+    // dormancy round-trip when evicted by another tab!
+    let _ = scheduler.reopen_verified_section(sec_id, false).unwrap();
+    wait_for_index(&mut scheduler, sec_id);
+    let verified_bounds = scheduler
+        .tab(sec_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .section_bounds()
+        .unwrap();
+    assert_eq!(verified_bounds.trust, BoundaryTrust::Verified);
+    assert_eq!(verified_bounds.snapped.base, quoted_start);
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.verified_bounds_override = Some(verified_bounds);
+        let target_row = doc.data_start;
+        doc.begin_cell_edit(target_row, 0, b"999999".to_vec())
+            .unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "DIRTY_KEEP".into();
+        doc.commit_cell_edit();
+    }
+
+    let _ = scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path2.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        scheduler.residency(sec_id),
+        Some(ResidencyState::DormantDirty)
+    );
+    assert!(
+        scheduler.tab_display_name(sec_id).unwrap().contains('['),
+        "dormant dirty section tab display name should keep byte range suffix"
+    );
+
+    let _ = scheduler.activate_tab(WindowId::PRIMARY, sec_id).unwrap();
+    wait_for_index(&mut scheduler, sec_id);
+    let woken = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+    assert!(woken.is_dirty());
+    assert_eq!(woken.verified_bounds_override, Some(verified_bounds));
+    assert_eq!(woken.section_trust(), Some(BoundaryTrust::Verified));
+
+    let _ = fs::remove_file(&path1);
+    let _ = fs::remove_file(&path2);
+}

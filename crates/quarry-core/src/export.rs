@@ -3640,6 +3640,13 @@ fn run_section_filtered_export(
     let header_estimate: u64 = header_row
         .map(|row| row.fields.iter().map(|f| f.len() as u64 + 4).sum::<u64>() + 8)
         .unwrap_or(0);
+    let encoding_growth = if config.source_encoding == config.output_encoding {
+        1
+    } else if config.output_encoding == crate::Encoding::Utf8 {
+        2
+    } else {
+        3
+    };
     let required = crate::estimate_edited_output_bytes_from_values(
         section_len.saturating_add(header_estimate),
         0,
@@ -3654,11 +3661,7 @@ fn run_section_filtered_export(
         None,
         None,
     )
-    .saturating_mul(if config.output_encoding == crate::Encoding::Utf8 {
-        1
-    } else {
-        3
-    });
+    .saturating_mul(encoding_growth);
     if let Err(err) = check_storage(output_parent(&output.destination), required) {
         output.discard()?;
         return Err(err);
@@ -3699,6 +3702,12 @@ fn run_section_filtered_export(
             rows_written += 1;
             bytes_written = output.bytes_written();
             shared.rows_written.store(rows_written, Ordering::Release);
+            shared.bytes_written.store(bytes_written, Ordering::Release);
+        } else if section_base > 0 && source_had_bom {
+            // Preserve the source BOM for headerless interior sections (critical for UTF-16LE/BE
+            // auto-detection when reopening the exported file).
+            output.write_all(UTF8_BOM)?;
+            bytes_written = output.bytes_written();
             shared.bytes_written.store(bytes_written, Ordering::Release);
         }
 
@@ -5759,6 +5768,13 @@ fn run_save_section_as(
     let header_estimate: u64 = header_row
         .map(|row| row.fields.iter().map(|f| f.len() as u64 + 4).sum::<u64>() + 8)
         .unwrap_or(0);
+    let encoding_growth = if config.source_encoding == config.output_encoding {
+        1
+    } else if config.output_encoding == crate::Encoding::Utf8 {
+        2
+    } else {
+        3
+    };
     let required = crate::estimate_edited_output_bytes_from_values(
         section_len.saturating_add(header_estimate),
         0,
@@ -5771,11 +5787,7 @@ fn run_save_section_as(
         None,
         None,
     )
-    .saturating_mul(if config.output_encoding == crate::Encoding::Utf8 {
-        1
-    } else {
-        3
-    });
+    .saturating_mul(encoding_growth);
     check_storage(output_parent(&output.destination), required)?;
     shared
         .estimated_output_bytes
@@ -5810,6 +5822,13 @@ fn run_save_section_as(
             config.max_record_bytes,
         )?;
         rows_written += 1;
+        shared
+            .bytes_written
+            .store(output.bytes_written(), Ordering::Release);
+    } else if section_base > 0 && source_had_bom {
+        // Preserve the source BOM for headerless interior sections so UTF-16LE/BE outputs
+        // reopen with the right encoding under Auto detection.
+        output.write_all(UTF8_BOM)?;
         shared
             .bytes_written
             .store(output.bytes_written(), Ordering::Release);
@@ -5892,23 +5911,37 @@ fn run_save_section_as(
                     fields[*col] = value.clone();
                 }
             }
+            let is_first_output_record = *rows_written == 0 && output.bytes_written() == 0;
             write_serialized_fields(
                 output,
                 prefix,
                 &fields,
                 delimiter,
                 ending,
-                section_base == 0 && row_idx == 0,
+                is_first_output_record,
                 config.max_record_bytes,
             )?;
-        } else if same_encoding {
-            output.write_raw_all(raw)?;
         } else {
-            let decoded = config
-                .source_encoding
-                .decode(raw, config.max_record_bytes)
-                .map_err(|error| crate::record_encoding_error(row_idx.saturating_add(1), error))?;
-            output.write_all(decoded.as_ref())?;
+            let guard_first = *rows_written == 0
+                && output.bytes_written() == 0
+                && !(section_base == 0 && row_idx == 0 && source_had_bom);
+            if guard_first {
+                output.begin_first_record_bom_guard(false);
+            }
+            if same_encoding && !guard_first {
+                output.write_raw_all(raw)?;
+            } else {
+                let decoded = config
+                    .source_encoding
+                    .decode(raw, config.max_record_bytes)
+                    .map_err(|error| {
+                        crate::record_encoding_error(row_idx.saturating_add(1), error)
+                    })?;
+                output.write_all(decoded.as_ref())?;
+            }
+            if guard_first {
+                output.finish_first_record_bom_guard()?;
+            }
         }
         *rows_written += 1;
         shared
