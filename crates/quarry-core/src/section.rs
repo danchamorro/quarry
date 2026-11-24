@@ -409,7 +409,9 @@ impl VerifyBoundaryJob {
 
         let target_base = original_bounds.requested.base.min(file_size);
         let start_checkpoint = parent_index
-            .filter(|idx| idx.matches_provenance(&source_stamp, delimiter, encoding))
+            .filter(|idx| {
+                idx.is_whole_file() && idx.matches_provenance(&source_stamp, delimiter, encoding)
+            })
             .map(|idx| idx.checkpoint_at_or_before_offset(target_base))
             .filter(|cp| cp.offset <= target_base)
             .unwrap_or(Checkpoint { row: 0, offset: 0 });
@@ -971,11 +973,15 @@ pub(crate) fn snap_section_window(
         .end()
         .ok_or(QuarryError::InvalidOption("section end overflow"))?;
 
-    // Tier 1: Validated checkpoint (or byte 0) within bounded synchronous scan distance.
+    // Tier 1: Validated whole-file checkpoint (or byte 0) within bounded synchronous scan distance.
+    // Section indexes store section-local row numbers and may be speculative, so never adopt one
+    // as a global parent index.
     let validated_cp = options
         .parent_index
         .as_ref()
-        .filter(|idx| idx.matches_provenance(source_stamp, delimiter, encoding))
+        .filter(|idx| {
+            idx.is_whole_file() && idx.matches_provenance(source_stamp, delimiter, encoding)
+        })
         .map(|idx| idx.checkpoint_at_or_before_offset(req_start))
         .filter(|cp| cp.offset <= req_start);
 
@@ -1021,8 +1027,9 @@ fn snap_from_validated_checkpoint(
 ) -> Result<SectionBounds, QuarryError> {
     let req_start = requested.base;
     let req_end = requested.end().unwrap();
+    let scan_target_end = align_up_code_unit(req_end, file_size, encoding);
     let max_scan_end = align_up_code_unit(
-        req_end.saturating_add(search_cap as u64),
+        scan_target_end.saturating_add(search_cap as u64),
         file_size,
         encoding,
     );
@@ -1037,7 +1044,14 @@ fn snap_from_validated_checkpoint(
     let mut aligned_end: Option<u64> = None;
 
     while cursor < max_scan_end && aligned_end.is_none() {
-        let step_cap = (max_scan_end - cursor).min(chunk.len() as u64) as usize;
+        // Read up to `scan_target_end` first, then advance past `req_end` in bounded slices
+        // truncated at the first encoding-aligned LF so malformed CSV after the closing record
+        // boundary in the same chunk never fails opening this valid section.
+        let step_cap = if cursor < scan_target_end {
+            (scan_target_end - cursor).min(chunk.len() as u64) as usize
+        } else {
+            (max_scan_end - cursor).min(4096).min(chunk.len() as u64) as usize
+        };
         let want = if encoding.is_utf16() && cursor + (step_cap as u64) < file_size {
             step_cap & !1
         } else {
@@ -1050,7 +1064,15 @@ fn snap_from_validated_checkpoint(
         if read < want {
             return Err(QuarryError::SourceChanged);
         }
-        scanner.scan_chunk(&chunk[..read], cursor, |record_end| {
+        let scan_slice = if cursor >= scan_target_end {
+            let first_lf = find_first_lf_end(&chunk[..read], cursor, encoding)
+                .map(|abs| (abs - cursor) as usize)
+                .unwrap_or(read);
+            &chunk[..first_lf.min(read)]
+        } else {
+            &chunk[..read]
+        };
+        scanner.scan_chunk(scan_slice, cursor, |record_end| {
             observe_record_for_bounds(
                 record_start,
                 record_end,
@@ -1064,7 +1086,7 @@ fn snap_from_validated_checkpoint(
             rows_counted += 1;
             record_start = record_end;
         })?;
-        cursor += read as u64;
+        cursor += scan_slice.len() as u64;
     }
 
     if aligned_end.is_none() && cursor == file_size {
@@ -2086,5 +2108,155 @@ mod tests {
         assert_eq!(odd_bounds.snapped.base % 2, 0);
         assert_eq!(odd_bounds.snapped_end() % 2, 0);
         assert!(odd_bounds.snapped_end() >= even_bounds.snapped_end());
+    }
+
+    #[test]
+    fn section_index_cannot_be_reused_as_whole_file_parent_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-section-parent.csv");
+        let mut data = b"id,val\n".to_vec();
+        for i in 0..500u64 {
+            data.extend_from_slice(format!("{i},row_{i:04}_padding\n").as_bytes());
+        }
+        fs::write(&path, &data).unwrap();
+
+        let sec1 = Session::open_section(
+            &path,
+            ByteWindow::from_range(200, 1200).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap();
+        let sec1_idx = sec1
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!sec1_idx.is_whole_file());
+
+        // Passing `sec1_idx` as `parent_index` must NOT mark a nested interior section as Verified
+        // with bogus section-local global row numbers.
+        let sec2 = Session::open_section(
+            &path,
+            ByteWindow::from_range(400, 800).unwrap(),
+            SectionOpenOptions {
+                parent_index: Some(sec1_idx),
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let bounds2 = sec2.section_bounds().unwrap();
+        assert_eq!(bounds2.trust, BoundaryTrust::Speculative);
+        assert_eq!(bounds2.first_global_row(), None);
+    }
+
+    #[test]
+    fn synchronous_counted_scan_stops_at_section_end_before_trailing_malformed_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing-malformed.csv");
+        fs::write(&path, b"a,b\nc,d\nbad\"quote,x\n").unwrap();
+
+        // Requesting [0, 4) (`a,b\n`) with explicit comma and NoHeader must succeed without
+        // parsing the malformed third row later in the same 256 KiB chunk.
+        let sec = Session::open_section(
+            &path,
+            ByteWindow::from_range(0, 4).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let bounds = sec.section_bounds().unwrap();
+        assert_eq!(bounds.trust, BoundaryTrust::Verified);
+        assert_eq!(bounds.snapped.base, 0);
+        assert_eq!(bounds.snapped_end(), 4);
+        assert_eq!(sec.first_rows.len(), 1);
+        assert_eq!(sec.first_rows[0].fields, vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn filtered_export_and_paused_filter_limit_stay_within_section_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("filtered-section.csv");
+        let mut data = b"id,tag\n".to_vec();
+        for i in 1..=20u64 {
+            data.extend_from_slice(format!("{i},match\n").as_bytes());
+        }
+        let sec_start = data.len() as u64;
+        for i in 21..=30u64 {
+            data.extend_from_slice(format!("{i},match\n").as_bytes());
+        }
+        let mid_section = data.len() as u64;
+        for i in 31..=40u64 {
+            data.extend_from_slice(format!("{i},match\n").as_bytes());
+        }
+        let sec_end = data.len() as u64;
+        for i in 41..=60u64 {
+            data.extend_from_slice(format!("{i},match\n").as_bytes());
+        }
+        fs::write(&path, &data).unwrap();
+
+        let sec = Session::open_section(
+            &path,
+            ByteWindow::from_range(sec_start, sec_end).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        // 1. Paused filter with absolute `max_bytes = mid_section` must stop at `mid_section`
+        // (10 rows: id 21..=30), NOT add `sec_start + mid_section` and scan the whole section.
+        let query = crate::FilterQuery {
+            predicates: vec![crate::FilterPredicate {
+                column: 1,
+                operator: crate::FilterOperator::Equals,
+                value: "match".into(),
+                upper_bound: None,
+            }],
+            case_sensitivity: crate::CaseSensitivity::Sensitive,
+        };
+        let partial_idx = sec
+            .start_filter_with_edits_and_limit(query.clone(), Arc::default(), Some(mid_section))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(partial_idx.matches_found(), 10);
+
+        // 2. Filtered export of the section with a section-local edit on local row 0 (id=21)
+        // must export ONLY the 20 matching rows inside `[sec_start, sec_end)` plus the byte-0
+        // header, applying the edit to local row 0 (id=21) and never including rows 1..=20 or 41..=60.
+        let out_path = dir.path().join("filtered-section-out.csv");
+        let mut cell_edits: BTreeMap<(u64, usize), Arc<Vec<u8>>> = BTreeMap::new();
+        cell_edits.insert((0u64, 1usize), Arc::new(b"match".to_vec()));
+        cell_edits.insert((0u64, 0usize), Arc::new(b"EDITED_21".to_vec()));
+        let outcome = sec
+            .start_filtered_export_with_edits(
+                query,
+                Arc::new(cell_edits),
+                BTreeMap::new(),
+                &out_path,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(outcome, crate::FilterExportOutcome::Complete(_)));
+        let exported = fs::read_to_string(&out_path).unwrap();
+        let lines: Vec<&str> = exported.lines().collect();
+        assert_eq!(lines.len(), 21, "header + 20 section rows");
+        assert_eq!(lines[0], "id,tag");
+        assert_eq!(lines[1], "EDITED_21,match");
+        assert_eq!(lines[20], "40,match");
+        assert!(!exported.contains("\n1,match\n"));
+        assert!(!exported.contains("\n41,match\n"));
     }
 }

@@ -802,8 +802,10 @@ impl Session {
         self.ensure_source_unchanged()?;
         let (section_base, section_end) = self.active_byte_range();
         let data_start = u64::from(self.dialect.has_header && section_base == 0);
+        // `max_bytes` is an absolute file offset (e.g. `StructuralIndex::committed_record_end()`),
+        // so clamp it within `[section_base, section_end]` instead of adding `section_base` again.
         let scan_limit = max_bytes
-            .map(|limit| section_base.saturating_add(limit).min(section_end))
+            .map(|limit| limit.clamp(section_base, section_end))
             .unwrap_or(section_end);
         FilterJob::start_with_range_edits_and_tuning(
             self.path.clone(),

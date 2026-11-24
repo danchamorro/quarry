@@ -138,6 +138,12 @@ impl StructuralIndex {
         Self::new_inner(config, section_base, Some(section_end))
     }
 
+    /// Returns `true` when this index covers the whole source file from byte 0 rather than a
+    /// bounded byte section (whose checkpoints store section-local row numbers).
+    pub fn is_whole_file(&self) -> bool {
+        self.section_base == 0 && self.section_end.is_none()
+    }
+
     fn new_inner(
         config: IndexConfig,
         section_base: u64,

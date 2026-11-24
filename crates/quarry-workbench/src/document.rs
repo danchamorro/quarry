@@ -413,6 +413,23 @@ impl Document {
         Ok(doc)
     }
 
+    /// Prepares a bounded section document at previously verified/snapped `preserved_bounds`
+    /// guarded by `expected_guard` (`Session::open_section_preserved`).
+    pub fn prepare_section_preserved(
+        path: &Path,
+        preserved_bounds: SectionBounds,
+        expected_guard: &quarry_core::SourceGuard,
+        mut options: SectionOpenOptions,
+    ) -> Result<Self, QuarryError> {
+        let quote_free = options.quote_free_confirmed;
+        options.open.rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS + 1;
+        let session =
+            Session::open_section_preserved(path, preserved_bounds, expected_guard, options)?;
+        let mut doc = Self::from_session(session, path);
+        doc.section_quote_free_confirmed = quote_free;
+        Ok(doc)
+    }
+
     /// Builds the view over an opened session; no worker starts here.
     pub fn from_session(session: Session, path: &Path) -> Self {
         Self::from_arc_session(Arc::new(session), path)
@@ -4945,6 +4962,12 @@ impl Document {
     }
 
     pub fn capture_join_document(&mut self, tab_id: u64) -> Result<CapturedDocument, String> {
+        if self.is_section() {
+            return Err(
+                "Open-tab Join is not supported for bounded section tabs yet; save the section as a new file to join it."
+                    .into(),
+            );
+        }
         self.commit_join_drafts()?;
         if self.has_structural_edits() && self.original_session.is_none() {
             return Err("The original source cannot be identified. Save a copy and reopen it before joining.".into());

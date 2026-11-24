@@ -642,7 +642,34 @@ impl Session {
         window: ByteWindow,
         options: SectionOpenOptions,
     ) -> Result<Self, QuarryError> {
-        let path = path.as_ref();
+        Self::open_section_inner(path.as_ref(), window, options, None)
+    }
+
+    /// Reopens a bounded byte section at previously validated `preserved_bounds` ONLY when the
+    /// underlying file still matches `expected_guard`; returns `QuarryError::SourceChanged` if
+    /// the file changed on disk. Used by verified boundary reopen and clean-section dormancy wake
+    /// so proven bounds (including multiline quoted starts past 16 MiB) are never re-snapped
+    /// speculatively when the file is unchanged.
+    pub fn open_section_preserved(
+        path: impl AsRef<Path>,
+        preserved_bounds: SectionBounds,
+        expected_guard: &SourceGuard,
+        options: SectionOpenOptions,
+    ) -> Result<Self, QuarryError> {
+        Self::open_section_inner(
+            path.as_ref(),
+            preserved_bounds.requested,
+            options,
+            Some((preserved_bounds, expected_guard)),
+        )
+    }
+
+    fn open_section_inner(
+        path: &Path,
+        window: ByteWindow,
+        options: SectionOpenOptions,
+        preserved: Option<(SectionBounds, &SourceGuard)>,
+    ) -> Result<Self, QuarryError> {
         validate_open_options(&options.open)?;
         if window.end().is_none() {
             return Err(QuarryError::InvalidOption(
@@ -663,6 +690,11 @@ impl Session {
             });
         }
         let source_stamp = SourceStamp::from_file(&file)?;
+        if let Some((_, expected_guard)) = preserved
+            && SourceGuard::from_stamp(source_stamp.clone()) != *expected_guard
+        {
+            return Err(QuarryError::SourceChanged);
+        }
         let file_size = source_stamp.file_size();
         let encoding = Encoding::detect(&mut file, options.encoding)?;
         if encoding.is_utf16() && options.open.bootstrap_limit < 2 {
@@ -751,16 +783,25 @@ impl Session {
             }
         };
 
-        let bounds = section::snap_section_window(
-            &file,
-            file_size,
-            delimiter,
-            encoding,
-            bom_len,
-            &source_stamp,
-            window,
-            &options,
-        )?;
+        let bounds = if let Some((preserved_bounds, _)) = preserved {
+            if preserved_bounds.snapped.end().is_none()
+                || preserved_bounds.snapped_end() > file_size
+            {
+                return Err(QuarryError::SourceChanged);
+            }
+            preserved_bounds
+        } else {
+            section::snap_section_window(
+                &file,
+                file_size,
+                delimiter,
+                encoding,
+                bom_len,
+                &source_stamp,
+                window,
+                &options,
+            )?
+        };
         let (first_rows, section_bytes_read) = section::read_section_initial_rows(
             &file,
             bounds.snapped.base,

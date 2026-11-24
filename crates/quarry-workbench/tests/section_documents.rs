@@ -360,3 +360,147 @@ fn clean_section_survives_dormancy_round_trip() {
     let _ = fs::remove_file(&path1);
     let _ = fs::remove_file(&path2);
 }
+
+#[test]
+fn verified_section_preserves_proof_across_dormancy_reloads_bounded_and_blocks_join() {
+    // Build a > 16 MiB file with a large multiline quoted record so parent-indexed Verified
+    // opening snaps to `quoted_start` whereas naive speculative alignment would snap inside.
+    let mut bytes = Vec::from(&b"id,note\n"[..]);
+    let pad = "a".repeat(60);
+    let mut i = 0u64;
+    while bytes.len() < 16 * 1024 * 1024 + 128 * 1024 {
+        bytes.extend_from_slice(format!("{i},{pad}\n").as_bytes());
+        i += 1;
+    }
+    let quoted_start = bytes.len() as u64;
+    bytes.extend_from_slice(format!("{i},\"open_line\n").as_bytes());
+    for k in 0..2400u64 {
+        bytes.extend_from_slice(format!("inner_{k:04},text_payload_line\n").as_bytes());
+    }
+    let interior = bytes.len() as u64 - 160;
+    bytes.extend_from_slice(b"closing_line\"\n");
+    let quoted_end = bytes.len() as u64;
+    bytes.extend_from_slice(b"999999,after\n");
+
+    let path1 = temp_csv("sec-verified-dormant", &bytes);
+    let path2 = temp_csv("sec-other-evictor", b"a,b\n1,2\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 2,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+
+    // 1. Open parent and wait for its full StructuralIndex, then open a section inside the
+    // multiline record so it borrows the parent index and becomes Verified at `[quoted_start, quoted_end)`.
+    let parent_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path1.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected parent outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, parent_id);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path1.clone(),
+            ByteWindow::new(interior, 64).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Verify section tab is excluded from open-tab Join choices and rejected by capture_join_document.
+    let join_ids: Vec<_> = scheduler
+        .hydrated_join_choices()
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert!(join_ids.contains(&parent_id));
+    assert!(!join_ids.contains(&sec_id));
+    assert!(
+        scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap()
+            .capture_join_document(sec_id.raw())
+            .is_err()
+    );
+
+    let orig_bounds = scheduler
+        .tab(sec_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .section_bounds()
+        .unwrap();
+    assert_eq!(orig_bounds.trust, BoundaryTrust::Verified);
+    assert_eq!(orig_bounds.snapped.base, quoted_start);
+    assert_eq!(orig_bounds.snapped_end(), quoted_end);
+
+    // 2. Close parent, open another file to evict the section (max_hydrated_tabs = 1 via new tab),
+    // wait: with max_hydrated_tabs = 2, close parent and open 2 files to evict sec_id.
+    scheduler.close_tab(parent_id).unwrap();
+    let path3 = temp_csv("sec-other-evictor-2", b"c,d\n3,4\n");
+    let _ = scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path2.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap();
+    let _ = scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path3.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        scheduler.residency(sec_id),
+        Some(ResidencyState::DormantClean)
+    );
+
+    // 3. Wake the section back up without any parent tab open: must preserve Verified trust,
+    // exact snapped range `[quoted_start, quoted_end)`, and global row number!
+    let _ = scheduler.activate_tab(WindowId::PRIMARY, sec_id).unwrap();
+    wait_for_index(&mut scheduler, sec_id);
+    let woken = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+    let woken_bounds = woken.section_bounds().unwrap();
+    assert_eq!(woken_bounds.trust, BoundaryTrust::Verified);
+    assert_eq!(woken_bounds.snapped, orig_bounds.snapped);
+    assert_eq!(
+        woken_bounds.first_global_row(),
+        orig_bounds.first_global_row()
+    );
+
+    // 4. Reload / reopen_tab on the section must keep it as a section, NEVER opening the whole file.
+    let _ = scheduler
+        .reopen_tab(WindowId::PRIMARY, sec_id, OpenOptions::default(), None)
+        .unwrap();
+    wait_for_index(&mut scheduler, sec_id);
+    let reloaded = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+    assert!(
+        reloaded.is_section(),
+        "reopen_tab on a section must keep it bounded as a section"
+    );
+
+    let _ = fs::remove_file(&path1);
+    let _ = fs::remove_file(&path2);
+    let _ = fs::remove_file(&path3);
+}

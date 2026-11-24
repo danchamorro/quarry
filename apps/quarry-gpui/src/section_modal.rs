@@ -142,17 +142,29 @@ impl OpenSectionDialogState {
                         Some(to) => {
                             self.to_bytes = to.min(self.file_size.max(from));
                             self.size_bytes = self.to_bytes.saturating_sub(self.from_bytes);
-                            let (to_val, _) = format_exact_bytes_in_unit(self.to_bytes, unit);
-                            let (size_val, _) = format_exact_bytes_in_unit(self.size_bytes, unit);
-                            self.suppress_sync = true;
-                            self.to_input.update(cx, |input, cx| {
-                                input.set_value(to_val.to_string(), window, cx);
-                            });
-                            self.size_input.update(cx, |input, cx| {
-                                input.set_value(size_val.to_string(), window, cx);
-                            });
-                            self.suppress_sync = false;
-                            self.validate_window();
+                            let factor = unit.factor();
+                            if factor > 1
+                                && (!self.from_bytes.is_multiple_of(factor)
+                                    || !self.to_bytes.is_multiple_of(factor)
+                                    || !self.size_bytes.is_multiple_of(factor))
+                            {
+                                // Switch the unit selector and all three fields to Bytes together
+                                // so displayed values always match the active unit label.
+                                self.sync_inputs_from_bytes(window, cx);
+                            } else {
+                                let (to_val, _) = format_exact_bytes_in_unit(self.to_bytes, unit);
+                                let (size_val, _) =
+                                    format_exact_bytes_in_unit(self.size_bytes, unit);
+                                self.suppress_sync = true;
+                                self.to_input.update(cx, |input, cx| {
+                                    input.set_value(to_val.to_string(), window, cx);
+                                });
+                                self.size_input.update(cx, |input, cx| {
+                                    input.set_value(size_val.to_string(), window, cx);
+                                });
+                                self.suppress_sync = false;
+                            }
+                            self.validate_all_inputs(cx);
                         }
                         None => {
                             self.error = Some("From + Size overflows 64-bit byte range.".into());
@@ -165,20 +177,32 @@ impl OpenSectionDialogState {
             },
             LastEditedField::Size => match parse_exact_byte_input(&size_str, unit) {
                 Ok(size) => {
-                    self.size_bytes = size;
-                    match self.from_bytes.checked_add(size) {
-                        Some(to) => {
-                            self.to_bytes = to;
-                            let (to_val, _) = format_exact_bytes_in_unit(self.to_bytes, unit);
-                            self.suppress_sync = true;
-                            self.to_input.update(cx, |input, cx| {
-                                input.set_value(to_val.to_string(), window, cx);
-                            });
-                            self.suppress_sync = false;
-                            self.validate_window();
+                    // Only derive `To` when `From` itself parses cleanly; otherwise keep `From`'s
+                    // error visible so invalid text in `From` cannot be masked.
+                    match parse_exact_byte_input(&from_str, unit) {
+                        Ok(from) => {
+                            self.from_bytes = from;
+                            self.size_bytes = size;
+                            match from.checked_add(size) {
+                                Some(to) => {
+                                    self.to_bytes = to;
+                                    let (to_val, _) =
+                                        format_exact_bytes_in_unit(self.to_bytes, unit);
+                                    self.suppress_sync = true;
+                                    self.to_input.update(cx, |input, cx| {
+                                        input.set_value(to_val.to_string(), window, cx);
+                                    });
+                                    self.suppress_sync = false;
+                                    self.validate_all_inputs(cx);
+                                }
+                                None => {
+                                    self.error =
+                                        Some("From + Size overflows 64-bit byte range.".into());
+                                }
+                            }
                         }
-                        None => {
-                            self.error = Some("From + Size overflows 64-bit byte range.".into());
+                        Err(err) => {
+                            self.error = Some(format!("From: {err}"));
                         }
                     }
                 }
@@ -188,20 +212,30 @@ impl OpenSectionDialogState {
             },
             LastEditedField::To => match parse_exact_byte_input(&to_str, unit) {
                 Ok(to) => {
-                    self.to_bytes = to;
-                    match to.checked_sub(self.from_bytes) {
-                        Some(size) => {
-                            self.size_bytes = size;
-                            let (size_val, _) = format_exact_bytes_in_unit(self.size_bytes, unit);
-                            self.suppress_sync = true;
-                            self.size_input.update(cx, |input, cx| {
-                                input.set_value(size_val.to_string(), window, cx);
-                            });
-                            self.suppress_sync = false;
-                            self.validate_window();
+                    // Re-parse `From` as well so invalid text in `From` cannot be masked by a valid `To`.
+                    match parse_exact_byte_input(&from_str, unit) {
+                        Ok(from) => {
+                            self.from_bytes = from;
+                            self.to_bytes = to;
+                            match to.checked_sub(from) {
+                                Some(size) => {
+                                    self.size_bytes = size;
+                                    let (size_val, _) =
+                                        format_exact_bytes_in_unit(self.size_bytes, unit);
+                                    self.suppress_sync = true;
+                                    self.size_input.update(cx, |input, cx| {
+                                        input.set_value(size_val.to_string(), window, cx);
+                                    });
+                                    self.suppress_sync = false;
+                                    self.validate_all_inputs(cx);
+                                }
+                                None => {
+                                    self.error = Some("To offset must be >= From offset.".into());
+                                }
+                            }
                         }
-                        None => {
-                            self.error = Some("To offset must be >= From offset.".into());
+                        Err(err) => {
+                            self.error = Some(format!("From: {err}"));
                         }
                     }
                 }
@@ -228,7 +262,7 @@ impl OpenSectionDialogState {
         self.to_bytes = self.from_bytes.saturating_add(kept_len).min(self.file_size);
         self.size_bytes = self.to_bytes.saturating_sub(self.from_bytes);
         self.sync_inputs_from_bytes(window, cx);
-        self.validate_window();
+        self.validate_all_inputs(cx);
         cx.notify();
     }
 
@@ -236,6 +270,44 @@ impl OpenSectionDialogState {
         let current = ByteWindow::offset_to_slider_fraction(self.from_bytes, self.file_size);
         let next = (current + (delta_pct as f64 / 100.0)).clamp(0.0, 0.99);
         self.apply_coarse_start_fraction(next, window, cx);
+    }
+
+    /// Re-parses all three visible input fields in `self.unit` and validates the resulting window
+    /// so stale cached bytes can never mask invalid input text in another field.
+    fn validate_all_inputs(&mut self, cx: &App) -> Option<ByteWindow> {
+        let unit = self.unit;
+        let from_str = self.from_input.read(cx).value().to_string();
+        let to_str = self.to_input.read(cx).value().to_string();
+        let size_str = self.size_input.read(cx).value().to_string();
+        let from = match parse_exact_byte_input(&from_str, unit) {
+            Ok(v) => v,
+            Err(err) => {
+                self.error = Some(format!("From: {err}"));
+                return None;
+            }
+        };
+        let to = match parse_exact_byte_input(&to_str, unit) {
+            Ok(v) => v,
+            Err(err) => {
+                self.error = Some(format!("To: {err}"));
+                return None;
+            }
+        };
+        let size = match parse_exact_byte_input(&size_str, unit) {
+            Ok(v) => v,
+            Err(err) => {
+                self.error = Some(format!("Size: {err}"));
+                return None;
+            }
+        };
+        if from.checked_add(size) != Some(to) {
+            self.error = Some("From + Size must equal To.".into());
+            return None;
+        }
+        self.from_bytes = from;
+        self.to_bytes = to;
+        self.size_bytes = size;
+        self.validate_window()
     }
 
     fn validate_window(&mut self) -> Option<ByteWindow> {
@@ -271,7 +343,7 @@ impl OpenSectionDialogState {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(byte_window) = self.validate_window() else {
+        let Some(byte_window) = self.validate_all_inputs(cx) else {
             cx.notify();
             return false;
         };

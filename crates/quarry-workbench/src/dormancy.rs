@@ -433,12 +433,18 @@ struct DormantDirtyState {
     _working_dir_fd_lease: Option<FdLease>,
 }
 
+#[derive(Clone, Copy)]
+struct DormantSectionSpec {
+    bounds: SectionBounds,
+    quote_free_confirmed: bool,
+}
+
 enum DormantKind {
     /// Clean plain file: `Session`, `StructuralIndex`, and row buffers fully dropped.
     CleanPlain {
         open_options: OpenOptions,
         encoding: Option<Encoding>,
-        section: Option<(ByteWindow, bool)>,
+        section: Option<DormantSectionSpec>,
     },
     /// Dirty document: sparse edits, history, working copy, and Undo/Redo dirs retained.
     Dirty(Box<DormantDirtyState>),
@@ -632,14 +638,14 @@ impl WorkbenchScheduler {
         if let Some(slot) = self.tabs.get(&id)
             && let SlotResidency::Dormant(dormant) = &slot.residency
             && let DormantKind::CleanPlain {
-                section: Some((window, _)),
+                section: Some(spec),
                 ..
             } = &dormant.kind
         {
             return Some(format!(
                 "{base} [{}–{}]",
-                crate::format_bytes(window.base),
-                crate::format_bytes(window.end().unwrap_or(u64::MAX)),
+                crate::format_bytes(spec.bounds.snapped.base),
+                crate::format_bytes(spec.bounds.snapped_end()),
             ));
         }
         Some(base)
@@ -1152,10 +1158,22 @@ impl WorkbenchScheduler {
         id: DocumentId,
         discard_unsaved: bool,
     ) -> Result<String, AppMessage> {
-        let (path, verified_bounds, open_options, encoding, quote_free) = {
-            let Some(doc) = self.tabs.get(&id).and_then(|s| s.tab.document.as_ref()) else {
+        let (path, verified_bounds, open_options, encoding, quote_free, expected_guard) = {
+            let Some(slot) = self.tabs.get(&id) else {
                 return Err(AppMessage::warning("Document is not hydrated."));
             };
+            let Some(doc) = slot.tab.document.as_ref() else {
+                return Err(AppMessage::warning("Document is not hydrated."));
+            };
+            if slot.tab.document_writing()
+                || doc.save_job.is_some()
+                || doc.export_job.is_some()
+                || doc.structural_job.is_some()
+            {
+                return Err(AppMessage::warning(
+                    "Wait for the active save or export to finish before reopening at verified boundaries.",
+                ));
+            }
             let Some(bounds) = doc.pending_verified_reopen else {
                 return Err(AppMessage::warning(
                     "No verified boundary update is pending for this section.",
@@ -1172,24 +1190,39 @@ impl WorkbenchScheduler {
                 doc.current_open_options(),
                 Some(doc.session.encoding()),
                 doc.section_quote_free_confirmed,
+                doc.session.source_guard(),
             )
         };
-        let parent_index = self.find_parent_index_for_path(&path);
         let options = SectionOpenOptions {
             open: open_options,
             encoding,
-            parent_index,
+            parent_index: None,
             quote_free_confirmed: quote_free,
             ..SectionOpenOptions::default()
         };
-        let mut replacement = Document::prepare_section(&path, verified_bounds.snapped, options)
-            .map_err(AppMessage::error)?;
+        let mut replacement = match Document::prepare_section_preserved(
+            &path,
+            verified_bounds,
+            &expected_guard,
+            options,
+        ) {
+            Ok(doc) => doc,
+            Err(quarry_core::QuarryError::SourceChanged) => {
+                if let Some(doc) = self.tabs.get_mut(&id).and_then(|s| s.tab.document.as_mut()) {
+                    doc.pending_verified_reopen = None;
+                    doc.source_changed = true;
+                }
+                return Err(AppMessage::warning(
+                    "The source file changed after boundary verification; reload or verify boundaries again.",
+                ));
+            }
+            Err(err) => return Err(AppMessage::error(err.to_string())),
+        };
         replacement.working_directory = self.config.working_directory.clone();
         replacement.custom_working_directory = self.config.custom_working_directory;
         replacement.index_cache_enabled = self.config.index_cache_enabled;
         replacement.working_cleanup = self.working_cleanup.clone();
         replacement.decompression_slots = self.decompression_slots.clone();
-        replacement.verified_bounds_override = Some(verified_bounds);
         replacement.section_verify_status = Some(
             if let Some(first) = replacement.global_data_row_number(replacement.data_start) {
                 format!(
@@ -2067,10 +2100,82 @@ impl WorkbenchScheduler {
             return Err(SchedulerError::NotFound(id));
         };
         let was_hydrated = matches!(slot.residency, SlotResidency::Hydrated { .. });
+        let existing_section = slot
+            .tab
+            .document
+            .as_ref()
+            .and_then(|doc| {
+                doc.section_bounds().map(|bounds| {
+                    (
+                        bounds,
+                        doc.section_quote_free_confirmed,
+                        doc.session.source_guard(),
+                        doc.session.dialect.delimiter,
+                        doc.session.encoding(),
+                    )
+                })
+            })
+            .or(match &slot.residency {
+                SlotResidency::Dormant(dormant) => match &dormant.kind {
+                    DormantKind::CleanPlain {
+                        open_options: prev_opts,
+                        encoding: prev_enc,
+                        section: Some(spec),
+                    } => Some((
+                        spec.bounds,
+                        spec.quote_free_confirmed,
+                        dormant.source_guard.clone(),
+                        prev_opts.delimiter.unwrap_or(b','),
+                        prev_enc.unwrap_or(Encoding::Utf8),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            });
 
         // Validate and prepare the replacement document BEFORE touching the existing slot.
-        let mut replacement = Document::prepare_with_encoding(&path, options, encoding)
-            .map_err(SchedulerError::OpenFailed)?;
+        // For section tabs, stay bounded to the section window instead of opening the whole parent.
+        let mut replacement = if let Some((
+            prev_bounds,
+            quote_free_confirmed,
+            prev_guard,
+            prev_delimiter,
+            prev_encoding,
+        )) = existing_section
+        {
+            let parent_index = self.find_parent_index_for_path(&path);
+            let same_framing = (options.delimiter.is_none()
+                || options.delimiter == Some(prev_delimiter))
+                && (encoding.is_none() || encoding == Some(prev_encoding));
+            let sec_opts = SectionOpenOptions {
+                open: options,
+                encoding,
+                parent_index,
+                quote_free_confirmed,
+                ..SectionOpenOptions::default()
+            };
+            if same_framing {
+                match Document::prepare_section_preserved(
+                    &path,
+                    prev_bounds,
+                    &prev_guard,
+                    sec_opts.clone(),
+                ) {
+                    Ok(doc) => doc,
+                    Err(quarry_core::QuarryError::SourceChanged) => {
+                        Document::prepare_section(&path, prev_bounds.requested, sec_opts)
+                            .map_err(SchedulerError::OpenFailed)?
+                    }
+                    Err(err) => return Err(SchedulerError::OpenFailed(err.to_string())),
+                }
+            } else {
+                Document::prepare_section(&path, prev_bounds.requested, sec_opts)
+                    .map_err(SchedulerError::OpenFailed)?
+            }
+        } else {
+            Document::prepare_with_encoding(&path, options, encoding)
+                .map_err(SchedulerError::OpenFailed)?
+        };
         if replacement.is_compressed() && !self.write_slot_available() {
             replacement.shutdown();
             return Err(SchedulerError::OpenFailed(
@@ -2111,6 +2216,13 @@ impl WorkbenchScheduler {
 
         // For Stub or Dormant tabs, shut down the pre-check document and hydrate normally now
         // that we know the target path + options + encoding open cleanly.
+        let replacement_section = replacement
+            .section_bounds()
+            .map(|bounds| DormantSectionSpec {
+                bounds,
+                quote_free_confirmed: replacement.section_quote_free_confirmed,
+            });
+        let replacement_guard = replacement.session.source_guard();
         replacement.shutdown();
         let canonical_path = canonicalize_best_effort(&path);
         let file_identity = FileIdentity::from_path(&path).ok().flatten();
@@ -2119,13 +2231,25 @@ impl WorkbenchScheduler {
             slot.tab.encoding_mode = encoding;
             slot.tab.notice = None;
             slot.tab.footer_status = None;
-            slot.residency = SlotResidency::Stub(LazyDocumentStub {
-                logical_path: path,
-                canonical_path,
-                file_identity,
-                open_options: options,
-                encoding,
-            });
+            if let Some(sec_spec) = replacement_section {
+                if let SlotResidency::Dormant(dormant) = &mut slot.residency {
+                    dormant.source_guard = replacement_guard;
+                    dormant.source_changed = false;
+                    dormant.kind = DormantKind::CleanPlain {
+                        open_options: options,
+                        encoding,
+                        section: Some(sec_spec),
+                    };
+                }
+            } else {
+                slot.residency = SlotResidency::Stub(LazyDocumentStub {
+                    logical_path: path,
+                    canonical_path,
+                    file_identity,
+                    open_options: options,
+                    encoding,
+                });
+            }
         }
         if self.active_by_window.get(&window) == Some(&id) {
             self.active_by_window.remove(&window);
@@ -3111,12 +3235,13 @@ impl WorkbenchScheduler {
         result
     }
 
-    /// Lists hydrated non-compressed tabs eligible as open-document inputs to Join Files.
+    /// Lists hydrated non-compressed whole-file tabs eligible as open-document inputs to Join Files.
     pub fn hydrated_join_choices(&self) -> Vec<(DocumentId, String, PathBuf)> {
         let mut choices = Vec::new();
         for (&id, slot) in &self.tabs {
             if let Some(doc) = slot.tab.document.as_ref()
                 && !doc.is_compressed()
+                && !doc.is_section()
             {
                 let label = doc
                     .logical_path
@@ -3819,9 +3944,10 @@ fn demote_document(
         }))
     } else {
         // Clean plain document: drop `Document` (including `Session`, `StructuralIndex`, buffers).
-        let section = doc
-            .section_bounds()
-            .map(|bounds| (bounds.requested, doc.section_quote_free_confirmed));
+        let section = doc.section_bounds().map(|bounds| DormantSectionSpec {
+            bounds,
+            quote_free_confirmed: doc.section_quote_free_confirmed,
+        });
         doc.shutdown();
         drop(doc);
         DormantKind::CleanPlain {
@@ -3940,15 +4066,15 @@ fn wake_dormant_document(
             encoding,
             section,
         } => {
-            let prepare_plain = |path: &Path| {
-                if let Some((window, quote_free_confirmed)) = section {
+            let prepare_fresh = |path: &Path| {
+                if let Some(spec) = section {
                     Document::prepare_section(
                         path,
-                        window,
+                        spec.bounds.requested,
                         SectionOpenOptions {
                             open: open_options,
                             encoding,
-                            quote_free_confirmed,
+                            quote_free_confirmed: spec.quote_free_confirmed,
                             ..SectionOpenOptions::default()
                         },
                     )
@@ -3959,7 +4085,7 @@ fn wake_dormant_document(
             if !source_unchanged {
                 // External file changed or vanished while dormant: never silently reload!
                 // Try opening a read-only shell if the file exists, or surface a conflict error.
-                let mut doc = match prepare_plain(&dormant.logical_path) {
+                let mut doc = match prepare_fresh(&dormant.logical_path) {
                     Ok(doc) => doc,
                     Err(message) => {
                         let restored = Box::new(DormantDocument {
@@ -4000,7 +4126,30 @@ fn wake_dormant_document(
                 ));
             }
 
-            let mut doc = match prepare_plain(&dormant.logical_path) {
+            let opened = if let Some(spec) = section {
+                match Document::prepare_section_preserved(
+                    &dormant.logical_path,
+                    spec.bounds,
+                    &dormant.source_guard,
+                    SectionOpenOptions {
+                        open: open_options,
+                        encoding,
+                        quote_free_confirmed: spec.quote_free_confirmed,
+                        ..SectionOpenOptions::default()
+                    },
+                ) {
+                    Ok(doc) => Ok(doc),
+                    Err(quarry_core::QuarryError::SourceChanged) => {
+                        // File changed between matches_path and open: reopen freshly without
+                        // reusing the old proof and mark source_changed below.
+                        prepare_fresh(&dormant.logical_path)
+                    }
+                    Err(err) => Err(err.to_string()),
+                }
+            } else {
+                Document::prepare_with_encoding(&dormant.logical_path, open_options, encoding)
+            };
+            let mut doc = match opened {
                 Ok(doc) => doc,
                 Err(message) => {
                     let restored = Box::new(DormantDocument {

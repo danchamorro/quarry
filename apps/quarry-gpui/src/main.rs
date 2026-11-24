@@ -2542,6 +2542,7 @@ impl QuarryWindow {
                         .label("Reopen Verified")
                         .primary()
                         .small()
+                        .disabled(snap.busy || snap.saving || snap.export_running)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.confirm_reopen_verified_section(window, cx);
                         })),

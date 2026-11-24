@@ -853,6 +853,80 @@ impl FilterExportJob {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn start_section_filtered_export(
+        source_path: PathBuf,
+        section_base: u64,
+        section_end: u64,
+        source_had_bom: bool,
+        delimiter: u8,
+        has_header: bool,
+        header_row: Option<crate::Row>,
+        query: FilterQuery,
+        destination: PathBuf,
+        config: ExportConfig,
+        edits: FilteredEdits,
+        stamp: SourceStamp,
+    ) -> Result<Self, QuarryError> {
+        if config.chunk_bytes == 0 {
+            return Err(QuarryError::InvalidOption(
+                "filter export chunk must be non-zero",
+            ));
+        }
+        let data_start = u64::from(has_header && section_base == 0);
+        validate_query(&query)?;
+        validate_filter_edits(&edits.cells, data_start, config.max_record_bytes)?;
+        if !has_header && !edits.headers.is_empty() {
+            return Err(QuarryError::InvalidOption(
+                "cannot rename headers in a headerless file",
+            ));
+        }
+        let source = File::open(&source_path)?;
+        let mut output = ExportTarget::new_guarded(&source_path, destination, &source, stamp)?;
+        output.configure(
+            config.source_encoding,
+            config.output_encoding,
+            config.max_record_bytes,
+        );
+        let section_len = section_end.saturating_sub(section_base);
+        let shared = Arc::new(SharedState::new(section_len));
+        let worker_state = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("quarry-section-export".into())
+            .spawn(move || {
+                let _completion = WorkerCompletion(&worker_state);
+                let result = run_section_filtered_export(
+                    source,
+                    output,
+                    section_base,
+                    section_end,
+                    source_had_bom,
+                    delimiter,
+                    has_header,
+                    header_row.as_ref(),
+                    &query,
+                    &edits,
+                    config,
+                    &worker_state,
+                );
+                match &result {
+                    Ok(FilterExportOutcome::Cancelled) => {
+                        worker_state.cancelled.store(true, Ordering::Release);
+                    }
+                    Err(error) => {
+                        *worker_state.error.lock().unwrap() = Some(error.to_string());
+                    }
+                    Ok(FilterExportOutcome::Complete(_)) => {}
+                }
+                result
+            })?;
+        Ok(Self {
+            shared,
+            handle: Some(handle),
+            _compressed: None,
+        })
+    }
+
     /// Keeps a compressed document's private copy until the worker is joined, even
     /// when the session that owned it closes first.
     fn retaining(mut self, compressed: Option<Arc<crate::compressed::CompressedBacking>>) -> Self {
@@ -1920,6 +1994,23 @@ impl Session {
         let requested_threads = crate::pool::resolve_worker_count(threads)?;
         self.check_uncompressed_destination(destination.as_ref())?;
         self.ensure_source_unchanged()?;
+        if let Some(meta) = &self.section {
+            return FilterExportJob::start_section_filtered_export(
+                self.path.clone(),
+                meta.bounds.snapped.base,
+                meta.bounds.snapped_end(),
+                meta.bom_len > 0,
+                self.dialect.delimiter,
+                self.dialect.has_header,
+                meta.header_row.clone(),
+                query,
+                destination.as_ref().to_path_buf(),
+                self.export_config(),
+                FilteredEdits { cells, headers },
+                self.source_stamp.clone(),
+            )
+            .map(|job| job.retaining(self.compressed.clone()));
+        }
         FilterExportJob::start_with_edits_and_tuning(
             self.path.clone(),
             self.file_size,
@@ -3510,6 +3601,242 @@ fn run_export(
             shared,
         )
     };
+    match scan_outcome {
+        Ok(ScanOutcome::Complete {
+            rows_written,
+            bytes_written,
+        }) => output.publish(rows_written, bytes_written, &shared.cancel_requested),
+        Ok(ScanOutcome::Cancelled) => {
+            output.discard()?;
+            Ok(FilterExportOutcome::Cancelled)
+        }
+        Err(error) => {
+            output.discard()?;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_section_filtered_export(
+    mut source: File,
+    mut output: ExportTarget,
+    section_base: u64,
+    section_end: u64,
+    source_had_bom: bool,
+    delimiter: u8,
+    has_header: bool,
+    header_row: Option<&crate::Row>,
+    query: &FilterQuery,
+    edits: &FilteredEdits,
+    config: ExportConfig,
+    shared: &SharedState,
+) -> Result<FilterExportOutcome, QuarryError> {
+    if shared.cancel_requested.load(Ordering::Acquire) {
+        output.discard()?;
+        return Ok(FilterExportOutcome::Cancelled);
+    }
+    let section_len = section_end.saturating_sub(section_base);
+    let header_estimate: u64 = header_row
+        .map(|row| row.fields.iter().map(|f| f.len() as u64 + 4).sum::<u64>() + 8)
+        .unwrap_or(0);
+    let required = crate::estimate_edited_output_bytes_from_values(
+        section_len.saturating_add(header_estimate),
+        0,
+        edits
+            .headers
+            .iter()
+            .map(|(&key, value)| (key, value.as_slice())),
+        edits
+            .cells
+            .iter()
+            .map(|(&key, value)| (key, value.as_slice())),
+        None,
+        None,
+    )
+    .saturating_mul(if config.output_encoding == crate::Encoding::Utf8 {
+        1
+    } else {
+        3
+    });
+    if let Err(err) = check_storage(output_parent(&output.destination), required) {
+        output.discard()?;
+        return Err(err);
+    }
+
+    let scan_outcome = (|| -> Result<ScanOutcome, QuarryError> {
+        let matchers = compile_matchers(query)?;
+        let groups = predicate_groups(query);
+        let data_start = u64::from(has_header && section_base == 0);
+        let mut rows_written = 0u64;
+        let mut bytes_written = 0u64;
+
+        if section_base > 0 && has_header {
+            let header = header_row.ok_or(QuarryError::InvalidOption(
+                "source does not contain a header row",
+            ))?;
+            let mut fields = header.fields.clone();
+            if let Some((&max_col, _)) = edits.headers.last_key_value()
+                && max_col >= fields.len()
+            {
+                return Err(QuarryError::InvalidOption(
+                    "header rename column is out of range",
+                ));
+            }
+            for (&col, value) in &edits.headers {
+                fields[col] = value.clone();
+            }
+            let prefix: &[u8] = if source_had_bom { UTF8_BOM } else { &[] };
+            write_serialized_fields(
+                &mut output,
+                prefix,
+                &fields,
+                delimiter,
+                b"\n",
+                true,
+                config.max_record_bytes,
+            )?;
+            rows_written += 1;
+            bytes_written = output.bytes_written();
+            shared.rows_written.store(rows_written, Ordering::Release);
+            shared.bytes_written.store(bytes_written, Ordering::Release);
+        }
+
+        if config.source_encoding.is_utf16() {
+            source.seek(SeekFrom::Start(section_base))?;
+        }
+        let mut scanner = crate::encoding::RecordScanner::at_offset(
+            delimiter,
+            section_base,
+            config.source_encoding,
+        )?;
+        let mut chunk = vec![0u8; config.source_encoding.chunk_size(config.chunk_bytes)];
+        let mut cursor = section_base;
+        let mut local_row = 0u64;
+        let mut record = Vec::new();
+
+        while cursor < section_end {
+            if shared.cancel_requested.load(Ordering::Acquire) {
+                return Ok(ScanOutcome::Cancelled);
+            }
+            let remaining = section_end - cursor;
+            let limit = chunk
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            let read = if config.source_encoding.is_utf16() {
+                config
+                    .source_encoding
+                    .read_chunk(&mut source, &mut chunk[..limit])?
+            } else {
+                crate::positional_io::read_at_exact_or_eof(&source, cursor, &mut chunk[..limit])?
+            };
+            if read == 0 {
+                return Err(QuarryError::SourceChanged);
+            }
+            let mut seg_start = 0usize;
+            let mut deferred_error = None;
+            let mut cancelled = false;
+            let scan_res = scanner.scan_chunk(&chunk[..read], cursor, |abs_end| {
+                let local_end = (abs_end - cursor) as usize;
+                if deferred_error.is_none() && !cancelled {
+                    if shared.cancel_requested.load(Ordering::Acquire) {
+                        cancelled = true;
+                    } else {
+                        let slice = &chunk[seg_start..local_end];
+                        let total_len = record.len().saturating_add(slice.len());
+                        if total_len > config.max_record_bytes {
+                            deferred_error = Some(QuarryError::RecordTooLarge {
+                                limit: config.max_record_bytes,
+                            });
+                        } else {
+                            let rec: &[u8] = if record.is_empty() {
+                                slice
+                            } else {
+                                record.extend_from_slice(slice);
+                                &record
+                            };
+                            if let Err(err) = process_record(
+                                rec,
+                                local_row,
+                                data_start,
+                                delimiter,
+                                query,
+                                edits,
+                                &matchers,
+                                &groups,
+                                config.max_record_bytes,
+                                source_had_bom && section_base == 0,
+                                &mut output,
+                                &mut rows_written,
+                                &mut bytes_written,
+                            ) {
+                                deferred_error = Some(err);
+                            }
+                        }
+                    }
+                }
+                record.clear();
+                local_row += 1;
+                seg_start = local_end;
+            });
+            if cancelled {
+                return Ok(ScanOutcome::Cancelled);
+            }
+            if let Some(err) = deferred_error {
+                return Err(err);
+            }
+            scan_res?;
+            if seg_start < read {
+                let tail = &chunk[seg_start..read];
+                if record.len().saturating_add(tail.len()) > config.max_record_bytes {
+                    return Err(QuarryError::RecordTooLarge {
+                        limit: config.max_record_bytes,
+                    });
+                }
+                record.extend_from_slice(tail);
+            }
+            cursor += read as u64;
+            shared
+                .bytes_scanned
+                .store(cursor.saturating_sub(section_base), Ordering::Release);
+            shared.rows_scanned.store(local_row, Ordering::Release);
+            shared.rows_written.store(rows_written, Ordering::Release);
+            shared.bytes_written.store(bytes_written, Ordering::Release);
+        }
+
+        if !record.is_empty() {
+            let mut finished = false;
+            scanner.finish(section_end, |_| {
+                finished = true;
+            })?;
+            if finished {
+                process_record(
+                    &record,
+                    local_row,
+                    data_start,
+                    delimiter,
+                    query,
+                    edits,
+                    &matchers,
+                    &groups,
+                    config.max_record_bytes,
+                    source_had_bom && section_base == 0,
+                    &mut output,
+                    &mut rows_written,
+                    &mut bytes_written,
+                )?;
+                local_row += 1;
+                shared.rows_scanned.store(local_row, Ordering::Release);
+                shared.rows_written.store(rows_written, Ordering::Release);
+                shared.bytes_written.store(bytes_written, Ordering::Release);
+            }
+        }
+        Ok(ScanOutcome::Complete {
+            rows_written,
+            bytes_written,
+        })
+    })();
+
     match scan_outcome {
         Ok(ScanOutcome::Complete {
             rows_written,
