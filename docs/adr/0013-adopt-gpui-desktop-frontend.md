@@ -1,6 +1,6 @@
 # ADR 0013: Adopt GPUI as Quarry's v1.0 desktop frontend
 
-**Status:** Accepted & Active (Phase 4B-3 macOS packaging and third-party notice cutover complete; `apps/quarry-egui` retained intact in the workspace for rollback until explicit post-cutover retirement sign-off)
+**Status:** Accepted & Active (Phase 4B-3 macOS packaging and third-party notice cutover complete; `apps/quarry-egui` retired from the workspace on 2026-11-24)
 **Date:** 2026-11-23
 **Supersedes:** [ADR 0003: Select egui for the production UI](0003-select-egui-ui.md)
 
@@ -44,7 +44,7 @@ Full raw measurements and environment details are recorded in [2026-11-23-phase4
 ## Consequences
 
 - **Active shipping desktop frontend:** `apps/quarry-gpui` is now the default macOS `.app` packaging target in `scripts/macos-app.sh` and the active notice target in `packaging/licenses/`.
-- **Rollback safety & deferred retirement:** `scripts/macos-app.sh rollback` restores verified pre-cutover `.app` backups (`Quarry-previous.zip`), and `apps/quarry-egui` remains intact in the Cargo workspace until explicit post-cutover owner sign-off authorizes its removal.
+- **Rollback safety & retirement:** `scripts/macos-app.sh rollback` restores verified `.app` backups (`Quarry-previous.zip`), and `apps/quarry-egui` was retired from the Cargo workspace on 2026-11-24 after owner sign-off.
 - **Upgrade discipline:** `gpui-kit` remains exact-pinned (`=0.10.0`). Any version bump must re-run the four-target `cargo tree` + linked-binary Zero-HTTP audit, both macOS and Linux accessibility checks, and notice audit.
 - **Linux packaging note:** Linux/Omarchy requires a working Vulkan ICD (`vulkan-virtio`, hardware Mesa/NVIDIA/Intel/AMD Vulkan driver, or `vulkan-swrast` fallback) for `wgpu` surface creation; Phase 9B Linux packaging docs and runtime diagnostics will surface clear guidance if no Vulkan ICD is installed.
 - **Next phases:** Phase 5+ desktop features (Large File Controller, Live Watch Mode, Focus Mode, Command Palette, Cell Inspector, Visual Join Preview, Pivot Tables) build directly on `apps/quarry-gpui` and `crates/quarry-workbench`.

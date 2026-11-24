@@ -258,15 +258,17 @@ Numeric filters and their exported results also have a separate 1 GB validation.
 - Stable Sort uses disk-backed runs and guarded publication rather than keeping
   every row in memory.
 
-The production desktop interface uses egui. The data engine remains independent
-of the UI framework and is exercised directly by the benchmark CLI.
+The production desktop interface uses GPUI (`apps/quarry-gpui`) over the
+frontend-neutral `crates/quarry-workbench` and `crates/quarry-core` crates.
+The data engine remains independent of the UI framework and is exercised
+directly by the benchmark CLI.
 
 ## Development
 
 Launch the desktop app directly from Cargo:
 
 ```bash
-cargo run --release -p quarry-egui -- huge.csv
+cargo run --release -p quarry-gpui -- huge.csv
 ```
 
 Run the benchmark-oriented CLI:
