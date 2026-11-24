@@ -17,6 +17,10 @@ parentheses are GitHub pull requests.
 - Added **Data → Pause / Resume Indexing** and an inline status-bar **Pause** / **Resume** control so large-file indexing can pause mid-scan without holding worker threads or file handles, while keeping Find and Filter usable up to the indexed row. (#206)
 - Added a per-window Live Resource HUD in the status bar showing process memory and available disk space on the document and temporary-storage volumes, with accessible status announcements on state changes. (#206)
 
+### Changed
+
+- Rewrote recent changelog entries (`2026-11-21` through `2026-11-24`) into a concise, plain-English style matching earlier releases. (#210)
+
 ### Removed
 
 - Retired the legacy egui desktop frontend (`apps/quarry-egui`) and its unused `eframe`/`egui_extras` dependencies after the GPUI cutover, leaving the GPUI app as Quarry's sole desktop frontend. Refreshed third-party license manifests and architecture docs while keeping upgrade cleanup for older installs in `scripts/macos-app.sh`. (#207)
