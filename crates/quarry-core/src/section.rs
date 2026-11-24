@@ -1660,6 +1660,125 @@ fn snap_speculative_window(
     })
 }
 
+/// Read at most `wanted` records from byte 0 for section header resolution, advancing line-by-line
+/// so malformed CSV after the `wanted`-th record in the same chunk is never parsed.
+pub(crate) fn read_header_probe_rows(
+    file: &File,
+    file_size: u64,
+    delimiter: u8,
+    wanted: usize,
+    limit: usize,
+    encoding: Encoding,
+) -> Result<(Vec<Row>, u64), QuarryError> {
+    if file_size == 0 || wanted == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let max_bytes = file_size.min(limit as u64);
+    let mut scanner = EncodedScanner::<false>::at_offset(delimiter, 0, encoding)?;
+    let chunk_cap = encoding.chunk_size(limit.clamp(4096, 64 * 1024));
+    let mut chunk = vec![0u8; chunk_cap];
+    let mut cursor = 0u64;
+    let mut record = Vec::new();
+    let mut record_start = 0u64;
+    let mut rows = Vec::with_capacity(wanted);
+    let mut physical_row = 0u64;
+
+    while rows.len() < wanted && cursor < max_bytes {
+        let remaining = max_bytes - cursor;
+        let want = chunk
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let want = if encoding.is_utf16() && cursor + (want as u64) < file_size {
+            want & !1
+        } else {
+            want
+        };
+        if want == 0 {
+            break;
+        }
+        let read = read_at_exact_or_eof(file, cursor, &mut chunk[..want])?;
+        if read == 0 {
+            break;
+        }
+        let mut pos = 0usize;
+        while pos < read && rows.len() < wanted {
+            let step_end = find_first_lf_end(&chunk[pos..read], cursor + pos as u64, encoding)
+                .map(|abs| (abs - cursor) as usize)
+                .unwrap_or(read)
+                .min(read);
+            let mut seg_start = pos;
+            let mut deferred_error = None;
+            scanner.scan_chunk(&chunk[pos..step_end], cursor + pos as u64, |record_end| {
+                let local_end = (record_end - cursor) as usize;
+                if rows.len() < wanted && deferred_error.is_none() {
+                    record.extend_from_slice(&chunk[seg_start..local_end]);
+                    if record.len() > DEFAULT_MAX_RECORD_BYTES {
+                        deferred_error = Some(QuarryError::RecordTooLarge {
+                            limit: DEFAULT_MAX_RECORD_BYTES,
+                        });
+                    } else {
+                        match crate::parse_encoded_record_with_bom(
+                            &record,
+                            delimiter,
+                            physical_row,
+                            record_start == 0,
+                            encoding,
+                        ) {
+                            Ok(fields) => rows.push(Row {
+                                offset: record_start,
+                                fields: fields.into_iter().map(|f| f.into_owned()).collect(),
+                            }),
+                            Err(err) => deferred_error = Some(err),
+                        }
+                    }
+                    record.clear();
+                }
+                physical_row += 1;
+                record_start = record_end;
+                seg_start = local_end;
+            })?;
+            if let Some(err) = deferred_error {
+                return Err(err);
+            }
+            if rows.len() < wanted && seg_start < step_end {
+                record.extend_from_slice(&chunk[seg_start..step_end]);
+                if record.len() > DEFAULT_MAX_RECORD_BYTES {
+                    return Err(QuarryError::RecordTooLarge {
+                        limit: DEFAULT_MAX_RECORD_BYTES,
+                    });
+                }
+            }
+            pos = step_end;
+        }
+        cursor += pos as u64;
+    }
+
+    if cursor == file_size && rows.len() < wanted && !record.is_empty() {
+        let mut finished = false;
+        scanner.finish(file_size, |_| {
+            finished = true;
+        })?;
+        if finished {
+            let fields = crate::parse_encoded_record_with_bom(
+                &record,
+                delimiter,
+                physical_row,
+                record_start == 0,
+                encoding,
+            )?
+            .into_iter()
+            .map(|f| f.into_owned())
+            .collect();
+            rows.push(Row {
+                offset: record_start,
+                fields,
+            });
+        }
+    }
+
+    Ok((rows, cursor))
+}
+
 /// Materialize initial rows strictly from `[section_start, section_end)` using positional `pread`
 /// (never seeking or scanning bytes before `section_start`).
 pub(crate) fn read_section_initial_rows(
@@ -2308,6 +2427,36 @@ mod tests {
         assert_eq!(bounds.snapped_end(), 4);
         assert_eq!(sec.first_rows.len(), 1);
         assert_eq!(sec.first_rows[0].fields, vec![b"a".to_vec(), b"b".to_vec()]);
+
+        // FirstRow and Auto header probes must also stop after collecting their 1 or 2 records
+        // so malformed row 3 later in the bootstrap chunk never breaks opening [0, 10).
+        let path2 = dir.path().join("trailing-malformed-headered.csv");
+        fs::write(&path2, b"h1,h2\na,b\nbad\"quote,x\n").unwrap();
+        for mode in [HeaderMode::FirstRow, HeaderMode::Auto] {
+            let sec_hdr = Session::open_section(
+                &path2,
+                ByteWindow::from_range(0, 10).unwrap(),
+                SectionOpenOptions {
+                    open: OpenOptions {
+                        delimiter: Some(b','),
+                        header_mode: mode,
+                        ..OpenOptions::default()
+                    },
+                    ..SectionOpenOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(sec_hdr.section_bounds().unwrap().snapped_end(), 10);
+            assert_eq!(sec_hdr.first_rows.len(), 2);
+            assert_eq!(
+                sec_hdr.first_rows[0].fields,
+                vec![b"h1".to_vec(), b"h2".to_vec()]
+            );
+            assert_eq!(
+                sec_hdr.first_rows[1].fields,
+                vec![b"a".to_vec(), b"b".to_vec()]
+            );
+        }
     }
 
     #[test]

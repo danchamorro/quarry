@@ -731,45 +731,28 @@ impl Session {
         };
 
         // Read only as many rows from byte 0 as needed to resolve headers (0 for NoHeader,
-        // 1 for FirstRow, 2 for Auto header detection).
+        // 1 for FirstRow, 2 for Auto header detection), stopping immediately at the closing
+        // record boundary so malformed CSV later in the file never breaks opening a valid section.
         let (has_header, header_row, byte0_bytes_read) = match options.open.header_mode {
             HeaderMode::NoHeader => (false, None, 0u64),
             HeaderMode::FirstRow => {
-                file.seek(SeekFrom::Start(0))?;
-                let (byte0_bootstrap, byte0_ends) = read_initial_records(
-                    &mut file,
-                    Some(file_size),
+                let (byte0_rows, bytes_read) = section::read_header_probe_rows(
+                    &file,
+                    file_size,
                     delimiter,
                     1,
                     options.open.bootstrap_limit,
                     encoding,
                 )?;
-                let byte0_rows = materialize_rows(
-                    &byte0_bootstrap,
-                    &byte0_ends[..byte0_ends.len().min(1)],
-                    delimiter,
-                    encoding,
-                )?;
-                (
-                    true,
-                    byte0_rows.into_iter().next(),
-                    byte0_bootstrap.len() as u64,
-                )
+                (true, byte0_rows.into_iter().next(), bytes_read)
             }
             HeaderMode::Auto => {
-                file.seek(SeekFrom::Start(0))?;
-                let (byte0_bootstrap, byte0_ends) = read_initial_records(
-                    &mut file,
-                    Some(file_size),
+                let (byte0_rows, bytes_read) = section::read_header_probe_rows(
+                    &file,
+                    file_size,
                     delimiter,
                     2,
                     options.open.bootstrap_limit,
-                    encoding,
-                )?;
-                let byte0_rows = materialize_rows(
-                    &byte0_bootstrap,
-                    &byte0_ends[..byte0_ends.len().min(2)],
-                    delimiter,
                     encoding,
                 )?;
                 let detected = detect_header(&byte0_rows);
@@ -778,7 +761,7 @@ impl Session {
                 } else {
                     None
                 };
-                (detected, header, byte0_bootstrap.len() as u64)
+                (detected, header, bytes_read)
             }
         };
 
