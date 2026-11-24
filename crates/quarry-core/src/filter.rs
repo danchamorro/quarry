@@ -4053,7 +4053,6 @@ mod tests {
                 header_mode: HeaderMode::FirstRow,
                 sample_bytes: 128,
                 bootstrap_limit: 128,
-                ..OpenOptions::default()
             },
         )
         .unwrap();
