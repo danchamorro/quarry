@@ -512,6 +512,7 @@ struct JobResumeContext {
 pub mod test_hooks {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
@@ -522,6 +523,10 @@ pub mod test_hooks {
     }
 
     type GateSignal = Arc<(Mutex<GateInner>, Condvar)>;
+
+    /// Fast-path count of installed pause gates so un-gated debug/test indexing never touches
+    /// the mutex or calls `fs::canonicalize` per chunk.
+    static ACTIVE_GATES: AtomicUsize = AtomicUsize::new(0);
 
     /// Deterministic path-scoped test barrier that pauses indexing after the first committed
     /// chunk until the test releases it or requests pause/cancel.
@@ -550,10 +555,9 @@ pub mod test_hooks {
                 }),
                 Condvar::new(),
             ));
-            registry()
-                .lock()
-                .unwrap()
-                .insert(key.clone(), Arc::clone(&inner));
+            let mut map = registry().lock().unwrap();
+            map.insert(key.clone(), Arc::clone(&inner));
+            ACTIVE_GATES.store(map.len(), Ordering::Release);
             Self { path: key, inner }
         }
 
@@ -585,11 +589,21 @@ pub mod test_hooks {
     impl Drop for TestIndexPauseGate {
         fn drop(&mut self) {
             self.release();
-            registry().lock().unwrap().remove(&self.path);
+            let mut map = registry().lock().unwrap();
+            if map
+                .get(&self.path)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &self.inner))
+            {
+                map.remove(&self.path);
+            }
+            ACTIVE_GATES.store(map.len(), Ordering::Release);
         }
     }
 
     pub(super) fn is_gated(path: &Path) -> bool {
+        if ACTIVE_GATES.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let gate = { registry().lock().unwrap().get(&key).cloned() };
         gate.is_some_and(|inner| !inner.0.lock().unwrap().released)
@@ -600,6 +614,9 @@ pub mod test_hooks {
         bytes_scanned: u64,
         stop_dispatch: &std::sync::atomic::AtomicBool,
     ) {
+        if ACTIVE_GATES.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let gate = { registry().lock().unwrap().get(&key).cloned() };
         let Some(inner) = gate else {
