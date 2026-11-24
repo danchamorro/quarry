@@ -3315,6 +3315,9 @@ impl WorkbenchController {
         let Some(id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
+        // Record the active document's pre-pause phase before issuing the pause request so a
+        // fast pause (before the first periodic poll tick) still announces Indexing -> Paused.
+        let _ = self.sync_resource_hud();
         self.scheduler.pause_indexing(id)?;
         let _ = self.sync_resource_hud();
         cx.notify();
@@ -3329,6 +3332,7 @@ impl WorkbenchController {
         let Some(id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
+        let _ = self.sync_resource_hud();
         self.scheduler.resume_indexing(id)?;
         let _ = self.sync_resource_hud();
         cx.notify();
