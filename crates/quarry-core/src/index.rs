@@ -513,6 +513,7 @@ pub mod test_hooks {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     struct GateInner {
         min_bytes: u64,
