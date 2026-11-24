@@ -3134,6 +3134,8 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
         assert!(window.find("section-browse-file").visible());
         assert!(window.find("section-unit-select").visible());
         assert!(window.find("section-encoding-select").visible());
+        assert!(window.find("section-delimiter-select").visible());
+        assert!(window.find("section-header-select").visible());
         assert!(window.find("section-quote-free").visible());
         assert!(window.find("section-open-confirm").visible());
         window.click("section-cancel", cx);
@@ -3357,4 +3359,55 @@ fn open_section_dialog_preserves_active_explicit_encoding_for_bomless_utf16le(
     );
     assert_eq!(sec_snap.headers, vec!["id".to_string(), "note".to_string()]);
     assert_eq!(sec_snap.total_rows, 2);
+
+    // Also verify explicit NoHeader + delimiter override are preserved when launching
+    // Open Section… from an active tab (so a headerless file never becomes headered).
+    let no_header_path = dir.path().join("explicit_no_header.csv");
+    std::fs::write(&no_header_path, "name;value\nalice;1\nbob;2\n").unwrap();
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![no_header_path.clone()],
+                    quarry_core::OpenOptions {
+                        delimiter: Some(b';'),
+                        header_mode: quarry_core::HeaderMode::NoHeader,
+                        ..quarry_core::OpenOptions::default()
+                    },
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.path == no_header_path && s.index_done)
+    });
+    let tabs_before_nh = cx.update(|cx| controller.read(cx).tabs_for_window(win_id).len());
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| q.open_section_dialog_now(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("section-delimiter-select").visible());
+        assert!(window.find("section-header-select").visible());
+        window.click("section-open-confirm", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        controller.read(cx).tabs_for_window(win_id).len() == tabs_before_nh + 1
+            && q.snapshot(cx)
+                .is_some_and(|s| s.section.is_some() && s.index_done)
+    });
+    let nh_sec = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(nh_sec.section.is_some());
+    assert!(!nh_sec.has_header);
+    assert_eq!(nh_sec.delimiter, b';');
+    assert_eq!(nh_sec.applied_delimiter, Some(b';'));
+    assert_eq!(
+        nh_sec.applied_header_mode,
+        quarry_core::HeaderMode::NoHeader
+    );
+    assert_eq!(nh_sec.total_rows, 3);
 }

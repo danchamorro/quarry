@@ -991,6 +991,7 @@ impl WorkbenchScheduler {
             let file_identity = FileIdentity::from_path(&path).ok().flatten();
             let id = self.allocate_id();
             let mut tab = WorkbenchTab::new(id.raw());
+            tab.delimiter_mode = crate::tab::DelimiterMode::from_delimiter(options.delimiter);
             tab.header_mode = options.header_mode;
             tab.encoding_mode = encoding;
             let stub = LazyDocumentStub {
@@ -1060,6 +1061,7 @@ impl WorkbenchScheduler {
             }
         };
 
+        let delimiter_mode = crate::tab::DelimiterMode::from_delimiter(options.open.delimiter);
         let header_mode = options.open.header_mode;
         let encoding_mode = options.encoding;
         let mut doc = match Document::prepare_section(&path, byte_window, options) {
@@ -1095,6 +1097,7 @@ impl WorkbenchScheduler {
 
         let id = self.allocate_id();
         let mut tab = WorkbenchTab::new(id.raw());
+        tab.delimiter_mode = delimiter_mode;
         tab.header_mode = header_mode;
         tab.encoding_mode = encoding_mode;
         tab.document = Some(doc);
@@ -1349,6 +1352,7 @@ impl WorkbenchScheduler {
         let file_identity = FileIdentity::from_path(&path).ok().flatten();
         let id = self.allocate_id();
         let mut tab = WorkbenchTab::new(id.raw());
+        tab.delimiter_mode = crate::tab::DelimiterMode::from_delimiter(options.delimiter);
         tab.header_mode = options.header_mode;
         tab.encoding_mode = encoding;
         let stub = LazyDocumentStub {
@@ -2250,6 +2254,8 @@ impl WorkbenchScheduler {
                     doc.shutdown();
                 }
                 slot.tab.document = Some(replacement);
+                slot.tab.delimiter_mode =
+                    crate::tab::DelimiterMode::from_delimiter(options.delimiter);
                 slot.tab.header_mode = options.header_mode;
                 slot.tab.encoding_mode = encoding;
                 slot.tab.notice = None;
@@ -2300,6 +2306,7 @@ impl WorkbenchScheduler {
         let file_identity = FileIdentity::from_path(&path).ok().flatten();
         let prev_active = self.active_by_window.get(&window).copied();
         let prev_slot_state = self.tabs.get_mut(&id).map(|slot| {
+            let old_delimiter_mode = slot.tab.delimiter_mode;
             let old_header_mode = slot.tab.header_mode;
             let old_encoding_mode = slot.tab.encoding_mode;
             let old_notice = slot.tab.notice.take();
@@ -2358,9 +2365,11 @@ impl WorkbenchScheduler {
                 })
             };
             let old_residency = std::mem::replace(&mut slot.residency, new_residency);
+            slot.tab.delimiter_mode = crate::tab::DelimiterMode::from_delimiter(options.delimiter);
             slot.tab.header_mode = options.header_mode;
             slot.tab.encoding_mode = encoding;
             (
+                old_delimiter_mode,
                 old_header_mode,
                 old_encoding_mode,
                 old_notice,
@@ -2377,6 +2386,7 @@ impl WorkbenchScheduler {
                 if let (
                     Some(slot),
                     Some((
+                        old_delimiter_mode,
                         old_header_mode,
                         old_encoding_mode,
                         old_notice,
@@ -2385,6 +2395,7 @@ impl WorkbenchScheduler {
                     )),
                 ) = (self.tabs.get_mut(&id), prev_slot_state)
                 {
+                    slot.tab.delimiter_mode = old_delimiter_mode;
                     slot.tab.header_mode = old_header_mode;
                     slot.tab.encoding_mode = old_encoding_mode;
                     slot.tab.notice = old_notice;

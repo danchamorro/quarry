@@ -45,6 +45,16 @@ impl DelimiterMode {
             Self::Semicolon => Some(b';'),
         }
     }
+
+    pub fn from_delimiter(delimiter: Option<u8>) -> Self {
+        match delimiter {
+            Some(b',') => Self::Comma,
+            Some(b'\t') => Self::Tab,
+            Some(b'|') => Self::Pipe,
+            Some(b';') => Self::Semicolon,
+            _ => Self::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

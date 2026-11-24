@@ -15,8 +15,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use quarry_core::{
-    ByteUnit, ByteWindow, Encoding, OpenOptions, SectionOpenOptions, format_exact_bytes_in_unit,
-    parse_exact_byte_input,
+    ByteUnit, ByteWindow, Encoding, HeaderMode, OpenOptions, SectionOpenOptions,
+    format_exact_bytes_in_unit, parse_exact_byte_input,
 };
 use quarry_workbench::format_bytes;
 
@@ -61,7 +61,56 @@ impl SelectItem for EncodingChoice {
     }
 }
 
+/// Active tab context pre-populated into the `Open Section…` modal.
+#[derive(Clone, Debug)]
+pub struct InitialSectionTarget {
+    pub path: PathBuf,
+    pub delimiter: Option<u8>,
+    pub header_mode: HeaderMode,
+    pub encoding: Option<Encoding>,
+}
+
 type EncodingSelectState = SelectState<SearchableVec<EncodingChoice>>;
+
+#[derive(Clone)]
+struct DelimiterChoice {
+    delimiter: Option<u8>,
+    label: &'static str,
+}
+
+impl SelectItem for DelimiterChoice {
+    type Value = Option<u8>;
+
+    fn title(&self) -> SharedString {
+        self.label.into()
+    }
+
+    fn value(&self) -> &Option<u8> {
+        &self.delimiter
+    }
+}
+
+type DelimiterSelectState = SelectState<SearchableVec<DelimiterChoice>>;
+
+#[derive(Clone)]
+struct HeaderModeChoice {
+    mode: HeaderMode,
+    label: &'static str,
+}
+
+impl SelectItem for HeaderModeChoice {
+    type Value = HeaderMode;
+
+    fn title(&self) -> SharedString {
+        self.label.into()
+    }
+
+    fn value(&self) -> &HeaderMode {
+        &self.mode
+    }
+}
+
+type HeaderModeSelectState = SelectState<SearchableVec<HeaderModeChoice>>;
 
 const ENCODING_CHOICES: [(Option<Encoding>, &str); 6] = [
     (None, "Auto"),
@@ -72,10 +121,38 @@ const ENCODING_CHOICES: [(Option<Encoding>, &str); 6] = [
     (Some(Encoding::Latin1), "ISO-8859-1"),
 ];
 
+const DELIMITER_CHOICES: [(Option<u8>, &str); 5] = [
+    (None, "Auto"),
+    (Some(b','), "Comma (,)"),
+    (Some(b'\t'), "Tab (\\t)"),
+    (Some(b'|'), "Pipe (|)"),
+    (Some(b';'), "Semicolon (;)"),
+];
+
+const HEADER_MODE_CHOICES: [(HeaderMode, &str); 3] = [
+    (HeaderMode::Auto, "Auto"),
+    (HeaderMode::FirstRow, "First row"),
+    (HeaderMode::NoHeader, "No header"),
+];
+
 fn encoding_choice_index(encoding: Option<Encoding>) -> usize {
     ENCODING_CHOICES
         .iter()
         .position(|(candidate, _)| *candidate == encoding)
+        .unwrap_or(0)
+}
+
+fn delimiter_choice_index(delimiter: Option<u8>) -> usize {
+    DELIMITER_CHOICES
+        .iter()
+        .position(|(candidate, _)| *candidate == delimiter)
+        .unwrap_or(0)
+}
+
+fn header_mode_choice_index(mode: HeaderMode) -> usize {
+    HEADER_MODE_CHOICES
+        .iter()
+        .position(|(candidate, _)| *candidate == mode)
         .unwrap_or(0)
 }
 
@@ -95,6 +172,12 @@ struct OpenSectionDialogState {
     encoding: Option<Encoding>,
     encoding_inherited: bool,
     encoding_select: Entity<EncodingSelectState>,
+    delimiter: Option<u8>,
+    delimiter_inherited: bool,
+    delimiter_select: Entity<DelimiterSelectState>,
+    header_mode: HeaderMode,
+    header_mode_inherited: bool,
+    header_select: Entity<HeaderModeSelectState>,
     from_input: Entity<InputState>,
     to_input: Entity<InputState>,
     size_input: Entity<InputState>,
@@ -114,12 +197,28 @@ impl OpenSectionDialogState {
         self.path = Some(path);
         self.file_size = size;
         self.quote_free_confirmed = false;
-        if path_changed && self.encoding_inherited {
-            self.encoding = None;
-            self.encoding_inherited = false;
-            self.encoding_select.update(cx, |sel, cx| {
-                sel.set_selected_index(Some(IndexPath::new(0)), window, cx);
-            });
+        if path_changed {
+            if self.encoding_inherited {
+                self.encoding = None;
+                self.encoding_inherited = false;
+                self.encoding_select.update(cx, |sel, cx| {
+                    sel.set_selected_index(Some(IndexPath::new(0)), window, cx);
+                });
+            }
+            if self.delimiter_inherited {
+                self.delimiter = None;
+                self.delimiter_inherited = false;
+                self.delimiter_select.update(cx, |sel, cx| {
+                    sel.set_selected_index(Some(IndexPath::new(0)), window, cx);
+                });
+            }
+            if self.header_mode_inherited {
+                self.header_mode = HeaderMode::Auto;
+                self.header_mode_inherited = false;
+                self.header_select.update(cx, |sel, cx| {
+                    sel.set_selected_index(Some(IndexPath::new(0)), window, cx);
+                });
+            }
         }
         let default_unit = ByteUnit::default_for_size(size);
         let default_size = size.min(10 * 1024 * 1024);
@@ -400,7 +499,11 @@ impl OpenSectionDialogState {
             return false;
         };
         let options = SectionOpenOptions {
-            open: OpenOptions::default(),
+            open: OpenOptions {
+                delimiter: self.delimiter,
+                header_mode: self.header_mode,
+                ..OpenOptions::default()
+            },
             encoding: self.encoding,
             parent_index: None,
             quote_free_confirmed: self.quote_free_confirmed,
@@ -422,8 +525,7 @@ impl OpenSectionDialogState {
 }
 
 pub fn open_section_dialog(
-    initial_path: Option<PathBuf>,
-    initial_encoding: Option<Encoding>,
+    initial_target: Option<InitialSectionTarget>,
     on_open_section: impl Fn(
         PathBuf,
         ByteWindow,
@@ -436,6 +538,13 @@ pub fn open_section_dialog(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let initial_path = initial_target.as_ref().map(|t| t.path.clone());
+    let initial_encoding = initial_target.as_ref().and_then(|t| t.encoding);
+    let initial_delimiter = initial_target.as_ref().and_then(|t| t.delimiter);
+    let initial_header_mode = initial_target
+        .as_ref()
+        .map(|t| t.header_mode)
+        .unwrap_or(HeaderMode::Auto);
     let initial_size = initial_path
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
@@ -481,6 +590,32 @@ pub fn open_section_dialog(
         SelectState::new(
             SearchableVec::new(encoding_items),
             Some(IndexPath::new(encoding_idx)),
+            window,
+            cx,
+        )
+    });
+    let delimiter_idx = delimiter_choice_index(initial_delimiter);
+    let delimiter_items: Vec<DelimiterChoice> = DELIMITER_CHOICES
+        .into_iter()
+        .map(|(delimiter, label)| DelimiterChoice { delimiter, label })
+        .collect();
+    let delimiter_select = cx.new(|cx| {
+        SelectState::new(
+            SearchableVec::new(delimiter_items),
+            Some(IndexPath::new(delimiter_idx)),
+            window,
+            cx,
+        )
+    });
+    let header_idx = header_mode_choice_index(initial_header_mode);
+    let header_items: Vec<HeaderModeChoice> = HEADER_MODE_CHOICES
+        .into_iter()
+        .map(|(mode, label)| HeaderModeChoice { mode, label })
+        .collect();
+    let header_select = cx.new(|cx| {
+        SelectState::new(
+            SearchableVec::new(header_items),
+            Some(IndexPath::new(header_idx)),
             window,
             cx,
         )
@@ -535,6 +670,36 @@ pub fn open_section_dialog(
                 },
             ),
             cx.subscribe_in(
+                &delimiter_select,
+                window,
+                |this: &mut OpenSectionDialogState,
+                 sel,
+                 _: &SelectEvent<SearchableVec<DelimiterChoice>>,
+                 _window,
+                 cx| {
+                    if let Some(&delimiter) = sel.read(cx).selected_value() {
+                        this.delimiter = delimiter;
+                        this.delimiter_inherited = false;
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &header_select,
+                window,
+                |this: &mut OpenSectionDialogState,
+                 sel,
+                 _: &SelectEvent<SearchableVec<HeaderModeChoice>>,
+                 _window,
+                 cx| {
+                    if let Some(&mode) = sel.read(cx).selected_value() {
+                        this.header_mode = mode;
+                        this.header_mode_inherited = false;
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
                 &from_input,
                 window,
                 |this: &mut OpenSectionDialogState, _, event: &InputEvent, window, cx| {
@@ -571,6 +736,12 @@ pub fn open_section_dialog(
             encoding: initial_encoding,
             encoding_inherited: initial_encoding.is_some(),
             encoding_select: encoding_select.clone(),
+            delimiter: initial_delimiter,
+            delimiter_inherited: initial_delimiter.is_some(),
+            delimiter_select: delimiter_select.clone(),
+            header_mode: initial_header_mode,
+            header_mode_inherited: initial_header_mode != HeaderMode::Auto,
+            header_select: header_select.clone(),
             from_input: from_input.clone(),
             to_input: to_input.clone(),
             size_input: size_input.clone(),
@@ -631,6 +802,8 @@ pub fn open_section_dialog(
                 let error_text = st.error.clone();
                 let unit_select = st.unit_select.clone();
                 let encoding_select = st.encoding_select.clone();
+                let delimiter_select = st.delimiter_select.clone();
+                let header_select = st.header_select.clone();
                 let from_input = st.from_input.clone();
                 let to_input = st.to_input.clone();
                 let size_input = st.size_input.clone();
@@ -731,23 +904,45 @@ pub fn open_section_dialog(
                                 .gap_2()
                                 .child(
                                     div()
-                                        .w(px(64.))
-                                        .text_size(px(12.))
-                                        .child("Encoding"),
-                                )
-                                .child(
-                                    div().w(px(130.)).child(
-                                        Select::new(&encoding_select)
-                                            .id("section-encoding-select")
-                                            .small()
-                                            .accessibility_label("Character encoding"),
-                                    ),
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(div().text_size(px(12.)).child("Encoding"))
+                                        .child(
+                                            Select::new(&encoding_select)
+                                                .id("section-encoding-select")
+                                                .small()
+                                                .accessibility_label("Character encoding"),
+                                        ),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(11.))
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("Auto detects BOM-marked files and defaults to UTF-8"),
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(div().text_size(px(12.)).child("Delimiter"))
+                                        .child(
+                                            Select::new(&delimiter_select)
+                                                .id("section-delimiter-select")
+                                                .small()
+                                                .accessibility_label("Field delimiter"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(div().text_size(px(12.)).child("Header"))
+                                        .child(
+                                            Select::new(&header_select)
+                                                .id("section-header-select")
+                                                .small()
+                                                .accessibility_label("Header row mode"),
+                                        ),
                                 ),
                         )
                         .child(
