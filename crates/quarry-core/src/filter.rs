@@ -4035,10 +4035,14 @@ mod tests {
 
     #[test]
     fn bounded_filter_reads_stop_at_scan_limit_and_ignore_edits_beyond_frontier() {
-        let prefix = b"id,val\n1,hit\n2,ok\n3,ok\n";
-        let malformed_suffix = b"4,\"bad\"trailing\n";
-        let mut data = Vec::new();
-        data.extend_from_slice(prefix);
+        let mut prefix = Vec::from(&b"id,val\n1,ok\n2,ok\n"[..]);
+        for i in 3..=10_000 {
+            prefix.extend_from_slice(format!("{i},ok\n").as_bytes());
+        }
+        prefix.extend_from_slice(b"10001,hit\n");
+        let malformed_suffix = b"10002,\"bad\"trailing\n";
+        let mut data = Vec::with_capacity(prefix.len() + malformed_suffix.len());
+        data.extend_from_slice(&prefix);
         data.extend_from_slice(malformed_suffix);
         let path = fixture(&data);
         let session = Session::open(
@@ -4047,14 +4051,14 @@ mod tests {
                 rows: 2,
                 delimiter: Some(b','),
                 header_mode: HeaderMode::FirstRow,
-                sample_bytes: prefix.len(),
+                sample_bytes: 256,
                 ..OpenOptions::default()
             },
         )
         .unwrap();
 
         let mut edits = BTreeMap::new();
-        edits.insert((99, 1), Arc::new(b"beyond_frontier_edit".to_vec()));
+        edits.insert((99_999, 1), Arc::new(b"beyond_frontier_edit".to_vec()));
         let query = FilterQuery::single(1, FilterOperator::Equals, b"hit".to_vec());
         let index = session
             .start_filter_with_edits_and_limit(query, Arc::new(edits), Some(prefix.len() as u64))
@@ -4064,7 +4068,7 @@ mod tests {
         assert_eq!(index.matches_found(), 1);
         let rows = session.read_filtered_rows(&index, 0, 10).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].row, 1);
+        assert_eq!(rows[0].row, 10_001);
         let async_rows = match session
             .start_filtered_read(&index, 0, 10)
             .unwrap()
