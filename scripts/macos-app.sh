@@ -469,6 +469,7 @@ self_test_rollback() {
     (
         trap cleanup EXIT
         LSREGISTER=/usr/bin/true
+        require_app_closed() { return 0; }
         restore_backup_app "$old_archive" >/dev/null
     ) || fail "valid archive restore failed; test data remains at $test_root"
     [[ "$(plist_value QuarryGitRevision "$INSTALL_APP/Contents/Info.plist")" == "rev-old" ]] \
@@ -479,6 +480,7 @@ self_test_rollback() {
     if (
         trap cleanup EXIT
         LSREGISTER=/usr/bin/true
+        require_app_closed() { return 0; }
         restore_backup_app "$corrupt_zip" >/dev/null 2>&1
     ); then
         fail "corrupt rollback archive was accepted; test data remains at $test_root"
@@ -493,6 +495,7 @@ self_test_rollback() {
     if (
         trap cleanup EXIT
         LSREGISTER=/usr/bin/true
+        require_app_closed() { return 0; }
         restore_backup_app "$wrong_zip" >/dev/null 2>&1
     ); then
         fail "wrong-shaped rollback archive was accepted; test data remains at $test_root"
@@ -514,6 +517,7 @@ EOF
     if (
         trap cleanup EXIT
         LSREGISTER="$fail_once_lsregister"
+        require_app_closed() { return 0; }
         restore_backup_app "$target_archive" >/dev/null 2>&1
     ); then
         fail "post-swap registration failure was not detected; test data remains at $test_root"
