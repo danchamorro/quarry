@@ -255,6 +255,7 @@ pub struct Document {
     pub search_case_sensitivity: CaseSensitivity,
     pub last_match: Option<SearchMatch>,
     pub search_history: Vec<SearchMatch>,
+    pub search_history_limits: Vec<Option<u64>>,
     pub search_history_index: Option<usize>,
     pub search_status: Option<String>,
     pub search_paused_row_limit: Option<u64>,
@@ -452,6 +453,7 @@ impl Document {
             search_case_sensitivity: CaseSensitivity::Insensitive,
             last_match: None,
             search_history: Vec::new(),
+            search_history_limits: Vec::new(),
             search_history_index: None,
             search_status: None,
             search_paused_row_limit: None,
@@ -2193,13 +2195,20 @@ impl Document {
             self.search_case_sensitivity = case_sensitivity;
             self.last_match = None;
             self.search_history.clear();
+            self.search_history_limits.clear();
             self.search_history_index = None;
         }
         if let Some(index) = self.search_history_index
             && let Some(found) = self.search_history.get(index.saturating_add(1)).copied()
         {
-            self.search_history_index = Some(index + 1);
-            return self.show_search_match(found);
+            let next_index = index + 1;
+            let limit = self
+                .search_history_limits
+                .get(next_index)
+                .copied()
+                .flatten();
+            self.search_history_index = Some(next_index);
+            return self.show_search_match_with_limit(found, limit);
         }
         let position = self.last_match.as_ref().map_or(
             SearchPosition {
@@ -2276,8 +2285,9 @@ impl Document {
         );
         let index = index.expect("a previous match was checked above");
         let found = self.search_history[index];
+        let limit = self.search_history_limits.get(index).copied().flatten();
         self.search_history_index = Some(index);
-        self.show_search_match(found)
+        self.show_search_match_with_limit(found, limit)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -2361,11 +2371,20 @@ impl Document {
         self.selected_rows.clear();
         if let Some(index) = self.search_history_index.take() {
             self.search_history.truncate(index);
+            self.search_history_limits.truncate(index);
         }
         self.start_find_next_with_case(query, case_sensitivity)
     }
 
     pub fn show_search_match(&mut self, found: SearchMatch) -> Result<(), String> {
+        self.show_search_match_with_limit(found, self.search_paused_row_limit)
+    }
+
+    fn show_search_match_with_limit(
+        &mut self,
+        found: SearchMatch,
+        paused_row_limit: Option<u64>,
+    ) -> Result<(), String> {
         let row = found.row;
         let column = found.column;
         self.navigate(row)?;
@@ -2377,7 +2396,7 @@ impl Document {
         self.column_selection_anchor = None;
         let data_row = row.saturating_sub(self.data_start).saturating_add(1);
         let data_col = column.saturating_add(1);
-        self.search_status = Some(if let Some(limit) = self.search_paused_row_limit {
+        self.search_status = Some(if let Some(limit) = paused_row_limit {
             format!(
                 "Found row {data_row}, column {data_col} (searched up to row {limit}, indexing paused)."
             )
@@ -2401,10 +2420,12 @@ impl Document {
             Ok(SearchOutcome::Match(found)) => {
                 if let Some(index) = self.search_history_index {
                     self.search_history.truncate(index + 1);
+                    self.search_history_limits.truncate(index + 1);
                 }
                 self.search_history.push(found);
+                self.search_history_limits.push(captured_paused_limit);
                 self.search_history_index = self.search_history.len().checked_sub(1);
-                self.show_search_match(found)?;
+                self.show_search_match_with_limit(found, captured_paused_limit)?;
             }
             Ok(SearchOutcome::NotFound) => {
                 self.search_status = Some(if let Some(limit) = captured_paused_limit {
@@ -3462,8 +3483,10 @@ impl Document {
         self.search_query.clear();
         self.last_match = None;
         self.search_history.clear();
+        self.search_history_limits.clear();
         self.search_history_index = None;
         self.search_status = None;
+        self.search_paused_row_limit = None;
         self.reveal_cell = None;
     }
 
@@ -3569,8 +3592,10 @@ impl Document {
         self.search_query.clear();
         self.last_match = None;
         self.search_history.clear();
+        self.search_history_limits.clear();
         self.search_history_index = None;
         self.search_status = None;
+        self.search_paused_row_limit = None;
         if self.session.path() == self.logical_path {
             self.working_copy = None;
             self.original_session = None;

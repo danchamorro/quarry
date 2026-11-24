@@ -3024,7 +3024,11 @@ fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut Tes
         });
     })
     .unwrap();
-    gate.wait_until_reached();
+    assert!(
+        gate.wait_until_reached(Duration::from_secs(10)),
+        "timed out waiting for UI pause gate to be reached: snapshot={:?}",
+        cx.update(|cx| view.read(cx).snapshot(cx)),
+    );
 
     cx.update_window(handle.into(), |_, window, cx| {
         view.update(cx, |q, cx| {

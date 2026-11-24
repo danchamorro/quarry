@@ -283,6 +283,17 @@ impl SearchJob {
                             Ok(outcome)
                         }
                     }
+                    Err(err @ QuarryError::RowNotIndexed { .. }) => {
+                        if let (Some(stamp), Some(guard_file)) = (&expected_source, &guard_file) {
+                            match crate::export::source_matches_stamp(guard_file, &path, stamp) {
+                                Ok(true) => Err(err),
+                                Ok(false) => Err(QuarryError::SourceChanged),
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            Err(err)
+                        }
+                    }
                     Err(error) => Err(error),
                 };
                 if let Err(error) = &result {

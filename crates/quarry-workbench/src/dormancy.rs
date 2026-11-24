@@ -3128,11 +3128,12 @@ fn doc_retained_dir_fds(doc: &Document) -> usize {
 const FILTER_JOB_AND_READ_FDS: usize = 3;
 
 fn doc_non_filter_job_fds(doc: &Document) -> usize {
-    // Index holds 1 FD; search holds 1 FD; filtered export, save, gzip decompression, and running
-    // structural workers each hold up to 2 FDs (source + destination); DuplicatePreview holds no
+    // Index holds 1 FD; search holds 2 FDs (source + cloned source-stamp guard handle);
+    // filtered export, save, and running structural workers each hold up to 2 FDs
+    // (source + destination); gzip decompression holds up to 4 FDs; DuplicatePreview holds no
     // running worker FDs.
     usize::from(doc.job.is_some())
-        + usize::from(doc.search_job.is_some())
+        + usize::from(doc.search_job.is_some()) * 2
         + usize::from(doc.export_job.is_some()) * 2
         + usize::from(doc.save_job.is_some()) * 2
         + usize::from(doc.decompression_running()) * 4

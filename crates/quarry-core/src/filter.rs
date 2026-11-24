@@ -772,7 +772,7 @@ impl Session {
             Some(self.source_stamp.clone()),
             self.encoding,
             FilterParallelTuning::for_production(requested_threads),
-            max_bytes.is_some(),
+            scan_limit < self.file_size,
         )
     }
 
@@ -4036,7 +4036,7 @@ mod tests {
     #[test]
     fn bounded_filter_reads_stop_at_scan_limit_and_ignore_edits_beyond_frontier() {
         let prefix = b"id,val\n1,hit\n2,ok\n3,ok\n";
-        let malformed_suffix = b"4,\"unterminated_quote\n";
+        let malformed_suffix = b"4,\"bad\"trailing\n";
         let mut data = Vec::new();
         data.extend_from_slice(prefix);
         data.extend_from_slice(malformed_suffix);

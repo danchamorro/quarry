@@ -556,13 +556,20 @@ pub mod test_hooks {
             Self { path: key, inner }
         }
 
-        /// Wait until the indexer has committed its initial partial chunk and reached the gate.
-        pub fn wait_until_reached(&self) {
+        /// Wait until the indexer has committed its initial partial chunk and reached the gate,
+        /// returning `false` if `timeout` elapses before the gate is reached.
+        pub fn wait_until_reached(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
             let (lock, cvar) = &*self.inner;
             let mut guard = lock.lock().unwrap();
             while !guard.reached {
-                guard = cvar.wait(guard).unwrap();
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                let (next, _) = cvar.wait_timeout(guard, remaining).unwrap();
+                guard = next;
             }
+            true
         }
 
         /// Allow the indexer to continue past the gate (e.g. after requesting pause).
@@ -3176,7 +3183,11 @@ mod tests {
         .unwrap();
 
         // Gate fires inside scan_giant_line_sequential after the 8-column parallel prefix committed.
-        gate.wait_until_reached();
+        assert!(
+            gate.wait_until_reached(Duration::from_secs(5)),
+            "timed out waiting for giant-line pause gate: progress={:?}",
+            job.progress(),
+        );
         assert_eq!(job.progress().columns_found, 8);
         assert!(job.progress().bytes_scanned > prefix_len);
         job.pause();

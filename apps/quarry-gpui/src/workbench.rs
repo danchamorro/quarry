@@ -2168,7 +2168,7 @@ impl WorkbenchController {
         };
         let reveal = self.scheduler.with_reserved_job_fds(
             doc_id,
-            1,
+            2,
             false,
             |doc| {
                 doc.start_find_next_with_case(&query, case_sensitivity)?;
@@ -2195,7 +2195,7 @@ impl WorkbenchController {
         };
         let reveal = self.scheduler.with_reserved_job_fds(
             doc_id,
-            1,
+            2,
             false,
             |doc| {
                 doc.start_find_previous_with_case(&query, case_sensitivity)?;
@@ -2223,7 +2223,7 @@ impl WorkbenchController {
         };
         let reveal = self.scheduler.with_reserved_job_fds(
             doc_id,
-            1,
+            2,
             false,
             |doc| {
                 doc.replace_current_match_with_case(&query, &replacement, case_sensitivity)?;
