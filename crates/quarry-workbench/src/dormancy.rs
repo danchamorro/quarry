@@ -1138,10 +1138,7 @@ impl WorkbenchScheduler {
     }
 
     pub fn cancel_verify_section_boundary(&mut self, id: DocumentId) {
-        if let Some(doc) = self
-            .tab_mut(id)
-            .and_then(|tab| tab.document.as_mut())
-        {
+        if let Some(doc) = self.tab_mut(id).and_then(|tab| tab.document.as_mut()) {
             doc.cancel_verify_section_boundary();
         }
         let _ = self.sync_fd_leases();
@@ -3547,11 +3544,9 @@ fn paths_alias(left: &Path, right: &Path) -> bool {
 
 fn slot_is_section(slot: &ManagedTab) -> bool {
     match &slot.residency {
-        SlotResidency::Hydrated { .. } => slot
-            .tab
-            .document
-            .as_ref()
-            .is_some_and(Document::is_section),
+        SlotResidency::Hydrated { .. } => {
+            slot.tab.document.as_ref().is_some_and(Document::is_section)
+        }
         SlotResidency::Dormant(dormant) => match &dormant.kind {
             DormantKind::CleanPlain { section, .. } => section.is_some(),
             DormantKind::Dirty(dirty) => dirty.session.is_section(),

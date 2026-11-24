@@ -3228,6 +3228,7 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
     .unwrap();
     wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
         controller.read(cx).tabs_for_window(win_id).len() == tabs_before + 1
-            && q.snapshot(cx).is_some_and(|s| s.section.is_some() && s.index_done)
+            && q.snapshot(cx)
+                .is_some_and(|s| s.section.is_some() && s.index_done)
     });
 }

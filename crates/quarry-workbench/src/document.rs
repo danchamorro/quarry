@@ -3087,7 +3087,10 @@ impl Document {
     }
 
     pub fn is_save_ready(&self) -> bool {
-        !self.is_compressed() && !self.is_section() && self.is_dirty() && self.save_operations_ready()
+        !self.is_compressed()
+            && !self.is_section()
+            && self.is_dirty()
+            && self.save_operations_ready()
     }
 
     pub fn has_reordered_columns(&self) -> bool {

@@ -20,8 +20,9 @@ use quarry_core::{
 };
 use quarry_workbench::format_bytes;
 
-type OpenSectionSubmitFn =
-    Box<dyn Fn(PathBuf, ByteWindow, SectionOpenOptions, &mut Window, &mut App) -> Result<(), String>>;
+type OpenSectionSubmitFn = Box<
+    dyn Fn(PathBuf, ByteWindow, SectionOpenOptions, &mut Window, &mut App) -> Result<(), String>,
+>;
 
 #[derive(Clone)]
 struct UnitChoice {
@@ -224,10 +225,7 @@ impl OpenSectionDialogState {
         let next_from = ByteWindow::slider_fraction_to_offset(fraction, self.file_size);
         let kept_len = self.size_bytes.max(1);
         self.from_bytes = next_from.min(self.file_size.saturating_sub(1));
-        self.to_bytes = self
-            .from_bytes
-            .saturating_add(kept_len)
-            .min(self.file_size);
+        self.to_bytes = self.from_bytes.saturating_add(kept_len).min(self.file_size);
         self.size_bytes = self.to_bytes.saturating_sub(self.from_bytes);
         self.sync_inputs_from_bytes(window, cx);
         self.validate_window();
@@ -305,7 +303,13 @@ impl OpenSectionDialogState {
 
 pub fn open_section_dialog(
     initial_path: Option<PathBuf>,
-    on_open_section: impl Fn(PathBuf, ByteWindow, SectionOpenOptions, &mut Window, &mut App) -> Result<(), String>
+    on_open_section: impl Fn(
+        PathBuf,
+        ByteWindow,
+        SectionOpenOptions,
+        &mut Window,
+        &mut App,
+    ) -> Result<(), String>
     + 'static,
     on_closed: impl Fn(&mut Window, &mut App) + 'static,
     window: &mut Window,
@@ -368,7 +372,11 @@ pub fn open_section_dialog(
             cx.subscribe_in(
                 &unit_select,
                 window,
-                |this: &mut OpenSectionDialogState, sel, _: &SelectEvent<SearchableVec<UnitChoice>>, window, cx| {
+                |this: &mut OpenSectionDialogState,
+                 sel,
+                 _: &SelectEvent<SearchableVec<UnitChoice>>,
+                 window,
+                 cx| {
                     if let Some(&unit) = sel.read(cx).selected_value() {
                         this.unit = unit;
                         this.sync_inputs_from_bytes(window, cx);

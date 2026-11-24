@@ -490,7 +490,12 @@ impl FilterJob {
         index.edits = edits;
         index.source = Some(source.clone());
         index.scan_limit = (bounded_scan || section_base > 0).then_some(scan_end);
-        let shared = Arc::new(SharedState::new(index, section_base, scan_end, bounded_scan));
+        let shared = Arc::new(SharedState::new(
+            index,
+            section_base,
+            scan_end,
+            bounded_scan,
+        ));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("quarry-filter".into())
@@ -1219,7 +1224,11 @@ fn run_filter(
         let read = if remaining == 0 {
             0
         } else {
-            let cap = encoding.chunk_size(usize::try_from(remaining).unwrap_or(usize::MAX).min(chunk.len()));
+            let cap = encoding.chunk_size(
+                usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(chunk.len()),
+            );
             encoding.read_chunk(&mut file, &mut chunk[..cap])?
         };
         if read == 0 {
@@ -1258,9 +1267,10 @@ fn run_filter(
                 record.clear();
             });
             publish_matches(shared, &mut pending_matches);
-            shared
-                .bytes_scanned
-                .store(absolute_start.saturating_sub(shared.section_base), Ordering::Release);
+            shared.bytes_scanned.store(
+                absolute_start.saturating_sub(shared.section_base),
+                Ordering::Release,
+            );
             shared
                 .rows_scanned
                 .store(records_scanned, Ordering::Release);
@@ -1364,9 +1374,10 @@ fn run_filter(
 
         absolute_start += read as u64;
         publish_matches(shared, &mut pending_matches);
-        shared
-            .bytes_scanned
-            .store(absolute_start.saturating_sub(shared.section_base), Ordering::Release);
+        shared.bytes_scanned.store(
+            absolute_start.saturating_sub(shared.section_base),
+            Ordering::Release,
+        );
         shared
             .rows_scanned
             .store(records_scanned, Ordering::Release);

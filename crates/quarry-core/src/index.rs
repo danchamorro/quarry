@@ -261,9 +261,10 @@ impl StructuralIndex {
             return;
         };
         let bucket = offset.saturating_sub(self.section_base) / stride;
-        let last_bucket = self.checkpoints.last().map_or(0, |cp| {
-            cp.offset.saturating_sub(self.section_base) / stride
-        });
+        let last_bucket = self
+            .checkpoints
+            .last()
+            .map_or(0, |cp| cp.offset.saturating_sub(self.section_base) / stride);
         if bucket <= last_bucket {
             return;
         }
@@ -1467,9 +1468,7 @@ fn run_sequential_indexer_range(
                     .store(index.indexed_rows, Ordering::Release);
             }
             absolute_start = next_offset;
-            shared
-                .bytes_scanned
-                .store(scanned_rel, Ordering::Release);
+            shared.bytes_scanned.store(scanned_rel, Ordering::Release);
             #[cfg(any(test, debug_assertions))]
             if absolute_start < range_end {
                 test_hooks::wait_if_gated(&shared.path, scanned_rel, &shared.stop_dispatch);
@@ -1545,9 +1544,7 @@ fn run_sequential_indexer_range(
                     .store(index.indexed_rows, Ordering::Release);
             }
             absolute_start = next_offset;
-            shared
-                .bytes_scanned
-                .store(scanned_rel, Ordering::Release);
+            shared.bytes_scanned.store(scanned_rel, Ordering::Release);
             #[cfg(any(test, debug_assertions))]
             if absolute_start < range_end {
                 test_hooks::wait_if_gated(&shared.path, scanned_rel, &shared.stop_dispatch);

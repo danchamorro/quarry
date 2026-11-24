@@ -73,7 +73,12 @@ fn section_borrows_parent_index_and_coexists_with_parent_tab() {
     scheduler.register_window(WindowId::PRIMARY);
 
     let parent_id = match scheduler
-        .open_path(WindowId::PRIMARY, path.clone(), OpenOptions::default(), None)
+        .open_path(
+            WindowId::PRIMARY,
+            path.clone(),
+            OpenOptions::default(),
+            None,
+        )
         .unwrap()
     {
         WakeOutcome::Ready { document_id, .. } => document_id,
@@ -99,7 +104,12 @@ fn section_borrows_parent_index_and_coexists_with_parent_tab() {
     );
     wait_for_index(&mut scheduler, section_id);
 
-    let doc = scheduler.tab(section_id).unwrap().document.as_ref().unwrap();
+    let doc = scheduler
+        .tab(section_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap();
     let bounds = doc.section_bounds().unwrap();
     assert_eq!(bounds.trust, BoundaryTrust::Verified);
     assert!(bounds.first_global_row().is_some());
@@ -134,7 +144,9 @@ fn dirty_speculative_section_preserves_drafts_on_boundary_shift_and_exports_clea
     // > 70 KiB of CSV-looking lines inside the multiline quote so the bounded 64 KiB speculative
     // validator genuinely lands on `interior_lf_after` while Verify Boundary detects `quoted_start`.
     for k in 0..2600u64 {
-        bytes.extend_from_slice(format!("{},inside_{k:04}_padding_for_quote_test\n", 5000 + k).as_bytes());
+        bytes.extend_from_slice(
+            format!("{},inside_{k:04}_padding_for_quote_test\n", 5000 + k).as_bytes(),
+        );
     }
     bytes.extend_from_slice(b"end_of_quote\"\n");
     for j in 0..30u64 {
@@ -214,7 +226,10 @@ fn dirty_speculative_section_preserves_drafts_on_boundary_shift_and_exports_clea
             bounds,
             boundary_changed,
         } => {
-            assert!(boundary_changed, "multiline quote must shift start boundary");
+            assert!(
+                boundary_changed,
+                "multiline quote must shift start boundary"
+            );
             assert_eq!(bounds.snapped.base, quoted_start);
             assert_eq!(bounds.trust, BoundaryTrust::Verified);
             assert_eq!(bounds.first_global_row(), Some(i + 1));
@@ -224,7 +239,12 @@ fn dirty_speculative_section_preserves_drafts_on_boundary_shift_and_exports_clea
 
     // Verify edits are still intact and pending_verified_reopen is set.
     {
-        let doc = scheduler.tab(section_id).unwrap().document.as_ref().unwrap();
+        let doc = scheduler
+            .tab(section_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap();
         assert!(doc.is_dirty(), "draft edit must be preserved");
         assert!(doc.pending_verified_reopen.is_some());
     }
@@ -256,7 +276,12 @@ fn dirty_speculative_section_preserves_drafts_on_boundary_shift_and_exports_clea
     let notice = scheduler.reopen_verified_section(section_id).unwrap();
     assert!(notice.contains("verified"));
     wait_for_index(&mut scheduler, section_id);
-    let doc = scheduler.tab(section_id).unwrap().document.as_ref().unwrap();
+    let doc = scheduler
+        .tab(section_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap();
     assert_eq!(doc.section_trust(), Some(BoundaryTrust::Verified));
     assert_eq!(doc.section_first_global_row(), Some(i + 1));
     assert_eq!(doc.section_bounds().unwrap().snapped.base, quoted_start);
@@ -304,9 +329,17 @@ fn clean_section_survives_dormancy_round_trip() {
 
     // Open a second file with max_hydrated_tabs = 1 -> evicts the clean section to dormancy.
     let _ = scheduler
-        .open_path(WindowId::PRIMARY, path2.clone(), OpenOptions::default(), None)
+        .open_path(
+            WindowId::PRIMARY,
+            path2.clone(),
+            OpenOptions::default(),
+            None,
+        )
         .unwrap();
-    assert_eq!(scheduler.residency(sec_id), Some(ResidencyState::DormantClean));
+    assert_eq!(
+        scheduler.residency(sec_id),
+        Some(ResidencyState::DormantClean)
+    );
 
     // Wake the section tab back up and verify section bounds & headers survived cleanly.
     let _ = scheduler.activate_tab(WindowId::PRIMARY, sec_id).unwrap();

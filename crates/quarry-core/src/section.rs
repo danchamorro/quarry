@@ -475,7 +475,9 @@ impl VerifyBoundaryJob {
             if resuming {
                 state.pause_requested = false;
                 state.paused = false;
-                worker_shared.pause_requested.store(false, Ordering::Release);
+                worker_shared
+                    .pause_requested
+                    .store(false, Ordering::Release);
                 worker_shared.paused.store(false, Ordering::Release);
             }
         }
@@ -766,29 +768,35 @@ fn run_verify_boundary(
         .unwrap_or(ctx.file_size)
         .min(ctx.file_size);
 
-    let (mut cursor, mut rows_counted, mut aligned_start, mut first_global_row, mut record_start, mut scanner) =
-        match resume_from {
-            Some(state) => (
-                state.cursor,
-                state.rows_counted,
-                state.aligned_start,
-                state.first_global_row,
-                state.record_start,
-                state.scanner,
-            ),
-            None => (
+    let (
+        mut cursor,
+        mut rows_counted,
+        mut aligned_start,
+        mut first_global_row,
+        mut record_start,
+        mut scanner,
+    ) = match resume_from {
+        Some(state) => (
+            state.cursor,
+            state.rows_counted,
+            state.aligned_start,
+            state.first_global_row,
+            state.record_start,
+            state.scanner,
+        ),
+        None => (
+            ctx.start_checkpoint.offset,
+            ctx.start_checkpoint.row,
+            None,
+            None,
+            ctx.start_checkpoint.offset,
+            Box::new(EncodedScanner::<false>::at_offset(
+                ctx.delimiter,
                 ctx.start_checkpoint.offset,
-                ctx.start_checkpoint.row,
-                None,
-                None,
-                ctx.start_checkpoint.offset,
-                Box::new(EncodedScanner::<false>::at_offset(
-                    ctx.delimiter,
-                    ctx.start_checkpoint.offset,
-                    ctx.encoding,
-                )?),
-            ),
-        };
+                ctx.encoding,
+            )?),
+        ),
+    };
 
     let chunk_size = ctx.encoding.chunk_size(256 * 1024);
     let mut chunk = vec![0u8; chunk_size];
@@ -980,9 +988,7 @@ pub(crate) fn snap_section_window(
     };
 
     if let Some(cp) = sync_cp {
-        return snap_from_validated_checkpoint(
-            file, file_size, delimiter, encoding, clamped, cp,
-        );
+        return snap_from_validated_checkpoint(file, file_size, delimiter, encoding, clamped, cp);
     }
 
     let search_cap = options
@@ -992,9 +998,7 @@ pub(crate) fn snap_section_window(
     // Tier 2: User-confirmed quote-free dialect (`quote = None`) with encoding-aligned terminators.
     // Note: global row ordinal remains unknown (`first_global_row() == None`).
     if options.quote_free_confirmed {
-        return snap_quote_free_verified(
-            file, file_size, encoding, bom_len, clamped, search_cap,
-        );
+        return snap_quote_free_verified(file, file_size, encoding, bom_len, clamped, search_cap);
     }
 
     // Tier 3: Bounded `<= 1 MiB` two-state speculative LF alignment.
@@ -1200,10 +1204,8 @@ fn snap_quote_free_verified(
         0
     } else {
         let end_probe = align_down_code_unit(req_start, encoding);
-        let probe_start = align_down_code_unit(
-            end_probe.saturating_sub(search_cap as u64),
-            encoding,
-        );
+        let probe_start =
+            align_down_code_unit(end_probe.saturating_sub(search_cap as u64), encoding);
         let probe_len = (end_probe - probe_start) as usize;
         let mut buf = vec![0u8; probe_len];
         let read = read_at_exact_or_eof(file, probe_start, &mut buf)?;
@@ -1231,11 +1233,7 @@ fn snap_quote_free_verified(
             && (!encoding.is_utf16() || req_end.is_multiple_of(2))
         {
             let mut prev = [0u8; 2];
-            let n = read_at_exact_or_eof(
-                file,
-                req_end - unit_len,
-                &mut prev[..unit_len as usize],
-            )?;
+            let n = read_at_exact_or_eof(file, req_end - unit_len, &mut prev[..unit_len as usize])?;
             n == unit_len as usize && is_lf_unit(&prev[..unit_len as usize], encoding)
         } else {
             false
@@ -1343,10 +1341,8 @@ fn snap_speculative_window(
         0
     } else {
         let probe_end = align_down_code_unit(req_start, encoding);
-        let probe_start = align_down_code_unit(
-            probe_end.saturating_sub(search_cap as u64),
-            encoding,
-        );
+        let probe_start =
+            align_down_code_unit(probe_end.saturating_sub(search_cap as u64), encoding);
         let probe_len = (probe_end - probe_start) as usize;
         let mut buf = vec![0u8; probe_len];
         let read = read_at_exact_or_eof(file, probe_start, &mut buf)?;
@@ -1444,11 +1440,7 @@ fn snap_speculative_window(
             && (!encoding.is_utf16() || req_end.is_multiple_of(2))
         {
             let mut prev = [0u8; 2];
-            let n = read_at_exact_or_eof(
-                file,
-                req_end - unit_len,
-                &mut prev[..unit_len as usize],
-            )?;
+            let n = read_at_exact_or_eof(file, req_end - unit_len, &mut prev[..unit_len as usize])?;
             n == unit_len as usize
                 && is_lf_unit(&prev[..unit_len as usize], encoding)
                 && validate_speculative_candidate(file, file_size, req_end, delimiter, encoding)?
@@ -1812,7 +1804,9 @@ mod tests {
         // bounded speculative probe legitimately accepts `interior_lf_after`, while the true
         // opening quote at `quoted_start` is only discovered by `VerifyBoundaryJob`.
         for k in 0..2600 {
-            data.extend_from_slice(format!("{},inside_quote_{k:04}_padding_text\n", 500 + k).as_bytes());
+            data.extend_from_slice(
+                format!("{},inside_quote_{k:04}_padding_text\n", 500 + k).as_bytes(),
+            );
         }
         data.extend_from_slice(b"closing_line\"\n");
         let quoted_end = data.len() as u64;
@@ -1964,8 +1958,14 @@ mod tests {
         let rows = section.read_rows(&index, 0, 10).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].offset, eighteen_tib);
-        assert_eq!(rows[0].fields, vec![b"1001".to_vec(), b"arctic".to_vec(), b"42.50".to_vec()]);
-        assert_eq!(rows[1].fields, vec![b"1002".to_vec(), b"tundra".to_vec(), b"99.25".to_vec()]);
+        assert_eq!(
+            rows[0].fields,
+            vec![b"1001".to_vec(), b"arctic".to_vec(), b"42.50".to_vec()]
+        );
+        assert_eq!(
+            rows[1].fields,
+            vec![b"1002".to_vec(), b"tundra".to_vec(), b"99.25".to_vec()]
+        );
 
         // Save Section As New File writes the byte-0 header + edited section rows cleanly.
         let out_path = dir.path().join("exported-section.csv");

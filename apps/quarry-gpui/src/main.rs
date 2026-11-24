@@ -48,9 +48,8 @@ use menus::{
     OpenIso88591, OpenSection, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252,
     PauseResumeIndexing, PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk,
     RenameHeader, ReplaceText, SaveAsFile, SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows,
-    SplitColumn, TemporaryStorage, ThemeDark, ThemeLight, ThemeOmarchy, ThemeSystem,
-    ToggleColumns, ToggleFilters, UndoEdit, VerifySectionBoundary, bind_shortcuts, encoding_label,
-    install_menus,
+    SplitColumn, TemporaryStorage, ThemeDark, ThemeLight, ThemeOmarchy, ThemeSystem, ToggleColumns,
+    ToggleFilters, UndoEdit, VerifySectionBoundary, bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use workbench::{
@@ -1419,7 +1418,12 @@ impl QuarryWindow {
         section_modal::open_section_dialog(initial_path, on_open_section, on_closed, window, cx);
     }
 
-    fn open_section_action(&mut self, _: &OpenSection, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_section_action(
+        &mut self,
+        _: &OpenSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.command_enabled(CommandId::OpenSection, cx) {
             return;
         }
@@ -2688,14 +2692,9 @@ impl QuarryWindow {
                                         rgb(tokens.text.to_rgb_hex())
                                     })
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        let res =
-                                            this.controller.update(cx, |controller, cx| {
-                                                controller.activate_tab(
-                                                    this.window_id,
-                                                    doc_id,
-                                                    cx,
-                                                )
-                                            });
+                                        let res = this.controller.update(cx, |controller, cx| {
+                                            controller.activate_tab(this.window_id, doc_id, cx)
+                                        });
                                         if let Err(error) = res {
                                             this.set_message(AppMessage::warning(error), cx);
                                         } else {

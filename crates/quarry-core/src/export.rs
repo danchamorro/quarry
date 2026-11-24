@@ -1614,7 +1614,8 @@ impl SaveAsJob {
                 error.into()
             }
         })?;
-        let mut output = ExportTarget::new_guarded(&source_path, destination, &source, source_stamp)?;
+        let mut output =
+            ExportTarget::new_guarded(&source_path, destination, &source, source_stamp)?;
         output.configure(
             config.source_encoding,
             config.output_encoding,
@@ -5499,10 +5500,10 @@ fn run_save_section_as(
     let mut next_cell_edit_row = cell_edits.first_key_value().map(|((row, _), _)| *row);
 
     let emit_record = |raw: &[u8],
-                           row_idx: u64,
-                           output: &mut ExportTarget,
-                           rows_written: &mut u64,
-                           next_edit: &mut Option<u64>|
+                       row_idx: u64,
+                       output: &mut ExportTarget,
+                       rows_written: &mut u64,
+                       next_edit: &mut Option<u64>|
      -> Result<(), QuarryError> {
         let is_header_in_section = section_base == 0 && has_header && row_idx == 0;
         let has_header_rename = is_header_in_section && !header_renames.is_empty();
@@ -5598,7 +5599,9 @@ fn run_save_section_as(
             .len()
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let read = if config.source_encoding.is_utf16() {
-            config.source_encoding.read_chunk(&mut source, &mut chunk[..limit])?
+            config
+                .source_encoding
+                .read_chunk(&mut source, &mut chunk[..limit])?
         } else {
             crate::positional_io::read_at_exact_or_eof(&source, cursor, &mut chunk[..limit])?
         };
