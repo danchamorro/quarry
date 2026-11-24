@@ -1525,13 +1525,17 @@ fn validate_speculative_candidate(
 /// Bounded fallback check for a large (`> 1 MiB`) speculative section when no backward LF anchor
 /// exists within `search_cap` before `req_end` (e.g. a single record longer than `1 MiB` ending
 /// exactly at `req_end`). Accepts `req_end` only when it is strictly before EOF, immediately
-/// preceded by an encoding-aligned LF, and followed by valid CSV across `SPECULATIVE_VALIDATE_BYTES`.
+/// preceded by an encoding-aligned LF, and followed by valid CSV that completes at least one full
+/// record within `search_cap` (always scanning at least `SPECULATIVE_VALIDATE_BYTES` or to EOF so
+/// an interior LF of a multiline quoted field is rejected even when its closing quote lies beyond
+/// 64 KiB or beyond `search_cap`).
 fn is_validated_speculative_end_boundary(
     file: &File,
     file_size: u64,
     req_end: u64,
     delimiter: u8,
     encoding: Encoding,
+    search_cap: usize,
 ) -> Result<bool, QuarryError> {
     let unit_len = lf_unit_len(encoding);
     if req_end < unit_len
@@ -1545,14 +1549,90 @@ fn is_validated_speculative_end_boundary(
     if n != unit_len as usize || !is_lf_unit(&prev[..unit_len as usize], encoding) {
         return Ok(false);
     }
-    validate_speculative_candidate(
-        file,
-        file_size,
-        req_end,
-        req_end.saturating_add(SPECULATIVE_VALIDATE_BYTES as u64),
-        delimiter,
-        encoding,
-    )
+
+    let mut max_probe = (file_size - req_end).min(search_cap as u64);
+    if encoding.is_utf16() && req_end + max_probe < file_size {
+        max_probe &= !1;
+    }
+    if max_probe == 0 {
+        return Ok(false);
+    }
+    let mut min_probe = max_probe.min(SPECULATIVE_VALIDATE_BYTES as u64);
+    if encoding.is_utf16() && req_end + min_probe < file_size {
+        min_probe &= !1;
+    }
+
+    let mut scanner = EncodedScanner::<false>::at_offset(delimiter, req_end, encoding)?;
+    let mut buf = vec![0u8; encoding.chunk_size(SPECULATIVE_VALIDATE_BYTES)];
+    let mut scanned = 0u64;
+    let mut records = 0u64;
+    while scanned < max_probe {
+        if scanned >= min_probe && records > 0 {
+            break;
+        }
+        let remaining = if scanned < min_probe {
+            min_probe - scanned
+        } else {
+            max_probe - scanned
+        };
+        let mut want = remaining.min(buf.len() as u64) as usize;
+        if encoding.is_utf16() && req_end + scanned + (want as u64) < file_size {
+            want &= !1;
+        }
+        if want == 0 {
+            break;
+        }
+        let read = read_at_exact_or_eof(file, req_end + scanned, &mut buf[..want])?;
+        if read < want {
+            return Err(QuarryError::SourceChanged);
+        }
+        if scanned >= min_probe {
+            // Past `min_probe`, advance LF-by-LF only until the first following record finishes
+            // (so a valid > 64 KiB next record succeeds without scanning unrelated trailing rows,
+            // while a closing quote past 64 KiB triggers a parse error and fails closed).
+            let mut pos = 0usize;
+            while pos < read && records == 0 {
+                let abs = req_end + scanned + pos as u64;
+                let step_end = find_first_lf_end(&buf[pos..read], abs, encoding)
+                    .map(|end_abs| (end_abs - (req_end + scanned)) as usize)
+                    .unwrap_or(read)
+                    .min(read);
+                if step_end <= pos {
+                    break;
+                }
+                if scanner
+                    .scan_chunk(&buf[pos..step_end], abs, |_| {
+                        records += 1;
+                    })
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+                pos = step_end;
+            }
+            scanned += pos as u64;
+        } else {
+            if scanner
+                .scan_chunk(&buf[..read], req_end + scanned, |_| {
+                    records += 1;
+                })
+                .is_err()
+            {
+                return Ok(false);
+            }
+            scanned += read as u64;
+        }
+    }
+    if req_end + scanned == file_size
+        && scanner
+            .finish(file_size, |_| {
+                records += 1;
+            })
+            .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(records > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1740,7 +1820,7 @@ fn snap_speculative_window(
                 file, file_size, anchor, req_end, delimiter, encoding, search_cap,
             )?
         } else if is_validated_speculative_end_boundary(
-            file, file_size, req_end, delimiter, encoding,
+            file, file_size, req_end, delimiter, encoding, search_cap,
         )? {
             req_end
         } else {
@@ -3341,11 +3421,81 @@ mod tests {
         let quoted_err = Session::open_section(
             &path_quoted,
             ByteWindow::from_range(4, interior_lf_end).unwrap(),
-            opts,
+            opts.clone(),
         );
         assert!(
             matches!(quoted_err, Err(QuarryError::SectionBoundaryNotFound { .. })),
             "interior LF inside > 1 MiB quoted field must not be accepted as a section end, got {quoted_err:?}"
+        );
+
+        // 4. Valid > 1 MiB record ending at req_end followed by a > 64 KiB valid next record.
+        let path_long_next = dir.path().join("single_record_over_1mib_long_next.csv");
+        let mut ln_bytes = Vec::with_capacity(1_300_000);
+        ln_bytes.extend_from_slice(b"a,b\n");
+        ln_bytes.extend_from_slice(b"1,");
+        ln_bytes.resize(ln_bytes.len() + 1_200_000, b'x');
+        ln_bytes.push(b'\n');
+        let ln_end = ln_bytes.len() as u64;
+        ln_bytes.extend_from_slice(b"2,");
+        ln_bytes.resize(ln_bytes.len() + 70_000, b'y');
+        ln_bytes.push(b'\n');
+        fs::write(&path_long_next, &ln_bytes).unwrap();
+
+        let sec_ln = Session::open_section(
+            &path_long_next,
+            ByteWindow::from_range(4, ln_end).unwrap(),
+            opts.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            sec_ln.section_bounds().unwrap().snapped,
+            ByteWindow::from_range(4, ln_end).unwrap(),
+            "exact end followed by a valid > 64 KiB record must be preserved"
+        );
+
+        // 5. > 1 MiB multiline quoted record whose closing quote lies > 64 KiB after the interior LF.
+        let path_quoted_70k = dir.path().join("quoted_record_over_1mib_70k_after_lf.csv");
+        let mut q70 = Vec::with_capacity(1_300_000);
+        q70.extend_from_slice(b"a,b\n");
+        q70.extend_from_slice(b"1,\"");
+        q70.resize(q70.len() + 1_200_000, b'q');
+        q70.push(b'\n');
+        let q70_lf_end = q70.len() as u64;
+        q70.resize(q70.len() + 70_000, b'q');
+        q70.extend_from_slice(b"\",ok\n2,after\n");
+        fs::write(&path_quoted_70k, &q70).unwrap();
+
+        let q70_err = Session::open_section(
+            &path_quoted_70k,
+            ByteWindow::from_range(4, q70_lf_end).unwrap(),
+            opts.clone(),
+        );
+        assert!(
+            matches!(q70_err, Err(QuarryError::SectionBoundaryNotFound { .. })),
+            "interior LF with closing quote > 64 KiB later must be rejected, got {q70_err:?}"
+        );
+
+        // 6. > 1 MiB multiline quoted record whose closing quote lies > 1 MiB after the interior LF
+        // (forward probe completes zero records within search_cap and must fail closed).
+        let path_quoted_far = dir.path().join("quoted_record_over_1mib_far_after_lf.csv");
+        let mut qfar = Vec::with_capacity(2_500_000);
+        qfar.extend_from_slice(b"a,b\n");
+        qfar.extend_from_slice(b"1,\"");
+        qfar.resize(qfar.len() + 1_200_000, b'q');
+        qfar.push(b'\n');
+        let qfar_lf_end = qfar.len() as u64;
+        qfar.resize(qfar.len() + 1_200_000, b'q');
+        qfar.extend_from_slice(b"\",ok\n2,after\n");
+        fs::write(&path_quoted_far, &qfar).unwrap();
+
+        let qfar_err = Session::open_section(
+            &path_quoted_far,
+            ByteWindow::from_range(4, qfar_lf_end).unwrap(),
+            opts,
+        );
+        assert!(
+            matches!(qfar_err, Err(QuarryError::SectionBoundaryNotFound { .. })),
+            "inconclusive forward probe completing zero records within search_cap must fail closed, got {qfar_err:?}"
         );
     }
 }
