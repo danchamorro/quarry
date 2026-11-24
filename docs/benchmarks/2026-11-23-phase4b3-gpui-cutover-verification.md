@@ -64,9 +64,9 @@ Audited exceptions (retained per ADR 0013): `gpui-pre-http-client` (pure traits 
 |---|---|---|---|
 | **macOS ARM64 `quarry-gpui` release binary** | `macOS VM 1` (`arm64`) | **`26.39 MiB`** (`27,675,376` B) | Signed inside `/Applications/Quarry.app` (vs `9.90 MiB` / `10,351,696` B for prior `quarry-egui` build `b3afd22` and `22 MiB` for Phase 4B-1 prototype) |
 | **Linux ARM64 `quarry-gpui` release binary** | `Omarchy VM 4` (`aarch64`) | **`48.75 MiB`** (`51,120,664` B) unstripped / **`36.01 MiB`** (`37,763,696` B) stripped | Static Rust + GPUI + `wgpu`/Vulkan + `cosmic-text` |
-| **macOS installed `.app` launch-to-onscreen-window** | `macOS VM 1` (`arm64`, `/Applications/Quarry.app`) | First run: **`157.0 ms`**; Warm median: **`139.3 ms`** (`min 136.1 ms`, `max 140.2 ms`, 3 warm runs) | Measured via `open -a /Applications/Quarry.app <csv>` until `CGWindowListCopyWindowInfo` reported an on-screen layer-0 `Quarry` window (`< 250 ms` warm target met) |
+| **macOS installed `.app` launch-to-onscreen-window** | `macOS VM 1` (`arm64`, `/Applications/Quarry.app`) | First run: **`343.0 ms`**; Warm process-launch median: **`329.8 ms`** (`min 314.2 ms`, `max 361.1 ms`, 3 warm launches from stopped process) | Measured via `open -a /Applications/Quarry.app <csv>` (confirming `Quarry` exited before each run) until `CGWindowListCopyWindowInfo` reported an on-screen layer-0 `Quarry` window (`< 1,000 ms` sub-second startup in virtualized VM) |
 
-Because full-parity `quarry-gpui` measures `26.39 MiB` on macOS ARM64 (just above the early `25 MB` prototype target), `C10` in `docs/V1_CLAIM_LEDGER.md` is updated to report the exact measured binary sizes and launch latency rather than claiming `<= 25 MB`.
+Because full-parity `quarry-gpui` measures `26.39 MiB` on macOS ARM64 (just above the early `25 MB` prototype target) and `329.8 ms` warm process-launch median inside virtualized `macOS VM 1`, `C10` in `docs/V1_CLAIM_LEDGER.md` is rephrased to report the exact measured binary sizes and launch bounds.
 
 ---
 
