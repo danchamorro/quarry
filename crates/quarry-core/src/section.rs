@@ -1289,36 +1289,6 @@ fn collect_backward_lf_boundaries(
     out
 }
 
-fn collect_forward_lf_boundaries(
-    buf: &[u8],
-    buf_start: u64,
-    encoding: Encoding,
-    max_candidates: usize,
-) -> Vec<u64> {
-    let mut out = Vec::new();
-    if !encoding.is_utf16() {
-        let mut offset = 0usize;
-        while offset < buf.len() && out.len() < max_candidates {
-            let Some(rel) = memchr(b'\n', &buf[offset..]) else {
-                break;
-            };
-            let end = offset + rel + 1;
-            out.push(buf_start + end as u64);
-            offset = end;
-        }
-        return out;
-    }
-    let even_len = buf.len() & !1;
-    let mut pos = 0usize;
-    while pos + 2 <= even_len && out.len() < max_candidates {
-        if is_lf_unit(&buf[pos..pos + 2], encoding) {
-            out.push(buf_start + (pos + 2) as u64);
-        }
-        pos += 2;
-    }
-    out
-}
-
 fn contains_quote_unit(buf: &[u8], encoding: Encoding) -> bool {
     if !encoding.is_utf16() {
         return memchr(b'"', buf).is_some();
@@ -1476,11 +1446,14 @@ fn snap_quote_free_verified(
 /// over a bounded forward probe. When `stop_after_offset` is `Some(req_end)`, validation stops as
 /// soon as a record closes at or past `req_end` so unrelated malformed CSV after the requested
 /// section never rejects a valid start candidate.
+/// Validate a speculative candidate offset by scanning forward up to `SPECULATIVE_VALIDATE_BYTES`,
+/// stopping immediately once a complete record ends at or after `stop_after_offset` so unrelated
+/// malformed CSV beyond the requested section never invalidates a valid boundary.
 fn validate_speculative_candidate(
     file: &File,
     file_size: u64,
     candidate: u64,
-    stop_after_offset: Option<u64>,
+    stop_after_offset: u64,
     delimiter: u8,
     encoding: Encoding,
 ) -> Result<bool, QuarryError> {
@@ -1501,65 +1474,44 @@ fn validate_speculative_candidate(
     let mut scanner = EncodedScanner::<false>::at_offset(delimiter, candidate, encoding)?;
     let mut records = 0u64;
     let mut stopped_early = false;
-    if let Some(target_end) = stop_after_offset {
-        let scan_target = align_up_code_unit(target_end, file_size, encoding);
-        let mut pos = 0usize;
-        while pos < probe_len && !stopped_early {
-            let abs = candidate + pos as u64;
-            let step_end = if abs < scan_target {
-                let want = (scan_target - abs) as usize;
-                let clamped = want.min(probe_len - pos);
-                if encoding.is_utf16() && pos + clamped < probe_len {
-                    pos + (clamped & !1).max(2).min(probe_len - pos)
-                } else {
-                    pos + clamped
-                }
+    let scan_target = align_up_code_unit(stop_after_offset, file_size, encoding);
+    let mut pos = 0usize;
+    while pos < probe_len && !stopped_early {
+        let abs = candidate + pos as u64;
+        let step_end = if abs < scan_target {
+            let want = (scan_target - abs) as usize;
+            let clamped = want.min(probe_len - pos);
+            if encoding.is_utf16() && pos + clamped < probe_len {
+                pos + (clamped & !1).max(2).min(probe_len - pos)
             } else {
-                find_first_lf_end(&buf[pos..probe_len], abs, encoding)
-                    .map(|end_abs| (end_abs - candidate) as usize)
-                    .unwrap_or(probe_len)
-                    .min(probe_len)
-            };
-            if step_end <= pos {
-                break;
+                pos + clamped
             }
-            if scanner
-                .scan_chunk(&buf[pos..step_end], abs, |record_end| {
-                    records += 1;
-                    if record_end >= target_end {
-                        stopped_early = true;
-                    }
-                })
-                .is_err()
-            {
-                return Ok(false);
-            }
-            pos = step_end;
+        } else {
+            find_first_lf_end(&buf[pos..probe_len], abs, encoding)
+                .map(|end_abs| (end_abs - candidate) as usize)
+                .unwrap_or(probe_len)
+                .min(probe_len)
+        };
+        if step_end <= pos {
+            break;
         }
-        if stopped_early {
-            return Ok(true);
-        }
-        if candidate + (pos as u64) == file_size
-            && scanner
-                .finish(file_size, |_| {
-                    records += 1;
-                })
-                .is_err()
+        if scanner
+            .scan_chunk(&buf[pos..step_end], abs, |record_end| {
+                records += 1;
+                if record_end >= stop_after_offset {
+                    stopped_early = true;
+                }
+            })
+            .is_err()
         {
             return Ok(false);
         }
-        return Ok(records > 0 || candidate + (pos as u64) < file_size);
+        pos = step_end;
     }
-
-    if scanner
-        .scan_chunk(&buf, candidate, |_| {
-            records += 1;
-        })
-        .is_err()
-    {
-        return Ok(false);
+    if stopped_early {
+        return Ok(true);
     }
-    if candidate + probe_len as u64 == file_size
+    if candidate + (pos as u64) == file_size
         && scanner
             .finish(file_size, |_| {
                 records += 1;
@@ -1568,7 +1520,92 @@ fn validate_speculative_candidate(
     {
         return Ok(false);
     }
-    Ok(records > 0 || candidate + (probe_len as u64) < file_size)
+    Ok(records > 0 || candidate + (pos as u64) < file_size)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_speculative_end_from_anchor(
+    file: &File,
+    file_size: u64,
+    anchor: u64,
+    req_end: u64,
+    delimiter: u8,
+    encoding: Encoding,
+    search_cap: usize,
+) -> Result<u64, QuarryError> {
+    // Align the scan target outward to a code-unit boundary so odd UTF-16 end offsets never
+    // collapse `step_cap` to zero before reaching the containing record terminator.
+    let scan_target_end = align_up_code_unit(req_end, file_size, encoding);
+    let mut scanner = EncodedScanner::<false>::at_offset(delimiter, anchor, encoding)?;
+    let max_end = align_up_code_unit(
+        scan_target_end.saturating_add(search_cap as u64),
+        file_size,
+        encoding,
+    );
+    let chunk_len = encoding.chunk_size(128 * 1024);
+    let mut chunk = vec![0u8; chunk_len];
+    let mut cursor = anchor;
+    let mut found_end = None;
+    while cursor < max_end && found_end.is_none() {
+        // Read up to `scan_target_end` first, then advance in bounded 4 KiB slices LF-by-LF so we
+        // stop immediately once the closing record covering `req_end` finishes without scanning
+        // unrelated trailing bytes.
+        let step_cap = if cursor < scan_target_end {
+            (scan_target_end - cursor).min(chunk.len() as u64)
+        } else {
+            (max_end - cursor).min(4096).min(chunk.len() as u64)
+        };
+        let want = if encoding.is_utf16() && cursor + step_cap < file_size {
+            (step_cap as usize) & !1
+        } else {
+            step_cap as usize
+        };
+        if want == 0 {
+            break;
+        }
+        let read = read_at_exact_or_eof(file, cursor, &mut chunk[..want])?;
+        if read < want {
+            return Err(QuarryError::SourceChanged);
+        }
+        if cursor >= scan_target_end {
+            let mut pos = 0usize;
+            while pos < read && found_end.is_none() {
+                let step_end = find_first_lf_end(&chunk[pos..read], cursor + pos as u64, encoding)
+                    .map(|abs| (abs - cursor) as usize)
+                    .unwrap_or(read)
+                    .min(read);
+                scanner.scan_chunk(&chunk[pos..step_end], cursor + pos as u64, |record_end| {
+                    if found_end.is_none() && record_end >= req_end {
+                        found_end = Some(record_end);
+                    }
+                })?;
+                pos = step_end;
+            }
+            cursor += pos as u64;
+        } else {
+            scanner.scan_chunk(&chunk[..read], cursor, |record_end| {
+                if found_end.is_none() && record_end >= req_end {
+                    found_end = Some(record_end);
+                }
+            })?;
+            cursor += read as u64;
+        }
+    }
+    if found_end.is_none() && cursor == file_size {
+        scanner.finish(file_size, |record_end| {
+            if found_end.is_none() && record_end >= req_end {
+                found_end = Some(record_end);
+            }
+        })?;
+    }
+    match found_end {
+        Some(end) => Ok(end),
+        None if cursor == file_size => Ok(file_size),
+        None => Err(boundary_not_found(
+            search_cap,
+            "Could not find a record terminator after the requested section end within the 1 MiB alignment window.",
+        )),
+    }
 }
 
 fn snap_speculative_window(
@@ -1600,12 +1637,7 @@ fn snap_speculative_window(
         let mut chosen = None;
         for candidate in candidates {
             if validate_speculative_candidate(
-                file,
-                file_size,
-                candidate,
-                Some(req_end),
-                delimiter,
-                encoding,
+                file, file_size, candidate, req_end, delimiter, encoding,
             )? {
                 chosen = Some(candidate);
                 break;
@@ -1629,143 +1661,71 @@ fn snap_speculative_window(
     } else if req_end.saturating_sub(aligned_start) <= search_cap as u64 {
         // When the requested window fits within `search_cap`, scan from `aligned_start` with exact
         // quote tracking so the end boundary is consistent with `aligned_start`.
-        // Align the scan target outward to a code-unit boundary so odd UTF-16 end offsets never
-        // collapse `step_cap` to zero before reaching the containing record terminator.
-        let scan_target_end = align_up_code_unit(req_end, file_size, encoding);
-        let mut scanner = EncodedScanner::<false>::at_offset(delimiter, aligned_start, encoding)?;
-        let max_end = align_up_code_unit(
-            scan_target_end.saturating_add(search_cap as u64),
+        scan_speculative_end_from_anchor(
+            file,
             file_size,
+            aligned_start,
+            req_end,
+            delimiter,
             encoding,
-        );
-        let chunk_len = encoding.chunk_size(128 * 1024);
-        let mut chunk = vec![0u8; chunk_len];
-        let mut cursor = aligned_start;
-        let mut found_end = None;
-        while cursor < max_end && found_end.is_none() {
-            // Read up to `scan_target_end` first, then advance in bounded 4 KiB slices so we never
-            // scan far past `req_end` into unrelated records (e.g. a later closing quote).
-            let step_cap = if cursor < scan_target_end {
-                (scan_target_end - cursor).min(chunk.len() as u64)
-            } else {
-                (max_end - cursor).min(4096).min(chunk.len() as u64)
-            };
-            let want = if encoding.is_utf16() && cursor + step_cap < file_size {
-                (step_cap as usize) & !1
-            } else {
-                step_cap as usize
-            };
-            if want == 0 {
-                break;
-            }
-            let read = read_at_exact_or_eof(file, cursor, &mut chunk[..want])?;
-            if read < want {
-                return Err(QuarryError::SourceChanged);
-            }
-            // When scanning past `scan_target_end`, stop at the first newline if not inside quotes
-            // so a stray quote in a following line doesn't abort boundary snapping.
-            let scan_slice = if cursor >= scan_target_end {
-                let first_lf = find_first_lf_end(&chunk[..read], cursor, encoding)
-                    .map(|abs| (abs - cursor) as usize)
-                    .unwrap_or(read);
-                &chunk[..first_lf.min(read)]
-            } else {
-                &chunk[..read]
-            };
-            scanner.scan_chunk(scan_slice, cursor, |record_end| {
-                if found_end.is_none() && record_end >= req_end {
-                    found_end = Some(record_end);
-                }
-            })?;
-            cursor += scan_slice.len() as u64;
-        }
-        if found_end.is_none() && cursor == file_size {
-            scanner.finish(file_size, |record_end| {
-                if found_end.is_none() && record_end >= req_end {
-                    found_end = Some(record_end);
-                }
-            })?;
-        }
-        match found_end {
-            Some(end) => end,
-            None if cursor == file_size => file_size,
-            None => {
-                return Err(boundary_not_found(
-                    search_cap,
-                    "Could not find a record terminator after the requested section end within the 1 MiB alignment window.",
-                ));
-            }
-        }
+            search_cap,
+        )?
     } else {
-        // Large section (> 1 MiB): probe around `req_end` within `<= 1 MiB` (preserving an
-        // existing boundary right before `req_end`).
+        // Large section (> 1 MiB): anchor to a validated record start within `<= 1 MiB` before
+        // `req_end`, then scan forward LF-by-LF stopping at the first `record_end >= req_end`.
+        // This validates the record(s) ending at or crossing `req_end` without ever reading
+        // unrelated malformed trailing data past the closing boundary.
         let unit_len = lf_unit_len(encoding);
-        let already_at_boundary = if req_end >= unit_len
-            && (!encoding.is_utf16() || req_end.is_multiple_of(2))
-        {
-            let mut prev = [0u8; 2];
-            let n = read_at_exact_or_eof(file, req_end - unit_len, &mut prev[..unit_len as usize])?;
-            n == unit_len as usize
-                && is_lf_unit(&prev[..unit_len as usize], encoding)
-                && validate_speculative_candidate(
-                    file, file_size, req_end, None, delimiter, encoding,
-                )?
-        } else {
-            false
-        };
-        if already_at_boundary {
-            req_end
-        } else {
-            let probe_start = align_down_code_unit(req_end, encoding);
-            let probe_len = (file_size - probe_start).min(search_cap as u64) as usize;
-            let probe_len = if encoding.is_utf16() {
-                probe_len & !1
-            } else {
-                probe_len
-            };
+        let probe_end = align_down_code_unit(req_end.saturating_sub(unit_len), encoding);
+        let probe_start = align_down_code_unit(req_end.saturating_sub(search_cap as u64), encoding)
+            .max(aligned_start);
+        let tail_anchor = if probe_end > probe_start {
+            let probe_len = (probe_end - probe_start) as usize;
             let mut buf = vec![0u8; probe_len];
             let read = read_at_exact_or_eof(file, probe_start, &mut buf)?;
             if read < probe_len {
                 return Err(QuarryError::SourceChanged);
             }
-            // Validate candidate LF boundaries with `validate_speculative_candidate` so an LF
-            // inside a multiline quoted field is never silently accepted as the section end.
-            // If an earlier candidate `< file_size` failed suffix validation, never fall through
-            // to blindly accepting `candidate == file_size` (which would swallow a malformed
-            // trailing record into the section); report boundary-not-found so the user can run a
-            // counted scan instead.
-            let candidates = collect_forward_lf_boundaries(&buf, probe_start, encoding, 16);
+            let candidates = collect_backward_lf_boundaries(&buf, probe_start, encoding, 16);
             let mut chosen = None;
-            let mut saw_rejected_earlier_lf = false;
             for candidate in candidates {
-                if candidate < req_end {
+                if candidate >= req_end {
                     continue;
                 }
-                if candidate == file_size {
-                    if !saw_rejected_earlier_lf {
-                        chosen = Some(file_size);
-                    }
-                    break;
-                }
                 if validate_speculative_candidate(
-                    file, file_size, candidate, None, delimiter, encoding,
+                    file, file_size, candidate, req_end, delimiter, encoding,
                 )? {
                     chosen = Some(candidate);
                     break;
                 }
-                saw_rejected_earlier_lf = true;
             }
-            if let Some(boundary) = chosen {
-                boundary
-            } else if !saw_rejected_earlier_lf && probe_start + probe_len as u64 >= file_size {
-                file_size
+            if let Some(anchor) = chosen {
+                anchor
+            } else if probe_start == aligned_start {
+                aligned_start
             } else {
                 return Err(boundary_not_found(
                     search_cap,
                     "Could not verify a clean record end within the 1 MiB alignment window; use a counted scan or smaller section.",
                 ));
             }
-        }
+        } else if probe_start == aligned_start {
+            aligned_start
+        } else {
+            return Err(boundary_not_found(
+                search_cap,
+                "Could not verify a clean record end within the 1 MiB alignment window; use a counted scan or smaller section.",
+            ));
+        };
+        scan_speculative_end_from_anchor(
+            file,
+            file_size,
+            tail_anchor,
+            req_end,
+            delimiter,
+            encoding,
+            search_cap,
+        )?
     };
 
     let snapped = ByteWindow::from_range(aligned_start, aligned_end.max(aligned_start))
@@ -3211,5 +3171,88 @@ mod tests {
             "out-of-range cell edit on section filtered export must be rejected, got {oob_res:?}"
         );
         assert!(!out_oob.exists());
+    }
+
+    #[test]
+    fn large_speculative_section_keeps_malformed_trailing_suffix_outside_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large_speculative_malformed_suffix.csv");
+        // 600,000 × "a,b\n" = 2,400,000 bytes (> 1 MiB speculative window) + malformed trailing row.
+        let mut bytes = Vec::with_capacity(2_400_064);
+        for _ in 0..600_000 {
+            bytes.extend_from_slice(b"a,b\n");
+        }
+        let clean_end = bytes.len() as u64;
+        assert_eq!(clean_end, 2_400_000);
+        bytes.extend_from_slice(b"bad\"quote,x\n");
+        fs::write(&path, &bytes).unwrap();
+
+        let opts = SectionOpenOptions {
+            open: OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+            ..SectionOpenOptions::default()
+        };
+
+        // 1. Requested end right at the clean boundary before malformed trailing CSV.
+        let sec_exact = Session::open_section(
+            &path,
+            ByteWindow::from_range(4, clean_end).unwrap(),
+            opts.clone(),
+        )
+        .unwrap();
+        let bounds_exact = sec_exact.section_bounds().unwrap();
+        assert_eq!(bounds_exact.trust, BoundaryTrust::Speculative);
+        assert_eq!(
+            bounds_exact.snapped,
+            ByteWindow::from_range(4, clean_end).unwrap(),
+            "malformed trailing suffix must not extend large speculative section end"
+        );
+        let idx = sec_exact
+            .start_indexing(crate::IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(idx.is_complete());
+        assert_eq!(idx.indexed_rows(), 599_999);
+
+        // 2. Requested end inside the final clean record before malformed trailing CSV.
+        let sec_mid = Session::open_section(
+            &path,
+            ByteWindow::from_range(4, clean_end - 2).unwrap(),
+            opts.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            sec_mid.section_bounds().unwrap().snapped,
+            ByteWindow::from_range(4, clean_end).unwrap()
+        );
+
+        // 3. Multiline quoted record crossing req_end, followed by malformed trailing CSV.
+        let path_ml = dir.path().join("large_speculative_multiline_suffix.csv");
+        let mut ml_bytes = Vec::with_capacity(2_400_128);
+        for _ in 0..600_000 {
+            ml_bytes.extend_from_slice(b"a,b\n");
+        }
+        ml_bytes.extend_from_slice(b"\"line1\n");
+        let mid_quoted_end = ml_bytes.len() as u64;
+        ml_bytes.extend_from_slice(b"line2\",c\n");
+        let closing_quoted_end = ml_bytes.len() as u64;
+        ml_bytes.extend_from_slice(b"bad\"quote,x\n");
+        fs::write(&path_ml, &ml_bytes).unwrap();
+
+        let sec_ml = Session::open_section(
+            &path_ml,
+            ByteWindow::from_range(4, mid_quoted_end).unwrap(),
+            opts,
+        )
+        .unwrap();
+        assert_eq!(
+            sec_ml.section_bounds().unwrap().snapped,
+            ByteWindow::from_range(4, closing_quoted_end).unwrap(),
+            "multiline quoted record must snap to its own closing LF without pulling in malformed suffix"
+        );
     }
 }
