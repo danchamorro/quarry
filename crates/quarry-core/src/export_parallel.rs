@@ -578,6 +578,7 @@ impl ExportMergeState {
                 if let Err(err) = process_record(
                     &buf[s..e],
                     self.rows_scanned,
+                    rec_start == 0,
                     data_start,
                     delimiter,
                     query,
@@ -605,6 +606,7 @@ impl ExportMergeState {
             process_record(
                 &buf[s..],
                 self.rows_scanned,
+                rec_start == 0,
                 data_start,
                 delimiter,
                 query,
@@ -774,6 +776,7 @@ impl ExportMergeState {
                         process_record(
                             &rec,
                             self.rows_scanned,
+                            self.open_record_start == 0,
                             data_start,
                             delimiter,
                             query,
@@ -928,6 +931,7 @@ fn scan_export_giant_line_sequential(
                     if let Err(err) = process_record(
                         &buf[s..e],
                         merge.rows_scanned,
+                        rec_start == 0,
                         data_start,
                         delimiter,
                         query,
@@ -949,6 +953,7 @@ fn scan_export_giant_line_sequential(
                             if let Err(err) = process_record(
                                 &stitched,
                                 merge.rows_scanned,
+                                rec_start == 0,
                                 data_start,
                                 delimiter,
                                 query,
@@ -995,6 +1000,7 @@ fn scan_export_giant_line_sequential(
             process_record(
                 &stitched,
                 merge.rows_scanned,
+                rec_start == 0,
                 data_start,
                 delimiter,
                 query,

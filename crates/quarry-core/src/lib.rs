@@ -139,6 +139,8 @@ const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
 const DEFAULT_BOOTSTRAP_LIMIT: usize = 64 * 1024 * 1024;
 const DEFAULT_READ_CHUNK: usize = 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// Parses native record bytes and wraps record-local decoding failures with their logical record.
 pub(crate) fn parse_encoded_record(
     record: &[u8],
