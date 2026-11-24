@@ -2498,11 +2498,12 @@ fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly
 
     // Deterministically wait for the first chunk to commit, then request pause and release gate.
     if !gate.wait_until_reached(Duration::from_secs(10)) {
-        let _ = scheduler.poll_all();
+        let errors = scheduler.poll_all();
         let tab = scheduler.tab(ids[0]);
         let diag = tab.and_then(|t| t.document.as_ref()).map(|d| d.progress);
-        let err = tab.and_then(|t| t.error.as_deref());
-        panic!("timed out waiting for pause gate to be reached: progress={diag:?}, error={err:?}");
+        panic!(
+            "timed out waiting for pause gate to be reached: progress={diag:?}, errors={errors:?}"
+        );
     }
     scheduler.pause_indexing(ids[0]).unwrap();
     gate.release();
