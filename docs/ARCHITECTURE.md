@@ -155,7 +155,7 @@ Optimize common paths without compromising quoted fields, escaped quotes, embedd
 
 ## Viewport
 The engine seeks from the nearest checkpoint and parses every field in a
-bounded row range. The egui viewer's active viewport buffer retains the visible
+bounded row range. The desktop viewer's active viewport buffer retains the visible
 rows plus 16 rows of overscan on each side and renders at most 64 columns at a
 time. Horizontal windowing keeps every shown column reachable while limiting
 UI work; it does not project fields out of the parsed rows.
@@ -740,7 +740,7 @@ with the document dialect.
 
 ## macOS packaging and application identity
 
-The internal `quarry-egui` release binary is packaged as the customer-facing
+The internal `quarry-gpui` release binary is packaged as the customer-facing
 `/Applications/Quarry.app`. The stable bundle identifier is
 `io.github.danchamorro.quarry`, and the bundle executable is `Quarry`.
 `packaging/macos/Info.plist`, `assets/quarry-logo-v3.png`, and
@@ -751,12 +751,12 @@ full-history commit-count build number, full commit, source status, and
 architecture, converts the checked-in logo to `Quarry.icns`, applies an ad-hoc
 signature, and strictly verifies the candidate. The CI macOS job runs the same
 command. Matching payload hashes are expected only from the same checkout,
-pinned Rust 1.88.0 toolchain, and macOS SDK; the workflow does not pin the
+pinned Rust 1.100.0 toolchain, and macOS SDK; the workflow does not pin the
 runner-provided SDK. The package and install commands share a per-user native
 file lock, and the packager rejects a checkout that changes while Cargo is
 building.
 
-The egui app holds a shared per-user installation lock for its process lifetime,
+The desktop app holds a shared per-user installation lock for its process lifetime,
 while installation holds the exclusive form through replacement and rollback.
 This prevents a participating app from starting during a bundle swap. Process
 name checks remain as a migration guard for legacy builds that predate the
@@ -776,13 +776,14 @@ hardened runtime, notarization, stapling, and Gatekeeper assessment remain a
 later distribution boundary.
 
 ## UI selection
-[ADR 0003](adr/0003-select-egui-ui.md) records the measured egui and AppKit
-bake-off. It selects egui while keeping core independent of the UI. AppKit stays
-in the workspace so the comparison remains reproducible.
+[ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md) adopts GPUI (`apps/quarry-gpui`)
+as Quarry's v1.0 desktop frontend over `crates/quarry-workbench` and
+`crates/quarry-core`, superseding the historical [ADR 0003](adr/0003-select-egui-ui.md)
+egui/AppKit bake-off (`apps/quarry-egui` was retired on 2026-11-24;
+`apps/quarry-appkit` remains frozen in the workspace as a historical comparator).
 
-The [design guide](DESIGN.md) defines the egui app's visual system: theme
-tokens, typography, window structure, shared components, and the native macOS
-menu bar.
+The [design guide](DESIGN.md) defines the desktop app's visual system: theme
+tokens, typography, window structure, shared components, and native menus.
 
 ## Benchmarking
 Generate deterministic 1 GB, 10 GB, 25 GB, and 50 GB datasets locally,
