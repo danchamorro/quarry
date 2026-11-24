@@ -1120,12 +1120,15 @@ impl WorkbenchController {
     pub fn reopen_verified_section_active(
         &mut self,
         window: WindowId,
+        discard_unsaved: bool,
         cx: &mut Context<Self>,
     ) -> Result<String, AppMessage> {
         let Some(id) = self.scheduler.active_document(window) else {
             return Err(AppMessage::warning("Open a section first."));
         };
-        let notice = self.scheduler.reopen_verified_section(id)?;
+        let notice = self
+            .scheduler
+            .reopen_verified_section(id, discard_unsaved)?;
         self.viewport_read_seq.remove(&id);
         self.pending_reveal_cells.remove(&id);
         cx.notify();

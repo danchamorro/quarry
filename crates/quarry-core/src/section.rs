@@ -987,13 +987,15 @@ pub(crate) fn snap_section_window(
         _ => None,
     };
 
-    if let Some(cp) = sync_cp {
-        return snap_from_validated_checkpoint(file, file_size, delimiter, encoding, clamped, cp);
-    }
-
     let search_cap = options
         .max_speculative_search_bytes
         .clamp(1024, MAX_SPECULATIVE_SEARCH_BYTES);
+
+    if let Some(cp) = sync_cp {
+        return snap_from_validated_checkpoint(
+            file, file_size, delimiter, encoding, clamped, cp, search_cap,
+        );
+    }
 
     // Tier 2: User-confirmed quote-free dialect (`quote = None`) with encoding-aligned terminators.
     // Note: global row ordinal remains unknown (`first_global_row() == None`).
@@ -1015,9 +1017,15 @@ fn snap_from_validated_checkpoint(
     encoding: Encoding,
     requested: ByteWindow,
     checkpoint: Checkpoint,
+    search_cap: usize,
 ) -> Result<SectionBounds, QuarryError> {
     let req_start = requested.base;
     let req_end = requested.end().unwrap();
+    let max_scan_end = align_up_code_unit(
+        req_end.saturating_add(search_cap as u64),
+        file_size,
+        encoding,
+    );
     let mut scanner = EncodedScanner::<false>::at_offset(delimiter, checkpoint.offset, encoding)?;
     let chunk_len = encoding.chunk_size(256 * 1024);
     let mut chunk = vec![0u8; chunk_len];
@@ -1028,8 +1036,16 @@ fn snap_from_validated_checkpoint(
     let mut first_global_row: Option<u64> = None;
     let mut aligned_end: Option<u64> = None;
 
-    while cursor < file_size && aligned_end.is_none() {
-        let want = (file_size - cursor).min(chunk.len() as u64) as usize;
+    while cursor < max_scan_end && aligned_end.is_none() {
+        let step_cap = (max_scan_end - cursor).min(chunk.len() as u64) as usize;
+        let want = if encoding.is_utf16() && cursor + (step_cap as u64) < file_size {
+            step_cap & !1
+        } else {
+            step_cap
+        };
+        if want == 0 {
+            break;
+        }
         let read = read_at_exact_or_eof(file, cursor, &mut chunk[..want])?;
         if read < want {
             return Err(QuarryError::SourceChanged);
@@ -1066,6 +1082,13 @@ fn snap_from_validated_checkpoint(
             rows_counted += 1;
             record_start = record_end;
         })?;
+    }
+
+    if aligned_end.is_none() && cursor < file_size {
+        return Err(boundary_not_found(
+            search_cap,
+            "Could not find a record terminator after the requested section end within the bounded synchronous scan budget.",
+        ));
     }
 
     let start = aligned_start.unwrap_or(req_start);
@@ -1375,22 +1398,32 @@ fn snap_speculative_window(
     } else if req_end.saturating_sub(aligned_start) <= search_cap as u64 {
         // When the requested window fits within `search_cap`, scan from `aligned_start` with exact
         // quote tracking so the end boundary is consistent with `aligned_start`.
+        // Align the scan target outward to a code-unit boundary so odd UTF-16 end offsets never
+        // collapse `step_cap` to zero before reaching the containing record terminator.
+        let scan_target_end = align_up_code_unit(req_end, file_size, encoding);
         let mut scanner = EncodedScanner::<false>::at_offset(delimiter, aligned_start, encoding)?;
-        let max_end = (req_end.saturating_add(search_cap as u64)).min(file_size);
+        let max_end = align_up_code_unit(
+            scan_target_end.saturating_add(search_cap as u64),
+            file_size,
+            encoding,
+        );
         let chunk_len = encoding.chunk_size(128 * 1024);
         let mut chunk = vec![0u8; chunk_len];
         let mut cursor = aligned_start;
         let mut found_end = None;
         while cursor < max_end && found_end.is_none() {
-            // Read up to `req_end` first, then advance in bounded 4 KiB slices so we never scan
-            // far past `req_end` into unrelated records (e.g. a later closing quote).
-            let step_cap = if cursor < req_end {
-                (req_end - cursor).min(chunk.len() as u64)
+            // Read up to `scan_target_end` first, then advance in bounded 4 KiB slices so we never
+            // scan far past `req_end` into unrelated records (e.g. a later closing quote).
+            let step_cap = if cursor < scan_target_end {
+                (scan_target_end - cursor).min(chunk.len() as u64)
             } else {
                 (max_end - cursor).min(4096).min(chunk.len() as u64)
             };
-            let want = step_cap as usize;
-            let want = if encoding.is_utf16() { want & !1 } else { want };
+            let want = if encoding.is_utf16() && cursor + step_cap < file_size {
+                (step_cap as usize) & !1
+            } else {
+                step_cap as usize
+            };
             if want == 0 {
                 break;
             }
@@ -1398,9 +1431,9 @@ fn snap_speculative_window(
             if read < want {
                 return Err(QuarryError::SourceChanged);
             }
-            // When scanning past `req_end`, stop at the first newline if not inside quotes so a
-            // stray quote in a following line doesn't abort boundary snapping.
-            let scan_slice = if cursor >= req_end {
+            // When scanning past `scan_target_end`, stop at the first newline if not inside quotes
+            // so a stray quote in a following line doesn't abort boundary snapping.
+            let scan_slice = if cursor >= scan_target_end {
                 let first_lf = find_first_lf_end(&chunk[..read], cursor, encoding)
                     .map(|abs| (abs - cursor) as usize)
                     .unwrap_or(read);
@@ -1982,5 +2015,76 @@ mod tests {
             exported,
             "id,region,amount\n1001,arctic,42.50\n1002,tundra,100.00\n"
         );
+    }
+
+    #[test]
+    fn synchronous_counted_scan_bounds_giant_record_beyond_requested_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("giant-first-record.csv");
+        // Write a 3 MiB single record without any newline; requesting [0, 64) from byte 0
+        // enters the synchronous checkpoint path and must fail cleanly within `search_cap`
+        // rather than scanning unboundedly.
+        let mut data = b"a,b\n".to_vec();
+        data.extend(std::iter::repeat_n(b'x', 3 * 1024 * 1024));
+        fs::write(&path, &data).unwrap();
+
+        let err = Session::open_section(
+            &path,
+            ByteWindow::from_range(0, 64).unwrap(),
+            SectionOpenOptions {
+                open: OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    delimiter: Some(b','),
+                    ..OpenOptions::default()
+                },
+                max_speculative_search_bytes: 16 * 1024,
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, QuarryError::SectionBoundaryNotFound { .. }),
+            "expected bounded SectionBoundaryNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn speculative_utf16_odd_end_offset_snaps_outward_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf16le-odd-end.csv");
+        let mut text = String::from("id,val\n");
+        for i in 0..40 {
+            text.push_str(&format!("{i},row_value_{i:04}\n"));
+        }
+        let mut utf16 = vec![0xFFu8, 0xFEu8];
+        for unit in text.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&path, &utf16).unwrap();
+
+        // Force Tier 3 speculative snapping (`req_start > 0`, no parent index) with an odd
+        // `req_end` inside the file and smaller than `search_cap`.
+        let even_win = ByteWindow::from_range(100, 120).unwrap();
+        let odd_win = ByteWindow::from_range(100, 121).unwrap();
+        let make_opts = || SectionOpenOptions {
+            open: OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                delimiter: Some(b','),
+                ..OpenOptions::default()
+            },
+            encoding: Some(Encoding::Utf16Le),
+            ..SectionOpenOptions::default()
+        };
+
+        let even_sec = Session::open_section(&path, even_win, make_opts()).unwrap();
+        let odd_sec = Session::open_section(&path, odd_win, make_opts()).unwrap();
+        let even_bounds = even_sec.section_bounds().unwrap();
+        let odd_bounds = odd_sec.section_bounds().unwrap();
+        assert_eq!(odd_bounds.trust, BoundaryTrust::Speculative);
+        assert!(odd_bounds.snapped.base <= 100);
+        assert!(odd_bounds.snapped_end() >= 121);
+        assert_eq!(odd_bounds.snapped.base % 2, 0);
+        assert_eq!(odd_bounds.snapped_end() % 2, 0);
+        assert!(odd_bounds.snapped_end() >= even_bounds.snapped_end());
     }
 }

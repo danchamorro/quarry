@@ -272,8 +272,16 @@ fn dirty_speculative_section_preserves_drafts_on_boundary_shift_and_exports_clea
     assert!(exported.starts_with("id,note\n"));
     assert!(exported.contains("EDITED_DRAFT"));
 
-    // Now explicitly reopen at the verified boundaries!
-    let notice = scheduler.reopen_verified_section(section_id).unwrap();
+    // Unconfirmed reopen while dirty must be refused so unsaved drafts cannot be silently lost.
+    assert!(
+        scheduler
+            .reopen_verified_section(section_id, false)
+            .is_err(),
+        "reopen_verified_section must refuse while dirty unless discard_unsaved is confirmed"
+    );
+
+    // Now explicitly reopen at the verified boundaries with confirmed discard!
+    let notice = scheduler.reopen_verified_section(section_id, true).unwrap();
     assert!(notice.contains("verified"));
     wait_for_index(&mut scheduler, section_id);
     let doc = scheduler

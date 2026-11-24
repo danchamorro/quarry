@@ -1145,9 +1145,13 @@ impl WorkbenchScheduler {
     }
 
     /// Reopens section tab `id` at its newly verified exact record boundaries, replacing the
-    /// section's session and clearing any draft edits (caller should prompt or offer Save As
-    /// first if the section is dirty).
-    pub fn reopen_verified_section(&mut self, id: DocumentId) -> Result<String, AppMessage> {
+    /// section's session. Refuses to discard unsaved section edits unless `discard_unsaved` is
+    /// explicitly `true` (after caller confirmation).
+    pub fn reopen_verified_section(
+        &mut self,
+        id: DocumentId,
+        discard_unsaved: bool,
+    ) -> Result<String, AppMessage> {
         let (path, verified_bounds, open_options, encoding, quote_free) = {
             let Some(doc) = self.tabs.get(&id).and_then(|s| s.tab.document.as_ref()) else {
                 return Err(AppMessage::warning("Document is not hydrated."));
@@ -1157,6 +1161,11 @@ impl WorkbenchScheduler {
                     "No verified boundary update is pending for this section.",
                 ));
             };
+            if doc.is_dirty() && !discard_unsaved {
+                return Err(AppMessage::warning(
+                    "Unsaved section edits would be discarded. Save the section as a new file first, or confirm discarding edits to reopen at verified boundaries.",
+                ));
+            }
             (
                 doc.logical_path.clone(),
                 bounds,
@@ -1234,7 +1243,7 @@ impl WorkbenchScheduler {
                     .get(&id)
                     .and_then(|slot| slot.tab.document.as_ref())
                     .is_some_and(Document::is_dirty);
-                if !is_dirty && self.reopen_verified_section(id).is_ok() {
+                if !is_dirty && self.reopen_verified_section(id, false).is_ok() {
                     reopened = true;
                 }
             }

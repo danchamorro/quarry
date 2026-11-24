@@ -1430,6 +1430,106 @@ impl QuarryWindow {
         self.open_section_dialog_now(window, cx);
     }
 
+    fn confirm_reopen_verified_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirming || self.editing {
+            return;
+        }
+        let Some(info) = self.snapshot(cx) else {
+            return;
+        };
+        if !info.dirty {
+            let res = self.controller.update(cx, |c, cx| {
+                c.reopen_verified_section_active(self.window_id, false, cx)
+            });
+            match res {
+                Ok(_) => self.sync_from_controller(window, cx),
+                Err(err) => self.set_message(err, cx),
+            }
+            return;
+        }
+
+        self.confirming = true;
+        self.panels
+            .update(cx, |panels, cx| panels.close(window, cx));
+        let filename = info.filename;
+        let save_weak = cx.weak_entity();
+        let discard_weak = cx.weak_entity();
+        let close_weak = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let filename_msg = filename.clone();
+            let save_weak = save_weak.clone();
+            let discard_weak = discard_weak.clone();
+            let close_weak = close_weak.clone();
+            dialog
+                .title(format!("Discard unsaved edits to {filename}?"))
+                .w(px(480.))
+                .overlay_closable(false)
+                .close_button(true)
+                .keyboard(true)
+                .content(move |content, _, _| {
+                    content.child(div().text_size(px(13.)).child(format!(
+                        "Boundary verification shifted the start of {filename_msg}. Reopening at the verified boundaries will discard your unsaved section edits. Save your draft as a new file first, or discard edits to reopen."
+                    )))
+                })
+                .footer(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("section-reopen-cancel")
+                                .label("Keep Editing")
+                                .small()
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(DialogCancel), cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("section-reopen-save-as")
+                                .label("Save Section As New…")
+                                .small()
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(Box::new(DialogCancel), cx);
+                                    let _ = save_weak.update(cx, |this, cx| {
+                                        this.confirming = false;
+                                        this.choose_save_destination(None, window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("section-reopen-discard")
+                                .label("Discard & Reopen")
+                                .danger()
+                                .small()
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(Box::new(DialogCancel), cx);
+                                    let _ = discard_weak.update(cx, |this, cx| {
+                                        this.confirming = false;
+                                        let res = this.controller.update(cx, |c, cx| {
+                                            c.reopen_verified_section_active(
+                                                this.window_id,
+                                                true,
+                                                cx,
+                                            )
+                                        });
+                                        match res {
+                                            Ok(_) => this.sync_from_controller(window, cx),
+                                            Err(err) => this.set_message(err, cx),
+                                        }
+                                    });
+                                }),
+                        ),
+                )
+                .on_close(move |_, _, cx| {
+                    let _ = close_weak.update(cx, |this, cx| {
+                        this.confirming = false;
+                        cx.notify();
+                    });
+                })
+        });
+    }
+
     fn verify_section_boundary_action(
         &mut self,
         _: &VerifySectionBoundary,
@@ -2442,13 +2542,8 @@ impl QuarryWindow {
                         .label("Reopen Verified")
                         .primary()
                         .small()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let res = this.controller.update(cx, |c, cx| {
-                                c.reopen_verified_section_active(this.window_id, cx)
-                            });
-                            if let Err(err) = res {
-                                this.set_message(err, cx);
-                            }
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_reopen_verified_section(window, cx);
                         })),
                 );
         } else if section.can_verify_boundary {
