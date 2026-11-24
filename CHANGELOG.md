@@ -12,7 +12,7 @@ parentheses are GitHub pull requests.
 
 ### Added
 
-- Added **File → Open Section…** (`Cmd+Shift+O` / `Ctrl+Shift+O`) to open a bounded byte range of a multi-terabyte file without indexing the whole file, with exact `Bytes`–`TiB` bounds, coarse slider presets, and **Save Section As New…** export. (#209)
+- Added **File → Open Section…** (`Cmd+Shift+O` / `Ctrl+Shift+O`) to open a bounded byte range of a multi-terabyte file without indexing the whole file, with exact `Bytes`–`TiB` bounds, coarse slider presets, and **Save Section As New…** export. Sections must be saved as a new file; in-place **Save** is disabled. (#209)
 - Added **Data → Verify Section Boundary** and a `Verified`/`Speculative` banner so mid-file sections can be verified with pause, resume, and cancel controls while preserving unsaved edits if the row boundary shifts. Documented in [ADR 0014](docs/adr/0014-large-file-controller-and-section-windows.md). (#209)
 - Added **Data → Pause / Resume Indexing** and an inline status-bar **Pause** / **Resume** control so large-file indexing can pause mid-scan without holding worker threads or file handles, while keeping Find and Filter usable up to the indexed row. (#206)
 - Added a per-window Live Resource HUD in the status bar showing process memory and available disk space on the document and temporary-storage volumes, with accessible status announcements on state changes. (#206)
@@ -29,7 +29,7 @@ parentheses are GitHub pull requests.
 
 ### Added
 
-- Added a verified `rollback [archive-path]` subcommand to `scripts/macos-app.sh` to restore backed-up macOS app bundles atomically, and recorded the GPUI cutover verification report in `docs/benchmarks/2026-11-23-phase4b3-gpui-cutover-verification.md`. (#204)
+- Added a verified `rollback [archive-path]` subcommand to `scripts/macos-app.sh` to restore backed-up macOS app bundles with in-process rollback recovery, and recorded the GPUI cutover verification report in `docs/benchmarks/2026-11-23-phase4b3-gpui-cutover-verification.md`. (#204)
 - Added macOS desktop integration to the GPUI app, including install-lock coordination with `scripts/macos-app.sh`, Finder file-open and hard-link window routing, and bundled build metadata in **About Quarry**. (#203)
 - Added **View → Theme** with **System**, **Light**, **Dark** (WCAG AA), and local **Omarchy** theme sync, plus right-aligned tabular numerals for numeric columns in the GPUI grid. (#200)
 - Recorded 200-tab multi-window and accessibility verification on macOS and Linux Wayland in `docs/benchmarks/2026-11-23-phase4b2-gpui-workbench-verification.md`. (#200)
@@ -57,7 +57,7 @@ parentheses are GitHub pull requests.
 - Recorded parallel out-of-core, adaptive 300 MB memory budget, and hash-join verification benchmarks in `docs/benchmarks/2026-11-22-phase3-out-of-core-benchmarks.md`, confirming golden output parity and up to 60× faster Replace All, 5.5× faster Sort, and 4.7× faster duplicate removal. (#178)
 - Added a multi-threaded partitioned hash-join engine to **Join Files** with automatic external sort-merge fallback for heavily skewed keys, cutting 10M-row and 18 GiB join times while staying within bounded memory. Amended [ADR 0011](docs/adr/0011-bounded-file-joining.md) and updated `docs/benchmarks/2026-11-22-phase3c-join-profiling.md`. (#177)
 - Added **Natural** alphanumeric sorting (`--mode natural` in `sort-save-as`), whole-row duplicate detection (`duplicates --all-fields` and **All fields (whole row)** in **Find Duplicates**), and bounded date/time format suggestions (`quarry suggest-date-format` and **Sort Rows** hints). Amended [ADR 0004](docs/adr/0004-bounded-duplicate-removal.md) and [ADR 0010](docs/adr/0010-multi-column-sorting.md). (#175)
-- Added multi-threaded **Find & Remove Duplicates** and **Replace All** with zero-spill fast paths for smaller files, immediate output index reuse in the desktop app, and `--threads` / `--memory-budget` CLI flags. (#174)
+- Added multi-threaded **Find & Remove Duplicates** and **Replace All** with zero-spill fast paths for smaller files, immediate output index reuse in the desktop app, `--threads` on both CLI commands, and `--memory-budget` on `duplicates`. (#174)
 - Added multi-threaded external sorting with an adaptive 300 MB in-memory fast path, `--threads` and `--memory-budget` flags on `sort-save-as`, and persistent custom scratch folders via **File → Temporary Storage…**. Updated [ADR 0005](docs/adr/0005-temporary-storage.md). (#173)
 
 ### Changed
@@ -72,11 +72,11 @@ parentheses are GitHub pull requests.
 ### Added
 
 - Recorded SIMD and parallel indexing benchmarks in `docs/benchmarks/2026-11-21-phase2-engine-benchmarks.md`, verifying golden output parity across all 30 public-dataset workloads with up to 29 GiB/s warm indexing and sub-21 ms cached reopen times. (#166)
-- Added a persistent, owner-private structural index cache (storing offsets only, never filenames or cell contents) with a 256 MiB LRU limit, integrity validation, **File → Temporary Storage…** cache controls, and CLI `--no-index-cache`, `--index-cache-dir`, and `clear-index-cache` options. (#165)
+- Added a persistent, owner-private structural index cache (storing structural metadata only, never filenames or cell contents) with a 256 MiB LRU limit, integrity validation, **File → Temporary Storage…** cache controls, and CLI `--no-index-cache`, `--index-cache-dir`, and `clear-index-cache` options. (#165)
 - Added multi-threaded literal Find, Filter, and backpressure-bounded Filtered Export across the core engine, with `--threads` support and worker telemetry in `quarry-cli`. (#164)
 - Added chunk-parallel structural indexing using positional file reads and a bounded worker pool (no new third-party dependencies), with `--threads` support in `quarry-cli`. Amended [ADR 0001](docs/adr/0001-initial-engine.md) to prefer positional reads over `mmap` on user files. (#163)
 - Added runtime-dispatched 64-byte SIMD structural scanning (NEON and AVX2, with scalar fallback and UTF-16 safety) plus configurable delimiter, quote, and escape rules in `quarry-delimited`. (#162)
-- Recorded the public-dataset benchmark baseline and golden output digests across all 30 Weather and Hacker News workloads in `docs/benchmarks/2026-11-21-phase1-public-datasets-baseline.md`. (#156)
+- Recorded the public-dataset benchmark baseline and golden output digests across all 30 Weather and Hacker News workloads in `docs/benchmarks/2026-11-21-phase1-public-datasets-baseline.md` and `docs/benchmarks/2026-11-21-phase1-public-datasets-golden.json`. (#156)
 - Added a pure-scalar reference CSV parser oracle, a seeded torture-corpus generator (`scripts/generate-torture-corpus.py`), and 64-bit sparse-file index tests beyond 16 TB. (#154)
 - Added `docs/V1_CLAIM_LEDGER.md` to track v1.0 performance, behavioral, accessibility, and platform targets alongside measurement criteria and evidence status. (#152)
 - Added native Linux ARM64 (`ubuntu-24.04-arm`) and macOS Intel (`macos-15-intel`) CI jobs plus strict Clippy checks on Linux CI. (#153)
