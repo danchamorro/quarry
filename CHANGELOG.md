@@ -25,6 +25,10 @@ parentheses are GitHub pull requests.
 
 - Retired the legacy egui desktop frontend (`apps/quarry-egui`) and its unused `eframe`/`egui_extras` dependencies after the GPUI cutover, leaving the GPUI app as Quarry's sole desktop frontend. Refreshed third-party license manifests and architecture docs while keeping upgrade cleanup for older installs in `scripts/macos-app.sh`. (#207)
 
+### Fixed
+
+- Preserved exact requested section end boundaries in **Open Section…** when a single record longer than 1 MiB ends at the requested offset, while still rejecting unvalidated or mid-quote boundaries and safely clamping speculative scan distances on 32-bit targets. (#211)
+
 ## [2026-11-23]
 
 ### Added
