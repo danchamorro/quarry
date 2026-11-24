@@ -4036,11 +4036,11 @@ mod tests {
     #[test]
     fn bounded_filter_reads_stop_at_scan_limit_and_ignore_edits_beyond_frontier() {
         let mut prefix = Vec::from(&b"id,val\n1,ok\n2,ok\n"[..]);
-        for i in 3..=40_000 {
+        for i in 3..=49 {
             prefix.extend_from_slice(format!("{i},ok\n").as_bytes());
         }
-        prefix.extend_from_slice(b"40001,hit\n");
-        let malformed_suffix = b"40002,\"bad\"trailing\n";
+        prefix.extend_from_slice(b"50,hit\n");
+        let malformed_suffix = b"51,\"bad\"trailing\n";
         let mut data = Vec::with_capacity(prefix.len() + malformed_suffix.len());
         data.extend_from_slice(&prefix);
         data.extend_from_slice(malformed_suffix);
@@ -4051,7 +4051,8 @@ mod tests {
                 rows: 2,
                 delimiter: Some(b','),
                 header_mode: HeaderMode::FirstRow,
-                sample_bytes: 256,
+                sample_bytes: 128,
+                bootstrap_limit: 128,
                 ..OpenOptions::default()
             },
         )
@@ -4068,7 +4069,7 @@ mod tests {
         assert_eq!(index.matches_found(), 1);
         let rows = session.read_filtered_rows(&index, 0, 10).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].row, 40_001);
+        assert_eq!(rows[0].row, 50);
         let async_rows = match session
             .start_filtered_read(&index, 0, 10)
             .unwrap()
