@@ -321,7 +321,7 @@ install_app() {
 
 restore_backup_app() {
     local archive="${1:-$BACKUP_ARCHIVE}"
-    local install_dir candidate
+    local install_dir archive_stage candidate
 
     install_dir="$(dirname "$INSTALL_APP")"
     acquire_app_install_lock
@@ -331,9 +331,11 @@ restore_backup_app() {
     /usr/bin/unzip -tq "$archive" >/dev/null || fail "rollback archive is corrupted: $archive"
 
     INSTALL_STAGE="$(mktemp -d "$install_dir/.quarry-install.XXXXXX")"
-    candidate="$INSTALL_STAGE/$APP_NAME.app"
+    archive_stage="$INSTALL_STAGE/archive"
+    candidate="$archive_stage/$APP_NAME.app"
     INSTALL_PREVIOUS="$INSTALL_STAGE/previous.app"
-    /usr/bin/ditto -x -k "$archive" "$INSTALL_STAGE" || fail "could not extract rollback archive: $archive"
+    /bin/mkdir "$archive_stage" || fail "could not create rollback extraction directory."
+    /usr/bin/ditto -x -k "$archive" "$archive_stage" || fail "could not extract rollback archive: $archive"
     verify_app_identity "$candidate" || fail "rollback archive does not contain a valid signed Quarry.app."
     require_app_closed
 
@@ -503,7 +505,11 @@ self_test_rollback() {
     [[ "$(plist_value QuarryGitRevision "$INSTALL_APP/Contents/Info.plist")" == "rev-old" ]] \
         || fail "wrong-shaped archive changed the installed app; test data remains at $test_root"
 
-    # 4. Post-swap verification/registration failure restores the previous app.
+    # 4. Post-swap verification/registration failure restores the previous app,
+    # even when the archive also contains a top-level previous.app entry.
+    /bin/mkdir -p "$test_root/target-src/previous.app"
+    printf 'decoy\n' > "$test_root/target-src/previous.app/decoy.marker"
+    /usr/bin/ditto -c -k --sequesterRsrc "$test_root/target-src" "$target_archive"
     fail_once_lsregister="$test_root/fail-once-lsregister.sh"
     cat > "$fail_once_lsregister" <<EOF
 #!/bin/sh

@@ -355,6 +355,14 @@
       "source": "https://raw.githubusercontent.com/etemesi254/zune-image/23e48ce24107a8c9816af2162a503399ae19a4ce/LICENSE-MIT",
       "sha256": "d30047bca3b516639339a3c279bb84c3483124fb5a9dafe3c75056a85090e745",
       "text": "MIT License\n\nCopyright (c) zune-image developers\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n"
+    },
+    {
+      "packages": [
+        "option-ext@0.2.0"
+      ],
+      "source": "option-ext@0.2.0/MPL-2.0-SOURCE-AVAILABILITY",
+      "sha256": "ed620f62a71a23f7a486c3611c58a1fb772392b8cf5559b3cb6b5cb49d7aae80",
+      "text": "MPL-2.0 Section 3.2(a) Source Code Availability Notice for option-ext@0.2.0\n\nThis Executable Form of Quarry incorporates unmodified Covered Software from the option-ext crate, version 0.2.0, licensed under the Mozilla Public License, Version 2.0 (MPL-2.0).\n\nRecipients may obtain the corresponding Source Code Form of option-ext 0.2.0 at no charge from:\n  - Crates.io registry package: https://crates.io/crates/option-ext/0.2.0\n  - Direct crate source archive: https://crates.io/api/v1/crates/option-ext/0.2.0/download\n  - Upstream Git repository: https://github.com/soc/option-ext\n  - Locked Cargo.lock archive SHA-256: 04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d\n\nThe full MPL-2.0 license text is included in the Collected source notices section of this document.\n"
     }
   ],
   "assets": []

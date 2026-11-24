@@ -314,14 +314,17 @@ SHA-256 `ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e`).
   shipping app graph). `gpui-kit-assets@0.10.0` embeds the default 101 Lucide
   SVG component icons; its locked `gpui-kit-assets@0.10.0/LICENSE-LUCIDE`
   notice is preserved and hash-verified in `supplemental.json`.
-- **Supplemental notice coverage (`supplemental.json`):** Updated to 37
+- **Supplemental notice coverage (`supplemental.json`):** Updated to 38
   hash-verified records covering every `cargo-about` fallback crate in
   `quarry-gpui` (`gpui-kit`, `gpui-kit-assets`, `ryu`, `exr`, `chrono`,
   `granit-parser` including all four inherited `.licenses/{ChenYuheng,Ethiraric}-{Apache,MIT}` files,
   `libm`, `accesskit@0.24.1`, `accesskit_consumer@0.38.0`,
   `accesskit_macos@0.26.3`, the `objc2`/`block2`/`dispatch2`/`objc-sys` family
   with `Zlib` selected where offered, `lyon*`, `mac`, `pathfinder_*`,
-  `profiling*`, `rust-i18n-*`, `seahash`, `svg_fmt`, `taffy`, `zune-inflate`)
+  `profiling*`, `rust-i18n-*`, `seahash`, `svg_fmt`, `taffy`, `zune-inflate`),
+  the MPL-2.0 Section 3.2(a) source-obtainment notice for `option-ext@0.2.0`
+  (citing crates.io version `0.2.0`, SHA-256 `04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d`,
+  and upstream repository `https://github.com/soc/option-ext`),
   plus crate `COPYRIGHT` files (`rustix`, `unicode-segmentation`, `utf8_iter`).
 - **Rust runtime notices:** Unchanged from the verified Rust `1.100.0` runtime
   notices in `packaging/licenses/rust/`.
