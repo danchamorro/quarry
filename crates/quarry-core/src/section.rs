@@ -1479,8 +1479,7 @@ fn validate_speculative_candidate(
     while pos < probe_len && !stopped_early {
         let abs = candidate + pos as u64;
         let step_end = if abs < scan_target {
-            let want = (scan_target - abs) as usize;
-            let clamped = want.min(probe_len - pos);
+            let clamped = (scan_target - abs).min((probe_len - pos) as u64) as usize;
             if encoding.is_utf16() && pos + clamped < probe_len {
                 pos + (clamped & !1).max(2).min(probe_len - pos)
             } else {
@@ -1521,6 +1520,39 @@ fn validate_speculative_candidate(
         return Ok(false);
     }
     Ok(records > 0 || candidate + (pos as u64) < file_size)
+}
+
+/// Bounded fallback check for a large (`> 1 MiB`) speculative section when no backward LF anchor
+/// exists within `search_cap` before `req_end` (e.g. a single record longer than `1 MiB` ending
+/// exactly at `req_end`). Accepts `req_end` only when it is strictly before EOF, immediately
+/// preceded by an encoding-aligned LF, and followed by valid CSV across `SPECULATIVE_VALIDATE_BYTES`.
+fn is_validated_speculative_end_boundary(
+    file: &File,
+    file_size: u64,
+    req_end: u64,
+    delimiter: u8,
+    encoding: Encoding,
+) -> Result<bool, QuarryError> {
+    let unit_len = lf_unit_len(encoding);
+    if req_end < unit_len
+        || req_end >= file_size
+        || (encoding.is_utf16() && !req_end.is_multiple_of(2))
+    {
+        return Ok(false);
+    }
+    let mut prev = [0u8; 2];
+    let n = read_at_exact_or_eof(file, req_end - unit_len, &mut prev[..unit_len as usize])?;
+    if n != unit_len as usize || !is_lf_unit(&prev[..unit_len as usize], encoding) {
+        return Ok(false);
+    }
+    validate_speculative_candidate(
+        file,
+        file_size,
+        req_end,
+        req_end.saturating_add(SPECULATIVE_VALIDATE_BYTES as u64),
+        delimiter,
+        encoding,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1699,33 +1731,24 @@ fn snap_speculative_window(
                     break;
                 }
             }
-            if let Some(anchor) = chosen {
-                anchor
-            } else if probe_start == aligned_start {
-                aligned_start
-            } else {
-                return Err(boundary_not_found(
-                    search_cap,
-                    "Could not verify a clean record end within the 1 MiB alignment window; use a counted scan or smaller section.",
-                ));
-            }
-        } else if probe_start == aligned_start {
-            aligned_start
+            chosen.or((probe_start == aligned_start).then_some(aligned_start))
+        } else {
+            (probe_start == aligned_start).then_some(aligned_start)
+        };
+        if let Some(anchor) = tail_anchor {
+            scan_speculative_end_from_anchor(
+                file, file_size, anchor, req_end, delimiter, encoding, search_cap,
+            )?
+        } else if is_validated_speculative_end_boundary(
+            file, file_size, req_end, delimiter, encoding,
+        )? {
+            req_end
         } else {
             return Err(boundary_not_found(
                 search_cap,
                 "Could not verify a clean record end within the 1 MiB alignment window; use a counted scan or smaller section.",
             ));
-        };
-        scan_speculative_end_from_anchor(
-            file,
-            file_size,
-            tail_anchor,
-            req_end,
-            delimiter,
-            encoding,
-            search_cap,
-        )?
+        }
     };
 
     let snapped = ByteWindow::from_range(aligned_start, aligned_end.max(aligned_start))
@@ -3253,6 +3276,76 @@ mod tests {
             sec_ml.section_bounds().unwrap().snapped,
             ByteWindow::from_range(4, closing_quoted_end).unwrap(),
             "multiline quoted record must snap to its own closing LF without pulling in malformed suffix"
+        );
+    }
+
+    #[test]
+    fn large_speculative_single_record_over_1mib_preserves_exact_end_and_rejects_interior_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = SectionOpenOptions {
+            open: OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+            ..SectionOpenOptions::default()
+        };
+
+        // 1. Single > 1 MiB record ending exactly at req_end, followed by valid CSV.
+        let path_exact = dir.path().join("single_record_over_1mib.csv");
+        let mut bytes = Vec::with_capacity(1_200_064);
+        bytes.extend_from_slice(b"a,b\n");
+        bytes.extend_from_slice(b"1,");
+        bytes.resize(bytes.len() + 1_200_000, b'x');
+        bytes.push(b'\n');
+        let exact_end = bytes.len() as u64;
+        bytes.extend_from_slice(b"2,ok\n");
+        fs::write(&path_exact, &bytes).unwrap();
+
+        let sec = Session::open_section(
+            &path_exact,
+            ByteWindow::from_range(4, exact_end).unwrap(),
+            opts.clone(),
+        )
+        .unwrap();
+        let bounds = sec.section_bounds().unwrap();
+        assert_eq!(bounds.trust, BoundaryTrust::Speculative);
+        assert_eq!(
+            bounds.snapped,
+            ByteWindow::from_range(4, exact_end).unwrap(),
+            "exact record end after a > 1 MiB record must be preserved"
+        );
+
+        // 2. Requesting a mid-record offset inside that > 1 MiB record still fails cleanly.
+        let mid_err = Session::open_section(
+            &path_exact,
+            ByteWindow::from_range(4, exact_end - 10).unwrap(),
+            opts.clone(),
+        );
+        assert!(
+            matches!(mid_err, Err(QuarryError::SectionBoundaryNotFound { .. })),
+            "mid-record offset with no anchor within 1 MiB must fail, got {mid_err:?}"
+        );
+
+        // 3. > 1 MiB multiline quoted record where req_end sits on an interior LF before closing quote.
+        let path_quoted = dir.path().join("quoted_record_over_1mib_interior_lf.csv");
+        let mut qbytes = Vec::with_capacity(1_200_128);
+        qbytes.extend_from_slice(b"a,b\n");
+        qbytes.extend_from_slice(b"1,\"");
+        qbytes.resize(qbytes.len() + 1_200_000, b'q');
+        qbytes.push(b'\n');
+        let interior_lf_end = qbytes.len() as u64;
+        qbytes.extend_from_slice(b"still inside quote\nclosing\",ok\n2,after\n");
+        fs::write(&path_quoted, &qbytes).unwrap();
+
+        let quoted_err = Session::open_section(
+            &path_quoted,
+            ByteWindow::from_range(4, interior_lf_end).unwrap(),
+            opts,
+        );
+        assert!(
+            matches!(quoted_err, Err(QuarryError::SectionBoundaryNotFound { .. })),
+            "interior LF inside > 1 MiB quoted field must not be accepted as a section end, got {quoted_err:?}"
         );
     }
 }
