@@ -5,13 +5,14 @@ Quarry must operate on files larger than available RAM. Treat it as a **large-fi
 
 ## Current design
 ```text
-egui viewer
+GPUI desktop app (`apps/quarry-gpui`)  [legacy rollback: `apps/quarry-egui`]
    |
 quarry-workbench
    +-- UI-neutral Document, WorkingCopyState, EditHistory, StructuralOverlay
    +-- ColumnView, GridSelection, RowSelection, GridCursor
-   +-- WorkbenchTab state, WindowId / DocumentId, CommandId enablement & targeting
-   +-- CompressedDocument / DecompressionSlots & UI-neutral whitespace cache
+   +-- WorkbenchTab state, WorkbenchScheduler (200-tab dormancy, multi-window, FD budget)
+   +-- WindowId / DocumentId, CommandId enablement & targeting
+   +-- CompressedDocument / DecompressionSlots, Theme/Storage preferences, multi-file workflows
    |
    +----------------+<--- CLI (`quarry-cli`) / AppKit comparator (`quarry-appkit`, frozen)
    |
@@ -33,14 +34,7 @@ quarry-delimited
    +-- Delimited record parser
 ```
 
-The egui app is the active production UI. `quarry-workbench` owns the
-frontend-neutral document, tab, selection, and command-enablement model so
-frontends only render and dispatch. The CLI exposes the engine and benchmark
-commands. `apps/quarry-appkit` is **frozen as-is during Phase 4**: it stays
-building in the workspace as a historical macOS comparator and receives no new
-features. The Rust engine and workbench crates stay UI-independent so new
-filter operators, transformations, sorting, and export reuse the same
-boundaries.
+The GPUI desktop app (`apps/quarry-gpui`, adopted in [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md)) is the active packaged production UI for macOS and Linux/Omarchy. `apps/quarry-egui` remains intact in the workspace as the rollback frontend until explicit post-cutover retirement sign-off. `quarry-workbench` owns the frontend-neutral document, tab, dormant-tab scheduler, multi-window command enablement, theme, and workflow model so frontends only render and dispatch. The CLI exposes the engine and benchmark commands. `apps/quarry-appkit` is **frozen as-is**: it stays building in the workspace as a historical macOS comparator and receives no new features. The Rust engine and workbench crates stay UI-independent so new filter operators, transformations, sorting, and export reuse the same boundaries.
 
 ## Current workspace
 ```text
@@ -51,7 +45,8 @@ quarry/
     quarry-workbench/
   apps/
     quarry-cli/
-    quarry-egui/
+    quarry-gpui/     # active packaged desktop UI (ADR 0013)
+    quarry-egui/     # rollback frontend (retained until post-cutover retirement sign-off)
     quarry-appkit/   # frozen comparator (no new features)
   fixtures/
   docs/
@@ -93,11 +88,15 @@ convert-utf8 provides the explicit conversion path.
 
 ## File access
 
-The egui app owns up to eight independent document tabs. Each tab retains its
-session, edits/history, selection, view, filters, dialogs, and worker completions.
-All tabs are polled, while input targets only the active tab. At most two file
-operations run concurrently across tabs and Combine Files. Temporary working
-files are released when their owning document closes. See
+The GPUI desktop app runs in a single process across multiple windows and up to
+200 open document tabs managed by `quarry_workbench::WorkbenchScheduler`. Clean
+idle tabs transition to a dormant state (retaining canonical-path and
+`(dev, ino)` hard-link identity without holding live file descriptors or
+structural indexes) while active and dirty tabs stay hydrated within a
+code-counted `< 128` internal FD budget; at most two file-writing operations run
+concurrently across tabs, Combine Files, and Join Files. Temporary working
+files are released when their owning document closes. The legacy `quarry-egui`
+rollback frontend retains its 8-tab single-window cap. See
 [ADR 0007](adr/0007-document-tabs.md) for lifecycle and resource policy.
 
 Core uses `std::fs::File`, fixed-size sequential reads, and seeks from the
