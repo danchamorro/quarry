@@ -515,6 +515,7 @@ pub mod test_hooks {
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
     struct GateInner {
+        min_bytes: u64,
         reached: bool,
         released: bool,
     }
@@ -535,9 +536,14 @@ pub mod test_hooks {
 
     impl TestIndexPauseGate {
         pub fn install(path: &Path) -> Self {
+            Self::install_after_bytes(path, 0)
+        }
+
+        pub fn install_after_bytes(path: &Path, min_bytes: u64) -> Self {
             let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let inner = Arc::new((
                 Mutex::new(GateInner {
+                    min_bytes,
                     reached: false,
                     released: false,
                 }),
@@ -581,7 +587,11 @@ pub mod test_hooks {
         gate.is_some_and(|inner| !inner.0.lock().unwrap().released)
     }
 
-    pub(super) fn wait_if_gated(path: &Path, stop_dispatch: &std::sync::atomic::AtomicBool) {
+    pub(super) fn wait_if_gated(
+        path: &Path,
+        bytes_scanned: u64,
+        stop_dispatch: &std::sync::atomic::AtomicBool,
+    ) {
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let gate = { registry().lock().unwrap().get(&key).cloned() };
         let Some(inner) = gate else {
@@ -589,7 +599,7 @@ pub mod test_hooks {
         };
         let (lock, cvar) = &*inner;
         let mut guard = lock.lock().unwrap();
-        if guard.released {
+        if guard.released || bytes_scanned < guard.min_bytes {
             return;
         }
         guard.reached = true;
@@ -1330,7 +1340,7 @@ fn run_sequential_indexer(
                 .store(absolute_start, Ordering::Release);
             #[cfg(any(test, debug_assertions))]
             if absolute_start < file_size {
-                test_hooks::wait_if_gated(&shared.path, &shared.stop_dispatch);
+                test_hooks::wait_if_gated(&shared.path, absolute_start, &shared.stop_dispatch);
             }
         }
     } else {
@@ -1399,7 +1409,7 @@ fn run_sequential_indexer(
                 .store(absolute_start, Ordering::Release);
             #[cfg(any(test, debug_assertions))]
             if absolute_start < file_size {
-                test_hooks::wait_if_gated(&shared.path, &shared.stop_dispatch);
+                test_hooks::wait_if_gated(&shared.path, absolute_start, &shared.stop_dispatch);
             }
         }
     }
@@ -1856,7 +1866,7 @@ fn scan_giant_line_sequential(
         }
         #[cfg(any(test, debug_assertions))]
         if pos < file_size {
-            test_hooks::wait_if_gated(&shared.path, &shared.stop_dispatch);
+            test_hooks::wait_if_gated(&shared.path, pos, &shared.stop_dispatch);
         }
     }
 
@@ -2026,7 +2036,11 @@ fn run_parallel_indexer(
 
             #[cfg(any(test, debug_assertions))]
             if shared.bytes_scanned.load(Ordering::Acquire) > 0 && cursor < file_size {
-                test_hooks::wait_if_gated(&shared.path, &shared.stop_dispatch);
+                test_hooks::wait_if_gated(
+                    &shared.path,
+                    shared.bytes_scanned.load(Ordering::Acquire),
+                    &shared.stop_dispatch,
+                );
                 if shared.stop_dispatch.load(Ordering::Acquire) {
                     stop_flag.store(true, Ordering::Release);
                     return Ok(());
@@ -3086,13 +3100,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("giant-line-pause-width.csv");
         let mut bytes = Vec::new();
-        // Leading parallel chunk with 8 columns (> 64 KiB so it commits before the giant line).
+        // Leading wide 8-column rows inside parallel chunk 0, followed by narrow 2-column rows
+        // past the 64 KiB boundary so chunk 0 commits width=8 while the giant-line fallback
+        // starts strictly inside 2-column rows (scanner.maximum_width() == 2).
         bytes.extend_from_slice(b"c1,c2,c3,c4,c5,c6,c7,c8\n");
-        for i in 0..3200 {
+        for i in 0..100 {
             bytes.extend_from_slice(format!("r{i},b,c,d,e,f,g,h\n").as_bytes());
         }
+        while bytes.len() < 70 * 1024 {
+            bytes.extend_from_slice(b"narrow,val\n");
+        }
         let prefix_len = bytes.len() as u64;
-        assert!(prefix_len > 64 * 1024);
         // Giant single-line 2-column record exceeding chunk_bytes + max_alignment_search.
         bytes.extend_from_slice(b"giant,");
         bytes.extend(std::iter::repeat_n(b'x', 320 * 1024));
@@ -3136,7 +3154,8 @@ mod tests {
         .unwrap();
         assert_eq!(expected.maximum_width(), 8);
 
-        let gate = super::test_hooks::TestIndexPauseGate::arm(&path);
+        let gate =
+            super::test_hooks::TestIndexPauseGate::install_after_bytes(&path, prefix_len + 1);
         let job = IndexJob::start_with_tuning_cache_and_pool(
             &session,
             IndexConfig {
@@ -3157,13 +3176,11 @@ mod tests {
         .unwrap();
 
         // Gate fires inside scan_giant_line_sequential after the 8-column parallel prefix committed.
-        assert!(
-            gate.wait_until_hit(Duration::from_secs(5)),
-            "expected giant-line fallback to hit pause gate"
-        );
+        gate.wait_until_reached();
         assert_eq!(job.progress().columns_found, 8);
         assert!(job.progress().bytes_scanned > prefix_len);
         job.pause();
+        gate.release();
         drop(gate);
 
         let deadline = Instant::now() + Duration::from_secs(5);
