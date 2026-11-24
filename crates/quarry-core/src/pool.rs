@@ -26,6 +26,60 @@ const MIN_ADAPTIVE_SINGLE_RUN_MEMORY_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// so at most one worker holds an oversized record at a time.
 pub(crate) const LARGE_RECORD_GATE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Snapshot of the current process's OS-reported memory usage with an explicit metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessMemorySample {
+    /// Exact OS metric name (for example `"phys_footprint"` on macOS or `"VmRSS"` on Linux).
+    pub label: &'static str,
+    pub bytes: u64,
+}
+
+/// Read the current process's OS-reported memory footprint with an explicit metric label.
+pub fn process_memory_usage() -> Option<ProcessMemorySample> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+        // SAFETY: `info` is a properly aligned writable `rusage_info_v2` buffer matching
+        // `RUSAGE_INFO_V2` for the current process ID.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                info.as_mut_ptr().cast(),
+            )
+        };
+        if rc == 0 {
+            // SAFETY: `proc_pid_rusage` succeeded and initialized `info`.
+            let info = unsafe { info.assume_init() };
+            return Some(ProcessMemorySample {
+                label: "phys_footprint",
+                bytes: info.ri_phys_footprint,
+            });
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(ProcessMemorySample {
+                    label: "VmRSS",
+                    bytes: kib.saturating_mul(1024),
+                });
+            }
+        }
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// Query total physical RAM on the host when supported by the OS.
 pub(crate) fn physical_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -270,6 +324,7 @@ struct PoolQueue {
 pub(crate) struct EnginePool {
     queue: Mutex<PoolQueue>,
     ready: Condvar,
+    max_workers: usize,
     byte_budget: Arc<ByteBudget>,
     out_of_core_budget: Arc<ByteBudget>,
     large_record_gate: Arc<LargeRecordGate>,
@@ -278,6 +333,15 @@ pub(crate) struct EnginePool {
 
 impl EnginePool {
     pub(crate) fn new(byte_budget_bytes: usize) -> Self {
+        Self::with_max_workers_inner(byte_budget_bytes, MAX_POOL_WORKERS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_max_workers(byte_budget_bytes: usize, max_workers: usize) -> Self {
+        Self::with_max_workers_inner(byte_budget_bytes, max_workers.clamp(1, MAX_POOL_WORKERS))
+    }
+
+    fn with_max_workers_inner(byte_budget_bytes: usize, max_workers: usize) -> Self {
         Self {
             queue: Mutex::new(PoolQueue {
                 foreground: VecDeque::new(),
@@ -286,6 +350,7 @@ impl EnginePool {
                 shutdown: false,
             }),
             ready: Condvar::new(),
+            max_workers,
             byte_budget: Arc::new(ByteBudget::new(byte_budget_bytes)),
             out_of_core_budget: Arc::new(ByteBudget::new(default_single_run_memory_budget_bytes())),
             large_record_gate: Arc::new(LargeRecordGate::new()),
@@ -309,6 +374,11 @@ impl EnginePool {
         &self.fd_budget
     }
 
+    #[cfg(test)]
+    pub(crate) fn spawned_workers(&self) -> usize {
+        self.queue.lock().unwrap().spawned_workers
+    }
+
     /// Ensure at least one worker thread exists (targeting `target_workers`, capped at `MAX_POOL_WORKERS`).
     ///
     /// Returns the number of live worker threads available for this job (up to `target_workers`),
@@ -317,7 +387,7 @@ impl EnginePool {
         &'static self,
         target_workers: usize,
     ) -> Result<usize, crate::QuarryError> {
-        let desired = target_workers.clamp(1, MAX_POOL_WORKERS);
+        let desired = target_workers.clamp(1, self.max_workers);
         let mut guard = self.queue.lock().unwrap();
         let mut last_error = None;
         while guard.spawned_workers < desired {

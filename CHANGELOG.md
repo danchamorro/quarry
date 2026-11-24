@@ -8,6 +8,12 @@ Tagged beta releases are noted on the day they were published, with exact
 checksums and verification details under `docs/releases/`. Numbers in
 parentheses are GitHub pull requests.
 
+## [2026-11-24]
+
+### Added
+
+- Added park-the-job **Pause / Resume Indexing** and an off-thread **Live Resource HUD** across `crates/quarry-core`, `crates/quarry-workbench`, and `apps/quarry-gpui` with zero new third-party dependencies (`#205`): added `IndexJob::{pause, is_paused, is_pause_requested, is_paused_or_pausing, resume}`, `StructuralIndex::{committed_record_end, is_complete}`, `IndexProgress::{bytes_read, paused}`, `Session::start_filter_with_edits_and_limit` (retaining the scan boundary on `FilterIndex` for filtered reads and tolerating preview edits beyond the partial frontier), source-stamp validation on `SearchJob`, pause-aware giant-line fallback, OS-labelled `process_memory_usage` (`phys_footprint` on macOS via `proc_pid_rusage`, `VmRSS` on Linux via `/proc/self/status`), and probe-free `available_disk_space` in `crates/quarry-core` so pausing drains bounded in-flight chunks, commits up to the contiguous frontier, releases all worker slots, byte-budget tokens, and file handles without parking pool threads or writing partial sidecars, and revalidates `SourceStamp` on resume (proven with a 1-worker-pool foreground-completion test); added `CommandId::PauseResumeIndexing`, atomic `PinReason::IndexingPaused`, captured-scope partial-index Find (`"searched up to row N, indexing paused"`) and Filter (`"filtered up to row N, indexing paused"`) notices while blocking partial-filter export, off-thread `<= 2 Hz` non-blocking-drop `ResourceHudSampler` sampling per-window document volumes plus scratch with Unix `dev()` deduplication and unknown-sample protection, and state-transition-only `HudAnnouncementTracker` in `crates/quarry-workbench`; wired **Data → Pause / Resume Indexing**, an inline status bar **Pause** / **Resume** control with committed-vs-read bytes/rows progress, per-window tabular (`tnum`) Live Resource HUD telemetry inside a quiet `Role::Group` container, and transition-only `Role::Status` / `Role::Alert` accessibility announcements (`hud-announcement`) in `apps/quarry-gpui`; verified with deterministic unit, headless workbench, and GPUI UI tests plus live macOS (`macOS VM 1`) and native Wayland / `accesskit_unix` AT-SPI (`Omarchy VM 4`) checks; and updated `docs/V1_CLAIM_LEDGER.md` (`C17`). (#206)
+
 ## [2026-11-23]
 
 ### Added

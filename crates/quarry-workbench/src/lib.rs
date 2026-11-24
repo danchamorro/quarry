@@ -5,6 +5,7 @@ pub mod compressed;
 pub mod document;
 pub mod dormancy;
 pub mod history;
+pub mod resource_hud;
 pub mod selection;
 pub mod storage_prefs;
 pub mod tab;
@@ -41,6 +42,11 @@ pub use document::{
 pub use history::{
     EditHistory, EditTarget, MAX_EDIT_HISTORY_BYTES, MAX_EDIT_HISTORY_ENTRIES, SharedCellEdits,
     StructuralOverlay, ValueEdit, WorkingCopySnapshot, WorkingCopyState,
+};
+pub use resource_hud::{
+    DEFAULT_HUD_SAMPLE_INTERVAL, HudAnnouncement, HudAnnouncementTracker, HudIndexPhase,
+    LOW_DISK_WARNING_BYTES, ResourceHudSample, ResourceHudSampler, ResourceHudTargets,
+    VolumeSpaceSample, sample_resource_hud,
 };
 pub use selection::{
     CellCoord, ColumnView, CursorSelectionMode, GridCursor, GridSelection, RowSelection,

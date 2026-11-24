@@ -366,6 +366,22 @@ pub(crate) struct EncodedScanner<const TRACK_WIDTH: bool> {
 }
 
 impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
+    pub(crate) fn from_structural(
+        inner: quarry_delimited::StructuralScanner<TRACK_WIDTH>,
+        delimiter: u8,
+        encoding: Encoding,
+    ) -> Self {
+        Self {
+            inner,
+            encoding,
+            delimiter,
+            at_start: false,
+            high_surrogate: None,
+            validate_utf16: true,
+            shadow: Vec::new(),
+        }
+    }
+
     pub(crate) fn new(delimiter: u8, encoding: Encoding) -> Result<Self, QuarryError> {
         Self::at_offset(delimiter, 0, encoding)
     }

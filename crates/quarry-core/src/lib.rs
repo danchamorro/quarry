@@ -68,6 +68,9 @@ pub use filter::{
     FilterEdits, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
     FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
 };
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use index::test_hooks;
 pub use index::{
     Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, IndexTelemetry,
     StructuralIndex,
@@ -91,8 +94,9 @@ pub use join::{
     read_join_header_with_format,
 };
 pub use pool::{
-    DEFAULT_SINGLE_RUN_MEMORY_BUDGET_BYTES, NofileLimitStatus,
-    default_single_run_memory_budget_bytes, default_worker_threads, raise_nofile_limit,
+    DEFAULT_SINGLE_RUN_MEMORY_BUDGET_BYTES, NofileLimitStatus, ProcessMemorySample,
+    default_single_run_memory_budget_bytes, default_worker_threads, process_memory_usage,
+    raise_nofile_limit,
 };
 pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
@@ -119,7 +123,7 @@ pub use source_stamp::{
 #[cfg(target_os = "macos")]
 pub use source_stamp::{acquire_macos_install_lock, acquire_macos_install_lock_at};
 pub use storage::{
-    StorageSpace, check_storage, estimate_duplicate_target_temporary_bytes,
+    StorageSpace, available_disk_space, check_storage, estimate_duplicate_target_temporary_bytes,
     estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
     estimate_edited_output_bytes_from_values, inspect_storage, restrict_private_file,
     validate_scratch_directory,

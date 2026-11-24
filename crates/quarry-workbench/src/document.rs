@@ -255,14 +255,17 @@ pub struct Document {
     pub search_case_sensitivity: CaseSensitivity,
     pub last_match: Option<SearchMatch>,
     pub search_history: Vec<SearchMatch>,
+    pub search_history_limits: Vec<Option<u64>>,
     pub search_history_index: Option<usize>,
     pub search_status: Option<String>,
+    pub search_paused_row_limit: Option<u64>,
     pub filter_job: Option<FilterJob>,
     pub filter_index: Option<FilterIndex>,
     pub filter_query: Option<FilterQuery>,
     pub filter_refresh_pending: bool,
     pub filter_progress: Option<FilterProgress>,
     pub filter_status: Option<String>,
+    pub filter_paused_row_limit: Option<u64>,
     pub export_job: Option<FilterExportJob>,
     pub export_progress: Option<FilterExportProgress>,
     pub export_status: Option<String>,
@@ -414,10 +417,12 @@ impl Document {
             .collect();
         let progress = IndexProgress {
             bytes_scanned: 0,
+            bytes_read: 0,
             rows_scanned: 0,
             columns_found: 0,
             file_size: session.file_size,
             elapsed: Duration::ZERO,
+            paused: false,
             done: false,
             cancelled: false,
         };
@@ -448,14 +453,17 @@ impl Document {
             search_case_sensitivity: CaseSensitivity::Insensitive,
             last_match: None,
             search_history: Vec::new(),
+            search_history_limits: Vec::new(),
             search_history_index: None,
             search_status: None,
+            search_paused_row_limit: None,
             filter_job: None,
             filter_index: None,
             filter_query: None,
             filter_refresh_pending: false,
             filter_progress: None,
             filter_status: None,
+            filter_paused_row_limit: None,
             export_job: None,
             export_progress: None,
             export_status: None,
@@ -2037,6 +2045,82 @@ impl Document {
         Ok(())
     }
 
+    pub fn is_indexing_paused(&self) -> bool {
+        self.job.as_ref().is_some_and(IndexJob::is_paused)
+    }
+
+    pub fn is_indexing_pausing(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.is_pause_requested() && !job.is_paused())
+    }
+
+    pub fn is_indexing_pause_pinned(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(IndexJob::is_paused_or_pausing)
+    }
+
+    pub fn can_pause_indexing(&self) -> bool {
+        !self.is_compressed()
+            && self.job.is_some()
+            && !self.progress.done
+            && !self.is_indexing_paused()
+            && !self.is_indexing_pausing()
+            && !self.saving_in_place
+            && !self.source_changed
+    }
+
+    pub fn can_resume_indexing(&self) -> bool {
+        !self.is_compressed()
+            && self.job.is_some()
+            && !self.progress.done
+            && self.is_indexing_paused()
+            && !self.saving_in_place
+            && !self.source_changed
+    }
+
+    pub fn committed_data_rows(&self) -> u64 {
+        self.progress.rows_scanned.saturating_sub(self.data_start)
+    }
+
+    pub fn pause_indexing(&mut self) -> Result<(), String> {
+        let Some(job) = &self.job else {
+            return Err("No active indexing job to pause.".into());
+        };
+        if self.progress.done || self.saving_in_place {
+            return Err("Indexing is already complete.".into());
+        }
+        job.pause();
+        self.progress = job.progress();
+        self.last_poll = Instant::now() - POLL_INTERVAL;
+        Ok(())
+    }
+
+    pub fn resume_indexing(&mut self) -> Result<(), String> {
+        let result = {
+            let Some(job) = self.job.as_mut() else {
+                return Err("No paused indexing job to resume.".into());
+            };
+            if !job.is_paused() {
+                return Err("Indexing is not paused.".into());
+            }
+            job.resume()
+        };
+        if let Err(error) = result {
+            if matches!(error, QuarryError::SourceChanged) {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            return Err(self.diagnostic_error(error));
+        }
+        if let Some(job) = &self.job {
+            self.progress = job.progress();
+        }
+        self.last_poll = Instant::now() - POLL_INTERVAL;
+        Ok(())
+    }
+
     pub fn poll(&mut self) -> Result<(), String> {
         if self.poll_decompression()? {
             return Ok(());
@@ -2045,7 +2129,8 @@ impl Document {
             return Ok(());
         };
         let progress = job.progress();
-        if self.last_poll.elapsed() < POLL_INTERVAL && !progress.done {
+        let transitioned_to_paused = progress.paused && !self.progress.paused;
+        if self.last_poll.elapsed() < POLL_INTERVAL && !progress.done && !transitioned_to_paused {
             return Ok(());
         }
         self.last_poll = Instant::now();
@@ -2072,7 +2157,7 @@ impl Document {
             }
         }
         self.apply_indexed_width(self.progress.columns_found);
-        if self.progress.done {
+        if self.progress.done || transitioned_to_paused {
             self.load_buffer(self.viewport_start)?;
         }
         Ok(())
@@ -2110,13 +2195,20 @@ impl Document {
             self.search_case_sensitivity = case_sensitivity;
             self.last_match = None;
             self.search_history.clear();
+            self.search_history_limits.clear();
             self.search_history_index = None;
         }
         if let Some(index) = self.search_history_index
             && let Some(found) = self.search_history.get(index.saturating_add(1)).copied()
         {
-            self.search_history_index = Some(index + 1);
-            return self.show_search_match(found);
+            let next_index = index + 1;
+            let limit = self
+                .search_history_limits
+                .get(next_index)
+                .copied()
+                .flatten();
+            self.search_history_index = Some(next_index);
+            return self.show_search_match_with_limit(found, limit);
         }
         let position = self.last_match.as_ref().map_or(
             SearchPosition {
@@ -2128,18 +2220,34 @@ impl Document {
                 column: found.column.saturating_add(1),
             },
         );
-        let index = self.index.as_ref().expect("index was checked above");
-        self.search_job = Some(
-            self.session
-                .start_search_with_cell_edits_and_case(
-                    index,
-                    query.to_vec(),
-                    position,
-                    self.owned_cell_edits(),
-                    case_sensitivity,
-                )
-                .map_err(|error| self.diagnostic_error(error))?,
-        );
+        let partial_snapshot;
+        let (index, captured_paused_limit) = if let Some(index) = &self.index {
+            (index, None)
+        } else if let Some(job) = &self.job {
+            partial_snapshot = job.snapshot();
+            let limit = partial_snapshot
+                .indexed_rows()
+                .saturating_sub(self.data_start);
+            (&partial_snapshot, Some(limit))
+        } else {
+            return Err("Search is available after indexing completes.".into());
+        };
+        let search_job = match self.session.start_search_with_cell_edits_and_case(
+            index,
+            query.to_vec(),
+            position,
+            self.owned_cell_edits(),
+            case_sensitivity,
+        ) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(error) => return Err(self.diagnostic_error(error)),
+        };
+        self.search_job = Some(search_job);
+        self.search_paused_row_limit = captured_paused_limit;
         self.search_status = None;
         self.reveal_cell = None;
         Ok(())
@@ -2177,8 +2285,9 @@ impl Document {
         );
         let index = index.expect("a previous match was checked above");
         let found = self.search_history[index];
+        let limit = self.search_history_limits.get(index).copied().flatten();
         self.search_history_index = Some(index);
-        self.show_search_match(found)
+        self.show_search_match_with_limit(found, limit)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -2262,11 +2371,20 @@ impl Document {
         self.selected_rows.clear();
         if let Some(index) = self.search_history_index.take() {
             self.search_history.truncate(index);
+            self.search_history_limits.truncate(index);
         }
         self.start_find_next_with_case(query, case_sensitivity)
     }
 
     pub fn show_search_match(&mut self, found: SearchMatch) -> Result<(), String> {
+        self.show_search_match_with_limit(found, self.search_paused_row_limit)
+    }
+
+    fn show_search_match_with_limit(
+        &mut self,
+        found: SearchMatch,
+        paused_row_limit: Option<u64>,
+    ) -> Result<(), String> {
         let row = found.row;
         let column = found.column;
         self.navigate(row)?;
@@ -2276,11 +2394,15 @@ impl Document {
         self.selected_rows.clear();
         self.selected_columns.clear();
         self.column_selection_anchor = None;
-        self.search_status = Some(format!(
-            "Found row {}, column {}.",
-            row.saturating_sub(self.data_start).saturating_add(1),
-            column.saturating_add(1)
-        ));
+        let data_row = row.saturating_sub(self.data_start).saturating_add(1);
+        let data_col = column.saturating_add(1);
+        self.search_status = Some(if let Some(limit) = paused_row_limit {
+            format!(
+                "Found row {data_row}, column {data_col} (searched up to row {limit}, indexing paused)."
+            )
+        } else {
+            format!("Found row {data_row}, column {data_col}.")
+        });
         self.last_match = Some(found);
         Ok(())
     }
@@ -2293,21 +2415,42 @@ impl Document {
             return Ok(());
         }
         let job = self.search_job.take().expect("search job is present");
-        match job.wait().map_err(|error| self.diagnostic_error(error))? {
-            SearchOutcome::Match(found) => {
+        let captured_paused_limit = self.search_paused_row_limit;
+        match job.wait() {
+            Ok(SearchOutcome::Match(found)) => {
                 if let Some(index) = self.search_history_index {
                     self.search_history.truncate(index + 1);
+                    self.search_history_limits.truncate(index + 1);
                 }
                 self.search_history.push(found);
+                self.search_history_limits.push(captured_paused_limit);
                 self.search_history_index = self.search_history.len().checked_sub(1);
-                self.show_search_match(found)?;
+                self.show_search_match_with_limit(found, captured_paused_limit)?;
             }
-            SearchOutcome::NotFound => {
-                self.search_status = Some("No further matches.".into());
+            Ok(SearchOutcome::NotFound) => {
+                self.search_status = Some(if let Some(limit) = captured_paused_limit {
+                    format!("No further matches (searched up to row {limit}, indexing paused).")
+                } else {
+                    "No further matches.".into()
+                });
             }
-            SearchOutcome::Cancelled => {
+            Ok(SearchOutcome::Cancelled) => {
                 self.search_status = Some("Search cancelled.".into());
             }
+            Err(QuarryError::RowNotIndexed { indexed_rows, .. })
+                if captured_paused_limit.is_some() =>
+            {
+                let limit = captured_paused_limit
+                    .unwrap_or_else(|| indexed_rows.saturating_sub(self.data_start));
+                self.search_status = Some(format!(
+                    "No match — searched up to row {limit}, indexing paused."
+                ));
+            }
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(error) => return Err(self.diagnostic_error(error)),
         }
         Ok(())
     }
@@ -2351,9 +2494,24 @@ impl Document {
             .map_err(|error| self.diagnostic_error(error))?;
 
         self.commit_edits();
+        let (max_bytes, paused_row_limit) = if self.is_indexing_paused() {
+            let partial = self.job.as_ref().map(IndexJob::snapshot);
+            (
+                partial.as_ref().map(StructuralIndex::committed_record_end),
+                partial
+                    .as_ref()
+                    .map(|idx| idx.indexed_rows().saturating_sub(self.data_start)),
+            )
+        } else {
+            (None, None)
+        };
         let job = self
             .session
-            .start_filter_with_edits(query.clone(), Arc::new(self.cell_edits.as_ref().clone()))
+            .start_filter_with_edits_and_limit(
+                query.clone(),
+                Arc::new(self.cell_edits.as_ref().clone()),
+                max_bytes,
+            )
             .map_err(|error| {
                 if matches!(error, QuarryError::SourceChanged) {
                     self.invalidate_changed_source();
@@ -2366,7 +2524,12 @@ impl Document {
         self.filter_job = Some(job);
         self.filter_query = Some(query);
         self.filter_refresh_pending = false;
-        self.filter_status = Some("Filtering rows…".into());
+        self.filter_paused_row_limit = paused_row_limit;
+        self.filter_status = Some(if let Some(limit) = paused_row_limit {
+            format!("Filtering rows (up to row {limit}, indexing paused)…")
+        } else {
+            "Filtering rows…".into()
+        });
         self.export_progress = None;
         self.export_status = None;
         self.export_cancel_requested = false;
@@ -2462,7 +2625,22 @@ impl Document {
             Ok(index) => {
                 let matches = index.matches_found();
                 self.filter_index = Some(index);
-                self.filter_status = Some(if progress.cancelled {
+                self.filter_status = Some(if let Some(limit) = self.filter_paused_row_limit {
+                    if progress.cancelled {
+                        let scanned = progress.rows_scanned.saturating_sub(self.data_start);
+                        format!(
+                            "Filter cancelled after {matches} matches (filtered up to row {scanned}, indexing paused)."
+                        )
+                    } else if matches == 0 {
+                        format!(
+                            "Filter complete. No matching rows (filtered up to row {limit}, indexing paused)."
+                        )
+                    } else {
+                        format!(
+                            "Filter complete. {matches} matches (filtered up to row {limit}, indexing paused)."
+                        )
+                    }
+                } else if progress.cancelled {
                     format!("Filter cancelled after {matches} matches.")
                 } else if matches == 0 {
                     "Filter complete. No matching rows.".into()
@@ -2485,6 +2663,7 @@ impl Document {
                 self.filter_refresh_pending = false;
                 self.filter_progress = None;
                 self.filter_status = None;
+                self.filter_paused_row_limit = None;
                 self.whitespace.invalidate_rows();
                 self.filtered_rows.clear();
                 self.filter_viewport_start = 0;
@@ -2577,6 +2756,11 @@ impl Document {
                 "Run the filter to completion before exporting.",
             ));
         }
+        if self.filter_paused_row_limit.is_some() {
+            return Err(AppMessage::warning(
+                "Resume indexing and re-run the filter over the full file before exporting filtered rows.",
+            ));
+        }
 
         let job = self
             .session
@@ -2659,6 +2843,7 @@ impl Document {
     pub fn is_filtered_export_ready(&self) -> bool {
         !self.source_changed
             && self.filter_query.is_some()
+            && self.filter_paused_row_limit.is_none()
             && !self.filter_refresh_pending
             && self.filter_job.is_none()
             && self.export_job.is_none()
@@ -2869,6 +3054,8 @@ impl Document {
         self.filter_query = None;
         self.filter_refresh_pending = false;
         self.filter_progress = None;
+        self.filter_paused_row_limit = None;
+        self.search_paused_row_limit = None;
         self.whitespace.invalidate_rows();
         self.buffered_rows.clear();
         self.whitespace.invalidate_rows();
@@ -2921,6 +3108,7 @@ impl Document {
         self.filter_refresh_pending = false;
         self.filter_progress = None;
         self.filter_status = None;
+        self.filter_paused_row_limit = None;
         self.export_progress = None;
         self.export_status = None;
         self.export_cancel_requested = false;
@@ -2984,10 +3172,10 @@ impl Document {
     }
 
     pub fn is_search_ready(&self) -> bool {
-        self.index.is_some()
-            && self.progress.done
-            && !self.progress.cancelled
-            && self.structural_job.is_none()
+        self.structural_job.is_none()
+            && !self.source_changed
+            && ((self.index.is_some() && self.progress.done && !self.progress.cancelled)
+                || (self.is_indexing_paused() && self.job.is_some()))
     }
 
     pub fn cancel_search(&self) {
@@ -3295,8 +3483,10 @@ impl Document {
         self.search_query.clear();
         self.last_match = None;
         self.search_history.clear();
+        self.search_history_limits.clear();
         self.search_history_index = None;
         self.search_status = None;
+        self.search_paused_row_limit = None;
         self.reveal_cell = None;
     }
 
@@ -3402,8 +3592,10 @@ impl Document {
         self.search_query.clear();
         self.last_match = None;
         self.search_history.clear();
+        self.search_history_limits.clear();
         self.search_history_index = None;
         self.search_status = None;
+        self.search_paused_row_limit = None;
         if self.session.path() == self.logical_path {
             self.working_copy = None;
             self.original_session = None;

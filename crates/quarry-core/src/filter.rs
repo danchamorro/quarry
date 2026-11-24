@@ -222,6 +222,7 @@ struct FilterReadPlan {
     query: FilterQuery,
     edits: FilterEdits,
     source: Option<FilterSource>,
+    scan_limit: Option<u64>,
     checkpoint: FilterCheckpoint,
     start_match: u64,
     target_end: u64,
@@ -233,6 +234,7 @@ pub struct FilterIndex {
     query: FilterQuery,
     edits: FilterEdits,
     source: Option<FilterSource>,
+    scan_limit: Option<u64>,
     checkpoints: Vec<FilterCheckpoint>,
     checkpoint_every: u64,
     max_checkpoints: usize,
@@ -252,6 +254,7 @@ impl FilterIndex {
             query,
             edits: Arc::default(),
             source: None,
+            scan_limit: None,
             checkpoints: Vec::with_capacity(max_checkpoints.min(4)),
             checkpoint_every: 1,
             max_checkpoints,
@@ -324,10 +327,11 @@ struct SharedState {
     error: Mutex<Option<String>>,
     started: Instant,
     file_size: u64,
+    bounded_scan: bool,
 }
 
 impl SharedState {
-    fn new(index: FilterIndex, file_size: u64) -> Self {
+    fn new(index: FilterIndex, file_size: u64, bounded_scan: bool) -> Self {
         Self {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
@@ -340,6 +344,7 @@ impl SharedState {
             error: Mutex::new(None),
             started: Instant::now(),
             file_size,
+            bounded_scan,
         }
     }
 }
@@ -382,6 +387,7 @@ impl FilterJob {
             None,
             Encoding::Utf8,
             FilterParallelTuning::for_production(1),
+            false,
         )
     }
 
@@ -409,6 +415,7 @@ impl FilterJob {
             expected,
             encoding,
             FilterParallelTuning::for_production(1),
+            false,
         )
     }
 
@@ -424,6 +431,7 @@ impl FilterJob {
         expected: Option<SourceStamp>,
         encoding: Encoding,
         tuning: FilterParallelTuning,
+        bounded_scan: bool,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
@@ -445,7 +453,8 @@ impl FilterJob {
         let guard_file = file.try_clone()?;
         index.edits = edits;
         index.source = Some(source.clone());
-        let shared = Arc::new(SharedState::new(index, file_size));
+        index.scan_limit = bounded_scan.then_some(file_size);
+        let shared = Arc::new(SharedState::new(index, file_size, bounded_scan));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("quarry-filter".into())
@@ -616,9 +625,12 @@ impl FilterReadJob {
         }
         let guard = source.clone();
         let guard_file = file.as_ref().map(File::try_clone).transpose()?;
-        let total_bytes = plan
-            .as_ref()
-            .map_or(0, |plan| file_size.saturating_sub(plan.checkpoint.offset));
+        let total_bytes = plan.as_ref().map_or(0, |plan| {
+            plan.scan_limit
+                .unwrap_or(file_size)
+                .min(file_size)
+                .saturating_sub(plan.checkpoint.offset)
+        });
         let shared = Arc::new(FilterReadSharedState::new(total_bytes));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -723,11 +735,35 @@ impl Session {
         edits: FilterEdits,
         threads: Option<usize>,
     ) -> Result<FilterJob, QuarryError> {
+        self.start_filter_with_edits_threads_and_limit(query, edits, threads, None)
+    }
+
+    /// Filters an immutable snapshot of working cell values up to an optional committed byte limit
+    /// (for example while background indexing is paused).
+    pub fn start_filter_with_edits_and_limit(
+        &self,
+        query: FilterQuery,
+        edits: FilterEdits,
+        max_bytes: Option<u64>,
+    ) -> Result<FilterJob, QuarryError> {
+        self.start_filter_with_edits_threads_and_limit(query, edits, None, max_bytes)
+    }
+
+    fn start_filter_with_edits_threads_and_limit(
+        &self,
+        query: FilterQuery,
+        edits: FilterEdits,
+        threads: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<FilterJob, QuarryError> {
         let requested_threads = resolve_worker_count(threads)?;
         self.ensure_source_unchanged()?;
+        let scan_limit = max_bytes
+            .map(|limit| limit.min(self.file_size))
+            .unwrap_or(self.file_size);
         FilterJob::start_with_edits_and_tuning(
             self.path.clone(),
-            self.file_size,
+            scan_limit,
             self.dialect.delimiter,
             u64::from(self.dialect.has_header),
             query,
@@ -736,6 +772,7 @@ impl Session {
             Some(self.source_stamp.clone()),
             self.encoding,
             FilterParallelTuning::for_production(requested_threads),
+            scan_limit < self.file_size,
         )
     }
 
@@ -1132,7 +1169,13 @@ fn run_filter(
             shared.cancelled.store(true, Ordering::Release);
             return Ok(());
         }
-        let read = encoding.read_chunk(&mut file, &mut chunk)?;
+        let remaining = shared.file_size.saturating_sub(absolute_start);
+        let read = if remaining == 0 {
+            0
+        } else {
+            let cap = encoding.chunk_size((remaining as usize).min(chunk.len()));
+            encoding.read_chunk(&mut file, &mut chunk[..cap])?
+        };
         if read == 0 {
             let mut deferred_error = None;
             let mut cancelled = false;
@@ -1183,10 +1226,11 @@ fn run_filter(
                 return Err(error);
             }
             finish_result?;
-            if edits
-                .keys()
-                .next_back()
-                .is_some_and(|(row, _)| *row >= row_number)
+            if !shared.bounded_scan
+                && edits
+                    .keys()
+                    .next_back()
+                    .is_some_and(|(row, _)| *row >= row_number)
             {
                 return Err(QuarryError::InvalidOption(
                     "cell edit points beyond the source rows",
@@ -2443,10 +2487,11 @@ fn run_parallel_filter(
             }
         }
 
-        if edits
-            .keys()
-            .next_back()
-            .is_some_and(|(row, _)| *row >= merge.rows_scanned)
+        if !shared.bounded_scan
+            && edits
+                .keys()
+                .next_back()
+                .is_some_and(|(row, _)| *row >= merge.rows_scanned)
         {
             return Err(QuarryError::InvalidOption(
                 "cell edit points beyond the source rows",
@@ -2527,6 +2572,7 @@ fn prepare_filtered_read(
         query: index.query().clone(),
         edits: index.edits.clone(),
         source: index.source.clone(),
+        scan_limit: index.scan_limit,
         checkpoint,
         start_match,
         target_end,
@@ -2591,7 +2637,26 @@ fn run_filtered_read(
         if filtered_read_cancel_requested(shared) {
             return Ok(FilterReadOutcome::Cancelled);
         }
-        let read = encoding.read_chunk(&mut file, &mut chunk)?;
+        let read = if let Some(limit) = plan.scan_limit {
+            let remaining = limit.saturating_sub(absolute_start);
+            if remaining == 0 {
+                0
+            } else {
+                let mut cap = usize::try_from(remaining)
+                    .unwrap_or(chunk.len())
+                    .min(chunk.len());
+                if encoding.is_utf16() {
+                    cap &= !1;
+                }
+                if cap == 0 {
+                    0
+                } else {
+                    encoding.read_chunk(&mut file, &mut chunk[..cap])?
+                }
+            }
+        } else {
+            encoding.read_chunk(&mut file, &mut chunk)?
+        };
         if read == 0 {
             let mut cancelled = false;
             let has_final_record = scanner.finish(absolute_start, |_| {
@@ -3657,7 +3722,7 @@ mod tests {
             DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES,
         )
         .unwrap();
-        let shared = Arc::new(SharedState::new(index, 0));
+        let shared = Arc::new(SharedState::new(index, 0, false));
         let worker_state = Arc::clone(&shared);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);
@@ -3826,6 +3891,7 @@ mod tests {
                 max_alignment_search: 256,
                 delay_chunk_zero: Some(Duration::from_millis(25)),
             },
+            false,
         )
         .unwrap()
         .wait()
@@ -3886,6 +3952,7 @@ mod tests {
                 max_alignment_search: 8 * 1024,
                 delay_chunk_zero: Some(Duration::from_millis(15)),
             },
+            false,
         )
         .unwrap()
         .wait()
@@ -3937,6 +4004,7 @@ mod tests {
                     max_alignment_search: 256,
                     delay_chunk_zero: None,
                 },
+                false,
             )
             .unwrap()
             .wait()
@@ -3962,6 +4030,55 @@ mod tests {
             .wait()
             .unwrap();
         assert_eq!(index.matches_found(), 0);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_filter_reads_stop_at_scan_limit_and_ignore_edits_beyond_frontier() {
+        let mut prefix = Vec::from(&b"id,val\n1,ok\n2,ok\n"[..]);
+        for i in 3..=49 {
+            prefix.extend_from_slice(format!("{i},ok\n").as_bytes());
+        }
+        prefix.extend_from_slice(b"50,hit\n");
+        let malformed_suffix = b"51,\"bad\"trailing\n";
+        let mut data = Vec::with_capacity(prefix.len() + malformed_suffix.len());
+        data.extend_from_slice(&prefix);
+        data.extend_from_slice(malformed_suffix);
+        let path = fixture(&data);
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                rows: 2,
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                sample_bytes: 128,
+                bootstrap_limit: 128,
+            },
+        )
+        .unwrap();
+
+        let mut edits = BTreeMap::new();
+        edits.insert((99_999, 1), Arc::new(b"beyond_frontier_edit".to_vec()));
+        let query = FilterQuery::single(1, FilterOperator::Equals, b"hit".to_vec());
+        let index = session
+            .start_filter_with_edits_and_limit(query, Arc::new(edits), Some(prefix.len() as u64))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(index.matches_found(), 1);
+        let rows = session.read_filtered_rows(&index, 0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row, 50);
+        let async_rows = match session
+            .start_filtered_read(&index, 0, 10)
+            .unwrap()
+            .wait()
+            .unwrap()
+        {
+            super::FilterReadOutcome::Complete(rows) => rows,
+            super::FilterReadOutcome::Cancelled => panic!("unexpected cancel"),
+        };
+        assert_eq!(async_rows, rows);
         fs::remove_file(path).unwrap();
     }
 }

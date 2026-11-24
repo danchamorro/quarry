@@ -43,6 +43,7 @@ gpui_kit::actions!(
         MoveColumns,
         SplitColumn,
         CombineColumns,
+        PauseResumeIndexing,
         ShowAllWhitespace,
         ThemeSystem,
         ThemeLight,
@@ -215,6 +216,8 @@ pub fn build_app_menus() -> Vec<Menu> {
                 MenuItem::action("Move Selected Columns…", MoveColumns),
                 MenuItem::action("Split Selected Column…", SplitColumn),
                 MenuItem::action("Combine Selected Columns…", CombineColumns),
+                MenuItem::separator(),
+                MenuItem::action("Pause / Resume Indexing", PauseResumeIndexing),
             ],
         },
         Menu {

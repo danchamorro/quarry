@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::{Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
@@ -14,7 +16,7 @@ use quarry_delimited::{
 use crate::Encoding;
 use crate::encoding::EncodedScanner;
 use crate::export::source_matches_stamp;
-use crate::pool::{JobExecutor, JobPriority, engine_pool, resolve_worker_count};
+use crate::pool::{EnginePool, JobExecutor, JobPriority, engine_pool, resolve_worker_count};
 use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
 use crate::sidecar::{IndexCacheConfig, save_sidecar, try_load_sidecar};
 use crate::source_stamp::open_regular_file;
@@ -98,6 +100,8 @@ pub struct StructuralIndex {
     indexed_rows: u64,
     maximum_width: usize,
     indexed_bytes: u64,
+    last_record_end: u64,
+    complete: bool,
     telemetry: IndexTelemetry,
     provenance: Option<IndexProvenance>,
 }
@@ -111,6 +115,7 @@ impl PartialEq for StructuralIndex {
             && self.indexed_rows == other.indexed_rows
             && self.maximum_width == other.maximum_width
             && self.indexed_bytes == other.indexed_bytes
+            && self.last_record_end == other.last_record_end
     }
 }
 
@@ -138,6 +143,8 @@ impl StructuralIndex {
             indexed_rows: 0,
             maximum_width: 0,
             indexed_bytes: 0,
+            last_record_end: 0,
+            complete: false,
             telemetry: IndexTelemetry::default(),
             provenance: None,
         })
@@ -183,6 +190,8 @@ impl StructuralIndex {
         index.indexed_rows = indexed_rows;
         index.maximum_width = maximum_width;
         index.indexed_bytes = indexed_bytes;
+        index.last_record_end = indexed_bytes;
+        index.complete = true;
         index.telemetry = IndexTelemetry {
             effective_workers: 0,
             simd_backend: active_simd_backend(),
@@ -199,6 +208,7 @@ impl StructuralIndex {
     pub(crate) fn record_boundary(&mut self, offset: u64) {
         self.indexed_rows += 1;
         self.indexed_bytes = offset;
+        self.last_record_end = offset;
         if self.checkpoint_byte_stride.is_some() {
             let row = self.indexed_rows;
             self.record_byte_stride_checkpoint(row, offset);
@@ -286,6 +296,13 @@ impl StructuralIndex {
     pub(crate) fn finish_output(&mut self, bytes_written: u64, maximum_width: usize) {
         self.maximum_width = maximum_width;
         self.indexed_bytes = bytes_written;
+        self.last_record_end = bytes_written;
+        self.complete = true;
+    }
+
+    /// True only when this index reached validated EOF (complete scan, verified output, or sidecar).
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// Widest completed logical record in the indexed portion, including the header.
@@ -299,6 +316,11 @@ impl StructuralIndex {
 
     pub fn indexed_bytes(&self) -> u64 {
         self.indexed_bytes
+    }
+
+    /// Byte offset immediately after the last complete logical record committed so far.
+    pub fn committed_record_end(&self) -> u64 {
+        self.last_record_end
     }
 
     pub fn checkpoint_every(&self) -> u64 {
@@ -419,12 +441,18 @@ impl Session {
 
 #[derive(Debug, Clone, Copy)]
 pub struct IndexProgress {
+    /// Contiguous bytes committed to the structural index.
     pub bytes_scanned: u64,
+    /// Raw bytes read from disk across indexing workers (may exceed committed bytes while parallel
+    /// chunks are in flight or after a pause discards out-of-order speculative reads).
+    pub bytes_read: u64,
+    /// Complete logical records committed to the structural index.
     pub rows_scanned: u64,
     pub columns_found: usize,
     pub file_size: u64,
     pub elapsed: Duration,
     pub done: bool,
+    pub paused: bool,
     pub cancelled: bool,
 }
 
@@ -435,6 +463,8 @@ struct ParallelTuning {
     byte_stride: u64,
     max_alignment_search: u64,
     allow_small_chunks: bool,
+    #[cfg(test)]
+    chunk_delay: Option<Duration>,
 }
 
 impl ParallelTuning {
@@ -445,37 +475,238 @@ impl ParallelTuning {
             byte_stride: DEFAULT_CHECKPOINT_BYTE_STRIDE,
             max_alignment_search: MAX_ALIGNMENT_SEARCH_BYTES,
             allow_small_chunks: false,
+            #[cfg(test)]
+            chunk_delay: None,
         }
+    }
+}
+
+enum PausedScannerState {
+    Parallel {
+        cursor: u64,
+        in_quote: bool,
+        pending_separators: usize,
+    },
+    Sequential {
+        cursor: u64,
+        scanner: Box<EncodedScanner<true>>,
+    },
+}
+
+#[derive(Clone)]
+struct JobResumeContext {
+    path: PathBuf,
+    file_size: u64,
+    delimiter: u8,
+    encoding: Encoding,
+    config: IndexConfig,
+    tuning: ParallelTuning,
+    cache_config: IndexCacheConfig,
+    source_stamp: SourceStamp,
+    completed_record_count: Arc<Mutex<Option<CompletedRecordCount>>>,
+    pool: &'static EnginePool,
+}
+
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    struct GateInner {
+        min_bytes: u64,
+        reached: bool,
+        released: bool,
+    }
+
+    type GateSignal = Arc<(Mutex<GateInner>, Condvar)>;
+
+    /// Fast-path count of installed pause gates so un-gated debug/test indexing never touches
+    /// the mutex or calls `fs::canonicalize` per chunk.
+    static ACTIVE_GATES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Deterministic path-scoped test barrier that pauses indexing after the first committed
+    /// chunk until the test releases it or requests pause/cancel.
+    pub struct TestIndexPauseGate {
+        path: PathBuf,
+        inner: GateSignal,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<PathBuf, GateSignal>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, GateSignal>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    impl TestIndexPauseGate {
+        pub fn install(path: &Path) -> Self {
+            Self::install_after_bytes(path, 0)
+        }
+
+        pub fn install_after_bytes(path: &Path, min_bytes: u64) -> Self {
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let inner = Arc::new((
+                Mutex::new(GateInner {
+                    min_bytes,
+                    reached: false,
+                    released: false,
+                }),
+                Condvar::new(),
+            ));
+            let mut map = registry().lock().unwrap();
+            map.insert(key.clone(), Arc::clone(&inner));
+            ACTIVE_GATES.store(map.len(), Ordering::Release);
+            Self { path: key, inner }
+        }
+
+        /// Wait until the indexer has committed its initial partial chunk and reached the gate,
+        /// returning `false` if `timeout` elapses before the gate is reached.
+        pub fn wait_until_reached(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let (lock, cvar) = &*self.inner;
+            let mut guard = lock.lock().unwrap();
+            while !guard.reached {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                let (next, _) = cvar.wait_timeout(guard, remaining).unwrap();
+                guard = next;
+            }
+            true
+        }
+
+        /// Allow the indexer to continue past the gate (e.g. after requesting pause).
+        pub fn release(&self) {
+            let (lock, cvar) = &*self.inner;
+            let mut guard = lock.lock().unwrap();
+            guard.released = true;
+            cvar.notify_all();
+        }
+    }
+
+    impl Drop for TestIndexPauseGate {
+        fn drop(&mut self) {
+            self.release();
+            let mut map = registry().lock().unwrap();
+            if map
+                .get(&self.path)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &self.inner))
+            {
+                map.remove(&self.path);
+            }
+            ACTIVE_GATES.store(map.len(), Ordering::Release);
+        }
+    }
+
+    pub(super) fn is_gated(path: &Path) -> bool {
+        if ACTIVE_GATES.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let gate = { registry().lock().unwrap().get(&key).cloned() };
+        gate.is_some_and(|inner| !inner.0.lock().unwrap().released)
+    }
+
+    pub(super) fn wait_if_gated(
+        path: &Path,
+        bytes_scanned: u64,
+        stop_dispatch: &std::sync::atomic::AtomicBool,
+    ) {
+        if ACTIVE_GATES.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let gate = { registry().lock().unwrap().get(&key).cloned() };
+        let Some(inner) = gate else {
+            return;
+        };
+        let (lock, cvar) = &*inner;
+        let mut guard = lock.lock().unwrap();
+        if guard.released || bytes_scanned < guard.min_bytes {
+            return;
+        }
+        guard.reached = true;
+        cvar.notify_all();
+        while !guard.released && !stop_dispatch.load(std::sync::atomic::Ordering::Acquire) {
+            let (next, _) = cvar
+                .wait_timeout(guard, std::time::Duration::from_millis(5))
+                .unwrap();
+            guard = next;
+        }
+    }
+}
+
+struct IndexLifecycle {
+    worker_running: bool,
+    pause_requested: bool,
+    paused: bool,
+    cancelled: bool,
+    done: bool,
+    paused_frontier: Option<PausedScannerState>,
+    terminal_error: Option<QuarryError>,
+}
+
+fn clone_terminal_error(error: &QuarryError) -> QuarryError {
+    match error {
+        QuarryError::SourceChanged => QuarryError::SourceChanged,
+        QuarryError::Io(io) => QuarryError::Io(std::io::Error::new(io.kind(), io.to_string())),
+        QuarryError::InvalidOption(msg) => QuarryError::InvalidOption(msg),
+        _ => QuarryError::Io(std::io::Error::other(error.to_string())),
     }
 }
 
 struct SharedState {
     index: RwLock<StructuralIndex>,
     bytes_scanned: AtomicU64,
+    bytes_read: AtomicU64,
     rows_scanned: AtomicU64,
     columns_found: AtomicUsize,
     finished_nanos: AtomicU64,
     done: AtomicBool,
+    pause_requested: AtomicBool,
+    paused: AtomicBool,
     cancelled: AtomicBool,
+    /// Shared wake/abort flag set whenever either pause or cancel is requested.
+    stop_dispatch: AtomicBool,
+    lifecycle: Mutex<IndexLifecycle>,
     error: Mutex<Option<String>>,
     started: Instant,
     file_size: u64,
+    #[cfg(any(test, debug_assertions))]
+    path: PathBuf,
 }
 
 struct WorkerCompletion<'a>(&'a SharedState);
 
 impl Drop for WorkerCompletion<'_> {
     fn drop(&mut self) {
+        let mut state = self.0.lifecycle.lock().unwrap();
+        state.worker_running = false;
+        if state.paused && !state.cancelled && state.terminal_error.is_none() {
+            return;
+        }
+        state.paused = false;
+        state.pause_requested = false;
+        state.paused_frontier = None;
+        state.done = true;
+        self.0.paused.store(false, Ordering::Release);
+        self.0.pause_requested.store(false, Ordering::Release);
         let elapsed = self.0.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        self.0
-            .finished_nanos
-            .store(elapsed.max(1), Ordering::Release);
+        let _ = self.0.finished_nanos.compare_exchange(
+            0,
+            elapsed.max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.0.done.store(true, Ordering::Release);
     }
 }
 
 pub struct IndexJob {
     shared: Arc<SharedState>,
+    ctx: JobResumeContext,
     handle: Option<JoinHandle<Result<(), QuarryError>>>,
 }
 
@@ -509,7 +740,13 @@ impl IndexJob {
         config: IndexConfig,
         tuning: ParallelTuning,
     ) -> Result<Self, QuarryError> {
-        Self::start_with_tuning_and_cache(session, config, tuning, IndexCacheConfig::disabled())
+        Self::start_with_tuning_cache_and_pool(
+            session,
+            config,
+            tuning,
+            IndexCacheConfig::disabled(),
+            engine_pool(),
+        )
     }
 
     fn start_with_tuning_and_cache(
@@ -518,50 +755,120 @@ impl IndexJob {
         tuning: ParallelTuning,
         cache_config: IndexCacheConfig,
     ) -> Result<Self, QuarryError> {
+        Self::start_with_tuning_cache_and_pool(session, config, tuning, cache_config, engine_pool())
+    }
+
+    fn start_with_tuning_cache_and_pool(
+        session: &Session,
+        config: IndexConfig,
+        tuning: ParallelTuning,
+        cache_config: IndexCacheConfig,
+        pool: &'static EnginePool,
+    ) -> Result<Self, QuarryError> {
         let index = StructuralIndex::new(config)?;
-        let path = session.path.clone();
-        let file_size = session.file_size;
-        let delimiter = session.dialect.delimiter;
-        let encoding = session.encoding;
-        let source_stamp = session.source_stamp.clone();
-        let completed_record_count = Arc::clone(&session.completed_record_count);
-        let file = open_regular_file(&path)?;
-        if !source_matches_stamp(&file, &path, &source_stamp)? {
+        let ctx = JobResumeContext {
+            path: session.path.clone(),
+            file_size: session.file_size,
+            delimiter: session.dialect.delimiter,
+            encoding: session.encoding,
+            config,
+            tuning,
+            cache_config,
+            source_stamp: session.source_stamp.clone(),
+            completed_record_count: Arc::clone(&session.completed_record_count),
+            pool,
+        };
+        let file = open_regular_file(&ctx.path)?;
+        if !source_matches_stamp(&file, &ctx.path, &ctx.source_stamp)? {
             return Err(QuarryError::SourceChanged);
         }
         let shared = Arc::new(SharedState {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
             rows_scanned: AtomicU64::new(0),
             columns_found: AtomicUsize::new(0),
             finished_nanos: AtomicU64::new(0),
             done: AtomicBool::new(false),
+            pause_requested: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            stop_dispatch: AtomicBool::new(false),
+            lifecycle: Mutex::new(IndexLifecycle {
+                worker_running: false,
+                pause_requested: false,
+                paused: false,
+                cancelled: false,
+                done: false,
+                paused_frontier: None,
+                terminal_error: None,
+            }),
             error: Mutex::new(None),
             started: Instant::now(),
-            file_size,
+            file_size: ctx.file_size,
+            #[cfg(any(test, debug_assertions))]
+            path: ctx.path.clone(),
         });
-        let worker_state = Arc::clone(&shared);
-        let handle = thread::Builder::new()
+        let handle = Self::spawn_worker(&ctx, &shared, file, false)?;
+        Ok(Self {
+            shared,
+            ctx,
+            handle: Some(handle),
+        })
+    }
+
+    fn spawn_worker(
+        ctx: &JobResumeContext,
+        shared: &Arc<SharedState>,
+        file: File,
+        resuming: bool,
+    ) -> Result<JoinHandle<Result<(), QuarryError>>, QuarryError> {
+        let worker_state = Arc::clone(shared);
+        let ctx = ctx.clone();
+        {
+            let mut state = worker_state.lifecycle.lock().unwrap();
+            state.worker_running = true;
+            if resuming {
+                state.pause_requested = false;
+                state.paused = false;
+                worker_state.pause_requested.store(false, Ordering::Release);
+                worker_state.paused.store(false, Ordering::Release);
+                worker_state.stop_dispatch.store(false, Ordering::Release);
+            }
+        }
+        let spawn_result = thread::Builder::new()
             .name("quarry-index".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
+                let resume_from = if resuming {
+                    worker_state
+                        .lifecycle
+                        .lock()
+                        .unwrap()
+                        .paused_frontier
+                        .take()
+                } else {
+                    None
+                };
                 let result = (|| {
-                    if !worker_state.cancelled.load(Ordering::Acquire)
+                    if resume_from.is_none()
+                        && !resuming
+                        && !worker_state.cancelled.load(Ordering::Acquire)
+                        && !worker_state.pause_requested.load(Ordering::Acquire)
                         && let Some(cached) = try_load_sidecar(
                             &file,
-                            &path,
-                            file_size,
-                            delimiter,
-                            encoding,
-                            config,
-                            &cache_config,
+                            &ctx.path,
+                            ctx.file_size,
+                            ctx.delimiter,
+                            ctx.encoding,
+                            ctx.config,
+                            &ctx.cache_config,
                         )
                     {
                         if worker_state.cancelled.load(Ordering::Acquire) {
                             return Ok(());
                         }
-                        if !source_matches_stamp(&file, &path, &source_stamp)? {
+                        if !source_matches_stamp(&file, &ctx.path, &ctx.source_stamp)? {
                             return Err(QuarryError::SourceChanged);
                         }
                         let rows = cached.indexed_rows;
@@ -569,81 +876,127 @@ impl IndexJob {
                         {
                             let mut guard = worker_state.index.write().unwrap();
                             *guard = cached;
-                            guard.set_provenance(source_stamp.clone(), delimiter, encoding);
+                            guard.complete = true;
+                            guard.set_provenance(
+                                ctx.source_stamp.clone(),
+                                ctx.delimiter,
+                                ctx.encoding,
+                            );
                         }
                         worker_state
                             .bytes_scanned
-                            .store(file_size, Ordering::Release);
+                            .store(ctx.file_size, Ordering::Release);
                         worker_state.rows_scanned.store(rows, Ordering::Release);
                         worker_state
                             .columns_found
                             .store(max_width, Ordering::Release);
-                        *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
-                            delimiter,
-                            encoding,
-                            file_size: source_stamp.file_size(),
+                        *ctx.completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
+                            delimiter: ctx.delimiter,
+                            encoding: ctx.encoding,
+                            file_size: ctx.source_stamp.file_size(),
                             records: rows,
                         });
                         return Ok(());
                     }
 
-                    let file = run_indexer(
+                    let (file, paused_state) = run_indexer(
                         file,
-                        file_size,
-                        delimiter,
-                        encoding,
-                        config,
-                        tuning,
+                        ctx.file_size,
+                        ctx.delimiter,
+                        ctx.encoding,
+                        ctx.config,
+                        ctx.tuning,
+                        ctx.pool,
+                        resume_from,
                         &worker_state,
                     )?;
-                    if !source_matches_stamp(&file, &path, &source_stamp)? {
+                    if let Some(frontier) = paused_state {
+                        {
+                            let mut state = worker_state.lifecycle.lock().unwrap();
+                            if !state.cancelled {
+                                state.paused_frontier = Some(frontier);
+                                state.paused = true;
+                                worker_state.paused.store(true, Ordering::Release);
+                            }
+                        }
+                        // Release the source file handle while parked; resume() reopens and
+                        // revalidates SourceStamp before continuing.
+                        drop(file);
+                        return Ok(());
+                    }
+                    if !source_matches_stamp(&file, &ctx.path, &ctx.source_stamp)? {
                         return Err(QuarryError::SourceChanged);
                     }
                     if !worker_state.cancelled.load(Ordering::Acquire)
+                        && !worker_state.paused.load(Ordering::Acquire)
                         && worker_state.bytes_scanned.load(Ordering::Acquire)
-                            == source_stamp.file_size()
+                            == ctx.source_stamp.file_size()
                     {
                         let snapshot = {
                             let mut guard = worker_state.index.write().unwrap();
-                            guard.set_provenance(source_stamp.clone(), delimiter, encoding);
+                            guard.last_record_end = guard.indexed_bytes;
+                            guard.complete = true;
+                            guard.set_provenance(
+                                ctx.source_stamp.clone(),
+                                ctx.delimiter,
+                                ctx.encoding,
+                            );
                             guard.clone()
                         };
-                        *completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
-                            delimiter,
-                            encoding,
-                            file_size: source_stamp.file_size(),
+                        *ctx.completed_record_count.lock().unwrap() = Some(CompletedRecordCount {
+                            delimiter: ctx.delimiter,
+                            encoding: ctx.encoding,
+                            file_size: ctx.source_stamp.file_size(),
                             records: snapshot.indexed_rows,
                         });
                         save_sidecar(
                             &file,
-                            &path,
-                            &source_stamp,
-                            file_size,
-                            delimiter,
-                            encoding,
-                            config.checkpoint_every,
+                            &ctx.path,
+                            &ctx.source_stamp,
+                            ctx.file_size,
+                            ctx.delimiter,
+                            ctx.encoding,
+                            ctx.config.checkpoint_every,
                             &snapshot,
-                            &cache_config,
+                            &ctx.cache_config,
                         );
                     }
                     Ok(())
                 })();
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
+                    worker_state.lifecycle.lock().unwrap().terminal_error =
+                        Some(clone_terminal_error(error));
                 }
                 result
-            })?;
-        Ok(Self {
-            shared,
-            handle: Some(handle),
-        })
+            });
+        match spawn_result {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                let mut state = shared.lifecycle.lock().unwrap();
+                state.worker_running = false;
+                if resuming && !state.cancelled && !state.done {
+                    // Thread creation failed before the closure ran; paused_frontier is still
+                    // intact so keep the job cleanly parked and recoverable.
+                    state.paused = true;
+                    state.pause_requested = true;
+                    shared.paused.store(true, Ordering::Release);
+                    shared.pause_requested.store(true, Ordering::Release);
+                    shared.stop_dispatch.store(true, Ordering::Release);
+                }
+                Err(error.into())
+            }
+        }
     }
 
     pub fn progress(&self) -> IndexProgress {
         let done = self.shared.done.load(Ordering::Acquire);
         let finished_nanos = self.shared.finished_nanos.load(Ordering::Acquire);
+        let bytes_scanned = self.shared.bytes_scanned.load(Ordering::Acquire);
+        let bytes_read = self.shared.bytes_read.load(Ordering::Acquire);
         IndexProgress {
-            bytes_scanned: self.shared.bytes_scanned.load(Ordering::Acquire),
+            bytes_scanned,
+            bytes_read,
             rows_scanned: self.shared.rows_scanned.load(Ordering::Acquire),
             columns_found: self.shared.columns_found.load(Ordering::Acquire),
             file_size: self.shared.file_size,
@@ -653,6 +1006,7 @@ impl IndexJob {
                 Duration::from_nanos(finished_nanos)
             },
             done,
+            paused: self.shared.paused.load(Ordering::Acquire),
             cancelled: self.shared.cancelled.load(Ordering::Acquire),
         }
     }
@@ -669,18 +1023,147 @@ impl IndexJob {
         self.shared.error.lock().unwrap().clone()
     }
 
+    /// Park this indexing job cleanly at the committed contiguous frontier without parking any
+    /// worker-pool threads. In-flight chunks drain and release all pool slots and byte-budget tokens.
+    pub fn pause(&self) {
+        let mut state = self.shared.lifecycle.lock().unwrap();
+        if state.done || state.cancelled {
+            return;
+        }
+        state.pause_requested = true;
+        self.shared.pause_requested.store(true, Ordering::Release);
+        self.shared.stop_dispatch.store(true, Ordering::Release);
+    }
+
+    /// True once the indexing job has drained in-flight chunks and parked at its frontier.
+    pub fn is_paused(&self) -> bool {
+        self.shared.paused.load(Ordering::Acquire)
+    }
+
+    /// True after `pause()` has been requested (including while draining bounded in-flight chunks).
+    pub fn is_pause_requested(&self) -> bool {
+        self.shared.pause_requested.load(Ordering::Acquire)
+    }
+
+    /// Single atomic predicate that stays true continuously from `pause()` through the parked
+    /// state until `resume()`, `cancel()`, or terminal completion.
+    pub fn is_paused_or_pausing(&self) -> bool {
+        let state = self.shared.lifecycle.lock().unwrap();
+        !state.done && !state.cancelled && (state.paused || state.pause_requested)
+    }
+
+    /// Revalidate `SourceStamp` and resume a paused indexing job from its committed frontier.
+    pub fn resume(&mut self) -> Result<(), QuarryError> {
+        {
+            let state = self.shared.lifecycle.lock().unwrap();
+            if state.done || state.cancelled {
+                return Ok(());
+            }
+            if !state.pause_requested && !state.paused {
+                return Ok(());
+            }
+        }
+        if let Some(handle) = self.handle.take() {
+            let join_res = handle.join().map_err(|_| QuarryError::WorkerPanicked)?;
+            join_res?;
+        }
+        {
+            let state = self.shared.lifecycle.lock().unwrap();
+            if state.done || state.cancelled {
+                return Ok(());
+            }
+        }
+        let file = match open_regular_file(&self.ctx.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.mark_resume_failed(QuarryError::SourceChanged);
+                return Err(QuarryError::SourceChanged);
+            }
+            Err(error) => {
+                let error = QuarryError::Io(error);
+                let stored = clone_terminal_error(&error);
+                self.mark_resume_failed(stored);
+                return Err(error);
+            }
+        };
+        match source_matches_stamp(&file, &self.ctx.path, &self.ctx.source_stamp) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.mark_resume_failed(QuarryError::SourceChanged);
+                return Err(QuarryError::SourceChanged);
+            }
+            Err(error) => {
+                let stored = clone_terminal_error(&error);
+                self.mark_resume_failed(stored);
+                return Err(error);
+            }
+        }
+        let handle = Self::spawn_worker(&self.ctx, &self.shared, file, true)?;
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    fn mark_resume_failed(&self, error: QuarryError) {
+        *self.shared.error.lock().unwrap() = Some(error.to_string());
+        let mut state = self.shared.lifecycle.lock().unwrap();
+        state.terminal_error = Some(error);
+        state.paused_frontier = None;
+        state.pause_requested = false;
+        state.paused = false;
+        state.done = true;
+        self.shared.pause_requested.store(false, Ordering::Release);
+        self.shared.paused.store(false, Ordering::Release);
+        let elapsed = self
+            .shared
+            .started
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        let _ = self.shared.finished_nanos.compare_exchange(
+            0,
+            elapsed.max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.shared.done.store(true, Ordering::Release);
+    }
+
     pub fn cancel(&self) {
+        let mut state = self.shared.lifecycle.lock().unwrap();
+        state.cancelled = true;
+        state.pause_requested = false;
         self.shared.cancelled.store(true, Ordering::Release);
+        self.shared.stop_dispatch.store(true, Ordering::Release);
+        self.shared.pause_requested.store(false, Ordering::Release);
+        if !state.worker_running {
+            state.paused_frontier = None;
+            state.paused = false;
+            state.done = true;
+            self.shared.paused.store(false, Ordering::Release);
+            let elapsed = self
+                .shared
+                .started
+                .elapsed()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            let _ = self.shared.finished_nanos.compare_exchange(
+                0,
+                elapsed.max(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.shared.done.store(true, Ordering::Release);
+        }
     }
 
     pub fn wait(mut self) -> Result<StructuralIndex, QuarryError> {
-        let result = self
-            .handle
-            .take()
-            .expect("index handle is present")
-            .join()
-            .map_err(|_| QuarryError::WorkerPanicked)?;
-        result?;
+        if let Some(handle) = self.handle.take() {
+            let result = handle.join().map_err(|_| QuarryError::WorkerPanicked)?;
+            result?;
+        }
+        if let Some(error) = self.shared.lifecycle.lock().unwrap().terminal_error.take() {
+            return Err(error);
+        }
         let index = self.shared.index.read().unwrap().clone();
         Ok(index)
     }
@@ -691,10 +1174,13 @@ impl Drop for IndexJob {
         if let Some(handle) = self.handle.take() {
             self.cancel();
             let _ = handle.join();
+        } else {
+            self.cancel();
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_indexer(
     file: File,
     file_size: u64,
@@ -702,32 +1188,81 @@ fn run_indexer(
     encoding: Encoding,
     config: IndexConfig,
     tuning: ParallelTuning,
-    shared: &SharedState,
-) -> Result<File, QuarryError> {
+    pool: &'static EnginePool,
+    resume_from: Option<PausedScannerState>,
+    shared: &Arc<SharedState>,
+) -> Result<(File, Option<PausedScannerState>), QuarryError> {
     let chunk_ok = tuning.allow_small_chunks || config.chunk_bytes >= PARALLEL_MIN_CHUNK_BYTES;
     let use_byte_stride = config.checkpoint_every == DEFAULT_CHECKPOINT_EVERY
         && file_size >= tuning.min_parallel_bytes
         && chunk_ok;
+
+    match resume_from {
+        Some(PausedScannerState::Parallel {
+            cursor,
+            in_quote,
+            pending_separators,
+        }) => {
+            let byte_class = encoding
+                .simd_byte_class()
+                .expect("parallel pause state only produced for byte-class encodings");
+            let file = Arc::new(file);
+            let paused = run_parallel_indexer(
+                Arc::clone(&file),
+                file_size,
+                delimiter,
+                encoding,
+                byte_class,
+                config,
+                tuning,
+                pool,
+                Some((cursor, in_quote, pending_separators)),
+                shared,
+            )?;
+            let file = Arc::try_unwrap(file).unwrap_or_else(|arc| {
+                arc.try_clone()
+                    .expect("file handle clone after worker drain")
+            });
+            return Ok((file, paused));
+        }
+        Some(PausedScannerState::Sequential { cursor, scanner }) => {
+            let paused = run_sequential_indexer(
+                &file,
+                file_size,
+                delimiter,
+                encoding,
+                config,
+                tuning,
+                Some((cursor, scanner)),
+                shared,
+            )?;
+            return Ok((file, paused));
+        }
+        None => {}
+    }
 
     if let Some(byte_class) = encoding.simd_byte_class()
         && use_byte_stride
         && tuning.requested_threads > 1
     {
         let file = Arc::new(file);
-        run_parallel_indexer(
+        let paused = run_parallel_indexer(
             Arc::clone(&file),
             file_size,
             delimiter,
+            encoding,
             byte_class,
             config,
             tuning,
+            pool,
+            None,
             shared,
         )?;
         let file = Arc::try_unwrap(file).unwrap_or_else(|arc| {
             arc.try_clone()
                 .expect("file handle clone after worker drain")
         });
-        return Ok(file);
+        return Ok((file, paused));
     }
 
     if use_byte_stride && encoding.simd_byte_class().is_some() {
@@ -738,18 +1273,23 @@ fn run_indexer(
             .enable_byte_stride_checkpoints(tuning.byte_stride);
     }
 
-    run_sequential_indexer(&file, file_size, delimiter, encoding, config, shared)?;
-    Ok(file)
+    let paused = run_sequential_indexer(
+        &file, file_size, delimiter, encoding, config, tuning, None, shared,
+    )?;
+    Ok((file, paused))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sequential_indexer(
     file: &File,
     file_size: u64,
     delimiter: u8,
     encoding: Encoding,
     config: IndexConfig,
+    tuning: ParallelTuning,
+    resume_from: Option<(u64, Box<EncodedScanner<true>>)>,
     shared: &SharedState,
-) -> Result<(), QuarryError> {
+) -> Result<Option<PausedScannerState>, QuarryError> {
     let backend = if encoding.simd_byte_class().is_some() {
         active_simd_backend()
     } else {
@@ -761,22 +1301,36 @@ fn run_sequential_indexer(
         index.telemetry.simd_backend = backend;
     }
 
-    let mut scanner = EncodedScanner::<true>::new(delimiter, encoding)?;
+    let (mut absolute_start, mut scanner) = match resume_from {
+        Some((cursor, scanner)) => (cursor, scanner),
+        None => (
+            0u64,
+            Box::new(EncodedScanner::<true>::new(delimiter, encoding)?),
+        ),
+    };
     let chunk_len = encoding.chunk_size(config.chunk_bytes);
     let mut chunk = vec![0u8; chunk_len];
-    let mut absolute_start = 0u64;
 
     if encoding.is_utf16() {
         let mut cursor_file = file;
+        if absolute_start > 0 {
+            cursor_file.seek(SeekFrom::Start(absolute_start))?;
+        }
         loop {
             if shared.cancelled.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(None);
+            }
+            if shared.pause_requested.load(Ordering::Acquire) {
+                return Ok(Some(PausedScannerState::Sequential {
+                    cursor: absolute_start,
+                    scanner,
+                }));
             }
             let read = encoding.read_chunk(&mut cursor_file, &mut chunk)?;
             if read == 0 {
                 let mut index = shared.index.write().unwrap();
                 scanner.finish(absolute_start, |end| index.record_boundary(end))?;
-                index.maximum_width = scanner.maximum_width();
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 shared
                     .columns_found
                     .store(index.maximum_width, Ordering::Release);
@@ -785,13 +1339,18 @@ fn run_sequential_indexer(
                     .store(index.indexed_rows, Ordering::Release);
                 break;
             }
+            shared.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+            #[cfg(test)]
+            if let Some(delay) = tuning.chunk_delay {
+                thread::sleep(delay);
+            }
             {
                 let mut index = shared.index.write().unwrap();
                 scanner.scan_chunk(&chunk[..read], absolute_start, |end| {
                     index.record_boundary(end)
                 })?;
                 index.indexed_bytes = absolute_start + read as u64;
-                index.maximum_width = scanner.maximum_width();
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 index.telemetry.chunks_processed += 1;
                 shared
                     .columns_found
@@ -804,18 +1363,35 @@ fn run_sequential_indexer(
             shared
                 .bytes_scanned
                 .store(absolute_start, Ordering::Release);
+            #[cfg(any(test, debug_assertions))]
+            if absolute_start < file_size {
+                test_hooks::wait_if_gated(&shared.path, absolute_start, &shared.stop_dispatch);
+            }
         }
     } else {
-        advise_readahead(file, 0, file_size.min(4 * 1024 * 1024));
+        let _ = tuning;
+        advise_readahead(
+            file,
+            absolute_start,
+            file_size
+                .saturating_sub(absolute_start)
+                .min(4 * 1024 * 1024),
+        );
         loop {
             if shared.cancelled.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(None);
+            }
+            if shared.pause_requested.load(Ordering::Acquire) {
+                return Ok(Some(PausedScannerState::Sequential {
+                    cursor: absolute_start,
+                    scanner,
+                }));
             }
             let read = read_at_exact_or_eof(file, absolute_start, &mut chunk)?;
             if read == 0 {
                 let mut index = shared.index.write().unwrap();
                 scanner.finish(absolute_start, |end| index.record_boundary(end))?;
-                index.maximum_width = scanner.maximum_width();
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 shared
                     .columns_found
                     .store(index.maximum_width, Ordering::Release);
@@ -823,6 +1399,11 @@ fn run_sequential_indexer(
                     .rows_scanned
                     .store(index.indexed_rows, Ordering::Release);
                 break;
+            }
+            shared.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+            #[cfg(test)]
+            if let Some(delay) = tuning.chunk_delay {
+                thread::sleep(delay);
             }
             let next_offset = absolute_start + read as u64;
             if next_offset < file_size {
@@ -838,7 +1419,7 @@ fn run_sequential_indexer(
                     index.record_boundary(end)
                 })?;
                 index.indexed_bytes = next_offset;
-                index.maximum_width = scanner.maximum_width();
+                index.maximum_width = index.maximum_width.max(scanner.maximum_width());
                 index.telemetry.chunks_processed += 1;
                 shared
                     .columns_found
@@ -851,18 +1432,23 @@ fn run_sequential_indexer(
             shared
                 .bytes_scanned
                 .store(absolute_start, Ordering::Release);
+            #[cfg(any(test, debug_assertions))]
+            if absolute_start < file_size {
+                test_hooks::wait_if_gated(&shared.path, absolute_start, &shared.stop_dispatch);
+            }
         }
     }
 
     shared
         .bytes_scanned
         .store(absolute_start, Ordering::Release);
-    Ok(())
+    Ok(None)
 }
 
 #[derive(Debug)]
 struct StateOutcome {
     rows: u64,
+    last_record_end: Option<u64>,
     checkpoints: Vec<(u64, u64)>,
     max_width: usize,
     first_record_extra_seps: Option<usize>,
@@ -890,9 +1476,13 @@ struct MergeState {
 
 impl MergeState {
     fn new() -> Self {
+        Self::from_frontier(false, 0)
+    }
+
+    fn from_frontier(in_quote: bool, pending_separators: usize) -> Self {
         Self {
-            in_quote: false,
-            pending_separators: 0,
+            in_quote,
+            pending_separators,
             next_id: 0,
             pending: BTreeMap::new(),
         }
@@ -923,6 +1513,9 @@ impl MergeState {
                 }
                 index.indexed_rows = base_row + outcome.rows;
                 index.indexed_bytes = chunk.end;
+                if let Some(record_end) = outcome.last_record_end {
+                    index.last_record_end = record_end;
+                }
                 if was_in_quote {
                     if outcome.rows == 0 {
                         self.pending_separators = self
@@ -1001,6 +1594,7 @@ fn scan_outcome(
     stop_flag: &AtomicBool,
 ) -> Option<StateOutcome> {
     let mut rows = 0u64;
+    let mut last_record_end: Option<u64> = None;
     let mut checkpoints = Vec::new();
     let mut next_target = if in_quote_entry {
         (start / byte_stride)
@@ -1022,6 +1616,7 @@ fn scan_outcome(
             start + offset as u64,
             |record_end| {
                 rows += 1;
+                last_record_end = Some(record_end);
                 if record_end >= next_target {
                     checkpoints.push((rows, record_end));
                     next_target =
@@ -1040,6 +1635,7 @@ fn scan_outcome(
         && is_last
         && let Err(err) = scanner.finish(end, |record_end| {
             rows += 1;
+            last_record_end = Some(record_end);
             if record_end >= next_target {
                 checkpoints.push((rows, record_end));
                 next_target =
@@ -1058,6 +1654,7 @@ fn scan_outcome(
 
     Some(StateOutcome {
         rows,
+        last_record_end,
         checkpoints,
         max_width: scanner.maximum_width(),
         first_record_extra_seps,
@@ -1079,6 +1676,8 @@ fn scan_lf_chunk_worker(
     byte_class: ByteEncodingClass,
     byte_stride: u64,
     stop_flag: &AtomicBool,
+    bytes_read: &AtomicU64,
+    #[cfg(test)] chunk_delay: Option<Duration>,
 ) -> Option<Result<ChunkResult, QuarryError>> {
     if stop_flag.load(Ordering::Acquire) {
         return None;
@@ -1089,9 +1688,23 @@ fn scan_lf_chunk_worker(
     };
     let mut buf = vec![0u8; len];
     match read_at_exact_or_eof(file, start, &mut buf) {
-        Ok(read) if read == len => {}
+        Ok(read) if read == len => {
+            bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+        }
         Ok(_) => return Some(Err(QuarryError::SourceChanged)),
         Err(error) => return Some(Err(QuarryError::Io(error))),
+    }
+    #[cfg(test)]
+    if let Some(delay) = chunk_delay {
+        let mut remaining = delay;
+        while !remaining.is_zero() {
+            if stop_flag.load(Ordering::Acquire) {
+                return None;
+            }
+            let step = remaining.min(Duration::from_millis(2));
+            thread::sleep(step);
+            remaining = remaining.saturating_sub(step);
+        }
     }
     if stop_flag.load(Ordering::Acquire) {
         return None;
@@ -1130,6 +1743,7 @@ fn scan_lf_chunk_worker(
             // Quote-free chunk starting inside a quoted field cannot close the quote.
             let trivial = StateOutcome {
                 rows: 0,
+                last_record_end: None,
                 checkpoints: Vec::new(),
                 max_width: 0,
                 first_record_extra_seps: None,
@@ -1175,6 +1789,11 @@ fn scan_lf_chunk_worker(
     }))
 }
 
+enum GiantLineOutcome {
+    Done(u64),
+    Paused(PausedScannerState),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_giant_line_sequential(
     file: &File,
@@ -1182,11 +1801,12 @@ fn scan_giant_line_sequential(
     min_stop: u64,
     file_size: u64,
     dialect: ScannerDialect,
+    encoding: Encoding,
     byte_class: ByteEncodingClass,
     read_chunk_bytes: usize,
     merge: &mut MergeState,
     shared: &SharedState,
-) -> Result<u64, QuarryError> {
+) -> Result<GiantLineOutcome, QuarryError> {
     let mut scanner = if start == 0 {
         StructuralScanner::<true>::with_dialect(dialect, 0, byte_class)?
     } else if merge.in_quote {
@@ -1208,13 +1828,30 @@ fn scan_giant_line_sequential(
 
     while pos < file_size {
         if shared.cancelled.load(Ordering::Acquire) {
-            return Ok(pos);
+            return Ok(GiantLineOutcome::Done(pos));
+        }
+        if shared.pause_requested.load(Ordering::Acquire) {
+            let mut index = shared.index.write().unwrap();
+            index.telemetry.rescanned_bytes += span_bytes;
+            index.telemetry.chunks_processed += 1;
+            drop(index);
+            merge.in_quote = scanner.is_in_quote();
+            merge.pending_separators = scanner.current_separators();
+            return Ok(GiantLineOutcome::Paused(PausedScannerState::Sequential {
+                cursor: pos,
+                scanner: Box::new(EncodedScanner::from_structural(
+                    scanner,
+                    dialect.delimiter,
+                    encoding,
+                )),
+            }));
         }
         let want = (file_size - pos).min(buf.len() as u64) as usize;
         let read = read_at_exact_or_eof(file, pos, &mut buf[..want])?;
         if read < want {
             return Err(QuarryError::SourceChanged);
         }
+        shared.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
 
         let mut slice_len = read;
         let mut hit_lf_after_min = false;
@@ -1252,6 +1889,10 @@ fn scan_giant_line_sequential(
         if hit_lf_after_min {
             break;
         }
+        #[cfg(any(test, debug_assertions))]
+        if pos < file_size {
+            test_hooks::wait_if_gated(&shared.path, pos, &shared.stop_dispatch);
+        }
     }
 
     {
@@ -1261,7 +1902,7 @@ fn scan_giant_line_sequential(
     }
     merge.in_quote = scanner.is_in_quote();
     merge.pending_separators = scanner.current_separators();
-    Ok(pos)
+    Ok(GiantLineOutcome::Done(pos))
 }
 
 fn drain_parallel_window(
@@ -1272,7 +1913,7 @@ fn drain_parallel_window(
     shared: &SharedState,
 ) -> Result<(), QuarryError> {
     while merge.next_id < dispatched_count {
-        if shared.cancelled.load(Ordering::Acquire) {
+        if shared.stop_dispatch.load(Ordering::Acquire) {
             stop_flag.store(true, Ordering::Release);
             return Ok(());
         }
@@ -1298,15 +1939,19 @@ fn drain_parallel_window(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_parallel_indexer(
     file: Arc<File>,
     file_size: u64,
     delimiter: u8,
+    encoding: Encoding,
     byte_class: ByteEncodingClass,
     config: IndexConfig,
     tuning: ParallelTuning,
-    shared: &SharedState,
-) -> Result<(), QuarryError> {
+    pool: &'static EnginePool,
+    resume_from: Option<(u64, bool, usize)>,
+    shared: &Arc<SharedState>,
+) -> Result<Option<PausedScannerState>, QuarryError> {
     let dialect = ScannerDialect::rfc4180(delimiter);
     dialect.validate(byte_class)?;
 
@@ -1317,35 +1962,57 @@ fn run_parallel_indexer(
             .chunk_bytes
             .clamp(DEFAULT_INDEX_CHUNK_BYTES, PARALLEL_MAX_CHUNK_BYTES)
     };
-    let estimated_chunks = file_size.div_ceil(chunk_size as u64).max(1) as usize;
+    let (mut cursor, mut merge) = match resume_from {
+        Some((start_cursor, in_quote, pending_separators)) => (
+            start_cursor,
+            MergeState::from_frontier(in_quote, pending_separators),
+        ),
+        None => (0u64, MergeState::new()),
+    };
+    let remaining_bytes = file_size.saturating_sub(cursor);
+    let estimated_chunks = remaining_bytes.div_ceil(chunk_size as u64).max(1) as usize;
     let effective_workers = tuning.requested_threads.min(estimated_chunks).max(1);
 
     {
         let mut index = shared.index.write().unwrap();
-        index.enable_byte_stride_checkpoints(tuning.byte_stride);
+        if resume_from.is_none() {
+            index.enable_byte_stride_checkpoints(tuning.byte_stride);
+        }
         index.telemetry.effective_workers = effective_workers;
         index.telemetry.simd_backend = active_simd_backend();
     }
 
-    if file_size == 0 {
-        return Ok(());
+    if cursor >= file_size {
+        return Ok(None);
     }
 
-    let pool = engine_pool();
     let executor = JobExecutor::new(pool, JobPriority::Background, effective_workers)?;
     let effective_workers = executor.effective_workers();
     shared.index.write().unwrap().telemetry.effective_workers = effective_workers;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Result<ChunkResult, QuarryError>>();
-    let max_window = (effective_workers * 2).clamp(2, 16);
+    let max_window = {
+        let base = (effective_workers * 2).clamp(2, 16);
+        #[cfg(any(test, debug_assertions))]
+        {
+            if test_hooks::is_gated(&shared.path) {
+                1
+            } else {
+                base
+            }
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            base
+        }
+    };
 
-    let mut merge = MergeState::new();
-    let mut cursor = 0u64;
     let mut next_chunk_id = 0u64;
+    let mut giant_line_paused: Option<PausedScannerState> = None;
 
     let run_result: Result<(), QuarryError> = (|| {
         while cursor < file_size {
-            if shared.cancelled.load(Ordering::Acquire) {
+            if shared.stop_dispatch.load(Ordering::Acquire) {
                 stop_flag.store(true, Ordering::Release);
                 return Ok(());
             }
@@ -1368,7 +2035,7 @@ fn run_parallel_indexer(
 
             // Bound in-flight window to keep peak RSS well under 64 MiB.
             while (next_chunk_id - merge.next_id) as usize >= max_window {
-                if shared.cancelled.load(Ordering::Acquire) {
+                if shared.stop_dispatch.load(Ordering::Acquire) {
                     stop_flag.store(true, Ordering::Release);
                     return Ok(());
                 }
@@ -1392,6 +2059,19 @@ fn run_parallel_indexer(
                 }
             }
 
+            #[cfg(any(test, debug_assertions))]
+            if shared.bytes_scanned.load(Ordering::Acquire) > 0 && cursor < file_size {
+                test_hooks::wait_if_gated(
+                    &shared.path,
+                    shared.bytes_scanned.load(Ordering::Acquire),
+                    &shared.stop_dispatch,
+                );
+                if shared.stop_dispatch.load(Ordering::Acquire) {
+                    stop_flag.store(true, Ordering::Release);
+                    return Ok(());
+                }
+            }
+
             let nominal_end = cursor.saturating_add(chunk_size as u64).min(file_size);
             let chunk_end = if nominal_end == file_size {
                 file_size
@@ -1399,9 +2079,9 @@ fn run_parallel_indexer(
                 let search_limit = nominal_end
                     .saturating_add(tuning.max_alignment_search)
                     .min(file_size);
-                match find_next_lf(&file, nominal_end, search_limit, &shared.cancelled)? {
+                match find_next_lf(&file, nominal_end, search_limit, &shared.stop_dispatch)? {
                     Some(lf_pos) => lf_pos + 1,
-                    None if shared.cancelled.load(Ordering::Acquire) => {
+                    None if shared.stop_dispatch.load(Ordering::Acquire) => {
                         stop_flag.store(true, Ordering::Release);
                         return Ok(());
                     }
@@ -1410,22 +2090,32 @@ fn run_parallel_indexer(
                         // drain prior parallel chunks so exact scanner state is confirmed,
                         // stream sequentially across the giant line, then resume parallel scanning.
                         drain_parallel_window(&mut merge, next_chunk_id, &rx, &stop_flag, shared)?;
-                        if shared.cancelled.load(Ordering::Acquire) {
+                        if shared.stop_dispatch.load(Ordering::Acquire) {
                             stop_flag.store(true, Ordering::Release);
                             return Ok(());
                         }
-                        cursor = scan_giant_line_sequential(
+                        match scan_giant_line_sequential(
                             &file,
                             cursor,
                             search_limit,
                             file_size,
                             dialect,
+                            encoding,
                             byte_class,
                             chunk_size,
                             &mut merge,
                             shared,
-                        )?;
-                        continue;
+                        )? {
+                            GiantLineOutcome::Done(next_cursor) => {
+                                cursor = next_cursor;
+                                continue;
+                            }
+                            GiantLineOutcome::Paused(paused_state) => {
+                                giant_line_paused = Some(paused_state);
+                                stop_flag.store(true, Ordering::Release);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             };
@@ -1439,7 +2129,7 @@ fn run_parallel_indexer(
 
             let chunk_len = usize::try_from(end - start)
                 .map_err(|_| QuarryError::InvalidOption("chunk length overflow"))?;
-            let Some(budget_guard) = pool.byte_budget().acquire(chunk_len, &shared.cancelled)
+            let Some(budget_guard) = pool.byte_budget().acquire(chunk_len, &shared.stop_dispatch)
             else {
                 stop_flag.store(true, Ordering::Release);
                 return Ok(());
@@ -1449,9 +2139,12 @@ fn run_parallel_indexer(
 
             let worker_file = Arc::clone(&file);
             let worker_stop = Arc::clone(&stop_flag);
+            let worker_shared = Arc::clone(shared);
             let worker_tx = tx.clone();
             let byte_stride = tuning.byte_stride;
-            let spawned = executor.spawn(&shared.cancelled, move || {
+            #[cfg(test)]
+            let chunk_delay = tuning.chunk_delay;
+            let spawned = executor.spawn(&shared.stop_dispatch, move || {
                 let _budget = budget_guard;
                 if let Some(result) = scan_lf_chunk_worker(
                     id,
@@ -1463,6 +2156,9 @@ fn run_parallel_indexer(
                     byte_class,
                     byte_stride,
                     &worker_stop,
+                    &worker_shared.bytes_read,
+                    #[cfg(test)]
+                    chunk_delay,
                 ) {
                     // Drop the byte-budget guard as soon as raw bytes are freed, before sending.
                     drop(_budget);
@@ -1478,14 +2174,38 @@ fn run_parallel_indexer(
         drain_parallel_window(&mut merge, next_chunk_id, &rx, &stop_flag, shared)
     })();
 
-    if run_result.is_err() || shared.cancelled.load(Ordering::Acquire) {
+    if run_result.is_err() || shared.stop_dispatch.load(Ordering::Acquire) {
         stop_flag.store(true, Ordering::Release);
     }
     drop(tx);
     let drain_result = executor.drain();
     run_result?;
     drain_result?;
-    Ok(())
+
+    // If pausing (and not cancelled), commit any already-completed contiguous prefix chunks
+    // and discard non-contiguous speculative chunks beyond the contiguous frontier.
+    if shared.pause_requested.load(Ordering::Acquire) && !shared.cancelled.load(Ordering::Acquire) {
+        if let Some(paused_state) = giant_line_paused {
+            return Ok(Some(paused_state));
+        }
+        while let Ok(result) = rx.try_recv() {
+            if let Ok(chunk) = result {
+                merge.pending.insert(chunk.id, Ok(chunk));
+            }
+        }
+        merge.apply_ready(shared)?;
+        merge.pending.clear();
+        let committed = shared.bytes_scanned.load(Ordering::Acquire);
+        if committed < file_size {
+            return Ok(Some(PausedScannerState::Parallel {
+                cursor: committed,
+                in_quote: merge.in_quote,
+                pending_separators: merge.pending_separators,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1571,14 +2291,28 @@ mod tests {
         let shared = SharedState {
             index: RwLock::new(StructuralIndex::new(IndexConfig::default()).unwrap()),
             bytes_scanned: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
             rows_scanned: AtomicU64::new(0),
             columns_found: AtomicUsize::new(0),
             finished_nanos: AtomicU64::new(0),
             done: AtomicBool::new(false),
+            pause_requested: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            stop_dispatch: AtomicBool::new(false),
+            lifecycle: Mutex::new(super::IndexLifecycle {
+                worker_running: true,
+                pause_requested: false,
+                paused: false,
+                cancelled: false,
+                done: false,
+                paused_frontier: None,
+                terminal_error: None,
+            }),
             error: Mutex::new(None),
             started: Instant::now(),
             file_size: 0,
+            path: std::path::PathBuf::new(),
         };
 
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1749,6 +2483,7 @@ mod tests {
                         byte_stride: 192,
                         max_alignment_search: 256,
                         allow_small_chunks: true,
+                        chunk_delay: None,
                     },
                 )
                 .unwrap()
@@ -1838,6 +2573,7 @@ mod tests {
                 byte_stride: 1024,
                 max_alignment_search: 512,
                 allow_small_chunks: true,
+                chunk_delay: None,
             },
         )
         .unwrap()
@@ -1908,6 +2644,7 @@ mod tests {
                     byte_stride: 16 * 1024,
                     max_alignment_search: 4 * 1024,
                     allow_small_chunks: true,
+                    chunk_delay: None,
                 },
             )
             .unwrap()
@@ -2092,5 +2829,420 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].as_ref(), b"1099511627775");
         assert_eq!(parsed[1].as_ref(), b"tail,quoted");
+    }
+
+    #[test]
+    fn one_worker_pool_completes_foreground_job_while_indexing_is_paused_and_resumes_cleanly() {
+        use std::sync::OnceLock;
+        static ONE_WORKER_POOL: OnceLock<crate::pool::EnginePool> = OnceLock::new();
+        let pool = ONE_WORKER_POOL
+            .get_or_init(|| crate::pool::EnginePool::with_max_workers(4 * 1024 * 1024, 1));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pause-resume.csv");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"id,note,val\n");
+        for i in 0..800_u32 {
+            if i % 11 == 0 {
+                payload
+                    .extend_from_slice(format!("{i},\"multi\nline\nquote {i}\",{i}\n").as_bytes());
+            } else {
+                payload.extend_from_slice(format!("{i},plain_{i},{i}\n").as_bytes());
+            }
+        }
+        fs::write(&path, &payload).unwrap();
+
+        let session = crate::Session::open(
+            &path,
+            crate::OpenOptions {
+                rows: 5,
+                delimiter: Some(b','),
+                sample_bytes: 256,
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let expected = session
+            .start_indexing_with_threads(IndexConfig::default(), Some(1))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let mut job = IndexJob::start_with_tuning_cache_and_pool(
+            &session,
+            IndexConfig {
+                chunk_bytes: 256,
+                ..IndexConfig::default()
+            },
+            ParallelTuning {
+                requested_threads: 2,
+                min_parallel_bytes: 64,
+                byte_stride: 512,
+                max_alignment_search: 256,
+                allow_small_chunks: true,
+                chunk_delay: Some(Duration::from_millis(8)),
+            },
+            crate::sidecar::IndexCacheConfig::disabled(),
+            pool,
+        )
+        .unwrap();
+
+        // Wait until at least one chunk is committed, then pause before EOF.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.progress().rows_scanned == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "index never made initial progress"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        job.pause();
+        let pause_deadline = Instant::now() + Duration::from_secs(5);
+        while !job.is_paused() {
+            assert!(
+                Instant::now() < pause_deadline,
+                "index did not pause in time; progress={:?}",
+                job.progress()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let paused_progress = job.progress();
+        assert!(paused_progress.paused);
+        assert!(!paused_progress.done);
+        assert!(paused_progress.bytes_scanned > 0);
+        assert!(paused_progress.bytes_scanned < payload.len() as u64);
+        assert!(paused_progress.bytes_read >= paused_progress.bytes_scanned);
+        assert_eq!(pool.spawned_workers(), 1);
+        assert_eq!(pool.byte_budget().used(), 0);
+
+        // Decisive 1-worker-pool invariant: a foreground job MUST complete on the same
+        // 1-worker pool while the indexing job is parked.
+        let fg_exec =
+            crate::pool::JobExecutor::new(pool, crate::pool::JobPriority::Foreground, 1).unwrap();
+        let fg_done = Arc::new(AtomicBool::new(false));
+        let fg_flag = Arc::clone(&fg_done);
+        let cancel = AtomicBool::new(false);
+        assert!(fg_exec.spawn(&cancel, move || {
+            fg_flag.store(true, Ordering::Release);
+        }));
+        fg_exec.drain().unwrap();
+        assert!(fg_done.load(Ordering::Acquire));
+
+        // Partial-index search while paused must stop cleanly at the committed frontier.
+        let partial = job.snapshot();
+        assert!(partial.committed_record_end() <= paused_progress.bytes_scanned);
+        let search_err = session
+            .start_search(
+                &partial,
+                b"definitely-not-in-file".to_vec(),
+                crate::SearchPosition { row: 1, column: 0 },
+            )
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert!(matches!(
+            search_err,
+            crate::QuarryError::RowNotIndexed { .. }
+        ));
+
+        // Partial-index filter while paused scans only up to committed_record_end.
+        let filter_idx = session
+            .start_filter_with_edits_and_limit(
+                crate::FilterQuery::single(0, crate::FilterOperator::Equals, b"0".to_vec()),
+                Arc::default(),
+                Some(partial.committed_record_end()),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(filter_idx.matches_found(), 1);
+
+        // Resume and finish cleanly to EOF; result must match unpaused sequential index.
+        job.resume().unwrap();
+        let resumed = job.wait().unwrap();
+        assert_eq!(resumed.indexed_rows(), expected.indexed_rows());
+        assert_eq!(resumed.maximum_width(), expected.maximum_width());
+        assert_eq!(resumed.indexed_bytes(), expected.indexed_bytes());
+        assert_eq!(
+            resumed.committed_record_end(),
+            expected.committed_record_end()
+        );
+        for probe in [0, 1, 11, 200, expected.indexed_rows() - 1] {
+            assert_eq!(
+                session.read_rows(&resumed, probe, 2).unwrap(),
+                session.read_rows(&expected, probe, 2).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn paused_indexing_detects_source_change_on_resume_and_never_publishes_partial_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mutable.csv");
+        fs::write(&path, b"a,b\n".repeat(4000)).unwrap();
+
+        let session = crate::Session::open(
+            &path,
+            crate::OpenOptions {
+                rows: 5,
+                delimiter: Some(b','),
+                sample_bytes: 256,
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let cache_config = crate::sidecar::IndexCacheConfig {
+            enabled: true,
+            cache_dir: Some(cache_dir.path().to_path_buf()),
+            min_file_bytes: 1,
+            max_cache_bytes: 8 * 1024 * 1024,
+        };
+
+        let mut job = IndexJob::start_with_tuning_cache_and_pool(
+            &session,
+            IndexConfig {
+                chunk_bytes: 256,
+                ..IndexConfig::default()
+            },
+            ParallelTuning {
+                requested_threads: 1,
+                min_parallel_bytes: u64::MAX,
+                byte_stride: 512,
+                max_alignment_search: 256,
+                allow_small_chunks: true,
+                chunk_delay: Some(Duration::from_millis(6)),
+            },
+            cache_config,
+            crate::pool::engine_pool(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.progress().rows_scanned == 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        job.pause();
+        while !job.is_paused() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Sidecar must NOT be written while paused before EOF.
+        let sidecar_entries: Vec<_> = fs::read_dir(cache_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "qidx"))
+            .collect();
+        assert!(sidecar_entries.is_empty(), "sidecar written before EOF");
+        assert_eq!(session.completed_record_count(), None);
+
+        // Mutate source while paused -> searching the paused snapshot AND resuming must both
+        // surface SourceChanged, and wait() must preserve the terminal SourceChanged error.
+        let paused_snapshot = job.snapshot();
+        fs::rename(&path, directory.path().join("moved.csv")).unwrap();
+        fs::write(&path, b"x,y\n1,2\n").unwrap();
+        assert!(matches!(
+            session.start_search(
+                &paused_snapshot,
+                b"1".to_vec(),
+                crate::SearchPosition { row: 1, column: 0 }
+            ),
+            Err(crate::QuarryError::SourceChanged)
+        ));
+        assert!(matches!(
+            job.resume(),
+            Err(crate::QuarryError::SourceChanged)
+        ));
+        assert!(job.progress().done);
+        assert!(!job.progress().paused);
+        assert_eq!(session.completed_record_count(), None);
+        assert!(matches!(job.wait(), Err(crate::QuarryError::SourceChanged)));
+    }
+
+    #[test]
+    fn cancelling_paused_indexing_completes_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cancel-paused.csv");
+        fs::write(&path, b"a,b\n".repeat(4000)).unwrap();
+        let session = crate::Session::open(
+            &path,
+            crate::OpenOptions {
+                rows: 5,
+                delimiter: Some(b','),
+                sample_bytes: 256,
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let job = IndexJob::start_with_tuning_cache_and_pool(
+            &session,
+            IndexConfig {
+                chunk_bytes: 256,
+                ..IndexConfig::default()
+            },
+            ParallelTuning {
+                requested_threads: 1,
+                min_parallel_bytes: u64::MAX,
+                byte_stride: 512,
+                max_alignment_search: 256,
+                allow_small_chunks: true,
+                chunk_delay: Some(Duration::from_millis(6)),
+            },
+            crate::sidecar::IndexCacheConfig::disabled(),
+            crate::pool::engine_pool(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.progress().rows_scanned == 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        job.pause();
+        while !job.is_paused() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        job.cancel();
+        let p = job.progress();
+        assert!(p.done);
+        assert!(p.cancelled);
+        assert!(!p.paused);
+        let partial = job.wait().unwrap();
+        assert!(partial.indexed_rows() > 0);
+        assert_eq!(session.completed_record_count(), None);
+    }
+
+    #[test]
+    fn pausing_inside_giant_line_fallback_preserves_prior_parallel_maximum_width() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("giant-line-pause-width.csv");
+        let mut bytes = Vec::new();
+        // Leading wide 8-column rows inside parallel chunk 0, followed by narrow 2-column rows
+        // past the 64 KiB boundary so chunk 0 commits width=8 while the giant-line fallback
+        // starts strictly inside 2-column rows (scanner.maximum_width() == 2).
+        bytes.extend_from_slice(b"c1,c2,c3,c4,c5,c6,c7,c8\n");
+        for i in 0..100 {
+            bytes.extend_from_slice(format!("r{i},b,c,d,e,f,g,h\n").as_bytes());
+        }
+        while bytes.len() < 70 * 1024 {
+            bytes.extend_from_slice(b"narrow,val\n");
+        }
+        let prefix_len = bytes.len() as u64;
+        // Giant single-line 2-column record exceeding chunk_bytes + max_alignment_search.
+        bytes.extend_from_slice(b"giant,");
+        bytes.extend(std::iter::repeat_n(b'x', 320 * 1024));
+        bytes.push(b'\n');
+        // Trailing narrow 2-column rows.
+        for i in 0..200 {
+            bytes.extend_from_slice(format!("tail{i},v\n").as_bytes());
+        }
+        fs::write(&path, &bytes).unwrap();
+
+        let session = crate::Session::open(
+            &path,
+            crate::OpenOptions {
+                rows: 5,
+                delimiter: Some(b','),
+                sample_bytes: 512,
+                ..crate::OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let expected = IndexJob::start_with_tuning_cache_and_pool(
+            &session,
+            IndexConfig {
+                chunk_bytes: 64 * 1024,
+                ..IndexConfig::default()
+            },
+            ParallelTuning {
+                requested_threads: 1,
+                min_parallel_bytes: u64::MAX,
+                byte_stride: 64 * 1024,
+                max_alignment_search: 64 * 1024,
+                allow_small_chunks: true,
+                chunk_delay: None,
+            },
+            crate::sidecar::IndexCacheConfig::disabled(),
+            crate::pool::engine_pool(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert_eq!(expected.maximum_width(), 8);
+
+        let gate =
+            super::test_hooks::TestIndexPauseGate::install_after_bytes(&path, prefix_len + 1);
+        let mut job = IndexJob::start_with_tuning_cache_and_pool(
+            &session,
+            IndexConfig {
+                chunk_bytes: 64 * 1024,
+                ..IndexConfig::default()
+            },
+            ParallelTuning {
+                requested_threads: 2,
+                min_parallel_bytes: 64 * 1024,
+                byte_stride: 64 * 1024,
+                max_alignment_search: 64 * 1024,
+                allow_small_chunks: true,
+                chunk_delay: None,
+            },
+            crate::sidecar::IndexCacheConfig::disabled(),
+            crate::pool::engine_pool(),
+        )
+        .unwrap();
+
+        // Gate fires inside scan_giant_line_sequential after the 8-column parallel prefix committed.
+        assert!(
+            gate.wait_until_reached(Duration::from_secs(5)),
+            "timed out waiting for giant-line pause gate: progress={:?}",
+            job.progress(),
+        );
+        assert_eq!(job.progress().columns_found, 8);
+        assert!(job.progress().bytes_scanned > prefix_len);
+        job.pause();
+        gate.release();
+        drop(gate);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.is_paused() {
+            assert!(
+                Instant::now() < deadline,
+                "job did not pause inside giant line"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        job.resume().unwrap();
+        let resumed = job.wait().unwrap();
+        assert_eq!(resumed.maximum_width(), 8);
+        assert_eq!(resumed.indexed_rows(), expected.indexed_rows());
+        assert_eq!(resumed.indexed_bytes(), expected.indexed_bytes());
+        assert_eq!(resumed.maximum_width(), expected.maximum_width());
+    }
+
+    #[test]
+    fn process_memory_and_disk_space_helpers_report_valid_telemetry() {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let sample = crate::process_memory_usage().expect("memory sample available");
+            assert!(sample.bytes > 0);
+            #[cfg(target_os = "macos")]
+            assert_eq!(sample.label, "phys_footprint");
+            #[cfg(target_os = "linux")]
+            assert_eq!(sample.label, "VmRSS");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let avail = crate::available_disk_space(dir.path()).unwrap();
+        assert!(avail > 0);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

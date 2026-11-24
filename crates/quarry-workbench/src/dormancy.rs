@@ -223,6 +223,7 @@ pub enum PinReason {
     PendingDuplicatePreview,
     CompressedDecompressing,
     CompressedPendingStorage,
+    IndexingPaused,
     JoinReserved,
     CloseFlowPending,
 }
@@ -813,6 +814,9 @@ impl WorkbenchScheduler {
         if doc.join_reserved() {
             return Some(PinReason::JoinReserved);
         }
+        if doc.is_indexing_pause_pinned() {
+            return Some(PinReason::IndexingPaused);
+        }
         if slot.tab.document_writing() {
             return Some(PinReason::ActiveWriteJob);
         }
@@ -853,6 +857,24 @@ impl WorkbenchScheduler {
     /// True when the shared global two-write limit (`MAX_WRITE_JOBS`) has a free slot.
     pub fn write_slot_available(&self) -> bool {
         self.active_write_operations() < MAX_WRITE_JOBS
+    }
+
+    /// Pause active background indexing on `id` without parking pool threads; pins the tab.
+    pub fn pause_indexing(&mut self, id: DocumentId) -> Result<(), String> {
+        let doc = self
+            .tab_mut(id)
+            .and_then(|tab| tab.document.as_mut())
+            .ok_or_else(|| "Document is not hydrated.".to_owned())?;
+        doc.pause_indexing()
+    }
+
+    /// Resume paused background indexing on `id` after revalidating `SourceStamp`.
+    pub fn resume_indexing(&mut self, id: DocumentId) -> Result<(), String> {
+        let doc = self
+            .tab_mut(id)
+            .and_then(|tab| tab.document.as_mut())
+            .ok_or_else(|| "Document is not hydrated.".to_owned())?;
+        doc.resume_indexing()
     }
 
     /// Lazily registers a batch of paths (e.g. 200 files) as lightweight stubs without
@@ -2898,6 +2920,7 @@ impl WorkbenchScheduler {
             return false;
         };
         if doc.join_reserved()
+            || doc.is_indexing_pause_pinned()
             || slot.tab.document_writing()
             || doc.pending_materialization.is_some()
             || matches!(
@@ -3105,11 +3128,12 @@ fn doc_retained_dir_fds(doc: &Document) -> usize {
 const FILTER_JOB_AND_READ_FDS: usize = 3;
 
 fn doc_non_filter_job_fds(doc: &Document) -> usize {
-    // Index holds 1 FD; search holds 1 FD; filtered export, save, gzip decompression, and running
-    // structural workers each hold up to 2 FDs (source + destination); DuplicatePreview holds no
+    // Index holds 1 FD; search holds 2 FDs (source + cloned source-stamp guard handle);
+    // filtered export, save, and running structural workers each hold up to 2 FDs
+    // (source + destination); gzip decompression holds up to 4 FDs; DuplicatePreview holds no
     // running worker FDs.
     usize::from(doc.job.is_some())
-        + usize::from(doc.search_job.is_some())
+        + usize::from(doc.search_job.is_some()) * 2
         + usize::from(doc.export_job.is_some()) * 2
         + usize::from(doc.save_job.is_some()) * 2
         + usize::from(doc.decompression_running()) * 4
