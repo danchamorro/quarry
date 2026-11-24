@@ -2454,17 +2454,20 @@ fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly
     let dir = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
 
-    // Generate a ~24 MiB CSV so background indexing runs long enough to pause mid-stream,
-    // with a unique marker near the start and another near the very end.
+    // Generate a multi-chunk (~3 MiB) CSV with an early marker and a late tail marker.
+    // A path-scoped TestIndexPauseGate holds the worker deterministically after its first
+    // committed chunk so pause/resume, partial Find/Filter, and LATE_TAIL_MARKER exclusion
+    // never depend on thread scheduling or CPU speed.
     let big_path = dir.path().join("big-pausable.csv");
+    const TOTAL_ROWS: u64 = 30_000;
     {
         let mut file = std::io::BufWriter::new(std::fs::File::create(&big_path).unwrap());
         writeln!(file, "id,tag,payload").unwrap();
         let pad = "x".repeat(80);
-        for i in 1..=250_000_u64 {
+        for i in 1..=TOTAL_ROWS {
             let tag = if i == 5 {
                 "EARLY_MARKER"
-            } else if i == 249_995 {
+            } else if i == TOTAL_ROWS - 5 {
                 "LATE_TAIL_MARKER"
             } else {
                 "steady"
@@ -2475,6 +2478,8 @@ fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly
     }
     let other_path = write_csv(dir.path(), "other-pause-tab.csv", 10);
     let third_path = write_csv(dir.path(), "third-pause-tab.csv", 10);
+
+    let gate = quarry_core::test_hooks::TestIndexPauseGate::install(&big_path);
 
     let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
         max_hydrated_tabs: 1,
@@ -2491,29 +2496,24 @@ fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly
         )
         .unwrap();
 
-    // Request pause immediately; if indexing already reached EOF on a very fast machine,
-    // retry once with a 2x file so this test deterministically exercises paused state.
-    let paused = if scheduler.pause_indexing(ids[0]).is_ok() {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let _ = scheduler.poll_all();
-            let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
-            if doc.is_indexing_paused() {
-                break true;
-            }
-            if doc.progress.done {
-                break false;
-            }
-            assert!(Instant::now() < deadline, "pause did not settle");
-            std::thread::sleep(Duration::from_millis(2));
+    // Deterministically wait for the first chunk to commit, then request pause and release gate.
+    gate.wait_until_reached();
+    scheduler.pause_indexing(ids[0]).unwrap();
+    gate.release();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+        if doc.is_indexing_paused() {
+            break;
         }
-    } else {
-        false
-    };
-    assert!(
-        paused,
-        "expected 24 MiB CSV indexing to pause before EOF so paused behavior is verified"
-    );
+        assert!(
+            !doc.progress.done,
+            "gated indexing job should have paused before EOF"
+        );
+        assert!(Instant::now() < deadline, "pause did not settle");
+        std::thread::sleep(Duration::from_millis(2));
+    }
 
     // 1. Paused tab cannot be evicted under max_hydrated_tabs = 1, and stays pinned with
     //    PinReason::IndexingPaused when switching away under max_hydrated_tabs = 2.
@@ -2549,8 +2549,8 @@ fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly
         .unwrap()
         .committed_data_rows();
     assert!(
-        committed_rows < 250_000,
-        "paused frontier should be strictly partial (got {committed_rows})"
+        committed_rows > 0 && committed_rows < TOTAL_ROWS - 10,
+        "paused frontier should be strictly partial before tail marker (got {committed_rows})"
     );
 
     // 2. Partial-index Find reports "searched up to row N, indexing paused" when marker is past frontier.
@@ -2581,7 +2581,20 @@ fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    // 3. Partial-index Filter scans only the committed frontier and reports paused status.
+    // 3. Partial-index Filter scans only the committed frontier, tolerates edits beyond the
+    //    committed frontier, reports "filtered up to row N, indexing paused", and blocks export.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        std::sync::Arc::make_mut(&mut doc.cell_edits).insert(
+            (TOTAL_ROWS, 1),
+            std::sync::Arc::new(b"PREVIEW_EDIT_PAST_FRONTIER".to_vec()),
+        );
+    }
     let filter_query = FilterQuery::single_with_case(
         1,
         FilterOperator::Equals,
@@ -2591,34 +2604,47 @@ fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly
     scheduler.start_filter(ids[0], filter_query).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let _ = scheduler.poll_all();
+        let errs = scheduler.poll_all();
+        assert!(errs.is_empty(), "partial filter should not error: {errs:?}");
         let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
         if doc.filter_job.is_none() {
             let status = doc.filter_status.as_deref().unwrap_or("");
             assert!(
-                status.contains("searched up to row") && status.contains("indexing paused"),
+                status.contains("filtered up to row") && status.contains("indexing paused"),
                 "expected partial-index paused filter status, got: {status:?}"
             );
             assert_eq!(doc.available_filter_rows(), 0);
+            assert!(
+                !doc.is_filtered_export_ready(),
+                "filtered export must stay disabled while filter covers only a paused prefix"
+            );
             break;
         }
         assert!(Instant::now() < deadline, "partial filter timed out");
         std::thread::sleep(Duration::from_millis(5));
     }
-    scheduler
-        .tab_mut(ids[0])
-        .unwrap()
-        .document
-        .as_mut()
-        .unwrap()
-        .clear_filter()
-        .unwrap();
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert!(
+            doc.start_filtered_export(dir.path().join("blocked-export.csv"))
+                .is_err(),
+            "start_filtered_export must reject partial paused filter results"
+        );
+        doc.clear_filter().unwrap();
+        std::sync::Arc::make_mut(&mut doc.cell_edits).clear();
+    }
 
-    // 4. Resume completes full index (250,000 rows) and releases PinReason::IndexingPaused.
+    // 4. Resume completes full index (TOTAL_ROWS) and releases PinReason::IndexingPaused.
+    drop(gate);
     scheduler.resume_indexing(ids[0]).unwrap();
     finish_active_indexing(&mut scheduler, ids[0]);
     let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
-    assert_eq!(doc.available_data_rows(), 250_000);
+    assert_eq!(doc.available_data_rows(), TOTAL_ROWS);
     assert!(!doc.is_indexing_paused());
 
     // Hydrating a third tab under cap=1 now evicts ids[0] cleanly since IndexingPaused pin is released.

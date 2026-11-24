@@ -257,6 +257,7 @@ pub struct Document {
     pub search_history: Vec<SearchMatch>,
     pub search_history_index: Option<usize>,
     pub search_status: Option<String>,
+    pub search_paused_row_limit: Option<u64>,
     pub filter_job: Option<FilterJob>,
     pub filter_index: Option<FilterIndex>,
     pub filter_query: Option<FilterQuery>,
@@ -453,6 +454,7 @@ impl Document {
             search_history: Vec::new(),
             search_history_index: None,
             search_status: None,
+            search_paused_row_limit: None,
             filter_job: None,
             filter_index: None,
             filter_query: None,
@@ -2051,6 +2053,12 @@ impl Document {
             .is_some_and(|job| job.is_pause_requested() && !job.is_paused())
     }
 
+    pub fn is_indexing_pause_pinned(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(IndexJob::is_paused_or_pausing)
+    }
+
     pub fn can_pause_indexing(&self) -> bool {
         !self.is_compressed()
             && self.job.is_some()
@@ -2204,25 +2212,33 @@ impl Document {
             },
         );
         let partial_snapshot;
-        let index = if let Some(index) = &self.index {
-            index
+        let (index, captured_paused_limit) = if let Some(index) = &self.index {
+            (index, None)
         } else if let Some(job) = &self.job {
             partial_snapshot = job.snapshot();
-            &partial_snapshot
+            let limit = partial_snapshot
+                .indexed_rows()
+                .saturating_sub(self.data_start);
+            (&partial_snapshot, Some(limit))
         } else {
             return Err("Search is available after indexing completes.".into());
         };
-        self.search_job = Some(
-            self.session
-                .start_search_with_cell_edits_and_case(
-                    index,
-                    query.to_vec(),
-                    position,
-                    self.owned_cell_edits(),
-                    case_sensitivity,
-                )
-                .map_err(|error| self.diagnostic_error(error))?,
-        );
+        let search_job = match self.session.start_search_with_cell_edits_and_case(
+            index,
+            query.to_vec(),
+            position,
+            self.owned_cell_edits(),
+            case_sensitivity,
+        ) {
+            Ok(job) => job,
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            Err(error) => return Err(self.diagnostic_error(error)),
+        };
+        self.search_job = Some(search_job);
+        self.search_paused_row_limit = captured_paused_limit;
         self.search_status = None;
         self.reveal_cell = None;
         Ok(())
@@ -2361,10 +2377,9 @@ impl Document {
         self.column_selection_anchor = None;
         let data_row = row.saturating_sub(self.data_start).saturating_add(1);
         let data_col = column.saturating_add(1);
-        self.search_status = Some(if self.is_indexing_paused() {
+        self.search_status = Some(if let Some(limit) = self.search_paused_row_limit {
             format!(
-                "Found row {data_row}, column {data_col} (searched up to row {}, indexing paused).",
-                self.committed_data_rows()
+                "Found row {data_row}, column {data_col} (searched up to row {limit}, indexing paused)."
             )
         } else {
             format!("Found row {data_row}, column {data_col}.")
@@ -2381,6 +2396,7 @@ impl Document {
             return Ok(());
         }
         let job = self.search_job.take().expect("search job is present");
+        let captured_paused_limit = self.search_paused_row_limit;
         match job.wait() {
             Ok(SearchOutcome::Match(found)) => {
                 if let Some(index) = self.search_history_index {
@@ -2391,11 +2407,8 @@ impl Document {
                 self.show_search_match(found)?;
             }
             Ok(SearchOutcome::NotFound) => {
-                self.search_status = Some(if self.is_indexing_paused() {
-                    format!(
-                        "No further matches (searched up to row {}, indexing paused).",
-                        self.committed_data_rows()
-                    )
+                self.search_status = Some(if let Some(limit) = captured_paused_limit {
+                    format!("No further matches (searched up to row {limit}, indexing paused).")
                 } else {
                     "No further matches.".into()
                 });
@@ -2403,11 +2416,18 @@ impl Document {
             Ok(SearchOutcome::Cancelled) => {
                 self.search_status = Some("Search cancelled.".into());
             }
-            Err(QuarryError::RowNotIndexed { indexed_rows, .. }) if self.is_indexing_paused() => {
+            Err(QuarryError::RowNotIndexed { indexed_rows, .. })
+                if captured_paused_limit.is_some() =>
+            {
+                let limit = captured_paused_limit
+                    .unwrap_or_else(|| indexed_rows.saturating_sub(self.data_start));
                 self.search_status = Some(format!(
-                    "No match — searched up to row {}, indexing paused.",
-                    indexed_rows.saturating_sub(self.data_start)
+                    "No match — searched up to row {limit}, indexing paused."
                 ));
+            }
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
             }
             Err(error) => return Err(self.diagnostic_error(error)),
         }
@@ -2586,16 +2606,17 @@ impl Document {
                 self.filter_index = Some(index);
                 self.filter_status = Some(if let Some(limit) = self.filter_paused_row_limit {
                     if progress.cancelled {
+                        let scanned = progress.rows_scanned.saturating_sub(self.data_start);
                         format!(
-                            "Filter cancelled after {matches} matches (searched up to row {limit}, indexing paused)."
+                            "Filter cancelled after {matches} matches (filtered up to row {scanned}, indexing paused)."
                         )
                     } else if matches == 0 {
                         format!(
-                            "Filter complete. No matching rows (searched up to row {limit}, indexing paused)."
+                            "Filter complete. No matching rows (filtered up to row {limit}, indexing paused)."
                         )
                     } else {
                         format!(
-                            "Filter complete. {matches} matches (searched up to row {limit}, indexing paused)."
+                            "Filter complete. {matches} matches (filtered up to row {limit}, indexing paused)."
                         )
                     }
                 } else if progress.cancelled {
@@ -2714,6 +2735,11 @@ impl Document {
                 "Run the filter to completion before exporting.",
             ));
         }
+        if self.filter_paused_row_limit.is_some() {
+            return Err(AppMessage::warning(
+                "Resume indexing and re-run the filter over the full file before exporting filtered rows.",
+            ));
+        }
 
         let job = self
             .session
@@ -2796,6 +2822,7 @@ impl Document {
     pub fn is_filtered_export_ready(&self) -> bool {
         !self.source_changed
             && self.filter_query.is_some()
+            && self.filter_paused_row_limit.is_none()
             && !self.filter_refresh_pending
             && self.filter_job.is_none()
             && self.export_job.is_none()
@@ -3007,6 +3034,7 @@ impl Document {
         self.filter_refresh_pending = false;
         self.filter_progress = None;
         self.filter_paused_row_limit = None;
+        self.search_paused_row_limit = None;
         self.whitespace.invalidate_rows();
         self.buffered_rows.clear();
         self.whitespace.invalidate_rows();

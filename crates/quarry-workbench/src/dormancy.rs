@@ -814,7 +814,7 @@ impl WorkbenchScheduler {
         if doc.join_reserved() {
             return Some(PinReason::JoinReserved);
         }
-        if doc.is_indexing_paused() || doc.is_indexing_pausing() {
+        if doc.is_indexing_pause_pinned() {
             return Some(PinReason::IndexingPaused);
         }
         if slot.tab.document_writing() {
@@ -2920,8 +2920,7 @@ impl WorkbenchScheduler {
             return false;
         };
         if doc.join_reserved()
-            || doc.is_indexing_paused()
-            || doc.is_indexing_pausing()
+            || doc.is_indexing_pause_pinned()
             || slot.tab.document_writing()
             || doc.pending_materialization.is_some()
             || matches!(

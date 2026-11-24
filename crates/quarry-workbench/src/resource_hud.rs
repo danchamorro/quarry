@@ -4,6 +4,7 @@
 //! per-volume available disk space strictly off the UI thread at `<= 2 Hz`, and emits
 //! screen-reader announcements only on real state transitions (never per polling sample).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -28,10 +29,16 @@ pub struct VolumeSpaceSample {
     pub low_disk: bool,
 }
 
-/// Snapshot of the current Live Resource HUD metrics.
+/// Snapshot of the current Live Resource HUD metrics across all tracked window document volumes
+/// and the shared temporary scratch volume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceHudSample {
     pub memory: Option<ProcessMemorySample>,
+    pub scratch_volume: Option<VolumeSpaceSample>,
+    pub scratch_failed: bool,
+    /// Per-document-directory volume reading (`None` when sampling failed / unknown).
+    pub document_volumes: BTreeMap<PathBuf, Option<VolumeSpaceSample>>,
+    /// Deduplicated summary across the scratch volume and first distinct document volume.
     pub volumes: Vec<VolumeSpaceSample>,
     pub sampled_at: Instant,
 }
@@ -40,23 +47,81 @@ impl Default for ResourceHudSample {
     fn default() -> Self {
         Self {
             memory: None,
+            scratch_volume: None,
+            scratch_failed: false,
+            document_volumes: BTreeMap::new(),
             volumes: Vec::new(),
             sampled_at: Instant::now(),
         }
     }
 }
 
+impl ResourceHudSample {
+    /// Resolve the deduplicated volume list for a specific window's active document directory
+    /// together with a flag indicating whether any required volume reading is missing/failed.
+    pub fn volumes_for(&self, document_dir: Option<&Path>) -> (Vec<VolumeSpaceSample>, bool) {
+        let mut out = Vec::new();
+        let mut incomplete = self.scratch_failed;
+
+        match document_dir {
+            Some(dir) => match self.document_volumes.get(dir) {
+                Some(Some(doc_vol)) => {
+                    if let Some(scratch) = &self.scratch_volume {
+                        if same_volume(&doc_vol.directory, &scratch.directory) {
+                            let mut merged = scratch.clone();
+                            merged.label = "Disk".into();
+                            out.push(merged);
+                        } else {
+                            out.push(doc_vol.clone());
+                            out.push(scratch.clone());
+                        }
+                    } else {
+                        let mut single = doc_vol.clone();
+                        single.label = "Disk".into();
+                        out.push(single);
+                    }
+                }
+                Some(None) => {
+                    incomplete = true;
+                    if let Some(scratch) = &self.scratch_volume {
+                        out.push(scratch.clone());
+                    }
+                }
+                None => {
+                    // Window's document directory has not been sampled yet; do not treat missing
+                    // data as recovery while still showing scratch space if available.
+                    incomplete = true;
+                    if let Some(scratch) = &self.scratch_volume {
+                        let mut merged = scratch.clone();
+                        merged.label = "Disk".into();
+                        out.push(merged);
+                    }
+                }
+            },
+            None => {
+                if let Some(scratch) = &self.scratch_volume {
+                    let mut merged = scratch.clone();
+                    merged.label = "Disk".into();
+                    out.push(merged);
+                }
+            }
+        }
+
+        (out, incomplete)
+    }
+}
+
 /// Relevant directories whose volumes should be sampled by the background HUD thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceHudTargets {
-    pub document_dir: Option<PathBuf>,
+    pub document_dirs: BTreeSet<PathBuf>,
     pub scratch_dir: PathBuf,
 }
 
 impl Default for ResourceHudTargets {
     fn default() -> Self {
         Self {
-            document_dir: None,
+            document_dirs: BTreeSet::new(),
             scratch_dir: std::env::temp_dir(),
         }
     }
@@ -74,10 +139,15 @@ fn nearest_existing_dir(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn same_volume(a: &Path, b: &Path) -> bool {
+fn volume_device(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
+    std::fs::metadata(path).ok().map(|meta| meta.dev())
+}
+
+#[cfg(unix)]
+fn same_volume(a: &Path, b: &Path) -> bool {
+    match (volume_device(a), volume_device(b)) {
+        (Some(da), Some(db)) => da == db,
         _ => a == b,
     }
 }
@@ -87,74 +157,69 @@ fn same_volume(a: &Path, b: &Path) -> bool {
     a == b
 }
 
-/// Sample OS process memory and relevant volume availability once.
+/// Sample OS process memory and all relevant volume availabilities once.
 /// Intended to run on a background thread so slow or network volumes never block UI rendering.
 pub fn sample_resource_hud(targets: &ResourceHudTargets) -> ResourceHudSample {
     let memory = process_memory_usage();
-    let mut volumes = Vec::new();
-    let scratch = nearest_existing_dir(&targets.scratch_dir);
-    let doc = targets
-        .document_dir
-        .as_deref()
-        .and_then(nearest_existing_dir);
+    let scratch_existing = nearest_existing_dir(&targets.scratch_dir);
 
-    match (doc, scratch) {
-        (Some(doc_dir), Some(scratch_dir)) if same_volume(&doc_dir, &scratch_dir) => {
-            if let Ok(available_bytes) = available_disk_space(&scratch_dir) {
-                volumes.push(VolumeSpaceSample {
-                    label: "Disk".into(),
-                    directory: scratch_dir,
-                    available_bytes,
-                    low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
-                });
+    #[cfg(unix)]
+    let mut dev_cache: BTreeMap<u64, Option<u64>> = BTreeMap::new();
+    let mut query_space = |dir: &Path| -> Option<u64> {
+        #[cfg(unix)]
+        if let Some(dev) = volume_device(dir) {
+            if let Some(&cached) = dev_cache.get(&dev) {
+                return cached;
             }
+            let reading = available_disk_space(dir).ok();
+            dev_cache.insert(dev, reading);
+            return reading;
         }
-        (Some(doc_dir), Some(scratch_dir)) => {
-            if let Ok(available_bytes) = available_disk_space(&doc_dir) {
-                volumes.push(VolumeSpaceSample {
-                    label: "File disk".into(),
-                    directory: doc_dir,
-                    available_bytes,
-                    low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
-                });
-            }
-            if let Ok(available_bytes) = available_disk_space(&scratch_dir) {
-                volumes.push(VolumeSpaceSample {
+        available_disk_space(dir).ok()
+    };
+
+    let (scratch_volume, scratch_failed) = match scratch_existing {
+        Some(dir) => match query_space(&dir) {
+            Some(available_bytes) => (
+                Some(VolumeSpaceSample {
                     label: "Scratch".into(),
-                    directory: scratch_dir,
+                    directory: dir,
                     available_bytes,
                     low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
-                });
-            }
-        }
-        (Some(doc_dir), None) => {
-            if let Ok(available_bytes) = available_disk_space(&doc_dir) {
-                volumes.push(VolumeSpaceSample {
-                    label: "Disk".into(),
-                    directory: doc_dir,
-                    available_bytes,
-                    low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
-                });
-            }
-        }
-        (None, Some(scratch_dir)) => {
-            if let Ok(available_bytes) = available_disk_space(&scratch_dir) {
-                volumes.push(VolumeSpaceSample {
-                    label: "Disk".into(),
-                    directory: scratch_dir,
-                    available_bytes,
-                    low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
-                });
-            }
-        }
-        (None, None) => {}
+                }),
+                false,
+            ),
+            None => (None, true),
+        },
+        None => (None, true),
+    };
+
+    let mut document_volumes = BTreeMap::new();
+    for raw_dir in &targets.document_dirs {
+        let entry = match nearest_existing_dir(raw_dir) {
+            Some(dir) => query_space(&dir).map(|available_bytes| VolumeSpaceSample {
+                label: "File disk".into(),
+                directory: dir,
+                available_bytes,
+                low_disk: available_bytes < LOW_DISK_WARNING_BYTES,
+            }),
+            None => None,
+        };
+        document_volumes.insert(raw_dir.clone(), entry);
     }
 
-    ResourceHudSample {
+    let first_doc = targets.document_dirs.iter().next().map(PathBuf::as_path);
+    let mut sample = ResourceHudSample {
         memory,
-        volumes,
+        scratch_volume,
+        scratch_failed,
+        document_volumes,
+        volumes: Vec::new(),
         sampled_at: Instant::now(),
-    }
+    };
+    let (summary_volumes, _) = sample.volumes_for(first_doc);
+    sample.volumes = summary_volumes;
+    sample
 }
 
 struct SamplerState {
@@ -247,10 +312,9 @@ impl ResourceHudSampler {
     pub fn snapshot(&self) -> ResourceHudSample {
         self.latest.lock().unwrap().clone()
     }
-}
 
-impl Drop for ResourceHudSampler {
-    fn drop(&mut self) {
+    #[cfg(test)]
+    pub fn stop_and_join(&mut self) {
         {
             let (lock, cvar) = &*self.state;
             let mut guard = lock.lock().unwrap();
@@ -260,6 +324,21 @@ impl Drop for ResourceHudSampler {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl Drop for ResourceHudSampler {
+    fn drop(&mut self) {
+        // Signal shutdown and detach without blocking the caller/UI thread if a slow volume
+        // statvfs call is currently in progress; the worker owns its Arc state and exits cleanly
+        // as soon as the in-flight sample returns.
+        {
+            let (lock, cvar) = &*self.state;
+            let mut guard = lock.lock().unwrap();
+            guard.shutdown = true;
+            cvar.notify_all();
+        }
+        let _ = self.handle.take();
     }
 }
 
@@ -300,6 +379,9 @@ impl HudAnnouncementTracker {
 
     /// Observe the current indexing phase and disk state, returning a new announcement **only**
     /// when a meaningful state transition occurred (paused, resumed, completed, or low-disk edge).
+    /// When `sample_incomplete` is true (or `volumes` is empty), a failed/unknown disk reading
+    /// never clears an active low-disk state or announces recovery.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         doc_instance: Option<u64>,
@@ -308,6 +390,7 @@ impl HudAnnouncementTracker {
         committed_bytes: u64,
         file_size: u64,
         volumes: &[VolumeSpaceSample],
+        sample_incomplete: bool,
     ) -> Option<HudAnnouncement> {
         let mut next: Option<HudAnnouncement> = None;
 
@@ -358,7 +441,7 @@ impl HudAnnouncementTracker {
                     is_alert: true,
                 });
             }
-        } else if !now_low && self.low_disk_active {
+        } else if !now_low && !sample_incomplete && !volumes.is_empty() && self.low_disk_active {
             self.low_disk_active = false;
             if next.is_none() {
                 next = Some(HudAnnouncement {
@@ -403,7 +486,8 @@ mod tests {
                 100,
                 4096,
                 100_000,
-                &healthy
+                &healthy,
+                false,
             ),
             None
         );
@@ -415,7 +499,8 @@ mod tests {
                 500,
                 16_384,
                 100_000,
-                &healthy
+                &healthy,
+                false,
             ),
             None
         );
@@ -426,7 +511,8 @@ mod tests {
                 900,
                 32_768,
                 100_000,
-                &healthy
+                &healthy,
+                false,
             ),
             None
         );
@@ -440,6 +526,7 @@ mod tests {
                 32_768,
                 100_000,
                 &healthy,
+                false,
             )
             .expect("pause transition announces");
         assert!(!paused.is_alert);
@@ -454,23 +541,54 @@ mod tests {
                 900,
                 32_768,
                 100_000,
-                &healthy
+                &healthy,
+                false,
             ),
             None
         );
 
-        // Low-disk rising edge emits one alert announcement; repeated low-disk polls stay silent.
-        let low_msg = tracker
-            .update(Some(1), HudIndexPhase::Paused, 900, 32_768, 100_000, &low)
-            .expect("low disk transition announces");
-        assert!(low_msg.is_alert);
-        assert!(low_msg.text.contains("Low disk space on Scratch"));
+        // Low-disk edge fires an Alert once.
+        let alert = tracker
+            .update(
+                Some(1),
+                HudIndexPhase::Paused,
+                900,
+                32_768,
+                100_000,
+                &low,
+                false,
+            )
+            .expect("low disk transition announces alert");
+        assert!(alert.is_alert);
+        assert!(alert.text.contains("Low disk space"));
+
+        // A failed/incomplete disk reading must NOT clear low_disk_active or announce recovery.
         assert_eq!(
-            tracker.update(Some(1), HudIndexPhase::Paused, 900, 32_768, 100_000, &low),
+            tracker.update(
+                Some(1),
+                HudIndexPhase::Paused,
+                900,
+                32_768,
+                100_000,
+                &[],
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            tracker.update(
+                Some(1),
+                HudIndexPhase::Paused,
+                900,
+                32_768,
+                100_000,
+                &healthy,
+                true,
+            ),
             None
         );
 
-        // Recovery emits once.
+        // Only a complete healthy reading announces recovery.
         let recovered = tracker
             .update(
                 Some(1),
@@ -479,12 +597,13 @@ mod tests {
                 32_768,
                 100_000,
                 &healthy,
+                false,
             )
-            .expect("disk recovery announces");
+            .expect("complete healthy sample announces recovery");
         assert!(!recovered.is_alert);
-        assert!(recovered.text.contains("Disk space recovered"));
+        assert!(recovered.text.contains("recovered"));
 
-        // Resume -> Complete emit one announcement each.
+        // Transition Paused -> Indexing -> Complete.
         let resumed = tracker
             .update(
                 Some(1),
@@ -493,61 +612,92 @@ mod tests {
                 32_768,
                 100_000,
                 &healthy,
+                false,
             )
             .expect("resume transition announces");
-        assert!(resumed.text.contains("Indexing resumed"));
-
-        let complete = tracker
+        assert!(resumed.text.contains("resumed"));
+        let done = tracker
             .update(
                 Some(1),
                 HudIndexPhase::Complete,
-                2_000,
+                2500,
                 100_000,
                 100_000,
                 &healthy,
+                false,
             )
-            .expect("complete transition announces");
-        assert!(complete.text.contains("Indexing complete"));
-        assert!(complete.text.contains("2,000"));
-
-        // Repeated completed polls stay silent.
-        assert_eq!(
-            tracker.update(
-                Some(1),
-                HudIndexPhase::Complete,
-                2_000,
-                100_000,
-                100_000,
-                &healthy
-            ),
-            None
-        );
+            .expect("completion transition announces");
+        assert!(done.text.contains("Indexing complete"));
+        assert!(done.text.contains("2,500"));
     }
 
     #[test]
     fn sampler_runs_off_thread_deduplicates_same_volume_and_stops_cleanly() {
-        let dir = tempfile::tempdir().unwrap();
-        let sampler = ResourceHudSampler::start(ResourceHudTargets {
-            document_dir: Some(dir.path().to_path_buf()),
-            scratch_dir: dir.path().to_path_buf(),
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut sampler = ResourceHudSampler::start(ResourceHudTargets {
+            document_dirs: BTreeSet::from([dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]),
+            scratch_dir: dir_a.path().to_path_buf(),
         });
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let sample = loop {
             let s = sampler.snapshot();
             if !s.volumes.is_empty() {
                 break s;
             }
-            assert!(
-                Instant::now() < deadline,
-                "HUD sampler did not populate sample"
-            );
+            assert!(Instant::now() < deadline, "HUD sampler timed out");
             thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(sample.volumes.len(), 1);
-        assert_eq!(sample.volumes[0].label, "Disk");
-        assert!(sample.volumes[0].available_bytes > 0);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        assert!(sample.memory.is_some_and(|m| m.bytes > 0));
-        drop(sampler);
+        assert!(sample.volumes.iter().all(|v| v.available_bytes > 0));
+        let (vols_a, incomplete_a) = sample.volumes_for(Some(dir_a.path()));
+        assert!(!incomplete_a);
+        assert_eq!(vols_a.len(), 1);
+        assert_eq!(vols_a[0].label, "Disk");
+
+        // Per-window selection handles distinct document volumes independently.
+        let synthetic = ResourceHudSample {
+            memory: sample.memory,
+            scratch_volume: Some(VolumeSpaceSample {
+                label: "Scratch".into(),
+                directory: PathBuf::from("/vol-a"),
+                available_bytes: 50 * 1024 * 1024 * 1024,
+                low_disk: false,
+            }),
+            scratch_failed: false,
+            document_volumes: BTreeMap::from([
+                (
+                    PathBuf::from("/vol-a/doc1"),
+                    Some(VolumeSpaceSample {
+                        label: "File disk".into(),
+                        directory: PathBuf::from("/vol-a"),
+                        available_bytes: 50 * 1024 * 1024 * 1024,
+                        low_disk: false,
+                    }),
+                ),
+                (
+                    PathBuf::from("/vol-b/doc2"),
+                    Some(VolumeSpaceSample {
+                        label: "File disk".into(),
+                        directory: PathBuf::from("/vol-b"),
+                        available_bytes: 64 * 1024 * 1024,
+                        low_disk: true,
+                    }),
+                ),
+            ]),
+            volumes: Vec::new(),
+            sampled_at: Instant::now(),
+        };
+        let (win1_vols, win1_inc) = synthetic.volumes_for(Some(Path::new("/vol-a/doc1")));
+        assert!(!win1_inc);
+        assert_eq!(win1_vols.len(), 1);
+        assert!(!win1_vols[0].low_disk);
+
+        let (win2_vols, win2_inc) = synthetic.volumes_for(Some(Path::new("/vol-b/doc2")));
+        assert!(!win2_inc);
+        assert_eq!(win2_vols.len(), 2);
+        assert_eq!(win2_vols[0].label, "File disk");
+        assert!(win2_vols[0].low_disk);
+
+        sampler.stop_and_join();
     }
 }

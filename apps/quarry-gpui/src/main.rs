@@ -30,10 +30,10 @@ use gpui_kit::{
     prelude::*,
     *,
 };
-use quarry_core::{Encoding, OpenOptions};
+use quarry_core::{Encoding, OpenOptions, ProcessMemorySample};
 use quarry_workbench::{
     AppMessage, CommandId, DocumentId, FailedOpen, MessageSeverity, ResidencyState, ResolvedTheme,
-    ResourceHudSample, ThemeAppearance, ThemePreference, WindowId, compressed::uncompressed_name,
+    ThemeAppearance, ThemePreference, VolumeSpaceSample, WindowId, compressed::uncompressed_name,
     format_bytes,
 };
 
@@ -2976,9 +2976,12 @@ impl Render for QuarryWindow {
             (hint.into(), None)
         };
 
-        let hud_sample = self.controller.read(cx).resource_hud_sample().clone();
-        let hud_text = format_resource_hud(&hud_sample);
-        let hud_low_disk = hud_sample.volumes.iter().any(|v| v.low_disk);
+        let (hud_memory, hud_volumes) = self
+            .controller
+            .read(cx)
+            .resource_hud_for_window(self.window_id);
+        let hud_text = format_resource_hud(hud_memory, &hud_volumes);
+        let hud_low_disk = hud_volumes.iter().any(|v| v.low_disk);
         let hud_announcement = self
             .controller
             .read(cx)
@@ -3075,12 +3078,15 @@ impl Render for QuarryWindow {
     }
 }
 
-fn format_resource_hud(sample: &ResourceHudSample) -> String {
+fn format_resource_hud(
+    memory: Option<ProcessMemorySample>,
+    volumes: &[VolumeSpaceSample],
+) -> String {
     let mut parts = Vec::new();
-    if let Some(mem) = sample.memory {
+    if let Some(mem) = memory {
         parts.push(format!("{} {}", mem.label, format_bytes(mem.bytes)));
     }
-    for volume in &sample.volumes {
+    for volume in volumes {
         parts.push(format!(
             "{} {} free",
             volume.label,

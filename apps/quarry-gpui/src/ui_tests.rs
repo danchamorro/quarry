@@ -2953,11 +2953,12 @@ fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut Tes
 
     let dir = tempfile::tempdir().unwrap();
     let big_csv = dir.path().join("hud-pausable.csv");
+    const TOTAL_ROWS: u64 = 30_000;
     {
         let mut file = std::io::BufWriter::new(std::fs::File::create(&big_csv).unwrap());
         writeln!(file, "id,tag,payload").unwrap();
         let pad = "p".repeat(80);
-        for i in 1..=250_000_u64 {
+        for i in 1..=TOTAL_ROWS {
             writeln!(file, "{i},row_{i},{pad}").unwrap();
         }
         file.flush().unwrap();
@@ -2983,30 +2984,31 @@ fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut Tes
     wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
         !controller.read(cx).resource_hud_sample().volumes.is_empty()
     });
-    let hud_sample = cx.update(|cx| controller.read(cx).resource_hud_sample().clone());
+    let (hud_mem, hud_vols) = cx.update(|cx| controller.read(cx).resource_hud_for_window(win_id));
     #[cfg(target_os = "macos")]
     assert_eq!(
-        hud_sample.memory.map(|m| m.label),
+        hud_mem.map(|m| m.label),
         Some("phys_footprint"),
         "macOS HUD must label memory as phys_footprint"
     );
     #[cfg(target_os = "linux")]
     assert_eq!(
-        hud_sample.memory.map(|m| m.label),
+        hud_mem.map(|m| m.label),
         Some("VmRSS"),
         "Linux HUD must label memory as VmRSS"
     );
     assert!(
-        !hud_sample.volumes.is_empty(),
+        !hud_vols.is_empty(),
         "HUD should report at least one volume's available space"
     );
-    let formatted_hud = crate::format_resource_hud(&hud_sample);
+    let formatted_hud = crate::format_resource_hud(hud_mem, &hud_vols);
     assert!(
         formatted_hud.contains("free"),
         "formatted HUD readout should include free disk space: {formatted_hud:?}"
     );
 
-    // 2. Open large CSV and immediately pause via PauseResumeIndexing action.
+    // 2. Open CSV with a deterministic test barrier, wait for chunk 0 to commit, then pause.
+    let gate = quarry_core::test_hooks::TestIndexPauseGate::install(&big_csv);
     cx.update_window(handle.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
             q.open_paths_direct(
@@ -3019,10 +3021,18 @@ fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut Tes
                 window,
                 cx,
             );
+        });
+    })
+    .unwrap();
+    gate.wait_until_reached();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
             q.pause_resume_indexing_action(&crate::menus::PauseResumeIndexing, window, cx);
         });
     })
     .unwrap();
+    gate.release();
 
     wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
         q.snapshot(cx)
@@ -3031,7 +3041,7 @@ fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut Tes
     let paused_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
     assert!(
         paused_snap.index_paused,
-        "expected large CSV indexing to pause cleanly before EOF"
+        "expected gated CSV indexing to pause cleanly before EOF"
     );
     assert!(paused_snap.can_resume_indexing);
     assert!(cx.update(|cx| {
@@ -3049,6 +3059,7 @@ fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut Tes
     );
 
     // 3. Click the inline status bar Resume button and verify completion announcement.
+    drop(gate);
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find("index-pause-resume").visible());
@@ -3060,7 +3071,7 @@ fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut Tes
         q.snapshot(cx).is_some_and(|s| s.index_done)
     });
     let done_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
-    assert_eq!(done_snap.total_rows, 250_000);
+    assert_eq!(done_snap.total_rows, TOTAL_ROWS);
     assert!(!done_snap.index_paused);
     assert!(!cx.update(|cx| {
         view.read(cx)

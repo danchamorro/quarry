@@ -101,6 +101,7 @@ pub struct StructuralIndex {
     maximum_width: usize,
     indexed_bytes: u64,
     last_record_end: u64,
+    complete: bool,
     telemetry: IndexTelemetry,
     provenance: Option<IndexProvenance>,
 }
@@ -143,6 +144,7 @@ impl StructuralIndex {
             maximum_width: 0,
             indexed_bytes: 0,
             last_record_end: 0,
+            complete: false,
             telemetry: IndexTelemetry::default(),
             provenance: None,
         })
@@ -189,6 +191,7 @@ impl StructuralIndex {
         index.maximum_width = maximum_width;
         index.indexed_bytes = indexed_bytes;
         index.last_record_end = indexed_bytes;
+        index.complete = true;
         index.telemetry = IndexTelemetry {
             effective_workers: 0,
             simd_backend: active_simd_backend(),
@@ -294,6 +297,12 @@ impl StructuralIndex {
         self.maximum_width = maximum_width;
         self.indexed_bytes = bytes_written;
         self.last_record_end = bytes_written;
+        self.complete = true;
+    }
+
+    /// True only when this index reached validated EOF (complete scan, verified output, or sidecar).
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// Widest completed logical record in the indexed portion, including the header.
@@ -498,6 +507,121 @@ struct JobResumeContext {
     pool: &'static EnginePool,
 }
 
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    struct GateInner {
+        reached: bool,
+        released: bool,
+    }
+
+    type GateSignal = Arc<(Mutex<GateInner>, Condvar)>;
+
+    /// Deterministic path-scoped test barrier that pauses indexing after the first committed
+    /// chunk until the test releases it or requests pause/cancel.
+    pub struct TestIndexPauseGate {
+        path: PathBuf,
+        inner: GateSignal,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<PathBuf, GateSignal>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, GateSignal>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    impl TestIndexPauseGate {
+        pub fn install(path: &Path) -> Self {
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let inner = Arc::new((
+                Mutex::new(GateInner {
+                    reached: false,
+                    released: false,
+                }),
+                Condvar::new(),
+            ));
+            registry()
+                .lock()
+                .unwrap()
+                .insert(key.clone(), Arc::clone(&inner));
+            Self { path: key, inner }
+        }
+
+        /// Wait until the indexer has committed its initial partial chunk and reached the gate.
+        pub fn wait_until_reached(&self) {
+            let (lock, cvar) = &*self.inner;
+            let mut guard = lock.lock().unwrap();
+            while !guard.reached {
+                guard = cvar.wait(guard).unwrap();
+            }
+        }
+
+        /// Allow the indexer to continue past the gate (e.g. after requesting pause).
+        pub fn release(&self) {
+            let (lock, cvar) = &*self.inner;
+            let mut guard = lock.lock().unwrap();
+            guard.released = true;
+            cvar.notify_all();
+        }
+    }
+
+    impl Drop for TestIndexPauseGate {
+        fn drop(&mut self) {
+            self.release();
+            registry().lock().unwrap().remove(&self.path);
+        }
+    }
+
+    pub(super) fn is_gated(path: &Path) -> bool {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let gate = { registry().lock().unwrap().get(&key).cloned() };
+        gate.is_some_and(|inner| !inner.0.lock().unwrap().released)
+    }
+
+    pub(super) fn wait_if_gated(path: &Path, stop_dispatch: &std::sync::atomic::AtomicBool) {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let gate = { registry().lock().unwrap().get(&key).cloned() };
+        let Some(inner) = gate else {
+            return;
+        };
+        let (lock, cvar) = &*inner;
+        let mut guard = lock.lock().unwrap();
+        if guard.released {
+            return;
+        }
+        guard.reached = true;
+        cvar.notify_all();
+        while !guard.released && !stop_dispatch.load(std::sync::atomic::Ordering::Acquire) {
+            let (next, _) = cvar
+                .wait_timeout(guard, std::time::Duration::from_millis(5))
+                .unwrap();
+            guard = next;
+        }
+    }
+}
+
+struct IndexLifecycle {
+    worker_running: bool,
+    pause_requested: bool,
+    paused: bool,
+    cancelled: bool,
+    done: bool,
+    paused_frontier: Option<PausedScannerState>,
+    terminal_error: Option<QuarryError>,
+}
+
+fn clone_terminal_error(error: &QuarryError) -> QuarryError {
+    match error {
+        QuarryError::SourceChanged => QuarryError::SourceChanged,
+        QuarryError::Io(io) => QuarryError::Io(std::io::Error::new(io.kind(), io.to_string())),
+        QuarryError::InvalidOption(msg) => QuarryError::InvalidOption(msg),
+        _ => QuarryError::Io(std::io::Error::other(error.to_string())),
+    }
+}
+
 struct SharedState {
     index: RwLock<StructuralIndex>,
     bytes_scanned: AtomicU64,
@@ -511,25 +635,36 @@ struct SharedState {
     cancelled: AtomicBool,
     /// Shared wake/abort flag set whenever either pause or cancel is requested.
     stop_dispatch: AtomicBool,
-    worker_running: AtomicBool,
-    paused_frontier: Mutex<Option<PausedScannerState>>,
+    lifecycle: Mutex<IndexLifecycle>,
     error: Mutex<Option<String>>,
     started: Instant,
     file_size: u64,
+    #[cfg(any(test, debug_assertions))]
+    path: PathBuf,
 }
 
 struct WorkerCompletion<'a>(&'a SharedState);
 
 impl Drop for WorkerCompletion<'_> {
     fn drop(&mut self) {
-        self.0.worker_running.store(false, Ordering::Release);
-        if self.0.paused.load(Ordering::Acquire) && !self.0.cancelled.load(Ordering::Acquire) {
+        let mut state = self.0.lifecycle.lock().unwrap();
+        state.worker_running = false;
+        if state.paused && !state.cancelled && state.terminal_error.is_none() {
             return;
         }
+        state.paused = false;
+        state.pause_requested = false;
+        state.paused_frontier = None;
+        state.done = true;
+        self.0.paused.store(false, Ordering::Release);
+        self.0.pause_requested.store(false, Ordering::Release);
         let elapsed = self.0.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        self.0
-            .finished_nanos
-            .store(elapsed.max(1), Ordering::Release);
+        let _ = self.0.finished_nanos.compare_exchange(
+            0,
+            elapsed.max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.0.done.store(true, Ordering::Release);
     }
 }
@@ -624,13 +759,22 @@ impl IndexJob {
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             stop_dispatch: AtomicBool::new(false),
-            worker_running: AtomicBool::new(false),
-            paused_frontier: Mutex::new(None),
+            lifecycle: Mutex::new(IndexLifecycle {
+                worker_running: false,
+                pause_requested: false,
+                paused: false,
+                cancelled: false,
+                done: false,
+                paused_frontier: None,
+                terminal_error: None,
+            }),
             error: Mutex::new(None),
             started: Instant::now(),
             file_size: ctx.file_size,
+            #[cfg(any(test, debug_assertions))]
+            path: ctx.path.clone(),
         });
-        let handle = Self::spawn_worker(&ctx, &shared, file, None)?;
+        let handle = Self::spawn_worker(&ctx, &shared, file, false)?;
         Ok(Self {
             shared,
             ctx,
@@ -642,17 +786,38 @@ impl IndexJob {
         ctx: &JobResumeContext,
         shared: &Arc<SharedState>,
         file: File,
-        resume_from: Option<PausedScannerState>,
+        resuming: bool,
     ) -> Result<JoinHandle<Result<(), QuarryError>>, QuarryError> {
         let worker_state = Arc::clone(shared);
         let ctx = ctx.clone();
-        worker_state.worker_running.store(true, Ordering::Release);
+        {
+            let mut state = worker_state.lifecycle.lock().unwrap();
+            state.worker_running = true;
+            if resuming {
+                state.pause_requested = false;
+                state.paused = false;
+                worker_state.pause_requested.store(false, Ordering::Release);
+                worker_state.paused.store(false, Ordering::Release);
+                worker_state.stop_dispatch.store(false, Ordering::Release);
+            }
+        }
         let spawn_result = thread::Builder::new()
             .name("quarry-index".into())
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
+                let resume_from = if resuming {
+                    worker_state
+                        .lifecycle
+                        .lock()
+                        .unwrap()
+                        .paused_frontier
+                        .take()
+                } else {
+                    None
+                };
                 let result = (|| {
                     if resume_from.is_none()
+                        && !resuming
                         && !worker_state.cancelled.load(Ordering::Acquire)
                         && !worker_state.pause_requested.load(Ordering::Acquire)
                         && let Some(cached) = try_load_sidecar(
@@ -676,6 +841,7 @@ impl IndexJob {
                         {
                             let mut guard = worker_state.index.write().unwrap();
                             *guard = cached;
+                            guard.complete = true;
                             guard.set_provenance(
                                 ctx.source_stamp.clone(),
                                 ctx.delimiter,
@@ -684,9 +850,6 @@ impl IndexJob {
                         }
                         worker_state
                             .bytes_scanned
-                            .store(ctx.file_size, Ordering::Release);
-                        worker_state
-                            .bytes_read
                             .store(ctx.file_size, Ordering::Release);
                         worker_state.rows_scanned.store(rows, Ordering::Release);
                         worker_state
@@ -713,9 +876,13 @@ impl IndexJob {
                         &worker_state,
                     )?;
                     if let Some(frontier) = paused_state {
-                        if !worker_state.cancelled.load(Ordering::Acquire) {
-                            *worker_state.paused_frontier.lock().unwrap() = Some(frontier);
-                            worker_state.paused.store(true, Ordering::Release);
+                        {
+                            let mut state = worker_state.lifecycle.lock().unwrap();
+                            if !state.cancelled {
+                                state.paused_frontier = Some(frontier);
+                                state.paused = true;
+                                worker_state.paused.store(true, Ordering::Release);
+                            }
                         }
                         // Release the source file handle while parked; resume() reopens and
                         // revalidates SourceStamp before continuing.
@@ -733,6 +900,7 @@ impl IndexJob {
                         let snapshot = {
                             let mut guard = worker_state.index.write().unwrap();
                             guard.last_record_end = guard.indexed_bytes;
+                            guard.complete = true;
                             guard.set_provenance(
                                 ctx.source_stamp.clone(),
                                 ctx.delimiter,
@@ -762,13 +930,25 @@ impl IndexJob {
                 })();
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
+                    worker_state.lifecycle.lock().unwrap().terminal_error =
+                        Some(clone_terminal_error(error));
                 }
                 result
             });
         match spawn_result {
             Ok(handle) => Ok(handle),
             Err(error) => {
-                shared.worker_running.store(false, Ordering::Release);
+                let mut state = shared.lifecycle.lock().unwrap();
+                state.worker_running = false;
+                if resuming && !state.cancelled && !state.done {
+                    // Thread creation failed before the closure ran; paused_frontier is still
+                    // intact so keep the job cleanly parked and recoverable.
+                    state.paused = true;
+                    state.pause_requested = true;
+                    shared.paused.store(true, Ordering::Release);
+                    shared.pause_requested.store(true, Ordering::Release);
+                    shared.stop_dispatch.store(true, Ordering::Release);
+                }
                 Err(error.into())
             }
         }
@@ -778,11 +958,7 @@ impl IndexJob {
         let done = self.shared.done.load(Ordering::Acquire);
         let finished_nanos = self.shared.finished_nanos.load(Ordering::Acquire);
         let bytes_scanned = self.shared.bytes_scanned.load(Ordering::Acquire);
-        let bytes_read = self
-            .shared
-            .bytes_read
-            .load(Ordering::Acquire)
-            .max(bytes_scanned);
+        let bytes_read = self.shared.bytes_read.load(Ordering::Acquire);
         IndexProgress {
             bytes_scanned,
             bytes_read,
@@ -815,10 +991,11 @@ impl IndexJob {
     /// Park this indexing job cleanly at the committed contiguous frontier without parking any
     /// worker-pool threads. In-flight chunks drain and release all pool slots and byte-budget tokens.
     pub fn pause(&self) {
-        if self.shared.done.load(Ordering::Acquire) || self.shared.cancelled.load(Ordering::Acquire)
-        {
+        let mut state = self.shared.lifecycle.lock().unwrap();
+        if state.done || state.cancelled {
             return;
         }
+        state.pause_requested = true;
         self.shared.pause_requested.store(true, Ordering::Release);
         self.shared.stop_dispatch.store(true, Ordering::Release);
     }
@@ -833,66 +1010,72 @@ impl IndexJob {
         self.shared.pause_requested.load(Ordering::Acquire)
     }
 
+    /// Single atomic predicate that stays true continuously from `pause()` through the parked
+    /// state until `resume()`, `cancel()`, or terminal completion.
+    pub fn is_paused_or_pausing(&self) -> bool {
+        let state = self.shared.lifecycle.lock().unwrap();
+        !state.done && !state.cancelled && (state.paused || state.pause_requested)
+    }
+
     /// Revalidate `SourceStamp` and resume a paused indexing job from its committed frontier.
     pub fn resume(&mut self) -> Result<(), QuarryError> {
-        if self.shared.done.load(Ordering::Acquire) || self.shared.cancelled.load(Ordering::Acquire)
         {
-            return Ok(());
-        }
-        if !self.shared.pause_requested.load(Ordering::Acquire)
-            && !self.shared.paused.load(Ordering::Acquire)
-        {
-            return Ok(());
+            let state = self.shared.lifecycle.lock().unwrap();
+            if state.done || state.cancelled {
+                return Ok(());
+            }
+            if !state.pause_requested && !state.paused {
+                return Ok(());
+            }
         }
         if let Some(handle) = self.handle.take() {
             let join_res = handle.join().map_err(|_| QuarryError::WorkerPanicked)?;
             join_res?;
         }
-        if self.shared.done.load(Ordering::Acquire) || self.shared.cancelled.load(Ordering::Acquire)
         {
-            return Ok(());
+            let state = self.shared.lifecycle.lock().unwrap();
+            if state.done || state.cancelled {
+                return Ok(());
+            }
         }
         let file = match open_regular_file(&self.ctx.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.mark_resume_source_changed();
+                self.mark_resume_failed(QuarryError::SourceChanged);
                 return Err(QuarryError::SourceChanged);
             }
             Err(error) => {
                 let error = QuarryError::Io(error);
-                *self.shared.error.lock().unwrap() = Some(error.to_string());
-                self.mark_resume_failed();
+                let stored = clone_terminal_error(&error);
+                self.mark_resume_failed(stored);
                 return Err(error);
             }
         };
         match source_matches_stamp(&file, &self.ctx.path, &self.ctx.source_stamp) {
             Ok(true) => {}
             Ok(false) => {
-                self.mark_resume_source_changed();
+                self.mark_resume_failed(QuarryError::SourceChanged);
                 return Err(QuarryError::SourceChanged);
             }
             Err(error) => {
-                *self.shared.error.lock().unwrap() = Some(error.to_string());
-                self.mark_resume_failed();
+                let stored = clone_terminal_error(&error);
+                self.mark_resume_failed(stored);
                 return Err(error);
             }
         }
-        let frontier = self.shared.paused_frontier.lock().unwrap().take();
-        self.shared.pause_requested.store(false, Ordering::Release);
-        self.shared.paused.store(false, Ordering::Release);
-        self.shared.stop_dispatch.store(false, Ordering::Release);
-        let handle = Self::spawn_worker(&self.ctx, &self.shared, file, frontier)?;
+        let handle = Self::spawn_worker(&self.ctx, &self.shared, file, true)?;
         self.handle = Some(handle);
         Ok(())
     }
 
-    fn mark_resume_source_changed(&self) {
-        *self.shared.error.lock().unwrap() = Some(QuarryError::SourceChanged.to_string());
-        self.mark_resume_failed();
-    }
-
-    fn mark_resume_failed(&self) {
-        *self.shared.paused_frontier.lock().unwrap() = None;
+    fn mark_resume_failed(&self, error: QuarryError) {
+        *self.shared.error.lock().unwrap() = Some(error.to_string());
+        let mut state = self.shared.lifecycle.lock().unwrap();
+        state.terminal_error = Some(error);
+        state.paused_frontier = None;
+        state.pause_requested = false;
+        state.paused = false;
+        state.done = true;
         self.shared.pause_requested.store(false, Ordering::Release);
         self.shared.paused.store(false, Ordering::Release);
         let elapsed = self
@@ -901,18 +1084,26 @@ impl IndexJob {
             .elapsed()
             .as_nanos()
             .min(u64::MAX as u128) as u64;
-        self.shared
-            .finished_nanos
-            .store(elapsed.max(1), Ordering::Release);
+        let _ = self.shared.finished_nanos.compare_exchange(
+            0,
+            elapsed.max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.shared.done.store(true, Ordering::Release);
     }
 
     pub fn cancel(&self) {
+        let mut state = self.shared.lifecycle.lock().unwrap();
+        state.cancelled = true;
+        state.pause_requested = false;
         self.shared.cancelled.store(true, Ordering::Release);
         self.shared.stop_dispatch.store(true, Ordering::Release);
         self.shared.pause_requested.store(false, Ordering::Release);
-        if !self.shared.worker_running.load(Ordering::Acquire) {
-            *self.shared.paused_frontier.lock().unwrap() = None;
+        if !state.worker_running {
+            state.paused_frontier = None;
+            state.paused = false;
+            state.done = true;
             self.shared.paused.store(false, Ordering::Release);
             let elapsed = self
                 .shared
@@ -934,6 +1125,9 @@ impl IndexJob {
         if let Some(handle) = self.handle.take() {
             let result = handle.join().map_err(|_| QuarryError::WorkerPanicked)?;
             result?;
+        }
+        if let Some(error) = self.shared.lifecycle.lock().unwrap().terminal_error.take() {
+            return Err(error);
         }
         let index = self.shared.index.read().unwrap().clone();
         Ok(index)
@@ -982,6 +1176,7 @@ fn run_indexer(
                 Arc::clone(&file),
                 file_size,
                 delimiter,
+                encoding,
                 byte_class,
                 config,
                 tuning,
@@ -1020,6 +1215,7 @@ fn run_indexer(
             Arc::clone(&file),
             file_size,
             delimiter,
+            encoding,
             byte_class,
             config,
             tuning,
@@ -1132,6 +1328,10 @@ fn run_sequential_indexer(
             shared
                 .bytes_scanned
                 .store(absolute_start, Ordering::Release);
+            #[cfg(any(test, debug_assertions))]
+            if absolute_start < file_size {
+                test_hooks::wait_if_gated(&shared.path, &shared.stop_dispatch);
+            }
         }
     } else {
         let _ = tuning;
@@ -1197,6 +1397,10 @@ fn run_sequential_indexer(
             shared
                 .bytes_scanned
                 .store(absolute_start, Ordering::Release);
+            #[cfg(any(test, debug_assertions))]
+            if absolute_start < file_size {
+                test_hooks::wait_if_gated(&shared.path, &shared.stop_dispatch);
+            }
         }
     }
 
@@ -1550,6 +1754,11 @@ fn scan_lf_chunk_worker(
     }))
 }
 
+enum GiantLineOutcome {
+    Done(u64),
+    Paused(PausedScannerState),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_giant_line_sequential(
     file: &File,
@@ -1557,11 +1766,12 @@ fn scan_giant_line_sequential(
     min_stop: u64,
     file_size: u64,
     dialect: ScannerDialect,
+    encoding: Encoding,
     byte_class: ByteEncodingClass,
     read_chunk_bytes: usize,
     merge: &mut MergeState,
     shared: &SharedState,
-) -> Result<u64, QuarryError> {
+) -> Result<GiantLineOutcome, QuarryError> {
     let mut scanner = if start == 0 {
         StructuralScanner::<true>::with_dialect(dialect, 0, byte_class)?
     } else if merge.in_quote {
@@ -1583,7 +1793,23 @@ fn scan_giant_line_sequential(
 
     while pos < file_size {
         if shared.cancelled.load(Ordering::Acquire) {
-            return Ok(pos);
+            return Ok(GiantLineOutcome::Done(pos));
+        }
+        if shared.pause_requested.load(Ordering::Acquire) {
+            let mut index = shared.index.write().unwrap();
+            index.telemetry.rescanned_bytes += span_bytes;
+            index.telemetry.chunks_processed += 1;
+            drop(index);
+            merge.in_quote = scanner.is_in_quote();
+            merge.pending_separators = scanner.current_separators();
+            return Ok(GiantLineOutcome::Paused(PausedScannerState::Sequential {
+                cursor: pos,
+                scanner: Box::new(EncodedScanner::from_structural(
+                    scanner,
+                    dialect.delimiter,
+                    encoding,
+                )),
+            }));
         }
         let want = (file_size - pos).min(buf.len() as u64) as usize;
         let read = read_at_exact_or_eof(file, pos, &mut buf[..want])?;
@@ -1637,7 +1863,7 @@ fn scan_giant_line_sequential(
     }
     merge.in_quote = scanner.is_in_quote();
     merge.pending_separators = scanner.current_separators();
-    Ok(pos)
+    Ok(GiantLineOutcome::Done(pos))
 }
 
 fn drain_parallel_window(
@@ -1679,6 +1905,7 @@ fn run_parallel_indexer(
     file: Arc<File>,
     file_size: u64,
     delimiter: u8,
+    encoding: Encoding,
     byte_class: ByteEncodingClass,
     config: IndexConfig,
     tuning: ParallelTuning,
@@ -1725,9 +1952,24 @@ fn run_parallel_indexer(
     shared.index.write().unwrap().telemetry.effective_workers = effective_workers;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Result<ChunkResult, QuarryError>>();
-    let max_window = (effective_workers * 2).clamp(2, 16);
+    let max_window = {
+        let base = (effective_workers * 2).clamp(2, 16);
+        #[cfg(any(test, debug_assertions))]
+        {
+            if test_hooks::is_gated(&shared.path) {
+                1
+            } else {
+                base
+            }
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            base
+        }
+    };
 
     let mut next_chunk_id = 0u64;
+    let mut giant_line_paused: Option<PausedScannerState> = None;
 
     let run_result: Result<(), QuarryError> = (|| {
         while cursor < file_size {
@@ -1778,6 +2020,15 @@ fn run_parallel_indexer(
                 }
             }
 
+            #[cfg(any(test, debug_assertions))]
+            if shared.bytes_scanned.load(Ordering::Acquire) > 0 && cursor < file_size {
+                test_hooks::wait_if_gated(&shared.path, &shared.stop_dispatch);
+                if shared.stop_dispatch.load(Ordering::Acquire) {
+                    stop_flag.store(true, Ordering::Release);
+                    return Ok(());
+                }
+            }
+
             let nominal_end = cursor.saturating_add(chunk_size as u64).min(file_size);
             let chunk_end = if nominal_end == file_size {
                 file_size
@@ -1800,18 +2051,28 @@ fn run_parallel_indexer(
                             stop_flag.store(true, Ordering::Release);
                             return Ok(());
                         }
-                        cursor = scan_giant_line_sequential(
+                        match scan_giant_line_sequential(
                             &file,
                             cursor,
                             search_limit,
                             file_size,
                             dialect,
+                            encoding,
                             byte_class,
                             chunk_size,
                             &mut merge,
                             shared,
-                        )?;
-                        continue;
+                        )? {
+                            GiantLineOutcome::Done(next_cursor) => {
+                                cursor = next_cursor;
+                                continue;
+                            }
+                            GiantLineOutcome::Paused(paused_state) => {
+                                giant_line_paused = Some(paused_state);
+                                stop_flag.store(true, Ordering::Release);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             };
@@ -1881,6 +2142,9 @@ fn run_parallel_indexer(
     // If pausing (and not cancelled), commit any already-completed contiguous prefix chunks
     // and discard non-contiguous speculative chunks beyond the contiguous frontier.
     if shared.pause_requested.load(Ordering::Acquire) && !shared.cancelled.load(Ordering::Acquire) {
+        if let Some(paused_state) = giant_line_paused {
+            return Ok(Some(paused_state));
+        }
         while let Ok(result) = rx.try_recv() {
             if let Ok(chunk) = result {
                 merge.pending.insert(chunk.id, Ok(chunk));
@@ -1993,11 +2257,19 @@ mod tests {
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             stop_dispatch: AtomicBool::new(false),
-            worker_running: AtomicBool::new(true),
-            paused_frontier: Mutex::new(None),
+            lifecycle: Mutex::new(super::IndexLifecycle {
+                worker_running: true,
+                pause_requested: false,
+                paused: false,
+                cancelled: false,
+                done: false,
+                paused_frontier: None,
+                terminal_error: None,
+            }),
             error: Mutex::new(None),
             started: Instant::now(),
             file_size: 0,
+            path: std::path::PathBuf::new(),
         };
 
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -2726,9 +2998,19 @@ mod tests {
         assert!(sidecar_entries.is_empty(), "sidecar written before EOF");
         assert_eq!(session.completed_record_count(), None);
 
-        // Mutate source while paused -> resume must surface SourceChanged.
+        // Mutate source while paused -> searching the paused snapshot AND resuming must both
+        // surface SourceChanged, and wait() must preserve the terminal SourceChanged error.
+        let paused_snapshot = job.snapshot();
         fs::rename(&path, directory.path().join("moved.csv")).unwrap();
         fs::write(&path, b"x,y\n1,2\n").unwrap();
+        assert!(matches!(
+            session.start_search(
+                &paused_snapshot,
+                b"1".to_vec(),
+                crate::SearchPosition { row: 1, column: 0 }
+            ),
+            Err(crate::QuarryError::SourceChanged)
+        ));
         assert!(matches!(
             job.resume(),
             Err(crate::QuarryError::SourceChanged)
@@ -2736,6 +3018,7 @@ mod tests {
         assert!(job.progress().done);
         assert!(!job.progress().paused);
         assert_eq!(session.completed_record_count(), None);
+        assert!(matches!(job.wait(), Err(crate::QuarryError::SourceChanged)));
     }
 
     #[test]

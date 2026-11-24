@@ -12,6 +12,7 @@ use crate::case::ByteMatcher;
 use crate::encoding::RecordScanner;
 use crate::pool::{JobExecutor, JobPriority, engine_pool, resolve_worker_count};
 use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
+use crate::source_stamp::SourceStamp;
 use crate::{
     CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError,
     Session, StructuralIndex, parse_encoded_record,
@@ -169,6 +170,7 @@ impl SearchJob {
             file_size,
             file_size,
             0,
+            None,
             delimiter,
             needle,
             case_sensitivity,
@@ -188,6 +190,7 @@ impl SearchJob {
         file_size: u64,
         indexed_frontier: u64,
         indexed_rows: u64,
+        expected_source: Option<SourceStamp>,
         delimiter: u8,
         needle: Vec<u8>,
         case_sensitivity: CaseSensitivity,
@@ -207,7 +210,16 @@ impl SearchJob {
                 limit: max_record_bytes,
             });
         }
-        let mut file = File::open(path)?;
+        let mut file = File::open(&path)?;
+        if let Some(ref stamp) = expected_source
+            && !crate::export::source_matches_stamp(&file, &path, stamp)?
+        {
+            return Err(QuarryError::SourceChanged);
+        }
+        let guard_file = expected_source
+            .as_ref()
+            .map(|_| file.try_clone())
+            .transpose()?;
         file.seek(SeekFrom::Start(checkpoint.offset))?;
         let total_bytes = indexed_frontier.saturating_sub(checkpoint.offset);
         let shared = Arc::new(SharedState::new(total_bytes));
@@ -258,6 +270,20 @@ impl SearchJob {
                         encoding,
                         &worker_state,
                     )
+                };
+                let result = match result {
+                    Ok(outcome) => {
+                        if let (Some(stamp), Some(guard_file)) = (&expected_source, &guard_file) {
+                            match crate::export::source_matches_stamp(guard_file, &path, stamp) {
+                                Ok(true) => Ok(outcome),
+                                Ok(false) => Err(QuarryError::SourceChanged),
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            Ok(outcome)
+                        }
+                    }
+                    Err(error) => Err(error),
                 };
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
@@ -463,7 +489,7 @@ impl Session {
         } else {
             start
         };
-        let indexed_frontier = if index.indexed_bytes() == self.file_size {
+        let indexed_frontier = if index.is_complete() {
             self.file_size
         } else {
             index.committed_record_end().min(self.file_size)
@@ -481,6 +507,7 @@ impl Session {
             self.file_size,
             indexed_frontier,
             index.indexed_rows(),
+            Some(self.source_stamp.clone()),
             self.dialect.delimiter,
             needle,
             case_sensitivity,
@@ -2062,6 +2089,9 @@ mod tests {
             .unwrap();
         // Overwrite with same-length malformed row 5 (in stripe 0) while stripe 1 hits row 30 first.
         fs::write(&path, &data).unwrap();
+        let mut session = session;
+        session.source_stamp =
+            crate::source_stamp::SourceStamp::from_file(&fs::File::open(&path).unwrap()).unwrap();
 
         let err = session
             .start_search_with_tuning(
@@ -2311,6 +2341,7 @@ mod tests {
             session.file_size,
             index.indexed_bytes(),
             index.indexed_rows(),
+            None,
             session.dialect.delimiter,
             b"missing".to_vec(),
             CaseSensitivity::Sensitive,

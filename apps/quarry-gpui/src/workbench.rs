@@ -272,7 +272,7 @@ impl WorkbenchController {
         let cleanup = scheduler.working_cleanup();
         let slots = scheduler.decompression_slots().clone();
         let hud_targets = ResourceHudTargets {
-            document_dir: None,
+            document_dirs: BTreeSet::new(),
             scratch_dir: working_dir.clone(),
         };
         let hud_sampler = ResourceHudSampler::start(hud_targets.clone());
@@ -3286,6 +3286,22 @@ impl WorkbenchController {
         &self.hud_sample
     }
 
+    /// Resolve the window-specific volume readings (active document volume + scratch volume)
+    /// and process memory sample for `window`.
+    pub fn resource_hud_for_window(
+        &self,
+        window: WindowId,
+    ) -> (
+        Option<quarry_core::ProcessMemorySample>,
+        Vec<quarry_workbench::VolumeSpaceSample>,
+    ) {
+        let doc_dir = self
+            .active_document(window)
+            .and_then(|doc| doc.logical_path.parent());
+        let (volumes, _) = self.hud_sample.volumes_for(doc_dir);
+        (self.hud_sample.memory, volumes)
+    }
+
     pub fn hud_announcement(&self, window: WindowId) -> Option<&HudAnnouncement> {
         self.last_hud_announcement.get(&window)
     }
@@ -3335,14 +3351,14 @@ impl WorkbenchController {
 
     fn sync_resource_hud(&mut self) -> bool {
         let mut changed = false;
-        let document_dir = self
-            .scheduler
-            .windows()
-            .into_iter()
-            .find_map(|window| self.active_document(window))
-            .and_then(|doc| doc.logical_path.parent().map(Path::to_path_buf));
+        let windows = self.scheduler.windows();
+        let document_dirs: BTreeSet<PathBuf> = windows
+            .iter()
+            .filter_map(|&window| self.active_document(window))
+            .filter_map(|doc| doc.logical_path.parent().map(Path::to_path_buf))
+            .collect();
         let next_targets = ResourceHudTargets {
-            document_dir,
+            document_dirs,
             scratch_dir: self.scheduler.working_directory().to_path_buf(),
         };
         if next_targets != self.hud_targets {
@@ -3354,9 +3370,8 @@ impl WorkbenchController {
             self.hud_sample = latest;
             changed = true;
         }
-        let windows = self.scheduler.windows();
         for window in windows {
-            let (doc_instance, phase, committed_rows, committed_bytes, file_size) =
+            let (doc_instance, doc_dir, phase, committed_rows, committed_bytes, file_size) =
                 match self.active_document(window) {
                     Some(doc) => {
                         let phase = if doc.job.is_none() && doc.progress.done {
@@ -3368,14 +3383,17 @@ impl WorkbenchController {
                         };
                         (
                             Some(doc.instance_id),
+                            doc.logical_path.parent().map(Path::to_path_buf),
                             phase,
                             doc.committed_data_rows(),
                             doc.progress.bytes_scanned,
                             doc.session.file_size,
                         )
                     }
-                    None => (None, HudIndexPhase::Idle, 0, 0, 0),
+                    None => (None, None, HudIndexPhase::Idle, 0, 0, 0),
                 };
+            let (window_volumes, sample_incomplete) =
+                self.hud_sample.volumes_for(doc_dir.as_deref());
             let tracker = self.hud_announcements.entry(window).or_default();
             if let Some(announcement) = tracker.update(
                 doc_instance,
@@ -3383,7 +3401,8 @@ impl WorkbenchController {
                 committed_rows,
                 committed_bytes,
                 file_size,
-                &self.hud_sample.volumes,
+                &window_volumes,
+                sample_incomplete,
             ) {
                 self.last_hud_announcement.insert(window, announcement);
                 changed = true;

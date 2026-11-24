@@ -68,6 +68,9 @@ pub use filter::{
     FilterEdits, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
     FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
 };
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use index::test_hooks;
 pub use index::{
     Checkpoint, CompletedIndex, IndexConfig, IndexJob, IndexProgress, IndexTelemetry,
     StructuralIndex,
