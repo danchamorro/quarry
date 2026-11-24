@@ -1592,9 +1592,10 @@ fn run_sequential_indexer_range(
         }
     }
 
-    shared
-        .bytes_scanned
-        .store(absolute_start, Ordering::Release);
+    shared.bytes_scanned.store(
+        absolute_start.saturating_sub(range_start),
+        Ordering::Release,
+    );
     Ok(None)
 }
 
@@ -3397,5 +3398,46 @@ mod tests {
         let avail = crate::available_disk_space(dir.path()).unwrap();
         assert!(avail > 0);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn nonzero_base_section_index_reports_section_relative_progress_and_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("section_progress.csv");
+        // "a,b\n" = 4 bytes [0, 4), "1,2\n" = 4 bytes [4, 8), "3,4\n" = 4 bytes [8, 12)
+        fs::write(&path, b"a,b\n1,2\n3,4\n").unwrap();
+
+        let session = crate::Session::open_section(
+            &path,
+            crate::ByteWindow::from_range(4, 8).unwrap(),
+            crate::SectionOpenOptions {
+                open: crate::OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: crate::HeaderMode::FirstRow,
+                    ..crate::OpenOptions::default()
+                },
+                ..crate::SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let job = session.start_indexing(IndexConfig::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.progress().done {
+            assert!(Instant::now() < deadline, "section index job timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let progress = job.progress();
+        let index = job.wait().unwrap();
+
+        assert_eq!(progress.file_size, 4);
+        assert_eq!(
+            progress.bytes_scanned, 4,
+            "section bytes_scanned must be section-relative, not absolute offset"
+        );
+        assert_eq!(index.indexed_bytes(), 4);
+        assert!(
+            index.is_complete(),
+            "finished nonzero-base section index must be marked complete"
+        );
     }
 }
