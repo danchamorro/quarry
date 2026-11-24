@@ -1514,7 +1514,10 @@ impl QuarryWindow {
         }
         self.set_editing(true, cx);
         self.panels.update(cx, |p, cx| p.close(window, cx));
-        let initial_path = self.snapshot(cx).map(|snap| snap.path);
+        let (initial_path, initial_encoding) = self
+            .snapshot(cx)
+            .map(|snap| (Some(snap.path), snap.applied_encoding))
+            .unwrap_or((None, None));
         let weak = cx.weak_entity();
         let on_open_section = move |path: PathBuf,
                                     byte_window: quarry_core::ByteWindow,
@@ -1546,7 +1549,14 @@ impl QuarryWindow {
             outcome
         };
         let on_closed = self.restore_grid_focus_callback(cx);
-        section_modal::open_section_dialog(initial_path, on_open_section, on_closed, window, cx);
+        section_modal::open_section_dialog(
+            initial_path,
+            initial_encoding,
+            on_open_section,
+            on_closed,
+            window,
+            cx,
+        );
     }
 
     fn open_section_action(

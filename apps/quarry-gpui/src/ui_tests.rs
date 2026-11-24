@@ -3133,6 +3133,7 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
         window.render_frame(cx);
         assert!(window.find("section-browse-file").visible());
         assert!(window.find("section-unit-select").visible());
+        assert!(window.find("section-encoding-select").visible());
         assert!(window.find("section-quote-free").visible());
         assert!(window.find("section-open-confirm").visible());
         window.click("section-cancel", cx);
@@ -3275,4 +3276,85 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
     });
     let close_saved = std::fs::read_to_string(&close_save_path).unwrap();
     assert!(close_saved.starts_with("edited_id,payload\n"));
+}
+
+#[gpui_kit::test]
+fn open_section_dialog_preserves_active_explicit_encoding_for_bomless_utf16le(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bomless_utf16le.csv");
+    let text = "id,note\n1,\"hello, world\"\n2,\"second, row\"\n";
+    let mut bytes = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // Open the BOM-less UTF-16LE file with an explicit encoding override.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![path.clone()],
+                    quarry_core::OpenOptions::default(),
+                    Some(quarry_core::Encoding::Utf16Le),
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+    let parent_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(parent_snap.encoding, quarry_core::Encoding::Utf16Le);
+    assert_eq!(
+        parent_snap.applied_encoding,
+        Some(quarry_core::Encoding::Utf16Le)
+    );
+
+    // Open Section… from the active BOM-less UTF-16LE tab and submit without manually re-picking.
+    let tabs_before = cx.update(|cx| controller.read(cx).tabs_for_window(win_id).len());
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| q.open_section_dialog_now(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("section-encoding-select").visible());
+        assert!(window.find("section-open-confirm").visible());
+        window.click("section-open-confirm", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        controller.read(cx).tabs_for_window(win_id).len() == tabs_before + 1
+            && q.snapshot(cx)
+                .is_some_and(|s| s.section.is_some() && s.index_done)
+    });
+
+    let sec_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(sec_snap.section.is_some());
+    assert_eq!(sec_snap.encoding, quarry_core::Encoding::Utf16Le);
+    assert_eq!(
+        sec_snap.applied_encoding,
+        Some(quarry_core::Encoding::Utf16Le)
+    );
+    assert_eq!(sec_snap.headers, vec!["id".to_string(), "note".to_string()]);
+    assert_eq!(sec_snap.total_rows, 2);
 }

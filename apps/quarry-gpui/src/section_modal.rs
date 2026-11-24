@@ -15,7 +15,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use quarry_core::{
-    ByteUnit, ByteWindow, OpenOptions, SectionOpenOptions, format_exact_bytes_in_unit,
+    ByteUnit, ByteWindow, Encoding, OpenOptions, SectionOpenOptions, format_exact_bytes_in_unit,
     parse_exact_byte_input,
 };
 use quarry_workbench::format_bytes;
@@ -43,6 +43,42 @@ impl SelectItem for UnitChoice {
 
 type UnitSelectState = SelectState<SearchableVec<UnitChoice>>;
 
+#[derive(Clone)]
+struct EncodingChoice {
+    encoding: Option<Encoding>,
+    label: &'static str,
+}
+
+impl SelectItem for EncodingChoice {
+    type Value = Option<Encoding>;
+
+    fn title(&self) -> SharedString {
+        self.label.into()
+    }
+
+    fn value(&self) -> &Option<Encoding> {
+        &self.encoding
+    }
+}
+
+type EncodingSelectState = SelectState<SearchableVec<EncodingChoice>>;
+
+const ENCODING_CHOICES: [(Option<Encoding>, &str); 6] = [
+    (None, "Auto"),
+    (Some(Encoding::Utf8), "UTF-8"),
+    (Some(Encoding::Utf16Le), "UTF-16 LE"),
+    (Some(Encoding::Utf16Be), "UTF-16 BE"),
+    (Some(Encoding::Windows1252), "Windows-1252"),
+    (Some(Encoding::Latin1), "ISO-8859-1"),
+];
+
+fn encoding_choice_index(encoding: Option<Encoding>) -> usize {
+    ENCODING_CHOICES
+        .iter()
+        .position(|(candidate, _)| *candidate == encoding)
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LastEditedField {
     From,
@@ -56,6 +92,9 @@ struct OpenSectionDialogState {
     file_size: u64,
     unit: ByteUnit,
     unit_select: Entity<UnitSelectState>,
+    encoding: Option<Encoding>,
+    encoding_inherited: bool,
+    encoding_select: Entity<EncodingSelectState>,
     from_input: Entity<InputState>,
     to_input: Entity<InputState>,
     size_input: Entity<InputState>,
@@ -70,10 +109,18 @@ struct OpenSectionDialogState {
 
 impl OpenSectionDialogState {
     fn set_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path_changed = self.path.as_ref() != Some(&path);
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         self.path = Some(path);
         self.file_size = size;
         self.quote_free_confirmed = false;
+        if path_changed && self.encoding_inherited {
+            self.encoding = None;
+            self.encoding_inherited = false;
+            self.encoding_select.update(cx, |sel, cx| {
+                sel.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            });
+        }
         let default_unit = ByteUnit::default_for_size(size);
         let default_size = size.min(10 * 1024 * 1024);
         self.from_bytes = 0;
@@ -354,7 +401,7 @@ impl OpenSectionDialogState {
         };
         let options = SectionOpenOptions {
             open: OpenOptions::default(),
-            encoding: None,
+            encoding: self.encoding,
             parent_index: None,
             quote_free_confirmed: self.quote_free_confirmed,
             ..SectionOpenOptions::default()
@@ -376,6 +423,7 @@ impl OpenSectionDialogState {
 
 pub fn open_section_dialog(
     initial_path: Option<PathBuf>,
+    initial_encoding: Option<Encoding>,
     on_open_section: impl Fn(
         PathBuf,
         ByteWindow,
@@ -424,6 +472,19 @@ pub fn open_section_dialog(
             cx,
         )
     });
+    let encoding_idx = encoding_choice_index(initial_encoding);
+    let encoding_items: Vec<EncodingChoice> = ENCODING_CHOICES
+        .into_iter()
+        .map(|(encoding, label)| EncodingChoice { encoding, label })
+        .collect();
+    let encoding_select = cx.new(|cx| {
+        SelectState::new(
+            SearchableVec::new(encoding_items),
+            Some(IndexPath::new(encoding_idx)),
+            window,
+            cx,
+        )
+    });
     let from_input = cx.new(|cx| {
         let mut s = InputState::new(window, cx).placeholder("0");
         s.set_value(init_from.to_string(), window, cx);
@@ -454,6 +515,21 @@ pub fn open_section_dialog(
                         this.unit = unit;
                         this.sync_inputs_from_bytes(window, cx);
                         this.validate_window();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &encoding_select,
+                window,
+                |this: &mut OpenSectionDialogState,
+                 sel,
+                 _: &SelectEvent<SearchableVec<EncodingChoice>>,
+                 _window,
+                 cx| {
+                    if let Some(&encoding) = sel.read(cx).selected_value() {
+                        this.encoding = encoding;
+                        this.encoding_inherited = false;
                         cx.notify();
                     }
                 },
@@ -492,6 +568,9 @@ pub fn open_section_dialog(
             file_size: initial_size,
             unit: display_unit,
             unit_select: unit_select.clone(),
+            encoding: initial_encoding,
+            encoding_inherited: initial_encoding.is_some(),
+            encoding_select: encoding_select.clone(),
             from_input: from_input.clone(),
             to_input: to_input.clone(),
             size_input: size_input.clone(),
@@ -551,6 +630,7 @@ pub fn open_section_dialog(
                 let quote_free = st.quote_free_confirmed;
                 let error_text = st.error.clone();
                 let unit_select = st.unit_select.clone();
+                let encoding_select = st.encoding_select.clone();
                 let from_input = st.from_input.clone();
                 let to_input = st.to_input.clone();
                 let size_input = st.size_input.clone();
@@ -642,6 +722,32 @@ pub fn open_section_dialog(
                                         .text_size(px(11.))
                                         .text_color(cx.theme().muted_foreground)
                                         .child("Exact 64-bit integer arithmetic (safe above 2^53 & 20 TiB)"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(64.))
+                                        .text_size(px(12.))
+                                        .child("Encoding"),
+                                )
+                                .child(
+                                    div().w(px(130.)).child(
+                                        Select::new(&encoding_select)
+                                            .id("section-encoding-select")
+                                            .small()
+                                            .accessibility_label("Character encoding"),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Auto detects BOM-marked files and defaults to UTF-8"),
                                 ),
                         )
                         .child(
