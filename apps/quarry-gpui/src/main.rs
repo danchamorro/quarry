@@ -638,7 +638,14 @@ impl QuarryWindow {
         self.panels
             .update(cx, |panels, cx| panels.close(window, cx));
         let controller = self.controller.clone();
+        let is_section = controller.read(cx).document_is_section(document_id);
+        let save_as_info = if is_section {
+            controller.read(cx).document_save_as_info(document_id)
+        } else {
+            None
+        };
         let status = cx.new(|_| CellEditStatus::default());
+        let prompting_save_as = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let this_weak = cx.weak_entity();
         let keep_weak = cx.weak_entity();
         let discard_weak = cx.weak_entity();
@@ -655,6 +662,9 @@ impl QuarryWindow {
             let save_weak = save_weak.clone();
             let close_weak = close_weak.clone();
             let save_status = status.clone();
+            let save_as_info = save_as_info.clone();
+            let prompting_save = std::sync::Arc::clone(&prompting_save_as);
+            let prompting_close = std::sync::Arc::clone(&prompting_save_as);
             let error = status.read(cx).error.clone();
             let _ = &this_weak;
             dialog
@@ -664,13 +674,20 @@ impl QuarryWindow {
                 .close_button(true)
                 .keyboard(true)
                 .content(move |content, _, cx| {
+                    let prompt_copy = if is_section {
+                        format!(
+                            "{filename_msg} has unsaved section edits. Save the section as a new file, discard edits, or keep editing."
+                        )
+                    } else {
+                        format!(
+                            "{filename_msg} has unsaved edits. Save your changes, discard them, or keep editing."
+                        )
+                    };
                     content
                         .child(
                             div()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(format!(
-                                    "{filename_msg} has unsaved edits. Save your changes, discard them, or keep editing."
-                                )),
+                                .child(prompt_copy),
                         )
                         .when_some(error.clone(), |content, error| {
                             content.child(
@@ -719,10 +736,104 @@ impl QuarryWindow {
                         )
                         .child(
                             Button::new("close-save")
-                                .label("Save")
+                                .label(if is_section { "Save As…" } else { "Save" })
                                 .primary()
                                 .small()
                                 .on_click(move |_, window, cx| {
+                                    if is_section {
+                                        let Some((source_path, warning)) = save_as_info.clone()
+                                        else {
+                                            return;
+                                        };
+                                        if let Some(warning) = warning {
+                                            let _ = save_weak.update(cx, |this, cx| {
+                                                this.set_message(AppMessage::warning(warning), cx);
+                                            });
+                                        }
+                                        prompting_save
+                                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                                        window.close_dialog(cx);
+                                        let suggested_base = uncompressed_name(&source_path);
+                                        let directory = suggested_base
+                                            .parent()
+                                            .unwrap_or_else(|| std::path::Path::new("."))
+                                            .to_path_buf();
+                                        let name = format!(
+                                            "{}-section.{}",
+                                            suggested_base
+                                                .file_stem()
+                                                .unwrap_or_default()
+                                                .to_string_lossy(),
+                                            suggested_base
+                                                .extension()
+                                                .unwrap_or_else(|| std::ffi::OsStr::new("csv"))
+                                                .to_string_lossy()
+                                        );
+                                        let selection =
+                                            cx.prompt_for_new_path(&directory, Some(&name));
+                                        let save_weak = save_weak.clone();
+                                        let controller_save = controller_save.clone();
+                                        cx.spawn_in(window, async move |_, cx| {
+                                            let selection = selection.await;
+                                            let _ = save_weak.update(cx, |this, cx| {
+                                                this.confirming = false;
+                                                match selection {
+                                                    Ok(Ok(Some(path))) => {
+                                                        let res =
+                                                            controller_save.update(cx, |c, cx| {
+                                                                c.save_as_in_review(
+                                                                    review_token,
+                                                                    document_id,
+                                                                    path,
+                                                                    cx,
+                                                                )
+                                                            });
+                                                        if let Err(error) = res {
+                                                            controller_save.update(cx, |c, cx| {
+                                                                c.cancel_close_review(
+                                                                    Some(review_token),
+                                                                    cx,
+                                                                );
+                                                            });
+                                                            this.set_message(error, cx);
+                                                        }
+                                                    }
+                                                    Ok(Ok(None)) => {
+                                                        controller_save.update(cx, |c, cx| {
+                                                            c.cancel_close_review(
+                                                                Some(review_token),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                    Ok(Err(error)) => {
+                                                        controller_save.update(cx, |c, cx| {
+                                                            c.cancel_close_review(
+                                                                Some(review_token),
+                                                                cx,
+                                                            );
+                                                        });
+                                                        this.set_message(
+                                                            AppMessage::error(format!(
+                                                                "Could not open save dialog: {error}"
+                                                            )),
+                                                            cx,
+                                                        );
+                                                    }
+                                                    Err(_) => {
+                                                        controller_save.update(cx, |c, cx| {
+                                                            c.cancel_close_review(
+                                                                Some(review_token),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                }
+                                            });
+                                        })
+                                        .detach();
+                                        return;
+                                    }
                                     let res = controller_save.update(cx, |c, cx| {
                                         c.save_in_review(review_token, document_id, cx)
                                     });
@@ -753,10 +864,12 @@ impl QuarryWindow {
                     true
                 })
                 .on_close(move |_, _, cx| {
-                    let _ = close_weak.update(cx, |this, cx| {
-                        this.confirming = false;
-                        cx.notify();
-                    });
+                    if !prompting_close.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = close_weak.update(cx, |this, cx| {
+                            this.confirming = false;
+                            cx.notify();
+                        });
+                    }
                 })
         });
     }

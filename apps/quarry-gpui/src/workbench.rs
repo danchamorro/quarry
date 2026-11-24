@@ -2120,6 +2120,25 @@ impl WorkbenchController {
         }
     }
 
+    /// Returns true when `document_id` is a bounded section document.
+    pub fn document_is_section(&self, document_id: DocumentId) -> bool {
+        self.scheduler.tab_section_bounds(document_id).is_some()
+    }
+
+    /// Returns `(path, speculative_save_warning)` for `document_id` if available.
+    pub fn document_save_as_info(
+        &self,
+        document_id: DocumentId,
+    ) -> Option<(PathBuf, Option<&'static str>)> {
+        let path = self.scheduler.tab_logical_path(document_id)?;
+        let warning = self
+            .scheduler
+            .tab(document_id)
+            .and_then(|tab| tab.document.as_ref())
+            .and_then(quarry_workbench::Document::speculative_save_warning);
+        Some((path, warning))
+    }
+
     /// Starts saving the specific reviewed dirty tab `document_id` and marks it to finish closing
     /// once saved. On startup failure (e.g., write slots busy), restores `close_confirmation_open`
     /// and preserves `pending_review` so the confirmation remains retryable.
@@ -2127,6 +2146,28 @@ impl WorkbenchController {
         &mut self,
         expected_token: u64,
         document_id: DocumentId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        self.save_in_review_with_destination(expected_token, document_id, None, cx)
+    }
+
+    /// Same as [`Self::save_in_review`], writing to an explicit Save As destination (used for
+    /// dirty section documents whose in-place Save is disabled).
+    pub fn save_as_in_review(
+        &mut self,
+        expected_token: u64,
+        document_id: DocumentId,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppMessage> {
+        self.save_in_review_with_destination(expected_token, document_id, Some(destination), cx)
+    }
+
+    fn save_in_review_with_destination(
+        &mut self,
+        expected_token: u64,
+        document_id: DocumentId,
+        destination: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Result<(), AppMessage> {
         if self.active_review_token != Some(expected_token) {
@@ -2146,7 +2187,7 @@ impl WorkbenchController {
             tab.close_confirmation_open = false;
             tab.close_after_save = true;
         }
-        if let Err(error) = self.start_save_document(document_id, None, None, cx) {
+        if let Err(error) = self.start_save_document(document_id, destination, None, cx) {
             if let Some(tab) = self.scheduler.tab_mut(document_id) {
                 tab.close_after_save = false;
                 tab.close_confirmation_open = true;

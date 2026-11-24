@@ -3231,4 +3231,47 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
             && q.snapshot(cx)
                 .is_some_and(|s| s.section.is_some() && s.index_done)
     });
+
+    // 6. Edit the active section, request tab close, and complete Save-and-Close via Save As.
+    let close_save_path = dir.path().join("section_close_save_as.csv");
+    let dirty_sec_id = cx.update(|cx| view.read(cx).snapshot(cx).unwrap().document_id);
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.rename_header_active(win_id, dirty_sec_id, 0, "edited_id".into(), cx)
+            })
+            .unwrap();
+    });
+    let review_token = cx.update(|cx| {
+        match controller.update(cx, |c, cx| {
+            c.request_close_tab(win_id, dirty_sec_id, false, cx)
+        }) {
+            CloseReviewAction::ConfirmTab {
+                review_token,
+                document_id,
+                ..
+            } => {
+                assert_eq!(document_id, dirty_sec_id);
+                assert!(controller.read(cx).document_is_section(document_id));
+                review_token
+            }
+            other => panic!("expected ConfirmTab for dirty section, got {other:?}"),
+        }
+    });
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.save_as_in_review(review_token, dirty_sec_id, close_save_path.clone(), cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+        close_save_path.exists()
+            && !controller
+                .read(cx)
+                .tabs_for_window(win_id)
+                .contains(&dirty_sec_id)
+    });
+    let close_saved = std::fs::read_to_string(&close_save_path).unwrap();
+    assert!(close_saved.starts_with("edited_id,payload\n"));
 }
