@@ -679,7 +679,7 @@ fn interior_section_header_rename_uses_captured_header_and_reordered_columns_rej
     assert_eq!(doc.headers[0], "alice");
 
     // 2. Reordering columns on a section must reject Save As rather than silently dropping order.
-    assert!(doc.move_column(1, 0));
+    doc.move_column(1, 0).unwrap();
     let err = doc.start_save_as(out_path.clone()).unwrap_err();
     assert!(
         err.text.to_lowercase().contains("transformation"),
