@@ -3156,7 +3156,7 @@ mod tests {
 
         let gate =
             super::test_hooks::TestIndexPauseGate::install_after_bytes(&path, prefix_len + 1);
-        let job = IndexJob::start_with_tuning_cache_and_pool(
+        let mut job = IndexJob::start_with_tuning_cache_and_pool(
             &session,
             IndexConfig {
                 chunk_bytes: 64 * 1024,
